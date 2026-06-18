@@ -1,12 +1,13 @@
 //! The parser: building a syntax tree from the token stream.
 
 use crate::ast::{
-    Accessor, AssignmentOperator, BinaryOperator, CatchClause, CompilationUnit, DelegateDecl,
-    EnumDecl, EnumMember, Expr, ExprKind, ForInitializer, GotoTarget, Literal, Member, Modifier,
-    NamespaceDecl, NamespaceMember, Parameter, ParameterModifier, PostfixOperator, PredefinedType,
-    QualifiedName, Stmt, StmtKind, SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeRef,
-    TypeRefKind, TypeTestOperation, UnaryOperator, UsingDirective, UsingKind, UsingResource,
-    VariableDeclarator,
+    Accessor, AssignmentOperator, Attribute, AttributeArgument, AttributeSection, BinaryOperator,
+    CatchClause, CompilationUnit, ConstructorInitializer, ConstructorInitializerKind,
+    ConversionDirection, DelegateDecl, EnumDecl, EnumMember, Expr, ExprKind, ForInitializer,
+    GotoTarget, Literal, Member, Modifier, NamespaceDecl, NamespaceMember, OverloadableOperator,
+    Parameter, ParameterModifier, PostfixOperator, PredefinedType, QualifiedName, Stmt, StmtKind,
+    SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeRef, TypeRefKind, TypeTestOperation,
+    UnaryOperator, UsingDirective, UsingKind, UsingResource, VariableDeclarator,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::lexer::{Tokenized, tokenize};
@@ -349,7 +350,11 @@ impl Parser {
             let declarator_start = self.current().span.start;
             let (name, mut end) = self.expect_identifier();
             let initializer = if self.eat(Punctuator::Equals) {
-                let value = self.parse_expression();
+                let value = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                    self.parse_array_initializer()
+                } else {
+                    self.parse_expression()
+                };
                 end = value.span.end;
                 Some(value)
             } else {
@@ -475,7 +480,10 @@ impl Parser {
         );
         let ty = self.parse_type();
         let (name, _) = self.expect_identifier();
-        self.expect_keyword(Keyword::In, "in");
+        if !self.eat_keyword(Keyword::In) {
+            let at = self.current().span.start;
+            self.report(DiagnosticKind::InExpected, Span::empty_at(at));
+        }
         let collection = self.parse_expression();
         self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
         let body = Box::new(self.parse_statement());
@@ -818,36 +826,139 @@ impl Parser {
         }
     }
 
-    /// Parses a namespace member (16.4): a nested namespace or a type declaration.
+    /// Parses zero or more leading attribute sections `[ ... ]` (clause 24).
+    fn parse_attribute_sections(&mut self) -> Vec<AttributeSection> {
+        let mut sections = Vec::new();
+        while self.current_punctuator() == Some(Punctuator::OpenBracket) {
+            sections.push(self.parse_attribute_section());
+        }
+        sections
+    }
+
+    /// Parses one attribute section `[ target? attribute-list ]` (24.1), the
+    /// scanner at the `[`. A trailing comma in the list is allowed.
+    fn parse_attribute_section(&mut self) -> AttributeSection {
+        let start = self.current().span.start;
+        self.bump();
+        let target = if matches!(self.current().kind, TokenKind::Identifier(_))
+            && self.next_is(Punctuator::Colon)
+        {
+            let (target, _) = self.expect_identifier();
+            self.bump();
+            Some(target)
+        } else {
+            None
+        };
+        let mut attributes = Vec::new();
+        attributes.push(self.parse_attribute());
+        while self.eat(Punctuator::Comma) {
+            if self.current_punctuator() == Some(Punctuator::CloseBracket) {
+                break;
+            }
+            attributes.push(self.parse_attribute());
+        }
+        let end = self.expect(
+            Punctuator::CloseBracket,
+            DiagnosticKind::TokenExpected { expected: "]" },
+        );
+        AttributeSection {
+            target,
+            attributes,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses one attribute: a type name and an optional argument list (24.2).
+    fn parse_attribute(&mut self) -> Attribute {
+        let start = self.current().span.start;
+        let name = self.parse_qualified_name();
+        let mut end = name.span.end;
+        let arguments = if self.current_punctuator() == Some(Punctuator::OpenParen) {
+            let (arguments, close) = self.parse_attribute_arguments();
+            end = close;
+            arguments
+        } else {
+            Vec::new()
+        };
+        Attribute {
+            name,
+            arguments,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses an attribute's parenthesized argument list (24.2): positional
+    /// arguments then named `name = value` arguments. Returns the arguments and
+    /// the offset past the closing `)`.
+    fn parse_attribute_arguments(&mut self) -> (Vec<AttributeArgument>, u32) {
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let mut arguments = Vec::new();
+        if self.current_punctuator() != Some(Punctuator::CloseParen) {
+            loop {
+                if matches!(self.current().kind, TokenKind::Identifier(_))
+                    && self.next_is(Punctuator::Equals)
+                {
+                    let (name, _) = self.expect_identifier();
+                    self.bump();
+                    let value = self.parse_expression();
+                    arguments.push(AttributeArgument::Named { name, value });
+                } else {
+                    arguments.push(AttributeArgument::Positional(self.parse_expression()));
+                }
+                if !self.eat(Punctuator::Comma) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        (arguments, end)
+    }
+
+    /// Parses a namespace member (16.4): a nested namespace or a type declaration,
+    /// with any leading attribute sections.
     fn parse_namespace_member(&mut self) -> NamespaceMember {
+        let start = self.current().span.start;
+        let attributes = self.parse_attribute_sections();
         if self.current_keyword() == Some(Keyword::Namespace) {
             return NamespaceMember::Namespace(self.parse_namespace_declaration());
         }
-        let start = self.current().span.start;
         let modifiers = self.parse_modifiers();
-        self.parse_type_kind_declaration(modifiers, start)
+        self.parse_type_kind_declaration(attributes, modifiers, start)
     }
 
-    /// Parses a type declaration given its already-parsed modifiers (16.5): a
-    /// class, struct, interface, enum, or delegate.
+    /// Parses a type declaration given its already-parsed attributes and modifiers
+    /// (16.5): a class, struct, interface, enum, or delegate.
     fn parse_type_kind_declaration(
         &mut self,
+        attributes: Vec<AttributeSection>,
         modifiers: Vec<Modifier>,
         start: u32,
     ) -> NamespaceMember {
         match self.current_keyword() {
-            Some(Keyword::Enum) => NamespaceMember::Enum(self.parse_enum(modifiers, start)),
-            Some(Keyword::Delegate) => {
-                NamespaceMember::Delegate(self.parse_delegate(modifiers, start))
+            Some(Keyword::Enum) => {
+                NamespaceMember::Enum(self.parse_enum(attributes, modifiers, start))
             }
-            _ => NamespaceMember::Type(self.parse_class_struct_interface(modifiers, start)),
+            Some(Keyword::Delegate) => {
+                NamespaceMember::Delegate(self.parse_delegate(attributes, modifiers, start))
+            }
+            _ => NamespaceMember::Type(
+                self.parse_class_struct_interface(attributes, modifiers, start),
+            ),
         }
     }
 
     /// Parses an `enum` declaration (21): the kind keyword, a name, an optional
     /// `: integral-type` base, then comma-separated members allowing a trailing
     /// comma.
-    fn parse_enum(&mut self, modifiers: Vec<Modifier>, start: u32) -> EnumDecl {
+    fn parse_enum(
+        &mut self,
+        attributes: Vec<AttributeSection>,
+        modifiers: Vec<Modifier>,
+        start: u32,
+    ) -> EnumDecl {
         self.bump();
         let (name, _) = self.expect_identifier();
         let base = if self.eat(Punctuator::Colon) {
@@ -884,6 +995,7 @@ impl Parser {
         }
         let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
         EnumDecl {
+            attributes,
             modifiers,
             name,
             base,
@@ -893,13 +1005,19 @@ impl Parser {
     }
 
     /// Parses a `delegate` declaration (22): `delegate return-type name ( params ) ;`.
-    fn parse_delegate(&mut self, modifiers: Vec<Modifier>, start: u32) -> DelegateDecl {
+    fn parse_delegate(
+        &mut self,
+        attributes: Vec<AttributeSection>,
+        modifiers: Vec<Modifier>,
+        start: u32,
+    ) -> DelegateDecl {
         self.bump();
         let return_type = self.parse_type();
         let (name, _) = self.expect_identifier();
         let parameters = self.parse_parameter_list();
         let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         DelegateDecl {
+            attributes,
             modifiers,
             return_type,
             name,
@@ -935,9 +1053,14 @@ impl Parser {
     }
 
     /// Parses a class, struct, or interface declaration given its already-parsed
-    /// modifiers (17, 18, 20): the kind keyword, a name, an optional base list,
-    /// and a member body.
-    fn parse_class_struct_interface(&mut self, modifiers: Vec<Modifier>, start: u32) -> TypeDecl {
+    /// attributes and modifiers (17, 18, 20): the kind keyword, a name, an
+    /// optional base list, and a member body.
+    fn parse_class_struct_interface(
+        &mut self,
+        attributes: Vec<AttributeSection>,
+        modifiers: Vec<Modifier>,
+        start: u32,
+    ) -> TypeDecl {
         let kind = match self.current_keyword() {
             Some(Keyword::Class) => {
                 self.bump();
@@ -981,6 +1104,7 @@ impl Parser {
         }
         let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
         TypeDecl {
+            attributes,
             modifiers,
             kind,
             name,
@@ -1008,6 +1132,7 @@ impl Parser {
     /// else is a field.
     fn parse_member(&mut self) -> Member {
         let start = self.current().span.start;
+        let attributes = self.parse_attribute_sections();
         let modifiers = self.parse_modifiers();
         if matches!(
             self.current_keyword(),
@@ -1018,25 +1143,50 @@ impl Parser {
                 | Some(Keyword::Delegate)
         ) {
             return Member::NestedType(Box::new(
-                self.parse_type_kind_declaration(modifiers, start),
+                self.parse_type_kind_declaration(attributes, modifiers, start),
             ));
+        }
+        let _ = attributes;
+        if self.current_keyword() == Some(Keyword::Event) {
+            return self.parse_event(modifiers, start);
+        }
+        if matches!(
+            self.current_keyword(),
+            Some(Keyword::Implicit) | Some(Keyword::Explicit)
+        ) {
+            return self.parse_conversion_operator(modifiers, start);
+        }
+        if self.current_punctuator() == Some(Punctuator::Tilde) {
+            return self.parse_destructor(modifiers, start);
         }
         if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::OpenParen)
         {
             let (name, _) = self.expect_identifier();
             let parameters = self.parse_parameter_list();
+            let initializer = if self.eat(Punctuator::Colon) {
+                Some(self.parse_constructor_initializer())
+            } else {
+                None
+            };
             let body = self.parse_required_block();
             let end = body.span.end;
             return Member::Constructor {
                 modifiers,
                 name,
                 parameters,
+                initializer,
                 body,
                 span: Span::new(start, end),
             };
         }
         let ty = self.parse_type();
+        if self.current_keyword() == Some(Keyword::Operator) {
+            return self.parse_operator(modifiers, ty, start);
+        }
+        if self.current_keyword() == Some(Keyword::This) {
+            return self.parse_indexer(modifiers, ty, start);
+        }
         if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::OpenParen)
         {
@@ -1080,17 +1230,11 @@ impl Parser {
         Member::Error
     }
 
-    /// Parses a property's accessor body (17.6): `{ get/set accessors }`, given
-    /// the modifiers, type, and name already parsed. Each accessor has a block
-    /// body or a bare `;`. `get` and `set` are contextual identifiers, not
-    /// keywords, so they are matched by spelling.
-    fn parse_property(
-        &mut self,
-        modifiers: Vec<Modifier>,
-        ty: TypeRef,
-        name: Box<str>,
-        start: u32,
-    ) -> Member {
+    /// Parses an accessor body `{ get/set accessors }` (17.6.2, 17.8.2), returning
+    /// the `get` and `set` accessors and the byte offset past the closing `}`.
+    /// `get` and `set` are contextual identifiers, not keywords, matched by
+    /// spelling. Each accessor has a block body or a bare `;`.
+    fn parse_accessor_block(&mut self) -> (Option<Accessor>, Option<Accessor>, u32) {
         self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
         let mut getter = None;
         let mut setter = None;
@@ -1126,10 +1270,258 @@ impl Parser {
             }
         }
         let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        (getter, setter, end)
+    }
+
+    /// Parses a property given the modifiers, type, and name already parsed (17.6).
+    fn parse_property(
+        &mut self,
+        modifiers: Vec<Modifier>,
+        ty: TypeRef,
+        name: Box<str>,
+        start: u32,
+    ) -> Member {
+        let (getter, setter, end) = self.parse_accessor_block();
         Member::Property {
             modifiers,
             ty,
             name,
+            getter,
+            setter,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses an event member given the modifiers already parsed (17.7): the
+    /// `event` keyword, a type, then either a field-like declarator list ending in
+    /// `;` or a `{ add/remove }` accessor block.
+    fn parse_event(&mut self, modifiers: Vec<Modifier>, start: u32) -> Member {
+        self.bump();
+        let ty = self.parse_type();
+        if matches!(self.current().kind, TokenKind::Identifier(_))
+            && self.next_is(Punctuator::OpenBrace)
+        {
+            let (name, _) = self.expect_identifier();
+            let (adder, remover, end) = self.parse_event_accessor_block();
+            return Member::Event {
+                modifiers,
+                ty,
+                name,
+                adder,
+                remover,
+                span: Span::new(start, end),
+            };
+        }
+        let declarators = self.parse_variable_declarators();
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Member::EventField {
+            modifiers,
+            ty,
+            declarators,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses an event's `{ add ... remove ... }` accessor block (17.7.1). `add`
+    /// and `remove` are contextual identifiers; each accessor has a block body.
+    fn parse_event_accessor_block(&mut self) -> (Option<Accessor>, Option<Accessor>, u32) {
+        self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+        let mut adder = None;
+        let mut remover = None;
+        loop {
+            if self.current_punctuator() == Some(Punctuator::CloseBrace)
+                || matches!(self.current().kind, TokenKind::EndOfFile)
+            {
+                break;
+            }
+            let accessor_start = self.current().span.start;
+            let is_adder = match self.current_identifier_text() {
+                Some("add") => true,
+                Some("remove") => false,
+                _ => break,
+            };
+            self.bump();
+            let (body, accessor_end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                let block = self.parse_block();
+                let end = block.span.end;
+                (Some(block), end)
+            } else {
+                let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+                (None, end)
+            };
+            let accessor = Accessor {
+                body,
+                span: Span::new(accessor_start, accessor_end),
+            };
+            if is_adder {
+                adder = Some(accessor);
+            } else {
+                remover = Some(accessor);
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        (adder, remover, end)
+    }
+
+    /// Parses an overloaded operator given the modifiers and return type already
+    /// parsed (17.9): the `operator` keyword, an overloadable operator, a parameter
+    /// list, then a body.
+    fn parse_operator(
+        &mut self,
+        modifiers: Vec<Modifier>,
+        return_type: TypeRef,
+        start: u32,
+    ) -> Member {
+        self.bump();
+        let operator = match self.overloadable_operator() {
+            Some(operator) => {
+                self.bump();
+                operator
+            }
+            None => {
+                let at = self.current().span.start;
+                self.report(
+                    DiagnosticKind::OverloadableOperatorExpected,
+                    Span::empty_at(at),
+                );
+                OverloadableOperator::Plus
+            }
+        };
+        let parameters = self.parse_parameter_list();
+        let body = self.parse_required_block();
+        let end = body.span.end;
+        Member::Operator {
+            modifiers,
+            return_type,
+            operator,
+            parameters,
+            body,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a user-defined conversion operator given the modifiers already
+    /// parsed (17.9.3): `implicit`/`explicit`, `operator`, a target type, a
+    /// parameter list, then a body.
+    fn parse_conversion_operator(&mut self, modifiers: Vec<Modifier>, start: u32) -> Member {
+        let direction = if self.eat_keyword(Keyword::Implicit) {
+            ConversionDirection::Implicit
+        } else {
+            self.bump();
+            ConversionDirection::Explicit
+        };
+        self.expect_keyword(Keyword::Operator, "operator");
+        let target = self.parse_type();
+        let parameters = self.parse_parameter_list();
+        let body = self.parse_required_block();
+        let end = body.span.end;
+        Member::ConversionOperator {
+            modifiers,
+            direction,
+            target,
+            parameters,
+            body,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// The overloadable operator the current token denotes, if any (17.9). `true`
+    /// and `false` are keyword operators; the rest are punctuators.
+    fn overloadable_operator(&self) -> Option<OverloadableOperator> {
+        if let Some(punctuator) = self.current_punctuator() {
+            return Some(match punctuator {
+                Punctuator::Plus => OverloadableOperator::Plus,
+                Punctuator::Minus => OverloadableOperator::Minus,
+                Punctuator::Exclamation => OverloadableOperator::LogicalNot,
+                Punctuator::Tilde => OverloadableOperator::BitwiseNot,
+                Punctuator::PlusPlus => OverloadableOperator::Increment,
+                Punctuator::MinusMinus => OverloadableOperator::Decrement,
+                Punctuator::Asterisk => OverloadableOperator::Multiply,
+                Punctuator::Slash => OverloadableOperator::Divide,
+                Punctuator::Percent => OverloadableOperator::Remainder,
+                Punctuator::Ampersand => OverloadableOperator::BitwiseAnd,
+                Punctuator::Bar => OverloadableOperator::BitwiseOr,
+                Punctuator::Caret => OverloadableOperator::ExclusiveOr,
+                Punctuator::LessThanLessThan => OverloadableOperator::LeftShift,
+                Punctuator::GreaterThanGreaterThan => OverloadableOperator::RightShift,
+                Punctuator::EqualsEquals => OverloadableOperator::Equality,
+                Punctuator::ExclamationEquals => OverloadableOperator::Inequality,
+                Punctuator::GreaterThan => OverloadableOperator::GreaterThan,
+                Punctuator::LessThan => OverloadableOperator::LessThan,
+                Punctuator::GreaterThanEquals => OverloadableOperator::GreaterThanOrEqual,
+                Punctuator::LessThanEquals => OverloadableOperator::LessThanOrEqual,
+                _ => return None,
+            });
+        }
+        match self.current_keyword() {
+            Some(Keyword::True) => Some(OverloadableOperator::True),
+            Some(Keyword::False) => Some(OverloadableOperator::False),
+            _ => None,
+        }
+    }
+
+    /// Parses a destructor given the modifiers already parsed (17.12): `~ name
+    /// ( ) body`.
+    fn parse_destructor(&mut self, modifiers: Vec<Modifier>, start: u32) -> Member {
+        self.bump();
+        let (name, _) = self.expect_identifier();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let body = self.parse_required_block();
+        let end = body.span.end;
+        Member::Destructor {
+            modifiers,
+            name,
+            body,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a constructor initializer (17.10.1), the scanner just past the `:`:
+    /// `base ( args )` or `this ( args )`.
+    fn parse_constructor_initializer(&mut self) -> ConstructorInitializer {
+        let kind = if self.eat_keyword(Keyword::Base) {
+            ConstructorInitializerKind::Base
+        } else if self.eat_keyword(Keyword::This) {
+            ConstructorInitializerKind::This
+        } else {
+            let at = self.current().span.start;
+            self.report(
+                DiagnosticKind::TokenExpected { expected: "base" },
+                Span::empty_at(at),
+            );
+            ConstructorInitializerKind::Base
+        };
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let (arguments, _) =
+            self.parse_arguments(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        ConstructorInitializer { kind, arguments }
+    }
+
+    /// Parses an indexer given the modifiers and type already parsed (17.8): the
+    /// `this` keyword, a bracketed index parameter list, then an accessor body.
+    fn parse_indexer(&mut self, modifiers: Vec<Modifier>, ty: TypeRef, start: u32) -> Member {
+        self.bump();
+        self.expect(
+            Punctuator::OpenBracket,
+            DiagnosticKind::TokenExpected { expected: "[" },
+        );
+        let parameters = self.parse_parameter_sequence(Punctuator::CloseBracket);
+        self.expect(
+            Punctuator::CloseBracket,
+            DiagnosticKind::TokenExpected { expected: "]" },
+        );
+        let (getter, setter, end) = self.parse_accessor_block();
+        Member::Indexer {
+            modifiers,
+            ty,
+            parameters,
             getter,
             setter,
             span: Span::new(start, end),
@@ -1142,39 +1534,49 @@ impl Parser {
             Punctuator::OpenParen,
             DiagnosticKind::TokenExpected { expected: "(" },
         );
+        let parameters = self.parse_parameter_sequence(Punctuator::CloseParen);
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        parameters
+    }
+
+    /// Parses a comma-separated formal-parameter sequence up to `close`, without
+    /// consuming the surrounding brackets. Shared by parameter lists `( )` and
+    /// indexer index lists `[ ]`.
+    fn parse_parameter_sequence(&mut self, close: Punctuator) -> Vec<Parameter> {
         let mut parameters = Vec::new();
-        if self.current_punctuator() != Some(Punctuator::CloseParen) {
-            loop {
-                let start = self.current().span.start;
-                let modifier = match self.current_keyword() {
-                    Some(Keyword::Ref) => {
-                        self.bump();
-                        Some(ParameterModifier::Ref)
-                    }
-                    Some(Keyword::Out) => {
-                        self.bump();
-                        Some(ParameterModifier::Out)
-                    }
-                    Some(Keyword::Params) => {
-                        self.bump();
-                        Some(ParameterModifier::Params)
-                    }
-                    _ => None,
-                };
-                let ty = self.parse_type();
-                let (name, end) = self.expect_identifier();
-                parameters.push(Parameter {
-                    modifier,
-                    ty,
-                    name,
-                    span: Span::new(start, end),
-                });
-                if !self.eat(Punctuator::Comma) {
-                    break;
+        if self.current_punctuator() == Some(close) {
+            return parameters;
+        }
+        loop {
+            let start = self.current().span.start;
+            let _ = self.parse_attribute_sections();
+            let modifier = match self.current_keyword() {
+                Some(Keyword::Ref) => {
+                    self.bump();
+                    Some(ParameterModifier::Ref)
                 }
+                Some(Keyword::Out) => {
+                    self.bump();
+                    Some(ParameterModifier::Out)
+                }
+                Some(Keyword::Params) => {
+                    self.bump();
+                    Some(ParameterModifier::Params)
+                }
+                _ => None,
+            };
+            let ty = self.parse_type();
+            let (name, end) = self.expect_identifier();
+            parameters.push(Parameter {
+                modifier,
+                ty,
+                name,
+                span: Span::new(start, end),
+            });
+            if !self.eat(Punctuator::Comma) {
+                break;
             }
         }
-        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
         parameters
     }
 
@@ -1464,6 +1866,10 @@ impl Parser {
                 self.bump();
                 Expr::new(ExprKind::This, span)
             }
+            TokenKind::Keyword(Keyword::Base) => {
+                self.bump();
+                Expr::new(ExprKind::Base, span)
+            }
             TokenKind::Keyword(Keyword::New) => self.parse_new(span.start),
             TokenKind::Keyword(Keyword::Typeof) => {
                 self.bump();
@@ -1669,15 +2075,50 @@ impl Parser {
             extra_ranks.push(extra);
             end = extra_end;
         }
+        let initializer = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+            let initializer = self.parse_array_initializer();
+            end = initializer.span.end;
+            Some(Box::new(initializer))
+        } else {
+            None
+        };
         Expr::new(
             ExprKind::ArrayCreation {
                 element,
                 lengths,
                 rank,
                 extra_ranks,
+                initializer,
             },
             Span::new(start, end),
         )
+    }
+
+    /// Parses an array initializer `{ variable-initializer-list? ,? }` (14.5.10.2),
+    /// the scanner at the `{`. Each element is a nested array initializer or an
+    /// expression; a trailing comma is allowed.
+    fn parse_array_initializer(&mut self) -> Expr {
+        let start = self.current().span.start;
+        self.bump();
+        let mut elements = Vec::new();
+        loop {
+            if self.current_punctuator() == Some(Punctuator::CloseBrace)
+                || matches!(self.current().kind, TokenKind::EndOfFile)
+            {
+                break;
+            }
+            let element = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                self.parse_array_initializer()
+            } else {
+                self.parse_expression()
+            };
+            elements.push(element);
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        Expr::new(ExprKind::ArrayInitializer(elements), Span::new(start, end))
     }
 
     /// Parses a type name (11.1): `identifier ('.' identifier)*`.
@@ -1856,6 +2297,7 @@ mod tests {
             ExprKind::Name(name) => String::from(&**name),
             ExprKind::PredefinedType(predefined) => String::from(predefined_text(*predefined)),
             ExprKind::This => String::from("this"),
+            ExprKind::Base => String::from("base"),
             ExprKind::Parenthesized(inner) => format!("(paren {})", dump(inner)),
             ExprKind::MemberAccess { receiver, name } => {
                 format!("(. {} {name})", dump(receiver))
@@ -1933,6 +2375,7 @@ mod tests {
                 lengths,
                 rank,
                 extra_ranks,
+                initializer,
             } => {
                 let mut text = format!("(newarr {} r{rank}", dump_type(element));
                 for length in lengths {
@@ -1942,7 +2385,22 @@ mod tests {
                 for extra in extra_ranks {
                     text.push_str(&format!(" +r{extra}"));
                 }
+                if let Some(initializer) = initializer {
+                    text.push(' ');
+                    text.push_str(&dump(initializer));
+                }
                 text.push(')');
+                text
+            }
+            ExprKind::ArrayInitializer(elements) => {
+                let mut text = String::from("{");
+                for (index, element) in elements.iter().enumerate() {
+                    if index > 0 {
+                        text.push(' ');
+                    }
+                    text.push_str(&dump(element));
+                }
+                text.push('}');
                 text
             }
             ExprKind::Error => String::from("<error>"),
@@ -2377,6 +2835,13 @@ mod tests {
     }
 
     #[test]
+    fn base_access() {
+        assert_eq!(tree("base.x"), "(. base x)");
+        assert_eq!(tree("base.M(a)"), "(call (. base M) a)");
+        assert_eq!(tree("base[i]"), "(index base i)");
+    }
+
+    #[test]
     fn checked_and_unchecked_wrap_an_expression() {
         assert_eq!(tree("checked(a + b)"), "(checked (+ a b))");
         assert_eq!(tree("unchecked(x)"), "(unchecked x)");
@@ -2425,6 +2890,29 @@ mod tests {
         assert_eq!(tree("new int[3, 4]"), "(newarr int r2 3 4)");
         assert_eq!(tree("new int[n][]"), "(newarr int r1 n +r1)");
         assert_eq!(tree("new Foo().Bar"), "(. (new Foo) Bar)");
+    }
+
+    #[test]
+    fn array_initializers() {
+        assert_eq!(tree("new int[] {1, 2, 3}"), "(newarr int r1 {1 2 3})");
+        assert_eq!(tree("new int[2] {1, 2}"), "(newarr int r1 2 {1 2})");
+        assert_eq!(
+            tree("new int[,] {{1, 2}, {3, 4}}"),
+            "(newarr int r2 {{1 2} {3 4}})"
+        );
+        assert_eq!(tree("new int[] {1, 2,}"), "(newarr int r1 {1 2})");
+        assert_eq!(
+            stmt_tree("int[] a = { 1, 2, 3 };"),
+            "(local int[] a={1 2 3})"
+        );
+        assert_eq!(
+            stmt_tree("int[,] m = { {1, 2}, {3, 4} };"),
+            "(local int[,] m={{1 2} {3 4}})"
+        );
+        assert_eq!(
+            unit_tree("class C { int[] data = {1, 2}; }"),
+            "(class C (field int[] data={1 2}))"
+        );
     }
 
     #[test]
@@ -2696,6 +3184,7 @@ mod tests {
                 modifiers,
                 name,
                 parameters,
+                initializer,
                 body,
                 ..
             } => {
@@ -2703,11 +3192,22 @@ mod tests {
                 for modifier in modifiers {
                     text.push_str(&format!(" {}", modifier_name(*modifier)));
                 }
-                text.push_str(&format!(
-                    " {name} ({}) {}",
-                    dump_params(parameters),
-                    dump_stmt(body)
-                ));
+                text.push_str(&format!(" {name} ({})", dump_params(parameters)));
+                if let Some(initializer) = initializer {
+                    let keyword = match initializer.kind {
+                        ConstructorInitializerKind::Base => "base",
+                        ConstructorInitializerKind::This => "this",
+                    };
+                    text.push_str(&format!(" :{keyword}("));
+                    for (index, argument) in initializer.arguments.iter().enumerate() {
+                        if index > 0 {
+                            text.push(' ');
+                        }
+                        text.push_str(&dump(argument));
+                    }
+                    text.push(')');
+                }
+                text.push_str(&format!(" {}", dump_stmt(body)));
                 text.push(')');
                 text
             }
@@ -2733,8 +3233,162 @@ mod tests {
                 text.push(')');
                 text
             }
+            Member::EventField {
+                modifiers,
+                ty,
+                declarators,
+                ..
+            } => {
+                let mut text = String::from("(event-field");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(" {}", dump_type(ty)));
+                for declarator in declarators {
+                    match &declarator.initializer {
+                        Some(value) => {
+                            text.push_str(&format!(" {}={}", declarator.name, dump(value)));
+                        }
+                        None => text.push_str(&format!(" {}", declarator.name)),
+                    }
+                }
+                text.push(')');
+                text
+            }
+            Member::Event {
+                modifiers,
+                ty,
+                name,
+                adder,
+                remover,
+                ..
+            } => {
+                let mut text = String::from("(event");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(" {} {name}", dump_type(ty)));
+                if let Some(adder) = adder {
+                    text.push_str(&format!(" {}", dump_accessor("add", adder)));
+                }
+                if let Some(remover) = remover {
+                    text.push_str(&format!(" {}", dump_accessor("remove", remover)));
+                }
+                text.push(')');
+                text
+            }
+            Member::Indexer {
+                modifiers,
+                ty,
+                parameters,
+                getter,
+                setter,
+                ..
+            } => {
+                let mut text = String::from("(indexer");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(" {} [{}]", dump_type(ty), dump_params(parameters)));
+                if let Some(getter) = getter {
+                    text.push_str(&format!(" {}", dump_accessor("get", getter)));
+                }
+                if let Some(setter) = setter {
+                    text.push_str(&format!(" {}", dump_accessor("set", setter)));
+                }
+                text.push(')');
+                text
+            }
+            Member::Operator {
+                modifiers,
+                return_type,
+                operator,
+                parameters,
+                body,
+                ..
+            } => {
+                let mut text = String::from("(operator");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(
+                    " {} {} ({}) {}",
+                    dump_type(return_type),
+                    operator_symbol(*operator),
+                    dump_params(parameters),
+                    dump_stmt(body)
+                ));
+                text.push(')');
+                text
+            }
+            Member::ConversionOperator {
+                modifiers,
+                direction,
+                target,
+                parameters,
+                body,
+                ..
+            } => {
+                let mut text = String::from("(conversion");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                let direction = match direction {
+                    ConversionDirection::Implicit => "implicit",
+                    ConversionDirection::Explicit => "explicit",
+                };
+                text.push_str(&format!(
+                    " {direction} {} ({}) {}",
+                    dump_type(target),
+                    dump_params(parameters),
+                    dump_stmt(body)
+                ));
+                text.push(')');
+                text
+            }
+            Member::Destructor {
+                modifiers,
+                name,
+                body,
+                ..
+            } => {
+                let mut text = String::from("(dtor");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(" {name} {}", dump_stmt(body)));
+                text.push(')');
+                text
+            }
             Member::NestedType(inner) => dump_namespace_member(inner),
             Member::Error => String::from("<error-member>"),
+        }
+    }
+
+    fn operator_symbol(operator: OverloadableOperator) -> &'static str {
+        match operator {
+            OverloadableOperator::Plus => "+",
+            OverloadableOperator::Minus => "-",
+            OverloadableOperator::LogicalNot => "!",
+            OverloadableOperator::BitwiseNot => "~",
+            OverloadableOperator::Increment => "++",
+            OverloadableOperator::Decrement => "--",
+            OverloadableOperator::True => "true",
+            OverloadableOperator::False => "false",
+            OverloadableOperator::Multiply => "*",
+            OverloadableOperator::Divide => "/",
+            OverloadableOperator::Remainder => "%",
+            OverloadableOperator::BitwiseAnd => "&",
+            OverloadableOperator::BitwiseOr => "|",
+            OverloadableOperator::ExclusiveOr => "^",
+            OverloadableOperator::LeftShift => "<<",
+            OverloadableOperator::RightShift => ">>",
+            OverloadableOperator::Equality => "==",
+            OverloadableOperator::Inequality => "!=",
+            OverloadableOperator::GreaterThan => ">",
+            OverloadableOperator::LessThan => "<",
+            OverloadableOperator::GreaterThanOrEqual => ">=",
+            OverloadableOperator::LessThanOrEqual => "<=",
         }
     }
 
@@ -2759,7 +3413,49 @@ mod tests {
             text.push_str(&format!(" {}", dump_member(member)));
         }
         text.push(')');
+        prefix_attributes(&declaration.attributes, text)
+    }
+
+    fn dump_attributes(sections: &[AttributeSection]) -> String {
+        let mut text = String::new();
+        for section in sections {
+            text.push('[');
+            if let Some(target) = &section.target {
+                text.push_str(&format!("{target}: "));
+            }
+            for (index, attribute) in section.attributes.iter().enumerate() {
+                if index > 0 {
+                    text.push_str(", ");
+                }
+                text.push_str(&dump_qname(&attribute.name));
+                if !attribute.arguments.is_empty() {
+                    text.push('(');
+                    for (argument_index, argument) in attribute.arguments.iter().enumerate() {
+                        if argument_index > 0 {
+                            text.push_str(", ");
+                        }
+                        match argument {
+                            AttributeArgument::Positional(value) => text.push_str(&dump(value)),
+                            AttributeArgument::Named { name, value } => {
+                                text.push_str(&format!("{name}={}", dump(value)));
+                            }
+                        }
+                    }
+                    text.push(')');
+                }
+            }
+            text.push(']');
+        }
         text
+    }
+
+    fn prefix_attributes(sections: &[AttributeSection], body: String) -> String {
+        let attributes = dump_attributes(sections);
+        if attributes.is_empty() {
+            body
+        } else {
+            format!("{attributes} {body}")
+        }
     }
 
     fn dump_accessor(kind: &str, accessor: &Accessor) -> String {
@@ -2790,7 +3486,7 @@ mod tests {
                     }
                 }
                 text.push(')');
-                text
+                prefix_attributes(&declaration.attributes, text)
             }
             NamespaceMember::Delegate(declaration) => {
                 let mut text = String::from("(delegate");
@@ -2804,7 +3500,7 @@ mod tests {
                     dump_params(&declaration.parameters)
                 ));
                 text.push(')');
-                text
+                prefix_attributes(&declaration.attributes, text)
             }
             NamespaceMember::Namespace(declaration) => {
                 let mut text = format!("(namespace {}", dump_qname(&declaration.name));
@@ -2903,6 +3599,22 @@ mod tests {
     }
 
     #[test]
+    fn constructor_initializers() {
+        assert_eq!(
+            unit_tree("class C { C() : base() {} }"),
+            "(class C (ctor C () :base() (block)))"
+        );
+        assert_eq!(
+            unit_tree("class C { C(int x) : this(x, 0) {} }"),
+            "(class C (ctor C (int x) :this(x 0) (block)))"
+        );
+        assert_eq!(
+            unit_tree("class C { C() : base(1, 2) {} }"),
+            "(class C (ctor C () :base(1 2) (block)))"
+        );
+    }
+
+    #[test]
     fn constructors_and_parameter_modifiers() {
         assert_eq!(
             unit_tree("class C { C() {} }"),
@@ -2933,6 +3645,18 @@ mod tests {
     fn declaration_diagnostics_match_the_reference_compiler() {
         assert_eq!(unit_codes("class C { int x }"), vec![1002]);
         assert_eq!(unit_codes("class C {"), vec![1513]);
+    }
+
+    #[test]
+    fn parser_diagnostic_codes_are_confirmed_against_csc() {
+        assert_eq!(unit_codes("using System"), vec![1002]);
+        assert_eq!(unit_codes("class C { void M() { return 0 } }"), vec![1002]);
+        assert_eq!(unit_codes("class C { void M() { try {} } }"), vec![1524]);
+        assert_eq!(unit_codes("namespace { }"), vec![1001]);
+        assert!(unit_codes("class C { void M() { foreach (int x xs) ; } }").contains(&1515));
+        assert!(unit_codes("class C { void M() { if x) ; } }").contains(&1003));
+        assert!(unit_codes("class C { void M() { f(1; } }").contains(&1026));
+        assert!(unit_codes("class C { void M() { object o = typeof(); } }").contains(&1031));
     }
 
     #[test]
@@ -2974,6 +3698,229 @@ mod tests {
             unit_tree("class C { public int P { get { return 1; } set {} } }"),
             "(class C (property public int P (get (block (return 1))) (set (block))))"
         );
+    }
+
+    #[test]
+    fn attributes() {
+        assert_eq!(
+            unit_tree("[Serializable] class C {}"),
+            "[Serializable] (class C)"
+        );
+        assert_eq!(
+            unit_tree("[Obsolete(\"x\")] public class C {}"),
+            "[Obsolete(str)] (class public C)"
+        );
+        assert_eq!(unit_tree("[A, B] enum E { X }"), "[A, B] (enum E X)");
+        assert_eq!(
+            unit_tree("[Conditional(\"DEBUG\")] delegate void D();"),
+            "[Conditional(str)] (delegate void D ())"
+        );
+        assert_eq!(
+            unit_tree("class C { [Obsolete] void M([In] int x) {} }"),
+            "(class C (method void M (int x) (block)))"
+        );
+    }
+
+    #[test]
+    fn destructors() {
+        assert_eq!(
+            unit_tree("class C { ~C() {} }"),
+            "(class C (dtor C (block)))"
+        );
+        assert_eq!(
+            unit_tree("class C { ~C() { Cleanup(); } }"),
+            "(class C (dtor C (block (expr (call Cleanup)))))"
+        );
+    }
+
+    #[test]
+    fn operators() {
+        assert_eq!(
+            unit_tree("class C { public static C operator +(C a, C b) { return a; } }"),
+            "(class C (operator public static C + (C a, C b) (block (return a))))"
+        );
+        assert_eq!(
+            unit_tree("class C { public static bool operator ==(C a, C b) { return true; } }"),
+            "(class C (operator public static bool == (C a, C b) (block (return true))))"
+        );
+        assert_eq!(
+            unit_tree("class C { public static implicit operator int(C c) { return 0; } }"),
+            "(class C (conversion public static implicit int (C c) (block (return 0))))"
+        );
+        assert_eq!(
+            unit_tree("class C { public static explicit operator C(int n) { return null; } }"),
+            "(class C (conversion public static explicit C (int n) (block (return null))))"
+        );
+    }
+
+    #[test]
+    fn events() {
+        assert_eq!(
+            unit_tree("class C { event Handler Click; }"),
+            "(class C (event-field Handler Click))"
+        );
+        assert_eq!(
+            unit_tree("class C { public event Handler A, B; }"),
+            "(class C (event-field public Handler A B))"
+        );
+        assert_eq!(
+            unit_tree("class C { event Handler E { add {} remove {} } }"),
+            "(class C (event Handler E (add (block)) (remove (block))))"
+        );
+    }
+
+    #[test]
+    fn indexers() {
+        assert_eq!(
+            unit_tree("class C { int this[int i] { get; set; } }"),
+            "(class C (indexer int [int i] (get ;) (set ;)))"
+        );
+        assert_eq!(
+            unit_tree("class C { string this[int x, int y] { get { return s; } } }"),
+            "(class C (indexer string [int x, int y] (get (block (return s)))))"
+        );
+    }
+
+    /// A small alphabet of token spellings the fuzzer draws from.
+    const FUZZ_TOKENS: &[&str] = &[
+        "class",
+        "struct",
+        "interface",
+        "enum",
+        "delegate",
+        "namespace",
+        "using",
+        "public",
+        "static",
+        "void",
+        "int",
+        "string",
+        "bool",
+        "object",
+        "new",
+        "return",
+        "if",
+        "else",
+        "while",
+        "for",
+        "foreach",
+        "do",
+        "switch",
+        "case",
+        "default",
+        "break",
+        "continue",
+        "throw",
+        "try",
+        "catch",
+        "finally",
+        "lock",
+        "checked",
+        "unchecked",
+        "this",
+        "base",
+        "operator",
+        "implicit",
+        "explicit",
+        "get",
+        "set",
+        "add",
+        "remove",
+        "event",
+        "const",
+        "ref",
+        "out",
+        "params",
+        "goto",
+        "is",
+        "as",
+        "typeof",
+        "null",
+        "true",
+        "false",
+        "{",
+        "}",
+        "(",
+        ")",
+        "[",
+        "]",
+        ";",
+        ",",
+        ".",
+        ":",
+        "=",
+        "==",
+        "+",
+        "-",
+        "*",
+        "/",
+        "%",
+        "&",
+        "|",
+        "^",
+        "!",
+        "~",
+        "<",
+        ">",
+        "<=",
+        ">=",
+        "<<",
+        ">>",
+        "?",
+        "++",
+        "--",
+        "@",
+        "x",
+        "Foo",
+        "M",
+        "a",
+        "0",
+        "42",
+        "\"s\"",
+    ];
+
+    fn fuzz_step(state: u64) -> u64 {
+        state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407)
+    }
+
+    #[test]
+    fn parsing_arbitrary_token_soup_never_panics() {
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        for seed in 0u64..4000 {
+            state = fuzz_step(state.wrapping_add(seed));
+            let mut walk = state;
+            let token_count = (walk % 40) as usize + 1;
+            let mut input = String::new();
+            for _ in 0..token_count {
+                walk = fuzz_step(walk);
+                input.push_str(FUZZ_TOKENS[(walk >> 33) as usize % FUZZ_TOKENS.len()]);
+                input.push(' ');
+            }
+            let _ = parse_compilation_unit(&input);
+            let _ = parse_statement(&input);
+            let _ = parse_expression(&input);
+        }
+    }
+
+    #[test]
+    fn parsing_every_prefix_of_a_program_never_panics() {
+        let corpus = [
+            "using System; namespace N { class C : B { public int F = 0; void M(ref int a) \
+             { for (int i = 0; i < 10; i++) { f(i); } } C() : base() {} int P { get; set; } \
+             int this[int i] { get { return 0; } } } }",
+            "[Serializable] enum E : byte { A, B = 2, } delegate int D(string s);",
+            "class C { public static C operator +(C a, C b) { return a; } ~C() {} \
+             event H E { add {} remove {} } int[] xs = { 1, 2, 3 }; }",
+        ];
+        for source in corpus {
+            for end in 0..=source.len() {
+                if source.is_char_boundary(end) {
+                    let _ = parse_compilation_unit(&source[..end]);
+                }
+            }
+        }
     }
 
     #[test]

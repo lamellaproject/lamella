@@ -35,6 +35,8 @@ pub enum ExprKind {
     PredefinedType(PredefinedType),
     /// The `this` access (14.5.7).
     This,
+    /// A `base` access (14.5.8): valid only as `base.member` or `base[args]`.
+    Base,
     /// A parenthesized expression (14.5.3): the parentheses group, they are not
     /// part of the value, so the inner expression is kept directly.
     Parenthesized(Box<Expr>),
@@ -142,7 +144,13 @@ pub enum ExprKind {
         rank: u8,
         /// Trailing jagged rank-specifiers, outermost first.
         extra_ranks: Vec<u8>,
+        /// The `{ ... }` initializer, if present.
+        initializer: Option<Box<Expr>>,
     },
+    /// An array initializer `{ e, ... }` (14.5.10.2). Grammatically valid only as a
+    /// variable initializer or array-creation initializer; the binder enforces
+    /// that. Elements may themselves be array initializers (nested).
+    ArrayInitializer(Vec<Expr>),
     /// A placeholder for an expression that could not be parsed. It is emitted
     /// with a diagnostic so the parser can keep building a tree for the rest.
     Error,
@@ -398,6 +406,42 @@ pub enum GotoTarget {
     Default,
 }
 
+/// An attribute section `[ target? attribute-list ]` (clause 24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeSection {
+    /// The target specifier before `:` (for example `assembly`), if any.
+    pub target: Option<Box<str>>,
+    /// The attributes in the section.
+    pub attributes: Vec<Attribute>,
+    /// The byte range the section covers.
+    pub span: Span,
+}
+
+/// One attribute within an [`AttributeSection`] (24.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attribute {
+    /// The attribute (type) name.
+    pub name: QualifiedName,
+    /// The positional and named arguments, in order.
+    pub arguments: Vec<AttributeArgument>,
+    /// The byte range the attribute covers.
+    pub span: Span,
+}
+
+/// An argument to an [`Attribute`] (24.2): positional or named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeArgument {
+    /// A positional argument expression.
+    Positional(Expr),
+    /// A named argument `name = expression`.
+    Named {
+        /// The parameter or field/property name.
+        name: Box<str>,
+        /// The argument value.
+        value: Expr,
+    },
+}
+
 /// A whole source file (ECMA-334 1st ed, 16.1): using directives then the
 /// top-level namespace and type declarations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -459,6 +503,8 @@ pub enum NamespaceMember {
 /// An `enum` declaration (21.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumDecl {
+    /// The attribute sections applied to the enum.
+    pub attributes: Vec<AttributeSection>,
     /// The declared modifiers, in source order.
     pub modifiers: Vec<Modifier>,
     /// The enum's name.
@@ -485,6 +531,8 @@ pub struct EnumMember {
 /// A `delegate` declaration (22.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegateDecl {
+    /// The attribute sections applied to the delegate.
+    pub attributes: Vec<AttributeSection>,
     /// The declared modifiers, in source order.
     pub modifiers: Vec<Modifier>,
     /// The delegate's return type.
@@ -510,10 +558,11 @@ pub struct NamespaceDecl {
     pub span: Span,
 }
 
-/// A class, struct, or interface declaration (17, 18, 20). Enum and delegate
-/// declarations arrive in a later chunk.
+/// A class, struct, or interface declaration (17, 18, 20).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeDecl {
+    /// The attribute sections applied to the type.
+    pub attributes: Vec<AttributeSection>,
     /// The declared modifiers, in source order.
     pub modifiers: Vec<Modifier>,
     /// Whether this is a class, struct, or interface.
@@ -606,7 +655,8 @@ pub enum Member {
         span: Span,
     },
     /// An instance or static constructor (17.10, 17.11): a name matching the
-    /// type, no return type, then a body.
+    /// type, no return type, an optional `: base(...)`/`: this(...)` initializer,
+    /// then a body.
     Constructor {
         /// The member's modifiers.
         modifiers: Vec<Modifier>,
@@ -614,6 +664,8 @@ pub enum Member {
         name: Box<str>,
         /// The formal parameters.
         parameters: Vec<Parameter>,
+        /// The `: base(...)` or `: this(...)` initializer, if present.
+        initializer: Option<ConstructorInitializer>,
         /// The constructor body.
         body: Stmt,
         /// The byte range the member covers.
@@ -634,11 +686,172 @@ pub enum Member {
         /// The byte range the member covers.
         span: Span,
     },
+    /// A field-like event declaration (17.7): `modifiers event type declarators ;`.
+    EventField {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// The event (delegate) type.
+        ty: TypeRef,
+        /// The declared events.
+        declarators: Vec<VariableDeclarator>,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// An event declaration with accessors (17.7): `modifiers event type name
+    /// { add ... remove ... }`.
+    Event {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// The event (delegate) type.
+        ty: TypeRef,
+        /// The event name.
+        name: Box<str>,
+        /// The `add` accessor, if present.
+        adder: Option<Accessor>,
+        /// The `remove` accessor, if present.
+        remover: Option<Accessor>,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// An indexer declaration (17.8): `modifiers type this [ params ] { accessors }`.
+    Indexer {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// The element type.
+        ty: TypeRef,
+        /// The index formal parameters (at least one).
+        parameters: Vec<Parameter>,
+        /// The `get` accessor, if present.
+        getter: Option<Accessor>,
+        /// The `set` accessor, if present.
+        setter: Option<Accessor>,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// An overloaded unary or binary operator (17.9.1, 17.9.2): `modifiers
+    /// return-type operator <op> ( params ) body`.
+    Operator {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// The operator's return type.
+        return_type: TypeRef,
+        /// The operator being defined.
+        operator: OverloadableOperator,
+        /// The operand parameters (one for unary, two for binary).
+        parameters: Vec<Parameter>,
+        /// The operator body.
+        body: Stmt,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// A user-defined conversion operator (17.9.3): `modifiers implicit|explicit
+    /// operator target ( param ) body`.
+    ConversionOperator {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// Whether the conversion is implicit or explicit.
+        direction: ConversionDirection,
+        /// The type converted to.
+        target: TypeRef,
+        /// The single source parameter.
+        parameters: Vec<Parameter>,
+        /// The operator body.
+        body: Stmt,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// A destructor (17.12): `~ name ( ) body`.
+    Destructor {
+        /// The member's modifiers (only `extern` is valid; the parser accepts any).
+        modifiers: Vec<Modifier>,
+        /// The destructor name (the type name).
+        name: Box<str>,
+        /// The destructor body.
+        body: Stmt,
+        /// The byte range the member covers.
+        span: Span,
+    },
     /// A type nested in another type (17.2): a class, struct, interface, enum, or
     /// delegate. Boxed because [`NamespaceMember`] holds members in turn.
     NestedType(Box<NamespaceMember>),
     /// A placeholder for a member that could not be parsed, for recovery.
     Error,
+}
+
+/// Whether a conversion operator is implicit or explicit (17.9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionDirection {
+    /// `implicit`.
+    Implicit,
+    /// `explicit`.
+    Explicit,
+}
+
+/// An operator that may be overloaded by an [`Member::Operator`] (17.9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverloadableOperator {
+    /// `+`.
+    Plus,
+    /// `-`.
+    Minus,
+    /// `!`.
+    LogicalNot,
+    /// `~`.
+    BitwiseNot,
+    /// `++`.
+    Increment,
+    /// `--`.
+    Decrement,
+    /// `true`.
+    True,
+    /// `false`.
+    False,
+    /// `*`.
+    Multiply,
+    /// `/`.
+    Divide,
+    /// `%`.
+    Remainder,
+    /// `&`.
+    BitwiseAnd,
+    /// `|`.
+    BitwiseOr,
+    /// `^`.
+    ExclusiveOr,
+    /// `<<`.
+    LeftShift,
+    /// `>>`.
+    RightShift,
+    /// `==`.
+    Equality,
+    /// `!=`.
+    Inequality,
+    /// `>`.
+    GreaterThan,
+    /// `<`.
+    LessThan,
+    /// `>=`.
+    GreaterThanOrEqual,
+    /// `<=`.
+    LessThanOrEqual,
+}
+
+/// A constructor initializer (17.10.1): `: base(args)` or `: this(args)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorInitializer {
+    /// Whether the initializer calls a base or a sibling constructor.
+    pub kind: ConstructorInitializerKind,
+    /// The argument expressions.
+    pub arguments: Vec<Expr>,
+}
+
+/// Which constructor a [`ConstructorInitializer`] chains to (17.10.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructorInitializerKind {
+    /// `: base(...)`.
+    Base,
+    /// `: this(...)`.
+    This,
 }
 
 /// A property accessor (17.6.2): a `get` or `set`, with a block body or, for an

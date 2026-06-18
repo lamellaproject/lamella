@@ -32,6 +32,10 @@ pub enum RelocKind {
     /// take the word-scaled distance from `Align(PC, 4)` to the pool entry
     /// (Armv6-M ARM (DDI 0419E), A6.7.27), which must lie ahead within about 1 KB.
     ThumbLdrLit8,
+    /// A 32-bit `BL` call (encoding T1): a 24-bit signed, halfword-scaled
+    /// PC-relative offset split as S:I1:I2:imm10:imm11 with the J1/J2 swizzle
+    /// (Armv6-M ARM (DDI 0419E), A6.7.13), reach about +/-16 MB.
+    ThumbCall,
 }
 
 /// A reference to an externally defined symbol, left for the link step.
@@ -337,6 +341,195 @@ impl Encoder {
         Ok(())
     }
 
+    /// The 16-bit register-offset load/store form, `0101 opB Rm Rn Rt` (Armv6-M
+    /// ARM (DDI 0419E), A5.2.4, Table A5-5). All three registers must be low.
+    fn ldst_reg(&mut self, opb: u16, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        if !(rt.is_low() && rn.is_low() && rm.is_low()) {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(
+            0x5000
+                | (opb << 9)
+                | (u16::from(rm.number()) << 6)
+                | (u16::from(rn.number()) << 3)
+                | u16::from(rt.number()),
+        );
+        Ok(())
+    }
+
+    /// `STR Rt, [Rn, Rm]` -- store a word (Table A5-5, opB 000).
+    pub fn str_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.ldst_reg(0b000, rt, rn, rm)
+    }
+
+    /// `STRH Rt, [Rn, Rm]` -- store a halfword (Table A5-5, opB 001).
+    pub fn strh_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.ldst_reg(0b001, rt, rn, rm)
+    }
+
+    /// `STRB Rt, [Rn, Rm]` -- store a byte (Table A5-5, opB 010).
+    pub fn strb_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.ldst_reg(0b010, rt, rn, rm)
+    }
+
+    /// `LDRSB Rt, [Rn, Rm]` -- load a sign-extended byte (Table A5-5, opB 011).
+    pub fn ldrsb_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.ldst_reg(0b011, rt, rn, rm)
+    }
+
+    /// `LDR Rt, [Rn, Rm]` -- load a word (Table A5-5, opB 100).
+    pub fn ldr_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.ldst_reg(0b100, rt, rn, rm)
+    }
+
+    /// `LDRH Rt, [Rn, Rm]` -- load a zero-extended halfword (Table A5-5, opB 101).
+    pub fn ldrh_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.ldst_reg(0b101, rt, rn, rm)
+    }
+
+    /// `LDRB Rt, [Rn, Rm]` -- load a zero-extended byte (Table A5-5, opB 110).
+    pub fn ldrb_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.ldst_reg(0b110, rt, rn, rm)
+    }
+
+    /// `LDRSH Rt, [Rn, Rm]` -- load a sign-extended halfword (Table A5-5, opB 111).
+    pub fn ldrsh_reg(&mut self, rt: Reg, rn: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.ldst_reg(0b111, rt, rn, rm)
+    }
+
+    /// `STRB Rt, [Rn, #imm5]` -- store a byte. 16-bit encoding T1 (Table A5-5, opA
+    /// 0111); low registers, `imm5` in 0..=31.
+    pub fn strb_imm(&mut self, rt: Reg, rn: Reg, imm5: u8) -> Result<(), AssembleError> {
+        if !(rt.is_low() && rn.is_low()) || imm5 > 31 {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(
+            0x7000
+                | (u16::from(imm5) << 6)
+                | (u16::from(rn.number()) << 3)
+                | u16::from(rt.number()),
+        );
+        Ok(())
+    }
+
+    /// `LDRB Rt, [Rn, #imm5]` -- load a zero-extended byte. 16-bit encoding T1
+    /// (Table A5-5, opA 0111); low registers, `imm5` in 0..=31.
+    pub fn ldrb_imm(&mut self, rt: Reg, rn: Reg, imm5: u8) -> Result<(), AssembleError> {
+        if !(rt.is_low() && rn.is_low()) || imm5 > 31 {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(
+            0x7800
+                | (u16::from(imm5) << 6)
+                | (u16::from(rn.number()) << 3)
+                | u16::from(rt.number()),
+        );
+        Ok(())
+    }
+
+    /// `STRH Rt, [Rn, #imm]` -- store a halfword. 16-bit encoding T1 (Table A5-5,
+    /// opA 1000); low registers, `imm` even in 0..=62.
+    pub fn strh_imm(&mut self, rt: Reg, rn: Reg, imm: u8) -> Result<(), AssembleError> {
+        if !(rt.is_low() && rn.is_low()) || imm % 2 != 0 || imm > 62 {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(
+            0x8000
+                | (u16::from(imm / 2) << 6)
+                | (u16::from(rn.number()) << 3)
+                | u16::from(rt.number()),
+        );
+        Ok(())
+    }
+
+    /// `LDRH Rt, [Rn, #imm]` -- load a zero-extended halfword. 16-bit encoding T1
+    /// (Table A5-5, opA 1000); low registers, `imm` even in 0..=62.
+    pub fn ldrh_imm(&mut self, rt: Reg, rn: Reg, imm: u8) -> Result<(), AssembleError> {
+        if !(rt.is_low() && rn.is_low()) || imm % 2 != 0 || imm > 62 {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(
+            0x8800
+                | (u16::from(imm / 2) << 6)
+                | (u16::from(rn.number()) << 3)
+                | u16::from(rt.number()),
+        );
+        Ok(())
+    }
+
+    /// The 16-bit sign/zero-extend form, `1011 0010 op2 Rm Rd` (Armv6-M ARM
+    /// (DDI 0419E), the extend instructions); low registers only.
+    fn extend(&mut self, op2: u16, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        if !(rd.is_low() && rm.is_low()) {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(0xB200 | (op2 << 6) | (u16::from(rm.number()) << 3) | u16::from(rd.number()));
+        Ok(())
+    }
+
+    /// `SXTH Rd, Rm` -- sign-extend the low halfword to 32 bits (op2 00).
+    pub fn sxth(&mut self, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.extend(0b00, rd, rm)
+    }
+
+    /// `SXTB Rd, Rm` -- sign-extend the low byte to 32 bits (op2 01).
+    pub fn sxtb(&mut self, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.extend(0b01, rd, rm)
+    }
+
+    /// `UXTH Rd, Rm` -- zero-extend the low halfword to 32 bits (op2 10).
+    pub fn uxth(&mut self, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.extend(0b10, rd, rm)
+    }
+
+    /// `UXTB Rd, Rm` -- zero-extend the low byte to 32 bits (op2 11).
+    pub fn uxtb(&mut self, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.extend(0b11, rd, rm)
+    }
+
+    /// The 16-bit byte-reverse form, `1011 1010 op2 Rm Rd` (the REV instructions);
+    /// low registers only.
+    fn reverse(&mut self, op2: u16, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        if !(rd.is_low() && rm.is_low()) {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(0xBA00 | (op2 << 6) | (u16::from(rm.number()) << 3) | u16::from(rd.number()));
+        Ok(())
+    }
+
+    /// `REV Rd, Rm` -- reverse the byte order of a word (op2 00).
+    pub fn rev(&mut self, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.reverse(0b00, rd, rm)
+    }
+
+    /// `REV16 Rd, Rm` -- reverse the byte order within each halfword (op2 01).
+    pub fn rev16(&mut self, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.reverse(0b01, rd, rm)
+    }
+
+    /// `REVSH Rd, Rm` -- reverse the low halfword's bytes and sign-extend (op2 11).
+    pub fn revsh(&mut self, rd: Reg, rm: Reg) -> Result<(), AssembleError> {
+        self.reverse(0b11, rd, rm)
+    }
+
+    /// `ADD Rdn, Rm` -- add two registers without setting flags, either of which
+    /// may be high. 16-bit encoding T2 (A6.7.3); the destination's high bit is DN.
+    pub fn add_high(&mut self, rdn: Reg, rm: Reg) {
+        let dn = u16::from(rdn.number() >> 3) & 1;
+        self.emit_u16(
+            0x4400 | (dn << 7) | (u16::from(rm.number()) << 3) | u16::from(rdn.number() & 7),
+        );
+    }
+
+    /// `CMP Rn, Rm` -- compare two registers, either of which may be high. 16-bit
+    /// encoding T2 (A6.7.18); `Rn`'s high bit is N.
+    pub fn cmp_high(&mut self, rn: Reg, rm: Reg) {
+        let n = u16::from(rn.number() >> 3) & 1;
+        self.emit_u16(
+            0x4500 | (n << 7) | (u16::from(rm.number()) << 3) | u16::from(rn.number() & 7),
+        );
+    }
+
     /// The 16-bit data-processing register form, `0100 00 op Rm Rdn` (Armv6-M ARM
     /// (DDI 0419E), A5.2.2, Table A5-3). `a` occupies bits 2..0 and `b` bits 5..3;
     /// both must be low registers.
@@ -478,6 +671,13 @@ impl Encoder {
         self.emit_u16(0xBE00 | u16::from(imm8));
     }
 
+    /// `UDF #imm8` -- permanently undefined instruction, used as a trap; executing
+    /// it raises an undefined-instruction fault. 16-bit encoding T1 (A6.7.26 area;
+    /// the conditional-branch `cond == 0b1110` slot).
+    pub fn udf(&mut self, imm8: u8) {
+        self.emit_u16(0xDE00 | u16::from(imm8));
+    }
+
     /// Emits a literal 32-bit little-endian word -- a vector-table entry, an
     /// inline constant, or a literal-pool datum.
     pub fn emit_word(&mut self, value: u32) {
@@ -529,6 +729,21 @@ impl Encoder {
         self.fixups
             .push((at, RelocKind::ThumbBranchCond8, target.0));
         self.emit_u16(0xD000 | (u16::from(cond.encoding()) << 8));
+    }
+
+    /// `BL <label>` -- branch with link (a call to a bound label). 32-bit encoding
+    /// T1 (A6.7.13); the J1/J2-swizzled, PC-relative offset (reach about +/-16 MB)
+    /// is resolved in [`Encoder::finish`].
+    pub fn bl(&mut self, target: Label) {
+        let at = self.position();
+        self.fixups.push((at, RelocKind::ThumbCall, target.0));
+        self.emit_thumb32(0xF000, 0xD000);
+    }
+
+    /// `BLX Rm` -- branch with link and exchange to the address in `Rm` (an
+    /// indirect call). 16-bit encoding T1 (A6.7.14).
+    pub fn blx(&mut self, rm: Reg) {
+        self.emit_u16(0x4780 | (u16::from(rm.number()) << 3));
     }
 
     /// Emits a 32-bit data word holding the address of `label`, to be patched in
@@ -602,6 +817,25 @@ impl Encoder {
                     if let Some(slot) = self.bytes.get_mut(site..site + 2) {
                         let base = u16::from_le_bytes([slot[0], slot[1]]) & 0xFF00;
                         slot.copy_from_slice(&(base | (imm8 & 0x00FF)).to_le_bytes());
+                    }
+                }
+                RelocKind::ThumbCall => {
+                    let off = i64::from(target) - (i64::from(*at) + 4);
+                    if off % 2 != 0 || !(-16_777_216..=16_777_214).contains(&off) {
+                        return Err(AssembleError::BranchOutOfRange { at: *at });
+                    }
+                    let s = ((off >> 24) & 1) as u16;
+                    let i1 = ((off >> 23) & 1) as u16;
+                    let i2 = ((off >> 22) & 1) as u16;
+                    let imm10 = ((off >> 12) & 0x3FF) as u16;
+                    let imm11 = ((off >> 1) & 0x7FF) as u16;
+                    let j1 = (!(i1 ^ s)) & 1;
+                    let j2 = (!(i2 ^ s)) & 1;
+                    let hw1 = 0xF000 | (s << 10) | imm10;
+                    let hw2 = 0xD000 | (j1 << 13) | (j2 << 11) | imm11;
+                    if let Some(slot) = self.bytes.get_mut(site..site + 4) {
+                        slot[0..2].copy_from_slice(&hw1.to_le_bytes());
+                        slot[2..4].copy_from_slice(&hw2.to_le_bytes());
                     }
                 }
             }
@@ -802,6 +1036,113 @@ mod tests {
         let out = enc.finish().unwrap();
         assert_eq!(&out.bytes[0..2], &[0x00, 0x48]);
         assert_eq!(&out.bytes[4..8], &0xDEAD_BEEFu32.to_le_bytes());
+    }
+
+    #[test]
+    fn bl_call_resolves_backward() {
+        let mut enc = Encoder::new();
+        let target = enc.new_label();
+        enc.bind_label(target);
+        enc.nop();
+        enc.nop();
+        enc.bl(target);
+        let out = enc.finish().unwrap();
+        assert_eq!(&out.bytes[4..8], &[0xFF, 0xF7, 0xFC, 0xFF]);
+    }
+
+    #[test]
+    fn blx_register() {
+        assert_eq!(one(|e| e.blx(Reg::R3)), [0x98, 0x47]);
+    }
+
+    #[test]
+    fn sub_word_loads_and_stores() {
+        assert_eq!(
+            one(|e| e.ldr_reg(Reg::R0, Reg::R1, Reg::R2).unwrap()),
+            [0x88, 0x58]
+        );
+        assert_eq!(
+            one(|e| e.str_reg(Reg::R0, Reg::R1, Reg::R2).unwrap()),
+            [0x88, 0x50]
+        );
+        assert_eq!(
+            one(|e| e.ldrsb_reg(Reg::R0, Reg::R1, Reg::R2).unwrap()),
+            [0x88, 0x56]
+        );
+        assert_eq!(
+            one(|e| e.ldrb_reg(Reg::R3, Reg::R4, Reg::R5).unwrap()),
+            [0x63, 0x5D]
+        );
+        assert_eq!(
+            one(|e| e.ldrb_imm(Reg::R0, Reg::R1, 5).unwrap()),
+            [0x48, 0x79]
+        );
+        assert_eq!(
+            one(|e| e.ldrh_imm(Reg::R0, Reg::R1, 6).unwrap()),
+            [0xC8, 0x88]
+        );
+    }
+
+    #[test]
+    fn udf_trap() {
+        assert_eq!(one(|e| e.udf(0)), [0x00, 0xDE]);
+    }
+
+    #[test]
+    fn extend_reverse_and_high_registers() {
+        assert_eq!(one(|e| e.sxtb(Reg::R0, Reg::R1).unwrap()), [0x48, 0xB2]);
+        assert_eq!(one(|e| e.uxtb(Reg::R2, Reg::R3).unwrap()), [0xDA, 0xB2]);
+        assert_eq!(one(|e| e.rev(Reg::R0, Reg::R1).unwrap()), [0x08, 0xBA]);
+        assert_eq!(one(|e| e.revsh(Reg::R0, Reg::R1).unwrap()), [0xC8, 0xBA]);
+        assert_eq!(one(|e| e.add_high(Reg::R8, Reg::R1)), [0x88, 0x44]);
+        assert_eq!(one(|e| e.cmp_high(Reg::R10, Reg::R3)), [0x9A, 0x45]);
+    }
+
+    #[test]
+    fn encoders_never_panic_over_all_registers_and_immediates() {
+        for rn in 0..=15u8 {
+            let a = Reg::new(rn).unwrap();
+            for rm in 0..=15u8 {
+                let b = Reg::new(rm).unwrap();
+                let mut e = Encoder::new();
+                let _ = e.adds(a, b, b);
+                let _ = e.subs(a, b, b);
+                let _ = e.cmp_reg(a, b);
+                let _ = e.ands(a, b);
+                let _ = e.ldr_reg(a, b, b);
+                e.mov_reg(a, b);
+                e.add_high(a, b);
+                let _ = e.sxtb(a, b);
+            }
+            for imm in [0u8, 1, 7, 8, 31, 32, 64, 255] {
+                let mut e = Encoder::new();
+                let _ = e.movs_imm(a, imm);
+                let _ = e.adds_imm8(a, imm);
+                let _ = e.cmp_imm(a, imm);
+                let _ = e.ldrb_imm(a, a, imm);
+                let _ = e.strh_imm(a, a, imm);
+            }
+        }
+    }
+
+    #[test]
+    fn finish_never_panics_on_bad_fixups() {
+        let mut e = Encoder::new();
+        let l = e.new_label();
+        e.b(l);
+        assert!(matches!(e.finish(), Err(AssembleError::UnboundLabel(_))));
+
+        let mut e = Encoder::new();
+        let l = e.new_label();
+        e.b_cond(Cond::Eq, l);
+        for _ in 0..400 {
+            e.nop();
+        }
+        e.bind_label(l);
+        assert!(matches!(
+            e.finish(),
+            Err(AssembleError::BranchOutOfRange { .. })
+        ));
     }
 
     #[test]

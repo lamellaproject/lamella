@@ -1,0 +1,15 @@
+[package]
+name = "lamella-metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "In-memory ECMA-335 Partition II metadata model and managed-PE reader."
+
+[dependencies]
+lamella-cil = { path = "../lamella-cil" }
+lamella-token = { path = "../lamella-token" }
+
+[lints]
+workspace = true

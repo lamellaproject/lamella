@@ -1,0 +1,18 @@
+[package]
+name = "lamella-dap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A Debug Adapter Protocol server over the Lamella interpreter (host-side)."
+
+# Host-side debugger; std and external deps are allowed here (User-approved), unlike
+# the no_std libraries. serde_json carries the DAP JSON wire format.
+[dependencies]
+lamella-ves = { path = "../lamella-ves" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

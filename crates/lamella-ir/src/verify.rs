@@ -242,6 +242,65 @@ mod tests {
     }
 
     #[test]
+    fn verify_never_panics_on_malformed_functions() {
+        let cases = [
+            Function {
+                params: Vec::new(),
+                ret: None,
+                value_types: Vec::new(),
+                entry: BlockId(9),
+                blocks: Vec::new(),
+            },
+            Function {
+                params: Vec::new(),
+                ret: None,
+                value_types: Vec::new(),
+                entry: BlockId(0),
+                blocks: vec![BasicBlock {
+                    params: Vec::new(),
+                    insts: Vec::new(),
+                    terminator: None,
+                }],
+            },
+            Function {
+                params: Vec::new(),
+                ret: None,
+                value_types: Vec::new(),
+                entry: BlockId(0),
+                blocks: vec![BasicBlock {
+                    params: Vec::new(),
+                    insts: Vec::new(),
+                    terminator: Some(Terminator::Jump {
+                        target: BlockId(9),
+                        args: vec![ValueId(7)],
+                    }),
+                }],
+            },
+            Function {
+                params: Vec::new(),
+                ret: Some(MirType::I32),
+                value_types: vec![MirType::I32],
+                entry: BlockId(0),
+                blocks: vec![BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![(
+                        ValueId(0),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(50),
+                            rhs: ValueId(99),
+                        },
+                    )],
+                    terminator: Some(Terminator::Return(Some(ValueId(0)))),
+                }],
+            },
+        ];
+        for case in &cases {
+            let _ = verify(case);
+        }
+    }
+
+    #[test]
     fn well_formed_add_verifies() {
         assert_eq!(verify(&add_function()), Ok(()));
     }

@@ -110,6 +110,10 @@ pub enum DiagnosticKind {
     /// A namespace member was expected to begin a type declaration but the
     /// `class`/`struct`/`interface`/`enum`/`delegate` keyword was missing (16.4).
     TypeDeclarationExpected,
+    /// `operator` was not followed by an overloadable operator (17.9).
+    OverloadableOperatorExpected,
+    /// A `foreach` header was missing the `in` keyword (15.8.4).
+    InExpected,
 }
 
 impl DiagnosticKind {
@@ -149,6 +153,8 @@ impl DiagnosticKind {
             DiagnosticKind::OpenBraceExpected => 1514,
             DiagnosticKind::ExpectedCatchOrFinally => 1524,
             DiagnosticKind::TypeDeclarationExpected => 1518,
+            DiagnosticKind::OverloadableOperatorExpected => 1037,
+            DiagnosticKind::InExpected => 1515,
         }
     }
 
@@ -224,6 +230,10 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::TypeDeclarationExpected => {
                 f.write_str("Expected class, delegate, enum, interface, or struct")
             }
+            DiagnosticKind::OverloadableOperatorExpected => {
+                f.write_str("Overloadable operator expected")
+            }
+            DiagnosticKind::InExpected => f.write_str("'in' expected"),
         }
     }
 }
