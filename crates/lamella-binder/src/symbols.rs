@@ -33,6 +33,17 @@ pub struct FieldSymbol {
     pub is_static: bool,
 }
 
+/// A property of a type (17.6), reduced to its name and type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertySymbol {
+    /// The property's name.
+    pub name: Box<str>,
+    /// The property's type.
+    pub ty: TypeSymbol,
+    /// Whether the property is `static`.
+    pub is_static: bool,
+}
+
 /// A method of a type (17.5), reduced to what overload resolution needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodSymbol {
@@ -55,12 +66,19 @@ pub struct TypeInfo {
     pub name: Box<str>,
     /// The kind of type.
     pub kind: TypeKind,
-    /// The direct base type, if any (a class's base; `None` for `object`).
+    /// The direct base class, resolved from `bases` by [`Model::link_bases`].
     pub base: Option<TypeSymbol>,
+    /// Every type listed after `:` (the base class and/or interfaces), as written.
+    pub bases: Vec<TypeSymbol>,
     /// The type's fields.
     pub fields: Vec<FieldSymbol>,
+    /// The type's properties.
+    pub properties: Vec<PropertySymbol>,
     /// The type's methods.
     pub methods: Vec<MethodSymbol>,
+    /// The type's instance constructors (each modeled as a method whose
+    /// parameters drive `new T(...)` overload resolution).
+    pub constructors: Vec<MethodSymbol>,
 }
 
 impl TypeInfo {
@@ -72,8 +90,11 @@ impl TypeInfo {
             name: name.into(),
             kind,
             base: None,
+            bases: Vec::new(),
             fields: Vec::new(),
+            properties: Vec::new(),
             methods: Vec::new(),
+            constructors: Vec::new(),
         }
     }
 
@@ -82,6 +103,14 @@ impl TypeInfo {
     #[must_use]
     pub fn find_field(&self, name: &str) -> Option<&FieldSymbol> {
         self.fields.iter().find(|field| &*field.name == name)
+    }
+
+    /// The property with the given name declared directly on this type.
+    #[must_use]
+    pub fn find_property(&self, name: &str) -> Option<&PropertySymbol> {
+        self.properties
+            .iter()
+            .find(|property| &*property.name == name)
     }
 
     /// The methods with the given name -- the method group overload resolution
@@ -120,6 +149,45 @@ impl Model {
             .get(&(String::from(namespace), String::from(name)))
     }
 
+    /// The type a named [`TypeSymbol`] refers to, if present (`None` for special
+    /// and array types).
+    #[must_use]
+    pub fn get_by_symbol(&self, ty: &TypeSymbol) -> Option<&TypeInfo> {
+        match ty {
+            TypeSymbol::Named(parts) => {
+                let (namespace, name) = split_named(parts);
+                self.get(&namespace, name)
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolves each type's base *class* -- the first of its declared bases that is
+    /// a class -- so member lookup can walk the inheritance chain. Run once after
+    /// every type is inserted.
+    pub fn link_bases(&mut self) {
+        let links: Vec<((String, String), TypeSymbol)> = self
+            .types
+            .iter()
+            .filter_map(|(key, info)| {
+                info.bases
+                    .iter()
+                    .find(|base| self.is_class(base))
+                    .map(|base| (key.clone(), base.clone()))
+            })
+            .collect();
+        for (key, base) in links {
+            if let Some(info) = self.types.get_mut(&key) {
+                info.base = Some(base);
+            }
+        }
+    }
+
+    fn is_class(&self, ty: &TypeSymbol) -> bool {
+        self.get_by_symbol(ty)
+            .is_some_and(|info| info.kind == TypeKind::Class)
+    }
+
     /// The existence-only [`TypeTable`] for plain type-name resolution.
     #[must_use]
     pub fn type_table(&self) -> TypeTable {
@@ -128,6 +196,23 @@ impl Model {
             table.insert(namespace, name);
         }
         table
+    }
+}
+
+/// Splits a type's dotted name parts into its namespace and simple name.
+fn split_named(parts: &[Box<str>]) -> (String, &str) {
+    match parts.split_last() {
+        Some((name, namespace_parts)) => {
+            let mut namespace = String::new();
+            for part in namespace_parts {
+                if !namespace.is_empty() {
+                    namespace.push('.');
+                }
+                namespace.push_str(part);
+            }
+            (namespace, name)
+        }
+        None => (String::new(), ""),
     }
 }
 

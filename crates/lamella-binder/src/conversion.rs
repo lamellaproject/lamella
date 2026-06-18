@@ -1,9 +1,42 @@
 //! Implicit conversions (ECMA-334 1st ed, 13.1).
 
 use crate::special::SpecialType;
+use crate::symbols::Model;
 use crate::types::TypeSymbol;
+use alloc::vec::Vec;
 
-/// Whether a standard implicit conversion exists from `from` to `to` (13.1).
+/// Whether an implicit conversion exists from `from` to `to`, including the
+/// reference conversions that walk `model`'s inheritance graph (13.1).
+#[must_use]
+pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    has_implicit_conversion(from, to) || reference_conversion(model, from, to)
+}
+
+/// An implicit reference conversion from `from` to a base class or implemented
+/// interface, transitively (13.1.4).
+fn reference_conversion(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    let mut stack: Vec<TypeSymbol> = match model.get_by_symbol(from) {
+        Some(info) => info.bases.to_vec(),
+        None => return false,
+    };
+    let mut seen: Vec<TypeSymbol> = Vec::new();
+    while let Some(ty) = stack.pop() {
+        if &ty == to {
+            return true;
+        }
+        if seen.contains(&ty) {
+            continue;
+        }
+        if let Some(info) = model.get_by_symbol(&ty) {
+            stack.extend(info.bases.iter().cloned());
+        }
+        seen.push(ty);
+    }
+    false
+}
+
+/// Whether a standard implicit conversion exists from `from` to `to`, using no
+/// type hierarchy (13.1.1, 13.1.2, and to-`object`).
 #[must_use]
 pub fn has_implicit_conversion(from: &TypeSymbol, to: &TypeSymbol) -> bool {
     if from == to {

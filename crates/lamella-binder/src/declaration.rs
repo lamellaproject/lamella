@@ -3,7 +3,9 @@
 
 use crate::bind::bind_type;
 use crate::resolve::TypeTable;
-use crate::symbols::{FieldSymbol, MethodSymbol, Model, TypeInfo, TypeKind};
+use crate::special::SpecialType;
+use crate::symbols::{FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind};
+use crate::types::TypeSymbol;
 use alloc::string::String;
 use lamella_syntax::ast::{
     CompilationUnit, Member, Modifier, NamespaceMember, QualifiedName, TypeDecl,
@@ -17,6 +19,7 @@ pub fn collect_model(unit: &CompilationUnit) -> Model {
     for member in &unit.members {
         collect_namespace_member(member, "", &mut model);
     }
+    model.link_bases();
     model
 }
 
@@ -53,6 +56,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
 /// methods.
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     let mut info = TypeInfo::new(namespace, &declaration.name, map_kind(declaration.kind));
+    info.bases = declaration.bases.iter().map(bind_type).collect();
     for member in &declaration.members {
         match member {
             Member::Field {
@@ -83,10 +87,39 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
                 is_static: is_static(modifiers),
             }),
+            Member::Property {
+                modifiers,
+                ty,
+                name,
+                ..
+            } => info.properties.push(PropertySymbol {
+                name: name.clone(),
+                ty: bind_type(ty),
+                is_static: is_static(modifiers),
+            }),
+            Member::Constructor {
+                modifiers,
+                parameters,
+                ..
+            } if !is_static(modifiers) => info.constructors.push(constructor(parameters)),
             _ => {}
         }
     }
+    if matches!(info.kind, TypeKind::Class | TypeKind::Struct) && info.constructors.is_empty() {
+        info.constructors.push(constructor(&[]));
+    }
     info
+}
+
+/// A constructor symbol from its parameters. The return type is unused (a `new`
+/// expression takes the created type), so it is left as `void`.
+fn constructor(parameters: &[lamella_syntax::ast::Parameter]) -> MethodSymbol {
+    MethodSymbol {
+        name: ".ctor".into(),
+        return_type: TypeSymbol::Special(SpecialType::Void),
+        parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
+        is_static: false,
+    }
 }
 
 fn map_kind(kind: SyntaxTypeKind) -> TypeKind {

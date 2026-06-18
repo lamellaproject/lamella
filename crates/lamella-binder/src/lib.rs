@@ -23,6 +23,6 @@ pub use declaration::{collect_model, collect_types};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use resolve::{TypeTable, resolve_type};
 pub use special::SpecialType;
-pub use statement::{BoundDeclarator, BoundStmt, BoundStmtKind};
-pub use symbols::{FieldSymbol, MethodSymbol, Model, TypeInfo, TypeKind};
+pub use statement::{BoundCatch, BoundDeclarator, BoundStmt, BoundStmtKind};
+pub use symbols::{FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind};
 pub use types::TypeSymbol;

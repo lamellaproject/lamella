@@ -113,6 +113,13 @@ pub enum DiagnosticKind {
         /// The type that was indexed.
         type_name: Box<str>,
     },
+    /// `CS1729`: the type has no constructor taking the given number of arguments.
+    NoConstructor {
+        /// The type being constructed.
+        type_name: Box<str>,
+        /// The number of arguments supplied.
+        count: u32,
+    },
 }
 
 impl DiagnosticKind {
@@ -132,6 +139,7 @@ impl DiagnosticKind {
             DiagnosticKind::ArgumentConversion { .. } => 1503,
             DiagnosticKind::AmbiguousCall { .. } => 121,
             DiagnosticKind::CannotIndex { .. } => 21,
+            DiagnosticKind::NoConstructor { .. } => 1729,
         }
     }
 }
@@ -187,6 +195,10 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::CannotIndex { type_name } => write!(
                 f,
                 "Cannot apply indexing with [] to an expression of type '{type_name}'"
+            ),
+            DiagnosticKind::NoConstructor { type_name, count } => write!(
+                f,
+                "'{type_name}' does not contain a constructor that takes {count} arguments"
             ),
         }
     }

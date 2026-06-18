@@ -5,15 +5,20 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::fmt;
 
 use lamella_cil::{Opcode, Operand};
-use lamella_metadata::{Assembly, Method};
+use lamella_metadata::{Assembly, Method, MethodSig, SigType};
 use lamella_token::Token;
-use lamella_ves::intrinsics::console_write_line;
-use lamella_ves::{MethodId, Module};
+use lamella_ves::intrinsics::{
+    console_write, console_write_bool, console_write_char, console_write_int32,
+    console_write_int64, console_write_line, console_write_line_bool, console_write_line_char,
+    console_write_line_empty, console_write_line_int32, console_write_line_int64, string_concat,
+    string_equals, string_get_chars, string_get_length,
+};
+use lamella_ves::{IntrinsicFn, MethodId, Module};
 
 const TYPE_REF: u8 = 0x01;
 const METHOD_DEF: u8 = 0x06;
@@ -116,32 +121,139 @@ fn bind_strings(assembly: &Assembly, module: &mut Module, tokens: &BTreeSet<Toke
 /// `System.Console.WriteLine`; an unrecognized call is left unbound and only traps
 /// if actually executed.
 fn bind_bcl_calls(assembly: &Assembly, module: &mut Module, tokens: &BTreeSet<Token>) {
-    let mut write_line: Option<MethodId> = None;
+    let mut bound: BTreeMap<usize, MethodId> = BTreeMap::new();
     for token in tokens {
-        let Some((namespace, type_name, method_name)) = resolve_bcl_member(assembly, *token) else {
+        let Some(member) = assembly.member_ref(token.row()) else {
             continue;
         };
-        if namespace == "System" && type_name == "Console" && method_name == "WriteLine" {
-            let id = *write_line.get_or_insert_with(|| module.add_intrinsic(console_write_line, 1));
-            module.bind_token(*token, id);
+        let Some(method_name) = member.name() else {
+            continue;
+        };
+        let parent = member.parent();
+        if parent.table() != TYPE_REF {
+            continue;
         }
+        let Some(parent_type) = assembly
+            .type_ref(parent.row())
+            .and_then(|type_ref| type_ref.name())
+        else {
+            continue;
+        };
+        let signature = member.method_signature();
+        let Some(function) = bcl_intrinsic(
+            parent_type.namespace,
+            parent_type.name,
+            method_name,
+            signature.as_ref(),
+        ) else {
+            continue;
+        };
+        let arg_count = signature
+            .as_ref()
+            .map_or(0, |sig| sig.parameters.len() + usize::from(sig.has_this));
+        let arg_count = u16::try_from(arg_count).unwrap_or(u16::MAX);
+        let id = match bound.get(&(function as usize)) {
+            Some(&id) => id,
+            None => {
+                let id = module.add_intrinsic(function, arg_count);
+                bound.insert(function as usize, id);
+                id
+            }
+        };
+        module.bind_token(*token, id);
     }
 }
 
-/// Resolves a MemberRef token to `(namespace, type, method)` when its parent is a
-/// TypeRef (the BCL case), via the metadata reader's `member_ref`/`type_ref`.
-fn resolve_bcl_member<'a>(
-    assembly: &Assembly<'a>,
-    token: Token,
-) -> Option<(&'a str, &'a str, &'a str)> {
-    let member = assembly.member_ref(token.row())?;
-    let method_name = member.name()?;
-    let parent = member.parent();
-    if parent.table() != TYPE_REF {
+/// Maps a recognized BCL member -- by declaring type, method name, and signature --
+/// to a runtime intrinsic and its argument count. Returns `None` for anything not
+/// implemented yet; that call stays unbound and only traps if executed.
+fn bcl_intrinsic(
+    namespace: &str,
+    type_name: &str,
+    method: &str,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    if namespace != "System" {
         return None;
     }
-    let parent_type = assembly.type_ref(parent.row())?.name()?;
-    Some((parent_type.namespace, parent_type.name, method_name))
+    match (type_name, method) {
+        ("Console", "WriteLine") => console_write_line_overload(signature),
+        ("Console", "Write") => console_write_overload(signature),
+        ("String", "Concat") => string_concat_overload(signature),
+        ("String", "get_Length") => string_get_length_overload(signature),
+        ("String", "get_Chars") => string_get_chars_overload(signature),
+        ("String", "op_Equality") => string_equals_overload(signature),
+        _ => None,
+    }
+}
+
+/// The parameter types of a signature (empty if absent).
+fn parameters_of(signature: Option<&MethodSig>) -> &[SigType] {
+    match signature {
+        Some(method_sig) => &method_sig.parameters,
+        None => &[],
+    }
+}
+
+/// Picks the `Console.WriteLine` overload by its parameter type.
+fn console_write_line_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    let intrinsic: IntrinsicFn = match parameters_of(signature) {
+        [] => console_write_line_empty,
+        [SigType::String] => console_write_line,
+        [SigType::I4] => console_write_line_int32,
+        [SigType::I8] => console_write_line_int64,
+        [SigType::Boolean] => console_write_line_bool,
+        [SigType::Char] => console_write_line_char,
+        _ => return None,
+    };
+    Some(intrinsic)
+}
+
+/// Picks the `Console.Write` overload (no line terminator) by its parameter type.
+fn console_write_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    let intrinsic: IntrinsicFn = match parameters_of(signature) {
+        [SigType::String] => console_write,
+        [SigType::I4] => console_write_int32,
+        [SigType::I8] => console_write_int64,
+        [SigType::Boolean] => console_write_bool,
+        [SigType::Char] => console_write_char,
+        _ => return None,
+    };
+    Some(intrinsic)
+}
+
+/// Picks the `String.Concat` overload by its parameter types (the two-string form
+/// for now -- what `a + b` on strings emits).
+fn string_concat_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::String, SigType::String] => Some(string_concat),
+        _ => None,
+    }
+}
+
+/// The `String.Length` getter -- an instance method with no explicit parameters.
+fn string_get_length_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [] => Some(string_get_length),
+        _ => None,
+    }
+}
+
+/// The `String.op_Equality(string, string)` operator (what `==` on strings emits).
+fn string_equals_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::String, SigType::String] => Some(string_equals),
+        _ => None,
+    }
+}
+
+/// The `String.get_Chars(int)` indexer (`s[i]`) -- an instance method taking an
+/// `int` index.
+fn string_get_chars_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::I4] => Some(string_get_chars),
+        _ => None,
+    }
 }
 
 /// Decodes a `#US` blob (UTF-16 little-endian code units followed by a one-byte

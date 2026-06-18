@@ -2,14 +2,15 @@
 
 use crate::bind::bind_type;
 use crate::bound::{Binder, BoundExpr};
-use crate::conversion::has_implicit_conversion;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use lamella_syntax::ast::{Expr, ForInitializer, Stmt, StmtKind, TypeRef, VariableDeclarator};
+use lamella_syntax::ast::{
+    CatchClause, Expr, ForInitializer, Stmt, StmtKind, TypeRef, UsingResource, VariableDeclarator,
+};
 use lamella_syntax::span::Span;
 
 /// A bound statement (15).
@@ -90,8 +91,65 @@ pub enum BoundStmtKind {
     Continue,
     /// A `throw` statement (15.9.5), with the thrown expression if any.
     Throw(Option<BoundExpr>),
+    /// A `switch` statement (15.7.2); each inner list is one section's bound
+    /// statements. Case-label constant checking is deferred.
+    Switch {
+        /// The governing expression.
+        expression: BoundExpr,
+        /// The bound statements of each section, in order.
+        sections: Vec<Vec<BoundStmt>>,
+    },
+    /// A `try` statement (15.10).
+    Try {
+        /// The protected block.
+        body: Box<BoundStmt>,
+        /// The catch clauses.
+        catches: Vec<BoundCatch>,
+        /// The finally block, if any.
+        finally: Option<Box<BoundStmt>>,
+    },
+    /// A `lock` statement (15.12).
+    Lock {
+        /// The object locked on.
+        expression: BoundExpr,
+        /// The guarded statement.
+        body: Box<BoundStmt>,
+    },
+    /// A `using` statement (15.13); the resource declaration/expression is bound
+    /// in the body's scope.
+    Using {
+        /// The resource acquisition, as bound statements.
+        resource: Vec<BoundStmt>,
+        /// The guarded statement.
+        body: Box<BoundStmt>,
+    },
+    /// A `checked` block (15.11).
+    Checked(Box<BoundStmt>),
+    /// An `unchecked` block (15.11).
+    Unchecked(Box<BoundStmt>),
+    /// A labeled statement (15.4).
+    Labeled {
+        /// The label.
+        label: Box<str>,
+        /// The labeled statement.
+        body: Box<BoundStmt>,
+    },
+    /// A `goto` statement (15.9.3); label resolution is deferred.
+    Goto,
     /// A statement form not yet bound, for recovery.
     Error,
+}
+
+/// A bound `catch` clause (15.10): the caught type, the bound exception variable
+/// (in the handler's scope), and the handler body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundCatch {
+    /// The caught exception type, or `None` for a general `catch`.
+    pub exception_type: Option<TypeSymbol>,
+    /// The exception variable's name, if any.
+    pub name: Option<Box<str>>,
+    /// The handler body.
+    pub body: Box<BoundStmt>,
 }
 
 /// One bound variable declarator (15.5.1).
@@ -175,9 +233,93 @@ impl Binder {
             StmtKind::Throw(value) => {
                 BoundStmtKind::Throw(value.as_ref().map(|expr| self.bind_expression(expr)))
             }
-            _ => BoundStmtKind::Error,
+            StmtKind::Switch {
+                expression,
+                sections,
+            } => {
+                let expression = self.bind_expression(expression);
+                self.enter_scope();
+                let sections = sections
+                    .iter()
+                    .map(|section| {
+                        section
+                            .statements
+                            .iter()
+                            .map(|statement| self.bind_statement(statement))
+                            .collect()
+                    })
+                    .collect();
+                self.exit_scope();
+                BoundStmtKind::Switch {
+                    expression,
+                    sections,
+                }
+            }
+            StmtKind::Try {
+                body,
+                catches,
+                finally_block,
+            } => BoundStmtKind::Try {
+                body: Box::new(self.bind_statement(body)),
+                catches: catches.iter().map(|catch| self.bind_catch(catch)).collect(),
+                finally: finally_block
+                    .as_ref()
+                    .map(|block| Box::new(self.bind_statement(block))),
+            },
+            StmtKind::Lock { expression, body } => BoundStmtKind::Lock {
+                expression: self.bind_expression(expression),
+                body: Box::new(self.bind_statement(body)),
+            },
+            StmtKind::Using { resource, body } => self.bind_using(resource, body),
+            StmtKind::Checked(inner) => {
+                BoundStmtKind::Checked(Box::new(self.bind_statement(inner)))
+            }
+            StmtKind::Unchecked(inner) => {
+                BoundStmtKind::Unchecked(Box::new(self.bind_statement(inner)))
+            }
+            StmtKind::Labeled { label, statement } => BoundStmtKind::Labeled {
+                label: label.clone(),
+                body: Box::new(self.bind_statement(statement)),
+            },
+            StmtKind::Goto(_) => BoundStmtKind::Goto,
+            StmtKind::Error => BoundStmtKind::Error,
         };
         BoundStmt { kind }
+    }
+
+    fn bind_catch(&mut self, catch: &CatchClause) -> BoundCatch {
+        let exception_type = catch
+            .exception_type
+            .as_ref()
+            .map(|ty| self.resolve_named_type(&bind_type(ty), ty.span));
+        self.enter_scope();
+        if let Some(name) = &catch.name {
+            let ty = exception_type.clone().unwrap_or(TypeSymbol::Error);
+            self.declare_local(name, ty);
+        }
+        let body = Box::new(self.bind_statement(&catch.body));
+        self.exit_scope();
+        BoundCatch {
+            exception_type,
+            name: catch.name.clone(),
+            body,
+        }
+    }
+
+    fn bind_using(&mut self, resource: &UsingResource, body: &Stmt) -> BoundStmtKind {
+        self.enter_scope();
+        let resource = match resource {
+            UsingResource::Declaration { ty, declarators } => {
+                let kind = self.bind_local(ty, declarators);
+                alloc::vec![BoundStmt { kind }]
+            }
+            UsingResource::Expression(expression) => alloc::vec![BoundStmt {
+                kind: BoundStmtKind::Expression(self.bind_expression(expression)),
+            }],
+        };
+        let body = Box::new(self.bind_statement(body));
+        self.exit_scope();
+        BoundStmtKind::Using { resource, body }
     }
 
     fn bind_for(
@@ -255,7 +397,7 @@ impl Binder {
         if source.is_error() || target.is_error() {
             return;
         }
-        if !has_implicit_conversion(source, target) {
+        if !self.converts(source, target) {
             self.report(Diagnostic::new(
                 DiagnosticKind::NoImplicitConversion {
                     from: source.to_string().into(),
@@ -307,6 +449,20 @@ mod tests {
     #[test]
     fn a_local_goes_out_of_scope_after_its_block() {
         assert_eq!(codes("{ { int x = 1; } int y = x + 0; }"), [103]);
+    }
+
+    #[test]
+    fn switch_try_using_lock_bind_their_parts() {
+        assert_eq!(
+            codes("switch (1) { case 1: int a = 2; break; default: break; }"),
+            []
+        );
+        assert_eq!(codes("try { } catch { }"), []);
+        assert_eq!(codes("{ int x = true; }"), [29]);
+        assert_eq!(codes("{ int n = 1; lock (n) { int m = n; } }"), []);
+        assert_eq!(codes("using (int r = 5) { int s = r; }"), []);
+        assert_eq!(codes("checked { int v = 1; }"), []);
+        assert_eq!(codes("done: ;"), []);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! clause 14).
 
 use crate::bind::bind_type;
-use crate::conversion::has_implicit_conversion;
+use crate::conversion::converts;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::resolve::{TypeTable, resolve_type};
 use crate::special::SpecialType;
@@ -13,7 +13,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    AssignmentOperator, BinaryOperator, Expr, ExprKind, Literal, PostfixOperator,
+    AssignmentOperator, BinaryOperator, Expr, ExprKind, Literal, PostfixOperator, TypeRef,
     TypeTestOperation, UnaryOperator,
 };
 use lamella_syntax::span::Span;
@@ -35,12 +35,22 @@ pub enum BoundExprKind {
     Literal(Literal),
     /// A reference to a local variable or parameter (14.5.2).
     Local(Box<str>),
+    /// The `this` access (14.5.7); its type is the enclosing type.
+    This,
     /// Access to an instance or static field through a receiver (14.5.4); the
     /// expression's type is the field's.
     FieldAccess {
         /// The receiver the field is read from.
         receiver: Box<BoundExpr>,
         /// The field name.
+        name: Box<str>,
+    },
+    /// Access to a property through a receiver (14.5.4); the expression's type is
+    /// the property's.
+    PropertyAccess {
+        /// The receiver the property is read from.
+        receiver: Box<BoundExpr>,
+        /// The property name.
         name: Box<str>,
     },
     /// A method group named through a receiver (14.5.4) -- not a value on its own,
@@ -70,6 +80,11 @@ pub enum BoundExprKind {
     ArrayCreation {
         /// The dimension-length expressions.
         lengths: Vec<BoundExpr>,
+    },
+    /// An object creation `new T(args)` (14.5.10.1); its type is the created type.
+    ObjectCreation {
+        /// The constructor arguments.
+        arguments: Vec<BoundExpr>,
     },
     /// A binary operation on two bound operands (14.7-14.12).
     Binary {
@@ -143,6 +158,7 @@ pub struct Binder {
     scopes: Vec<BTreeMap<String, TypeSymbol>>,
     world: TypeTable,
     model: Model,
+    current_type: Option<TypeSymbol>,
 }
 
 impl Binder {
@@ -182,6 +198,12 @@ impl Binder {
         resolve_type(&self.world, ty, &mut self.diagnostics, span)
     }
 
+    /// Whether `from` implicitly converts to `to`, including reference conversions
+    /// that walk the model's inheritance graph (13.1).
+    pub(crate) fn converts(&self, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+        converts(&self.model, from, to)
+    }
+
     /// The diagnostics gathered so far.
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
@@ -192,6 +214,17 @@ impl Binder {
     #[must_use]
     pub fn into_diagnostics(self) -> Vec<Diagnostic> {
         self.diagnostics
+    }
+
+    /// Sets the enclosing type whose members an unqualified name and `this`
+    /// resolve against, for binding that type's method bodies.
+    pub fn enter_type(&mut self, ty: TypeSymbol) {
+        self.current_type = Some(ty);
+    }
+
+    /// Clears the enclosing type.
+    pub fn exit_type(&mut self) {
+        self.current_type = None;
     }
 
     /// Opens a nested scope (a block or method body).
@@ -224,6 +257,7 @@ impl Binder {
                 ty: literal_type(literal),
             },
             ExprKind::Name(name) => self.bind_name(name, expr.span),
+            ExprKind::This => self.this_expr(),
             ExprKind::MemberAccess { receiver, name } => {
                 self.bind_member_access(receiver, name, expr.span)
             }
@@ -235,6 +269,9 @@ impl Binder {
                 receiver,
                 arguments,
             } => self.bind_element_access(receiver, arguments, expr.span),
+            ExprKind::ObjectCreation { target, arguments } => {
+                self.bind_object_creation(target, arguments, expr.span)
+            }
             ExprKind::ArrayCreation {
                 element,
                 lengths,
@@ -442,7 +479,7 @@ impl Binder {
         let condition_span = condition.span;
         let condition = self.bind_expression(condition);
         let boolean = TypeSymbol::Special(SpecialType::Boolean);
-        if !condition.ty.is_error() && !has_implicit_conversion(&condition.ty, &boolean) {
+        if !condition.ty.is_error() && !self.converts(&condition.ty, &boolean) {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::NoImplicitConversion {
                     from: condition.ty.to_string().into(),
@@ -456,7 +493,9 @@ impl Binder {
         let when_false = self.bind_expression(when_false);
         let ty = if when_true.ty.is_error() || when_false.ty.is_error() {
             TypeSymbol::Error
-        } else if let Some(common) = conditional_result_type(&when_true.ty, &when_false.ty) {
+        } else if let Some(common) =
+            conditional_result_type(&self.model, &when_true.ty, &when_false.ty)
+        {
             common
         } else {
             self.diagnostics.push(Diagnostic::new(
@@ -514,7 +553,7 @@ impl Binder {
     ) {
         match compound_binary_operator(operator) {
             None => {
-                if !has_implicit_conversion(value, target) {
+                if !self.converts(value, target) {
                     self.diagnostics.push(Diagnostic::new(
                         DiagnosticKind::NoImplicitConversion {
                             from: value.to_string().into(),
@@ -547,6 +586,13 @@ impl Binder {
         match self.resolve_member(&receiver.ty, name) {
             MemberResolution::Field(ty) => BoundExpr {
                 kind: BoundExprKind::FieldAccess {
+                    receiver: Box::new(receiver),
+                    name: name.into(),
+                },
+                ty,
+            },
+            MemberResolution::Property(ty) => BoundExpr {
+                kind: BoundExprKind::PropertyAccess {
                     receiver: Box::new(receiver),
                     name: name.into(),
                 },
@@ -594,10 +640,7 @@ impl Binder {
             Some((receiver_ty, name))
                 if !arguments.iter().any(|argument| argument.ty.is_error()) =>
             {
-                let candidates: Vec<MethodSymbol> = self
-                    .type_info_of(&receiver_ty)
-                    .map(|info| info.methods_named(&name).cloned().collect())
-                    .unwrap_or_default();
+                let candidates = self.methods_in_chain(&receiver_ty, &name);
                 let argument_types: Vec<TypeSymbol> = arguments
                     .iter()
                     .map(|argument| argument.ty.clone())
@@ -624,7 +667,7 @@ impl Binder {
         argument_types: &[TypeSymbol],
         span: Span,
     ) -> TypeSymbol {
-        match resolve_overload(candidates, argument_types) {
+        match resolve_overload(&self.model, candidates, argument_types) {
             OverloadResult::Resolved(return_type) => return_type,
             OverloadResult::Ambiguous => {
                 self.diagnostics.push(Diagnostic::new(
@@ -693,29 +736,113 @@ impl Binder {
         }
     }
 
-    /// Looks a member up on a type via the reference model.
-    fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
-        let Some(info) = self.type_info_of(ty) else {
-            return MemberResolution::Unknown;
+    fn bind_object_creation(
+        &mut self,
+        target: &TypeRef,
+        argument_exprs: &[Expr],
+        span: Span,
+    ) -> BoundExpr {
+        let target_ty = self.resolve_named_type(&bind_type(target), target.span);
+        let arguments: Vec<BoundExpr> = argument_exprs
+            .iter()
+            .map(|argument| self.bind_expression(argument))
+            .collect();
+        let ty = if target_ty.is_error() {
+            TypeSymbol::Error
+        } else {
+            if !arguments.iter().any(|argument| argument.ty.is_error()) {
+                if let Some(constructors) = self
+                    .type_info_of(&target_ty)
+                    .map(|info| info.constructors.clone())
+                {
+                    let argument_types: Vec<TypeSymbol> = arguments
+                        .iter()
+                        .map(|argument| argument.ty.clone())
+                        .collect();
+                    self.check_constructor(&target_ty, &constructors, &argument_types, span);
+                }
+            }
+            target_ty
         };
-        if let Some(field) = info.find_field(name) {
-            return MemberResolution::Field(field.ty.clone());
+        BoundExpr {
+            kind: BoundExprKind::ObjectCreation { arguments },
+            ty,
         }
-        if info.methods_named(name).next().is_some() {
-            return MemberResolution::MethodGroup;
+    }
+
+    /// Resolves `new T(args)` against `T`'s constructors, reporting the diagnostic
+    /// for a failed resolution. The created type is the result regardless.
+    fn check_constructor(
+        &mut self,
+        target: &TypeSymbol,
+        constructors: &[MethodSymbol],
+        argument_types: &[TypeSymbol],
+        span: Span,
+    ) {
+        match resolve_overload(&self.model, constructors, argument_types) {
+            OverloadResult::Resolved(_) => {}
+            OverloadResult::WrongArgumentCount => self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::NoConstructor {
+                    type_name: target.to_string().into(),
+                    count: argument_types.len() as u32,
+                },
+                span,
+            )),
+            OverloadResult::BadArgument { index, from, to } => {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::ArgumentConversion {
+                        index: index as u32 + 1,
+                        from: from.to_string().into(),
+                        to: to.to_string().into(),
+                    },
+                    span,
+                ));
+            }
+            OverloadResult::Ambiguous => self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::AmbiguousCall {
+                    method: target.to_string().into(),
+                },
+                span,
+            )),
+        }
+    }
+
+    /// Looks a member up on a type, walking the base-class chain (14.3, 14.5.4).
+    fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
+        let mut current = self.type_info_of(ty);
+        if current.is_none() {
+            return MemberResolution::Unknown;
+        }
+        while let Some(info) = current {
+            if let Some(field) = info.find_field(name) {
+                return MemberResolution::Field(field.ty.clone());
+            }
+            if let Some(property) = info.find_property(name) {
+                return MemberResolution::Property(property.ty.clone());
+            }
+            if info.methods_named(name).next().is_some() {
+                return MemberResolution::MethodGroup;
+            }
+            current = info.base.as_ref().and_then(|base| self.type_info_of(base));
         }
         MemberResolution::NoSuchMember(ty.to_string())
     }
 
     /// The model entry for a named type, if any.
     fn type_info_of(&self, ty: &TypeSymbol) -> Option<&TypeInfo> {
-        match ty {
-            TypeSymbol::Named(parts) => {
-                let (namespace, name) = named_namespace_and_name(parts);
-                self.model.get(&namespace, name)
-            }
-            _ => None,
+        self.model.get_by_symbol(ty)
+    }
+
+    /// Every method named `name` on `ty` or any of its base classes -- the method
+    /// group an invocation resolves over (most-derived first).
+    fn methods_in_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
+        let mut methods = Vec::new();
+        let mut current = self.type_info_of(ty);
+        while let Some(info) = current {
+            methods.extend(info.methods_named(name).cloned());
+            current = info.base.as_ref().and_then(|base| self.type_info_of(base));
         }
+        methods
     }
 
     /// Binds a simple name (14.5.2). For now a name resolves only to a local
@@ -723,19 +850,56 @@ impl Binder {
     /// namespace lookup arrive with the declaration model).
     fn bind_name(&mut self, name: &str, span: Span) -> BoundExpr {
         if let Some(ty) = self.lookup_local(name) {
-            BoundExpr {
+            return BoundExpr {
                 kind: BoundExprKind::Local(name.into()),
                 ty: ty.clone(),
+            };
+        }
+        if let Some(current) = self.current_type.clone() {
+            match self.resolve_member(&current, name) {
+                MemberResolution::Field(field_ty) => {
+                    return BoundExpr {
+                        kind: BoundExprKind::FieldAccess {
+                            receiver: Box::new(self.this_expr()),
+                            name: name.into(),
+                        },
+                        ty: field_ty,
+                    };
+                }
+                MemberResolution::Property(property_ty) => {
+                    return BoundExpr {
+                        kind: BoundExprKind::PropertyAccess {
+                            receiver: Box::new(self.this_expr()),
+                            name: name.into(),
+                        },
+                        ty: property_ty,
+                    };
+                }
+                MemberResolution::MethodGroup => {
+                    return BoundExpr {
+                        kind: BoundExprKind::MethodGroup {
+                            receiver: Box::new(self.this_expr()),
+                            name: name.into(),
+                        },
+                        ty: TypeSymbol::Error,
+                    };
+                }
+                MemberResolution::NoSuchMember(_) | MemberResolution::Unknown => {}
             }
-        } else {
-            self.diagnostics.push(Diagnostic::new(
-                DiagnosticKind::NameNotFound { name: name.into() },
-                span,
-            ));
-            BoundExpr {
-                kind: BoundExprKind::Error,
-                ty: TypeSymbol::Error,
-            }
+        }
+        self.diagnostics.push(Diagnostic::new(
+            DiagnosticKind::NameNotFound { name: name.into() },
+            span,
+        ));
+        error_expr()
+    }
+
+    /// The `this` access, typed as the enclosing type (the error type when there
+    /// is none, for recovery).
+    fn this_expr(&self) -> BoundExpr {
+        BoundExpr {
+            kind: BoundExprKind::This,
+            ty: self.current_type.clone().unwrap_or(TypeSymbol::Error),
         }
     }
 }
@@ -794,6 +958,8 @@ fn binary_result_type(
 enum MemberResolution {
     /// A field, with its type.
     Field(TypeSymbol),
+    /// A property, with its type.
+    Property(TypeSymbol),
     /// One or more methods of that name (a method group).
     MethodGroup,
     /// The type is known but has no such member; carries the type's display name.
@@ -807,23 +973,6 @@ fn error_expr() -> BoundExpr {
     BoundExpr {
         kind: BoundExprKind::Error,
         ty: TypeSymbol::Error,
-    }
-}
-
-/// Splits a type's dotted name parts into its namespace and simple name.
-fn named_namespace_and_name(parts: &[Box<str>]) -> (String, &str) {
-    match parts.split_last() {
-        Some((name, namespace_parts)) => {
-            let mut namespace = String::new();
-            for part in namespace_parts {
-                if !namespace.is_empty() {
-                    namespace.push('.');
-                }
-                namespace.push_str(part);
-            }
-            (namespace, name)
-        }
-        None => (String::new(), ""),
     }
 }
 
@@ -847,13 +996,18 @@ enum OverloadResult {
 }
 
 /// Chooses the overload for a call (14.4.2): the unique best among the applicable
-/// candidates, or the diagnostic-bearing outcome otherwise.
-fn resolve_overload(candidates: &[MethodSymbol], arguments: &[TypeSymbol]) -> OverloadResult {
+/// candidates, or the diagnostic-bearing outcome otherwise. Conversions are
+/// resolved against `model` so a derived argument matches a base parameter.
+fn resolve_overload(
+    model: &Model,
+    candidates: &[MethodSymbol],
+    arguments: &[TypeSymbol],
+) -> OverloadResult {
     let applicable: Vec<&MethodSymbol> = candidates
         .iter()
-        .filter(|candidate| is_applicable(candidate, arguments))
+        .filter(|candidate| is_applicable(model, candidate, arguments))
         .collect();
-    if let Some(best) = best_candidate(&applicable, arguments) {
+    if let Some(best) = best_candidate(model, &applicable, arguments) {
         return OverloadResult::Resolved(best.return_type.clone());
     }
     if !applicable.is_empty() {
@@ -868,7 +1022,7 @@ fn resolve_overload(candidates: &[MethodSymbol], arguments: &[TypeSymbol]) -> Ov
     for (index, (argument, parameter)) in
         arguments.iter().zip(&count_matched.parameters).enumerate()
     {
-        if !has_implicit_conversion(argument, parameter) {
+        if !converts(model, argument, parameter) {
             return OverloadResult::BadArgument {
                 index,
                 from: argument.clone(),
@@ -880,39 +1034,45 @@ fn resolve_overload(candidates: &[MethodSymbol], arguments: &[TypeSymbol]) -> Ov
 }
 
 /// Whether a method is applicable to the arguments: the counts match and every
-/// argument implicitly converts to its parameter (14.4.2.1).
-fn is_applicable(method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
+/// argument converts to its parameter (14.4.2.1).
+fn is_applicable(model: &Model, method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
     method.parameters.len() == arguments.len()
         && arguments
             .iter()
             .zip(&method.parameters)
-            .all(|(argument, parameter)| has_implicit_conversion(argument, parameter))
+            .all(|(argument, parameter)| converts(model, argument, parameter))
 }
 
 /// The single applicable candidate better than every other, or `None` when none
 /// is uniquely best.
 fn best_candidate<'a>(
+    model: &Model,
     applicable: &[&'a MethodSymbol],
     arguments: &[TypeSymbol],
 ) -> Option<&'a MethodSymbol> {
     applicable.iter().copied().find(|&candidate| {
-        applicable
-            .iter()
-            .all(|&other| core::ptr::eq(candidate, other) || is_better(candidate, other, arguments))
+        applicable.iter().all(|&other| {
+            core::ptr::eq(candidate, other) || is_better(model, candidate, other, arguments)
+        })
     })
 }
 
 /// Whether `c1` is a better function member than `c2` for the arguments: no worse
 /// a parameter for every argument and strictly better for at least one, using the
 /// better-conversion-target rule (14.4.2.2, 14.4.2.3 simplified).
-fn is_better(c1: &MethodSymbol, c2: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
+fn is_better(
+    model: &Model,
+    c1: &MethodSymbol,
+    c2: &MethodSymbol,
+    arguments: &[TypeSymbol],
+) -> bool {
     let mut strictly_better_somewhere = false;
     for index in 0..arguments.len() {
         let (p1, p2) = (&c1.parameters[index], &c2.parameters[index]);
         if p1 == p2 {
             continue;
         }
-        if has_implicit_conversion(p1, p2) {
+        if converts(model, p1, p2) {
             strictly_better_somewhere = true;
         } else {
             return false;
@@ -937,13 +1097,17 @@ fn system_type() -> TypeSymbol {
 /// The type of a conditional expression from its branch types (14.13): the branch
 /// type the other implicitly converts to, or `None` (`CS0173`) when there is no
 /// one-way conversion between them.
-fn conditional_result_type(when_true: &TypeSymbol, when_false: &TypeSymbol) -> Option<TypeSymbol> {
+fn conditional_result_type(
+    model: &Model,
+    when_true: &TypeSymbol,
+    when_false: &TypeSymbol,
+) -> Option<TypeSymbol> {
     if when_true == when_false {
         return Some(when_true.clone());
     }
     match (
-        has_implicit_conversion(when_true, when_false),
-        has_implicit_conversion(when_false, when_true),
+        converts(model, when_true, when_false),
+        converts(model, when_false, when_true),
     ) {
         (true, false) => Some(when_false.clone()),
         (false, true) => Some(when_true.clone()),
@@ -951,11 +1115,17 @@ fn conditional_result_type(when_true: &TypeSymbol, when_false: &TypeSymbol) -> O
     }
 }
 
-/// Whether a bound expression denotes something assignable. Only locals and
-/// parameters qualify for now; fields, array elements, and properties follow with
-/// member access.
+/// Whether a bound expression denotes something assignable: a local or parameter,
+/// a field or (writable) property, or an array element. A read-only property's
+/// missing setter is a finer check left for later.
 fn is_lvalue(expr: &BoundExpr) -> bool {
-    matches!(expr.kind, BoundExprKind::Local(_))
+    matches!(
+        expr.kind,
+        BoundExprKind::Local(_)
+            | BoundExprKind::FieldAccess { .. }
+            | BoundExprKind::PropertyAccess { .. }
+            | BoundExprKind::ElementAccess { .. }
+    )
 }
 
 /// The binary operator underlying a compound assignment, or `None` for simple `=`.
@@ -1397,6 +1567,162 @@ mod tests {
         binder.declare_local("n", TypeSymbol::Special(SpecialType::Int32));
         bound_in_scope(&mut binder, "n[0]");
         assert!(binder.diagnostics().iter().any(|d| d.code() == 21));
+    }
+
+    #[test]
+    fn object_creation_resolves_constructors() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Point { Point(int x, int y) { } Point(int x) { } } class Empty { }",
+        )
+        .unit;
+        let model = collect_model(&unit);
+        let bound = |source: &str| {
+            Binder::with_model(model.clone()).bind_expression(&parse_expression(source).expr)
+        };
+        let codes = |source: &str| {
+            let mut binder = Binder::with_model(model.clone());
+            binder.bind_expression(&parse_expression(source).expr);
+            binder
+                .into_diagnostics()
+                .iter()
+                .map(Diagnostic::code)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(bound("new Point(1, 2)").ty.to_string(), "Point");
+        assert!(codes("new Point(1, 2)").is_empty());
+        assert_eq!(bound("new Empty()").ty.to_string(), "Empty");
+        assert!(codes("new Empty()").is_empty());
+        assert_eq!(codes("new Point(1, 2, 3)"), [1729]);
+        assert_eq!(codes("new Point(true, 2)"), [1503]);
+        assert_eq!(codes("new Gadget()"), [246]);
+    }
+
+    #[test]
+    fn this_and_bare_names_resolve_against_the_enclosing_type() {
+        use crate::symbols::{FieldSymbol, MethodSymbol, TypeInfo, TypeKind};
+        let mut widget = TypeInfo::new("", "Widget", TypeKind::Class);
+        widget.fields.push(FieldSymbol {
+            name: "count".into(),
+            ty: TypeSymbol::Special(SpecialType::Int32),
+            is_static: false,
+        });
+        widget.methods.push(MethodSymbol {
+            name: "Area".into(),
+            return_type: TypeSymbol::Special(SpecialType::Double),
+            parameters: Vec::new(),
+            is_static: false,
+        });
+        let mut model = Model::new();
+        model.insert(widget);
+
+        let mut binder = Binder::with_model(model);
+        binder.enter_type(TypeSymbol::Named(["Widget".into()].into()));
+        binder.enter_scope();
+
+        assert_eq!(bound_in_scope(&mut binder, "this").to_string(), "Widget");
+        assert_eq!(
+            bound_in_scope(&mut binder, "count"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        assert_eq!(
+            bound_in_scope(&mut binder, "this.count"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        assert_eq!(
+            bound_in_scope(&mut binder, "Area()"),
+            TypeSymbol::Special(SpecialType::Double)
+        );
+        assert_eq!(
+            bound_in_scope(&mut binder, "this.Area()"),
+            TypeSymbol::Special(SpecialType::Double)
+        );
+        assert!(binder.diagnostics().is_empty());
+        bound_in_scope(&mut binder, "missing");
+        assert!(binder.diagnostics().iter().any(|d| d.code() == 103));
+    }
+
+    #[test]
+    fn member_lookup_walks_the_base_chain() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Animal { int legs; int Speed() { } } \
+             class Dog : Animal { string breed; }",
+        )
+        .unit;
+        let model = collect_model(&unit);
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        binder.declare_local("d", TypeSymbol::Named(["Dog".into()].into()));
+
+        assert_eq!(
+            bound_in_scope(&mut binder, "d.breed"),
+            TypeSymbol::Special(SpecialType::String)
+        );
+        assert_eq!(
+            bound_in_scope(&mut binder, "d.legs"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        assert_eq!(
+            bound_in_scope(&mut binder, "d.Speed()"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        assert!(binder.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn property_access_and_member_assignment() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Box { int Width { get { return 0; } set { } } int height; }",
+        )
+        .unit;
+        let model = collect_model(&unit);
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        binder.declare_local("b", TypeSymbol::Named(["Box".into()].into()));
+
+        assert_eq!(
+            bound_in_scope(&mut binder, "b.Width"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        bound_in_scope(&mut binder, "b.height = 5");
+        bound_in_scope(&mut binder, "b.Width = 5");
+        assert!(binder.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn reference_conversions_follow_the_base_chain() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Animal { } class Dog : Animal { } class Pen { void Hold(Animal a) { } }",
+        )
+        .unit;
+        let model = collect_model(&unit);
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        binder.declare_local("a", TypeSymbol::Named(["Animal".into()].into()));
+        binder.declare_local("d", TypeSymbol::Named(["Dog".into()].into()));
+        binder.declare_local("p", TypeSymbol::Named(["Pen".into()].into()));
+
+        bound_in_scope(&mut binder, "a = d");
+        bound_in_scope(&mut binder, "p.Hold(d)");
+        assert!(binder.diagnostics().is_empty());
+        assert!(binder.converts(
+            &TypeSymbol::Named(["Dog".into()].into()),
+            &TypeSymbol::Special(SpecialType::Object)
+        ));
+        bound_in_scope(&mut binder, "d = a");
+        assert!(binder.diagnostics().iter().any(|d| d.code() == 29));
     }
 
     #[test]

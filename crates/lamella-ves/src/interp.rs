@@ -508,8 +508,8 @@ fn step(
             frame.stack.push(Value::Object(reference));
         }
 
-        Opcode::Call => {
-            let module = module.ok_or(Trap::Unsupported(Opcode::Call))?;
+        Opcode::Call | Opcode::Callvirt => {
+            let module = module.ok_or(Trap::Unsupported(instruction.opcode))?;
             let token = token_operand(instruction)?;
             let method = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
             let arg_count = module

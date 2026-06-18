@@ -15,131 +15,136 @@ pub enum CilError {
     NoReturn,
     /// An opcode's decoded operand was not the shape the opcode requires.
     BadOperand,
-    /// A CIL opcode this spike does not lower yet.
+    /// A CIL opcode this lowering does not handle yet.
     Unsupported(Opcode),
+    /// A control-flow shape this lowering does not handle yet: a conditional branch
+    /// into a merge block (which would need its edge split), an entry block reached
+    /// by a back-edge, or a block that runs off the end of the method.
+    UnsupportedControlFlow,
 }
 
-/// Lowers a straight-line integer [`MethodBodyImage`] to a MIR [`Function`] by
-/// abstract interpretation of the evaluation stack.
+/// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`] by abstract
+/// interpretation: the CIL is split into basic blocks, the evaluation stack and
+/// locals are tracked per block, and join points (merges) become block parameters.
 pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
-    let (arg_count, local_count) = scan_slots(&body.code);
-    let mut value_types: Vec<MirType> = Vec::new();
-    let mut args: Vec<ValueId> = Vec::with_capacity(arg_count);
-    for _ in 0..arg_count {
-        args.push(new_value(&mut value_types, MirType::I32));
-    }
-    let mut locals: Vec<Option<ValueId>> = Vec::new();
-    locals.resize(local_count, None);
-    let mut stack: Vec<ValueId> = Vec::new();
-    let mut insts: Vec<(ValueId, Inst)> = Vec::new();
-    let mut terminator: Option<Terminator> = None;
+    let code = &body.code;
+    let blocks = control_flow::discover_blocks(code);
+    let preds = control_flow::predecessors(code, &blocks);
+    let (arg_count, local_count) = scan_slots(code);
 
-    for instruction in body.code.iter() {
-        match instruction.opcode {
-            Opcode::Nop => {}
-            Opcode::Ldarg0 => push_arg(&args, &mut stack, 0)?,
-            Opcode::Ldarg1 => push_arg(&args, &mut stack, 1)?,
-            Opcode::Ldarg2 => push_arg(&args, &mut stack, 2)?,
-            Opcode::Ldarg3 => push_arg(&args, &mut stack, 3)?,
-            Opcode::LdargS | Opcode::Ldarg => {
-                let Operand::Variable(n) = &instruction.operand else {
-                    return Err(CilError::BadOperand);
-                };
-                push_arg(&args, &mut stack, *n as usize)?;
-            }
-            Opcode::Ldloc0 => push_local(&mut value_types, &mut locals, &mut stack, &mut insts, 0)?,
-            Opcode::Ldloc1 => push_local(&mut value_types, &mut locals, &mut stack, &mut insts, 1)?,
-            Opcode::Ldloc2 => push_local(&mut value_types, &mut locals, &mut stack, &mut insts, 2)?,
-            Opcode::Ldloc3 => push_local(&mut value_types, &mut locals, &mut stack, &mut insts, 3)?,
-            Opcode::LdlocS | Opcode::Ldloc => {
-                let Operand::Variable(n) = &instruction.operand else {
-                    return Err(CilError::BadOperand);
-                };
-                push_local(
-                    &mut value_types,
-                    &mut locals,
+    let block_of = |instr: usize| blocks.iter().position(|&(s, e)| instr >= s && instr < e);
+    let is_merge = |b: usize| preds.get(b).is_some_and(|p| p.len() > 1);
+
+    if is_merge(0) {
+        return Err(CilError::UnsupportedControlFlow);
+    }
+
+    let mut value_types: Vec<MirType> = Vec::new();
+    let args: Vec<ValueId> = (0..arg_count)
+        .map(|_| new_value(&mut value_types, MirType::I32))
+        .collect();
+
+    let mut block_params: Vec<Vec<ValueId>> = Vec::with_capacity(blocks.len());
+    for b in 0..blocks.len() {
+        let params = if b == 0 {
+            args.clone()
+        } else if is_merge(b) {
+            (0..local_count)
+                .map(|_| new_value(&mut value_types, MirType::I32))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        block_params.push(params);
+    }
+
+    let mut mir_blocks: Vec<BasicBlock> = Vec::with_capacity(blocks.len());
+    let mut exit_locals: Vec<Vec<Option<ValueId>>> = vec![Vec::new(); blocks.len()];
+
+    for (b, &(start, end)) in blocks.iter().enumerate() {
+        let mut locals: Vec<Option<ValueId>> = if b == 0 {
+            vec![None; local_count]
+        } else if is_merge(b) {
+            block_params[b].iter().map(|&p| Some(p)).collect()
+        } else {
+            let pred = *preds[b].first().ok_or(CilError::UnsupportedControlFlow)?;
+            exit_locals[pred].clone()
+        };
+        locals.resize(local_count, None);
+
+        let mut stack: Vec<ValueId> = Vec::new();
+        let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+        let mut terminator: Option<Terminator> = None;
+
+        for i in start..end {
+            let inst = &code[i];
+            let is_last = i + 1 == end;
+            if is_last && inst.opcode == Opcode::Ret {
+                terminator = Some(Terminator::Return(stack.pop()));
+            } else if is_last && control_flow::branch_kind(inst.opcode).is_some() {
+                terminator = Some(build_branch(
+                    inst,
+                    end,
+                    &block_of,
+                    &is_merge,
+                    local_count,
                     &mut stack,
+                    &locals,
+                    &mut value_types,
                     &mut insts,
-                    *n as usize,
+                )?);
+            } else {
+                apply_value_op(
+                    inst,
+                    &mut value_types,
+                    &mut stack,
+                    &mut locals,
+                    &args,
+                    &mut insts,
                 )?;
             }
-            Opcode::Stloc0 => store_local(&mut locals, &mut stack, 0)?,
-            Opcode::Stloc1 => store_local(&mut locals, &mut stack, 1)?,
-            Opcode::Stloc2 => store_local(&mut locals, &mut stack, 2)?,
-            Opcode::Stloc3 => store_local(&mut locals, &mut stack, 3)?,
-            Opcode::StlocS | Opcode::Stloc => {
-                let Operand::Variable(n) = &instruction.operand else {
-                    return Err(CilError::BadOperand);
-                };
-                store_local(&mut locals, &mut stack, *n as usize)?;
-            }
-            Opcode::LdcI4M1 => push_const(&mut value_types, &mut stack, &mut insts, -1),
-            Opcode::LdcI40 => push_const(&mut value_types, &mut stack, &mut insts, 0),
-            Opcode::LdcI41 => push_const(&mut value_types, &mut stack, &mut insts, 1),
-            Opcode::LdcI42 => push_const(&mut value_types, &mut stack, &mut insts, 2),
-            Opcode::LdcI43 => push_const(&mut value_types, &mut stack, &mut insts, 3),
-            Opcode::LdcI44 => push_const(&mut value_types, &mut stack, &mut insts, 4),
-            Opcode::LdcI45 => push_const(&mut value_types, &mut stack, &mut insts, 5),
-            Opcode::LdcI46 => push_const(&mut value_types, &mut stack, &mut insts, 6),
-            Opcode::LdcI47 => push_const(&mut value_types, &mut stack, &mut insts, 7),
-            Opcode::LdcI48 => push_const(&mut value_types, &mut stack, &mut insts, 8),
-            Opcode::LdcI4S => {
-                let Operand::Int8(v) = &instruction.operand else {
-                    return Err(CilError::BadOperand);
-                };
-                push_const(&mut value_types, &mut stack, &mut insts, i64::from(*v));
-            }
-            Opcode::LdcI4 => {
-                let Operand::Int32(v) = &instruction.operand else {
-                    return Err(CilError::BadOperand);
-                };
-                push_const(&mut value_types, &mut stack, &mut insts, i64::from(*v));
-            }
-            Opcode::Add => binary(&mut value_types, &mut stack, &mut insts, BinOp::Add)?,
-            Opcode::Sub => binary(&mut value_types, &mut stack, &mut insts, BinOp::Sub)?,
-            Opcode::Mul => binary(&mut value_types, &mut stack, &mut insts, BinOp::Mul)?,
-            Opcode::And => binary(&mut value_types, &mut stack, &mut insts, BinOp::And)?,
-            Opcode::Or => binary(&mut value_types, &mut stack, &mut insts, BinOp::Or)?,
-            Opcode::Xor => binary(&mut value_types, &mut stack, &mut insts, BinOp::Xor)?,
-            Opcode::Shl => binary(&mut value_types, &mut stack, &mut insts, BinOp::Shl)?,
-            Opcode::Shr => binary(&mut value_types, &mut stack, &mut insts, BinOp::ShrSigned)?,
-            Opcode::ShrUn => binary(&mut value_types, &mut stack, &mut insts, BinOp::ShrUnsigned)?,
-            Opcode::Ceq => compare(&mut value_types, &mut stack, &mut insts, CmpOp::Eq)?,
-            Opcode::Cgt => compare(&mut value_types, &mut stack, &mut insts, CmpOp::SignedGt)?,
-            Opcode::CgtUn => compare(&mut value_types, &mut stack, &mut insts, CmpOp::UnsignedGt)?,
-            Opcode::Clt => compare(&mut value_types, &mut stack, &mut insts, CmpOp::SignedLt)?,
-            Opcode::CltUn => compare(&mut value_types, &mut stack, &mut insts, CmpOp::UnsignedLt)?,
-            Opcode::Pop => {
-                stack.pop().ok_or(CilError::StackUnderflow)?;
-            }
-            Opcode::Dup => {
-                let top = *stack.last().ok_or(CilError::StackUnderflow)?;
-                stack.push(top);
-            }
-            Opcode::Ret => {
-                terminator = Some(Terminator::Return(stack.pop()));
-                break;
-            }
-            other => return Err(CilError::Unsupported(other)),
         }
+
+        let terminator = match terminator {
+            Some(t) => t,
+            None => {
+                let next = b + 1;
+                if next >= blocks.len() {
+                    return Err(CilError::UnsupportedControlFlow);
+                }
+                let merge_args = merge_args(
+                    is_merge(next),
+                    local_count,
+                    &locals,
+                    &mut value_types,
+                    &mut insts,
+                );
+                Terminator::Jump {
+                    target: BlockId(next as u32),
+                    args: merge_args,
+                }
+            }
+        };
+
+        exit_locals[b] = locals.clone();
+        mir_blocks.push(BasicBlock {
+            params: block_params[b].clone(),
+            insts,
+            terminator: Some(terminator),
+        });
     }
 
-    let terminator = terminator.ok_or(CilError::NoReturn)?;
-    let ret = match &terminator {
-        Terminator::Return(Some(v)) => value_types.get(v.index()).copied(),
+    let ret = mir_blocks.iter().find_map(|blk| match &blk.terminator {
+        Some(Terminator::Return(Some(v))) => value_types.get(v.index()).copied(),
         _ => None,
-    };
+    });
 
     Ok(Function {
         params: (0..arg_count).map(|_| MirType::I32).collect(),
         ret,
         value_types,
         entry: BlockId(0),
-        blocks: vec![BasicBlock {
-            params: args,
-            insts,
-            terminator: Some(terminator),
-        }],
+        blocks: mir_blocks,
     })
 }
 
@@ -197,6 +202,262 @@ fn compare(
     insts.push((result, Inst::Compare { op, lhs, rhs }));
     stack.push(result);
     Ok(())
+}
+
+/// Applies one value-producing CIL instruction to the abstract state. Control-flow
+/// terminators (`ret` and the branches) are handled by the caller, not here.
+fn apply_value_op(
+    inst: &Instruction,
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    locals: &mut [Option<ValueId>],
+    args: &[ValueId],
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<(), CilError> {
+    match inst.opcode {
+        Opcode::Nop => {}
+        Opcode::Ldarg0 => push_arg(args, stack, 0)?,
+        Opcode::Ldarg1 => push_arg(args, stack, 1)?,
+        Opcode::Ldarg2 => push_arg(args, stack, 2)?,
+        Opcode::Ldarg3 => push_arg(args, stack, 3)?,
+        Opcode::LdargS | Opcode::Ldarg => {
+            let Operand::Variable(n) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            push_arg(args, stack, *n as usize)?;
+        }
+        Opcode::Ldloc0 => push_local(value_types, locals, stack, insts, 0)?,
+        Opcode::Ldloc1 => push_local(value_types, locals, stack, insts, 1)?,
+        Opcode::Ldloc2 => push_local(value_types, locals, stack, insts, 2)?,
+        Opcode::Ldloc3 => push_local(value_types, locals, stack, insts, 3)?,
+        Opcode::LdlocS | Opcode::Ldloc => {
+            let Operand::Variable(n) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            push_local(value_types, locals, stack, insts, *n as usize)?;
+        }
+        Opcode::Stloc0 => store_local(locals, stack, 0)?,
+        Opcode::Stloc1 => store_local(locals, stack, 1)?,
+        Opcode::Stloc2 => store_local(locals, stack, 2)?,
+        Opcode::Stloc3 => store_local(locals, stack, 3)?,
+        Opcode::StlocS | Opcode::Stloc => {
+            let Operand::Variable(n) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            store_local(locals, stack, *n as usize)?;
+        }
+        Opcode::LdcI4M1 => push_const(value_types, stack, insts, -1),
+        Opcode::LdcI40 => push_const(value_types, stack, insts, 0),
+        Opcode::LdcI41 => push_const(value_types, stack, insts, 1),
+        Opcode::LdcI42 => push_const(value_types, stack, insts, 2),
+        Opcode::LdcI43 => push_const(value_types, stack, insts, 3),
+        Opcode::LdcI44 => push_const(value_types, stack, insts, 4),
+        Opcode::LdcI45 => push_const(value_types, stack, insts, 5),
+        Opcode::LdcI46 => push_const(value_types, stack, insts, 6),
+        Opcode::LdcI47 => push_const(value_types, stack, insts, 7),
+        Opcode::LdcI48 => push_const(value_types, stack, insts, 8),
+        Opcode::LdcI4S => {
+            let Operand::Int8(v) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            push_const(value_types, stack, insts, i64::from(*v));
+        }
+        Opcode::LdcI4 => {
+            let Operand::Int32(v) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            push_const(value_types, stack, insts, i64::from(*v));
+        }
+        Opcode::Add => binary(value_types, stack, insts, BinOp::Add)?,
+        Opcode::Sub => binary(value_types, stack, insts, BinOp::Sub)?,
+        Opcode::Mul => binary(value_types, stack, insts, BinOp::Mul)?,
+        Opcode::And => binary(value_types, stack, insts, BinOp::And)?,
+        Opcode::Or => binary(value_types, stack, insts, BinOp::Or)?,
+        Opcode::Xor => binary(value_types, stack, insts, BinOp::Xor)?,
+        Opcode::Shl => binary(value_types, stack, insts, BinOp::Shl)?,
+        Opcode::Shr => binary(value_types, stack, insts, BinOp::ShrSigned)?,
+        Opcode::ShrUn => binary(value_types, stack, insts, BinOp::ShrUnsigned)?,
+        Opcode::Ceq => compare(value_types, stack, insts, CmpOp::Eq)?,
+        Opcode::Cgt => compare(value_types, stack, insts, CmpOp::SignedGt)?,
+        Opcode::CgtUn => compare(value_types, stack, insts, CmpOp::UnsignedGt)?,
+        Opcode::Clt => compare(value_types, stack, insts, CmpOp::SignedLt)?,
+        Opcode::Neg => {
+            let x = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let zero = new_value(value_types, MirType::I32);
+            insts.push((
+                zero,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ));
+            let result = new_value(value_types, MirType::I32);
+            insts.push((
+                result,
+                Inst::Binary {
+                    op: BinOp::Sub,
+                    lhs: zero,
+                    rhs: x,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::Not => {
+            let x = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let ones = new_value(value_types, MirType::I32);
+            insts.push((
+                ones,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: -1,
+                },
+            ));
+            let result = new_value(value_types, MirType::I32);
+            insts.push((
+                result,
+                Inst::Binary {
+                    op: BinOp::Xor,
+                    lhs: x,
+                    rhs: ones,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::ConvI4 | Opcode::ConvU4 => {}
+        Opcode::Pop => {
+            stack.pop().ok_or(CilError::StackUnderflow)?;
+        }
+        Opcode::Dup => {
+            let top = *stack.last().ok_or(CilError::StackUnderflow)?;
+            stack.push(top);
+        }
+        other => return Err(CilError::Unsupported(other)),
+    }
+    Ok(())
+}
+
+/// The arguments a predecessor passes to a successor. A merge block takes a
+/// parameter per local, so the predecessor passes its current locals, materializing
+/// a zero for any never written along this path (CIL zero-initializes locals). A
+/// non-merge successor inherits directly and receives no arguments.
+fn merge_args(
+    target_is_merge: bool,
+    local_count: usize,
+    locals: &[Option<ValueId>],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Vec<ValueId> {
+    if !target_is_merge {
+        return Vec::new();
+    }
+    (0..local_count)
+        .map(|slot| match locals.get(slot).copied().flatten() {
+            Some(value) => value,
+            None => {
+                let zero = new_value(value_types, MirType::I32);
+                insts.push((
+                    zero,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                ));
+                zero
+            }
+        })
+        .collect()
+}
+
+/// Builds the terminator for a block ending in a branch. `fallthrough` is the
+/// instruction index immediately after the block (the not-taken successor).
+#[allow(clippy::too_many_arguments)]
+fn build_branch(
+    inst: &Instruction,
+    fallthrough: usize,
+    block_of: &impl Fn(usize) -> Option<usize>,
+    is_merge: &impl Fn(usize) -> bool,
+    local_count: usize,
+    stack: &mut Vec<ValueId>,
+    locals: &[Option<ValueId>],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<Terminator, CilError> {
+    let Operand::Target(target_instr) = &inst.operand else {
+        return Err(CilError::BadOperand);
+    };
+    let target = block_of(*target_instr as usize).ok_or(CilError::UnsupportedControlFlow)?;
+
+    match control_flow::branch_kind(inst.opcode) {
+        Some(control_flow::BranchKind::Unconditional) => {
+            let args = merge_args(is_merge(target), local_count, locals, value_types, insts);
+            Ok(Terminator::Jump {
+                target: BlockId(target as u32),
+                args,
+            })
+        }
+        Some(control_flow::BranchKind::Conditional) => {
+            let other = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow)?;
+            if is_merge(target) || is_merge(other) {
+                return Err(CilError::UnsupportedControlFlow);
+            }
+            let (cond, if_true, if_false) =
+                build_condition(inst.opcode, target, other, stack, value_types, insts)?;
+            Ok(Terminator::Branch {
+                cond,
+                if_true: BlockId(if_true as u32),
+                true_args: Vec::new(),
+                if_false: BlockId(if_false as u32),
+                false_args: Vec::new(),
+            })
+        }
+        None => Err(CilError::UnsupportedControlFlow),
+    }
+}
+
+/// Builds the condition value for a conditional branch and resolves which block is
+/// the taken (`if_true`) and not-taken (`if_false`) successor. The compare-branches
+/// (`beq`/`blt`/...) test two popped operands; `brtrue`/`brfalse` test one.
+fn build_condition(
+    op: Opcode,
+    target: usize,
+    fallthrough: usize,
+    stack: &mut Vec<ValueId>,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<(ValueId, usize, usize), CilError> {
+    let compare_op = match op {
+        Opcode::BeqS | Opcode::Beq => Some(CmpOp::Eq),
+        Opcode::BneUnS | Opcode::BneUn => Some(CmpOp::Ne),
+        Opcode::BgtS | Opcode::Bgt => Some(CmpOp::SignedGt),
+        Opcode::BgtUnS | Opcode::BgtUn => Some(CmpOp::UnsignedGt),
+        Opcode::BltS | Opcode::Blt => Some(CmpOp::SignedLt),
+        Opcode::BltUnS | Opcode::BltUn => Some(CmpOp::UnsignedLt),
+        Opcode::BgeS | Opcode::Bge => Some(CmpOp::SignedGe),
+        Opcode::BgeUnS | Opcode::BgeUn => Some(CmpOp::UnsignedGe),
+        Opcode::BleS | Opcode::Ble => Some(CmpOp::SignedLe),
+        Opcode::BleUnS | Opcode::BleUn => Some(CmpOp::UnsignedLe),
+        _ => None,
+    };
+    if let Some(cmpop) = compare_op {
+        let rhs = stack.pop().ok_or(CilError::StackUnderflow)?;
+        let lhs = stack.pop().ok_or(CilError::StackUnderflow)?;
+        let cond = new_value(value_types, MirType::I32);
+        insts.push((
+            cond,
+            Inst::Compare {
+                op: cmpop,
+                lhs,
+                rhs,
+            },
+        ));
+        return Ok((cond, target, fallthrough));
+    }
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    match op {
+        Opcode::BrtrueS | Opcode::Brtrue => Ok((value, target, fallthrough)),
+        Opcode::BrfalseS | Opcode::Brfalse => Ok((value, fallthrough, target)),
+        _ => Err(CilError::Unsupported(op)),
+    }
 }
 
 /// Scans a method body for the highest argument and local slot it references, to
@@ -279,8 +540,7 @@ fn store_local(
 }
 
 /// Control-flow graph analysis over a CIL instruction stream: basic-block
-/// discovery and predecessors.
-#[allow(dead_code)]
+/// discovery and predecessors, consumed by the lowering's abstract interpreter.
 mod control_flow {
     use alloc::vec;
     use alloc::vec::Vec;
@@ -458,6 +718,49 @@ mod tests {
     }
 
     #[test]
+    fn lowers_neg() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::simple(Opcode::Neg),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_an_if_else() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::new(Opcode::BgtS, Operand::Target(5)),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(9)),
+                Instruction::simple(Opcode::Ret),
+                Instruction::simple(Opcode::LdcI47),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert_eq!(func.blocks.len(), 3);
+        assert!(lamella_ir::verify(&func).is_ok());
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
     fn discovers_an_if_else_cfg() {
         let code = [
             Instruction::simple(Opcode::Ldarg0),
@@ -485,7 +788,7 @@ mod tests {
             code: vec![Instruction::simple(Opcode::Nop)].into_boxed_slice(),
             handlers: Vec::new().into_boxed_slice(),
         };
-        assert_eq!(lower_method(&body), Err(CilError::NoReturn));
+        assert!(lower_method(&body).is_err());
     }
 
     #[cfg(feature = "arm32")]

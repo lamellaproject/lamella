@@ -3,6 +3,7 @@
 use crate::interp::Vm;
 use crate::trap::Trap;
 use crate::value::Value;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use lamella_cil::Opcode;
 
@@ -30,6 +31,248 @@ pub fn console_write_line(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, 
     }
     vm.write(&[NEWLINE]);
     Ok(None)
+}
+
+/// Writes `text` (UTF-16 encoded).
+fn write_text(vm: &mut Vm, text: &str) {
+    let chars: Vec<u16> = text.encode_utf16().collect();
+    vm.write(&chars);
+}
+
+/// Writes `text` (UTF-16 encoded) followed by the line terminator.
+fn write_line_text(vm: &mut Vm, text: &str) {
+    write_text(vm, text);
+    vm.write(&[NEWLINE]);
+}
+
+/// `System.Console.WriteLine()`: write just a line terminator.
+///
+/// # Errors
+/// Never; the signature matches the intrinsic ABI.
+pub fn console_write_line_empty(vm: &mut Vm, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    vm.write(&[NEWLINE]);
+    Ok(None)
+}
+
+/// `System.Console.WriteLine(int)`: write an `int32` in decimal.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int32`.
+pub fn console_write_line_int32(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_line_text(vm, &value.to_string());
+    Ok(None)
+}
+
+/// `System.Console.WriteLine(long)`: write an `int64` in decimal.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int64`.
+pub fn console_write_line_int64(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int64(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_line_text(vm, &value.to_string());
+    Ok(None)
+}
+
+/// `System.Console.WriteLine(bool)`: write `True` or `False`. A `bool` is an
+/// `int32` on the evaluation stack.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int32`.
+pub fn console_write_line_bool(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_line_text(vm, if value != 0 { "True" } else { "False" });
+    Ok(None)
+}
+
+/// `System.Console.WriteLine(char)`: write a single UTF-16 code unit. A `char` is
+/// an `int32` on the evaluation stack.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int32`.
+pub fn console_write_line_char(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    vm.write(&[value as u16, NEWLINE]);
+    Ok(None)
+}
+
+/// `System.Console.Write(string)`: write the string's characters, no terminator.
+/// `Write(null)` writes nothing.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a string or null reference.
+pub fn console_write(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    match args.first() {
+        Some(Value::Object(reference)) => {
+            let chars: Vec<u16> = vm
+                .heap()
+                .as_string(*reference)
+                .ok_or(Trap::TypeMismatch(Opcode::Call))?
+                .to_vec();
+            vm.write(&chars);
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => return Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+    Ok(None)
+}
+
+/// `System.Console.Write(int)`: write an `int32` in decimal, no terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int32`.
+pub fn console_write_int32(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_text(vm, &value.to_string());
+    Ok(None)
+}
+
+/// `System.Console.Write(long)`: write an `int64` in decimal, no terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int64`.
+pub fn console_write_int64(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int64(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_text(vm, &value.to_string());
+    Ok(None)
+}
+
+/// `System.Console.Write(bool)`: write `True` or `False`, no terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int32`.
+pub fn console_write_bool(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_text(vm, if value != 0 { "True" } else { "False" });
+    Ok(None)
+}
+
+/// `System.Console.Write(char)`: write a single UTF-16 code unit, no terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int32`.
+pub fn console_write_char(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    vm.write(&[value as u16]);
+    Ok(None)
+}
+
+/// The UTF-16 characters of a string-or-null argument; a null or missing argument
+/// is the empty string.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is some non-string value.
+fn string_arg_chars(vm: &Vm, arg: Option<&Value>) -> Result<Vec<u16>, Trap> {
+    match arg {
+        Some(Value::Object(reference)) => Ok(vm
+            .heap()
+            .as_string(*reference)
+            .ok_or(Trap::TypeMismatch(Opcode::Call))?
+            .to_vec()),
+        Some(Value::Null) | None => Ok(Vec::new()),
+        Some(_) => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// `System.String.Concat(string, string)`: concatenate two strings into a new one
+/// (a null argument is the empty string), returning the new string reference.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if either argument is a non-string value.
+pub fn string_concat(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let mut chars = string_arg_chars(vm, args.first())?;
+    chars.extend_from_slice(&string_arg_chars(vm, args.get(1))?);
+    let reference = vm.heap_mut().alloc_string(&chars);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.get_Length` (the `Length` property): the number of UTF-16 code
+/// units. The string is the implicit `this`, the only argument.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a string.
+pub fn string_get_length(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(Value::Object(reference)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let length = vm
+        .heap()
+        .as_string(*reference)
+        .ok_or(Trap::TypeMismatch(Opcode::Call))?
+        .len();
+    Ok(Some(Value::Int32(
+        i32::try_from(length).unwrap_or(i32::MAX),
+    )))
+}
+
+/// The UTF-16 characters of a string argument, or `None` for a null reference --
+/// kept distinct from the empty string so equality is correct.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is some non-string value.
+fn string_opt(vm: &Vm, arg: Option<&Value>) -> Result<Option<Vec<u16>>, Trap> {
+    match arg {
+        Some(Value::Object(reference)) => Ok(Some(
+            vm.heap()
+                .as_string(*reference)
+                .ok_or(Trap::TypeMismatch(Opcode::Call))?
+                .to_vec(),
+        )),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// `System.String.op_Equality(string, string)`: ordinal equality as a `bool` (an
+/// `int32` 0/1). Two nulls are equal; a null and a string are not.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if either argument is a non-string value.
+pub fn string_equals(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let left = string_opt(vm, args.first())?;
+    let right = string_opt(vm, args.get(1))?;
+    Ok(Some(Value::Int32(i32::from(left == right))))
+}
+
+/// `System.String.get_Chars(int)` (the indexer `s[i]`): the UTF-16 code unit at
+/// `index`, as the `int32` a `char` is on the stack. The string is `this`, the
+/// index the second argument.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a string or the index not an
+/// `int32`; [`Trap::ArgumentOutOfRange`] if the index is out of bounds.
+pub fn string_get_chars(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(Value::Object(reference)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(index)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let chars = vm
+        .heap()
+        .as_string(*reference)
+        .ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let unit = usize::try_from(index)
+        .ok()
+        .and_then(|index| chars.get(index))
+        .ok_or(Trap::IndexOutOfRange(index))?;
+    Ok(Some(Value::Int32(i32::from(*unit))))
 }
 
 #[cfg(test)]

@@ -508,9 +508,12 @@ mod tests {
             init_locals: false,
             local_var_sig: None,
             code: vec![
-                Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
-                Instruction::new(Opcode::LdcI4S, Operand::Int8(2)),
-                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::new(Opcode::BgtS, Operand::Target(5)),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(9)),
+                Instruction::simple(Opcode::Ret),
+                Instruction::simple(Opcode::LdcI47),
                 Instruction::simple(Opcode::Ret),
             ]
             .into_boxed_slice(),

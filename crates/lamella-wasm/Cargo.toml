@@ -1,0 +1,25 @@
+[package]
+name = "lamella-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Embedding the Lamella interpreter (WebAssembly and other hosts): run an assembly, capture its result."
+
+# cdylib produces the host-agnostic .wasm; rlib lets the core be used natively and tested.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lamella-load = { path = "../lamella-load" }
+lamella-metadata = { path = "../lamella-metadata" }
+lamella-ves = { path = "../lamella-ves" }
+
+[features]
+# Adds the lamella_selftest export (embeds a fixture) so a wasm host can validate
+# the module end to end with a single --invoke. Off by default; not in the drop.
+selftest = []
+
+[lints]
+workspace = true

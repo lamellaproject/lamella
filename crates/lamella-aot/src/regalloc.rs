@@ -1,5 +1,6 @@
 //! Liveness analysis over the middle IR, the foundation for register allocation.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use lamella_ir::{BlockId, Function, Inst, Terminator, ValueId};
@@ -85,6 +86,188 @@ impl Liveness {
             .and_then(|s| s.get(value.index()))
             .copied()
             .unwrap_or(false)
+    }
+}
+
+/// A value's live interval: the half-open span of program points from its first
+/// definition to its last use, conservatively contiguous across any holes. The
+/// linear scan sorts intervals by `start` and assigns registers, spilling the
+/// interval that ends furthest away when it runs out.
+#[derive(Debug, Clone, Copy)]
+pub struct Interval {
+    /// The first program point at which the value is live.
+    pub start: u32,
+    /// The last program point at which the value is live.
+    pub end: u32,
+}
+
+impl Interval {
+    /// The interval's length in program points (longer-lived values span more).
+    pub fn span(&self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+}
+
+/// Builds a live interval per value from the block-level liveness, numbering
+/// program points in block-layout order (a block-entry point, one per instruction,
+/// then a terminator point). A value live into or out of a block extends to that
+/// block's entry or terminator point, so loop-carried values span the loop.
+pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
+    let m = func.value_types.len();
+    let mut lo = vec![u32::MAX; m];
+    let mut hi = vec![0u32; m];
+    let mut defined = vec![false; m];
+
+    let mut point = 0u32;
+    for (b, block) in func.blocks.iter().enumerate() {
+        let entry = point;
+        point += 1;
+        for &param in &block.params {
+            mark(&mut lo, &mut hi, &mut defined, param, entry);
+        }
+        for v in 0..m {
+            if live.live_in(b, ValueId(v as u32)) {
+                lo[v] = lo[v].min(entry);
+                defined[v] = true;
+            }
+        }
+        for (result, inst) in &block.insts {
+            let ip = point;
+            point += 1;
+            match inst {
+                Inst::Binary { lhs, rhs, .. } | Inst::Compare { lhs, rhs, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *lhs, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *rhs, ip);
+                }
+                Inst::ConstInt { .. } => {}
+            }
+            mark(&mut lo, &mut hi, &mut defined, *result, ip);
+        }
+        let term = point;
+        point += 1;
+        match &block.terminator {
+            Some(Terminator::Jump { args, .. }) => {
+                for a in args {
+                    mark(&mut lo, &mut hi, &mut defined, *a, term);
+                }
+            }
+            Some(Terminator::Branch {
+                cond,
+                true_args,
+                false_args,
+                ..
+            }) => {
+                mark(&mut lo, &mut hi, &mut defined, *cond, term);
+                for a in true_args.iter().chain(false_args) {
+                    mark(&mut lo, &mut hi, &mut defined, *a, term);
+                }
+            }
+            Some(Terminator::Return(Some(v))) => mark(&mut lo, &mut hi, &mut defined, *v, term),
+            _ => {}
+        }
+        for v in 0..m {
+            if live.live_out(b, ValueId(v as u32)) {
+                hi[v] = hi[v].max(term);
+                defined[v] = true;
+            }
+        }
+    }
+
+    (0..m)
+        .map(|v| Interval {
+            start: if defined[v] { lo[v] } else { 0 },
+            end: hi[v],
+        })
+        .collect()
+}
+
+fn mark(lo: &mut [u32], hi: &mut [u32], defined: &mut [bool], value: ValueId, point: u32) {
+    let i = value.index();
+    if i < lo.len() {
+        lo[i] = lo[i].min(point);
+        hi[i] = hi[i].max(point);
+        defined[i] = true;
+    }
+}
+
+/// Where the allocator places a value: an allocatable register index (in
+/// `0..reg_count`, which the target maps to a real machine register) or a spill slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Location {
+    /// An allocatable register, numbered from zero.
+    Register(u32),
+    /// A stack spill slot, numbered from zero.
+    Spill(u32),
+}
+
+/// The result of register allocation: a location per value, the number of registers
+/// used (for the prologue's saves), and the number of spill slots (for the frame).
+pub struct Allocation {
+    /// The location chosen for each value, indexed by value id.
+    pub locations: Vec<Location>,
+    /// The count of distinct registers used (highest index plus one).
+    pub registers_used: u32,
+    /// The count of spill slots used.
+    pub spill_count: u32,
+}
+
+/// Linear-scan register allocation (Poletto and Sarkar): intervals are taken in
+/// order of start point, each claiming a free register; when none is free, the
+/// interval reaching furthest -- the new one or an active one -- is spilled. With
+/// `reg_count` registers and never a panic, even for zero registers.
+pub fn allocate(intervals: &[Interval], reg_count: usize) -> Allocation {
+    let mut order: Vec<usize> = (0..intervals.len()).collect();
+    order.sort_by_key(|&v| intervals[v].start);
+
+    let mut locations = vec![Location::Spill(0); intervals.len()];
+    let mut active: Vec<usize> = Vec::new();
+    let mut free: Vec<u32> = (0..reg_count as u32).rev().collect();
+    let mut spill_count = 0u32;
+    let mut registers_used = 0u32;
+
+    for &v in &order {
+        let start = intervals[v].start;
+        let mut kept = Vec::with_capacity(active.len());
+        for &a in &active {
+            if intervals[a].end < start {
+                if let Location::Register(r) = locations[a] {
+                    free.push(r);
+                }
+            } else {
+                kept.push(a);
+            }
+        }
+        active = kept;
+
+        if let Some(r) = free.pop() {
+            locations[v] = Location::Register(r);
+            registers_used = registers_used.max(r + 1);
+            active.push(v);
+        } else {
+            let furthest = active.iter().max_by_key(|&&a| intervals[a].end).copied();
+            match furthest {
+                Some(a) if intervals[a].end > intervals[v].end => {
+                    if let Location::Register(r) = locations[a] {
+                        locations[v] = Location::Register(r);
+                        registers_used = registers_used.max(r + 1);
+                    }
+                    locations[a] = Location::Spill(spill_count);
+                    spill_count += 1;
+                    active.retain(|&x| x != a);
+                    active.push(v);
+                }
+                _ => {
+                    locations[v] = Location::Spill(spill_count);
+                    spill_count += 1;
+                }
+            }
+        }
+    }
+
+    Allocation {
+        locations,
+        registers_used,
+        spill_count,
     }
 }
 
@@ -278,5 +461,26 @@ mod tests {
         assert!(live.live_in(2, ValueId(1)));
         assert!(!live.live_out(1, ValueId(5)));
         assert!(!live.live_in(2, ValueId(5)));
+    }
+
+    #[test]
+    fn loop_carried_values_have_longer_intervals() {
+        let func = loop_function();
+        let live = Liveness::analyze(&func);
+        let intervals = live_intervals(&func, &live);
+        assert!(intervals[2].span() > intervals[5].span());
+        assert!(intervals[1].span() > intervals[5].span());
+    }
+
+    #[test]
+    fn linear_scan_assigns_and_spills() {
+        let func = loop_function();
+        let intervals = live_intervals(&func, &Liveness::analyze(&func));
+        let roomy = allocate(&intervals, 8);
+        assert_eq!(roomy.locations.len(), func.value_types.len());
+        assert!(allocate(&intervals, 2).spill_count > 0);
+        let none = allocate(&intervals, 0);
+        assert_eq!(none.registers_used, 0);
+        assert_eq!(none.spill_count as usize, func.value_types.len());
     }
 }

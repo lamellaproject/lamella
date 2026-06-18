@@ -26,6 +26,8 @@ pub enum Trap {
     ArgumentOutOfRange(u16),
     /// A branch named an instruction index outside the method.
     BranchOutOfRange(u32),
+    /// A string or array index was outside its bounds.
+    IndexOutOfRange(i32),
     /// Integer division or remainder by zero (`div`, `rem`, and unsigned forms).
     DivideByZero,
     /// A `call` token resolved to no method in the module.
@@ -53,6 +55,7 @@ impl fmt::Display for Trap {
             Trap::LocalOutOfRange(slot) => write!(f, "local variable {slot} out of range"),
             Trap::ArgumentOutOfRange(slot) => write!(f, "argument {slot} out of range"),
             Trap::BranchOutOfRange(target) => write!(f, "branch target {target} out of range"),
+            Trap::IndexOutOfRange(index) => write!(f, "index {index} out of range"),
             Trap::DivideByZero => f.write_str("integer divide by zero"),
             Trap::UnresolvedCall(token) => {
                 write!(f, "call token 0x{:08X} resolved to no method", token.0)
