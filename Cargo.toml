@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# Shared package metadata. Member crates inherit these with `field.workspace = true`
+# so versioning and licensing stay in one place.
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["The Lamella project"]
+description = "A from-scratch C# toolchain: compiler, runtime, and base class library."
+
+# Lints applied to every member that opts in with `[lints] workspace = true`.
+# Warnings stay warnings so the build does not break, but nothing is silently
+# undocumented and unsafe code is called out. The compiler libraries forbid
+# unsafe outright in their own source; device crates that genuinely need it can
+# relax this locally.
+[workspace.lints.rust]
+unsafe_code = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"

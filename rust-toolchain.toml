@@ -1,0 +1,7 @@
+[toolchain]
+# Tracked against current stable for now (developed on 1.96.0). Once we set an
+# MSRV and add the bare-metal and wasm targets for the runtime, this gets pinned
+# to an exact version and gains rust-src plus those targets.
+channel = "stable"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
