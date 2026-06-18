@@ -197,6 +197,19 @@ impl<'a> Session<'a> {
         self.breakpoints.remove(&(method, instruction));
     }
 
+    /// Removes all breakpoints (e.g. when a debugger replaces the whole set).
+    pub fn clear_breakpoints(&mut self) {
+        self.breakpoints.clear();
+    }
+
+    /// Whether the session is currently sitting at a breakpoint -- the next
+    /// [`Session::resume`] would pause immediately. A debugger uses this to step
+    /// off a breakpoint before continuing.
+    #[must_use]
+    pub fn is_at_breakpoint(&self) -> bool {
+        self.at_breakpoint()
+    }
+
     /// Executes exactly one instruction, ignoring breakpoints.
     ///
     /// # Errors

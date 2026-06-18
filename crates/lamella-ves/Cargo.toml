@@ -11,5 +11,9 @@ description = "The Lamella virtual execution system: a CIL interpreter implement
 lamella-cil = { path = "../lamella-cil" }
 lamella-token = { path = "../lamella-token" }
 
+# The run-assembly example loads real assemblies through the metadata reader.
+[dev-dependencies]
+lamella-metadata = { path = "../lamella-metadata" }
+
 [lints]
 workspace = true

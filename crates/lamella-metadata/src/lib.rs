@@ -24,8 +24,8 @@ pub use heaps::{BlobHeap, GuidHeap, HeapError, StringsHeap, UserStringsHeap, rea
 pub use image::{MetadataError, MetadataImage};
 pub use pe::{PeError, PeImage};
 pub use reader::{
-    Assembly, AssemblyRef, CustomAttribute, Event, Field, Method, Param, Property, TypeDef,
-    TypeName, TypeRef,
+    Assembly, AssemblyRef, CustomAttribute, Event, Field, MemberRef, Method, Param, Property,
+    TypeDef, TypeName, TypeRef,
 };
 pub use rows::{Col, Row, Tables, columns};
 pub use signature::{MethodSig, SigError, SigType, parse_field, parse_method, parse_type};

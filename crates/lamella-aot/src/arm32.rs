@@ -501,8 +501,22 @@ mod tests {
     #[ignore = "writes a micro:bit image for manual QEMU validation"]
     fn emit_qemu_microbit_image() {
         use lamella_asm_arm32::{Encoder, Reg};
+        use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand};
 
-        let func = spilled_sum_function();
+        let body_image = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(2)),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = crate::cil::lower_method(&body_image).unwrap();
 
         let mut body = lower(&func).unwrap();
         assert_eq!(&body[body.len() - 2..], &[0x70, 0x47]);

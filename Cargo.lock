@@ -13,12 +13,20 @@ name = "lamella-aot"
 version = "0.0.0"
 dependencies = [
  "lamella-asm-arm32",
+ "lamella-cil",
  "lamella-ir",
 ]
 
 [[package]]
 name = "lamella-asm-arm32"
 version = "0.0.0"
+
+[[package]]
+name = "lamella-binder"
+version = "0.0.0"
+dependencies = [
+ "lamella-syntax",
+]
 
 [[package]]
 name = "lamella-cil"
@@ -31,6 +39,8 @@ dependencies = [
 name = "lamella-dap"
 version = "0.0.0"
 dependencies = [
+ "lamella-cil",
+ "lamella-token",
  "lamella-ves",
  "serde",
  "serde_json",
@@ -61,6 +71,7 @@ name = "lamella-ves"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-metadata",
  "lamella-token",
 ]
 

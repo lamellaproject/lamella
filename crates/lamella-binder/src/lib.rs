@@ -1,0 +1,24 @@
+#![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
+
+//! Semantic analysis for C# 1.0 (ECMA-334 1st edition).
+
+extern crate alloc;
+
+pub mod bind;
+pub mod bound;
+pub mod conversion;
+pub mod diagnostic;
+pub mod resolve;
+pub mod special;
+pub mod statement;
+pub mod types;
+
+pub use bind::bind_type;
+pub use bound::{Binder, BoundExpr, BoundExprKind, bind_expression};
+pub use conversion::has_implicit_conversion;
+pub use diagnostic::{Diagnostic, DiagnosticKind};
+pub use resolve::{TypeTable, resolve_type};
+pub use special::SpecialType;
+pub use statement::{BoundDeclarator, BoundStmt, BoundStmtKind};
+pub use types::TypeSymbol;

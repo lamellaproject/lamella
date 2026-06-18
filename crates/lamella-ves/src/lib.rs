@@ -12,7 +12,7 @@ pub mod object;
 pub mod trap;
 pub mod value;
 
-pub use interp::{Vm, run, run_method};
+pub use interp::{FrameView, Session, Status, Vm, run, run_method};
 pub use module::{IntrinsicFn, Method, MethodId, Module};
 pub use object::{Heap, Object, ObjectRef};
 pub use trap::Trap;

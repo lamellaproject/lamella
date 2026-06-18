@@ -6,7 +6,7 @@ use crate::heaps::StringsHeap;
 use crate::image::{MetadataError, MetadataImage};
 use crate::pe::PeImage;
 use crate::rows::Tables;
-use crate::signature::{MethodSig, SigType, parse_field, parse_method};
+use crate::signature::{MethodSig, SigType, calling, parse_field, parse_method};
 use crate::tables::{TableError, TablesHeader, table};
 use lamella_cil::{MethodBodyImage, read_method_body};
 use lamella_token::Token;
@@ -175,6 +175,24 @@ impl<'a> Assembly<'a> {
     pub fn assembly_refs(&self) -> impl Iterator<Item = AssemblyRef<'a>> + '_ {
         (1..=self.tables.row_count(table::ASSEMBLY_REF))
             .filter_map(move |index| self.assembly_ref(index))
+    }
+
+    /// The 1-based `index`-th `MemberRef` (a referenced method or field, II.22.25).
+    #[must_use]
+    pub fn member_ref(&self, index: u32) -> Option<MemberRef<'a>> {
+        if index == 0 || index > self.tables.row_count(table::MEMBER_REF) {
+            return None;
+        }
+        Some(MemberRef {
+            assembly: *self,
+            index,
+        })
+    }
+
+    /// Iterates the referenced members.
+    pub fn member_refs(&self) -> impl Iterator<Item = MemberRef<'a>> + '_ {
+        (1..=self.tables.row_count(table::MEMBER_REF))
+            .filter_map(move |index| self.member_ref(index))
     }
 
     /// The custom attributes applied to `parent`, from the `CustomAttribute`
@@ -677,6 +695,70 @@ impl<'a> AssemblyRef<'a> {
     }
 }
 
+/// A navigable member reference (II.22.25): a method or field referenced through
+/// its parent type, by name and signature. The runtime resolves a `call`/`ldfld`
+/// token to this to find the target.
+#[derive(Debug, Clone, Copy)]
+pub struct MemberRef<'a> {
+    assembly: Assembly<'a>,
+    index: u32,
+}
+
+impl<'a> MemberRef<'a> {
+    /// The token of the member's parent (a `TypeRef`, `TypeDef`, `ModuleRef`,
+    /// `MethodDef`, or `TypeSpec`).
+    #[must_use]
+    pub fn parent(&self) -> Token {
+        self.assembly
+            .tables
+            .row(table::MEMBER_REF, self.index)
+            .map_or(Token::new(0, 0), |row| row.token(0))
+    }
+
+    /// The referenced member's name.
+    #[must_use]
+    pub fn name(&self) -> Option<&'a str> {
+        let row = self.assembly.tables.row(table::MEMBER_REF, self.index)?;
+        self.assembly.strings().get(row.raw(1)).ok()
+    }
+
+    /// The raw signature blob.
+    #[must_use]
+    pub fn signature_blob(&self) -> &'a [u8] {
+        self.assembly
+            .tables
+            .row(table::MEMBER_REF, self.index)
+            .and_then(|row| self.assembly.image.blob().get(row.raw(2)).ok())
+            .unwrap_or(&[])
+    }
+
+    /// Whether the reference is to a field (its signature starts with the FIELD
+    /// calling convention) rather than a method.
+    #[must_use]
+    pub fn is_field(&self) -> bool {
+        self.signature_blob().first() == Some(&calling::FIELD)
+    }
+
+    /// The referenced method's signature, if this is a method reference.
+    #[must_use]
+    pub fn method_signature(&self) -> Option<MethodSig> {
+        if self.is_field() {
+            return None;
+        }
+        parse_method(self.signature_blob()).ok()
+    }
+
+    /// The referenced field's type, if this is a field reference.
+    #[must_use]
+    pub fn field_type(&self) -> Option<SigType> {
+        if self.is_field() {
+            parse_field(self.signature_blob()).ok()
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +866,8 @@ mod tests {
         assert_eq!(foo_bar.events().count(), 0);
         assert!(foo_bar.enclosing_type().is_none());
         assert_eq!(foo_bar.nested_types().count(), 0);
+        assert_eq!(assembly.member_refs().count(), 0);
+        assert!(assembly.member_ref(1).is_none());
         assert!(assembly.type_def(0).is_none());
         assert!(assembly.type_def(3).is_none());
     }

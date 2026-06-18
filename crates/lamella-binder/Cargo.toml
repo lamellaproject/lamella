@@ -1,0 +1,14 @@
+[package]
+name = "lamella-binder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Semantic analysis for C# 1.0: name and type resolution, type checking, and a bound tree."
+
+[dependencies]
+lamella-syntax = { path = "../lamella-syntax" }
+
+[lints]
+workspace = true

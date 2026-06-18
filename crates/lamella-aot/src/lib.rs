@@ -5,7 +5,11 @@
 
 extern crate alloc;
 
+pub mod cil;
 pub mod target;
+
+#[allow(dead_code)]
+mod regalloc;
 
 #[cfg(feature = "arm32")]
 pub mod arm32;

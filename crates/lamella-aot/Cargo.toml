@@ -9,6 +9,7 @@ description = "Lamella's ahead-of-time backend driver: lowers the middle IR to t
 
 [dependencies]
 lamella-ir = { path = "../lamella-ir" }
+lamella-cil = { path = "../lamella-cil" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32", optional = true }
 
 [features]
