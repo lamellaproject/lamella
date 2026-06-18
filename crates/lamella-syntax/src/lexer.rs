@@ -280,7 +280,7 @@ impl<'a> Lexer<'a> {
         self.skip_inline_whitespace();
         let symbol = self.read_directive_name();
         if symbol.is_empty() || symbol == "true" || symbol == "false" {
-            self.report(DiagnosticKind::SymbolNameExpected, start);
+            self.report(DiagnosticKind::IdentifierExpected, start);
             self.consume_to_line_end();
             return;
         }

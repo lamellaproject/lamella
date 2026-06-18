@@ -51,9 +51,10 @@ pub enum DiagnosticKind {
     /// A directive line carried tokens past its content where only white space,
     /// a single-line comment, or the end of the line was allowed (9.5).
     EndOfLineExpected,
-    /// A `#define` or `#undef` named no conditional compilation symbol, or named
-    /// `true` or `false`, which are not symbols (9.5.3).
-    SymbolNameExpected,
+    /// An identifier was required but not found: a `#define`/`#undef` symbol name
+    /// (9.5.3), the member after a `.`, or any other identifier the grammar
+    /// demands. (`true`/`false` are not valid symbol names.)
+    IdentifierExpected,
     /// A `#define` or `#undef` appeared after the first real token of the file,
     /// which 9.5.3 forbids.
     SymbolAfterFirstToken,
@@ -86,6 +87,17 @@ pub enum DiagnosticKind {
         /// The text following `#warning` on the directive line.
         message: Box<str>,
     },
+    /// A primary expression was expected, but the token there cannot begin one
+    /// (ECMA-334 1st ed, 14.5).
+    ExpressionExpected,
+    /// A specific token the grammar required was not present.
+    TokenExpected {
+        /// The expected token's spelling, for example `]` or `:`.
+        expected: &'static str,
+    },
+    /// A type was expected, for example inside `typeof( )` or after `is`/`as`
+    /// (ECMA-334 1st ed, clause 11).
+    TypeExpected,
 }
 
 impl DiagnosticKind {
@@ -103,7 +115,7 @@ impl DiagnosticKind {
             DiagnosticKind::EmptyCharacterLiteral => 1011,
             DiagnosticKind::TooManyCharactersInCharacterLiteral => 1012,
             DiagnosticKind::UnterminatedStringLiteral => 1039,
-            DiagnosticKind::SymbolNameExpected => 1001,
+            DiagnosticKind::IdentifierExpected => 1001,
             DiagnosticKind::PreprocessorDirectiveExpected => 1024,
             DiagnosticKind::EndOfLineExpected => 1025,
             DiagnosticKind::CloseParenExpected => 1026,
@@ -117,6 +129,9 @@ impl DiagnosticKind {
             DiagnosticKind::InvalidPreprocessorExpression => 1517,
             DiagnosticKind::InvalidLineDirective => 1576,
             DiagnosticKind::LineNumberOutOfRange => 1687,
+            DiagnosticKind::ExpressionExpected => 1525,
+            DiagnosticKind::TokenExpected { .. } => 1003,
+            DiagnosticKind::TypeExpected => 1031,
         }
     }
 
@@ -148,7 +163,7 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::UnterminatedStringLiteral => {
                 f.write_str("Unterminated string literal")
             }
-            DiagnosticKind::SymbolNameExpected => f.write_str("Identifier expected"),
+            DiagnosticKind::IdentifierExpected => f.write_str("Identifier expected"),
             DiagnosticKind::PreprocessorDirectiveExpected => {
                 f.write_str("Preprocessor directive expected")
             }
@@ -178,6 +193,11 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::LineNumberOutOfRange => {
                 f.write_str("The line number specified for #line directive is out of range")
             }
+            DiagnosticKind::ExpressionExpected => f.write_str("Invalid expression term"),
+            DiagnosticKind::TokenExpected { expected } => {
+                write!(f, "Syntax error, '{expected}' expected")
+            }
+            DiagnosticKind::TypeExpected => f.write_str("Type expected"),
         }
     }
 }
