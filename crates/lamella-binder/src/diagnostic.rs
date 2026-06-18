@@ -147,6 +147,22 @@ pub enum DiagnosticKind {
         /// The local variable's name.
         name: Box<str>,
     },
+    /// `CS0234`: a name does not exist in the given namespace.
+    NamespaceMemberNotFound {
+        /// The namespace that was searched.
+        namespace: Box<str>,
+        /// The name that was not found in it.
+        name: Box<str>,
+    },
+    /// `CS0104`: a simple name is ambiguous between two imported namespaces.
+    AmbiguousReference {
+        /// The ambiguous simple name.
+        name: Box<str>,
+        /// One candidate's full name.
+        first: Box<str>,
+        /// Another candidate's full name.
+        second: Box<str>,
+    },
 }
 
 impl DiagnosticKind {
@@ -172,6 +188,8 @@ impl DiagnosticKind {
             DiagnosticKind::NotAllPathsReturn { .. } => 161,
             DiagnosticKind::CannotCast { .. } => 30,
             DiagnosticKind::UseOfUnassignedLocal { .. } => 165,
+            DiagnosticKind::NamespaceMemberNotFound { .. } => 234,
+            DiagnosticKind::AmbiguousReference { .. } => 104,
         }
     }
 }
@@ -249,6 +267,18 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::UseOfUnassignedLocal { name } => {
                 write!(f, "Use of unassigned local variable '{name}'")
             }
+            DiagnosticKind::NamespaceMemberNotFound { namespace, name } => write!(
+                f,
+                "The type or namespace name '{name}' does not exist in the namespace '{namespace}'"
+            ),
+            DiagnosticKind::AmbiguousReference {
+                name,
+                first,
+                second,
+            } => write!(
+                f,
+                "'{name}' is an ambiguous reference between '{first}' and '{second}'"
+            ),
         }
     }
 }

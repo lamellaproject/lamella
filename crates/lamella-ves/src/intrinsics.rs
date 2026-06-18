@@ -310,6 +310,81 @@ pub fn string_get_chars(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Tr
     Ok(Some(Value::Int32(i32::from(*unit))))
 }
 
+/// `System.String.op_Inequality(string, string)`: ordinal inequality as a `bool`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if either argument is a non-string value.
+pub fn string_not_equals(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let left = string_opt(vm, args.first())?;
+    let right = string_opt(vm, args.get(1))?;
+    Ok(Some(Value::Int32(i32::from(left != right))))
+}
+
+/// `System.String.IsNullOrEmpty(string)`: true for a null or zero-length string.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is a non-string value.
+pub fn string_is_null_or_empty(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let value = string_opt(vm, args.first())?;
+    let empty = value.is_none_or(|chars| chars.is_empty());
+    Ok(Some(Value::Int32(i32::from(empty))))
+}
+
+/// `System.String.Substring(int)`: the tail from `startIndex` (which may equal the
+/// length, giving the empty string). The string is `this`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for bad argument types; [`Trap::IndexOutOfRange`] if
+/// `startIndex` is negative or past the end.
+pub fn string_substring(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(start)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let start = usize::try_from(start)
+        .ok()
+        .filter(|&start| start <= chars.len())
+        .ok_or(Trap::IndexOutOfRange(start))?;
+    let reference = vm.heap_mut().alloc_string(&chars[start..]);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.Substring(int, int)`: `length` units from `startIndex`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for bad argument types; [`Trap::IndexOutOfRange`] if the
+/// range falls outside the string.
+pub fn string_substring_len(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(start)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(length)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let start = usize::try_from(start).map_err(|_| Trap::IndexOutOfRange(start))?;
+    let count = usize::try_from(length).map_err(|_| Trap::IndexOutOfRange(length))?;
+    let end = start
+        .checked_add(count)
+        .filter(|&end| end <= chars.len())
+        .ok_or(Trap::IndexOutOfRange(length))?;
+    let reference = vm.heap_mut().alloc_string(&chars[start..end]);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.Concat(string, string, string)`: join three strings into a new
+/// one (a null argument is the empty string).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if any argument is a non-string value.
+pub fn string_concat3(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let mut chars = string_arg_chars(vm, args.first())?;
+    chars.extend_from_slice(&string_arg_chars(vm, args.get(1))?);
+    chars.extend_from_slice(&string_arg_chars(vm, args.get(2))?);
+    let reference = vm.heap_mut().alloc_string(&chars);
+    Ok(Some(Value::Object(reference)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

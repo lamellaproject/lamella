@@ -16,8 +16,9 @@ use lamella_ves::intrinsics::{
     console_write, console_write_bool, console_write_char, console_write_double,
     console_write_int32, console_write_int64, console_write_line, console_write_line_bool,
     console_write_line_char, console_write_line_double, console_write_line_empty,
-    console_write_line_int32, console_write_line_int64, string_concat, string_equals,
-    string_get_chars, string_get_length,
+    console_write_line_int32, console_write_line_int64, string_concat, string_concat3,
+    string_equals, string_get_chars, string_get_length, string_is_null_or_empty, string_not_equals,
+    string_substring, string_substring_len,
 };
 use lamella_ves::{IntrinsicFn, MethodId, Module};
 
@@ -184,6 +185,9 @@ fn bcl_intrinsic(
         ("String", "get_Length") => string_get_length_overload(signature),
         ("String", "get_Chars") => string_get_chars_overload(signature),
         ("String", "op_Equality") => string_equals_overload(signature),
+        ("String", "op_Inequality") => string_not_equals_overload(signature),
+        ("String", "IsNullOrEmpty") => string_is_null_or_empty_overload(signature),
+        ("String", "Substring") => string_substring_overload(signature),
         _ => None,
     }
 }
@@ -230,6 +234,7 @@ fn console_write_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> 
 fn string_concat_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
     match parameters_of(signature) {
         [SigType::String, SigType::String] => Some(string_concat),
+        [SigType::String, SigType::String, SigType::String] => Some(string_concat3),
         _ => None,
     }
 }
@@ -246,6 +251,31 @@ fn string_get_length_overload(signature: Option<&MethodSig>) -> Option<Intrinsic
 fn string_equals_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
     match parameters_of(signature) {
         [SigType::String, SigType::String] => Some(string_equals),
+        _ => None,
+    }
+}
+
+/// The `String.op_Inequality(string, string)` operator (`!=`).
+fn string_not_equals_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::String, SigType::String] => Some(string_not_equals),
+        _ => None,
+    }
+}
+
+/// `String.IsNullOrEmpty(string)` -- a static one-string predicate.
+fn string_is_null_or_empty_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::String] => Some(string_is_null_or_empty),
+        _ => None,
+    }
+}
+
+/// `String.Substring(int)` / `Substring(int, int)` -- instance methods.
+fn string_substring_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::I4] => Some(string_substring),
+        [SigType::I4, SigType::I4] => Some(string_substring_len),
         _ => None,
     }
 }

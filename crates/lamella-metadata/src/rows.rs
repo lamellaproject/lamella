@@ -76,6 +76,9 @@ pub fn columns(table_number: u8) -> Option<&'static [Col]> {
         table::EXPORTED_TYPE => &[U32, U32, Str, Str, Coded(C::Implementation)],
         table::MANIFEST_RESOURCE => &[U32, U32, Str, Coded(C::Implementation)],
         table::NESTED_CLASS => &[Idx(table::TYPE_DEF), Idx(table::TYPE_DEF)],
+        table::GENERIC_PARAM => &[U16, U16, Coded(C::TypeOrMethodDef), Str],
+        table::METHOD_SPEC => &[Coded(C::MethodDefOrRef), Blob],
+        table::GENERIC_PARAM_CONSTRAINT => &[Idx(table::GENERIC_PARAM), Coded(C::TypeDefOrRef)],
         _ => return None,
     })
 }
@@ -269,5 +272,24 @@ mod tests {
         assert!(tables.row(table::TYPE_DEF, 0).is_none());
         assert!(tables.row(table::TYPE_DEF, 2).is_none());
         assert!(tables.row(table::FIELD, 1).is_none());
+    }
+
+    #[test]
+    fn the_generics_tables_have_a_known_row_size() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&[2, 0, 0, 0]);
+        let valid = (1u64 << table::GENERIC_PARAM)
+            | (1u64 << table::METHOD_SPEC)
+            | (1u64 << table::GENERIC_PARAM_CONSTRAINT);
+        stream.extend_from_slice(&valid.to_le_bytes());
+        stream.extend_from_slice(&0u64.to_le_bytes());
+        stream.extend_from_slice(&1u32.to_le_bytes());
+        stream.extend_from_slice(&1u32.to_le_bytes());
+        stream.extend_from_slice(&1u32.to_le_bytes());
+        let header = TablesHeader::parse(&stream).unwrap();
+        assert!(row_size(table::GENERIC_PARAM, &header).is_some());
+        assert!(row_size(table::METHOD_SPEC, &header).is_some());
+        assert!(row_size(table::GENERIC_PARAM_CONSTRAINT, &header).is_some());
     }
 }

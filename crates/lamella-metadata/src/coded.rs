@@ -34,6 +34,8 @@ pub enum CodedIndex {
     CustomAttributeType,
     /// `ResolutionScope`: Module, ModuleRef, AssemblyRef, TypeRef.
     ResolutionScope,
+    /// `TypeOrMethodDef`: TypeDef, MethodDef (the owner of a generic parameter).
+    TypeOrMethodDef,
 }
 
 impl CodedIndex {
@@ -84,6 +86,7 @@ impl CodedIndex {
                 table::ASSEMBLY_REF,
                 table::TYPE_REF,
             ],
+            CodedIndex::TypeOrMethodDef => &[table::TYPE_DEF, table::METHOD_DEF],
         }
     }
 

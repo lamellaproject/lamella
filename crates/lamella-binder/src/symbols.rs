@@ -188,6 +188,18 @@ impl Model {
             .is_some_and(|info| info.kind == TypeKind::Class)
     }
 
+    /// Whether `namespace` is a declared namespace -- some type lives in it or in a
+    /// namespace nested under it.
+    #[must_use]
+    pub fn is_namespace(&self, namespace: &str) -> bool {
+        self.types.keys().any(|(type_namespace, _)| {
+            type_namespace == namespace
+                || type_namespace
+                    .strip_prefix(namespace)
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    }
+
     /// The existence-only [`TypeTable`] for plain type-name resolution.
     #[must_use]
     pub fn type_table(&self) -> TypeTable {

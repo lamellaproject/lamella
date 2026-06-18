@@ -11,6 +11,8 @@ pub mod conversion;
 pub mod declaration;
 pub mod diagnostic;
 pub mod flow;
+pub mod program;
+pub mod reference;
 pub mod resolve;
 pub mod special;
 pub mod statement;
@@ -23,6 +25,10 @@ pub use conversion::has_implicit_conversion;
 pub use declaration::{collect_model, collect_types};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use flow::{always_exits, check_definite_assignment};
+pub use program::{
+    bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references,
+};
+pub use reference::load_assembly;
 pub use resolve::{TypeTable, resolve_type};
 pub use special::SpecialType;
 pub use statement::{BoundCatch, BoundDeclarator, BoundStmt, BoundStmtKind};

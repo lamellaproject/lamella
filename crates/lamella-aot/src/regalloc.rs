@@ -70,6 +70,29 @@ impl Liveness {
         Liveness { live_in, live_out }
     }
 
+    /// Whether any value is live across a call -- defined before a call and used
+    /// after it. Such a value cannot survive in a caller-saved register, which the
+    /// call clobbers, so the lowering keeps it on the stack instead.
+    pub fn any_value_live_across_call(&self, func: &Function) -> bool {
+        for (b, block) in func.blocks.iter().enumerate() {
+            let mut live = self.live_out[b].clone();
+            each_terminator_use(&block.terminator, |u| set(&mut live, u));
+            for (result, inst) in block.insts.iter().rev() {
+                if matches!(inst, Inst::Call { .. })
+                    && live
+                        .iter()
+                        .enumerate()
+                        .any(|(v, &alive)| alive && v != result.index())
+                {
+                    return true;
+                }
+                live[result.index()] = false;
+                each_inst_use(inst, |u| set(&mut live, u));
+            }
+        }
+        false
+    }
+
     /// Whether `value` is live on entry to block `block`.
     pub fn live_in(&self, block: usize, value: ValueId) -> bool {
         self.live_in

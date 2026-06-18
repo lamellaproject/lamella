@@ -67,6 +67,12 @@ pub mod table {
     pub const MANIFEST_RESOURCE: u8 = 0x28;
     /// `NestedClass` (II.22.32).
     pub const NESTED_CLASS: u8 = 0x29;
+    /// `GenericParam` (II.22.20).
+    pub const GENERIC_PARAM: u8 = 0x2A;
+    /// `MethodSpec` (II.22.29).
+    pub const METHOD_SPEC: u8 = 0x2B;
+    /// `GenericParamConstraint` (II.22.21).
+    pub const GENERIC_PARAM_CONSTRAINT: u8 = 0x2C;
 }
 
 /// An error parsing the tables-stream header.

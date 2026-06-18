@@ -261,6 +261,7 @@ impl Analyzer {
             | BoundExprKind::This
             | BoundExprKind::Base
             | BoundExprKind::TypeReference(_)
+            | BoundExprKind::NamespaceReference(_)
             | BoundExprKind::TypeOf
             | BoundExprKind::Error => {}
             BoundExprKind::FieldAccess { receiver, .. }

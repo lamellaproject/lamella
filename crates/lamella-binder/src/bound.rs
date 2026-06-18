@@ -43,6 +43,9 @@ pub enum BoundExprKind {
     /// A type name used as the receiver of a static member access (14.5.4). Its
     /// type is the named type so member lookup reaches the type's members.
     TypeReference(TypeSymbol),
+    /// A namespace name used as the receiver of a qualified name (10.8). Not a
+    /// value; only a step in resolving a qualified type name.
+    NamespaceReference(Box<str>),
     /// Access to an instance or static field through a receiver (14.5.4); the
     /// expression's type is the field's.
     FieldAccess {
@@ -174,6 +177,7 @@ pub struct Binder {
     model: Model,
     current_type: Option<TypeSymbol>,
     current_method: Option<MethodContext>,
+    imported_namespaces: Vec<Box<str>>,
 }
 
 impl Binder {
@@ -242,6 +246,52 @@ impl Binder {
         self.current_type = None;
     }
 
+    /// Brings a namespace into scope for unqualified type-name resolution (a
+    /// `using` directive, 16.3).
+    pub fn import_namespace(&mut self, namespace: &str) {
+        self.imported_namespaces.push(namespace.into());
+    }
+
+    /// A marker for the current set of imported namespaces, to scope the usings of
+    /// a namespace block: snapshot before, restore after.
+    #[must_use]
+    pub fn import_scope(&self) -> usize {
+        self.imported_namespaces.len()
+    }
+
+    /// Restores the imported namespaces to an earlier [`Binder::import_scope`].
+    pub fn restore_import_scope(&mut self, scope: usize) {
+        self.imported_namespaces.truncate(scope);
+    }
+
+    /// The current type's namespace, if any, for unqualified type resolution.
+    fn current_namespace(&self) -> Option<Box<str>> {
+        match &self.current_type {
+            Some(TypeSymbol::Named(parts)) if parts.len() > 1 => {
+                Some(parts[..parts.len() - 1].join(".").into())
+            }
+            _ => None,
+        }
+    }
+
+    /// The distinct in-scope namespaces (current, global, and imported) that hold
+    /// a type with this name.
+    fn type_namespaces_containing(&self, name: &str) -> Vec<Box<str>> {
+        let mut search: Vec<Box<str>> = Vec::new();
+        if let Some(current) = self.current_namespace() {
+            search.push(current);
+        }
+        search.push(Box::from(""));
+        search.extend(self.imported_namespaces.iter().cloned());
+        let mut hits: Vec<Box<str>> = Vec::new();
+        for namespace in search {
+            if self.model.get(&namespace, name).is_some() && !hits.contains(&namespace) {
+                hits.push(namespace);
+            }
+        }
+        hits
+    }
+
     /// Binds a method body end to end: the enclosing type is in scope for `this`
     /// and unqualified names, the parameters are declared as locals, and `return`
     /// statements are checked against `return_type` (15.9.4). Returns the bound
@@ -287,6 +337,30 @@ impl Binder {
         self.current_method = None;
         self.current_type = None;
         bound
+    }
+
+    /// Binds a field initializer in `enclosing`'s context and checks it converts
+    /// to the field's type (`CS0029`).
+    pub fn bind_field_initializer(
+        &mut self,
+        enclosing: TypeSymbol,
+        field_type: &TypeSymbol,
+        initializer: &Expr,
+    ) {
+        self.current_type = Some(enclosing);
+        self.enter_scope();
+        let value = self.bind_expression(initializer);
+        if !value.ty.is_error() && !field_type.is_error() && !self.converts(&value.ty, field_type) {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::NoImplicitConversion {
+                    from: value.ty.to_string().into(),
+                    to: field_type.to_string().into(),
+                },
+                initializer.span,
+            ));
+        }
+        self.exit_scope();
+        self.current_type = None;
     }
 
     /// Checks a `return` statement against the enclosing method's return type
@@ -695,6 +769,10 @@ impl Binder {
 
     fn bind_member_access(&mut self, receiver_expr: &Expr, name: &str, span: Span) -> BoundExpr {
         let receiver = self.bind_expression(receiver_expr);
+        if let BoundExprKind::NamespaceReference(namespace) = &receiver.kind {
+            let namespace = namespace.clone();
+            return self.bind_qualified_name(&namespace, name, span);
+        }
         if receiver.ty.is_error() {
             return error_expr();
         }
@@ -1002,15 +1080,61 @@ impl Binder {
                 MemberResolution::NoSuchMember(_) | MemberResolution::Unknown => {}
             }
         }
-        if self.model.get("", name).is_some() {
-            let ty = TypeSymbol::Named([Box::from(name)].into());
+        let hits = self.type_namespaces_containing(name);
+        if hits.len() == 1 {
+            let ty = type_symbol_in(&hits[0], name);
             return BoundExpr {
                 kind: BoundExprKind::TypeReference(ty.clone()),
                 ty,
             };
         }
+        if hits.len() >= 2 {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::AmbiguousReference {
+                    name: name.into(),
+                    first: full_type_name(&hits[0], name),
+                    second: full_type_name(&hits[1], name),
+                },
+                span,
+            ));
+            return error_expr();
+        }
+        if self.model.is_namespace(name) {
+            return BoundExpr {
+                kind: BoundExprKind::NamespaceReference(name.into()),
+                ty: TypeSymbol::Error,
+            };
+        }
         self.diagnostics.push(Diagnostic::new(
             DiagnosticKind::NameNotFound { name: name.into() },
+            span,
+        ));
+        error_expr()
+    }
+
+    /// Resolves `namespace.name`: a nested namespace, a type, or `CS0234`.
+    fn bind_qualified_name(&mut self, namespace: &str, name: &str, span: Span) -> BoundExpr {
+        if self.model.get(namespace, name).is_some() {
+            let ty = qualified_type_symbol(namespace, name);
+            return BoundExpr {
+                kind: BoundExprKind::TypeReference(ty.clone()),
+                ty,
+            };
+        }
+        let mut nested = String::from(namespace);
+        nested.push('.');
+        nested.push_str(name);
+        if self.model.is_namespace(&nested) {
+            return BoundExpr {
+                kind: BoundExprKind::NamespaceReference(nested.into()),
+                ty: TypeSymbol::Error,
+            };
+        }
+        self.diagnostics.push(Diagnostic::new(
+            DiagnosticKind::NamespaceMemberNotFound {
+                namespace: namespace.into(),
+                name: name.into(),
+            },
             span,
         ));
         error_expr()
@@ -1102,6 +1226,34 @@ enum MemberResolution {
     NoSuchMember(String),
     /// The type is not in the model, so members cannot be resolved.
     Unknown,
+}
+
+/// A named-type symbol from a (non-empty, dotted) namespace and a simple name.
+fn qualified_type_symbol(namespace: &str, name: &str) -> TypeSymbol {
+    let mut parts: Vec<Box<str>> = namespace.split('.').map(Box::from).collect();
+    parts.push(Box::from(name));
+    TypeSymbol::Named(parts.into_boxed_slice())
+}
+
+/// A named-type symbol from a namespace (possibly empty) and a simple name.
+fn type_symbol_in(namespace: &str, name: &str) -> TypeSymbol {
+    if namespace.is_empty() {
+        TypeSymbol::Named([Box::from(name)].into())
+    } else {
+        qualified_type_symbol(namespace, name)
+    }
+}
+
+/// The full dotted name of a type in a namespace (the bare name when global).
+fn full_type_name(namespace: &str, name: &str) -> Box<str> {
+    if namespace.is_empty() {
+        Box::from(name)
+    } else {
+        let mut full = String::from(namespace);
+        full.push('.');
+        full.push_str(name);
+        full.into()
+    }
 }
 
 /// An error placeholder expression, used for recovery.
@@ -1885,6 +2037,64 @@ mod tests {
         );
         assert_eq!(bound_in_scope(&mut binder, "(Color)1").to_string(), "Color");
         assert!(binder.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn qualified_namespace_names_resolve_to_types() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "namespace A.B { class Widget { } } namespace A { class Top { } }",
+        )
+        .unit;
+        let model = collect_model(&unit);
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+
+        assert_eq!(
+            bound_in_scope(&mut binder, "A.B.Widget").to_string(),
+            "A.B.Widget"
+        );
+        assert_eq!(bound_in_scope(&mut binder, "A.Top").to_string(), "A.Top");
+        assert!(binder.diagnostics().is_empty());
+        bound_in_scope(&mut binder, "A.Nope");
+        assert!(binder.diagnostics().iter().any(|d| d.code() == 234));
+    }
+
+    #[test]
+    fn using_directives_resolve_unqualified_type_names() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "namespace System { class Console { } } \
+             namespace Drawing { class Pen { } } \
+             namespace Text { class Pen { } }",
+        )
+        .unit;
+        let model = collect_model(&unit);
+
+        let mut bare = Binder::with_model(model.clone());
+        bare.enter_scope();
+        bare.bind_expression(&parse_expression("Console").expr);
+        assert!(bare.diagnostics().iter().any(|d| d.code() == 103));
+
+        let mut binder = Binder::with_model(model.clone());
+        binder.import_namespace("System");
+        binder.enter_scope();
+        assert_eq!(
+            bound_in_scope(&mut binder, "Console").to_string(),
+            "System.Console"
+        );
+        assert!(binder.diagnostics().is_empty());
+
+        let mut ambiguous = Binder::with_model(model);
+        ambiguous.import_namespace("Drawing");
+        ambiguous.import_namespace("Text");
+        ambiguous.enter_scope();
+        ambiguous.bind_expression(&parse_expression("Pen").expr);
+        assert!(ambiguous.diagnostics().iter().any(|d| d.code() == 104));
     }
 
     #[test]

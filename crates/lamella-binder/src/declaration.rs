@@ -16,11 +16,17 @@ use lamella_syntax::ast::{
 #[must_use]
 pub fn collect_model(unit: &CompilationUnit) -> Model {
     let mut model = Model::new();
-    for member in &unit.members {
-        collect_namespace_member(member, "", &mut model);
-    }
+    collect_into(&mut model, unit);
     model.link_bases();
     model
+}
+
+/// Adds `unit`'s declared types to an existing model (e.g. one already holding the
+/// reference assemblies). The caller links bases once the model is complete.
+pub fn collect_into(model: &mut Model, unit: &CompilationUnit) {
+    for member in &unit.members {
+        collect_namespace_member(member, "", model);
+    }
 }
 
 /// Builds a [`TypeTable`] of every type declared in `unit` (the existence-only

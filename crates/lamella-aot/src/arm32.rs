@@ -45,6 +45,28 @@ fn cmpop_to_cond(op: CmpOp) -> Cond {
     }
 }
 
+/// Emits `dest = (lhs <op> rhs) ? 1 : 0`. Nothing comes between the compare and the
+/// branch: materializing the 0 or 1 sets the condition flags, so it must follow the
+/// branch rather than sit between the compare and it.
+fn materialize_compare(
+    enc: &mut Encoder,
+    dest: Reg,
+    lhs: Reg,
+    rhs: Reg,
+    op: CmpOp,
+) -> Result<(), AssembleError> {
+    enc.cmp_reg(lhs, rhs)?;
+    let one = enc.new_label();
+    let done = enc.new_label();
+    enc.b_cond(cmpop_to_cond(op), one);
+    enc.movs_imm(dest, 0)?;
+    enc.b(done);
+    enc.bind_label(one);
+    enc.movs_imm(dest, 1)?;
+    enc.bind_label(done);
+    Ok(())
+}
+
 /// Emits register-to-register moves so they take effect as if simultaneous: each
 /// is emitted once nothing else still needs its destination as a source, and a
 /// cycle (such as a register swap) is broken by rescuing one value through the
@@ -110,15 +132,8 @@ fn lower_inst(
             emitted.map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::Compare { op, lhs, rhs } => {
-            enc.cmp_reg(assign(*lhs), assign(*rhs))
+            materialize_compare(enc, assign(result), assign(*lhs), assign(*rhs), *op)
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.movs_imm(assign(result), 1)
-                .map_err(|_| LowerError::TooManyValues)?;
-            let done = enc.new_label();
-            enc.b_cond(cmpop_to_cond(*op), done);
-            enc.movs_imm(assign(result), 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.bind_label(done);
         }
         Inst::Call { .. } => return Err(LowerError::CallUnsupported),
     }
@@ -172,90 +187,186 @@ fn shift(
 /// shuttling operands through scratch registers r0 and r1. The frame is bounded
 /// by the `SUB SP` reach (508 bytes, so up to 127 values); spilling is not yet
 /// combined with control flow.
-fn lower_spilled(func: &Function) -> Result<Vec<u8>, LowerError> {
-    let block = &func.blocks[0];
-    let frame = (func.value_types.len() * 4 + 7) & !7usize;
+/// Lowers one instruction of a spilled function: load its operands from their
+/// stack slots into scratch registers (r0-r3), compute, and leave the result in
+/// r0 for the caller to store.
+fn lower_spilled_inst(
+    enc: &mut Encoder,
+    pool: &mut Vec<(Label, u32)>,
+    slot: &impl Fn(ValueId) -> u16,
+    inst: &Inst,
+    func_labels: &[Label],
+) -> Result<(), LowerError> {
+    match inst {
+        Inst::ConstInt { value, .. } => {
+            if let Ok(imm) = u8::try_from(*value) {
+                enc.movs_imm(Reg::R0, imm)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                let entry = enc.new_label();
+                enc.ldr_literal(Reg::R0, entry)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                pool.push((entry, *value as u32));
+            }
+        }
+        Inst::Binary { op, lhs, rhs } => {
+            enc.ldr_sp(Reg::R0, slot(*lhs))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*rhs))
+                .map_err(|_| LowerError::TooManyValues)?;
+            let emitted = match op {
+                BinOp::Add => enc.adds(Reg::R0, Reg::R0, Reg::R1),
+                BinOp::Sub => enc.subs(Reg::R0, Reg::R0, Reg::R1),
+                BinOp::And => enc.ands(Reg::R0, Reg::R1),
+                BinOp::Or => enc.orrs(Reg::R0, Reg::R1),
+                BinOp::Xor => enc.eors(Reg::R0, Reg::R1),
+                BinOp::Mul => enc.muls(Reg::R0, Reg::R1),
+                BinOp::Shl => enc.lsls_reg(Reg::R0, Reg::R1),
+                BinOp::ShrSigned => enc.asrs_reg(Reg::R0, Reg::R1),
+                BinOp::ShrUnsigned => enc.lsrs_reg(Reg::R0, Reg::R1),
+            };
+            emitted.map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::Compare { op, lhs, rhs } => {
+            enc.ldr_sp(Reg::R0, slot(*lhs))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*rhs))
+                .map_err(|_| LowerError::TooManyValues)?;
+            materialize_compare(enc, Reg::R0, Reg::R0, Reg::R1, *op)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::Call { callee, args } => {
+            if args.len() > 4 {
+                return Err(LowerError::CallUnsupported);
+            }
+            for (i, a) in args.iter().enumerate() {
+                let r = Reg::new(i as u8).ok_or(LowerError::TooManyValues)?;
+                enc.ldr_sp(r, slot(*a))
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+            let target = *func_labels
+                .get(*callee as usize)
+                .ok_or(LowerError::CallUnsupported)?;
+            enc.bl(target);
+        }
+    }
+    Ok(())
+}
+
+/// Lowers a function whose values do not fit in registers into a shared encoder.
+/// Every value gets a stack slot; each instruction loads its operands into scratch
+/// registers, computes, and stores the result. Control flow is handled: because a
+/// block's parameter values are distinct from any argument value, the parameter
+/// copies on a jump need no ordering. `func_labels` resolves calls.
+fn lower_spilled_into(
+    func: &Function,
+    enc: &mut Encoder,
+    func_labels: &[Label],
+) -> Result<(), LowerError> {
+    let has_calls = func
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
+    let lr_bytes = if has_calls { 4 } else { 0 };
+    let frame = ((func.value_types.len() * 4 + lr_bytes + 7) & !7usize) - lr_bytes;
     if frame > 508 {
         return Err(LowerError::TooManyValues);
     }
     let frame = frame as u16;
     let slot = |v: ValueId| (v.0 as u16) * 4;
 
-    let mut enc = Encoder::new();
     let mut pool: Vec<(Label, u32)> = Vec::new();
+    if has_calls {
+        enc.push_registers(0, true);
+    }
     enc.sub_sp(frame).map_err(|_| LowerError::TooManyValues)?;
 
-    for (i, &param) in block.params.iter().enumerate() {
-        if i >= 4 {
-            return Err(LowerError::TooManyValues);
-        }
-        let arg = Reg::new(i as u8).ok_or(LowerError::TooManyValues)?;
+    let entry_block = func
+        .blocks
+        .get(func.entry.index())
+        .ok_or(LowerError::ControlFlowUnsupported)?;
+    for (i, &param) in entry_block.params.iter().enumerate() {
+        let arg = Reg::new(i as u8)
+            .filter(|_| i < 4)
+            .ok_or(LowerError::TooManyValues)?;
         enc.str_sp(arg, slot(param))
             .map_err(|_| LowerError::TooManyValues)?;
     }
 
-    for (result, inst) in &block.insts {
-        match inst {
-            Inst::ConstInt { value, .. } => {
-                if let Ok(imm) = u8::try_from(*value) {
-                    enc.movs_imm(Reg::R0, imm)
-                        .map_err(|_| LowerError::TooManyValues)?;
-                } else {
-                    let entry = enc.new_label();
-                    enc.ldr_literal(Reg::R0, entry)
-                        .map_err(|_| LowerError::TooManyValues)?;
-                    pool.push((entry, *value as u32));
-                }
-            }
-            Inst::Binary { op, lhs, rhs } => {
-                enc.ldr_sp(Reg::R0, slot(*lhs))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R1, slot(*rhs))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                let emitted = match op {
-                    BinOp::Add => enc.adds(Reg::R0, Reg::R0, Reg::R1),
-                    BinOp::Sub => enc.subs(Reg::R0, Reg::R0, Reg::R1),
-                    BinOp::And => enc.ands(Reg::R0, Reg::R1),
-                    BinOp::Or => enc.orrs(Reg::R0, Reg::R1),
-                    BinOp::Xor => enc.eors(Reg::R0, Reg::R1),
-                    BinOp::Mul => enc.muls(Reg::R0, Reg::R1),
-                    BinOp::Shl => enc.lsls_reg(Reg::R0, Reg::R1),
-                    BinOp::ShrSigned => enc.asrs_reg(Reg::R0, Reg::R1),
-                    BinOp::ShrUnsigned => enc.lsrs_reg(Reg::R0, Reg::R1),
-                };
-                emitted.map_err(|_| LowerError::TooManyValues)?;
-            }
-            Inst::Compare { op, lhs, rhs } => {
-                enc.ldr_sp(Reg::R0, slot(*lhs))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R1, slot(*rhs))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.cmp_reg(Reg::R0, Reg::R1)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.movs_imm(Reg::R0, 1)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                let done = enc.new_label();
-                enc.b_cond(cmpop_to_cond(*op), done);
-                enc.movs_imm(Reg::R0, 0)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.bind_label(done);
-            }
-            Inst::Call { .. } => return Err(LowerError::CallUnsupported),
-        }
-        enc.str_sp(Reg::R0, slot(*result))
-            .map_err(|_| LowerError::TooManyValues)?;
+    let block_labels: Vec<Label> = (0..func.blocks.len()).map(|_| enc.new_label()).collect();
+    match block_labels.get(func.entry.index()) {
+        Some(entry) if func.entry != BlockId(0) => enc.b(*entry),
+        Some(_) => {}
+        None => return Err(LowerError::ControlFlowUnsupported),
     }
 
-    match &block.terminator {
-        Some(Terminator::Return(value)) => {
-            if let Some(v) = value {
-                enc.ldr_sp(Reg::R0, slot(*v))
-                    .map_err(|_| LowerError::TooManyValues)?;
-            }
-            enc.add_sp(frame).map_err(|_| LowerError::TooManyValues)?;
-            enc.bx(Reg::LR);
+    for (index, block) in func.blocks.iter().enumerate() {
+        enc.bind_label(block_labels[index]);
+        for (result, inst) in &block.insts {
+            lower_spilled_inst(enc, &mut pool, &slot, inst, func_labels)?;
+            enc.str_sp(Reg::R0, slot(*result))
+                .map_err(|_| LowerError::TooManyValues)?;
         }
-        _ => return Err(LowerError::ControlFlowUnsupported),
+        match &block.terminator {
+            Some(Terminator::Return(value)) => {
+                if let Some(v) = value {
+                    enc.ldr_sp(Reg::R0, slot(*v))
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                enc.add_sp(frame).map_err(|_| LowerError::TooManyValues)?;
+                if has_calls {
+                    enc.pop_registers(0, true);
+                } else {
+                    enc.bx(Reg::LR);
+                }
+            }
+            Some(Terminator::Jump { target, args }) => {
+                let params = &func
+                    .block(*target)
+                    .ok_or(LowerError::ControlFlowUnsupported)?
+                    .params;
+                if args.len() != params.len() {
+                    return Err(LowerError::ControlFlowUnsupported);
+                }
+                for (p, a) in params.iter().zip(args) {
+                    enc.ldr_sp(Reg::R0, slot(*a))
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.str_sp(Reg::R0, slot(*p))
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                let label = *block_labels
+                    .get(target.index())
+                    .ok_or(LowerError::ControlFlowUnsupported)?;
+                enc.b(label);
+            }
+            Some(Terminator::Branch {
+                cond,
+                if_true,
+                true_args,
+                if_false,
+                false_args,
+            }) => {
+                if !true_args.is_empty() || !false_args.is_empty() {
+                    return Err(LowerError::ControlFlowUnsupported);
+                }
+                let true_label = *block_labels
+                    .get(if_true.index())
+                    .ok_or(LowerError::ControlFlowUnsupported)?;
+                let false_label = *block_labels
+                    .get(if_false.index())
+                    .ok_or(LowerError::ControlFlowUnsupported)?;
+                enc.ldr_sp(Reg::R0, slot(*cond))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.cmp_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.b_cond(Cond::Ne, true_label);
+                enc.b(false_label);
+            }
+            Some(Terminator::Unreachable) => {
+                enc.udf(0);
+            }
+            None => return Err(LowerError::ControlFlowUnsupported),
+        }
     }
 
     if !pool.is_empty() {
@@ -265,22 +376,18 @@ fn lower_spilled(func: &Function) -> Result<Vec<u8>, LowerError> {
             enc.emit_word(value);
         }
     }
-
-    enc.finish()
-        .map(|assembled| assembled.bytes)
-        .map_err(|_| LowerError::CodeTooLarge)
+    Ok(())
 }
 
 /// Lowers an integer [`Function`] -- straight-line or branching -- to ARMv6-M
 /// Thumb machine code via the AAPCS convention. See the module documentation for
 /// the supported slice.
 /// How a function's values are placed: in registers (with the callee-saved set to
-/// preserve), or spilled to the stack (handled only for one straight-line block so
-/// far).
+/// preserve), or spilled to the stack when more values are live at once than there
+/// are registers.
 enum Assignment {
     Registers { regs: Vec<Reg>, saved: u8 },
-    SpilledSingleBlock,
-    TooMany,
+    Spilled,
 }
 
 /// Verifies `func` and decides where its values live.
@@ -291,6 +398,13 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     if func.value_types.iter().any(|ty| !ty.is_integer()) {
         return Err(LowerError::NonIntegerValue);
     }
+    let has_calls = func
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
+    if has_calls && crate::regalloc::Liveness::analyze(func).any_value_live_across_call(func) {
+        return Ok(Assignment::Spilled);
+    }
     let regs: Vec<Reg> = if func.value_types.len() <= 8 {
         (0..func.value_types.len())
             .map(|i| Reg::new(i as u8).unwrap_or(Reg::R0))
@@ -300,11 +414,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
         let intervals = crate::regalloc::live_intervals(func, &live);
         let allocation = crate::regalloc::allocate(&intervals, 8);
         if allocation.spill_count > 0 {
-            return Ok(if func.blocks.len() == 1 {
-                Assignment::SpilledSingleBlock
-            } else {
-                Assignment::TooMany
-            });
+            return Ok(Assignment::Spilled);
         }
         allocation
             .locations
@@ -496,17 +606,14 @@ fn lower_into(
 /// Lowers a single function to ARM32 machine code. A function that calls another
 /// must go through [`lower_module`], which resolves the call targets.
 pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
+    let mut enc = Encoder::new();
     match prepare(func)? {
-        Assignment::Registers { regs, saved } => {
-            let mut enc = Encoder::new();
-            lower_into(func, &mut enc, &regs, saved, &[])?;
-            enc.finish()
-                .map(|assembled| assembled.bytes)
-                .map_err(|_| LowerError::CodeTooLarge)
-        }
-        Assignment::SpilledSingleBlock => lower_spilled(func),
-        Assignment::TooMany => Err(LowerError::TooManyValues),
+        Assignment::Registers { regs, saved } => lower_into(func, &mut enc, &regs, saved, &[])?,
+        Assignment::Spilled => lower_spilled_into(func, &mut enc, &[])?,
     }
+    enc.finish()
+        .map(|assembled| assembled.bytes)
+        .map_err(|_| LowerError::CodeTooLarge)
 }
 
 /// Lowers a whole program -- several functions concatenated into one image, the
@@ -516,12 +623,12 @@ pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     for (index, func) in funcs.iter().enumerate() {
+        enc.bind_label(func_labels[index]);
         match prepare(func)? {
             Assignment::Registers { regs, saved } => {
-                enc.bind_label(func_labels[index]);
                 lower_into(func, &mut enc, &regs, saved, &func_labels)?;
             }
-            _ => return Err(LowerError::TooManyValues),
+            Assignment::Spilled => lower_spilled_into(func, &mut enc, &func_labels)?,
         }
     }
     enc.finish()
@@ -655,6 +762,153 @@ mod tests {
         assert!(!bytes.is_empty());
         assert_eq!(&bytes[0..2], &[0x00, 0xB5]);
         assert_eq!(&bytes[bytes.len() - 2..], &[0x70, 0x47]);
+    }
+
+    fn spilled_branch_function() -> Function {
+        let value_types = vec![MirType::I32; 20];
+        let mut block0: Vec<(ValueId, Inst)> = (0..10)
+            .map(|i| {
+                (
+                    ValueId(i),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i64::from(i) + 1,
+                    },
+                )
+            })
+            .collect();
+        block0.push((
+            ValueId(10),
+            Inst::Compare {
+                op: CmpOp::SignedLt,
+                lhs: ValueId(0),
+                rhs: ValueId(9),
+            },
+        ));
+        let mut block1: Vec<(ValueId, Inst)> = vec![(
+            ValueId(11),
+            Inst::Binary {
+                op: BinOp::Add,
+                lhs: ValueId(0),
+                rhs: ValueId(1),
+            },
+        )];
+        for i in 0..8 {
+            block1.push((
+                ValueId(12 + i),
+                Inst::Binary {
+                    op: BinOp::Add,
+                    lhs: ValueId(11 + i),
+                    rhs: ValueId(2 + i),
+                },
+            ));
+        }
+        Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types,
+            entry: BlockId(0),
+            blocks: vec![
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: block0,
+                    terminator: Some(Terminator::Branch {
+                        cond: ValueId(10),
+                        if_true: BlockId(1),
+                        true_args: Vec::new(),
+                        if_false: BlockId(2),
+                        false_args: Vec::new(),
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: block1,
+                    terminator: Some(Terminator::Return(Some(ValueId(19)))),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: Vec::new(),
+                    terminator: Some(Terminator::Return(Some(ValueId(0)))),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn lowers_a_spilled_branch() {
+        let func = spilled_branch_function();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert_eq!(bytes[1], 0xB0);
+        assert_eq!(&bytes[bytes.len() - 2..], &[0x70, 0x47]);
+    }
+
+    fn cross_call_example() -> [Function; 2] {
+        let g = Function {
+            params: vec![MirType::I32],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 1,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let f = Function {
+            params: vec![MirType::I32],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: vec![ValueId(0)],
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(1),
+                            rhs: ValueId(0),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        [f, g]
+    }
+
+    #[test]
+    fn a_value_live_across_a_call_spills() {
+        let module = cross_call_example();
+        assert!(
+            crate::regalloc::Liveness::analyze(&module[0]).any_value_live_across_call(&module[0])
+        );
+        let bytes = lower_module(&module).unwrap();
+        assert_eq!(&bytes[0..2], &[0x00, 0xB5]);
     }
 
     #[test]

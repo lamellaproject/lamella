@@ -26,7 +26,9 @@ version = "0.0.0"
 name = "lamella-binder"
 version = "0.0.0"
 dependencies = [
+ "lamella-metadata",
  "lamella-syntax",
+ "lamella-token",
 ]
 
 [[package]]

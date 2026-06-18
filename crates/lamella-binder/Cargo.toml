@@ -9,6 +9,9 @@ description = "Semantic analysis for C# 1.0: name and type resolution, type chec
 
 [dependencies]
 lamella-syntax = { path = "../lamella-syntax" }
+# Reading reference assemblies (the BCL, the parity reference set) into the model.
+lamella-metadata = { path = "../lamella-metadata" }
+lamella-token = { path = "../lamella-token" }
 
 [lints]
 workspace = true
