@@ -1,0 +1,11 @@
+# Build output
+/target/
+
+# Reference specifications
+/reference/*.pdf
+/reference/*.txt
+
+# OS and editor noise.
+Thumbs.db
+desktop.ini
+.DS_Store
