@@ -1,15 +1,17 @@
 [package]
-name = "lamella-ves"
+name = "lamella-load"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The Lamella virtual execution system: a CIL interpreter implemented from ECMA-335."
+description = "Loads an ECMA-335 assembly into a runnable lamella-ves module."
 
 [dependencies]
 lamella-cil = { path = "../lamella-cil" }
+lamella-metadata = { path = "../lamella-metadata" }
 lamella-token = { path = "../lamella-token" }
+lamella-ves = { path = "../lamella-ves" }
 
 [lints]
 workspace = true

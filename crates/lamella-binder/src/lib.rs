@@ -13,14 +13,16 @@ pub mod diagnostic;
 pub mod resolve;
 pub mod special;
 pub mod statement;
+pub mod symbols;
 pub mod types;
 
 pub use bind::bind_type;
 pub use bound::{Binder, BoundExpr, BoundExprKind, bind_expression};
 pub use conversion::has_implicit_conversion;
-pub use declaration::collect_types;
+pub use declaration::{collect_model, collect_types};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use resolve::{TypeTable, resolve_type};
 pub use special::SpecialType;
 pub use statement::{BoundDeclarator, BoundStmt, BoundStmtKind};
+pub use symbols::{FieldSymbol, MethodSymbol, Model, TypeInfo, TypeKind};
 pub use types::TypeSymbol;

@@ -15,6 +15,7 @@ dependencies = [
  "lamella-asm-arm32",
  "lamella-cil",
  "lamella-ir",
+ "lamella-metadata",
 ]
 
 [[package]]
@@ -40,6 +41,8 @@ name = "lamella-dap"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-load",
+ "lamella-metadata",
  "lamella-token",
  "lamella-ves",
  "serde",
@@ -47,8 +50,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-gc"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-ir"
 version = "0.0.0"
+
+[[package]]
+name = "lamella-load"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil",
+ "lamella-metadata",
+ "lamella-token",
+ "lamella-ves",
+]
 
 [[package]]
 name = "lamella-metadata"
@@ -71,7 +88,6 @@ name = "lamella-ves"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
- "lamella-metadata",
  "lamella-token",
 ]
 

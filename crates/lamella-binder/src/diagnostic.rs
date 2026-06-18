@@ -80,6 +80,39 @@ pub enum DiagnosticKind {
     },
     /// `CS0131`: the target of an assignment is not a variable, property, or indexer.
     NotAssignable,
+    /// `CS0117`: the type does not contain a definition for the named member.
+    MemberNotFound {
+        /// The type the member was looked for on.
+        type_name: Box<str>,
+        /// The member name that was not found.
+        member: Box<str>,
+    },
+    /// `CS1501`: no overload of the method takes the given number of arguments.
+    NoOverloadForArgumentCount {
+        /// The method name.
+        method: Box<str>,
+        /// The number of arguments supplied.
+        count: u32,
+    },
+    /// `CS1503`: an argument has no implicit conversion to its parameter type.
+    ArgumentConversion {
+        /// The 1-based argument position.
+        index: u32,
+        /// The argument's type.
+        from: Box<str>,
+        /// The parameter's type.
+        to: Box<str>,
+    },
+    /// `CS0121`: a call is ambiguous between two or more overloads.
+    AmbiguousCall {
+        /// The method name.
+        method: Box<str>,
+    },
+    /// `CS0021`: a value of this type cannot be indexed with `[]`.
+    CannotIndex {
+        /// The type that was indexed.
+        type_name: Box<str>,
+    },
 }
 
 impl DiagnosticKind {
@@ -94,6 +127,11 @@ impl DiagnosticKind {
             DiagnosticKind::UnaryOperatorNotApplicable { .. } => 23,
             DiagnosticKind::ConditionalTypeMismatch { .. } => 173,
             DiagnosticKind::NotAssignable => 131,
+            DiagnosticKind::MemberNotFound { .. } => 117,
+            DiagnosticKind::NoOverloadForArgumentCount { .. } => 1501,
+            DiagnosticKind::ArgumentConversion { .. } => 1503,
+            DiagnosticKind::AmbiguousCall { .. } => 121,
+            DiagnosticKind::CannotIndex { .. } => 21,
         }
     }
 }
@@ -130,6 +168,25 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NotAssignable => write!(
                 f,
                 "The left-hand side of an assignment must be a variable, property or indexer"
+            ),
+            DiagnosticKind::MemberNotFound { type_name, member } => write!(
+                f,
+                "'{type_name}' does not contain a definition for '{member}'"
+            ),
+            DiagnosticKind::NoOverloadForArgumentCount { method, count } => write!(
+                f,
+                "No overload for method '{method}' takes {count} arguments"
+            ),
+            DiagnosticKind::ArgumentConversion { index, from, to } => write!(
+                f,
+                "Argument {index}: cannot convert from '{from}' to '{to}'"
+            ),
+            DiagnosticKind::AmbiguousCall { method } => {
+                write!(f, "The call is ambiguous between overloads of '{method}'")
+            }
+            DiagnosticKind::CannotIndex { type_name } => write!(
+                f,
+                "Cannot apply indexing with [] to an expression of type '{type_name}'"
             ),
         }
     }

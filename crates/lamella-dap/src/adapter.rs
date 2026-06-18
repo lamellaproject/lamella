@@ -2,7 +2,8 @@
 //! [`lamella_ves::Session`] and produces the responses and events DAP expects.
 
 use crate::protocol::{Event, Message, Request, Response};
-use lamella_ves::{Module, Status, Value, Vm};
+use lamella_cil::{Instruction, Operand};
+use lamella_ves::{Module, Status, Trap, Value, Vm};
 use serde_json::{Value as Json, json};
 
 /// A debug session over one program: the module being debugged, the runtime
@@ -15,14 +16,18 @@ pub struct Debugger<'a> {
     /// The current instruction breakpoints, as `(method, instruction)`. Held here
     /// so they survive across `launch` (which creates the session) and re-apply.
     breakpoints: Vec<(u32, u32)>,
+    /// How many UTF-16 code units of the program's console output have already been
+    /// forwarded to the client as `output` events.
+    output_sent: usize,
     out_seq: i64,
 }
 
 impl<'a> Debugger<'a> {
     /// Creates a debugger for `module`, whose program entry point is `entry`.
     ///
-    /// (A real `launch` would load the program named in its arguments; until the
-    /// metadata reader lands, the program is the hand-built module supplied here.)
+    /// The caller provides the already-loaded program: the server binary loads it
+    /// (via `lamella-load`) from the command line; reading it from the DAP `launch`
+    /// request instead is a later refinement.
     #[must_use]
     pub fn new(module: &'a Module, entry: u32) -> Debugger<'a> {
         Debugger {
@@ -31,6 +36,7 @@ impl<'a> Debugger<'a> {
             vm: Vm::new(),
             session: None,
             breakpoints: Vec::new(),
+            output_sent: 0,
             out_seq: 0,
         }
     }
@@ -77,8 +83,15 @@ impl<'a> Debugger<'a> {
                 self.step_out(&mut events);
                 (true, None)
             }
+            "pause" => {
+                if self.session.is_some() {
+                    events.push(("stopped", Some(stopped("pause"))));
+                }
+                (true, None)
+            }
             "setBreakpoints" => (true, Some(unverified_breakpoints(request))),
             "setInstructionBreakpoints" => (true, Some(self.set_instruction_breakpoints(request))),
+            "disassemble" => (true, Some(self.disassemble(request))),
             "disconnect" => (true, None),
             _ => (false, None),
         };
@@ -151,77 +164,98 @@ impl<'a> Debugger<'a> {
     }
 
     fn resume(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
-        let Debugger { session, vm, .. } = self;
+        let Debugger {
+            session,
+            vm,
+            output_sent,
+            ..
+        } = self;
         let Some(session) = session.as_mut() else {
             return;
         };
         if session.is_at_breakpoint() {
             match session.step(vm) {
-                Ok(Status::Done(_)) => return terminate(events),
+                Ok(Status::Done(_)) => return finish(Run::Done, vm, output_sent, events),
                 Ok(_) => {}
-                Err(trap) => return fault(events, &trap),
+                Err(trap) => return finish(Run::Fault(trap), vm, output_sent, events),
             }
         }
-        match session.resume(vm) {
-            Ok(Status::Paused) => events.push(("stopped", Some(stopped("breakpoint")))),
-            Ok(Status::Done(_)) => terminate(events),
-            Ok(Status::Running) => {}
-            Err(trap) => fault(events, &trap),
-        }
+        let run = match session.resume(vm) {
+            Ok(Status::Paused | Status::Running) => Run::Stopped("breakpoint"),
+            Ok(Status::Done(_)) => Run::Done,
+            Err(trap) => Run::Fault(trap),
+        };
+        finish(run, vm, output_sent, events);
     }
 
     /// `stepIn`: execute exactly one instruction, descending into any call.
     fn step_in(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
-        let Debugger { session, vm, .. } = self;
+        let Debugger {
+            session,
+            vm,
+            output_sent,
+            ..
+        } = self;
         let Some(session) = session.as_mut() else {
             return;
         };
-        match session.step(vm) {
-            Ok(Status::Done(_)) => terminate(events),
-            Ok(Status::Running | Status::Paused) => events.push(("stopped", Some(stopped("step")))),
-            Err(trap) => fault(events, &trap),
-        }
+        let run = match session.step(vm) {
+            Ok(Status::Done(_)) => Run::Done,
+            Ok(Status::Running | Status::Paused) => Run::Stopped("step"),
+            Err(trap) => Run::Fault(trap),
+        };
+        finish(run, vm, output_sent, events);
     }
 
     /// `next`: step one instruction, but run any call it makes to completion
     /// (stop once the stack is no deeper than it began).
     fn step_over(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
-        let Debugger { session, vm, .. } = self;
+        let Debugger {
+            session,
+            vm,
+            output_sent,
+            ..
+        } = self;
         let Some(session) = session.as_mut() else {
             return;
         };
         let target_depth = session.depth();
-        loop {
+        let run = loop {
             match session.step(vm) {
-                Ok(Status::Done(_)) => return terminate(events),
-                Ok(Status::Running | Status::Paused) => {
-                    if session.depth() <= target_depth {
-                        return events.push(("stopped", Some(stopped("step"))));
-                    }
+                Ok(Status::Done(_)) => break Run::Done,
+                Ok(Status::Running | Status::Paused) if session.depth() <= target_depth => {
+                    break Run::Stopped("step");
                 }
-                Err(trap) => return fault(events, &trap),
+                Ok(_) => {}
+                Err(trap) => break Run::Fault(trap),
             }
-        }
+        };
+        finish(run, vm, output_sent, events);
     }
 
     /// `stepOut`: run until the current method returns to its caller.
     fn step_out(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
-        let Debugger { session, vm, .. } = self;
+        let Debugger {
+            session,
+            vm,
+            output_sent,
+            ..
+        } = self;
         let Some(session) = session.as_mut() else {
             return;
         };
         let target_depth = session.depth();
-        loop {
+        let run = loop {
             match session.step(vm) {
-                Ok(Status::Done(_)) => return terminate(events),
-                Ok(Status::Running | Status::Paused) => {
-                    if session.depth() < target_depth {
-                        return events.push(("stopped", Some(stopped("step"))));
-                    }
+                Ok(Status::Done(_)) => break Run::Done,
+                Ok(Status::Running | Status::Paused) if session.depth() < target_depth => {
+                    break Run::Stopped("step");
                 }
-                Err(trap) => return fault(events, &trap),
+                Ok(_) => {}
+                Err(trap) => break Run::Fault(trap),
             }
-        }
+        };
+        finish(run, vm, output_sent, events);
     }
 
     fn stack_trace(&self) -> Json {
@@ -236,6 +270,7 @@ impl<'a> Debugger<'a> {
                     "name": alloc_method_name(frame.method, frame.ip),
                     "line": frame.ip + 1,
                     "column": 1,
+                    "instructionPointerReference": encode_address(frame.method, frame.ip).to_string(),
                 }));
             }
         }
@@ -285,6 +320,54 @@ impl<'a> Debugger<'a> {
         json!({ "variables": variables })
     }
 
+    /// Lists CIL instructions starting at the `memoryReference` address, returning
+    /// each with its own address so the client can set instruction breakpoints.
+    fn disassemble(&self, request: &Request) -> Json {
+        let arguments = request.arguments.as_ref();
+        let reference = arguments
+            .and_then(|args| args.get("memoryReference"))
+            .and_then(Json::as_str)
+            .and_then(|reference| reference.parse::<u64>().ok());
+        let Some(reference) = reference else {
+            return json!({ "instructions": [] });
+        };
+        let (method, base_ip) = decode_address(reference);
+        let instruction_offset = arguments
+            .and_then(|args| args.get("instructionOffset"))
+            .and_then(Json::as_i64)
+            .unwrap_or(0);
+        let count = arguments
+            .and_then(|args| args.get("instructionCount"))
+            .and_then(Json::as_u64)
+            .unwrap_or(0)
+            .min(4096);
+
+        let code = self.method_code(method);
+        let mut instructions = Vec::new();
+        for step in 0..count {
+            let ip = i64::from(base_ip) + instruction_offset + step as i64;
+            let address = if ip >= 0 {
+                encode_address(method, ip as u32)
+            } else {
+                0
+            };
+            let text = match (code, usize::try_from(ip)) {
+                (Some(code), Ok(index)) if index < code.len() => format_instruction(&code[index]),
+                _ => "(out of range)".to_owned(),
+            };
+            instructions.push(json!({ "address": address.to_string(), "instruction": text }));
+        }
+        json!({ "instructions": instructions })
+    }
+
+    /// The CIL of a loaded method, or `None` for an intrinsic or unknown method.
+    fn method_code(&self, method: u32) -> Option<&[Instruction]> {
+        match self.module.method(method)? {
+            lamella_ves::Method::Managed { body, .. } => Some(&body.code[..]),
+            lamella_ves::Method::Intrinsic { .. } => None,
+        }
+    }
+
     fn response(&mut self, request: &Request, success: bool, body: Option<Json>) -> Message {
         self.out_seq += 1;
         Message::Response(Response {
@@ -304,6 +387,46 @@ impl<'a> Debugger<'a> {
             event: event.to_owned(),
             body,
         })
+    }
+}
+
+/// The outcome of running the interpreter for one command, before output is
+/// flushed and the matching event emitted.
+enum Run {
+    /// Paused, with the DAP stop reason (`breakpoint` or `step`).
+    Stopped(&'static str),
+    /// The program ran to completion.
+    Done,
+    /// A trap ended the run.
+    Fault(Trap),
+}
+
+/// Flushes any new program output as an `output` event, then emits the event for
+/// `run` -- so console output precedes the stop or terminate it accompanies.
+fn finish(
+    run: Run,
+    vm: &Vm,
+    output_sent: &mut usize,
+    events: &mut Vec<(&'static str, Option<Json>)>,
+) {
+    flush_output(vm, output_sent, events);
+    match run {
+        Run::Stopped(reason) => events.push(("stopped", Some(stopped(reason)))),
+        Run::Done => terminate(events),
+        Run::Fault(trap) => fault(events, &trap),
+    }
+}
+
+/// Emits an `output` event for console output produced since the last flush.
+fn flush_output(vm: &Vm, output_sent: &mut usize, events: &mut Vec<(&'static str, Option<Json>)>) {
+    let output = vm.output();
+    if output.len() > *output_sent {
+        let text = String::from_utf16_lossy(&output[*output_sent..]);
+        events.push((
+            "output",
+            Some(json!({ "category": "stdout", "output": text })),
+        ));
+        *output_sent = output.len();
     }
 }
 
@@ -328,7 +451,26 @@ fn capabilities() -> Json {
     json!({
         "supportsConfigurationDoneRequest": true,
         "supportsInstructionBreakpoints": true,
+        "supportsDisassembleRequest": true,
     })
+}
+
+/// Renders one CIL instruction as a mnemonic and its operand, for disassembly.
+fn format_instruction(instruction: &Instruction) -> String {
+    let mnemonic = instruction.opcode.mnemonic();
+    match &instruction.operand {
+        Operand::None => mnemonic.to_owned(),
+        Operand::Int8(value) => format!("{mnemonic} {value}"),
+        Operand::Int32(value) => format!("{mnemonic} {value}"),
+        Operand::Int64(value) => format!("{mnemonic} {value}"),
+        Operand::Float32(value) => format!("{mnemonic} {value}"),
+        Operand::Float64(value) => format!("{mnemonic} {value}"),
+        Operand::Variable(slot) => format!("{mnemonic} {slot}"),
+        Operand::Target(target) => format!("{mnemonic} -> {target}"),
+        Operand::Switch(targets) => format!("{mnemonic} ({} targets)", targets.len()),
+        Operand::Token(token) => format!("{mnemonic} 0x{:08X}", token.0),
+        Operand::Alignment(align) => format!("{mnemonic} {align}"),
+    }
 }
 
 /// Encodes a CIL location `(method, instruction)` as a single instruction address
@@ -640,6 +782,39 @@ mod tests {
     #[test]
     fn addresses_round_trip() {
         assert_eq!(decode_address(encode_address(7, 42)), (7, 42));
+    }
+
+    #[test]
+    fn disassemble_lists_a_methods_instructions() {
+        let (module, main) = add_program();
+        let mut dbg = Debugger::new(&module, main);
+        let reference = encode_address(main, 0).to_string();
+        let args = json!({
+            "memoryReference": reference,
+            "instructionOffset": 0,
+            "instructionCount": 6,
+        });
+        let out = dbg.handle(&request(1, "disassemble", Some(args)));
+        let listing = out[0].response_body()["instructions"]
+            .as_array()
+            .unwrap()
+            .clone();
+
+        assert_eq!(listing.len(), 6);
+        assert!(
+            listing[0]["instruction"]
+                .as_str()
+                .unwrap()
+                .starts_with("ldstr")
+        );
+        assert!(
+            listing
+                .iter()
+                .any(|entry| entry["instruction"] == json!("add"))
+        );
+        assert_eq!(listing[5]["instruction"], json!("ret"));
+        let address: u64 = listing[0]["address"].as_str().unwrap().parse().unwrap();
+        assert_eq!(decode_address(address), (main, 0));
     }
 
     impl Message {

@@ -9,7 +9,7 @@ use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use lamella_syntax::ast::{Expr, Stmt, StmtKind, TypeRef, VariableDeclarator};
+use lamella_syntax::ast::{Expr, ForInitializer, Stmt, StmtKind, TypeRef, VariableDeclarator};
 use lamella_syntax::span::Span;
 
 /// A bound statement (15).
@@ -53,6 +53,43 @@ pub enum BoundStmtKind {
     },
     /// A `return` statement (15.9.4).
     Return(Option<BoundExpr>),
+    /// A `do ... while` statement (15.8.2).
+    DoWhile {
+        /// The loop body.
+        body: Box<BoundStmt>,
+        /// The (boolean) condition tested after each iteration.
+        condition: BoundExpr,
+    },
+    /// A `for` statement (15.8.3). The initializer is a local declaration or a
+    /// list of expression statements, already in the loop's scope.
+    For {
+        /// The initializer statements.
+        initializer: Vec<BoundStmt>,
+        /// The (boolean) loop condition, if any.
+        condition: Option<BoundExpr>,
+        /// The iterator expressions.
+        iterators: Vec<BoundExpr>,
+        /// The loop body.
+        body: Box<BoundStmt>,
+    },
+    /// A `foreach` statement (15.8.4); the iteration variable is in the body's
+    /// scope. The element-type check against the collection is deferred.
+    ForEach {
+        /// The iteration variable's name.
+        name: Box<str>,
+        /// The iteration variable's declared type.
+        element_type: TypeSymbol,
+        /// The collection iterated over.
+        collection: BoundExpr,
+        /// The loop body.
+        body: Box<BoundStmt>,
+    },
+    /// A `break` statement (15.9.1).
+    Break,
+    /// A `continue` statement (15.9.2).
+    Continue,
+    /// A `throw` statement (15.9.5), with the thrown expression if any.
+    Throw(Option<BoundExpr>),
     /// A statement form not yet bound, for recovery.
     Error,
 }
@@ -103,9 +140,80 @@ impl Binder {
             StmtKind::Return(value) => {
                 BoundStmtKind::Return(value.as_ref().map(|expr| self.bind_expression(expr)))
             }
+            StmtKind::DoWhile { body, condition } => {
+                let body = Box::new(self.bind_statement(body));
+                let condition = self.bind_condition(condition);
+                BoundStmtKind::DoWhile { body, condition }
+            }
+            StmtKind::For {
+                initializer,
+                condition,
+                iterators,
+                body,
+            } => self.bind_for(initializer.as_ref(), condition.as_ref(), iterators, body),
+            StmtKind::ForEach {
+                ty,
+                name,
+                collection,
+                body,
+            } => {
+                let collection = self.bind_expression(collection);
+                let element_type = self.resolve_named_type(&bind_type(ty), ty.span);
+                self.enter_scope();
+                self.declare_local(name, element_type.clone());
+                let body = Box::new(self.bind_statement(body));
+                self.exit_scope();
+                BoundStmtKind::ForEach {
+                    name: name.clone(),
+                    element_type,
+                    collection,
+                    body,
+                }
+            }
+            StmtKind::Break => BoundStmtKind::Break,
+            StmtKind::Continue => BoundStmtKind::Continue,
+            StmtKind::Throw(value) => {
+                BoundStmtKind::Throw(value.as_ref().map(|expr| self.bind_expression(expr)))
+            }
             _ => BoundStmtKind::Error,
         };
         BoundStmt { kind }
+    }
+
+    fn bind_for(
+        &mut self,
+        initializer: Option<&ForInitializer>,
+        condition: Option<&Expr>,
+        iterators: &[Expr],
+        body: &Stmt,
+    ) -> BoundStmtKind {
+        self.enter_scope();
+        let initializer = match initializer {
+            None => Vec::new(),
+            Some(ForInitializer::Declaration { ty, declarators }) => {
+                let kind = self.bind_local(ty, declarators);
+                alloc::vec![BoundStmt { kind }]
+            }
+            Some(ForInitializer::Expressions(expressions)) => expressions
+                .iter()
+                .map(|expression| BoundStmt {
+                    kind: BoundStmtKind::Expression(self.bind_expression(expression)),
+                })
+                .collect(),
+        };
+        let condition = condition.map(|condition| self.bind_condition(condition));
+        let iterators = iterators
+            .iter()
+            .map(|iterator| self.bind_expression(iterator))
+            .collect();
+        let body = Box::new(self.bind_statement(body));
+        self.exit_scope();
+        BoundStmtKind::For {
+            initializer,
+            condition,
+            iterators,
+            body,
+        }
     }
 
     fn bind_local(&mut self, ty: &TypeRef, declarators: &[VariableDeclarator]) -> BoundStmtKind {
@@ -199,6 +307,19 @@ mod tests {
     #[test]
     fn a_local_goes_out_of_scope_after_its_block() {
         assert_eq!(codes("{ { int x = 1; } int y = x + 0; }"), [103]);
+    }
+
+    #[test]
+    fn loops_and_jumps_check_conditions_and_scope() {
+        assert_eq!(codes("for (int i = 0; i < 10; i = i + 1) ;"), []);
+        assert_eq!(codes("for (int i = 0; i; i = i + 1) ;"), [29]);
+        assert_eq!(codes("do ; while (1);"), [29]);
+        assert_eq!(codes("while (true) break;"), []);
+        assert_eq!(codes("throw;"), []);
+        assert_eq!(
+            codes("for (int i = 0; i < 3; i = i + 1) { int j = i; }"),
+            []
+        );
     }
 
     #[test]

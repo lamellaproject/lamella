@@ -19,5 +19,8 @@ default = ["arm32"]
 # paths, and vice versa.
 arm32 = ["dep:lamella-asm-arm32"]
 
+[dev-dependencies]
+lamella-metadata = { path = "../lamella-metadata" }
+
 [lints]
 workspace = true

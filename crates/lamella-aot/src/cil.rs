@@ -278,6 +278,133 @@ fn store_local(
     Ok(())
 }
 
+/// Control-flow graph analysis over a CIL instruction stream: basic-block
+/// discovery and predecessors.
+#[allow(dead_code)]
+mod control_flow {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use alloc::collections::BTreeSet;
+    use lamella_cil::{Instruction, Opcode, Operand};
+
+    /// Whether an opcode is a branch and, if so, whether it also falls through.
+    #[derive(Clone, Copy)]
+    pub enum BranchKind {
+        /// `br`/`leave`: control always leaves to the target.
+        Unconditional,
+        /// `brtrue`/`beq`/...: control goes to the target or falls through.
+        Conditional,
+    }
+
+    /// Classifies an opcode's control flow; `None` if it is not a branch.
+    pub fn branch_kind(op: Opcode) -> Option<BranchKind> {
+        match op {
+            Opcode::Br | Opcode::BrS | Opcode::Leave | Opcode::LeaveS => {
+                Some(BranchKind::Unconditional)
+            }
+            Opcode::BrtrueS
+            | Opcode::Brtrue
+            | Opcode::BrfalseS
+            | Opcode::Brfalse
+            | Opcode::BeqS
+            | Opcode::Beq
+            | Opcode::BgeS
+            | Opcode::Bge
+            | Opcode::BgtS
+            | Opcode::Bgt
+            | Opcode::BleS
+            | Opcode::Ble
+            | Opcode::BltS
+            | Opcode::Blt
+            | Opcode::BneUnS
+            | Opcode::BneUn
+            | Opcode::BgeUnS
+            | Opcode::BgeUn
+            | Opcode::BgtUnS
+            | Opcode::BgtUn
+            | Opcode::BleUnS
+            | Opcode::BleUn
+            | Opcode::BltUnS
+            | Opcode::BltUn => Some(BranchKind::Conditional),
+            _ => None,
+        }
+    }
+
+    /// Whether an opcode ends control flow with no fall-through.
+    fn is_return(op: Opcode) -> bool {
+        matches!(op, Opcode::Ret | Opcode::Throw | Opcode::Rethrow)
+    }
+
+    /// The instruction indices control can reach from the terminator at `index`.
+    pub fn successors(inst: &Instruction, index: usize) -> Vec<usize> {
+        let mut out = Vec::new();
+        match branch_kind(inst.opcode) {
+            Some(BranchKind::Unconditional) => {
+                if let Operand::Target(t) = &inst.operand {
+                    out.push(*t as usize);
+                }
+            }
+            Some(BranchKind::Conditional) => {
+                if let Operand::Target(t) = &inst.operand {
+                    out.push(*t as usize);
+                }
+                out.push(index + 1);
+            }
+            None => {
+                if !is_return(inst.opcode) {
+                    out.push(index + 1);
+                }
+            }
+        }
+        out
+    }
+
+    /// Partitions a method's CIL into basic blocks, as `[start, end)` index ranges.
+    /// Leaders are instruction 0, every branch target, and the instruction after a
+    /// branch or a return.
+    pub fn discover_blocks(code: &[Instruction]) -> Vec<(usize, usize)> {
+        let mut leaders: BTreeSet<usize> = BTreeSet::new();
+        leaders.insert(0);
+        for (i, inst) in code.iter().enumerate() {
+            if branch_kind(inst.opcode).is_some() {
+                if let Operand::Target(t) = &inst.operand {
+                    leaders.insert(*t as usize);
+                }
+                leaders.insert(i + 1);
+            } else if is_return(inst.opcode) {
+                leaders.insert(i + 1);
+            }
+        }
+        let starts: Vec<usize> = leaders.into_iter().filter(|&l| l < code.len()).collect();
+        starts
+            .iter()
+            .enumerate()
+            .map(|(idx, &start)| (start, starts.get(idx + 1).copied().unwrap_or(code.len())))
+            .collect()
+    }
+
+    /// The predecessor block indices of each block.
+    pub fn predecessors(code: &[Instruction], blocks: &[(usize, usize)]) -> Vec<Vec<usize>> {
+        let block_of = |instr: usize| blocks.iter().position(|&(s, e)| instr >= s && instr < e);
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); blocks.len()];
+        for (b, &(_, end)) in blocks.iter().enumerate() {
+            let Some(last) = end.checked_sub(1) else {
+                continue;
+            };
+            let Some(inst) = code.get(last) else { continue };
+            for succ in successors(inst, last) {
+                if let Some(target) = block_of(succ) {
+                    if !preds[target].contains(&b) {
+                        preds[target].push(b);
+                    }
+                }
+            }
+        }
+        preds
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +455,25 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.params.len(), 2);
         assert_eq!(func.ret, Some(MirType::I32));
+    }
+
+    #[test]
+    fn discovers_an_if_else_cfg() {
+        let code = [
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::new(Opcode::BgtS, Operand::Target(5)),
+            Instruction::simple(Opcode::LdcI42),
+            Instruction::simple(Opcode::Ret),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::Ret),
+        ];
+        let blocks = control_flow::discover_blocks(&code);
+        assert_eq!(blocks, vec![(0, 3), (3, 5), (5, 7)]);
+        let preds = control_flow::predecessors(&code, &blocks);
+        assert!(preds[0].is_empty());
+        assert_eq!(preds[1], vec![0]);
+        assert_eq!(preds[2], vec![0]);
     }
 
     #[test]

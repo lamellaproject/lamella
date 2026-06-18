@@ -1,0 +1,15 @@
+[package]
+name = "lamella-gc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The shared garbage-collection contract: root reporting, the trace and allocator seams."
+
+# A leaf: the GC contract both the interpreter (lamella-ves) and the AOT backend
+# (lamella-aot) implement against. No dependencies -- it only defines the shapes.
+[dependencies]
+
+[lints]
+workspace = true

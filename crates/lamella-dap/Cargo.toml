@@ -11,12 +11,16 @@ description = "A Debug Adapter Protocol server over the Lamella interpreter (hos
 # the no_std libraries. serde_json carries the DAP JSON wire format.
 [dependencies]
 lamella-ves = { path = "../lamella-ves" }
+# disassemble renders CIL opcodes/operands.
+lamella-cil = { path = "../lamella-cil" }
+# The server binary loads a program to debug; the library does not need these.
+lamella-load = { path = "../lamella-load" }
+lamella-metadata = { path = "../lamella-metadata" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# The adapter tests build hand-written programs, which needs the CIL/token model.
+# The adapter tests build hand-written programs, which also needs the token model.
 [dev-dependencies]
-lamella-cil = { path = "../lamella-cil" }
 lamella-token = { path = "../lamella-token" }
 
 [lints]

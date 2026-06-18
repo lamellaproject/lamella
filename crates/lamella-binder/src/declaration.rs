@@ -1,31 +1,104 @@
-//! Collecting the types declared in source (ECMA-334 1st ed, clauses 16-17).
+//! Collecting the types and members declared in source (ECMA-334 1st ed,
+//! clauses 16-18).
 
+use crate::bind::bind_type;
 use crate::resolve::TypeTable;
+use crate::symbols::{FieldSymbol, MethodSymbol, Model, TypeInfo, TypeKind};
 use alloc::string::String;
-use lamella_syntax::ast::{CompilationUnit, NamespaceMember, QualifiedName};
+use lamella_syntax::ast::{
+    CompilationUnit, Member, Modifier, NamespaceMember, QualifiedName, TypeDecl,
+    TypeKind as SyntaxTypeKind,
+};
 
-/// Builds a [`TypeTable`] of every type declared in `unit`.
+/// Builds the [`Model`] of every type and member declared in `unit`.
 #[must_use]
-pub fn collect_types(unit: &CompilationUnit) -> TypeTable {
-    let mut table = TypeTable::new();
+pub fn collect_model(unit: &CompilationUnit) -> Model {
+    let mut model = Model::new();
     for member in &unit.members {
-        collect_member(member, "", &mut table);
+        collect_namespace_member(member, "", &mut model);
     }
-    table
+    model
 }
 
-fn collect_member(member: &NamespaceMember, namespace: &str, table: &mut TypeTable) {
+/// Builds a [`TypeTable`] of every type declared in `unit` (the existence-only
+/// view derived from the full [`Model`]).
+#[must_use]
+pub fn collect_types(unit: &CompilationUnit) -> TypeTable {
+    collect_model(unit).type_table()
+}
+
+fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &mut Model) {
     match member {
         NamespaceMember::Namespace(declaration) => {
             let inner = join_namespace(namespace, &declaration.name);
             for inner_member in &declaration.members {
-                collect_member(inner_member, &inner, table);
+                collect_namespace_member(inner_member, &inner, model);
             }
         }
-        NamespaceMember::Type(declaration) => table.insert(namespace, &declaration.name),
-        NamespaceMember::Enum(declaration) => table.insert(namespace, &declaration.name),
-        NamespaceMember::Delegate(declaration) => table.insert(namespace, &declaration.name),
+        NamespaceMember::Type(declaration) => model.insert(type_info(namespace, declaration)),
+        NamespaceMember::Enum(declaration) => {
+            model.insert(TypeInfo::new(namespace, &declaration.name, TypeKind::Enum));
+        }
+        NamespaceMember::Delegate(declaration) => {
+            model.insert(TypeInfo::new(
+                namespace,
+                &declaration.name,
+                TypeKind::Delegate,
+            ));
+        }
     }
+}
+
+/// Builds the [`TypeInfo`] for one type declaration, collecting its fields and
+/// methods.
+fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
+    let mut info = TypeInfo::new(namespace, &declaration.name, map_kind(declaration.kind));
+    for member in &declaration.members {
+        match member {
+            Member::Field {
+                modifiers,
+                ty,
+                declarators,
+                ..
+            } => {
+                let field_ty = bind_type(ty);
+                let is_static = is_static(modifiers);
+                for declarator in declarators {
+                    info.fields.push(FieldSymbol {
+                        name: declarator.name.clone(),
+                        ty: field_ty.clone(),
+                        is_static,
+                    });
+                }
+            }
+            Member::Method {
+                modifiers,
+                return_type,
+                name,
+                parameters,
+                ..
+            } => info.methods.push(MethodSymbol {
+                name: name.clone(),
+                return_type: bind_type(return_type),
+                parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
+                is_static: is_static(modifiers),
+            }),
+            _ => {}
+        }
+    }
+    info
+}
+
+fn map_kind(kind: SyntaxTypeKind) -> TypeKind {
+    match kind {
+        SyntaxTypeKind::Class => TypeKind::Class,
+        SyntaxTypeKind::Struct => TypeKind::Struct,
+        SyntaxTypeKind::Interface => TypeKind::Interface,
+    }
+}
+
+fn is_static(modifiers: &[Modifier]) -> bool {
+    modifiers.contains(&Modifier::Static)
 }
 
 /// Appends a (possibly dotted) namespace declaration name to the enclosing
@@ -44,6 +117,7 @@ fn join_namespace(outer: &str, name: &QualifiedName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
     use lamella_syntax::parser::parse_compilation_unit;
 
     #[test]
@@ -62,5 +136,33 @@ mod tests {
         assert!(table.contains("A.B.C", "S"));
         assert!(!table.contains("", "Foo"));
         assert!(!table.contains("", "Missing"));
+    }
+
+    #[test]
+    fn collects_fields_and_methods_of_a_source_type() {
+        let unit = parse_compilation_unit(
+            "namespace N { class Widget { \
+                int count; \
+                static int Make(int n, string s) { } \
+                double Area() { } \
+             } }",
+        )
+        .unit;
+        let model = collect_model(&unit);
+        let widget = model
+            .get("N", "Widget")
+            .expect("Widget should be collected");
+        assert_eq!(widget.kind, TypeKind::Class);
+        assert_eq!(
+            widget.find_field("count").map(|field| field.ty.to_string()),
+            Some("int".to_string())
+        );
+        let make = widget.methods_named("Make").next().expect("Make");
+        assert!(make.is_static);
+        assert_eq!(make.parameters.len(), 2);
+        assert_eq!(make.return_type.to_string(), "int");
+        let area = widget.methods_named("Area").next().expect("Area");
+        assert!(!area.is_static);
+        assert!(area.return_type.to_string() == "double");
     }
 }
