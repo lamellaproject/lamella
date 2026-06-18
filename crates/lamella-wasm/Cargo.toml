@@ -15,11 +15,17 @@ crate-type = ["cdylib", "rlib"]
 lamella-load = { path = "../lamella-load" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-ves = { path = "../lamella-ves" }
+# The DAP feature pulls in the debugger and a JSON codec for its wire messages.
+lamella-dap = { path = "../lamella-dap", optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 # Adds the lamella_selftest export (embeds a fixture) so a wasm host can validate
 # the module end to end with a single --invoke. Off by default; not in the drop.
 selftest = []
+# Adds the in-page DAP agent (lamella_dap_create/request/dispose) for browser
+# debugging. Off by default so the run-only .wasm stays lean (no serde).
+dap = ["dep:lamella-dap", "dep:serde_json"]
 
 [lints]
 workspace = true

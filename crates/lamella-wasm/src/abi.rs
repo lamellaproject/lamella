@@ -37,12 +37,18 @@ pub unsafe extern "C" fn lamella_dealloc(ptr: *mut u8, len: usize) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lamella_run(ptr: *const u8, len: usize) -> *mut u8 {
     let assembly = unsafe { core::slice::from_raw_parts(ptr, len) };
-    let json = to_json(&run_bytes(assembly)).into_bytes();
+    result_buffer(to_json(&run_bytes(assembly)).into_bytes())
+}
 
-    let length = u32::try_from(json.len()).unwrap_or(u32::MAX);
-    let mut buffer = Vec::with_capacity(4 + json.len());
+/// Packages `bytes` into a freshly allocated `[u32 little-endian length][bytes]`
+/// buffer and returns a pointer to it; the host reads the length, then the bytes,
+/// then frees it with `lamella_dealloc(result, 4 + length)`. Shared by the run and
+/// DAP results.
+pub(crate) fn result_buffer(bytes: Vec<u8>) -> *mut u8 {
+    let length = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+    let mut buffer = Vec::with_capacity(4 + bytes.len());
     buffer.extend_from_slice(&length.to_le_bytes());
-    buffer.extend_from_slice(&json);
+    buffer.extend_from_slice(&bytes);
     Box::into_raw(buffer.into_boxed_slice()) as *mut u8
 }
 

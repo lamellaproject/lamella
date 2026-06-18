@@ -18,6 +18,9 @@ use lamella_syntax::span::Span;
 pub struct BoundStmt {
     /// What the statement is, after binding.
     pub kind: BoundStmtKind,
+    /// The source range the statement came from, retained so code emission can
+    /// attach sequence points (CIL offset to source line) for the debugger.
+    pub span: Span,
 }
 
 /// The kind of a [`BoundStmt`].
@@ -196,7 +199,9 @@ impl Binder {
                 BoundStmtKind::While { condition, body }
             }
             StmtKind::Return(value) => {
-                BoundStmtKind::Return(value.as_ref().map(|expr| self.bind_expression(expr)))
+                let value = value.as_ref().map(|expr| self.bind_expression(expr));
+                self.check_return(value.as_ref(), stmt.span);
+                BoundStmtKind::Return(value)
             }
             StmtKind::DoWhile { body, condition } => {
                 let body = Box::new(self.bind_statement(body));
@@ -284,7 +289,10 @@ impl Binder {
             StmtKind::Goto(_) => BoundStmtKind::Goto,
             StmtKind::Error => BoundStmtKind::Error,
         };
-        BoundStmt { kind }
+        BoundStmt {
+            kind,
+            span: stmt.span,
+        }
     }
 
     fn bind_catch(&mut self, catch: &CatchClause) -> BoundCatch {
@@ -311,10 +319,14 @@ impl Binder {
         let resource = match resource {
             UsingResource::Declaration { ty, declarators } => {
                 let kind = self.bind_local(ty, declarators);
-                alloc::vec![BoundStmt { kind }]
+                alloc::vec![BoundStmt {
+                    kind,
+                    span: ty.span,
+                }]
             }
             UsingResource::Expression(expression) => alloc::vec![BoundStmt {
                 kind: BoundStmtKind::Expression(self.bind_expression(expression)),
+                span: expression.span,
             }],
         };
         let body = Box::new(self.bind_statement(body));
@@ -334,12 +346,16 @@ impl Binder {
             None => Vec::new(),
             Some(ForInitializer::Declaration { ty, declarators }) => {
                 let kind = self.bind_local(ty, declarators);
-                alloc::vec![BoundStmt { kind }]
+                alloc::vec![BoundStmt {
+                    kind,
+                    span: ty.span,
+                }]
             }
             Some(ForInitializer::Expressions(expressions)) => expressions
                 .iter()
                 .map(|expression| BoundStmt {
                     kind: BoundStmtKind::Expression(self.bind_expression(expression)),
+                    span: expression.span,
                 })
                 .collect(),
         };
@@ -463,6 +479,15 @@ mod tests {
         assert_eq!(codes("using (int r = 5) { int s = r; }"), []);
         assert_eq!(codes("checked { int v = 1; }"), []);
         assert_eq!(codes("done: ;"), []);
+    }
+
+    #[test]
+    fn bound_statements_retain_their_source_span() {
+        let parsed = parse_statement("int x = 1;");
+        let mut binder = Binder::new();
+        binder.enter_scope();
+        let bound = binder.bind_statement(&parsed.statement);
+        assert_eq!(bound.span, parsed.statement.span);
     }
 
     #[test]

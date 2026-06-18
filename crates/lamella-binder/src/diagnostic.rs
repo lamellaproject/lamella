@@ -120,6 +120,33 @@ pub enum DiagnosticKind {
         /// The number of arguments supplied.
         count: u32,
     },
+    /// `CS0127`: a `return` in a `void` method has an expression.
+    ReturnValueInVoidMethod {
+        /// The enclosing method's name.
+        method: Box<str>,
+    },
+    /// `CS0126`: a `return` in a value-returning method has no expression.
+    ReturnValueRequired {
+        /// The required return type.
+        ty: Box<str>,
+    },
+    /// `CS0161`: not every code path in a value-returning method returns a value.
+    NotAllPathsReturn {
+        /// The method's name.
+        method: Box<str>,
+    },
+    /// `CS0030`: no explicit conversion exists for a cast.
+    CannotCast {
+        /// The operand's type.
+        from: Box<str>,
+        /// The cast's target type.
+        to: Box<str>,
+    },
+    /// `CS0165`: a local variable is read before it is definitely assigned.
+    UseOfUnassignedLocal {
+        /// The local variable's name.
+        name: Box<str>,
+    },
 }
 
 impl DiagnosticKind {
@@ -140,6 +167,11 @@ impl DiagnosticKind {
             DiagnosticKind::AmbiguousCall { .. } => 121,
             DiagnosticKind::CannotIndex { .. } => 21,
             DiagnosticKind::NoConstructor { .. } => 1729,
+            DiagnosticKind::ReturnValueInVoidMethod { .. } => 127,
+            DiagnosticKind::ReturnValueRequired { .. } => 126,
+            DiagnosticKind::NotAllPathsReturn { .. } => 161,
+            DiagnosticKind::CannotCast { .. } => 30,
+            DiagnosticKind::UseOfUnassignedLocal { .. } => 165,
         }
     }
 }
@@ -200,6 +232,23 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "'{type_name}' does not contain a constructor that takes {count} arguments"
             ),
+            DiagnosticKind::ReturnValueInVoidMethod { method } => write!(
+                f,
+                "Since '{method}' returns void, a return keyword must not be followed by an \
+                 object expression"
+            ),
+            DiagnosticKind::ReturnValueRequired { ty } => {
+                write!(f, "An object of a type convertible to '{ty}' is required")
+            }
+            DiagnosticKind::NotAllPathsReturn { method } => {
+                write!(f, "'{method}': not all code paths return a value")
+            }
+            DiagnosticKind::CannotCast { from, to } => {
+                write!(f, "Cannot convert type '{from}' to '{to}'")
+            }
+            DiagnosticKind::UseOfUnassignedLocal { name } => {
+                write!(f, "Use of unassigned local variable '{name}'")
+            }
         }
     }
 }

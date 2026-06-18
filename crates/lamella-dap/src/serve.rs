@@ -13,7 +13,7 @@ use std::io::{self, BufRead, Write};
 /// Returns an [`io::Error`] if reading a frame, parsing it, or writing a reply
 /// fails.
 pub fn serve<R: BufRead, W: Write>(
-    debugger: &mut Debugger<'_>,
+    debugger: &mut Debugger,
     reader: &mut R,
     writer: &mut W,
 ) -> io::Result<()> {
@@ -90,7 +90,7 @@ mod tests {
     #[test]
     fn serves_a_full_scripted_session() {
         let (module, main) = program();
-        let mut debugger = Debugger::new(&module, main);
+        let mut debugger = Debugger::new(module, main);
 
         let input = request_frames(&["initialize", "launch", "continue", "disconnect"]);
         let mut reader = Cursor::new(input);
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn stops_at_a_clean_end_of_stream_without_disconnect() {
         let (module, main) = program();
-        let mut debugger = Debugger::new(&module, main);
+        let mut debugger = Debugger::new(module, main);
         let input = request_frames(&["initialize"]);
         let mut reader = Cursor::new(input);
         let mut output = Vec::new();

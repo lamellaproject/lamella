@@ -13,10 +13,11 @@ use lamella_cil::{Opcode, Operand};
 use lamella_metadata::{Assembly, Method, MethodSig, SigType};
 use lamella_token::Token;
 use lamella_ves::intrinsics::{
-    console_write, console_write_bool, console_write_char, console_write_int32,
-    console_write_int64, console_write_line, console_write_line_bool, console_write_line_char,
-    console_write_line_empty, console_write_line_int32, console_write_line_int64, string_concat,
-    string_equals, string_get_chars, string_get_length,
+    console_write, console_write_bool, console_write_char, console_write_double,
+    console_write_int32, console_write_int64, console_write_line, console_write_line_bool,
+    console_write_line_char, console_write_line_double, console_write_line_empty,
+    console_write_line_int32, console_write_line_int64, string_concat, string_equals,
+    string_get_chars, string_get_length,
 };
 use lamella_ves::{IntrinsicFn, MethodId, Module};
 
@@ -204,6 +205,7 @@ fn console_write_line_overload(signature: Option<&MethodSig>) -> Option<Intrinsi
         [SigType::I8] => console_write_line_int64,
         [SigType::Boolean] => console_write_line_bool,
         [SigType::Char] => console_write_line_char,
+        [SigType::R8] => console_write_line_double,
         _ => return None,
     };
     Some(intrinsic)
@@ -217,6 +219,7 @@ fn console_write_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> 
         [SigType::I8] => console_write_int64,
         [SigType::Boolean] => console_write_bool,
         [SigType::Char] => console_write_char,
+        [SigType::R8] => console_write_double,
         _ => return None,
     };
     Some(intrinsic)

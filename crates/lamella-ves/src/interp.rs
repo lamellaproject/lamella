@@ -67,8 +67,7 @@ impl Vm {
 /// One activation frame: the evaluation stack, the local variables, the
 /// arguments, the instruction pointer, and which method is running, for a single
 /// method invocation.
-struct Frame<'a> {
-    code: &'a [Instruction],
+struct Frame {
     method: MethodId,
     ip: usize,
     stack: Vec<Value>,
@@ -102,11 +101,11 @@ enum Flow {
 /// out-of-range local, argument, or branch, or integer division by zero.
 pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Value>, Trap> {
     let mut vm = Vm::new();
-    let mut frame = Frame::new(&body.code, 0, args);
+    let mut frame = Frame::new(0, args);
     loop {
-        let instruction = frame.code.get(frame.ip).ok_or(Trap::FellThroughEnd)?;
+        let instruction = body.code.get(frame.ip).ok_or(Trap::FellThroughEnd)?;
         frame.ip += 1;
-        match step(&mut frame, None, &mut vm, instruction)? {
+        match step(&mut frame, &body.code, None, &mut vm, instruction)? {
             Flow::Next => {}
             Flow::Return(result) => return Ok(result),
             Flow::Call { .. } => return Err(Trap::Unsupported(Opcode::Call)),
@@ -128,7 +127,7 @@ pub fn run(
     entry: MethodId,
     args: Vec<Value>,
 ) -> Result<Option<Value>, Trap> {
-    Session::new(module, entry, args)?.run(vm)
+    Session::new(module, entry, args)?.run(module, vm)
 }
 
 /// A steppable, inspectable execution: the foundation the debugger drives.
@@ -137,11 +136,11 @@ pub fn run(
 /// which is what instruction-level (source-free) debugging needs. It can run to
 /// completion ([`Session::run`]), single-step ([`Session::step`]), or resume until
 /// a breakpoint ([`Session::resume`]); the call stack is open to inspection
-/// throughout ([`Session::frame`]). The runtime context ([`Vm`]) is passed in on
-/// each advance rather than owned, so the heap and console outlive a session.
-pub struct Session<'a> {
-    module: &'a Module,
-    frames: Vec<Frame<'a>>,
+/// throughout ([`Session::frame`]). The module and the runtime context ([`Vm`]) are
+/// passed in on each call rather than owned -- the session borrows neither, so a
+/// debugger can own the module it steps, and the heap and console outlive a session.
+pub struct Session {
+    frames: Vec<Frame>,
     breakpoints: BTreeSet<(MethodId, u32)>,
     result: Option<Option<Value>>,
 }
@@ -173,14 +172,14 @@ pub struct FrameView<'s> {
     pub args: &'s [Value],
 }
 
-impl<'a> Session<'a> {
-    /// Starts a session at `entry` with `args`.
+impl Session {
+    /// Starts a session at `entry` with `args`. The `module` is used to set up the
+    /// first frame but not retained; pass it again to each step/resume/run.
     ///
     /// # Errors
     /// Returns [`Trap::NoSuchMethod`] if `entry` is not a managed method.
-    pub fn new(module: &'a Module, entry: MethodId, args: Vec<Value>) -> Result<Session<'a>, Trap> {
+    pub fn new(module: &Module, entry: MethodId, args: Vec<Value>) -> Result<Session, Trap> {
         Ok(Session {
-            module,
             frames: alloc::vec![new_frame(module, entry, args)?],
             breakpoints: BTreeSet::new(),
             result: None,
@@ -214,11 +213,11 @@ impl<'a> Session<'a> {
     ///
     /// # Errors
     /// Returns a [`Trap`] if the instruction faults.
-    pub fn step(&mut self, vm: &mut Vm) -> Result<Status, Trap> {
+    pub fn step(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
         if let Some(result) = &self.result {
             return Ok(Status::Done(*result));
         }
-        self.advance(vm)
+        self.advance(module, vm)
     }
 
     /// Runs until a breakpoint is reached or the program finishes. A breakpoint
@@ -227,7 +226,7 @@ impl<'a> Session<'a> {
     ///
     /// # Errors
     /// Returns a [`Trap`] if an instruction faults.
-    pub fn resume(&mut self, vm: &mut Vm) -> Result<Status, Trap> {
+    pub fn resume(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
         loop {
             if let Some(result) = &self.result {
                 return Ok(Status::Done(*result));
@@ -235,7 +234,7 @@ impl<'a> Session<'a> {
             if self.at_breakpoint() {
                 return Ok(Status::Paused);
             }
-            if let Status::Done(value) = self.advance(vm)? {
+            if let Status::Done(value) = self.advance(module, vm)? {
                 return Ok(Status::Done(value));
             }
         }
@@ -245,12 +244,12 @@ impl<'a> Session<'a> {
     ///
     /// # Errors
     /// Returns a [`Trap`] if an instruction faults.
-    pub fn run(&mut self, vm: &mut Vm) -> Result<Option<Value>, Trap> {
+    pub fn run(&mut self, module: &Module, vm: &mut Vm) -> Result<Option<Value>, Trap> {
         loop {
             if let Some(result) = &self.result {
                 return Ok(*result);
             }
-            self.advance(vm)?;
+            self.advance(module, vm)?;
         }
     }
 
@@ -284,20 +283,15 @@ impl<'a> Session<'a> {
     /// Executes one instruction of the top frame and applies its effect to the
     /// call stack: a return pops (handing the result back, or finishing); a call
     /// pushes a managed frame or invokes an intrinsic.
-    fn advance(&mut self, vm: &mut Vm) -> Result<Status, Trap> {
-        let Session {
-            module,
-            frames,
-            result,
-            ..
-        } = self;
-        let module = *module;
+    fn advance(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
+        let Session { frames, result, .. } = self;
         let Some(top) = frames.last_mut() else {
             return Ok(Status::Done(None));
         };
-        let instruction = top.code.get(top.ip).ok_or(Trap::FellThroughEnd)?;
+        let code = method_code(module, top.method)?;
+        let instruction = code.get(top.ip).ok_or(Trap::FellThroughEnd)?;
         top.ip += 1;
-        match step(top, Some(module), vm, instruction)? {
+        match step(top, code, Some(module), vm, instruction)? {
             Flow::Next => Ok(Status::Running),
             Flow::Return(value) => {
                 frames.pop();
@@ -339,15 +333,25 @@ impl<'a> Session<'a> {
     }
 }
 
-fn new_frame<'a>(module: &'a Module, id: MethodId, args: Vec<Value>) -> Result<Frame<'a>, Trap> {
+fn new_frame(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
     match module.method(id) {
-        Some(Method::Managed { body, .. }) => Ok(Frame::new(&body.code, id, args)),
+        Some(Method::Managed { .. }) => Ok(Frame::new(id, args)),
+        _ => Err(Trap::NoSuchMethod(id)),
+    }
+}
+
+/// The CIL of a managed method -- looked up per advance now that a frame no longer
+/// borrows it. Errors if `id` names an intrinsic or no method.
+fn method_code(module: &Module, id: MethodId) -> Result<&[Instruction], Trap> {
+    match module.method(id) {
+        Some(Method::Managed { body, .. }) => Ok(&body.code[..]),
         _ => Err(Trap::NoSuchMethod(id)),
     }
 }
 
 fn step(
-    frame: &mut Frame<'_>,
+    frame: &mut Frame,
+    code: &[Instruction],
     module: Option<&Module>,
     vm: &mut Vm,
     instruction: &Instruction,
@@ -447,17 +451,17 @@ fn step(
             frame.stack.push(Value::Int32(i32::from(result)));
         }
 
-        Opcode::Br | Opcode::BrS => frame.ip = branch_target(instruction, frame.code.len())?,
+        Opcode::Br | Opcode::BrS => frame.ip = branch_target(instruction, code.len())?,
         Opcode::Brtrue | Opcode::BrtrueS => {
             let value = frame.pop()?;
             if value.is_truthy() {
-                frame.ip = branch_target(instruction, frame.code.len())?;
+                frame.ip = branch_target(instruction, code.len())?;
             }
         }
         Opcode::Brfalse | Opcode::BrfalseS => {
             let value = frame.pop()?;
             if !value.is_truthy() {
-                frame.ip = branch_target(instruction, frame.code.len())?;
+                frame.ip = branch_target(instruction, code.len())?;
             }
         }
         Opcode::Beq
@@ -482,7 +486,7 @@ fn step(
         | Opcode::BltUnS => {
             let (a, b) = frame.pop2()?;
             if compare(opcode, a, b)? {
-                frame.ip = branch_target(instruction, frame.code.len())?;
+                frame.ip = branch_target(instruction, code.len())?;
             }
         }
         Opcode::Switch => {
@@ -491,7 +495,7 @@ fn step(
                 return Err(Trap::MalformedInstruction(Opcode::Switch));
             };
             if let Some(&target) = targets.get(index) {
-                if target as usize >= frame.code.len() {
+                if target as usize >= code.len() {
                     return Err(Trap::BranchOutOfRange(target));
                 }
                 frame.ip = target as usize;
@@ -527,10 +531,9 @@ fn step(
     Ok(Flow::Next)
 }
 
-impl<'a> Frame<'a> {
-    fn new(code: &'a [Instruction], method: MethodId, args: Vec<Value>) -> Frame<'a> {
+impl Frame {
+    fn new(method: MethodId, args: Vec<Value>) -> Frame {
         Frame {
-            code,
             method,
             ip: 0,
             stack: Vec::new(),
@@ -1327,19 +1330,19 @@ mod tests {
 
         assert_eq!(session.frame(0).unwrap().ip, 0);
         assert!(session.frame(0).unwrap().stack.is_empty());
-        assert_eq!(session.step(&mut vm), Ok(Status::Running));
+        assert_eq!(session.step(&module, &mut vm), Ok(Status::Running));
         assert_eq!(
             session.frame(0).unwrap().stack,
             [Value::Int32(2)].as_slice()
         );
-        assert_eq!(session.step(&mut vm), Ok(Status::Running));
-        assert_eq!(session.step(&mut vm), Ok(Status::Running));
+        assert_eq!(session.step(&module, &mut vm), Ok(Status::Running));
+        assert_eq!(session.step(&module, &mut vm), Ok(Status::Running));
         assert_eq!(
             session.frame(0).unwrap().stack,
             [Value::Int32(5)].as_slice()
         );
         assert_eq!(
-            session.step(&mut vm),
+            session.step(&module, &mut vm),
             Ok(Status::Done(Some(Value::Int32(5))))
         );
     }
@@ -1360,15 +1363,15 @@ mod tests {
         let mut session = Session::new(&module, main, Vec::new()).unwrap();
         session.add_breakpoint(main, 2);
 
-        assert_eq!(session.resume(&mut vm), Ok(Status::Paused));
+        assert_eq!(session.resume(&module, &mut vm), Ok(Status::Paused));
         assert_eq!(session.frame(0).unwrap().ip, 2);
         assert_eq!(
             session.frame(0).unwrap().stack,
             [Value::Int32(2), Value::Int32(3)].as_slice()
         );
-        assert_eq!(session.step(&mut vm), Ok(Status::Running));
+        assert_eq!(session.step(&module, &mut vm), Ok(Status::Running));
         assert_eq!(
-            session.resume(&mut vm),
+            session.resume(&module, &mut vm),
             Ok(Status::Done(Some(Value::Int32(5))))
         );
     }
@@ -1399,7 +1402,7 @@ mod tests {
         let mut session = Session::new(&module, main, Vec::new()).unwrap();
         session.add_breakpoint(add, 0);
 
-        assert_eq!(session.resume(&mut vm), Ok(Status::Paused));
+        assert_eq!(session.resume(&module, &mut vm), Ok(Status::Paused));
         assert_eq!(session.depth(), 2);
         assert_eq!(session.frame(0).unwrap().method, main);
         assert_eq!(session.frame(1).unwrap().method, add);
@@ -1407,9 +1410,9 @@ mod tests {
             session.frame(1).unwrap().args,
             [Value::Int32(2), Value::Int32(3)].as_slice()
         );
-        assert_eq!(session.step(&mut vm), Ok(Status::Running));
+        assert_eq!(session.step(&module, &mut vm), Ok(Status::Running));
         assert_eq!(
-            session.resume(&mut vm),
+            session.resume(&module, &mut vm),
             Ok(Status::Done(Some(Value::Int32(5))))
         );
     }

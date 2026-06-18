@@ -1,5 +1,7 @@
 //! MIR instructions and the operators they use.
 
+use alloc::vec::Vec;
+
 use crate::function::ValueId;
 use crate::types::MirType;
 
@@ -81,5 +83,13 @@ pub enum Inst {
         lhs: ValueId,
         /// The right operand.
         rhs: ValueId,
+    },
+    /// A direct call to another function of the program (named by index), passing
+    /// `args` and producing the callee's return value.
+    Call {
+        /// The index of the called function within the program.
+        callee: u32,
+        /// The argument values, in order (placed in the ABI's argument registers).
+        args: Vec<ValueId>,
     },
 }

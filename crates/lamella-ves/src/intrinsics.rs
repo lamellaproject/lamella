@@ -3,7 +3,7 @@
 use crate::interp::Vm;
 use crate::trap::Trap;
 use crate::value::Value;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_cil::Opcode;
 
@@ -170,6 +170,41 @@ pub fn console_write_char(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, 
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
     vm.write(&[value as u16]);
+    Ok(None)
+}
+
+/// Formats an `f64` as .NET's `double.ToString()` does for the common cases:
+/// shortest round-trippable for finite values (Rust matches .NET here), and
+/// `Infinity` / `-Infinity` / `NaN` for the specials. Exponent formatting of very
+/// large or small magnitudes still differs from .NET -- a stage-4-oracle refinement.
+fn format_double(value: f64) -> String {
+    if value.is_infinite() {
+        return String::from(if value < 0.0 { "-Infinity" } else { "Infinity" });
+    }
+    value.to_string()
+}
+
+/// `System.Console.WriteLine(double)`: write a double, then a line terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a floating-point value.
+pub fn console_write_line_double(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Float(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_line_text(vm, &format_double(value));
+    Ok(None)
+}
+
+/// `System.Console.Write(double)`: write a double, no terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a floating-point value.
+pub fn console_write_double(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Float(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_text(vm, &format_double(value));
     Ok(None)
 }
 

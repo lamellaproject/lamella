@@ -68,7 +68,13 @@ pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
             block_params[b].iter().map(|&p| Some(p)).collect()
         } else {
             let pred = *preds[b].first().ok_or(CilError::UnsupportedControlFlow)?;
-            exit_locals[pred].clone()
+            if pred < b {
+                exit_locals[pred].clone()
+            } else if is_merge(pred) {
+                block_params[pred].iter().map(|&p| Some(p)).collect()
+            } else {
+                return Err(CilError::UnsupportedControlFlow);
+            }
         };
         locals.resize(local_count, None);
 
@@ -733,6 +739,43 @@ mod tests {
         };
         let func = lower_method(&body).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_a_counting_loop() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Stloc1),
+                Instruction::new(Opcode::BrS, Operand::Target(13)),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ldloc1),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldloc1),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Stloc1),
+                Instruction::simple(Opcode::Ldloc1),
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::new(Opcode::BleS, Operand::Target(5)),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert_eq!(func.blocks.len(), 4);
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(func.value_types.len() > 8);
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
     }
 
     #[test]

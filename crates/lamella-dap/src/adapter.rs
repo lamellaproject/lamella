@@ -8,28 +8,32 @@ use serde_json::{Value as Json, json};
 
 /// A debug session over one program: the module being debugged, the runtime
 /// context, and the running [`lamella_ves::Session`] once launched.
-pub struct Debugger<'a> {
-    module: &'a Module,
+pub struct Debugger {
+    module: Module,
     entry: u32,
     vm: Vm,
-    session: Option<lamella_ves::Session<'a>>,
+    session: Option<lamella_ves::Session>,
     /// The current instruction breakpoints, as `(method, instruction)`. Held here
     /// so they survive across `launch` (which creates the session) and re-apply.
     breakpoints: Vec<(u32, u32)>,
     /// How many UTF-16 code units of the program's console output have already been
     /// forwarded to the client as `output` events.
     output_sent: usize,
+    /// Whether `launch` asked to stop at the entry point instead of running.
+    stop_on_entry: bool,
     out_seq: i64,
 }
 
-impl<'a> Debugger<'a> {
-    /// Creates a debugger for `module`, whose program entry point is `entry`.
+impl Debugger {
+    /// Creates a debugger that owns `module`, whose program entry point is `entry`.
     ///
-    /// The caller provides the already-loaded program: the server binary loads it
-    /// (via `lamella-load`) from the command line; reading it from the DAP `launch`
-    /// request instead is a later refinement.
+    /// The caller provides the loaded program (the server binary loads it from the
+    /// command line; the WASM agent from the bytes it is handed). Owning the module
+    /// -- rather than borrowing it -- is what lets the session and the module live
+    /// in one value behind a handle, and enables reading the program from the DAP
+    /// `launch` request in future.
     #[must_use]
-    pub fn new(module: &'a Module, entry: u32) -> Debugger<'a> {
+    pub fn new(module: Module, entry: u32) -> Debugger {
         Debugger {
             module,
             entry,
@@ -37,6 +41,7 @@ impl<'a> Debugger<'a> {
             session: None,
             breakpoints: Vec::new(),
             output_sent: 0,
+            stop_on_entry: false,
             out_seq: 0,
         }
     }
@@ -55,8 +60,15 @@ impl<'a> Debugger<'a> {
                 events.push(("initialized", None));
                 (true, Some(capabilities()))
             }
-            "launch" => (self.launch(), None),
-            "configurationDone" => (true, None),
+            "launch" => (self.launch(request), None),
+            "configurationDone" => {
+                if self.stop_on_entry {
+                    events.push(("stopped", Some(stopped("entry"))));
+                } else {
+                    self.resume(&mut events);
+                }
+                (true, None)
+            }
             "threads" => (
                 true,
                 Some(json!({ "threads": [{ "id": 1, "name": "main" }] })),
@@ -104,8 +116,14 @@ impl<'a> Debugger<'a> {
         out
     }
 
-    fn launch(&mut self) -> bool {
-        match lamella_ves::Session::new(self.module, self.entry, Vec::new()) {
+    fn launch(&mut self, request: &Request) -> bool {
+        self.stop_on_entry = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get("stopOnEntry"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        match lamella_ves::Session::new(&self.module, self.entry, Vec::new()) {
             Ok(session) => {
                 self.session = Some(session);
                 self.apply_breakpoints();
@@ -168,19 +186,20 @@ impl<'a> Debugger<'a> {
             session,
             vm,
             output_sent,
+            module,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
             return;
         };
         if session.is_at_breakpoint() {
-            match session.step(vm) {
+            match session.step(module, vm) {
                 Ok(Status::Done(_)) => return finish(Run::Done, vm, output_sent, events),
                 Ok(_) => {}
                 Err(trap) => return finish(Run::Fault(trap), vm, output_sent, events),
             }
         }
-        let run = match session.resume(vm) {
+        let run = match session.resume(module, vm) {
             Ok(Status::Paused | Status::Running) => Run::Stopped("breakpoint"),
             Ok(Status::Done(_)) => Run::Done,
             Err(trap) => Run::Fault(trap),
@@ -194,12 +213,13 @@ impl<'a> Debugger<'a> {
             session,
             vm,
             output_sent,
+            module,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
             return;
         };
-        let run = match session.step(vm) {
+        let run = match session.step(module, vm) {
             Ok(Status::Done(_)) => Run::Done,
             Ok(Status::Running | Status::Paused) => Run::Stopped("step"),
             Err(trap) => Run::Fault(trap),
@@ -214,6 +234,7 @@ impl<'a> Debugger<'a> {
             session,
             vm,
             output_sent,
+            module,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
@@ -221,7 +242,7 @@ impl<'a> Debugger<'a> {
         };
         let target_depth = session.depth();
         let run = loop {
-            match session.step(vm) {
+            match session.step(module, vm) {
                 Ok(Status::Done(_)) => break Run::Done,
                 Ok(Status::Running | Status::Paused) if session.depth() <= target_depth => {
                     break Run::Stopped("step");
@@ -239,6 +260,7 @@ impl<'a> Debugger<'a> {
             session,
             vm,
             output_sent,
+            module,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
@@ -246,7 +268,7 @@ impl<'a> Debugger<'a> {
         };
         let target_depth = session.depth();
         let run = loop {
-            match session.step(vm) {
+            match session.step(module, vm) {
                 Ok(Status::Done(_)) => break Run::Done,
                 Ok(Status::Running | Status::Paused) if session.depth() < target_depth => {
                     break Run::Stopped("step");
@@ -596,7 +618,7 @@ mod tests {
     #[test]
     fn initialize_reports_capabilities_and_the_initialized_event() {
         let (module, main) = add_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         let out = dbg.handle(&request(1, "initialize", None));
         assert_eq!(out.len(), 2);
         match &out[0] {
@@ -616,7 +638,7 @@ mod tests {
     #[test]
     fn launch_then_continue_runs_to_termination() {
         let (module, main) = add_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         assert!(matches!(&dbg.handle(&request(1, "launch", None))[0],
             Message::Response(r) if r.success));
         let out = dbg.handle(&request(2, "continue", None));
@@ -635,7 +657,7 @@ mod tests {
     #[test]
     fn stepping_emits_stopped_then_inspects_locals_and_stack() {
         let (module, main) = add_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         dbg.handle(&request(1, "launch", None));
         let out = dbg.handle(&request(2, "next", None));
         assert!(
@@ -665,7 +687,7 @@ mod tests {
     #[test]
     fn an_unknown_request_is_unsuccessful() {
         let (module, main) = add_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         let out = dbg.handle(&request(1, "unheardOf", None));
         assert!(matches!(&out[0], Message::Response(r) if !r.success));
     }
@@ -673,7 +695,7 @@ mod tests {
     #[test]
     fn set_breakpoints_reports_unverified_pending_source_mapping() {
         let (module, main) = add_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         let args = json!({ "breakpoints": [{ "line": 1 }, { "line": 2 }] });
         let out = dbg.handle(&request(1, "setBreakpoints", Some(args)));
         let bps = out[0].response_body()["breakpoints"]
@@ -717,7 +739,7 @@ mod tests {
     #[test]
     fn step_in_descends_into_a_call_while_next_steps_over_it() {
         let (module, main) = call_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         dbg.handle(&request(1, "launch", None));
         dbg.handle(&request(2, "stepIn", None));
         dbg.handle(&request(3, "stepIn", None));
@@ -725,7 +747,8 @@ mod tests {
         dbg.handle(&request(4, "stepIn", None));
         assert_eq!(frame_count(&mut dbg), 2);
 
-        let mut dbg = Debugger::new(&module, main);
+        let (module, main) = call_program();
+        let mut dbg = Debugger::new(module, main);
         dbg.handle(&request(1, "launch", None));
         dbg.handle(&request(2, "stepIn", None));
         dbg.handle(&request(3, "stepIn", None));
@@ -736,7 +759,7 @@ mod tests {
     #[test]
     fn step_out_returns_to_the_caller() {
         let (module, main) = call_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         dbg.handle(&request(1, "launch", None));
         dbg.handle(&request(2, "stepIn", None));
         dbg.handle(&request(3, "stepIn", None));
@@ -749,7 +772,7 @@ mod tests {
     #[test]
     fn an_instruction_breakpoint_stops_continue() {
         let (module, main) = call_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         dbg.handle(&request(1, "initialize", None));
         let address = encode_address(main, 2).to_string();
         let args = json!({ "breakpoints": [{ "instructionReference": address }] });
@@ -787,7 +810,7 @@ mod tests {
     #[test]
     fn disassemble_lists_a_methods_instructions() {
         let (module, main) = add_program();
-        let mut dbg = Debugger::new(&module, main);
+        let mut dbg = Debugger::new(module, main);
         let reference = encode_address(main, 0).to_string();
         let args = json!({
             "memoryReference": reference,

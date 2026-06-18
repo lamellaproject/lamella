@@ -1,6 +1,8 @@
 //! Embedding the interpreter: run a managed assembly and capture its result.
 
 pub mod abi;
+#[cfg(feature = "dap")]
+pub mod dap;
 
 use lamella_load::load;
 use lamella_metadata::Assembly;

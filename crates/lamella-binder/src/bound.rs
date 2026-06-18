@@ -2,7 +2,7 @@
 //! clause 14).
 
 use crate::bind::bind_type;
-use crate::conversion::converts;
+use crate::conversion::{can_cast, converts};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::resolve::{TypeTable, resolve_type};
 use crate::special::SpecialType;
@@ -37,6 +37,12 @@ pub enum BoundExprKind {
     Local(Box<str>),
     /// The `this` access (14.5.7); its type is the enclosing type.
     This,
+    /// A `base` access (14.5.8); its type is the enclosing type's base class, used
+    /// as the receiver of a non-virtual `base.member`.
+    Base,
+    /// A type name used as the receiver of a static member access (14.5.4). Its
+    /// type is the named type so member lookup reaches the type's members.
+    TypeReference(TypeSymbol),
     /// Access to an instance or static field through a receiver (14.5.4); the
     /// expression's type is the field's.
     FieldAccess {
@@ -150,6 +156,14 @@ pub enum BoundExprKind {
     Error,
 }
 
+/// The method currently being bound: its name (for `CS0127`) and declared return
+/// type (for checking `return`).
+#[derive(Debug, Clone)]
+struct MethodContext {
+    name: Box<str>,
+    return_type: TypeSymbol,
+}
+
 /// Binds expressions, accumulating the semantic diagnostics found. Holds a stack
 /// of local-variable scopes for name resolution.
 #[derive(Debug, Default)]
@@ -159,6 +173,7 @@ pub struct Binder {
     world: TypeTable,
     model: Model,
     current_type: Option<TypeSymbol>,
+    current_method: Option<MethodContext>,
 }
 
 impl Binder {
@@ -227,6 +242,93 @@ impl Binder {
         self.current_type = None;
     }
 
+    /// Binds a method body end to end: the enclosing type is in scope for `this`
+    /// and unqualified names, the parameters are declared as locals, and `return`
+    /// statements are checked against `return_type` (15.9.4). Returns the bound
+    /// body.
+    pub fn bind_method(
+        &mut self,
+        enclosing_type: Option<TypeSymbol>,
+        name: &str,
+        return_type: TypeSymbol,
+        parameters: &[(Box<str>, TypeSymbol)],
+        body: &lamella_syntax::ast::Stmt,
+    ) -> crate::statement::BoundStmt {
+        let returns_value = !return_type.is_void();
+        let body_span = body.span;
+        self.current_type = enclosing_type;
+        self.current_method = Some(MethodContext {
+            name: name.into(),
+            return_type,
+        });
+        self.enter_scope();
+        for (parameter, ty) in parameters {
+            self.declare_local(parameter, ty.clone());
+        }
+        let bound = self.bind_statement(body);
+        self.exit_scope();
+        if returns_value && !crate::flow::always_exits(&bound) {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::NotAllPathsReturn {
+                    method: name.into(),
+                },
+                body_span,
+            ));
+        }
+        let parameter_names: Vec<Box<str>> = parameters
+            .iter()
+            .map(|(parameter, _)| parameter.clone())
+            .collect();
+        self.diagnostics
+            .extend(crate::flow::check_definite_assignment(
+                &bound,
+                &parameter_names,
+            ));
+        self.current_method = None;
+        self.current_type = None;
+        bound
+    }
+
+    /// Checks a `return` statement against the enclosing method's return type
+    /// (15.9.4): `CS0127` for a value in a `void` method, `CS0126` for a missing
+    /// value, `CS0029` for a value that does not convert.
+    pub(crate) fn check_return(&mut self, value: Option<&BoundExpr>, span: Span) {
+        let Some(method) = self.current_method.clone() else {
+            return;
+        };
+        if method.return_type.is_void() {
+            if value.is_some_and(|expr| !expr.ty.is_error()) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::ReturnValueInVoidMethod {
+                        method: method.name,
+                    },
+                    span,
+                ));
+            }
+        } else {
+            match value {
+                None => self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::ReturnValueRequired {
+                        ty: method.return_type.to_string().into(),
+                    },
+                    span,
+                )),
+                Some(expr)
+                    if !expr.ty.is_error() && !self.converts(&expr.ty, &method.return_type) =>
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::NoImplicitConversion {
+                            from: expr.ty.to_string().into(),
+                            to: method.return_type.to_string().into(),
+                        },
+                        span,
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Opens a nested scope (a block or method body).
     pub fn enter_scope(&mut self) {
         self.scopes.push(BTreeMap::new());
@@ -258,6 +360,7 @@ impl Binder {
             },
             ExprKind::Name(name) => self.bind_name(name, expr.span),
             ExprKind::This => self.this_expr(),
+            ExprKind::Base => self.base_expr(),
             ExprKind::MemberAccess { receiver, name } => {
                 self.bind_member_access(receiver, name, expr.span)
             }
@@ -307,6 +410,18 @@ impl Binder {
             ExprKind::Cast { target, operand } => {
                 let operand = self.bind_expression(operand);
                 let ty = self.resolve_named_type(&bind_type(target), target.span);
+                if !operand.ty.is_error()
+                    && !ty.is_error()
+                    && !can_cast(&self.model, &operand.ty, &ty)
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::CannotCast {
+                            from: operand.ty.to_string().into(),
+                            to: ty.to_string().into(),
+                        },
+                        target.span,
+                    ));
+                }
                 BoundExpr {
                     kind: BoundExprKind::Cast {
                         operand: Box::new(operand),
@@ -887,6 +1002,13 @@ impl Binder {
                 MemberResolution::NoSuchMember(_) | MemberResolution::Unknown => {}
             }
         }
+        if self.model.get("", name).is_some() {
+            let ty = TypeSymbol::Named([Box::from(name)].into());
+            return BoundExpr {
+                kind: BoundExprKind::TypeReference(ty.clone()),
+                ty,
+            };
+        }
         self.diagnostics.push(Diagnostic::new(
             DiagnosticKind::NameNotFound { name: name.into() },
             span,
@@ -900,6 +1022,20 @@ impl Binder {
         BoundExpr {
             kind: BoundExprKind::This,
             ty: self.current_type.clone().unwrap_or(TypeSymbol::Error),
+        }
+    }
+
+    /// The `base` access, typed as the enclosing type's base class (the error type
+    /// when there is no enclosing type or it has no base, for recovery).
+    fn base_expr(&self) -> BoundExpr {
+        let base = self
+            .current_type
+            .as_ref()
+            .and_then(|ty| self.type_info_of(ty))
+            .and_then(|info| info.base.clone());
+        BoundExpr {
+            kind: BoundExprKind::Base,
+            ty: base.unwrap_or(TypeSymbol::Error),
         }
     }
 }
@@ -1490,6 +1626,15 @@ mod tests {
     }
 
     #[test]
+    fn casts_require_an_explicit_conversion() {
+        assert_eq!(codes("(byte)1"), []);
+        assert_eq!(codes("(int)1u"), []);
+        assert_eq!(codes("(long)1"), []);
+        assert_eq!(codes("(string)1"), [30]);
+        assert_eq!(codes("(bool)1"), [30]);
+    }
+
+    #[test]
     fn conditional_result_type_and_condition_check() {
         assert_eq!(special("true ? 1 : 2"), SpecialType::Int32);
         assert_eq!(special("true ? 1 : 2L"), SpecialType::Int64);
@@ -1676,6 +1821,73 @@ mod tests {
     }
 
     #[test]
+    fn base_access_resolves_against_the_base_class() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Animal { int Speed() { return 0; } } class Dog : Animal { }",
+        )
+        .unit;
+        let model = collect_model(&unit);
+        let mut binder = Binder::with_model(model);
+        binder.enter_type(TypeSymbol::Named(["Dog".into()].into()));
+        binder.enter_scope();
+        assert_eq!(
+            bound_in_scope(&mut binder, "base.Speed()"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        assert!(binder.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn static_access_through_a_type_name() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit =
+            parse_compilation_unit("class Calc { static int Zero; static int Pi() { return 3; } }")
+                .unit;
+        let model = collect_model(&unit);
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+
+        assert_eq!(
+            bound_in_scope(&mut binder, "Calc.Zero"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        assert_eq!(
+            bound_in_scope(&mut binder, "Calc.Pi()"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        assert!(binder.diagnostics().is_empty());
+        bound_in_scope(&mut binder, "Nope");
+        assert!(binder.diagnostics().iter().any(|d| d.code() == 103));
+    }
+
+    #[test]
+    fn enum_members_and_enum_casts() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit("enum Color { Red, Green, Blue }").unit;
+        let model = collect_model(&unit);
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+
+        assert_eq!(
+            bound_in_scope(&mut binder, "Color.Red").to_string(),
+            "Color"
+        );
+        assert_eq!(
+            bound_in_scope(&mut binder, "(int)Color.Red"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        assert_eq!(bound_in_scope(&mut binder, "(Color)1").to_string(), "Color");
+        assert!(binder.diagnostics().is_empty());
+    }
+
+    #[test]
     fn property_access_and_member_assignment() {
         use crate::declaration::collect_model;
         use lamella_syntax::parser::parse_compilation_unit;
@@ -1723,6 +1935,100 @@ mod tests {
         ));
         bound_in_scope(&mut binder, "d = a");
         assert!(binder.diagnostics().iter().any(|d| d.code() == 29));
+    }
+
+    #[test]
+    fn method_binding_checks_return_and_scopes_parameters() {
+        use lamella_syntax::parser::parse_statement;
+        let int = TypeSymbol::Special(SpecialType::Int32);
+        let void = TypeSymbol::Special(SpecialType::Void);
+
+        let codes = |return_type: TypeSymbol, source: &str| {
+            let mut binder = Binder::new();
+            let body = parse_statement(source).statement;
+            binder.bind_method(None, "M", return_type, &[], &body);
+            binder
+                .into_diagnostics()
+                .iter()
+                .map(Diagnostic::code)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(codes(int.clone(), "{ return 1; }"), []);
+        assert_eq!(codes(int.clone(), "{ return; }"), [126]);
+        assert_eq!(codes(int.clone(), "{ return \"x\"; }"), [29]);
+        assert_eq!(codes(void.clone(), "{ return 1; }"), [127]);
+        assert_eq!(codes(void, "{ return; }"), []);
+
+        let mut binder = Binder::new();
+        let body = parse_statement("{ return n; }").statement;
+        binder.bind_method(None, "M", int.clone(), &[("n".into(), int)], &body);
+        assert!(binder.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn definite_assignment_reports_cs0165() {
+        use lamella_syntax::parser::parse_statement;
+        let int = TypeSymbol::Special(SpecialType::Int32);
+        let void = TypeSymbol::Special(SpecialType::Void);
+        let codes = |source: &str| {
+            let mut binder = Binder::new();
+            let body = parse_statement(source).statement;
+            binder.bind_method(None, "M", void.clone(), &[], &body);
+            binder
+                .into_diagnostics()
+                .iter()
+                .map(Diagnostic::code)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(codes("{ int x; int y = x; }"), [165]);
+        assert_eq!(codes("{ int x; x = 1; int y = x; }"), []);
+        assert_eq!(
+            codes("{ bool c = true; int x; if (c) x = 1; int y = x; }"),
+            [165]
+        );
+        assert_eq!(
+            codes("{ bool c = true; int x; if (c) x = 1; else x = 2; int y = x; }"),
+            []
+        );
+        assert_eq!(
+            codes("{ bool c = true; int x; if (c) return; else x = 1; int y = x; }"),
+            []
+        );
+        assert_eq!(codes("{ int x; if (true) x = 1; int y = x; }"), []);
+
+        let mut binder = Binder::new();
+        let body = parse_statement("{ int y = p; }").statement;
+        binder.bind_method(None, "M", void, &[("p".into(), int)], &body);
+        assert!(binder.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn not_all_paths_return_is_cs0161() {
+        use lamella_syntax::parser::parse_statement;
+        let int = TypeSymbol::Special(SpecialType::Int32);
+        let void = TypeSymbol::Special(SpecialType::Void);
+
+        let codes = |return_type: TypeSymbol, source: &str| {
+            let mut binder = Binder::new();
+            let body = parse_statement(source).statement;
+            binder.bind_method(None, "M", return_type, &[], &body);
+            binder
+                .into_diagnostics()
+                .iter()
+                .map(Diagnostic::code)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(codes(int.clone(), "{ int x = 1; }"), [161]);
+        assert_eq!(
+            codes(int.clone(), "{ if (true) return 1; else return 2; }"),
+            []
+        );
+        assert_eq!(codes(int.clone(), "{ while (true) { } }"), []);
+        assert_eq!(codes(int, "{ throw; }"), []);
+        assert_eq!(codes(void, "{ int x = 1; }"), []);
     }
 
     #[test]

@@ -101,13 +101,6 @@ pub struct Interval {
     pub end: u32,
 }
 
-impl Interval {
-    /// The interval's length in program points (longer-lived values span more).
-    pub fn span(&self) -> u32 {
-        self.end.saturating_sub(self.start)
-    }
-}
-
 /// Builds a live interval per value from the block-level liveness, numbering
 /// program points in block-layout order (a block-entry point, one per instruction,
 /// then a terminator point). A value live into or out of a block extends to that
@@ -138,6 +131,11 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::Binary { lhs, rhs, .. } | Inst::Compare { lhs, rhs, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *lhs, ip);
                     mark(&mut lo, &mut hi, &mut defined, *rhs, ip);
+                }
+                Inst::Call { args, .. } => {
+                    for arg in args {
+                        mark(&mut lo, &mut hi, &mut defined, *arg, ip);
+                    }
                 }
                 Inst::ConstInt { .. } => {}
             }
@@ -205,7 +203,9 @@ pub enum Location {
 pub struct Allocation {
     /// The location chosen for each value, indexed by value id.
     pub locations: Vec<Location>,
-    /// The count of distinct registers used (highest index plus one).
+    /// The count of distinct registers used (highest index plus one). The
+    /// callee-saved prologue consults it; unused until spilling and saves land.
+    #[allow(dead_code)]
     pub registers_used: u32,
     /// The count of spill slots used.
     pub spill_count: u32,
@@ -308,6 +308,7 @@ fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*lhs);
             f(*rhs);
         }
+        Inst::Call { args, .. } => args.iter().for_each(|a| f(*a)),
     }
 }
 
@@ -468,8 +469,9 @@ mod tests {
         let func = loop_function();
         let live = Liveness::analyze(&func);
         let intervals = live_intervals(&func, &live);
-        assert!(intervals[2].span() > intervals[5].span());
-        assert!(intervals[1].span() > intervals[5].span());
+        let span = |i: usize| intervals[i].end.saturating_sub(intervals[i].start);
+        assert!(span(2) > span(5));
+        assert!(span(1) > span(5));
     }
 
     #[test]

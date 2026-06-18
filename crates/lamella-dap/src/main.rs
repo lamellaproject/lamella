@@ -22,7 +22,7 @@ fn main() {
         process::exit(1);
     });
 
-    let mut debugger = Debugger::new(&program.module, program.entry);
+    let mut debugger = Debugger::new(program.module, program.entry);
     let stdin = io::stdin();
     let stdout = io::stdout();
     if let Err(error) = serve(&mut debugger, &mut stdin.lock(), &mut stdout.lock()) {

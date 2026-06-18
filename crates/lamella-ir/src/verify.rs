@@ -143,6 +143,11 @@ fn check_inst(
                 expect(MirType::I32, r, errors);
             }
         }
+        Inst::Call { args, .. } => {
+            for &arg in args {
+                use_value(func, defined, arg, errors);
+            }
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 //! Implicit conversions (ECMA-334 1st ed, 13.1).
 
 use crate::special::SpecialType;
-use crate::symbols::Model;
+use crate::symbols::{Model, TypeKind};
 use crate::types::TypeSymbol;
 use alloc::vec::Vec;
 
@@ -10,6 +10,42 @@ use alloc::vec::Vec;
 #[must_use]
 pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
     has_implicit_conversion(from, to) || reference_conversion(model, from, to)
+}
+
+/// Whether an explicit conversion (a cast) exists from `from` to `to` (13.2): any
+/// implicit conversion, the reverse of one (numeric narrowing, a reference
+/// downcast), any numeric-to-numeric conversion, or a cast to/from `object`
+/// (boxing/unboxing and reference downcast). User-defined and enum casts follow.
+#[must_use]
+pub fn can_cast(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    converts(model, from, to)
+        || converts(model, to, from)
+        || (is_numeric_type(from) && is_numeric_type(to))
+        || is_object(from)
+        || is_object(to)
+        || enum_cast(model, from, to)
+}
+
+/// The explicit conversions involving enums (13.2.2): an enum to and from any
+/// integral type, and an enum to another enum.
+fn enum_cast(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    let from_enum = is_enum(model, from);
+    let to_enum = is_enum(model, to);
+    (from_enum && (to_enum || is_numeric_type(to))) || (to_enum && is_numeric_type(from))
+}
+
+fn is_enum(model: &Model, ty: &TypeSymbol) -> bool {
+    model
+        .get_by_symbol(ty)
+        .is_some_and(|info| info.kind == TypeKind::Enum)
+}
+
+fn is_numeric_type(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Special(special) if special.is_numeric())
+}
+
+fn is_object(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Special(SpecialType::Object))
 }
 
 /// An implicit reference conversion from `from` to a base class or implemented

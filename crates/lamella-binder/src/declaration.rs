@@ -40,7 +40,16 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
         }
         NamespaceMember::Type(declaration) => model.insert(type_info(namespace, declaration)),
         NamespaceMember::Enum(declaration) => {
-            model.insert(TypeInfo::new(namespace, &declaration.name, TypeKind::Enum));
+            let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Enum);
+            let enum_ty = named_symbol(namespace, &declaration.name);
+            for member in &declaration.members {
+                info.fields.push(FieldSymbol {
+                    name: member.name.clone(),
+                    ty: enum_ty.clone(),
+                    is_static: true,
+                });
+            }
+            model.insert(info);
         }
         NamespaceMember::Delegate(declaration) => {
             model.insert(TypeInfo::new(
@@ -120,6 +129,19 @@ fn constructor(parameters: &[lamella_syntax::ast::Parameter]) -> MethodSymbol {
         parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
         is_static: false,
     }
+}
+
+/// A named-type symbol from a namespace and simple name, e.g. `"A.B"` + `Color`
+/// gives `A.B.Color`.
+fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
+    let mut parts: alloc::vec::Vec<alloc::boxed::Box<str>> = alloc::vec::Vec::new();
+    if !namespace.is_empty() {
+        for part in namespace.split('.') {
+            parts.push(part.into());
+        }
+    }
+    parts.push(name.into());
+    TypeSymbol::Named(parts.into_boxed_slice())
 }
 
 fn map_kind(kind: SyntaxTypeKind) -> TypeKind {

@@ -165,6 +165,18 @@ impl Encoder {
         self.emit_u16(0xBD00);
     }
 
+    /// `PUSH {registers}` -- push the given low registers, and LR when `lr` is set.
+    /// 16-bit encoding T1 (A6.7.50); `registers` is a bitmask of R0-R7.
+    pub fn push_registers(&mut self, registers: u8, lr: bool) {
+        self.emit_u16(0xB400 | (u16::from(lr) << 8) | u16::from(registers));
+    }
+
+    /// `POP {registers}` -- pop the given low registers, and PC when `pc` is set.
+    /// 16-bit encoding T1 (A6.7.49); `registers` is a bitmask of R0-R7.
+    pub fn pop_registers(&mut self, registers: u8, pc: bool) {
+        self.emit_u16(0xBC00 | (u16::from(pc) << 8) | u16::from(registers));
+    }
+
     /// `ADDS Rd, Rn, Rm` -- add two registers, setting flags. 16-bit encoding T1
     /// (A6.7.3), which admits only the low registers R0-R7; a high register
     /// yields [`AssembleError::UnencodableOperand`].
@@ -1081,6 +1093,13 @@ mod tests {
             one(|e| e.ldrh_imm(Reg::R0, Reg::R1, 6).unwrap()),
             [0xC8, 0x88]
         );
+    }
+
+    #[test]
+    fn push_pop_register_lists() {
+        assert_eq!(one(|e| e.push_registers(0x30, false)), [0x30, 0xB4]);
+        assert_eq!(one(|e| e.pop_registers(0x30, false)), [0x30, 0xBC]);
+        assert_eq!(one(|e| e.push_registers(0x10, true)), [0x10, 0xB5]);
     }
 
     #[test]
