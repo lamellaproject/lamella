@@ -1,0 +1,15 @@
+[package]
+name = "lamella-ves"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Lamella virtual execution system: a CIL interpreter implemented from ECMA-335."
+
+[dependencies]
+lamella-cil = { path = "../lamella-cil" }
+lamella-token = { path = "../lamella-token" }
+
+[lints]
+workspace = true

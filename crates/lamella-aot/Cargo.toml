@@ -1,0 +1,22 @@
+[package]
+name = "lamella-aot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lamella's ahead-of-time backend driver: lowers the middle IR to target machine code."
+
+[dependencies]
+lamella-ir = { path = "../lamella-ir" }
+lamella-asm-arm32 = { path = "../lamella-asm-arm32", optional = true }
+
+[features]
+default = ["arm32"]
+# Each target backend is independently selectable, so a deployment compiles only
+# the code generators it needs -- an ARM32 device never builds the RISC-V or WASM
+# paths, and vice versa.
+arm32 = ["dep:lamella-asm-arm32"]
+
+[lints]
+workspace = true

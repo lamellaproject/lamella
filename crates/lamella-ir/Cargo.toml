@@ -1,0 +1,11 @@
+[package]
+name = "lamella-ir"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lamella's typed middle IR (MIR): a CLI-typed basic-block control flow graph lowered to native targets."
+
+[lints]
+workspace = true

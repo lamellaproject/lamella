@@ -3,9 +3,40 @@
 version = 4
 
 [[package]]
+name = "lamella-aot"
+version = "0.0.0"
+dependencies = [
+ "lamella-asm-arm32",
+ "lamella-ir",
+]
+
+[[package]]
+name = "lamella-asm-arm32"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-cil"
+version = "0.0.0"
+dependencies = [
+ "lamella-token",
+]
+
+[[package]]
+name = "lamella-ir"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-syntax"
 version = "0.0.0"
 
 [[package]]
 name = "lamella-token"
 version = "0.0.0"
+
+[[package]]
+name = "lamella-ves"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil",
+ "lamella-token",
+]

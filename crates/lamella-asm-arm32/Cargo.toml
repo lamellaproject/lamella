@@ -1,0 +1,11 @@
+[package]
+name = "lamella-asm-arm32"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cortex-M (ARMv6-M through ARMv8.1-M) Thumb machine-code encoder for the Lamella backend."
+
+[lints]
+workspace = true

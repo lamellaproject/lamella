@@ -1,0 +1,67 @@
+//! Traps: controlled execution failures reported instead of panicking.
+
+use core::fmt;
+use lamella_cil::Opcode;
+use lamella_token::Token;
+
+/// A controlled execution failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Trap {
+    /// An instruction needed more values than the evaluation stack held.
+    StackUnderflow,
+    /// Execution ran off the end of the method without a `ret`.
+    FellThroughEnd,
+    /// The interpreter does not implement this opcode yet.
+    Unsupported(Opcode),
+    /// An operation was applied to evaluation-stack types it does not accept
+    /// (ECMA-335 1st ed, III.1.5 operand-type tables).
+    TypeMismatch(Opcode),
+    /// An instruction carried an operand of the wrong shape -- a malformed
+    /// instruction that should not survive decoding.
+    MalformedInstruction(Opcode),
+    /// A local-variable slot was out of range for the method.
+    LocalOutOfRange(u16),
+    /// An argument slot was out of range for the call.
+    ArgumentOutOfRange(u16),
+    /// A branch named an instruction index outside the method.
+    BranchOutOfRange(u32),
+    /// Integer division or remainder by zero (`div`, `rem`, and unsigned forms).
+    DivideByZero,
+    /// A `call` token resolved to no method in the module.
+    UnresolvedCall(Token),
+    /// An `ldstr` token resolved to no string in the module's user-string heap.
+    UnresolvedString(Token),
+    /// A resolved method id did not exist in the module.
+    NoSuchMethod(u32),
+    /// The call stack grew past the interpreter's depth limit (runaway recursion).
+    CallStackOverflow,
+}
+
+impl fmt::Display for Trap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Trap::StackUnderflow => f.write_str("evaluation stack underflow"),
+            Trap::FellThroughEnd => f.write_str("execution fell off the end of the method"),
+            Trap::Unsupported(opcode) => write!(f, "unsupported instruction {}", opcode.mnemonic()),
+            Trap::TypeMismatch(opcode) => {
+                write!(f, "operand types invalid for {}", opcode.mnemonic())
+            }
+            Trap::MalformedInstruction(opcode) => {
+                write!(f, "malformed operand for {}", opcode.mnemonic())
+            }
+            Trap::LocalOutOfRange(slot) => write!(f, "local variable {slot} out of range"),
+            Trap::ArgumentOutOfRange(slot) => write!(f, "argument {slot} out of range"),
+            Trap::BranchOutOfRange(target) => write!(f, "branch target {target} out of range"),
+            Trap::DivideByZero => f.write_str("integer divide by zero"),
+            Trap::UnresolvedCall(token) => {
+                write!(f, "call token 0x{:08X} resolved to no method", token.0)
+            }
+            Trap::UnresolvedString(token) => {
+                write!(f, "ldstr token 0x{:08X} resolved to no string", token.0)
+            }
+            Trap::NoSuchMethod(id) => write!(f, "method id {id} does not exist"),
+            Trap::CallStackOverflow => f.write_str("call stack overflow"),
+        }
+    }
+}
