@@ -245,8 +245,8 @@ impl<'a> Lexer<'a> {
     /// applies its effect. `active` says whether the enclosing conditional
     /// section is being compiled. A directive must be lexically correct even in
     /// a skipped section (9.5.4), so malformed-directive diagnostics fire either
-    /// way; only the *effects* — defining symbols, evaluating which branch to
-    /// include, raising `#error`/`#warning`, the first-token rule — are gated on
+    /// way; only the *effects* -- defining symbols, evaluating which branch to
+    /// include, raising `#error`/`#warning`, the first-token rule -- are gated on
     /// `active`. The structural stack of conditionals is always maintained, so
     /// nesting stays correct through skipped regions.
     fn scan_directive(&mut self, start: usize) -> TokenKind {
@@ -358,14 +358,15 @@ impl<'a> Lexer<'a> {
         top.branch_taken |= take;
     }
 
-    /// Processes an `#endif` (9.5.4): closes the innermost `#if` group. Closing a
-    /// `#region` instead is the wrong directive and is recovered by closing it.
+    /// Processes an `#endif` (9.5.4): closes the innermost `#if` group. With a
+    /// `#region` open instead, its `#endregion` was due (`CS1038`); the region is
+    /// left open for its real `#endregion` or the end-of-file error, NOT closed
+    /// here -- a wrong closer does not match, matching csc.
     fn scan_endif(&mut self, start: usize) {
         self.expect_directive_line_end(start);
         match self.conditionals.last() {
             Some(top) if top.is_region => {
                 self.report(DiagnosticKind::EndRegionDirectiveExpected, start);
-                self.conditionals.pop();
             }
             Some(_) => {
                 self.conditionals.pop();
@@ -388,14 +389,15 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    /// Processes an `#endregion` (9.5.6): closes the innermost `#region`. Closing
-    /// an `#if` instead is the wrong directive and is recovered by closing it.
+    /// Processes an `#endregion` (9.5.6): closes the innermost `#region`. With an
+    /// `#if` open instead, its `#endif` was due (`CS1027`); the `#if` is left open
+    /// for its real `#endif` or the end-of-file error, NOT closed here -- a wrong
+    /// closer does not match, matching csc.
     fn scan_endregion(&mut self, start: usize) {
         self.consume_to_line_end();
         match self.conditionals.last() {
             Some(top) if !top.is_region => {
                 self.report(DiagnosticKind::EndIfDirectiveExpected, start);
-                self.conditionals.pop();
             }
             Some(_) => {
                 self.conditionals.pop();
@@ -1789,8 +1791,6 @@ mod tests {
         assert_eq!(sorted_codes("#region r\nclass C {}"), vec![1038]);
         assert_eq!(sorted_codes("#if A\n#else\n#else\n#endif\nx"), vec![1027]);
         assert_eq!(sorted_codes("#if A\n#else\n#elif B\n#endif\nx"), vec![1027]);
-        assert_eq!(sorted_codes("#region\n#endif\nclass C {}"), vec![1038]);
-        assert_eq!(sorted_codes("#if A\n#endregion\nclass C {}"), vec![1027]);
         assert_eq!(sorted_codes("#line abc\nclass C {}"), vec![1576]);
     }
 
@@ -1841,10 +1841,28 @@ mod tests {
     }
 
     #[test]
-    fn a_conditional_directive_inside_a_region_wants_endregion() {
+    fn mismatched_and_unterminated_directives_match_csc() {
+
+        assert_eq!(sorted_codes("#region\n#endif\n#endregion\nx"), vec![1038]);
+        assert_eq!(sorted_codes("#region\n#endif\nx"), vec![1038, 1038]);
         assert_eq!(sorted_codes("#region\n#elif A\n#endregion\nx"), vec![1038]);
         assert_eq!(sorted_codes("#region\n#else\n#endregion\nx"), vec![1038]);
-        assert_eq!(sorted_codes("#region\n#endif\nx"), vec![1038]);
+        assert_eq!(sorted_codes("#if X\n#endregion\n#endif\nx"), vec![1027]);
+        assert_eq!(sorted_codes("#if X\n#endregion\nx"), vec![1027, 1027]);
+        assert_eq!(
+            sorted_codes("#region\n#if X\n#endregion\n#endif\nx"),
+            vec![1027, 1038]
+        );
+        assert!(
+            tokenize("#region\n#if X\n#endif\n#endregion\nx")
+                .diagnostics
+                .is_empty()
+        );
+        assert_eq!(sorted_codes("#if A\n#if B\nx"), vec![1027]);
+        assert_eq!(sorted_codes("#region\n#region\nx"), vec![1038]);
+        assert_eq!(sorted_codes("#if A\n#region\nx"), vec![1038]);
+        assert_eq!(sorted_codes("#region\n#if A\nx"), vec![1027]);
+        assert_eq!(sorted_codes("#endif\n#endif\nx"), vec![1028, 1028]);
     }
 
     #[test]
