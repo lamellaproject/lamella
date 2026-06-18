@@ -1,5 +1,8 @@
-//! The bound expression tree and the expression binder
+//! The bound expression tree and the expression binder (ECMA-334 1st ed,
+//! clause 14).
 
+use crate::bind::bind_type;
+use crate::conversion::has_implicit_conversion;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::resolve::{TypeTable, resolve_type};
 use crate::special::SpecialType;
@@ -9,7 +12,8 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    BinaryOperator, Expr, ExprKind, Literal, PostfixOperator, UnaryOperator,
+    AssignmentOperator, BinaryOperator, Expr, ExprKind, Literal, PostfixOperator,
+    TypeTestOperation, UnaryOperator,
 };
 use lamella_syntax::span::Span;
 use lamella_syntax::token::{IntegerSuffix, RealSuffix};
@@ -53,6 +57,43 @@ pub enum BoundExprKind {
         /// The operand.
         operand: Box<BoundExpr>,
     },
+    /// A cast to the expression's type (14.6.6).
+    Cast {
+        /// The operand being cast.
+        operand: Box<BoundExpr>,
+    },
+    /// An `is`/`as` type test (14.9.9, 14.9.10); the tested type is the result
+    /// type for `as` and `bool` for `is`.
+    TypeTest {
+        /// Whether this is `is` or `as`.
+        operation: TypeTestOperation,
+        /// The operand.
+        operand: Box<BoundExpr>,
+    },
+    /// An assignment, simple or compound (14.14); its type is the target's.
+    Assignment {
+        /// The assignment operator.
+        operator: AssignmentOperator,
+        /// The assignment target (an lvalue).
+        target: Box<BoundExpr>,
+        /// The assigned value.
+        value: Box<BoundExpr>,
+    },
+    /// A conditional expression `c ? a : b` (14.13).
+    Conditional {
+        /// The condition.
+        condition: Box<BoundExpr>,
+        /// The value when true.
+        when_true: Box<BoundExpr>,
+        /// The value when false.
+        when_false: Box<BoundExpr>,
+    },
+    /// A `typeof` expression (14.5.11); its type is `System.Type`.
+    TypeOf,
+    /// A `checked` expression (14.5.12); the type is the operand's.
+    Checked(Box<BoundExpr>),
+    /// An `unchecked` expression (14.5.12); the type is the operand's.
+    Unchecked(Box<BoundExpr>),
     /// An expression that could not be bound (yet), for recovery.
     Error,
 }
@@ -143,6 +184,68 @@ impl Binder {
             ExprKind::PostfixUnary { operator, operand } => {
                 self.bind_postfix(*operator, operand, expr.span)
             }
+            ExprKind::Cast { target, operand } => {
+                let operand = self.bind_expression(operand);
+                let ty = self.resolve_named_type(&bind_type(target), target.span);
+                BoundExpr {
+                    kind: BoundExprKind::Cast {
+                        operand: Box::new(operand),
+                    },
+                    ty,
+                }
+            }
+            ExprKind::TypeTest {
+                operation,
+                operand,
+                target,
+            } => {
+                let operand = self.bind_expression(operand);
+                let target = self.resolve_named_type(&bind_type(target), target.span);
+                let ty = match operation {
+                    TypeTestOperation::Is => TypeSymbol::Special(SpecialType::Boolean),
+                    TypeTestOperation::As => target,
+                };
+                BoundExpr {
+                    kind: BoundExprKind::TypeTest {
+                        operation: *operation,
+                        operand: Box::new(operand),
+                    },
+                    ty,
+                }
+            }
+            ExprKind::TypeOf(target) => {
+                let _ = self.resolve_named_type(&bind_type(target), target.span);
+                BoundExpr {
+                    kind: BoundExprKind::TypeOf,
+                    ty: system_type(),
+                }
+            }
+            ExprKind::Checked(inner) => {
+                let inner = self.bind_expression(inner);
+                let ty = inner.ty.clone();
+                BoundExpr {
+                    kind: BoundExprKind::Checked(Box::new(inner)),
+                    ty,
+                }
+            }
+            ExprKind::Unchecked(inner) => {
+                let inner = self.bind_expression(inner);
+                let ty = inner.ty.clone();
+                BoundExpr {
+                    kind: BoundExprKind::Unchecked(Box::new(inner)),
+                    ty,
+                }
+            }
+            ExprKind::Conditional {
+                condition,
+                when_true,
+                when_false,
+            } => self.bind_conditional(condition, when_true, when_false),
+            ExprKind::Assignment {
+                operator,
+                target,
+                value,
+            } => self.bind_assignment(*operator, target, value, expr.span),
             ExprKind::Parenthesized(inner) => self.bind_expression(inner),
             _ => BoundExpr {
                 kind: BoundExprKind::Error,
@@ -247,6 +350,112 @@ impl Binder {
         ));
     }
 
+    fn bind_conditional(
+        &mut self,
+        condition: &Expr,
+        when_true: &Expr,
+        when_false: &Expr,
+    ) -> BoundExpr {
+        let condition_span = condition.span;
+        let condition = self.bind_expression(condition);
+        let boolean = TypeSymbol::Special(SpecialType::Boolean);
+        if !condition.ty.is_error() && !has_implicit_conversion(&condition.ty, &boolean) {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::NoImplicitConversion {
+                    from: condition.ty.to_string().into(),
+                    to: "bool".into(),
+                },
+                condition_span,
+            ));
+        }
+        let span = when_false.span;
+        let when_true = self.bind_expression(when_true);
+        let when_false = self.bind_expression(when_false);
+        let ty = if when_true.ty.is_error() || when_false.ty.is_error() {
+            TypeSymbol::Error
+        } else if let Some(common) = conditional_result_type(&when_true.ty, &when_false.ty) {
+            common
+        } else {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::ConditionalTypeMismatch {
+                    left: when_true.ty.to_string().into(),
+                    right: when_false.ty.to_string().into(),
+                },
+                span,
+            ));
+            TypeSymbol::Error
+        };
+        BoundExpr {
+            kind: BoundExprKind::Conditional {
+                condition: Box::new(condition),
+                when_true: Box::new(when_true),
+                when_false: Box::new(when_false),
+            },
+            ty,
+        }
+    }
+
+    fn bind_assignment(
+        &mut self,
+        operator: AssignmentOperator,
+        target_expr: &Expr,
+        value_expr: &Expr,
+        span: Span,
+    ) -> BoundExpr {
+        let target_span = target_expr.span;
+        let target = self.bind_expression(target_expr);
+        let value = self.bind_expression(value_expr);
+        if !target.ty.is_error() && !is_lvalue(&target) {
+            self.diagnostics
+                .push(Diagnostic::new(DiagnosticKind::NotAssignable, target_span));
+        } else if !target.ty.is_error() && !value.ty.is_error() {
+            self.check_assignment(operator, &target.ty, &value.ty, span);
+        }
+        let ty = target.ty.clone();
+        BoundExpr {
+            kind: BoundExprKind::Assignment {
+                operator,
+                target: Box::new(target),
+                value: Box::new(value),
+            },
+            ty,
+        }
+    }
+
+    fn check_assignment(
+        &mut self,
+        operator: AssignmentOperator,
+        target: &TypeSymbol,
+        value: &TypeSymbol,
+        span: Span,
+    ) {
+        match compound_binary_operator(operator) {
+            None => {
+                if !has_implicit_conversion(value, target) {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::NoImplicitConversion {
+                            from: value.to_string().into(),
+                            to: target.to_string().into(),
+                        },
+                        span,
+                    ));
+                }
+            }
+            Some(binary) => {
+                if binary_result_type(binary, target, value).is_none() {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::OperatorNotApplicable {
+                            operator: assignment_symbol(operator).into(),
+                            left: target.to_string().into(),
+                            right: value.to_string().into(),
+                        },
+                        span,
+                    ));
+                }
+            }
+        }
+    }
+
     /// Binds a simple name (14.5.2). For now a name resolves only to a local
     /// variable or parameter; anything else is `CS0103` (field, type, and
     /// namespace lookup arrive with the declaration model).
@@ -324,6 +533,71 @@ fn as_special(ty: &TypeSymbol) -> Option<SpecialType> {
     match ty {
         TypeSymbol::Special(special) => Some(*special),
         _ => None,
+    }
+}
+
+/// The `System.Type` named type, the result of a `typeof` expression (14.5.11).
+fn system_type() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("System"), Box::from("Type")].into())
+}
+
+/// The type of a conditional expression from its branch types (14.13): the branch
+/// type the other implicitly converts to, or `None` (`CS0173`) when there is no
+/// one-way conversion between them.
+fn conditional_result_type(when_true: &TypeSymbol, when_false: &TypeSymbol) -> Option<TypeSymbol> {
+    if when_true == when_false {
+        return Some(when_true.clone());
+    }
+    match (
+        has_implicit_conversion(when_true, when_false),
+        has_implicit_conversion(when_false, when_true),
+    ) {
+        (true, false) => Some(when_false.clone()),
+        (false, true) => Some(when_true.clone()),
+        _ => None,
+    }
+}
+
+/// Whether a bound expression denotes something assignable. Only locals and
+/// parameters qualify for now; fields, array elements, and properties follow with
+/// member access.
+fn is_lvalue(expr: &BoundExpr) -> bool {
+    matches!(expr.kind, BoundExprKind::Local(_))
+}
+
+/// The binary operator underlying a compound assignment, or `None` for simple `=`.
+fn compound_binary_operator(operator: AssignmentOperator) -> Option<BinaryOperator> {
+    use AssignmentOperator as A;
+    Some(match operator {
+        A::Assign => return None,
+        A::Add => BinaryOperator::Add,
+        A::Subtract => BinaryOperator::Subtract,
+        A::Multiply => BinaryOperator::Multiply,
+        A::Divide => BinaryOperator::Divide,
+        A::Modulo => BinaryOperator::Modulo,
+        A::And => BinaryOperator::BitwiseAnd,
+        A::Or => BinaryOperator::BitwiseOr,
+        A::Xor => BinaryOperator::BitwiseXor,
+        A::LeftShift => BinaryOperator::LeftShift,
+        A::RightShift => BinaryOperator::RightShift,
+    })
+}
+
+/// The source symbol of an assignment operator, for diagnostics.
+fn assignment_symbol(operator: AssignmentOperator) -> &'static str {
+    use AssignmentOperator as A;
+    match operator {
+        A::Assign => "=",
+        A::Add => "+=",
+        A::Subtract => "-=",
+        A::Multiply => "*=",
+        A::Divide => "/=",
+        A::Modulo => "%=",
+        A::And => "&=",
+        A::Or => "|=",
+        A::Xor => "^=",
+        A::LeftShift => "<<=",
+        A::RightShift => ">>=",
     }
 }
 
@@ -640,6 +914,46 @@ mod tests {
         binder.bind_expression(&parse_expression("missing").expr);
         let codes: Vec<u16> = binder.diagnostics().iter().map(Diagnostic::code).collect();
         assert_eq!(codes, [103]);
+    }
+
+    #[test]
+    fn cast_typetest_typeof_and_checked() {
+        assert_eq!(special("(long)1"), SpecialType::Int64);
+        assert_eq!(special("1 is int"), SpecialType::Boolean);
+        assert_eq!(special("1 as object"), SpecialType::Object);
+        assert_eq!(bound_type("typeof(int)").to_string(), "System.Type");
+        assert_eq!(special("checked(1 + 2)"), SpecialType::Int32);
+        assert_eq!(special("unchecked(1)"), SpecialType::Int32);
+    }
+
+    #[test]
+    fn conditional_result_type_and_condition_check() {
+        assert_eq!(special("true ? 1 : 2"), SpecialType::Int32);
+        assert_eq!(special("true ? 1 : 2L"), SpecialType::Int64);
+        assert_eq!(special("false ? 2L : 1"), SpecialType::Int64);
+        assert_eq!(codes("1 ? 1 : 2"), [29]);
+        assert_eq!(codes("true ? 1 : \"x\""), [173]);
+    }
+
+    #[test]
+    fn assignment_typing_and_checks() {
+        let mut binder = Binder::new();
+        binder.enter_scope();
+        binder.declare_local("x", TypeSymbol::Special(SpecialType::Int32));
+        assert_eq!(
+            bound_in_scope(&mut binder, "x = 1"),
+            TypeSymbol::Special(SpecialType::Int32)
+        );
+        bound_in_scope(&mut binder, "x += 2");
+        assert!(binder.diagnostics().is_empty());
+        let before = binder.diagnostics().len();
+        bound_in_scope(&mut binder, "x = true");
+        assert_eq!(binder.diagnostics()[before].code(), 29);
+    }
+
+    #[test]
+    fn assigning_to_a_non_variable_is_cs0131() {
+        assert_eq!(codes("1 = 2"), [131]);
     }
 
     #[test]

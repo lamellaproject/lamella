@@ -71,6 +71,15 @@ pub enum DiagnosticKind {
         /// The operand's type.
         operand: Box<str>,
     },
+    /// `CS0173`: a conditional expression's two branches have no common type.
+    ConditionalTypeMismatch {
+        /// The `true` branch's type.
+        left: Box<str>,
+        /// The `false` branch's type.
+        right: Box<str>,
+    },
+    /// `CS0131`: the target of an assignment is not a variable, property, or indexer.
+    NotAssignable,
 }
 
 impl DiagnosticKind {
@@ -83,6 +92,8 @@ impl DiagnosticKind {
             DiagnosticKind::NoImplicitConversion { .. } => 29,
             DiagnosticKind::OperatorNotApplicable { .. } => 19,
             DiagnosticKind::UnaryOperatorNotApplicable { .. } => 23,
+            DiagnosticKind::ConditionalTypeMismatch { .. } => 173,
+            DiagnosticKind::NotAssignable => 131,
         }
     }
 }
@@ -110,6 +121,15 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::UnaryOperatorNotApplicable { operator, operand } => write!(
                 f,
                 "Operator '{operator}' cannot be applied to operand of type '{operand}'"
+            ),
+            DiagnosticKind::ConditionalTypeMismatch { left, right } => write!(
+                f,
+                "Type of conditional expression cannot be determined because there is no \
+                 implicit conversion between '{left}' and '{right}'"
+            ),
+            DiagnosticKind::NotAssignable => write!(
+                f,
+                "The left-hand side of an assignment must be a variable, property or indexer"
             ),
         }
     }

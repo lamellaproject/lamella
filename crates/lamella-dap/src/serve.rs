@@ -1,4 +1,5 @@
 //! The serve loop: read framed DAP requests, dispatch them to a [`Debugger`], and
+//! write the responses and events back.
 
 use crate::adapter::Debugger;
 use crate::protocol::{Message, read_message, write_message};

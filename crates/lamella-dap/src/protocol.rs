@@ -1,4 +1,5 @@
 //! The Debug Adapter Protocol base wire format: the message envelope and its
+//! `Content-Length` framing.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -1,4 +1,5 @@
 //! The seam between the middle IR and a target: the lowering trait every
+//! per-target code generator implements.
 
 use alloc::vec::Vec;
 

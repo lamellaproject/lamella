@@ -1,4 +1,5 @@
 //! A minimal, interim module: the methods the interpreter runs and calls between,
+//! the intrinsics they reach, and the strings `ldstr` loads.
 
 use crate::interp::Vm;
 use crate::trap::Trap;

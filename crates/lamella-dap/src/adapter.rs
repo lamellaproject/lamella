@@ -1,4 +1,5 @@
 //! The debug adapter: translates DAP requests into actions on a
+//! [`lamella_ves::Session`] and produces the responses and events DAP expects.
 
 use crate::protocol::{Event, Message, Request, Response};
 use lamella_ves::{Module, Status, Value, Vm};

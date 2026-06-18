@@ -1,4 +1,5 @@
 //! Method bodies: the II.25.4 header, the instruction stream, and the
+//! exception-handling clauses, decoded together.
 
 use crate::codec::{self, DecodeError, EncodeError};
 use crate::instruction::Instruction;
