@@ -1,8 +1,9 @@
 //! The parser: building a syntax tree from the token stream.
 
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, Expr, ExprKind, Literal, PostfixOperator, PredefinedType,
-    TypeRef, TypeRefKind, TypeTestOperation, UnaryOperator,
+    AssignmentOperator, BinaryOperator, CatchClause, Expr, ExprKind, ForInitializer, GotoTarget,
+    Literal, PostfixOperator, PredefinedType, Stmt, StmtKind, SwitchLabel, SwitchSection, TypeRef,
+    TypeRefKind, TypeTestOperation, UnaryOperator, UsingResource, VariableDeclarator,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::lexer::{Tokenized, tokenize};
@@ -33,6 +34,27 @@ pub fn parse_expression(source: &str) -> ParsedExpression {
     let expr = parser.parse_expression();
     ParsedExpression {
         expr,
+        diagnostics: parser.diagnostics,
+    }
+}
+
+/// The result of parsing a statement: the tree and every diagnostic gathered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedStatement {
+    /// The statement tree, with [`crate::ast::StmtKind::Error`] placeholders
+    /// where recovery was needed.
+    pub statement: Stmt,
+    /// Lexical and syntactic diagnostics, in source order.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Lexes and parses `source` as a single statement (ECMA-334 1st ed, clause 15).
+#[must_use]
+pub fn parse_statement(source: &str) -> ParsedStatement {
+    let mut parser = Parser::new(tokenize(source));
+    let statement = parser.parse_statement();
+    ParsedStatement {
+        statement,
         diagnostics: parser.diagnostics,
     }
 }
@@ -94,6 +116,44 @@ impl Parser {
         }
     }
 
+    /// The current token's keyword, if it is one.
+    fn current_keyword(&self) -> Option<Keyword> {
+        match self.current().kind {
+            TokenKind::Keyword(keyword) => Some(keyword),
+            _ => None,
+        }
+    }
+
+    /// Consumes the current token if it is `keyword`, reporting whether it was.
+    fn eat_keyword(&mut self, keyword: Keyword) -> bool {
+        if self.current_keyword() == Some(keyword) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Requires `keyword`, reporting `'expected' expected` at the current
+    /// position if it is absent.
+    fn expect_keyword(&mut self, keyword: Keyword, expected: &'static str) {
+        if !self.eat_keyword(keyword) {
+            let at = self.current().span.start;
+            self.report(
+                DiagnosticKind::TokenExpected { expected },
+                Span::empty_at(at),
+            );
+        }
+    }
+
+    /// Whether the token after the current one is `punctuator`.
+    fn next_is(&self, punctuator: Punctuator) -> bool {
+        matches!(
+            self.tokens.get(self.position + 1).map(|token| &token.kind),
+            Some(TokenKind::Punctuator(found)) if *found == punctuator
+        )
+    }
+
     /// Requires `punctuator`, returning the byte offset just past it. When it is
     /// absent, `missing` is reported at the current position and that position is
     /// returned, so a caller's span computation still terminates the node.
@@ -111,6 +171,548 @@ impl Parser {
 
     fn report(&mut self, kind: DiagnosticKind, span: Span) {
         self.diagnostics.push(Diagnostic::new(kind, span));
+    }
+
+    /// Parses a statement (clause 15): a block, the empty statement, `return`,
+    /// `if`, `while`, a local declaration, or an expression statement.
+    fn parse_statement(&mut self) -> Stmt {
+        let start = self.current().span.start;
+        if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+            return self.parse_block();
+        }
+        if self.current_punctuator() == Some(Punctuator::Semicolon) {
+            let end = self.current().span.end;
+            self.bump();
+            return Stmt::new(StmtKind::Empty, Span::new(start, end));
+        }
+        if let Some(keyword) = self.current_keyword() {
+            match keyword {
+                Keyword::Return => return self.parse_return(start),
+                Keyword::If => return self.parse_if(start),
+                Keyword::While => return self.parse_while(start),
+                Keyword::Do => return self.parse_do_while(start),
+                Keyword::For => return self.parse_for(start),
+                Keyword::Foreach => return self.parse_foreach(start),
+                Keyword::Break => return self.parse_keyword_then_semicolon(start, StmtKind::Break),
+                Keyword::Continue => {
+                    return self.parse_keyword_then_semicolon(start, StmtKind::Continue);
+                }
+                Keyword::Throw => return self.parse_throw(start),
+                Keyword::Try => return self.parse_try(start),
+                Keyword::Lock => return self.parse_lock(start),
+                Keyword::Using => return self.parse_using(start),
+                Keyword::Switch => return self.parse_switch(start),
+                Keyword::Goto => return self.parse_goto(start),
+                Keyword::Checked | Keyword::Unchecked if self.next_is(Punctuator::OpenBrace) => {
+                    return self.parse_checked_block(start, keyword);
+                }
+                _ => {}
+            }
+        }
+        if matches!(self.current().kind, TokenKind::Identifier(_))
+            && self.next_is(Punctuator::Colon)
+        {
+            return self.parse_labeled(start);
+        }
+        self.parse_declaration_or_expression_statement(start)
+    }
+
+    /// Parses a block `{ statements }` (15.2), with the scanner at the `{`.
+    fn parse_block(&mut self) -> Stmt {
+        let start = self.current().span.start;
+        self.bump();
+        let mut statements = Vec::new();
+        while self.current_punctuator() != Some(Punctuator::CloseBrace)
+            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        {
+            let before = self.position;
+            statements.push(self.parse_statement());
+            if self.position == before {
+                self.bump();
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        Stmt::new(StmtKind::Block(statements), Span::new(start, end))
+    }
+
+    /// Parses a `return` statement (15.9.4): `return expression_opt ;`.
+    fn parse_return(&mut self, start: u32) -> Stmt {
+        self.bump();
+        let value = if self.current_punctuator() == Some(Punctuator::Semicolon) {
+            None
+        } else {
+            Some(self.parse_expression())
+        };
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Stmt::new(StmtKind::Return(value), Span::new(start, end))
+    }
+
+    /// Parses an `if` statement (15.7.1): `if ( expression ) statement` with an
+    /// optional `else statement`. An `else` binds to the nearest `if`.
+    fn parse_if(&mut self, start: u32) -> Stmt {
+        self.bump();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let condition = self.parse_expression();
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let then_branch = Box::new(self.parse_statement());
+        let mut end = then_branch.span.end;
+        let else_branch = if self.eat_keyword(Keyword::Else) {
+            let statement = self.parse_statement();
+            end = statement.span.end;
+            Some(Box::new(statement))
+        } else {
+            None
+        };
+        Stmt::new(
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            },
+            Span::new(start, end),
+        )
+    }
+
+    /// Parses a `while` statement (15.8.1): `while ( expression ) statement`.
+    fn parse_while(&mut self, start: u32) -> Stmt {
+        self.bump();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let condition = self.parse_expression();
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let body = Box::new(self.parse_statement());
+        let end = body.span.end;
+        Stmt::new(StmtKind::While { condition, body }, Span::new(start, end))
+    }
+
+    /// Disambiguates a local declaration from an expression statement (15.5.1,
+    /// 15.6): the statement is a declaration when it begins with a type followed
+    /// by an identifier (the variable name). The type is parsed speculatively and
+    /// rolled back, diagnostics included, if it turns out to be an expression.
+    fn parse_declaration_or_expression_statement(&mut self, start: u32) -> Stmt {
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let ty = self.parse_type();
+        if !matches!(ty.kind, TypeRefKind::Error)
+            && matches!(self.current().kind, TokenKind::Identifier(_))
+        {
+            return self.parse_local_declaration(start, ty);
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        self.parse_expression_statement(start)
+    }
+
+    /// Parses one or more comma-separated variable declarators (15.5.1), each an
+    /// identifier with an optional `= expression` initializer. Array initializers
+    /// are not yet parsed. Does not consume a terminator.
+    fn parse_variable_declarators(&mut self) -> Vec<VariableDeclarator> {
+        let mut declarators = Vec::new();
+        loop {
+            let declarator_start = self.current().span.start;
+            let (name, mut end) = self.expect_identifier();
+            let initializer = if self.eat(Punctuator::Equals) {
+                let value = self.parse_expression();
+                end = value.span.end;
+                Some(value)
+            } else {
+                None
+            };
+            declarators.push(VariableDeclarator {
+                name,
+                initializer,
+                span: Span::new(declarator_start, end),
+            });
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
+        declarators
+    }
+
+    /// Parses the declarators and terminator of a local declaration, given its
+    /// already-parsed type (15.5.1).
+    fn parse_local_declaration(&mut self, start: u32, ty: TypeRef) -> Stmt {
+        let declarators = self.parse_variable_declarators();
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Stmt::new(
+            StmtKind::LocalDeclaration { ty, declarators },
+            Span::new(start, end),
+        )
+    }
+
+    /// Parses an expression statement (15.6): `expression ;`.
+    fn parse_expression_statement(&mut self, start: u32) -> Stmt {
+        let expr = self.parse_expression();
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Stmt::new(StmtKind::Expression(expr), Span::new(start, end))
+    }
+
+    /// A comma-separated list of expressions (14.4.1), used by `for` clauses.
+    fn parse_expression_list(&mut self) -> Vec<Expr> {
+        let mut expressions = Vec::new();
+        expressions.push(self.parse_expression());
+        while self.eat(Punctuator::Comma) {
+            expressions.push(self.parse_expression());
+        }
+        expressions
+    }
+
+    /// Parses a `do body while ( condition ) ;` statement (15.8.2).
+    fn parse_do_while(&mut self, start: u32) -> Stmt {
+        self.bump();
+        let body = Box::new(self.parse_statement());
+        self.expect_keyword(Keyword::While, "while");
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let condition = self.parse_expression();
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Stmt::new(StmtKind::DoWhile { body, condition }, Span::new(start, end))
+    }
+
+    /// Parses a `for` statement (15.8.3): an optional initializer, condition, and
+    /// iterator list, each clause separated by `;`, then the body.
+    fn parse_for(&mut self, start: u32) -> Stmt {
+        self.bump();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let initializer = self.parse_for_initializer();
+        self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        let condition = if self.current_punctuator() == Some(Punctuator::Semicolon) {
+            None
+        } else {
+            Some(self.parse_expression())
+        };
+        self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        let iterators = if self.current_punctuator() == Some(Punctuator::CloseParen) {
+            Vec::new()
+        } else {
+            self.parse_expression_list()
+        };
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let body = Box::new(self.parse_statement());
+        let end = body.span.end;
+        Stmt::new(
+            StmtKind::For {
+                initializer,
+                condition,
+                iterators,
+                body,
+            },
+            Span::new(start, end),
+        )
+    }
+
+    /// Parses a `for` initializer (15.8.3): a local declaration (a type then an
+    /// identifier) or a list of statement expressions, disambiguated as in a
+    /// statement. Returns `None` when the clause is empty.
+    fn parse_for_initializer(&mut self) -> Option<ForInitializer> {
+        if self.current_punctuator() == Some(Punctuator::Semicolon) {
+            return None;
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let ty = self.parse_type();
+        if !matches!(ty.kind, TypeRefKind::Error)
+            && matches!(self.current().kind, TokenKind::Identifier(_))
+        {
+            let declarators = self.parse_variable_declarators();
+            return Some(ForInitializer::Declaration { ty, declarators });
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        Some(ForInitializer::Expressions(self.parse_expression_list()))
+    }
+
+    /// Parses a `foreach ( type name in collection ) body` statement (15.8.4).
+    fn parse_foreach(&mut self, start: u32) -> Stmt {
+        self.bump();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let ty = self.parse_type();
+        let (name, _) = self.expect_identifier();
+        self.expect_keyword(Keyword::In, "in");
+        let collection = self.parse_expression();
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let body = Box::new(self.parse_statement());
+        let end = body.span.end;
+        Stmt::new(
+            StmtKind::ForEach {
+                ty,
+                name,
+                collection,
+                body,
+            },
+            Span::new(start, end),
+        )
+    }
+
+    /// Parses a bare keyword statement terminated by `;`, used for `break` and
+    /// `continue` (15.9.1, 15.9.2).
+    fn parse_keyword_then_semicolon(&mut self, start: u32, kind: StmtKind) -> Stmt {
+        self.bump();
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Stmt::new(kind, Span::new(start, end))
+    }
+
+    /// Parses a `throw expression_opt ;` statement (15.9.5).
+    fn parse_throw(&mut self, start: u32) -> Stmt {
+        self.bump();
+        let value = if self.current_punctuator() == Some(Punctuator::Semicolon) {
+            None
+        } else {
+            Some(self.parse_expression())
+        };
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Stmt::new(StmtKind::Throw(value), Span::new(start, end))
+    }
+
+    /// Parses a block where the grammar requires one (a `try`/`catch`/`finally`
+    /// body, or a `checked`/`unchecked` block). A missing `{` is `CS1514`,
+    /// recovered with an empty block so parsing continues.
+    fn parse_required_block(&mut self) -> Stmt {
+        if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+            self.parse_block()
+        } else {
+            let at = self.current().span.start;
+            self.report(DiagnosticKind::OpenBraceExpected, Span::empty_at(at));
+            Stmt::new(StmtKind::Block(Vec::new()), Span::empty_at(at))
+        }
+    }
+
+    /// Parses a `try` statement (15.10): a protected block, then catch clauses
+    /// and/or a finally block.
+    fn parse_try(&mut self, start: u32) -> Stmt {
+        self.bump();
+        let body = Box::new(self.parse_required_block());
+        let mut end = body.span.end;
+        let mut catches = Vec::new();
+        while self.current_keyword() == Some(Keyword::Catch) {
+            let clause = self.parse_catch_clause();
+            end = clause.body.span.end;
+            catches.push(clause);
+        }
+        let finally_block = if self.eat_keyword(Keyword::Finally) {
+            let block = self.parse_required_block();
+            end = block.span.end;
+            Some(Box::new(block))
+        } else {
+            None
+        };
+        if catches.is_empty() && finally_block.is_none() {
+            let at = self.current().span.start;
+            self.report(DiagnosticKind::ExpectedCatchOrFinally, Span::empty_at(at));
+        }
+        Stmt::new(
+            StmtKind::Try {
+                body,
+                catches,
+                finally_block,
+            },
+            Span::new(start, end),
+        )
+    }
+
+    /// Parses one `catch` clause (15.10): an optional `( type name_opt )` then a
+    /// block. A bare `catch` is a general catch.
+    fn parse_catch_clause(&mut self) -> CatchClause {
+        self.bump();
+        let (exception_type, name) = if self.eat(Punctuator::OpenParen) {
+            let ty = self.parse_type();
+            let name = if matches!(self.current().kind, TokenKind::Identifier(_)) {
+                Some(self.expect_identifier().0)
+            } else {
+                None
+            };
+            self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+            (Some(ty), name)
+        } else {
+            (None, None)
+        };
+        let body = Box::new(self.parse_required_block());
+        CatchClause {
+            exception_type,
+            name,
+            body,
+        }
+    }
+
+    /// Parses a `lock ( expression ) statement` (15.12).
+    fn parse_lock(&mut self, start: u32) -> Stmt {
+        self.bump();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let expression = self.parse_expression();
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let body = Box::new(self.parse_statement());
+        let end = body.span.end;
+        Stmt::new(StmtKind::Lock { expression, body }, Span::new(start, end))
+    }
+
+    /// Parses a `using ( resource ) statement` (15.13).
+    fn parse_using(&mut self, start: u32) -> Stmt {
+        self.bump();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let resource = self.parse_using_resource();
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let body = Box::new(self.parse_statement());
+        let end = body.span.end;
+        Stmt::new(StmtKind::Using { resource, body }, Span::new(start, end))
+    }
+
+    /// Parses a `using` resource (15.13): a local declaration or an expression,
+    /// disambiguated as in a statement.
+    fn parse_using_resource(&mut self) -> UsingResource {
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let ty = self.parse_type();
+        if !matches!(ty.kind, TypeRefKind::Error)
+            && matches!(self.current().kind, TokenKind::Identifier(_))
+        {
+            let declarators = self.parse_variable_declarators();
+            return UsingResource::Declaration { ty, declarators };
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        UsingResource::Expression(self.parse_expression())
+    }
+
+    /// Parses a `checked`/`unchecked` block statement (15.11), with the scanner
+    /// at the keyword and a block known to follow.
+    fn parse_checked_block(&mut self, start: u32, keyword: Keyword) -> Stmt {
+        self.bump();
+        let block = Box::new(self.parse_required_block());
+        let end = block.span.end;
+        let kind = if keyword == Keyword::Checked {
+            StmtKind::Checked(block)
+        } else {
+            StmtKind::Unchecked(block)
+        };
+        Stmt::new(kind, Span::new(start, end))
+    }
+
+    /// Parses a `switch` statement (15.7.2): `switch ( expression ) { sections }`,
+    /// each section a run of `case`/`default` labels followed by statements.
+    fn parse_switch(&mut self, start: u32) -> Stmt {
+        self.bump();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let expression = self.parse_expression();
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+        let mut sections = Vec::new();
+        while self.current_punctuator() != Some(Punctuator::CloseBrace)
+            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        {
+            let before = self.position;
+            let mut labels = Vec::new();
+            while let Some(label) = self.try_parse_switch_label() {
+                labels.push(label);
+            }
+            let mut statements = Vec::new();
+            while self.current_keyword() != Some(Keyword::Case)
+                && self.current_keyword() != Some(Keyword::Default)
+                && self.current_punctuator() != Some(Punctuator::CloseBrace)
+                && !matches!(self.current().kind, TokenKind::EndOfFile)
+            {
+                let statement_start = self.position;
+                statements.push(self.parse_statement());
+                if self.position == statement_start {
+                    self.bump();
+                }
+            }
+            sections.push(SwitchSection { labels, statements });
+            if self.position == before {
+                self.bump();
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        Stmt::new(
+            StmtKind::Switch {
+                expression,
+                sections,
+            },
+            Span::new(start, end),
+        )
+    }
+
+    /// Parses a `case constant-expression :` or `default :` label, if one begins
+    /// here (15.7.2).
+    fn try_parse_switch_label(&mut self) -> Option<SwitchLabel> {
+        match self.current_keyword() {
+            Some(Keyword::Case) => {
+                self.bump();
+                let value = self.parse_expression();
+                self.expect(
+                    Punctuator::Colon,
+                    DiagnosticKind::TokenExpected { expected: ":" },
+                );
+                Some(SwitchLabel::Case(value))
+            }
+            Some(Keyword::Default) => {
+                self.bump();
+                self.expect(
+                    Punctuator::Colon,
+                    DiagnosticKind::TokenExpected { expected: ":" },
+                );
+                Some(SwitchLabel::Default)
+            }
+            _ => None,
+        }
+    }
+
+    /// Parses a labeled statement `label : statement` (15.4), with the scanner at
+    /// the identifier.
+    fn parse_labeled(&mut self, start: u32) -> Stmt {
+        let (label, _) = self.expect_identifier();
+        self.expect(
+            Punctuator::Colon,
+            DiagnosticKind::TokenExpected { expected: ":" },
+        );
+        let statement = Box::new(self.parse_statement());
+        let end = statement.span.end;
+        Stmt::new(
+            StmtKind::Labeled { label, statement },
+            Span::new(start, end),
+        )
+    }
+
+    /// Parses a `goto` statement (15.9.3): `goto label ;`, `goto case e ;`, or
+    /// `goto default ;`.
+    fn parse_goto(&mut self, start: u32) -> Stmt {
+        self.bump();
+        let target = match self.current_keyword() {
+            Some(Keyword::Case) => {
+                self.bump();
+                GotoTarget::Case(self.parse_expression())
+            }
+            Some(Keyword::Default) => {
+                self.bump();
+                GotoTarget::Default
+            }
+            _ => GotoTarget::Label(self.expect_identifier().0),
+        };
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        Stmt::new(StmtKind::Goto(target), Span::new(start, end))
     }
 
     /// Parses a full expression (14): an assignment, which sits at the bottom of
@@ -209,22 +811,81 @@ impl Parser {
         left
     }
 
-    /// Prefix unary operators, including pre-increment and pre-decrement (14.6).
+    /// Unary expressions (14.6): a prefix operator, a cast, or a postfix chain.
     fn parse_unary(&mut self) -> Expr {
-        let Some(operator) = self.current_punctuator().and_then(prefix_operator) else {
-            return self.parse_postfix();
-        };
+        if let Some(operator) = self.current_punctuator().and_then(prefix_operator) {
+            let start = self.current().span.start;
+            self.bump();
+            let operand = self.parse_unary();
+            let span = Span::new(start, operand.span.end);
+            return Expr::new(
+                ExprKind::Unary {
+                    operator,
+                    operand: Box::new(operand),
+                },
+                span,
+            );
+        }
+        if self.current_punctuator() == Some(Punctuator::OpenParen) {
+            if let Some(cast) = self.try_parse_cast() {
+                return cast;
+            }
+        }
+        self.parse_postfix()
+    }
+
+    /// Attempts to parse a cast `( type ) operand` at the current `(`, applying
+    /// the disambiguation of 14.6.6: the parenthesized tokens must form a type,
+    /// and either that type cannot also be an expression (a predefined or array
+    /// type) or the token after the `)` can begin a unary operand. Otherwise this
+    /// is a parenthesized expression: the speculative parse is rolled back (its
+    /// position and any diagnostics it emitted) and `None` is returned.
+    fn try_parse_cast(&mut self) -> Option<Expr> {
         let start = self.current().span.start;
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
         self.bump();
-        let operand = self.parse_unary();
-        let span = Span::new(start, operand.span.end);
-        Expr::new(
-            ExprKind::Unary {
-                operator,
-                operand: Box::new(operand),
-            },
-            span,
-        )
+        let target = self.parse_type();
+        let is_type = !matches!(target.kind, TypeRefKind::Error);
+        if is_type && self.current_punctuator() == Some(Punctuator::CloseParen) {
+            self.bump();
+            let forces_cast = matches!(
+                target.kind,
+                TypeRefKind::Predefined(_) | TypeRefKind::Array { .. }
+            );
+            if forces_cast || self.current_begins_cast_operand() {
+                let operand = self.parse_unary();
+                let span = Span::new(start, operand.span.end);
+                return Some(Expr::new(
+                    ExprKind::Cast {
+                        target,
+                        operand: Box::new(operand),
+                    },
+                    span,
+                ));
+            }
+        }
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        None
+    }
+
+    /// Whether the current token can begin the operand of a cast (14.6.6): `~`,
+    /// `!`, `(`, an identifier, a literal, or any keyword other than `as`/`is`.
+    fn current_begins_cast_operand(&self) -> bool {
+        match &self.current().kind {
+            TokenKind::Identifier(_)
+            | TokenKind::IntegerLiteral { .. }
+            | TokenKind::RealLiteral { .. }
+            | TokenKind::CharacterLiteral(_)
+            | TokenKind::StringLiteral(_) => true,
+            TokenKind::Punctuator(punctuator) => matches!(
+                punctuator,
+                Punctuator::Tilde | Punctuator::Exclamation | Punctuator::OpenParen
+            ),
+            TokenKind::Keyword(keyword) => !matches!(keyword, Keyword::As | Keyword::Is),
+            _ => false,
+        }
     }
 
     /// A primary expression followed by any run of postfix suffixes: member
@@ -340,6 +1001,7 @@ impl Parser {
                 self.bump();
                 Expr::new(ExprKind::This, span)
             }
+            TokenKind::Keyword(Keyword::New) => self.parse_new(span.start),
             TokenKind::Keyword(Keyword::Typeof) => {
                 self.bump();
                 self.expect(
@@ -378,6 +1040,14 @@ impl Parser {
                     ExprKind::Parenthesized(Box::new(inner)),
                     Span::new(span.start, end),
                 )
+            }
+            TokenKind::Keyword(keyword)
+                if predefined_type(&TokenKind::Keyword(keyword)).is_some() =>
+            {
+                self.bump();
+                let predefined = predefined_type(&TokenKind::Keyword(keyword))
+                    .expect("the guard checked it is a predefined type");
+                Expr::new(ExprKind::PredefinedType(predefined), span)
             }
             _ => {
                 self.report(DiagnosticKind::ExpressionExpected, span);
@@ -439,9 +1109,11 @@ impl Parser {
 
     /// Parses a type (clause 11): a predefined type or a type name, then any
     /// array rank-specifiers (12.1). A missing type is `CS1031`.
-    fn parse_type(&mut self) -> TypeRef {
-        let start = self.current().span.start;
-        let base = if let Some(predefined) = predefined_type(&self.current().kind) {
+    /// Parses a non-array type (11.1): a predefined type or a type name, with no
+    /// rank-specifiers. This is the element type for `new` and the base of a
+    /// full type. A missing type is `CS1031`.
+    fn parse_non_array_type(&mut self) -> TypeRef {
+        if let Some(predefined) = predefined_type(&self.current().kind) {
             let span = self.current().span;
             self.bump();
             TypeRef::new(TypeRefKind::Predefined(predefined), span)
@@ -450,8 +1122,13 @@ impl Parser {
         } else {
             let at = self.current().span.start;
             self.report(DiagnosticKind::TypeExpected, Span::empty_at(at));
-            return TypeRef::new(TypeRefKind::Error, Span::empty_at(at));
-        };
+            TypeRef::new(TypeRefKind::Error, Span::empty_at(at))
+        }
+    }
+
+    fn parse_type(&mut self) -> TypeRef {
+        let base = self.parse_non_array_type();
+        let start = base.span.start;
         let mut ranks = Vec::new();
         while let Some(rank) = self.try_rank_specifier() {
             ranks.push(rank);
@@ -470,6 +1147,74 @@ impl Parser {
             );
         }
         ty
+    }
+
+    /// Parses a `new` expression (14.5.10): object/delegate creation
+    /// `new type ( arguments )` or array creation `new element[lengths] ranks`.
+    /// Array initializers (`{ ... }`) are not parsed yet.
+    fn parse_new(&mut self, start: u32) -> Expr {
+        self.bump();
+        let element = self.parse_non_array_type();
+        match self.current_punctuator() {
+            Some(Punctuator::OpenParen) => {
+                self.bump();
+                let (arguments, end) = self
+                    .parse_arguments(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                Expr::new(
+                    ExprKind::ObjectCreation {
+                        target: element,
+                        arguments,
+                    },
+                    Span::new(start, end),
+                )
+            }
+            Some(Punctuator::OpenBracket) => self.parse_array_creation(start, element),
+            _ => {
+                let end = self.expect(
+                    Punctuator::OpenParen,
+                    DiagnosticKind::TokenExpected { expected: "(" },
+                );
+                Expr::new(
+                    ExprKind::ObjectCreation {
+                        target: element,
+                        arguments: Vec::new(),
+                    },
+                    Span::new(start, end),
+                )
+            }
+        }
+    }
+
+    /// Parses the bracket part of an array creation, with the scanner at the
+    /// first `[`. The first dimension is either size expressions (`[e, ...]`) or
+    /// an unsized rank-specifier (`[]`/`[,]`, whose initializer is deferred);
+    /// trailing rank-specifiers give the jagged dimensions.
+    fn parse_array_creation(&mut self, start: u32, element: TypeRef) -> Expr {
+        let (lengths, rank, mut end) = if let Some((rank, end)) = self.try_rank_specifier() {
+            (Vec::new(), rank, end)
+        } else {
+            self.bump();
+            let (sizes, end) = self.parse_arguments(
+                Punctuator::CloseBracket,
+                DiagnosticKind::TokenExpected { expected: "]" },
+            );
+            let rank = (sizes.len() as u8).max(1);
+            (sizes, rank, end)
+        };
+        let mut extra_ranks = Vec::new();
+        while let Some((extra, extra_end)) = self.try_rank_specifier() {
+            extra_ranks.push(extra);
+            end = extra_end;
+        }
+        Expr::new(
+            ExprKind::ArrayCreation {
+                element,
+                lengths,
+                rank,
+                extra_ranks,
+            },
+            Span::new(start, end),
+        )
     }
 
     /// Parses a type name (11.1): `identifier ('.' identifier)*`.
@@ -624,6 +1369,7 @@ mod tests {
             ExprKind::Literal(Literal::Boolean(value)) => format!("{value}"),
             ExprKind::Literal(Literal::Null) => String::from("null"),
             ExprKind::Name(name) => String::from(&**name),
+            ExprKind::PredefinedType(predefined) => String::from(predefined_text(*predefined)),
             ExprKind::This => String::from("this"),
             ExprKind::Parenthesized(inner) => format!("(paren {})", dump(inner)),
             ExprKind::MemberAccess { receiver, name } => {
@@ -690,6 +1436,29 @@ mod tests {
                     TypeTestOperation::As => "as",
                 };
                 format!("({text} {} {})", dump(operand), dump_type(target))
+            }
+            ExprKind::Cast { target, operand } => {
+                format!("(cast {} {})", dump_type(target), dump(operand))
+            }
+            ExprKind::ObjectCreation { target, arguments } => {
+                format!("(new {}{})", dump_type(target), dump_args(arguments))
+            }
+            ExprKind::ArrayCreation {
+                element,
+                lengths,
+                rank,
+                extra_ranks,
+            } => {
+                let mut text = format!("(newarr {} r{rank}", dump_type(element));
+                for length in lengths {
+                    text.push(' ');
+                    text.push_str(&dump(length));
+                }
+                for extra in extra_ranks {
+                    text.push_str(&format!(" +r{extra}"));
+                }
+                text.push(')');
+                text
             }
             ExprKind::Error => String::from("<error>"),
         }
@@ -822,6 +1591,205 @@ mod tests {
             .collect()
     }
 
+    /// Renders a statement as a parenthesized prefix form, like [`dump`].
+    fn dump_stmt(statement: &Stmt) -> String {
+        match &statement.kind {
+            StmtKind::Block(statements) => {
+                let mut text = String::from("(block");
+                for inner in statements {
+                    text.push(' ');
+                    text.push_str(&dump_stmt(inner));
+                }
+                text.push(')');
+                text
+            }
+            StmtKind::Empty => String::from("(empty)"),
+            StmtKind::Expression(expr) => format!("(expr {})", dump(expr)),
+            StmtKind::LocalDeclaration { ty, declarators } => {
+                let mut text = format!("(local {}", dump_type(ty));
+                for declarator in declarators {
+                    match &declarator.initializer {
+                        Some(initializer) => {
+                            text.push_str(&format!(" {}={}", declarator.name, dump(initializer)));
+                        }
+                        None => text.push_str(&format!(" {}", declarator.name)),
+                    }
+                }
+                text.push(')');
+                text
+            }
+            StmtKind::Return(None) => String::from("(return)"),
+            StmtKind::Return(Some(expr)) => format!("(return {})", dump(expr)),
+            StmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => match else_branch {
+                Some(otherwise) => format!(
+                    "(if {} {} {})",
+                    dump(condition),
+                    dump_stmt(then_branch),
+                    dump_stmt(otherwise)
+                ),
+                None => format!("(if {} {})", dump(condition), dump_stmt(then_branch)),
+            },
+            StmtKind::While { condition, body } => {
+                format!("(while {} {})", dump(condition), dump_stmt(body))
+            }
+            StmtKind::DoWhile { body, condition } => {
+                format!("(do {} {})", dump_stmt(body), dump(condition))
+            }
+            StmtKind::For {
+                initializer,
+                condition,
+                iterators,
+                body,
+            } => {
+                let init = match initializer {
+                    None => String::from("_"),
+                    Some(ForInitializer::Declaration { ty, declarators }) => {
+                        let mut text = format!("(local {}", dump_type(ty));
+                        for declarator in declarators {
+                            match &declarator.initializer {
+                                Some(value) => {
+                                    text.push_str(&format!(" {}={}", declarator.name, dump(value)));
+                                }
+                                None => text.push_str(&format!(" {}", declarator.name)),
+                            }
+                        }
+                        text.push(')');
+                        text
+                    }
+                    Some(ForInitializer::Expressions(expressions)) => {
+                        format!("(exprs{})", dump_args(expressions))
+                    }
+                };
+                let cond = match condition {
+                    Some(condition) => dump(condition),
+                    None => String::from("_"),
+                };
+                let iters = if iterators.is_empty() {
+                    String::from("_")
+                } else {
+                    format!("(iters{})", dump_args(iterators))
+                };
+                format!("(for {init} {cond} {iters} {})", dump_stmt(body))
+            }
+            StmtKind::ForEach {
+                ty,
+                name,
+                collection,
+                body,
+            } => format!(
+                "(foreach {} {name} {} {})",
+                dump_type(ty),
+                dump(collection),
+                dump_stmt(body)
+            ),
+            StmtKind::Break => String::from("(break)"),
+            StmtKind::Continue => String::from("(continue)"),
+            StmtKind::Throw(None) => String::from("(throw)"),
+            StmtKind::Throw(Some(expr)) => format!("(throw {})", dump(expr)),
+            StmtKind::Try {
+                body,
+                catches,
+                finally_block,
+            } => {
+                let mut text = format!("(try {}", dump_stmt(body));
+                for clause in catches {
+                    text.push_str(" (catch");
+                    if let Some(ty) = &clause.exception_type {
+                        text.push_str(&format!(" {}", dump_type(ty)));
+                    }
+                    if let Some(name) = &clause.name {
+                        text.push_str(&format!(" {name}"));
+                    }
+                    text.push_str(&format!(" {})", dump_stmt(&clause.body)));
+                }
+                if let Some(finally_block) = finally_block {
+                    text.push_str(&format!(" (finally {})", dump_stmt(finally_block)));
+                }
+                text.push(')');
+                text
+            }
+            StmtKind::Lock { expression, body } => {
+                format!("(lock {} {})", dump(expression), dump_stmt(body))
+            }
+            StmtKind::Using { resource, body } => {
+                let res = match resource {
+                    UsingResource::Declaration { ty, declarators } => {
+                        let mut text = format!("(local {}", dump_type(ty));
+                        for declarator in declarators {
+                            match &declarator.initializer {
+                                Some(value) => {
+                                    text.push_str(&format!(" {}={}", declarator.name, dump(value)));
+                                }
+                                None => text.push_str(&format!(" {}", declarator.name)),
+                            }
+                        }
+                        text.push(')');
+                        text
+                    }
+                    UsingResource::Expression(expr) => dump(expr),
+                };
+                format!("(using {res} {})", dump_stmt(body))
+            }
+            StmtKind::Checked(body) => format!("(checked-block {})", dump_stmt(body)),
+            StmtKind::Unchecked(body) => format!("(unchecked-block {})", dump_stmt(body)),
+            StmtKind::Switch {
+                expression,
+                sections,
+            } => {
+                let mut text = format!("(switch {}", dump(expression));
+                for section in sections {
+                    text.push_str(" (section");
+                    for label in &section.labels {
+                        match label {
+                            SwitchLabel::Case(value) => {
+                                text.push_str(&format!(" (case {})", dump(value)));
+                            }
+                            SwitchLabel::Default => text.push_str(" (default)"),
+                        }
+                    }
+                    for statement in &section.statements {
+                        text.push(' ');
+                        text.push_str(&dump_stmt(statement));
+                    }
+                    text.push(')');
+                }
+                text.push(')');
+                text
+            }
+            StmtKind::Labeled { label, statement } => {
+                format!("(label {label} {})", dump_stmt(statement))
+            }
+            StmtKind::Goto(target) => match target {
+                GotoTarget::Label(name) => format!("(goto {name})"),
+                GotoTarget::Case(value) => format!("(goto-case {})", dump(value)),
+                GotoTarget::Default => String::from("(goto-default)"),
+            },
+            StmtKind::Error => String::from("<error-stmt>"),
+        }
+    }
+
+    fn stmt_tree(source: &str) -> String {
+        let parsed = parse_statement(source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "unexpected diagnostics for {source:?}: {:?}",
+            parsed.diagnostics
+        );
+        dump_stmt(&parsed.statement)
+    }
+
+    fn stmt_codes(source: &str) -> Vec<u16> {
+        parse_statement(source)
+            .diagnostics
+            .iter()
+            .map(Diagnostic::code)
+            .collect()
+    }
+
     #[test]
     fn literals_and_names() {
         assert_eq!(tree("42"), "42");
@@ -943,5 +1911,194 @@ mod tests {
     fn a_missing_type_is_cs1031() {
         assert_eq!(codes("typeof()"), vec![1031]);
         assert_eq!(codes("x is"), vec![1031]);
+    }
+
+    #[test]
+    fn casts_follow_the_disambiguation_rule() {
+        assert_eq!(tree("(int)x"), "(cast int x)");
+        assert_eq!(tree("(int[])x"), "(cast int[] x)");
+        assert_eq!(tree("(a)b"), "(cast a b)");
+        assert_eq!(tree("(a)(b)"), "(cast a (paren b))");
+        assert_eq!(tree("(Foo)new Bar()"), "(cast Foo (new Bar))");
+        assert_eq!(tree("(a)-b"), "(- (paren a) b)");
+        assert_eq!(tree("(a)*b"), "(* (paren a) b)");
+        assert_eq!(tree("(int)(long)x"), "(cast int (cast long x))");
+    }
+
+    #[test]
+    fn a_predefined_type_can_begin_a_static_member_access() {
+        assert_eq!(tree("int.Parse(s)"), "(call (. int Parse) s)");
+        assert_eq!(tree("string.Empty"), "(. string Empty)");
+    }
+
+    #[test]
+    fn object_and_array_creation() {
+        assert_eq!(tree("new Foo()"), "(new Foo)");
+        assert_eq!(tree("new Foo(a, b)"), "(new Foo a b)");
+        assert_eq!(tree("new A.B.C(x)"), "(new A.B.C x)");
+        assert_eq!(tree("new int[5]"), "(newarr int r1 5)");
+        assert_eq!(tree("new int[3, 4]"), "(newarr int r2 3 4)");
+        assert_eq!(tree("new int[n][]"), "(newarr int r1 n +r1)");
+        assert_eq!(tree("new Foo().Bar"), "(. (new Foo) Bar)");
+    }
+
+    #[test]
+    fn blocks_and_empty_statements() {
+        assert_eq!(stmt_tree("{}"), "(block)");
+        assert_eq!(stmt_tree("{ ; ; }"), "(block (empty) (empty))");
+        assert_eq!(stmt_tree("{ { } }"), "(block (block))");
+    }
+
+    #[test]
+    fn expression_statements() {
+        assert_eq!(stmt_tree("f(x);"), "(expr (call f x))");
+        assert_eq!(stmt_tree("a = b;"), "(expr (= a b))");
+        assert_eq!(stmt_tree("i++;"), "(expr (post++ i))");
+    }
+
+    #[test]
+    fn local_variable_declarations() {
+        assert_eq!(stmt_tree("int x;"), "(local int x)");
+        assert_eq!(stmt_tree("int x = 5;"), "(local int x=5)");
+        assert_eq!(stmt_tree("int a = 1, b, c = 3;"), "(local int a=1 b c=3)");
+        assert_eq!(stmt_tree("Foo.Bar baz;"), "(local Foo.Bar baz)");
+        assert_eq!(stmt_tree("int[] xs;"), "(local int[] xs)");
+    }
+
+    #[test]
+    fn declaration_versus_expression_is_disambiguated() {
+        assert_eq!(stmt_tree("Foo x;"), "(local Foo x)");
+        assert_eq!(stmt_tree("Foo.Bar();"), "(expr (call (. Foo Bar)))");
+        assert_eq!(stmt_tree("int.Parse(s);"), "(expr (call (. int Parse) s))");
+        assert_eq!(stmt_tree("x = y;"), "(expr (= x y))");
+    }
+
+    #[test]
+    fn return_if_and_while() {
+        assert_eq!(stmt_tree("return;"), "(return)");
+        assert_eq!(stmt_tree("return x + 1;"), "(return (+ x 1))");
+        assert_eq!(stmt_tree("if (c) return;"), "(if c (return))");
+        assert_eq!(
+            stmt_tree("if (c) a(); else b();"),
+            "(if c (expr (call a)) (expr (call b)))"
+        );
+        assert_eq!(
+            stmt_tree("while (i < n) i++;"),
+            "(while (< i n) (expr (post++ i)))"
+        );
+    }
+
+    #[test]
+    fn a_dangling_else_binds_to_the_nearest_if() {
+        assert_eq!(
+            stmt_tree("if (a) if (b) x(); else y();"),
+            "(if a (if b (expr (call x)) (expr (call y))))"
+        );
+    }
+
+    #[test]
+    fn statement_diagnostics_match_the_reference_compiler() {
+        assert_eq!(stmt_codes("f(x)"), vec![1002]);
+        assert_eq!(stmt_codes("int x"), vec![1002]);
+        assert_eq!(stmt_codes("{ f(x);"), vec![1513]);
+    }
+
+    #[test]
+    fn loops_and_jumps() {
+        assert_eq!(stmt_tree("do x(); while (c);"), "(do (expr (call x)) c)");
+        assert_eq!(
+            stmt_tree("for (int i = 0; i < n; i++) f();"),
+            "(for (local int i=0) (< i n) (iters (post++ i)) (expr (call f)))"
+        );
+        assert_eq!(stmt_tree("for (;;) ;"), "(for _ _ _ (empty))");
+        assert_eq!(
+            stmt_tree("for (i = 0; ; i++, j--) {}"),
+            "(for (exprs (= i 0)) _ (iters (post++ i) (post-- j)) (block))"
+        );
+        assert_eq!(
+            stmt_tree("foreach (int x in xs) f(x);"),
+            "(foreach int x xs (expr (call f x)))"
+        );
+        assert_eq!(stmt_tree("break;"), "(break)");
+        assert_eq!(stmt_tree("continue;"), "(continue)");
+        assert_eq!(stmt_tree("throw;"), "(throw)");
+        assert_eq!(stmt_tree("throw new Error();"), "(throw (new Error))");
+    }
+
+    #[test]
+    fn try_catch_finally() {
+        assert_eq!(
+            stmt_tree("try {} finally {}"),
+            "(try (block) (finally (block)))"
+        );
+        assert_eq!(
+            stmt_tree("try {} catch {}"),
+            "(try (block) (catch (block)))"
+        );
+        assert_eq!(
+            stmt_tree("try { a(); } catch (Exception e) { b(); }"),
+            "(try (block (expr (call a))) (catch Exception e (block (expr (call b)))))"
+        );
+        assert_eq!(
+            stmt_tree("try {} catch (A) {} catch (B b) {} finally {}"),
+            "(try (block) (catch A (block)) (catch B b (block)) (finally (block)))"
+        );
+    }
+
+    #[test]
+    fn lock_using_and_checked_blocks() {
+        assert_eq!(stmt_tree("lock (o) f();"), "(lock o (expr (call f)))");
+        assert_eq!(stmt_tree("using (r) f();"), "(using r (expr (call f)))");
+        assert_eq!(
+            stmt_tree("using (Foo r = new Foo()) f();"),
+            "(using (local Foo r=(new Foo)) (expr (call f)))"
+        );
+        assert_eq!(
+            stmt_tree("checked { x(); }"),
+            "(checked-block (block (expr (call x))))"
+        );
+        assert_eq!(
+            stmt_tree("unchecked { y(); }"),
+            "(unchecked-block (block (expr (call y))))"
+        );
+        assert_eq!(stmt_tree("checked(a + b);"), "(expr (checked (+ a b)))");
+    }
+
+    #[test]
+    fn a_try_needs_a_catch_or_finally() {
+        assert_eq!(stmt_codes("try {}"), vec![1524]);
+        assert!(tokenize_ok("try {} catch {}"));
+        assert!(tokenize_ok("try {} finally {}"));
+    }
+
+    fn tokenize_ok(source: &str) -> bool {
+        parse_statement(source).diagnostics.is_empty()
+    }
+
+    #[test]
+    fn switch_statements() {
+        assert_eq!(stmt_tree("switch (x) {}"), "(switch x)");
+        assert_eq!(
+            stmt_tree("switch (x) { case 1: f(); break; default: g(); break; }"),
+            "(switch x (section (case 1) (expr (call f)) (break)) \
+             (section (default) (expr (call g)) (break)))"
+        );
+        assert_eq!(
+            stmt_tree("switch (x) { case 1: case 2: f(); break; }"),
+            "(switch x (section (case 1) (case 2) (expr (call f)) (break)))"
+        );
+    }
+
+    #[test]
+    fn labeled_statements_and_goto() {
+        assert_eq!(stmt_tree("done: ;"), "(label done (empty))");
+        assert_eq!(
+            stmt_tree("loop: while (c) break;"),
+            "(label loop (while c (break)))"
+        );
+        assert_eq!(stmt_tree("goto done;"), "(goto done)");
+        assert_eq!(stmt_tree("goto case 1;"), "(goto-case 1)");
+        assert_eq!(stmt_tree("goto default;"), "(goto-default)");
+        assert_eq!(stmt_tree("x;"), "(expr x)");
     }
 }

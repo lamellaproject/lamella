@@ -98,6 +98,15 @@ pub enum DiagnosticKind {
     /// A type was expected, for example inside `typeof( )` or after `is`/`as`
     /// (ECMA-334 1st ed, clause 11).
     TypeExpected,
+    /// A statement was not terminated by the required `;` (clause 15).
+    SemicolonExpected,
+    /// A block or similar construct was not closed by the required `}`.
+    CloseBraceExpected,
+    /// A block was required (for example a `try`, `catch`, or `finally` body) but
+    /// no `{` was found.
+    OpenBraceExpected,
+    /// A `try` block was followed by neither a `catch` nor a `finally` (15.10).
+    ExpectedCatchOrFinally,
 }
 
 impl DiagnosticKind {
@@ -132,6 +141,10 @@ impl DiagnosticKind {
             DiagnosticKind::ExpressionExpected => 1525,
             DiagnosticKind::TokenExpected { .. } => 1003,
             DiagnosticKind::TypeExpected => 1031,
+            DiagnosticKind::SemicolonExpected => 1002,
+            DiagnosticKind::CloseBraceExpected => 1513,
+            DiagnosticKind::OpenBraceExpected => 1514,
+            DiagnosticKind::ExpectedCatchOrFinally => 1524,
         }
     }
 
@@ -198,6 +211,12 @@ impl fmt::Display for DiagnosticKind {
                 write!(f, "Syntax error, '{expected}' expected")
             }
             DiagnosticKind::TypeExpected => f.write_str("Type expected"),
+            DiagnosticKind::SemicolonExpected => f.write_str("; expected"),
+            DiagnosticKind::CloseBraceExpected => f.write_str("} expected"),
+            DiagnosticKind::OpenBraceExpected => f.write_str("{ expected"),
+            DiagnosticKind::ExpectedCatchOrFinally => {
+                f.write_str("Expected catch or finally")
+            }
         }
     }
 }

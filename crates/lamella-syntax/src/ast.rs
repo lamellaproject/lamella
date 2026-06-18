@@ -29,6 +29,10 @@ pub enum ExprKind {
     Literal(Literal),
     /// A simple name (14.5.2): a bare identifier, its `@` prefix already removed.
     Name(Box<str>),
+    /// A predefined type in expression position (14.5.4): the left side of a
+    /// static member access such as `int.Parse`. Binding rejects it anywhere a
+    /// value, rather than a type name, is required.
+    PredefinedType(PredefinedType),
     /// The `this` access (14.5.7).
     This,
     /// A parenthesized expression (14.5.3): the parentheses group, they are not
@@ -110,6 +114,34 @@ pub enum ExprKind {
         operand: Box<Expr>,
         /// The type tested against.
         target: TypeRef,
+    },
+    /// A cast `( type ) operand` (14.6.6).
+    Cast {
+        /// The type cast to.
+        target: TypeRef,
+        /// The expression being cast.
+        operand: Box<Expr>,
+    },
+    /// An object (or delegate) creation `new type ( arguments )` (14.5.10.1).
+    ObjectCreation {
+        /// The type being created (a non-array type).
+        target: TypeRef,
+        /// The constructor arguments, in order.
+        arguments: Vec<Expr>,
+    },
+    /// An array creation `new element[lengths] extra-ranks` (14.5.10.2). When
+    /// `lengths` is empty the size came from an initializer, which is not yet
+    /// parsed; `rank` is the first dimension's rank and `extra_ranks` the trailing
+    /// jagged ranks.
+    ArrayCreation {
+        /// The element (non-array) type.
+        element: TypeRef,
+        /// The size expressions of the first dimension; empty if unsized.
+        lengths: Vec<Expr>,
+        /// The rank of the first dimension.
+        rank: u8,
+        /// Trailing jagged rank-specifiers, outermost first.
+        extra_ranks: Vec<u8>,
     },
     /// A placeholder for an expression that could not be parsed. It is emitted
     /// with a diagnostic so the parser can keep building a tree for the rest.
@@ -199,6 +231,223 @@ pub enum PredefinedType {
     Object,
     /// `void`, valid only in a few positions but parsed uniformly here.
     Void,
+}
+
+/// A statement: a [`StmtKind`] and the source [`Span`] it covers (clause 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stmt {
+    /// What kind of statement this is, with its children.
+    pub kind: StmtKind,
+    /// The byte range the statement covers in the source.
+    pub span: Span,
+}
+
+impl Stmt {
+    /// Creates a statement of `kind` covering `span`.
+    #[must_use]
+    pub fn new(kind: StmtKind, span: Span) -> Stmt {
+        Stmt { kind, span }
+    }
+}
+
+/// The kind of a [`Stmt`] (ECMA-334 1st ed, clause 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StmtKind {
+    /// A block `{ ... }` (15.2).
+    Block(Vec<Stmt>),
+    /// The empty statement `;` (15.3).
+    Empty,
+    /// An expression statement `expression ;` (15.6). Binding checks that the
+    /// expression is one allowed as a statement (a call, assignment, increment,
+    /// decrement, or object creation).
+    Expression(Expr),
+    /// A local variable declaration `type declarators ;` (15.5.1).
+    LocalDeclaration {
+        /// The declared type, shared by every declarator.
+        ty: TypeRef,
+        /// The declared variables, in order.
+        declarators: Vec<VariableDeclarator>,
+    },
+    /// A `return` statement, with its optional value (15.9.4).
+    Return(Option<Expr>),
+    /// An `if` statement with an optional `else` branch (15.7.1).
+    If {
+        /// The condition tested.
+        condition: Expr,
+        /// The statement run when the condition is true.
+        then_branch: Box<Stmt>,
+        /// The statement run otherwise, if an `else` is present.
+        else_branch: Option<Box<Stmt>>,
+    },
+    /// A `while` statement (15.8.1).
+    While {
+        /// The loop condition.
+        condition: Expr,
+        /// The loop body.
+        body: Box<Stmt>,
+    },
+    /// A `do body while ( condition ) ;` statement (15.8.2).
+    DoWhile {
+        /// The loop body, run before the first test.
+        body: Box<Stmt>,
+        /// The condition tested after each iteration.
+        condition: Expr,
+    },
+    /// A `for` statement (15.8.3).
+    For {
+        /// The initializer clause, if any.
+        initializer: Option<ForInitializer>,
+        /// The loop condition, if any.
+        condition: Option<Expr>,
+        /// The iterator expressions run after each iteration.
+        iterators: Vec<Expr>,
+        /// The loop body.
+        body: Box<Stmt>,
+    },
+    /// A `foreach ( type name in collection ) body` statement (15.8.4).
+    ForEach {
+        /// The iteration variable's type.
+        ty: TypeRef,
+        /// The iteration variable's name.
+        name: Box<str>,
+        /// The collection iterated over.
+        collection: Expr,
+        /// The loop body.
+        body: Box<Stmt>,
+    },
+    /// A `break ;` statement (15.9.1).
+    Break,
+    /// A `continue ;` statement (15.9.2).
+    Continue,
+    /// A `throw expression_opt ;` statement (15.9.5).
+    Throw(Option<Expr>),
+    /// A `try` statement with catch clauses and/or a finally block (15.10).
+    Try {
+        /// The protected block.
+        body: Box<Stmt>,
+        /// The catch clauses, in order.
+        catches: Vec<CatchClause>,
+        /// The finally block, if present.
+        finally_block: Option<Box<Stmt>>,
+    },
+    /// A `lock ( expression ) statement` (15.12).
+    Lock {
+        /// The object locked on.
+        expression: Expr,
+        /// The guarded statement.
+        body: Box<Stmt>,
+    },
+    /// A `using ( resource ) statement` (15.13).
+    Using {
+        /// The resource acquired for the duration of the body.
+        resource: UsingResource,
+        /// The guarded statement.
+        body: Box<Stmt>,
+    },
+    /// A `checked` block statement (15.11), forcing overflow checking on.
+    Checked(Box<Stmt>),
+    /// An `unchecked` block statement (15.11), forcing overflow checking off.
+    Unchecked(Box<Stmt>),
+    /// A `switch` statement (15.7.2).
+    Switch {
+        /// The value switched on.
+        expression: Expr,
+        /// The switch sections, in order.
+        sections: Vec<SwitchSection>,
+    },
+    /// A labeled statement `label : statement` (15.4).
+    Labeled {
+        /// The label name.
+        label: Box<str>,
+        /// The labeled statement.
+        statement: Box<Stmt>,
+    },
+    /// A `goto` statement (15.9.3).
+    Goto(GotoTarget),
+    /// A placeholder for a statement that could not be parsed, emitted with a
+    /// diagnostic for recovery.
+    Error,
+}
+
+/// One section of a `switch` statement (15.7.2): its labels and statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchSection {
+    /// The `case`/`default` labels introducing the section.
+    pub labels: Vec<SwitchLabel>,
+    /// The statements run when a label matches.
+    pub statements: Vec<Stmt>,
+}
+
+/// A `switch` label (15.7.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchLabel {
+    /// `case constant-expression :`.
+    Case(Expr),
+    /// `default :`.
+    Default,
+}
+
+/// The target of a `goto` statement (15.9.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GotoTarget {
+    /// `goto label ;`.
+    Label(Box<str>),
+    /// `goto case constant-expression ;`.
+    Case(Expr),
+    /// `goto default ;`.
+    Default,
+}
+
+/// One `catch` clause of a `try` statement (15.10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatchClause {
+    /// The caught exception type, or `None` for a general `catch`.
+    pub exception_type: Option<TypeRef>,
+    /// The bound exception variable's name, if any.
+    pub name: Option<Box<str>>,
+    /// The handler block.
+    pub body: Box<Stmt>,
+}
+
+/// The resource of a `using` statement (15.13): a local declaration or an
+/// expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsingResource {
+    /// `type declarators`.
+    Declaration {
+        /// The declared type.
+        ty: TypeRef,
+        /// The declared variables.
+        declarators: Vec<VariableDeclarator>,
+    },
+    /// An expression evaluating to the resource.
+    Expression(Expr),
+}
+
+/// The initializer of a `for` statement (15.8.3): either a local variable
+/// declaration or a list of statement expressions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForInitializer {
+    /// `type declarators`.
+    Declaration {
+        /// The declared type.
+        ty: TypeRef,
+        /// The declared variables.
+        declarators: Vec<VariableDeclarator>,
+    },
+    /// A comma-separated list of statement expressions.
+    Expressions(Vec<Expr>),
+}
+
+/// One declared variable in a [`StmtKind::LocalDeclaration`] (15.5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariableDeclarator {
+    /// The variable's name.
+    pub name: Box<str>,
+    /// The initializer expression, if the declarator has one.
+    pub initializer: Option<Expr>,
+    /// The byte range the declarator covers.
+    pub span: Span,
 }
 
 /// A literal value as decoded by the lexer (9.4.4): the parser lifts the token's
