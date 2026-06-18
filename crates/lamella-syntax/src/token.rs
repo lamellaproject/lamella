@@ -261,6 +261,16 @@ pub enum TokenKind {
     /// `u16`: a regular string may contain lone surrogates via `\u` escapes, so
     /// the value is not always well-formed UTF-8 and cannot be a `str`.
     StringLiteral(Box<[u16]>),
+    /// A pre-processing directive line (9.5), consumed in full, leading `#`
+    /// through to but not including the line terminator. Directives are not part
+    /// of the syntactic grammar; the scanner resolves them and their effects, so
+    /// this is trivia and never reaches the parser. A malformed directive is
+    /// still scanned as one of these, with a diagnostic alongside.
+    PreprocessingDirective,
+    /// Source text excluded by conditional compilation (9.5.4): the body of a
+    /// branch whose controlling condition was false. No tokens are produced from
+    /// such text; it is surfaced as trivia so the stream still covers the source.
+    SkippedText,
     /// The end of the source, emitted once after the final token.
     EndOfFile,
     /// A character that begins no valid token. Emitted for error recovery with
@@ -279,6 +289,8 @@ impl TokenKind {
                 | TokenKind::NewLine
                 | TokenKind::SingleLineComment
                 | TokenKind::DelimitedComment
+                | TokenKind::PreprocessingDirective
+                | TokenKind::SkippedText
         )
     }
 }
@@ -358,6 +370,8 @@ mod tests {
         assert!(TokenKind::NewLine.is_trivia());
         assert!(TokenKind::SingleLineComment.is_trivia());
         assert!(TokenKind::DelimitedComment.is_trivia());
+        assert!(TokenKind::PreprocessingDirective.is_trivia());
+        assert!(TokenKind::SkippedText.is_trivia());
 
         assert!(!TokenKind::Keyword(Keyword::Class).is_trivia());
         assert!(!TokenKind::Punctuator(Punctuator::Semicolon).is_trivia());

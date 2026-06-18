@@ -3,6 +3,8 @@
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::span::Span;
 use crate::token::{IntegerSuffix, Keyword, Punctuator, RealSuffix, Token, TokenKind};
+use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 /// The result of scanning a source file: the full token stream (ending in one
@@ -48,6 +50,85 @@ pub struct Lexer<'a> {
     source: &'a str,
     position: usize,
     diagnostics: Vec<Diagnostic>,
+    /// Whether only white space has been seen since the last line terminator, so
+    /// the next `#` would begin its line. Pre-processing directives are valid
+    /// only at the first non-white-space character of a line (9.5).
+    line_start: bool,
+    /// Whether a real token (9.4), as opposed to trivia or a directive, has been
+    /// emitted yet. `#define` and `#undef` are valid only before it (9.5.3).
+    seen_token: bool,
+    /// The conditional compilation symbols currently defined (9.5.1), as built up
+    /// by `#define` and torn down by `#undef` while scanning.
+    defined_symbols: BTreeSet<Box<str>>,
+    /// The stack of open `#if`/`#region` constructs, innermost last (9.5.4). Its
+    /// top decides whether source is currently being included or skipped.
+    conditionals: Vec<Conditional>,
+}
+
+/// One open conditional construct: an `#if`/`#elif`/`#else`/`#endif` group or a
+/// `#region`/`#endregion` pair (9.5.4, 9.5.6). A `#region` behaves lexically as
+/// `#if true`, so both are tracked the same way.
+#[derive(Debug)]
+struct Conditional {
+    /// True for a `#region`, false for an `#if` group. Decides whether `#endif`
+    /// or `#endregion` closes it and which diagnostic an unterminated one gets.
+    is_region: bool,
+    /// Whether the enclosing context was including source. When false the whole
+    /// construct is skipped, whatever its own conditions say.
+    parent_active: bool,
+    /// Whether a branch of this group has already been selected for inclusion, so
+    /// no later `#elif`/`#else` branch may be.
+    branch_taken: bool,
+    /// Whether the branch now in effect is being included.
+    including: bool,
+    /// Whether an `#else` has been seen, after which `#elif`/`#else` is invalid.
+    seen_else: bool,
+}
+
+/// A pre-processing directive name (9.5), the word right after the `#`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectiveKind {
+    Define,
+    Undef,
+    If,
+    Elif,
+    Else,
+    Endif,
+    Line,
+    Error,
+    Warning,
+    Region,
+    EndRegion,
+}
+
+impl DirectiveKind {
+    /// The directive named by `text`, if `text` is a directive name.
+    fn from_text(text: &str) -> Option<DirectiveKind> {
+        Some(match text {
+            "define" => DirectiveKind::Define,
+            "undef" => DirectiveKind::Undef,
+            "if" => DirectiveKind::If,
+            "elif" => DirectiveKind::Elif,
+            "else" => DirectiveKind::Else,
+            "endif" => DirectiveKind::Endif,
+            "line" => DirectiveKind::Line,
+            "error" => DirectiveKind::Error,
+            "warning" => DirectiveKind::Warning,
+            "region" => DirectiveKind::Region,
+            "endregion" => DirectiveKind::EndRegion,
+            _ => return None,
+        })
+    }
+}
+
+/// Records which diagnostics a single pre-processing expression has already
+/// reported (9.5.2), so a malformed expression yields each at most once rather
+/// than one per nesting level as the recursive descent unwinds.
+struct PpExprErrors {
+    /// Whether `CS1517` (invalid expression) has been reported for this line.
+    invalid_reported: bool,
+    /// Whether `CS1026` (missing `)`) has been reported for this line.
+    close_paren_reported: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -63,6 +144,10 @@ impl<'a> Lexer<'a> {
             source,
             position: 0,
             diagnostics: Vec::new(),
+            line_start: true,
+            seen_token: false,
+            defined_symbols: BTreeSet::new(),
+            conditionals: Vec::new(),
         }
     }
 
@@ -82,7 +167,17 @@ impl<'a> Lexer<'a> {
     /// an `EndOfFile` token, and continues to do so on further calls.
     pub fn next_token(&mut self) -> Token {
         let start = self.position;
+        let line_start = self.line_start;
         let Some(c) = self.peek() else {
+            if let Some(top) = self.conditionals.last() {
+                let kind = if top.is_region {
+                    DiagnosticKind::EndRegionDirectiveExpected
+                } else {
+                    DiagnosticKind::EndIfDirectiveExpected
+                };
+                self.report(kind, start);
+                self.conditionals.clear();
+            }
             return Token::new(TokenKind::EndOfFile, Span::empty_at(start as u32));
         };
 
@@ -90,6 +185,14 @@ impl<'a> Lexer<'a> {
             self.scan_new_line()
         } else if is_whitespace(c) {
             self.scan_whitespace()
+        } else if c == '#' && line_start {
+            self.scan_directive(start)
+        } else if c == '#' {
+            self.bump();
+            self.report(DiagnosticKind::DirectiveNotFirstOnLine, start);
+            TokenKind::Unknown
+        } else if !self.including() {
+            self.scan_skipped_text()
         } else if c == '/' && matches!(self.peek_second(), Some('/' | '*')) {
             self.scan_comment(start)
         } else if is_identifier_start(c) {
@@ -106,16 +209,399 @@ impl<'a> Lexer<'a> {
             self.scan_string_literal(start)
         } else if let Some(punctuator) = self.try_scan_operator() {
             TokenKind::Punctuator(punctuator)
-        } else if is_deferred_start(c) {
-            self.bump();
-            TokenKind::Unknown
         } else {
             self.bump();
             self.report(DiagnosticKind::UnexpectedCharacter { character: c }, start);
             TokenKind::Unknown
         };
 
+        if matches!(kind, TokenKind::NewLine) {
+            self.line_start = true;
+        } else if !matches!(kind, TokenKind::Whitespace) {
+            self.line_start = false;
+        }
+        if !kind.is_trivia() && !matches!(kind, TokenKind::EndOfFile) {
+            self.seen_token = true;
+        }
+
         Token::new(kind, Span::new(start as u32, self.position as u32))
+    }
+
+    /// Whether source at the current position is being included rather than
+    /// skipped: true unless an open conditional's selected branch excludes it.
+    fn including(&self) -> bool {
+        self.conditionals.last().is_none_or(|c| c.including)
+    }
+
+    /// Consumes the rest of a line that conditional compilation is skipping
+    /// (9.5.4), up to but not including the line terminator. Such text need not
+    /// be lexically well formed, so it is taken as one opaque [`TokenKind::SkippedText`].
+    fn scan_skipped_text(&mut self) -> TokenKind {
+        self.consume_to_line_end();
+        TokenKind::SkippedText
+    }
+
+    /// Scans one pre-processing directive line (9.5), beginning at the `#`, and
+    /// applies its effect. `active` says whether the enclosing conditional
+    /// section is being compiled. A directive must be lexically correct even in
+    /// a skipped section (9.5.4), so malformed-directive diagnostics fire either
+    /// way; only the *effects* — defining symbols, evaluating which branch to
+    /// include, raising `#error`/`#warning`, the first-token rule — are gated on
+    /// `active`. The structural stack of conditionals is always maintained, so
+    /// nesting stays correct through skipped regions.
+    fn scan_directive(&mut self, start: usize) -> TokenKind {
+        let active = self.including();
+        self.bump();
+        self.skip_inline_whitespace();
+        match DirectiveKind::from_text(self.read_directive_name()) {
+            Some(DirectiveKind::Define) => self.scan_define_or_undef(start, active, true),
+            Some(DirectiveKind::Undef) => self.scan_define_or_undef(start, active, false),
+            Some(DirectiveKind::If) => self.scan_if(start, active),
+            Some(DirectiveKind::Elif) => self.scan_elif(start),
+            Some(DirectiveKind::Else) => self.scan_else(start),
+            Some(DirectiveKind::Endif) => self.scan_endif(start),
+            Some(DirectiveKind::Region) => self.scan_region(active),
+            Some(DirectiveKind::EndRegion) => self.scan_endregion(start),
+            Some(DirectiveKind::Error) => self.scan_error_or_warning(start, active, true),
+            Some(DirectiveKind::Warning) => self.scan_error_or_warning(start, active, false),
+            Some(DirectiveKind::Line) => self.scan_line(start),
+            None => {
+                self.report(DiagnosticKind::PreprocessorDirectiveExpected, start);
+                self.consume_to_line_end();
+            }
+        }
+        TokenKind::PreprocessingDirective
+    }
+
+    /// Processes a `#define` or `#undef` (9.5.3): the named symbol, which must be
+    /// an identifier-or-keyword other than `true` or `false`, becomes defined or
+    /// undefined for the rest of the file when this section is being compiled.
+    fn scan_define_or_undef(&mut self, start: usize, active: bool, is_define: bool) {
+        self.skip_inline_whitespace();
+        let symbol = self.read_directive_name();
+        if symbol.is_empty() || symbol == "true" || symbol == "false" {
+            self.report(DiagnosticKind::SymbolNameExpected, start);
+            self.consume_to_line_end();
+            return;
+        }
+        if active && self.seen_token {
+            self.report(DiagnosticKind::SymbolAfterFirstToken, start);
+        }
+        if active {
+            if is_define {
+                self.defined_symbols.insert(symbol.into());
+            } else {
+                self.defined_symbols.remove(symbol);
+            }
+        }
+        self.expect_directive_line_end(start);
+    }
+
+    /// Processes an `#if` (9.5.4): evaluates its pre-processing expression and
+    /// opens a conditional whose first branch is included when the expression is
+    /// true and the enclosing section is itself being compiled.
+    fn scan_if(&mut self, start: usize, active: bool) {
+        let condition = self.scan_pp_expression(start);
+        self.expect_directive_line_end(start);
+        let including = active && condition;
+        self.conditionals.push(Conditional {
+            is_region: false,
+            parent_active: active,
+            branch_taken: including,
+            including,
+            seen_else: false,
+        });
+    }
+
+    /// Processes an `#elif` (9.5.4): selects its branch when no earlier branch of
+    /// the group was taken and its expression is true. The expression is always
+    /// parsed, so a malformed one is reported even in a skipped group.
+    fn scan_elif(&mut self, start: usize) {
+        let condition = self.scan_pp_expression(start);
+        self.expect_directive_line_end(start);
+        let Some(top) = self.conditionals.last_mut() else {
+            self.report(DiagnosticKind::UnexpectedDirective, start);
+            return;
+        };
+        if top.is_region {
+            self.report(DiagnosticKind::UnexpectedDirective, start);
+            return;
+        }
+        if top.seen_else {
+            self.report(DiagnosticKind::EndIfDirectiveExpected, start);
+            return;
+        }
+        let take = top.parent_active && !top.branch_taken && condition;
+        top.including = take;
+        top.branch_taken |= take;
+    }
+
+    /// Processes an `#else` (9.5.4): selects its branch when the group is active
+    /// and no earlier branch was taken.
+    fn scan_else(&mut self, start: usize) {
+        self.expect_directive_line_end(start);
+        let Some(top) = self.conditionals.last_mut() else {
+            self.report(DiagnosticKind::UnexpectedDirective, start);
+            return;
+        };
+        if top.is_region {
+            self.report(DiagnosticKind::UnexpectedDirective, start);
+            return;
+        }
+        if top.seen_else {
+            self.report(DiagnosticKind::EndIfDirectiveExpected, start);
+            return;
+        }
+        top.seen_else = true;
+        let take = top.parent_active && !top.branch_taken;
+        top.including = take;
+        top.branch_taken |= take;
+    }
+
+    /// Processes an `#endif` (9.5.4): closes the innermost `#if` group. Closing a
+    /// `#region` instead is the wrong directive and is recovered by closing it.
+    fn scan_endif(&mut self, start: usize) {
+        self.expect_directive_line_end(start);
+        match self.conditionals.last() {
+            Some(top) if top.is_region => {
+                self.report(DiagnosticKind::EndRegionDirectiveExpected, start);
+                self.conditionals.pop();
+            }
+            Some(_) => {
+                self.conditionals.pop();
+            }
+            None => self.report(DiagnosticKind::UnexpectedDirective, start),
+        }
+    }
+
+    /// Processes a `#region` (9.5.6), which behaves lexically as `#if true`: its
+    /// body is included exactly when the enclosing section is. The label after
+    /// the directive name is arbitrary text and carries no meaning.
+    fn scan_region(&mut self, active: bool) {
+        self.consume_to_line_end();
+        self.conditionals.push(Conditional {
+            is_region: true,
+            parent_active: active,
+            branch_taken: true,
+            including: active,
+            seen_else: false,
+        });
+    }
+
+    /// Processes an `#endregion` (9.5.6): closes the innermost `#region`. Closing
+    /// an `#if` instead is the wrong directive and is recovered by closing it.
+    fn scan_endregion(&mut self, start: usize) {
+        self.consume_to_line_end();
+        match self.conditionals.last() {
+            Some(top) if !top.is_region => {
+                self.report(DiagnosticKind::EndIfDirectiveExpected, start);
+                self.conditionals.pop();
+            }
+            Some(_) => {
+                self.conditionals.pop();
+            }
+            None => self.report(DiagnosticKind::UnexpectedDirective, start),
+        }
+    }
+
+    /// Processes an `#error` or `#warning` (9.5.5): when this section is being
+    /// compiled, raises a diagnostic carrying the rest of the line as its
+    /// message. The message is arbitrary text, so no end-of-line check applies.
+    fn scan_error_or_warning(&mut self, start: usize, active: bool, is_error: bool) {
+        self.skip_inline_whitespace();
+        let message_start = self.position;
+        self.consume_to_line_end();
+        if !active {
+            return;
+        }
+        let message: Box<str> = self.source[message_start..self.position].trim().into();
+        let kind = if is_error {
+            DiagnosticKind::ErrorDirective { message }
+        } else {
+            DiagnosticKind::WarningDirective { message }
+        };
+        self.report(kind, start);
+    }
+
+    /// Processes a `#line` directive (9.5.7), validating its indicator: a line
+    /// number with an optional file name, or `default`.
+    fn scan_line(&mut self, start: usize) {
+        self.skip_inline_whitespace();
+        let valid = if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            self.consume_decimal_digits();
+            self.skip_inline_whitespace();
+            if self.peek() == Some('"') {
+                self.consume_line_file_name();
+            }
+            true
+        } else {
+            self.read_directive_name() == "default"
+        };
+        if !valid {
+            self.report(DiagnosticKind::InvalidLineDirective, start);
+            self.consume_to_line_end();
+            return;
+        }
+        self.expect_directive_line_end(start);
+    }
+
+    /// Consumes a `#line` file name (9.5.7): a `"`-delimited run with no escapes,
+    /// stopping at the closing quote or, if the line ends first, the terminator.
+    fn consume_line_file_name(&mut self) {
+        self.bump();
+        while let Some(c) = self.peek() {
+            if is_new_line(c) {
+                break;
+            }
+            self.bump();
+            if c == '"' {
+                break;
+            }
+        }
+    }
+
+    /// Reads the identifier-or-keyword starting at the current position, used for
+    /// a directive name or a conditional symbol, returning its text (empty when
+    /// no identifier is there). The text borrows the source, not the scanner.
+    fn read_directive_name(&mut self) -> &'a str {
+        let name_start = self.position;
+        if self.peek().is_some_and(is_identifier_start) {
+            self.bump();
+            self.consume_identifier_part();
+        }
+        &self.source[name_start..self.position]
+    }
+
+    /// Skips white space within a line (9.3.3), stopping at a line terminator.
+    fn skip_inline_whitespace(&mut self) {
+        while self.peek().is_some_and(is_whitespace) {
+            self.bump();
+        }
+    }
+
+    /// Consumes everything up to, but not including, the next line terminator (or
+    /// the end of the file).
+    fn consume_to_line_end(&mut self) {
+        while self.peek().is_some_and(|c| !is_new_line(c)) {
+            self.bump();
+        }
+    }
+
+    /// Requires the rest of a directive line to be empty but for white space and
+    /// at most one trailing single-line comment, as pp-new-line demands (9.5.3).
+    /// A delimited comment is not permitted on a directive line and so counts as
+    /// unexpected content. Anything unexpected is reported once as `CS1025` and
+    /// then consumed. Stops at, without consuming, the line terminator.
+    fn expect_directive_line_end(&mut self, start: usize) {
+        self.skip_inline_whitespace();
+        if self.peek() == Some('/') && self.peek_second() == Some('/') {
+            self.consume_to_line_end();
+            return;
+        }
+        if self.peek().is_some_and(|c| !is_new_line(c)) {
+            self.report(DiagnosticKind::EndOfLineExpected, start);
+            self.consume_to_line_end();
+        }
+    }
+
+    /// Evaluates the pre-processing expression of an `#if` or `#elif` against the
+    /// defined symbols (9.5.2), leaving the scanner just past it. A malformed
+    /// expression is reported and treated as false.
+    fn scan_pp_expression(&mut self, start: usize) -> bool {
+        let mut errors = PpExprErrors {
+            invalid_reported: false,
+            close_paren_reported: false,
+        };
+        self.pp_or(start, &mut errors)
+    }
+
+    fn pp_or(&mut self, start: usize, errors: &mut PpExprErrors) -> bool {
+        let mut value = self.pp_and(start, errors);
+        loop {
+            self.skip_inline_whitespace();
+            if self.try_consume_str("||") {
+                value |= self.pp_and(start, errors);
+            } else {
+                return value;
+            }
+        }
+    }
+
+    fn pp_and(&mut self, start: usize, errors: &mut PpExprErrors) -> bool {
+        let mut value = self.pp_equality(start, errors);
+        loop {
+            self.skip_inline_whitespace();
+            if self.try_consume_str("&&") {
+                value &= self.pp_equality(start, errors);
+            } else {
+                return value;
+            }
+        }
+    }
+
+    fn pp_equality(&mut self, start: usize, errors: &mut PpExprErrors) -> bool {
+        let mut value = self.pp_unary(start, errors);
+        loop {
+            self.skip_inline_whitespace();
+            if self.try_consume_str("==") {
+                value = value == self.pp_unary(start, errors);
+            } else if self.try_consume_str("!=") {
+                value = value != self.pp_unary(start, errors);
+            } else {
+                return value;
+            }
+        }
+    }
+
+    fn pp_unary(&mut self, start: usize, errors: &mut PpExprErrors) -> bool {
+        self.skip_inline_whitespace();
+        if self.peek() == Some('!') && self.peek_second() != Some('=') {
+            self.bump();
+            return !self.pp_unary(start, errors);
+        }
+        self.pp_primary(start, errors)
+    }
+
+    fn pp_primary(&mut self, start: usize, errors: &mut PpExprErrors) -> bool {
+        self.skip_inline_whitespace();
+        match self.peek() {
+            Some('(') => {
+                self.bump();
+                let value = self.pp_or(start, errors);
+                self.skip_inline_whitespace();
+                if self.peek() == Some(')') {
+                    self.bump();
+                } else if !errors.close_paren_reported {
+                    self.report(DiagnosticKind::CloseParenExpected, start);
+                    errors.close_paren_reported = true;
+                }
+                value
+            }
+            Some(c) if is_identifier_start(c) => match self.read_directive_name() {
+                "true" => true,
+                "false" => false,
+                symbol => self.defined_symbols.contains(symbol),
+            },
+            _ => {
+                if !errors.invalid_reported {
+                    self.report(DiagnosticKind::InvalidPreprocessorExpression, start);
+                    errors.invalid_reported = true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Consumes `text` at the current position if it appears there exactly,
+    /// reporting whether it did. Used for the multi-character pre-processing
+    /// operators, which are all ASCII.
+    fn try_consume_str(&mut self, text: &str) -> bool {
+        if self.remaining().starts_with(text) {
+            self.position += text.len();
+            true
+        } else {
+            false
+        }
     }
 
     fn scan_new_line(&mut self) -> TokenKind {
@@ -586,15 +1072,10 @@ fn push_utf16(units: &mut Vec<u16>, scalar: char) {
     units.extend_from_slice(scalar.encode_utf16(&mut buffer));
 }
 
-/// A character that begins a construct scanned in a later chunk: a pre-processing
-/// directive (9.5).
-fn is_deferred_start(c: char) -> bool {
-    c == '#'
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostic::Severity;
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -897,10 +1378,11 @@ mod tests {
     }
 
     #[test]
-    fn a_hash_surfaces_as_unknown_without_a_diagnostic() {
+    fn a_bare_hash_is_a_missing_directive_name() {
         let result = tokenize("#");
-        assert_eq!(result.tokens[0].kind, TokenKind::Unknown);
-        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.tokens[0].kind, TokenKind::PreprocessingDirective);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code(), 1024);
     }
 
     fn character(value: u16) -> TokenKind {
@@ -1058,5 +1540,284 @@ mod tests {
             kinds("class\u{1A}"),
             vec![TokenKind::Keyword(Keyword::Class), TokenKind::EndOfFile]
         );
+    }
+
+    /// The significant tokens of `source`: everything that is neither trivia
+    /// (including directives and skipped text) nor the end-of-file marker.
+    fn significant(source: &str) -> Vec<TokenKind> {
+        tokenize(source)
+            .tokens
+            .into_iter()
+            .map(|token| token.kind)
+            .filter(|kind| !kind.is_trivia() && *kind != TokenKind::EndOfFile)
+            .collect()
+    }
+
+    /// The diagnostic codes raised for `source`, sorted, so a test can compare
+    /// the set of codes without depending on the order they were emitted in.
+    fn sorted_codes(source: &str) -> Vec<u16> {
+        let mut codes: Vec<u16> = tokenize(source)
+            .diagnostics
+            .iter()
+            .map(Diagnostic::code)
+            .collect();
+        codes.sort_unstable();
+        codes
+    }
+
+    #[test]
+    fn a_defined_symbol_includes_its_if_branch() {
+        assert_eq!(
+            significant("#define A\n#if A\nclass C {}\n#endif"),
+            vec![
+                TokenKind::Keyword(Keyword::Class),
+                ident("C"),
+                TokenKind::Punctuator(Punctuator::OpenBrace),
+                TokenKind::Punctuator(Punctuator::CloseBrace),
+            ]
+        );
+        assert!(
+            tokenize("#define A\n#if A\nclass C {}\n#endif")
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_undefined_symbol_skips_its_if_branch() {
+        let result = tokenize("#if A\nclass C {}\n#endif");
+        assert!(significant("#if A\nclass C {}\n#endif").is_empty());
+        assert!(result.diagnostics.is_empty());
+        assert!(
+            result
+                .tokens
+                .iter()
+                .any(|t| t.kind == TokenKind::SkippedText)
+        );
+    }
+
+    #[test]
+    fn else_is_taken_when_the_if_is_false() {
+        assert_eq!(
+            significant("#if A\ntaken_away\n#else\nclass C {}\n#endif"),
+            vec![
+                TokenKind::Keyword(Keyword::Class),
+                ident("C"),
+                TokenKind::Punctuator(Punctuator::OpenBrace),
+                TokenKind::Punctuator(Punctuator::CloseBrace),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_first_true_elif_branch_wins() {
+        let source =
+            "#define B\n#if A\nfirst\n#elif B\nsecond\n#elif C\nthird\n#else\nlast\n#endif";
+        assert_eq!(significant(source), vec![ident("second")]);
+    }
+
+    #[test]
+    fn undef_makes_a_symbol_undefined_again() {
+        let result = tokenize("#define A\n#undef A\n#if A\nx\n#endif");
+        assert!(significant("#define A\n#undef A\n#if A\nx\n#endif").is_empty());
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn pre_processing_expression_operators_evaluate() {
+        assert_eq!(significant("#if !A\nyes\n#endif"), vec![ident("yes")]);
+        assert_eq!(
+            significant("#define A\n#if A && !B\nyes\n#endif"),
+            vec![ident("yes")]
+        );
+        assert_eq!(
+            significant("#if (A == B) || C\nyes\n#endif"),
+            vec![ident("yes")]
+        );
+        assert_eq!(
+            significant("#if true != false\nyes\n#endif"),
+            vec![ident("yes")]
+        );
+        assert_eq!(significant("#if A || B\nno\n#endif"), Vec::new());
+    }
+
+    #[test]
+    fn nested_conditionals_in_a_skipped_branch_stay_skipped() {
+        let source = "#if A\n#if true\nx\n#endif\n#endif\nclass C {}";
+        assert_eq!(
+            significant(source),
+            vec![
+                TokenKind::Keyword(Keyword::Class),
+                ident("C"),
+                TokenKind::Punctuator(Punctuator::OpenBrace),
+                TokenKind::Punctuator(Punctuator::CloseBrace),
+            ]
+        );
+        assert!(tokenize(source).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_skipped_section_need_not_be_well_formed() {
+        let source = "#if A\n\"unterminated\n/* unclosed\n#endif\nclass C {}";
+        let result = tokenize(source);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            significant(source),
+            vec![
+                TokenKind::Keyword(Keyword::Class),
+                ident("C"),
+                TokenKind::Punctuator(Punctuator::OpenBrace),
+                TokenKind::Punctuator(Punctuator::CloseBrace),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_region_includes_its_body_like_if_true() {
+        assert_eq!(
+            significant("#region a label\nclass C {}\n#endregion done"),
+            vec![
+                TokenKind::Keyword(Keyword::Class),
+                ident("C"),
+                TokenKind::Punctuator(Punctuator::OpenBrace),
+                TokenKind::Punctuator(Punctuator::CloseBrace),
+            ]
+        );
+        assert!(
+            tokenize("#region a label\nclass C {}\n#endregion done")
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_directive_may_carry_leading_and_inner_white_space() {
+        assert_eq!(
+            significant("   #   define   A\n#if A\nyes\n#endif"),
+            vec![ident("yes")]
+        );
+    }
+
+    #[test]
+    fn a_directive_line_may_end_with_a_single_line_comment() {
+        let result = tokenize("#define A // fine\n#if A\nyes\n#endif");
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            significant("#define A // fine\n#if A\nyes\n#endif"),
+            vec![ident("yes")]
+        );
+    }
+
+    #[test]
+    fn a_delimited_comment_is_not_allowed_on_a_directive_line() {
+        assert_eq!(sorted_codes("#define A /* no */\nclass C {}"), vec![1025]);
+    }
+
+    #[test]
+    fn error_and_warning_carry_their_message_and_severity() {
+        let error = tokenize("#error something bad");
+        assert_eq!(error.diagnostics.len(), 1);
+        assert_eq!(error.diagnostics[0].code(), 1029);
+        assert_eq!(error.diagnostics[0].severity(), Severity::Error);
+        assert_eq!(
+            error.diagnostics[0].kind,
+            DiagnosticKind::ErrorDirective {
+                message: "something bad".into()
+            }
+        );
+
+        let warning = tokenize("#warning be careful");
+        assert_eq!(warning.diagnostics[0].code(), 1030);
+        assert_eq!(warning.diagnostics[0].severity(), Severity::Warning);
+    }
+
+    #[test]
+    fn diagnostics_in_a_skipped_branch_do_not_fire() {
+        assert!(
+            tokenize("#if A\n#error boom\n#warning meh\n#endif")
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_directive_must_still_be_well_formed_when_skipped() {
+        assert_eq!(sorted_codes("#if A\n#nonsense\n#endif"), vec![1024]);
+        assert_eq!(sorted_codes("#if A\n#endif x\nclass C {}"), vec![1025]);
+    }
+
+    #[test]
+    fn define_or_undef_after_the_first_token_is_an_error() {
+        assert_eq!(sorted_codes("class C {}\n#define A"), vec![1032]);
+        assert_eq!(sorted_codes("class C {}\n#undef A"), vec![1032]);
+        assert!(
+            tokenize("class C {}\n#if A\n#define B\n#endif")
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn directive_diagnostics_match_the_reference_compiler() {
+        assert_eq!(sorted_codes("#bad\nclass C {}"), vec![1024]);
+        assert_eq!(sorted_codes("#define\nclass C {}"), vec![1001]);
+        assert_eq!(sorted_codes("#define true\nclass C {}"), vec![1001]);
+        assert_eq!(sorted_codes("#endif\nclass C {}"), vec![1028]);
+        assert_eq!(sorted_codes("#else\nclass C {}"), vec![1028]);
+        assert_eq!(sorted_codes("#elif A\nclass C {}"), vec![1028]);
+        assert_eq!(sorted_codes("#endregion\nclass C {}"), vec![1028]);
+        assert_eq!(sorted_codes("#if A\nclass C {}"), vec![1027]);
+        assert_eq!(sorted_codes("#region r\nclass C {}"), vec![1038]);
+        assert_eq!(sorted_codes("#if A\n#else\n#else\n#endif\nx"), vec![1027]);
+        assert_eq!(sorted_codes("#if A\n#else\n#elif B\n#endif\nx"), vec![1027]);
+        assert_eq!(sorted_codes("#region\n#endif\nclass C {}"), vec![1038]);
+        assert_eq!(sorted_codes("#if A\n#endregion\nclass C {}"), vec![1027]);
+        assert_eq!(sorted_codes("#line abc\nclass C {}"), vec![1576]);
+    }
+
+    #[test]
+    fn well_formed_line_directives_are_accepted() {
+        for source in [
+            "#line default\nclass C {}",
+            "#line 200\nclass C {}",
+            "#line 200 \"foo.cs\"\nclass C {}",
+        ] {
+            assert!(tokenize(source).diagnostics.is_empty(), "source {source:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_pre_processing_expression_matches_the_reference_compiler() {
+        assert_eq!(sorted_codes("#if\n#endif\nx"), vec![1517]);
+        assert_eq!(sorted_codes("#if A ==\n#endif\nx"), vec![1517]);
+        assert_eq!(sorted_codes("#if 1\n#endif\nx"), vec![1025, 1517]);
+        assert_eq!(sorted_codes("#if (A\n#endif\nx"), vec![1026]);
+        assert_eq!(sorted_codes("#if (((\n#endif\nx"), vec![1026, 1517]);
+    }
+
+    #[test]
+    fn a_hash_not_first_on_a_line_is_cs1040() {
+        let result = tokenize("class C { int x = #; }");
+        assert!(result.diagnostics.iter().any(|d| d.code() == 1040));
+    }
+
+    #[test]
+    fn a_directive_inside_a_multi_line_token_is_not_processed() {
+        let source = "#define D\nclass C {\nstring s = @\"a\n#if D\nb\n#endif\nc\";\n}\n#endif";
+        assert_eq!(sorted_codes(source), vec![1028]);
+    }
+
+    #[test]
+    fn directives_and_skipped_text_still_cover_the_source() {
+        let source = "#define A\n#if A\nclass C {}\n#else\nbad ## text\n#endif\n#region r\nint x;\n#endregion\n";
+        let tokens = tokenize(source).tokens;
+        let mut rebuilt = String::new();
+        for token in &tokens {
+            if token.kind == TokenKind::EndOfFile {
+                continue;
+            }
+            rebuilt.push_str(token.span.slice(source));
+        }
+        assert_eq!(rebuilt, source);
     }
 }

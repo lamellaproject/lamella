@@ -1,6 +1,7 @@
 //! Diagnostics produced by the front end.
 
 use crate::span::Span;
+use alloc::boxed::Box;
 use core::fmt;
 
 /// How serious a diagnostic is.
@@ -42,6 +43,46 @@ pub enum DiagnosticKind {
     /// A verbatim string literal (`@"..."`) ran to end of file before its
     /// closing quote.
     UnterminatedStringLiteral,
+    /// A `#` that is not the first non-white-space character on its line: a
+    /// pre-processing directive must begin its own line (9.5).
+    DirectiveNotFirstOnLine,
+    /// A `#` was followed by something other than a known directive name (9.5).
+    PreprocessorDirectiveExpected,
+    /// A directive line carried tokens past its content where only white space,
+    /// a single-line comment, or the end of the line was allowed (9.5).
+    EndOfLineExpected,
+    /// A `#define` or `#undef` named no conditional compilation symbol, or named
+    /// `true` or `false`, which are not symbols (9.5.3).
+    SymbolNameExpected,
+    /// A `#define` or `#undef` appeared after the first real token of the file,
+    /// which 9.5.3 forbids.
+    SymbolAfterFirstToken,
+    /// An `#elif`, `#else`, `#endif`, or `#endregion` had no open construct to
+    /// match, or appeared where it was not allowed (9.5.4, 9.5.6).
+    UnexpectedDirective,
+    /// An `#if` (or `#region` whose body holds an `#if`) reached the end of the
+    /// file, or a directive that may not appear, without its `#endif` (9.5.4).
+    EndIfDirectiveExpected,
+    /// A `#region` reached the end of the file, or an `#endif` where an
+    /// `#endregion` was due, without its `#endregion` (9.5.6).
+    EndRegionDirectiveExpected,
+    /// A pre-processing expression in an `#if` or `#elif` was malformed (9.5.2).
+    InvalidPreprocessorExpression,
+    /// A parenthesised pre-processing expression was missing its `)` (9.5.2).
+    CloseParenExpected,
+    /// A `#line` directive had no valid line number, file name, or `default`
+    /// indicator (9.5.7).
+    InvalidLineDirective,
+    /// A `#error` directive, carrying its message text (9.5.5).
+    ErrorDirective {
+        /// The text following `#error` on the directive line.
+        message: Box<str>,
+    },
+    /// A `#warning` directive, carrying its message text (9.5.5).
+    WarningDirective {
+        /// The text following `#warning` on the directive line.
+        message: Box<str>,
+    },
 }
 
 impl DiagnosticKind {
@@ -59,6 +100,19 @@ impl DiagnosticKind {
             DiagnosticKind::EmptyCharacterLiteral => 1011,
             DiagnosticKind::TooManyCharactersInCharacterLiteral => 1012,
             DiagnosticKind::UnterminatedStringLiteral => 1039,
+            DiagnosticKind::SymbolNameExpected => 1001,
+            DiagnosticKind::PreprocessorDirectiveExpected => 1024,
+            DiagnosticKind::EndOfLineExpected => 1025,
+            DiagnosticKind::CloseParenExpected => 1026,
+            DiagnosticKind::EndIfDirectiveExpected => 1027,
+            DiagnosticKind::UnexpectedDirective => 1028,
+            DiagnosticKind::ErrorDirective { .. } => 1029,
+            DiagnosticKind::WarningDirective { .. } => 1030,
+            DiagnosticKind::SymbolAfterFirstToken => 1032,
+            DiagnosticKind::EndRegionDirectiveExpected => 1038,
+            DiagnosticKind::DirectiveNotFirstOnLine => 1040,
+            DiagnosticKind::InvalidPreprocessorExpression => 1517,
+            DiagnosticKind::InvalidLineDirective => 1576,
         }
     }
 
@@ -66,15 +120,8 @@ impl DiagnosticKind {
     #[must_use]
     pub fn severity(&self) -> Severity {
         match self {
-            DiagnosticKind::UnterminatedDelimitedComment
-            | DiagnosticKind::UnexpectedCharacter { .. }
-            | DiagnosticKind::IntegerLiteralTooLarge
-            | DiagnosticKind::MalformedNumericLiteral
-            | DiagnosticKind::UnrecognizedEscapeSequence
-            | DiagnosticKind::NewlineInConstant
-            | DiagnosticKind::EmptyCharacterLiteral
-            | DiagnosticKind::TooManyCharactersInCharacterLiteral
-            | DiagnosticKind::UnterminatedStringLiteral => Severity::Error,
+            DiagnosticKind::WarningDirective { .. } => Severity::Warning,
+            _ => Severity::Error,
         }
     }
 }
@@ -96,6 +143,33 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::UnterminatedStringLiteral => {
                 f.write_str("Unterminated string literal")
+            }
+            DiagnosticKind::SymbolNameExpected => f.write_str("Identifier expected"),
+            DiagnosticKind::PreprocessorDirectiveExpected => {
+                f.write_str("Preprocessor directive expected")
+            }
+            DiagnosticKind::EndOfLineExpected => {
+                f.write_str("Single-line comment or end-of-line expected")
+            }
+            DiagnosticKind::CloseParenExpected => f.write_str(") expected"),
+            DiagnosticKind::EndIfDirectiveExpected => f.write_str("#endif directive expected"),
+            DiagnosticKind::UnexpectedDirective => f.write_str("Unexpected preprocessor directive"),
+            DiagnosticKind::ErrorDirective { message } => write!(f, "#error: '{message}'"),
+            DiagnosticKind::WarningDirective { message } => write!(f, "#warning: '{message}'"),
+            DiagnosticKind::SymbolAfterFirstToken => {
+                f.write_str("Cannot define/undefine preprocessor symbols after first token in file")
+            }
+            DiagnosticKind::EndRegionDirectiveExpected => {
+                f.write_str("#endregion directive expected")
+            }
+            DiagnosticKind::DirectiveNotFirstOnLine => f.write_str(
+                "Preprocessor directives must appear as the first non-whitespace character on a line",
+            ),
+            DiagnosticKind::InvalidPreprocessorExpression => {
+                f.write_str("Invalid preprocessor expression")
+            }
+            DiagnosticKind::InvalidLineDirective => {
+                f.write_str("The line number specified for #line directive is missing or invalid")
             }
         }
     }
