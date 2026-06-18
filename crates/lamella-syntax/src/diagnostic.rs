@@ -73,6 +73,9 @@ pub enum DiagnosticKind {
     /// A `#line` directive had no valid line number, file name, or `default`
     /// indicator (9.5.7).
     InvalidLineDirective,
+    /// A `#line` line number parsed as an integer but lay past the range a
+    /// `#line` directive accepts (9.5.7).
+    LineNumberOutOfRange,
     /// A `#error` directive, carrying its message text (9.5.5).
     ErrorDirective {
         /// The text following `#error` on the directive line.
@@ -113,6 +116,7 @@ impl DiagnosticKind {
             DiagnosticKind::DirectiveNotFirstOnLine => 1040,
             DiagnosticKind::InvalidPreprocessorExpression => 1517,
             DiagnosticKind::InvalidLineDirective => 1576,
+            DiagnosticKind::LineNumberOutOfRange => 1687,
         }
     }
 
@@ -170,6 +174,9 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::InvalidLineDirective => {
                 f.write_str("The line number specified for #line directive is missing or invalid")
+            }
+            DiagnosticKind::LineNumberOutOfRange => {
+                f.write_str("The line number specified for #line directive is out of range")
             }
         }
     }

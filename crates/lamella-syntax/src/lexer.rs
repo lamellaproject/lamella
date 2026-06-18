@@ -324,7 +324,7 @@ impl<'a> Lexer<'a> {
             return;
         };
         if top.is_region {
-            self.report(DiagnosticKind::UnexpectedDirective, start);
+            self.report(DiagnosticKind::EndRegionDirectiveExpected, start);
             return;
         }
         if top.seen_else {
@@ -345,7 +345,7 @@ impl<'a> Lexer<'a> {
             return;
         };
         if top.is_region {
-            self.report(DiagnosticKind::UnexpectedDirective, start);
+            self.report(DiagnosticKind::EndRegionDirectiveExpected, start);
             return;
         }
         if top.seen_else {
@@ -427,17 +427,16 @@ impl<'a> Lexer<'a> {
     /// number with an optional file name, or `default`.
     fn scan_line(&mut self, start: usize) {
         self.skip_inline_whitespace();
-        let valid = if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+        if self.peek().is_some_and(|c| c.is_ascii_digit()) {
+            let digits_start = self.position;
             self.consume_decimal_digits();
+            self.validate_line_number(&self.source[digits_start..self.position], start);
             self.skip_inline_whitespace();
-            if self.peek() == Some('"') {
-                self.consume_line_file_name();
+            if self.peek() == Some('"') && !self.consume_line_file_name() {
+                self.report(DiagnosticKind::NewlineInConstant, start);
+                return;
             }
-            true
-        } else {
-            self.read_directive_name() == "default"
-        };
-        if !valid {
+        } else if self.read_directive_name() != "default" {
             self.report(DiagnosticKind::InvalidLineDirective, start);
             self.consume_to_line_end();
             return;
@@ -445,19 +444,39 @@ impl<'a> Lexer<'a> {
         self.expect_directive_line_end(start);
     }
 
-    /// Consumes a `#line` file name (9.5.7): a `"`-delimited run with no escapes,
-    /// stopping at the closing quote or, if the line ends first, the terminator.
-    fn consume_line_file_name(&mut self) {
+    /// Checks a `#line` line number (9.5.7) against the range the reference
+    /// compiler accepts. Zero is `CS1576`; a value past the limit but still
+    /// within `int` range is `CS1687`; one that overflows `int` is `CS1021` and
+    /// `CS1576`. All three boundaries were confirmed against `csc`.
+    fn validate_line_number(&mut self, digits: &str, start: usize) {
+        const MAX_LINE: u64 = 16_707_565;
+        let value = digits.parse::<u64>().unwrap_or(u64::MAX);
+        if value == 0 {
+            self.report(DiagnosticKind::InvalidLineDirective, start);
+        } else if value > i32::MAX as u64 {
+            self.report(DiagnosticKind::IntegerLiteralTooLarge, start);
+            self.report(DiagnosticKind::InvalidLineDirective, start);
+        } else if value > MAX_LINE {
+            self.report(DiagnosticKind::LineNumberOutOfRange, start);
+        }
+    }
+
+    /// Consumes a `#line` file name (9.5.7): a `"`-delimited run with no escapes.
+    /// Returns whether the closing quote was reached; a file name that runs to
+    /// the line terminator or end of file is unterminated, and the scanner stops
+    /// at the terminator without consuming it.
+    fn consume_line_file_name(&mut self) -> bool {
         self.bump();
         while let Some(c) = self.peek() {
             if is_new_line(c) {
-                break;
+                return false;
             }
             self.bump();
             if c == '"' {
-                break;
+                return true;
             }
         }
+        false
     }
 
     /// Reads the identifier-or-keyword starting at the current position, used for
@@ -1819,5 +1838,58 @@ mod tests {
             rebuilt.push_str(token.span.slice(source));
         }
         assert_eq!(rebuilt, source);
+    }
+
+    #[test]
+    fn a_conditional_directive_inside_a_region_wants_endregion() {
+        assert_eq!(sorted_codes("#region\n#elif A\n#endregion\nx"), vec![1038]);
+        assert_eq!(sorted_codes("#region\n#else\n#endregion\nx"), vec![1038]);
+        assert_eq!(sorted_codes("#region\n#endif\nx"), vec![1038]);
+    }
+
+    #[test]
+    fn line_directive_numbers_are_range_checked() {
+        assert_eq!(sorted_codes("#line 0\nx"), vec![1576]);
+        assert!(tokenize("#line 16707565\nx").diagnostics.is_empty());
+        assert_eq!(sorted_codes("#line 16707566\nx"), vec![1687]);
+        assert_eq!(sorted_codes("#line 2147483648\nx"), vec![1021, 1576]);
+    }
+
+    #[test]
+    fn an_unterminated_line_directive_file_name_is_cs1010() {
+        assert_eq!(sorted_codes("#line 5 \"oops\nx"), vec![1010]);
+        assert!(tokenize("#line 5 \"ok.cs\"\nx").diagnostics.is_empty());
+    }
+
+    #[test]
+    fn a_define_in_a_skipped_branch_has_no_effect() {
+        let source = "#if false\n#define A\n#endif\n#if A\nyes\n#endif";
+        assert!(significant(source).is_empty());
+        assert!(tokenize(source).diagnostics.is_empty());
+    }
+
+    #[test]
+    fn undef_of_an_undefined_symbol_and_redefinition_are_fine() {
+        assert!(tokenize("#undef Never\nclass C {}").diagnostics.is_empty());
+        assert!(
+            tokenize("#define A\n#define A\nclass C {}")
+                .diagnostics
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_white_space_may_precede_a_directive_on_its_line() {
+        assert!(
+            tokenize("/* c */ #define A\nclass C {}")
+                .diagnostics
+                .iter()
+                .any(|d| d.code() == 1040)
+        );
+        assert!(
+            tokenize("// c\n#define A\n#if A\nyes\n#endif")
+                .diagnostics
+                .is_empty()
+        );
     }
 }
