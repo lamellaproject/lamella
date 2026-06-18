@@ -398,6 +398,283 @@ pub enum GotoTarget {
     Default,
 }
 
+/// A whole source file (ECMA-334 1st ed, 16.1): using directives then the
+/// top-level namespace and type declarations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilationUnit {
+    /// The file-level using directives.
+    pub usings: Vec<UsingDirective>,
+    /// The top-level namespace and type declarations.
+    pub members: Vec<NamespaceMember>,
+    /// The byte range the unit covers.
+    pub span: Span,
+}
+
+/// A dotted name such as `System.Collections` (10.8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QualifiedName {
+    /// The dot-separated parts, in order.
+    pub parts: Vec<Box<str>>,
+    /// The byte range the name covers.
+    pub span: Span,
+}
+
+/// A `using` directive (16.3): import a namespace or define an alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsingDirective {
+    /// What the directive imports.
+    pub kind: UsingKind,
+    /// The byte range it covers.
+    pub span: Span,
+}
+
+/// The kind of a [`UsingDirective`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsingKind {
+    /// `using A.B.C ;` -- bring a namespace's members into scope.
+    Namespace(QualifiedName),
+    /// `using X = A.B.C ;` -- an alias for a namespace or type.
+    Alias {
+        /// The alias identifier.
+        name: Box<str>,
+        /// The aliased namespace or type name.
+        target: QualifiedName,
+    },
+}
+
+/// A member of a compilation unit or namespace (16.4). Also used for a type
+/// nested in another type (17.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceMember {
+    /// A nested namespace.
+    Namespace(NamespaceDecl),
+    /// A class, struct, or interface declaration.
+    Type(TypeDecl),
+    /// An enum declaration.
+    Enum(EnumDecl),
+    /// A delegate declaration.
+    Delegate(DelegateDecl),
+}
+
+/// An `enum` declaration (21.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDecl {
+    /// The declared modifiers, in source order.
+    pub modifiers: Vec<Modifier>,
+    /// The enum's name.
+    pub name: Box<str>,
+    /// The underlying integral type, if given after `:`.
+    pub base: Option<TypeRef>,
+    /// The enum members, in order.
+    pub members: Vec<EnumMember>,
+    /// The byte range the declaration covers.
+    pub span: Span,
+}
+
+/// One member of an [`EnumDecl`] (21.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumMember {
+    /// The member's name.
+    pub name: Box<str>,
+    /// The constant value expression, if given with `=`.
+    pub value: Option<Expr>,
+    /// The byte range the member covers.
+    pub span: Span,
+}
+
+/// A `delegate` declaration (22.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelegateDecl {
+    /// The declared modifiers, in source order.
+    pub modifiers: Vec<Modifier>,
+    /// The delegate's return type.
+    pub return_type: TypeRef,
+    /// The delegate's name.
+    pub name: Box<str>,
+    /// The delegate's formal parameters.
+    pub parameters: Vec<Parameter>,
+    /// The byte range the declaration covers.
+    pub span: Span,
+}
+
+/// A `namespace` declaration (16.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamespaceDecl {
+    /// The (possibly dotted) namespace name.
+    pub name: QualifiedName,
+    /// The namespace body's using directives.
+    pub usings: Vec<UsingDirective>,
+    /// The namespace body's member declarations.
+    pub members: Vec<NamespaceMember>,
+    /// The byte range the declaration covers.
+    pub span: Span,
+}
+
+/// A class, struct, or interface declaration (17, 18, 20). Enum and delegate
+/// declarations arrive in a later chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeDecl {
+    /// The declared modifiers, in source order.
+    pub modifiers: Vec<Modifier>,
+    /// Whether this is a class, struct, or interface.
+    pub kind: TypeKind,
+    /// The type's name.
+    pub name: Box<str>,
+    /// The base class and/or interfaces listed after `:`.
+    pub bases: Vec<TypeRef>,
+    /// The type's members.
+    pub members: Vec<Member>,
+    /// The byte range the declaration covers.
+    pub span: Span,
+}
+
+/// Which kind of type a [`TypeDecl`] declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeKind {
+    /// `class`.
+    Class,
+    /// `struct`.
+    Struct,
+    /// `interface`.
+    Interface,
+}
+
+/// A declaration modifier (the parser accepts any; binding checks validity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modifier {
+    /// `new`.
+    New,
+    /// `public`.
+    Public,
+    /// `protected`.
+    Protected,
+    /// `internal`.
+    Internal,
+    /// `private`.
+    Private,
+    /// `abstract`.
+    Abstract,
+    /// `sealed`.
+    Sealed,
+    /// `static`.
+    Static,
+    /// `readonly`.
+    Readonly,
+    /// `volatile`.
+    Volatile,
+    /// `virtual`.
+    Virtual,
+    /// `override`.
+    Override,
+    /// `extern`.
+    Extern,
+    /// `const`.
+    Const,
+    /// `unsafe`.
+    Unsafe,
+}
+
+/// A member of a type (17.2). Fields, methods, and constructors land first;
+/// properties, indexers, events, operators, constants, and nested types follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Member {
+    /// A field declaration `modifiers type declarators ;` (17.4).
+    Field {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// The field type.
+        ty: TypeRef,
+        /// The declared fields.
+        declarators: Vec<VariableDeclarator>,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// A method declaration (17.5). The body is `None` for an abstract, extern,
+    /// or interface method (a `;` in place of a block).
+    Method {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// The return type.
+        return_type: TypeRef,
+        /// The method name.
+        name: Box<str>,
+        /// The formal parameters.
+        parameters: Vec<Parameter>,
+        /// The method body, or `None` if it was a bare `;`.
+        body: Option<Stmt>,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// An instance or static constructor (17.10, 17.11): a name matching the
+    /// type, no return type, then a body.
+    Constructor {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// The constructor name (the type name).
+        name: Box<str>,
+        /// The formal parameters.
+        parameters: Vec<Parameter>,
+        /// The constructor body.
+        body: Stmt,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// A property declaration (17.6): `modifiers type name { accessors }`.
+    Property {
+        /// The member's modifiers.
+        modifiers: Vec<Modifier>,
+        /// The property type.
+        ty: TypeRef,
+        /// The property name.
+        name: Box<str>,
+        /// The `get` accessor, if present.
+        getter: Option<Accessor>,
+        /// The `set` accessor, if present.
+        setter: Option<Accessor>,
+        /// The byte range the member covers.
+        span: Span,
+    },
+    /// A type nested in another type (17.2): a class, struct, interface, enum, or
+    /// delegate. Boxed because [`NamespaceMember`] holds members in turn.
+    NestedType(Box<NamespaceMember>),
+    /// A placeholder for a member that could not be parsed, for recovery.
+    Error,
+}
+
+/// A property accessor (17.6.2): a `get` or `set`, with a block body or, for an
+/// abstract or interface property, a bare `;` (so the body is `None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Accessor {
+    /// The accessor body, or `None` if it was a bare `;`.
+    pub body: Option<Stmt>,
+    /// The byte range the accessor covers.
+    pub span: Span,
+}
+
+/// A formal parameter (17.5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Parameter {
+    /// The `ref`, `out`, or `params` modifier, if any.
+    pub modifier: Option<ParameterModifier>,
+    /// The parameter type.
+    pub ty: TypeRef,
+    /// The parameter name.
+    pub name: Box<str>,
+    /// The byte range the parameter covers.
+    pub span: Span,
+}
+
+/// A parameter-passing modifier (17.5.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParameterModifier {
+    /// `ref`: pass by reference.
+    Ref,
+    /// `out`: pass by reference, assigned by the callee.
+    Out,
+    /// `params`: a variable-length trailing array.
+    Params,
+}
+
 /// One `catch` clause of a `try` statement (15.10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatchClause {

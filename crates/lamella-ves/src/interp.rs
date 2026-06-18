@@ -254,6 +254,7 @@ fn step(
         Opcode::Stloc2 => frame.store_local(2)?,
         Opcode::Stloc3 => frame.store_local(3)?,
         Opcode::StlocS | Opcode::Stloc => frame.store_local(var_operand(instruction)?)?,
+        Opcode::StargS | Opcode::Starg => frame.store_arg(var_operand(instruction)?)?,
 
         Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Rem => {
             let (a, b) = frame.pop2()?;
@@ -274,6 +275,23 @@ fn step(
         Opcode::Not => {
             let value = frame.pop()?;
             frame.stack.push(bitwise_not(value)?);
+        }
+
+        Opcode::ConvI1
+        | Opcode::ConvI2
+        | Opcode::ConvI4
+        | Opcode::ConvI8
+        | Opcode::ConvU1
+        | Opcode::ConvU2
+        | Opcode::ConvU4
+        | Opcode::ConvU8
+        | Opcode::ConvI
+        | Opcode::ConvU
+        | Opcode::ConvR4
+        | Opcode::ConvR8
+        | Opcode::ConvRUn => {
+            let value = frame.pop()?;
+            frame.stack.push(convert(opcode, value)?);
         }
 
         Opcode::Ceq | Opcode::Cgt | Opcode::CgtUn | Opcode::Clt | Opcode::CltUn => {
@@ -318,6 +336,18 @@ fn step(
             let (a, b) = frame.pop2()?;
             if compare(opcode, a, b)? {
                 frame.ip = branch_target(instruction, frame.code.len())?;
+            }
+        }
+        Opcode::Switch => {
+            let index = unsigned_index(frame.pop()?).ok_or(Trap::TypeMismatch(Opcode::Switch))?;
+            let Operand::Switch(targets) = &instruction.operand else {
+                return Err(Trap::MalformedInstruction(Opcode::Switch));
+            };
+            if let Some(&target) = targets.get(index) {
+                if target as usize >= frame.code.len() {
+                    return Err(Trap::BranchOutOfRange(target));
+                }
+                frame.ip = target as usize;
             }
         }
 
@@ -408,6 +438,26 @@ impl<'a> Frame<'a> {
         }
         self.locals[slot as usize] = value;
         Ok(())
+    }
+
+    fn store_arg(&mut self, slot: u16) -> Result<(), Trap> {
+        let value = self.pop()?;
+        let target = self
+            .args
+            .get_mut(slot as usize)
+            .ok_or(Trap::ArgumentOutOfRange(slot))?;
+        *target = value;
+        Ok(())
+    }
+}
+
+/// The unsigned index a `switch` pops, or `None` if the value is not an integer
+/// (III.3.66 compares the value as an unsigned integer).
+fn unsigned_index(value: Value) -> Option<usize> {
+    match value {
+        Value::Int32(x) => Some(x as u32 as usize),
+        Value::Int64(x) | Value::NativeInt(x) => Some(x as usize),
+        _ => None,
     }
 }
 
@@ -571,6 +621,62 @@ fn bitwise_not(value: Value) -> Result<Value, Trap> {
         Value::NativeInt(x) => Ok(Value::NativeInt(!x)),
         _ => Err(Trap::TypeMismatch(Opcode::Not)),
     }
+}
+
+/// Converts the top-of-stack value per a `conv.*` opcode (III.3.27). Float to
+/// integer truncates toward zero; integer narrowing truncates the high bits;
+/// `conv.i*` widen by sign-extension and `conv.u*` by zero-extension; results
+/// narrower than `int32` fill the slot. `conv.r.un` reads the source as unsigned.
+fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
+    if opcode == Opcode::ConvRUn {
+        let unsigned = match value {
+            Value::Int32(x) => u64::from(x as u32),
+            Value::Int64(x) | Value::NativeInt(x) => x as u64,
+            _ => return Err(Trap::TypeMismatch(opcode)),
+        };
+        return Ok(Value::Float(unsigned as f64));
+    }
+
+    if matches!(opcode, Opcode::ConvR4 | Opcode::ConvR8) {
+        let float = match value {
+            Value::Int32(x) => f64::from(x),
+            Value::Int64(x) | Value::NativeInt(x) => x as f64,
+            Value::Float(f) => f,
+            _ => return Err(Trap::TypeMismatch(opcode)),
+        };
+        let float = if opcode == Opcode::ConvR4 {
+            f64::from(float as f32)
+        } else {
+            float
+        };
+        return Ok(Value::Float(float));
+    }
+
+    let (source, from_32) = match value {
+        Value::Int32(x) => (i64::from(x), true),
+        Value::Int64(x) => (x, false),
+        Value::NativeInt(x) => (x, false),
+        Value::Float(f) => (f as i64, false),
+        Value::Object(_) | Value::Null => return Err(Trap::TypeMismatch(opcode)),
+    };
+    let zero_extended = if from_32 {
+        i64::from(source as u32)
+    } else {
+        source
+    };
+    Ok(match opcode {
+        Opcode::ConvI1 => Value::Int32(i32::from(source as i8)),
+        Opcode::ConvU1 => Value::Int32(i32::from(source as u8)),
+        Opcode::ConvI2 => Value::Int32(i32::from(source as i16)),
+        Opcode::ConvU2 => Value::Int32(i32::from(source as u16)),
+        Opcode::ConvI4 => Value::Int32(source as i32),
+        Opcode::ConvU4 => Value::Int32(source as u32 as i32),
+        Opcode::ConvI8 => Value::Int64(source),
+        Opcode::ConvU8 => Value::Int64(zero_extended),
+        Opcode::ConvI => Value::NativeInt(source),
+        Opcode::ConvU => Value::NativeInt(zero_extended),
+        _ => return Err(Trap::Unsupported(opcode)),
+    })
 }
 
 /// The relation a comparison or conditional branch tests.
@@ -840,6 +946,98 @@ mod tests {
             Instruction::simple(Opcode::Ret),
         ]);
         assert_eq!(result, Ok(Some(Value::Float(3.0))));
+    }
+
+    fn run_convert(opcode: Opcode, value: Operand, load: Opcode) -> Result<Option<Value>, Trap> {
+        run(vec![
+            Instruction::new(load, value),
+            Instruction::simple(opcode),
+            Instruction::simple(Opcode::Ret),
+        ])
+    }
+
+    #[test]
+    fn conv_i4_truncates_a_float_toward_zero() {
+        let result = run_convert(Opcode::ConvI4, Operand::Float64(3.9), Opcode::LdcR8);
+        assert_eq!(result, Ok(Some(Value::Int32(3))));
+    }
+
+    #[test]
+    fn conv_i1_sign_extends_but_conv_u1_zero_extends() {
+        let signed = run_convert(Opcode::ConvI1, Operand::Int32(0x1FF), Opcode::LdcI4);
+        assert_eq!(signed, Ok(Some(Value::Int32(-1))));
+        let unsigned = run_convert(Opcode::ConvU1, Operand::Int32(0x1FF), Opcode::LdcI4);
+        assert_eq!(unsigned, Ok(Some(Value::Int32(255))));
+    }
+
+    #[test]
+    fn conv_i8_sign_extends_but_conv_u8_zero_extends_int32() {
+        let signed = run_convert(Opcode::ConvI8, Operand::Int32(-1), Opcode::LdcI4);
+        assert_eq!(signed, Ok(Some(Value::Int64(-1))));
+        let unsigned = run_convert(Opcode::ConvU8, Operand::Int32(-1), Opcode::LdcI4);
+        assert_eq!(unsigned, Ok(Some(Value::Int64(0xFFFF_FFFF))));
+    }
+
+    #[test]
+    fn conv_r8_is_signed_but_conv_r_un_is_unsigned() {
+        let signed = run_convert(Opcode::ConvR8, Operand::Int32(-1), Opcode::LdcI4);
+        assert_eq!(signed, Ok(Some(Value::Float(-1.0))));
+        let unsigned = run_convert(Opcode::ConvRUn, Operand::Int32(-1), Opcode::LdcI4);
+        assert_eq!(unsigned, Ok(Some(Value::Float(4_294_967_295.0))));
+    }
+
+    #[test]
+    fn converting_a_reference_traps() {
+        let result = run(vec![
+            Instruction::simple(Opcode::Ldnull),
+            Instruction::simple(Opcode::ConvI4),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(result, Err(Trap::TypeMismatch(Opcode::ConvI4)));
+    }
+
+    #[test]
+    fn switch_selects_a_case_or_falls_through() {
+        let code = vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(
+                Opcode::Switch,
+                Operand::Switch(vec![4, 6].into_boxed_slice()),
+            ),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(100)),
+            Instruction::simple(Opcode::Ret),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(10)),
+            Instruction::simple(Opcode::Ret),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(20)),
+            Instruction::simple(Opcode::Ret),
+        ];
+        let body = method(code);
+        assert_eq!(
+            run_method(&body, vec![Value::Int32(0)]),
+            Ok(Some(Value::Int32(10)))
+        );
+        assert_eq!(
+            run_method(&body, vec![Value::Int32(1)]),
+            Ok(Some(Value::Int32(20)))
+        );
+        assert_eq!(
+            run_method(&body, vec![Value::Int32(5)]),
+            Ok(Some(Value::Int32(100)))
+        );
+    }
+
+    #[test]
+    fn starg_overwrites_an_argument() {
+        let body = method(vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(99)),
+            Instruction::new(Opcode::StargS, Operand::Variable(0)),
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(
+            run_method(&body, vec![Value::Int32(1)]),
+            Ok(Some(Value::Int32(99)))
+        );
     }
 
     #[test]

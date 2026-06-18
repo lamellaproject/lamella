@@ -107,6 +107,9 @@ pub enum DiagnosticKind {
     OpenBraceExpected,
     /// A `try` block was followed by neither a `catch` nor a `finally` (15.10).
     ExpectedCatchOrFinally,
+    /// A namespace member was expected to begin a type declaration but the
+    /// `class`/`struct`/`interface`/`enum`/`delegate` keyword was missing (16.4).
+    TypeDeclarationExpected,
 }
 
 impl DiagnosticKind {
@@ -145,6 +148,7 @@ impl DiagnosticKind {
             DiagnosticKind::CloseBraceExpected => 1513,
             DiagnosticKind::OpenBraceExpected => 1514,
             DiagnosticKind::ExpectedCatchOrFinally => 1524,
+            DiagnosticKind::TypeDeclarationExpected => 1518,
         }
     }
 
@@ -216,6 +220,9 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::OpenBraceExpected => f.write_str("{ expected"),
             DiagnosticKind::ExpectedCatchOrFinally => {
                 f.write_str("Expected catch or finally")
+            }
+            DiagnosticKind::TypeDeclarationExpected => {
+                f.write_str("Expected class, delegate, enum, interface, or struct")
             }
         }
     }

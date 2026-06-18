@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use lamella_asm_arm32::{Encoder, Reg};
+use lamella_asm_arm32::{Encoder, Label, Reg};
 use lamella_ir::{BinOp, Function, Inst, Terminator, ValueId};
 
 use crate::target::TargetLowering;
@@ -23,8 +23,9 @@ pub enum LowerError {
     /// An instruction is outside the supported subset (so far only `ConstInt` and
     /// `Binary` addition).
     UnsupportedInstruction,
-    /// A constant does not fit the 8-bit immediate this tracer can materialize.
-    ConstantTooWide,
+    /// The function plus its literal pool is too large for a literal load to
+    /// reach (a constant's pool entry sits more than ~1 KB past the load).
+    CodeTooLarge,
 }
 
 /// Lowers a straight-line, integer [`Function`] to ARMv6-M Thumb machine code via
@@ -47,13 +48,20 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
 
     let block = &func.blocks[0];
     let mut enc = Encoder::new();
+    let mut pool: Vec<(Label, u32)> = Vec::new();
 
     for (result, inst) in &block.insts {
         match inst {
             Inst::ConstInt { value, .. } => {
-                let imm = u8::try_from(*value).map_err(|_| LowerError::ConstantTooWide)?;
-                enc.movs_imm(reg(*result), imm)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                if let Ok(imm) = u8::try_from(*value) {
+                    enc.movs_imm(reg(*result), imm)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                } else {
+                    let entry = enc.new_label();
+                    enc.ldr_literal(reg(*result), entry)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    pool.push((entry, *value as u32));
+                }
             }
             Inst::Binary { op, lhs, rhs } => {
                 let (d, a, b) = (reg(*result), reg(*lhs), reg(*rhs));
@@ -108,9 +116,17 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
         _ => return Err(LowerError::ControlFlowUnsupported),
     }
 
+    if !pool.is_empty() {
+        enc.align_to_word();
+        for (entry, value) in pool {
+            enc.bind_label(entry);
+            enc.emit_word(value);
+        }
+    }
+
     enc.finish()
         .map(|assembled| assembled.bytes)
-        .map_err(|_| LowerError::UnsupportedInstruction)
+        .map_err(|_| LowerError::CodeTooLarge)
 }
 
 /// The ARMv6-M (Cortex-M) target code generator.
@@ -232,6 +248,95 @@ mod tests {
             lower(&func).unwrap(),
             vec![0x02, 0x46, 0x0A, 0x40, 0x10, 0x46, 0x70, 0x47]
         );
+    }
+
+    #[test]
+    #[ignore = "writes a micro:bit image for manual QEMU validation"]
+    fn emit_qemu_microbit_image() {
+        use lamella_asm_arm32::{Encoder, Reg};
+
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 40,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 2,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+
+        let mut body = lower(&func).unwrap();
+        assert_eq!(&body[body.len() - 2..], &[0x70, 0x47]);
+        body.truncate(body.len() - 2);
+
+        let mut img = Encoder::new();
+        img.emit_word(0x2000_4000);
+        img.emit_word(0x0000_0009);
+        img.emit_bytes(&body);
+        img.movs_imm(Reg::R2, 0x20).unwrap();
+        img.lsls_imm(Reg::R2, Reg::R2, 24).unwrap();
+        img.movs_imm(Reg::R3, 0x80).unwrap();
+        img.lsls_imm(Reg::R3, Reg::R3, 10).unwrap();
+        img.adds_imm8(Reg::R3, 0x26).unwrap();
+        img.str_imm(Reg::R3, Reg::R2, 0).unwrap();
+        img.str_imm(Reg::R0, Reg::R2, 4).unwrap();
+        img.mov_reg(Reg::R1, Reg::R2);
+        img.movs_imm(Reg::R0, 0x20).unwrap();
+        img.bkpt(0xAB);
+        let image = img.finish().unwrap().bytes;
+
+        let path = std::env::temp_dir().join("lamella_microbit.bin");
+        std::fs::write(&path, &image).unwrap();
+        eprintln!("wrote {} bytes to {}", image.len(), path.display());
+    }
+
+    #[test]
+    fn lowers_wide_constant_via_literal_pool() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0x1_2345,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let bytes = lower(&func).unwrap();
+        assert_eq!(bytes[1], 0x48);
+        assert_eq!(&bytes[bytes.len() - 4..], &0x0001_2345u32.to_le_bytes());
     }
 
     #[test]

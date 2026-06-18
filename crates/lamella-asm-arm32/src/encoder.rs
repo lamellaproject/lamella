@@ -28,6 +28,10 @@ pub enum RelocKind {
     /// take the halfword-scaled PC-relative offset (A6.7.10), a reach of about
     /// +/-256 bytes.
     ThumbBranchCond8,
+    /// A PC-relative literal load (`LDR` (literal), encoding T1): the low 8 bits
+    /// take the word-scaled distance from `Align(PC, 4)` to the pool entry
+    /// (Armv6-M ARM (DDI 0419E), A6.7.27), which must lie ahead within about 1 KB.
+    ThumbLdrLit8,
 }
 
 /// A reference to an externally defined symbol, left for the link step.
@@ -468,6 +472,46 @@ impl Encoder {
         Ok(())
     }
 
+    /// `BKPT #imm8` -- breakpoint. With `imm8 == 0xAB` it is the semihosting
+    /// request a debugger or QEMU intercepts. 16-bit encoding T1 (A6.7.12).
+    pub fn bkpt(&mut self, imm8: u8) {
+        self.emit_u16(0xBE00 | u16::from(imm8));
+    }
+
+    /// Emits a literal 32-bit little-endian word -- a vector-table entry, an
+    /// inline constant, or a literal-pool datum.
+    pub fn emit_word(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    /// Appends raw, already-encoded bytes -- for example a separately lowered
+    /// function body -- to the image.
+    pub fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    /// Pads with a `NOP` if the next emission would not be 4-byte aligned, which
+    /// a literal pool requires (the PC for a literal load is `Align(PC, 4)`).
+    pub fn align_to_word(&mut self) {
+        if self.position() % 4 != 0 {
+            self.nop();
+        }
+    }
+
+    /// `LDR Rt, <label>` -- load a 32-bit word from a PC-relative literal pool
+    /// entry. 16-bit encoding T1 (A6.7.27); the entry must lie ahead of the load,
+    /// 4-byte aligned, within about 1 KB. The offset is resolved in
+    /// [`Encoder::finish`].
+    pub fn ldr_literal(&mut self, rt: Reg, target: Label) -> Result<(), AssembleError> {
+        if !rt.is_low() {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        let at = self.position();
+        self.fixups.push((at, RelocKind::ThumbLdrLit8, target.0));
+        self.emit_u16(0x4800 | (u16::from(rt.number()) << 8));
+        Ok(())
+    }
+
     /// `B <label>` -- unconditional branch to a bound label. 16-bit encoding T2
     /// (A6.7.10); the PC-relative offset is resolved in [`Encoder::finish`],
     /// reaching about +/-2 KB ([`AssembleError::BranchOutOfRange`] otherwise).
@@ -546,6 +590,18 @@ impl Encoder {
                     if let Some(slot) = self.bytes.get_mut(site..site + 2) {
                         let base = u16::from_le_bytes([slot[0], slot[1]]) & 0xFF00;
                         slot.copy_from_slice(&(base | (imm & 0x00FF)).to_le_bytes());
+                    }
+                }
+                RelocKind::ThumbLdrLit8 => {
+                    let pc = i64::from((*at + 4) & !3u32);
+                    let offset = i64::from(target) - pc;
+                    if !(0..=1020).contains(&offset) || offset % 4 != 0 {
+                        return Err(AssembleError::BranchOutOfRange { at: *at });
+                    }
+                    let imm8 = (offset / 4) as u16;
+                    if let Some(slot) = self.bytes.get_mut(site..site + 2) {
+                        let base = u16::from_le_bytes([slot[0], slot[1]]) & 0xFF00;
+                        slot.copy_from_slice(&(base | (imm8 & 0x00FF)).to_le_bytes());
                     }
                 }
             }
@@ -727,6 +783,25 @@ mod tests {
         assert_eq!(one(|e| e.add_sp_imm(Reg::R0, 16).unwrap()), [0x04, 0xA8]);
         assert_eq!(one(|e| e.add_sp(8).unwrap()), [0x02, 0xB0]);
         assert_eq!(one(|e| e.sub_sp(8).unwrap()), [0x82, 0xB0]);
+    }
+
+    #[test]
+    fn breakpoint_and_data_word() {
+        assert_eq!(one(|e| e.bkpt(0xAB)), [0xAB, 0xBE]);
+        assert_eq!(one(|e| e.emit_word(0x2000_4000)), [0x00, 0x40, 0x00, 0x20]);
+    }
+
+    #[test]
+    fn ldr_literal_resolves_to_pool() {
+        let mut enc = Encoder::new();
+        let pool = enc.new_label();
+        enc.ldr_literal(Reg::R0, pool).unwrap();
+        enc.nop();
+        enc.bind_label(pool);
+        enc.emit_word(0xDEAD_BEEF);
+        let out = enc.finish().unwrap();
+        assert_eq!(&out.bytes[0..2], &[0x00, 0x48]);
+        assert_eq!(&out.bytes[4..8], &0xDEAD_BEEFu32.to_le_bytes());
     }
 
     #[test]

@@ -1,9 +1,12 @@
 //! The parser: building a syntax tree from the token stream.
 
 use crate::ast::{
-    AssignmentOperator, BinaryOperator, CatchClause, Expr, ExprKind, ForInitializer, GotoTarget,
-    Literal, PostfixOperator, PredefinedType, Stmt, StmtKind, SwitchLabel, SwitchSection, TypeRef,
-    TypeRefKind, TypeTestOperation, UnaryOperator, UsingResource, VariableDeclarator,
+    Accessor, AssignmentOperator, BinaryOperator, CatchClause, CompilationUnit, DelegateDecl,
+    EnumDecl, EnumMember, Expr, ExprKind, ForInitializer, GotoTarget, Literal, Member, Modifier,
+    NamespaceDecl, NamespaceMember, Parameter, ParameterModifier, PostfixOperator, PredefinedType,
+    QualifiedName, Stmt, StmtKind, SwitchLabel, SwitchSection, TypeDecl, TypeKind, TypeRef,
+    TypeRefKind, TypeTestOperation, UnaryOperator, UsingDirective, UsingKind, UsingResource,
+    VariableDeclarator,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::lexer::{Tokenized, tokenize};
@@ -55,6 +58,26 @@ pub fn parse_statement(source: &str) -> ParsedStatement {
     let statement = parser.parse_statement();
     ParsedStatement {
         statement,
+        diagnostics: parser.diagnostics,
+    }
+}
+
+/// The result of parsing a whole compilation unit: the tree and its diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCompilationUnit {
+    /// The compilation unit, with `Error` placeholders where recovery was needed.
+    pub unit: CompilationUnit,
+    /// Lexical and syntactic diagnostics, in source order.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Lexes and parses `source` as a whole compilation unit (ECMA-334 1st ed, 16.1).
+#[must_use]
+pub fn parse_compilation_unit(source: &str) -> ParsedCompilationUnit {
+    let mut parser = Parser::new(tokenize(source));
+    let unit = parser.parse_compilation_unit();
+    ParsedCompilationUnit {
+        unit,
         diagnostics: parser.diagnostics,
     }
 }
@@ -120,6 +143,15 @@ impl Parser {
     fn current_keyword(&self) -> Option<Keyword> {
         match self.current().kind {
             TokenKind::Keyword(keyword) => Some(keyword),
+            _ => None,
+        }
+    }
+
+    /// The current token's identifier text, if it is an identifier. Used for the
+    /// contextual `get`/`set` accessor names, which are not keywords.
+    fn current_identifier_text(&self) -> Option<&str> {
+        match &self.current().kind {
+            TokenKind::Identifier(text) => Some(text),
             _ => None,
         }
     }
@@ -713,6 +745,437 @@ impl Parser {
         };
         let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         Stmt::new(StmtKind::Goto(target), Span::new(start, end))
+    }
+
+    /// Parses a whole compilation unit (16.1): using directives then top-level
+    /// namespace and type declarations, to end of file.
+    fn parse_compilation_unit(&mut self) -> CompilationUnit {
+        let start = self.current().span.start;
+        let usings = self.parse_using_directives();
+        let mut members = Vec::new();
+        while !matches!(self.current().kind, TokenKind::EndOfFile) {
+            let before = self.position;
+            members.push(self.parse_namespace_member());
+            if self.position == before {
+                self.bump();
+            }
+        }
+        let end = self.current().span.start;
+        CompilationUnit {
+            usings,
+            members,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a run of leading `using` directives (16.3).
+    fn parse_using_directives(&mut self) -> Vec<UsingDirective> {
+        let mut directives = Vec::new();
+        while self.current_keyword() == Some(Keyword::Using) {
+            directives.push(self.parse_using_directive());
+        }
+        directives
+    }
+
+    /// Parses one `using` directive (16.3): a namespace import or an alias.
+    fn parse_using_directive(&mut self) -> UsingDirective {
+        let start = self.current().span.start;
+        self.bump();
+        let kind = if matches!(self.current().kind, TokenKind::Identifier(_))
+            && self.next_is(Punctuator::Equals)
+        {
+            let (name, _) = self.expect_identifier();
+            self.bump();
+            UsingKind::Alias {
+                name,
+                target: self.parse_qualified_name(),
+            }
+        } else {
+            UsingKind::Namespace(self.parse_qualified_name())
+        };
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        UsingDirective {
+            kind,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a dotted name `a.b.c` (10.8).
+    fn parse_qualified_name(&mut self) -> QualifiedName {
+        let start = self.current().span.start;
+        let mut parts = Vec::new();
+        let (first, mut end) = self.expect_identifier();
+        parts.push(first);
+        while self.current_punctuator() == Some(Punctuator::Dot) {
+            self.bump();
+            let (part, part_end) = self.expect_identifier();
+            end = part_end;
+            parts.push(part);
+        }
+        QualifiedName {
+            parts,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a namespace member (16.4): a nested namespace or a type declaration.
+    fn parse_namespace_member(&mut self) -> NamespaceMember {
+        if self.current_keyword() == Some(Keyword::Namespace) {
+            return NamespaceMember::Namespace(self.parse_namespace_declaration());
+        }
+        let start = self.current().span.start;
+        let modifiers = self.parse_modifiers();
+        self.parse_type_kind_declaration(modifiers, start)
+    }
+
+    /// Parses a type declaration given its already-parsed modifiers (16.5): a
+    /// class, struct, interface, enum, or delegate.
+    fn parse_type_kind_declaration(
+        &mut self,
+        modifiers: Vec<Modifier>,
+        start: u32,
+    ) -> NamespaceMember {
+        match self.current_keyword() {
+            Some(Keyword::Enum) => NamespaceMember::Enum(self.parse_enum(modifiers, start)),
+            Some(Keyword::Delegate) => {
+                NamespaceMember::Delegate(self.parse_delegate(modifiers, start))
+            }
+            _ => NamespaceMember::Type(self.parse_class_struct_interface(modifiers, start)),
+        }
+    }
+
+    /// Parses an `enum` declaration (21): the kind keyword, a name, an optional
+    /// `: integral-type` base, then comma-separated members allowing a trailing
+    /// comma.
+    fn parse_enum(&mut self, modifiers: Vec<Modifier>, start: u32) -> EnumDecl {
+        self.bump();
+        let (name, _) = self.expect_identifier();
+        let base = if self.eat(Punctuator::Colon) {
+            Some(self.parse_type())
+        } else {
+            None
+        };
+        self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+        let mut members = Vec::new();
+        loop {
+            if self.current_punctuator() == Some(Punctuator::CloseBrace)
+                || matches!(self.current().kind, TokenKind::EndOfFile)
+                || !matches!(self.current().kind, TokenKind::Identifier(_))
+            {
+                break;
+            }
+            let member_start = self.current().span.start;
+            let (member_name, mut member_end) = self.expect_identifier();
+            let value = if self.eat(Punctuator::Equals) {
+                let value = self.parse_expression();
+                member_end = value.span.end;
+                Some(value)
+            } else {
+                None
+            };
+            members.push(EnumMember {
+                name: member_name,
+                value,
+                span: Span::new(member_start, member_end),
+            });
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        EnumDecl {
+            modifiers,
+            name,
+            base,
+            members,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a `delegate` declaration (22): `delegate return-type name ( params ) ;`.
+    fn parse_delegate(&mut self, modifiers: Vec<Modifier>, start: u32) -> DelegateDecl {
+        self.bump();
+        let return_type = self.parse_type();
+        let (name, _) = self.expect_identifier();
+        let parameters = self.parse_parameter_list();
+        let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+        DelegateDecl {
+            modifiers,
+            return_type,
+            name,
+            parameters,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a `namespace` declaration (16.2).
+    fn parse_namespace_declaration(&mut self) -> NamespaceDecl {
+        let start = self.current().span.start;
+        self.bump();
+        let name = self.parse_qualified_name();
+        self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+        let usings = self.parse_using_directives();
+        let mut members = Vec::new();
+        while self.current_punctuator() != Some(Punctuator::CloseBrace)
+            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        {
+            let before = self.position;
+            members.push(self.parse_namespace_member());
+            if self.position == before {
+                self.bump();
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        NamespaceDecl {
+            name,
+            usings,
+            members,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a class, struct, or interface declaration given its already-parsed
+    /// modifiers (17, 18, 20): the kind keyword, a name, an optional base list,
+    /// and a member body.
+    fn parse_class_struct_interface(&mut self, modifiers: Vec<Modifier>, start: u32) -> TypeDecl {
+        let kind = match self.current_keyword() {
+            Some(Keyword::Class) => {
+                self.bump();
+                TypeKind::Class
+            }
+            Some(Keyword::Struct) => {
+                self.bump();
+                TypeKind::Struct
+            }
+            Some(Keyword::Interface) => {
+                self.bump();
+                TypeKind::Interface
+            }
+            _ => {
+                let at = self.current().span.start;
+                self.report(DiagnosticKind::TypeDeclarationExpected, Span::empty_at(at));
+                TypeKind::Class
+            }
+        };
+        let (name, _) = self.expect_identifier();
+        let bases = if self.eat(Punctuator::Colon) {
+            let mut bases = Vec::new();
+            bases.push(self.parse_type());
+            while self.eat(Punctuator::Comma) {
+                bases.push(self.parse_type());
+            }
+            bases
+        } else {
+            Vec::new()
+        };
+        self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+        let mut members = Vec::new();
+        while self.current_punctuator() != Some(Punctuator::CloseBrace)
+            && !matches!(self.current().kind, TokenKind::EndOfFile)
+        {
+            let before = self.position;
+            members.push(self.parse_member());
+            if self.position == before {
+                self.bump();
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        TypeDecl {
+            modifiers,
+            kind,
+            name,
+            bases,
+            members,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a run of leading declaration modifiers (17.2 and elsewhere). The
+    /// parser accepts any; binding checks which are valid where.
+    fn parse_modifiers(&mut self) -> Vec<Modifier> {
+        let mut modifiers = Vec::new();
+        while let Some(modifier) = self.current_keyword().and_then(modifier_of) {
+            modifiers.push(modifier);
+            self.bump();
+        }
+        modifiers
+    }
+
+    /// Parses one type member (17.2): a nested type, constructor, method,
+    /// property, or field. A type keyword begins a nested type; an identifier
+    /// directly followed by `(` is a constructor; otherwise a type is parsed, and
+    /// a following name then `(` is a method, then `{` is a property, and anything
+    /// else is a field.
+    fn parse_member(&mut self) -> Member {
+        let start = self.current().span.start;
+        let modifiers = self.parse_modifiers();
+        if matches!(
+            self.current_keyword(),
+            Some(Keyword::Class)
+                | Some(Keyword::Struct)
+                | Some(Keyword::Interface)
+                | Some(Keyword::Enum)
+                | Some(Keyword::Delegate)
+        ) {
+            return Member::NestedType(Box::new(
+                self.parse_type_kind_declaration(modifiers, start),
+            ));
+        }
+        if matches!(self.current().kind, TokenKind::Identifier(_))
+            && self.next_is(Punctuator::OpenParen)
+        {
+            let (name, _) = self.expect_identifier();
+            let parameters = self.parse_parameter_list();
+            let body = self.parse_required_block();
+            let end = body.span.end;
+            return Member::Constructor {
+                modifiers,
+                name,
+                parameters,
+                body,
+                span: Span::new(start, end),
+            };
+        }
+        let ty = self.parse_type();
+        if matches!(self.current().kind, TokenKind::Identifier(_))
+            && self.next_is(Punctuator::OpenParen)
+        {
+            let (name, _) = self.expect_identifier();
+            let parameters = self.parse_parameter_list();
+            let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                let block = self.parse_block();
+                let end = block.span.end;
+                (Some(block), end)
+            } else {
+                let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+                (None, end)
+            };
+            return Member::Method {
+                modifiers,
+                return_type: ty,
+                name,
+                parameters,
+                body,
+                span: Span::new(start, end),
+            };
+        }
+        if matches!(self.current().kind, TokenKind::Identifier(_))
+            && self.next_is(Punctuator::OpenBrace)
+        {
+            let (name, _) = self.expect_identifier();
+            return self.parse_property(modifiers, ty, name, start);
+        }
+        if matches!(self.current().kind, TokenKind::Identifier(_)) {
+            let declarators = self.parse_variable_declarators();
+            let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+            return Member::Field {
+                modifiers,
+                ty,
+                declarators,
+                span: Span::new(start, end),
+            };
+        }
+        let at = self.current().span.start;
+        self.report(DiagnosticKind::IdentifierExpected, Span::empty_at(at));
+        Member::Error
+    }
+
+    /// Parses a property's accessor body (17.6): `{ get/set accessors }`, given
+    /// the modifiers, type, and name already parsed. Each accessor has a block
+    /// body or a bare `;`. `get` and `set` are contextual identifiers, not
+    /// keywords, so they are matched by spelling.
+    fn parse_property(
+        &mut self,
+        modifiers: Vec<Modifier>,
+        ty: TypeRef,
+        name: Box<str>,
+        start: u32,
+    ) -> Member {
+        self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+        let mut getter = None;
+        let mut setter = None;
+        loop {
+            if self.current_punctuator() == Some(Punctuator::CloseBrace)
+                || matches!(self.current().kind, TokenKind::EndOfFile)
+            {
+                break;
+            }
+            let accessor_start = self.current().span.start;
+            let is_getter = match self.current_identifier_text() {
+                Some("get") => true,
+                Some("set") => false,
+                _ => break,
+            };
+            self.bump();
+            let (body, accessor_end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                let block = self.parse_block();
+                let end = block.span.end;
+                (Some(block), end)
+            } else {
+                let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+                (None, end)
+            };
+            let accessor = Accessor {
+                body,
+                span: Span::new(accessor_start, accessor_end),
+            };
+            if is_getter {
+                getter = Some(accessor);
+            } else {
+                setter = Some(accessor);
+            }
+        }
+        let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+        Member::Property {
+            modifiers,
+            ty,
+            name,
+            getter,
+            setter,
+            span: Span::new(start, end),
+        }
+    }
+
+    /// Parses a parenthesized formal-parameter list (17.5.1).
+    fn parse_parameter_list(&mut self) -> Vec<Parameter> {
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let mut parameters = Vec::new();
+        if self.current_punctuator() != Some(Punctuator::CloseParen) {
+            loop {
+                let start = self.current().span.start;
+                let modifier = match self.current_keyword() {
+                    Some(Keyword::Ref) => {
+                        self.bump();
+                        Some(ParameterModifier::Ref)
+                    }
+                    Some(Keyword::Out) => {
+                        self.bump();
+                        Some(ParameterModifier::Out)
+                    }
+                    Some(Keyword::Params) => {
+                        self.bump();
+                        Some(ParameterModifier::Params)
+                    }
+                    _ => None,
+                };
+                let ty = self.parse_type();
+                let (name, end) = self.expect_identifier();
+                parameters.push(Parameter {
+                    modifier,
+                    ty,
+                    name,
+                    span: Span::new(start, end),
+                });
+                if !self.eat(Punctuator::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        parameters
     }
 
     /// Parses a full expression (14): an assignment, which sits at the bottom of
@@ -1348,6 +1811,28 @@ fn assignment_operator(punctuator: Punctuator) -> Option<AssignmentOperator> {
         Punctuator::CaretEquals => AssignmentOperator::Xor,
         Punctuator::LessThanLessThanEquals => AssignmentOperator::LeftShift,
         Punctuator::GreaterThanGreaterThanEquals => AssignmentOperator::RightShift,
+        _ => return None,
+    })
+}
+
+/// The declaration modifier a keyword denotes, if it is one (17.2 and elsewhere).
+fn modifier_of(keyword: Keyword) -> Option<Modifier> {
+    Some(match keyword {
+        Keyword::New => Modifier::New,
+        Keyword::Public => Modifier::Public,
+        Keyword::Protected => Modifier::Protected,
+        Keyword::Internal => Modifier::Internal,
+        Keyword::Private => Modifier::Private,
+        Keyword::Abstract => Modifier::Abstract,
+        Keyword::Sealed => Modifier::Sealed,
+        Keyword::Static => Modifier::Static,
+        Keyword::Readonly => Modifier::Readonly,
+        Keyword::Volatile => Modifier::Volatile,
+        Keyword::Virtual => Modifier::Virtual,
+        Keyword::Override => Modifier::Override,
+        Keyword::Extern => Modifier::Extern,
+        Keyword::Const => Modifier::Const,
+        Keyword::Unsafe => Modifier::Unsafe,
         _ => return None,
     })
 }
@@ -2100,5 +2585,410 @@ mod tests {
         assert_eq!(stmt_tree("goto case 1;"), "(goto-case 1)");
         assert_eq!(stmt_tree("goto default;"), "(goto-default)");
         assert_eq!(stmt_tree("x;"), "(expr x)");
+    }
+
+    fn modifier_name(modifier: Modifier) -> &'static str {
+        match modifier {
+            Modifier::New => "new",
+            Modifier::Public => "public",
+            Modifier::Protected => "protected",
+            Modifier::Internal => "internal",
+            Modifier::Private => "private",
+            Modifier::Abstract => "abstract",
+            Modifier::Sealed => "sealed",
+            Modifier::Static => "static",
+            Modifier::Readonly => "readonly",
+            Modifier::Volatile => "volatile",
+            Modifier::Virtual => "virtual",
+            Modifier::Override => "override",
+            Modifier::Extern => "extern",
+            Modifier::Const => "const",
+            Modifier::Unsafe => "unsafe",
+        }
+    }
+
+    fn dump_qname(name: &QualifiedName) -> String {
+        let mut text = String::new();
+        for (index, part) in name.parts.iter().enumerate() {
+            if index > 0 {
+                text.push('.');
+            }
+            text.push_str(part);
+        }
+        text
+    }
+
+    fn dump_using(directive: &UsingDirective) -> String {
+        match &directive.kind {
+            UsingKind::Namespace(name) => format!("(using {})", dump_qname(name)),
+            UsingKind::Alias { name, target } => {
+                format!("(using-alias {name} {})", dump_qname(target))
+            }
+        }
+    }
+
+    fn dump_params(parameters: &[Parameter]) -> String {
+        let mut text = String::new();
+        for (index, parameter) in parameters.iter().enumerate() {
+            if index > 0 {
+                text.push_str(", ");
+            }
+            match parameter.modifier {
+                Some(ParameterModifier::Ref) => text.push_str("ref "),
+                Some(ParameterModifier::Out) => text.push_str("out "),
+                Some(ParameterModifier::Params) => text.push_str("params "),
+                None => {}
+            }
+            text.push_str(&format!("{} {}", dump_type(&parameter.ty), parameter.name));
+        }
+        text
+    }
+
+    fn dump_member(member: &Member) -> String {
+        match member {
+            Member::Field {
+                modifiers,
+                ty,
+                declarators,
+                ..
+            } => {
+                let mut text = String::from("(field");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(" {}", dump_type(ty)));
+                for declarator in declarators {
+                    match &declarator.initializer {
+                        Some(value) => {
+                            text.push_str(&format!(" {}={}", declarator.name, dump(value)));
+                        }
+                        None => text.push_str(&format!(" {}", declarator.name)),
+                    }
+                }
+                text.push(')');
+                text
+            }
+            Member::Method {
+                modifiers,
+                return_type,
+                name,
+                parameters,
+                body,
+                ..
+            } => {
+                let mut text = String::from("(method");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(
+                    " {} {name} ({})",
+                    dump_type(return_type),
+                    dump_params(parameters)
+                ));
+                match body {
+                    Some(body) => text.push_str(&format!(" {}", dump_stmt(body))),
+                    None => text.push_str(" ;"),
+                }
+                text.push(')');
+                text
+            }
+            Member::Constructor {
+                modifiers,
+                name,
+                parameters,
+                body,
+                ..
+            } => {
+                let mut text = String::from("(ctor");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(
+                    " {name} ({}) {}",
+                    dump_params(parameters),
+                    dump_stmt(body)
+                ));
+                text.push(')');
+                text
+            }
+            Member::Property {
+                modifiers,
+                ty,
+                name,
+                getter,
+                setter,
+                ..
+            } => {
+                let mut text = String::from("(property");
+                for modifier in modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(" {} {name}", dump_type(ty)));
+                if let Some(getter) = getter {
+                    text.push_str(&format!(" {}", dump_accessor("get", getter)));
+                }
+                if let Some(setter) = setter {
+                    text.push_str(&format!(" {}", dump_accessor("set", setter)));
+                }
+                text.push(')');
+                text
+            }
+            Member::NestedType(inner) => dump_namespace_member(inner),
+            Member::Error => String::from("<error-member>"),
+        }
+    }
+
+    fn dump_type_decl(declaration: &TypeDecl) -> String {
+        let keyword = match declaration.kind {
+            TypeKind::Class => "class",
+            TypeKind::Struct => "struct",
+            TypeKind::Interface => "interface",
+        };
+        let mut text = format!("({keyword}");
+        for modifier in &declaration.modifiers {
+            text.push_str(&format!(" {}", modifier_name(*modifier)));
+        }
+        text.push_str(&format!(" {}", declaration.name));
+        if !declaration.bases.is_empty() {
+            text.push_str(" :");
+            for base in &declaration.bases {
+                text.push_str(&format!(" {}", dump_type(base)));
+            }
+        }
+        for member in &declaration.members {
+            text.push_str(&format!(" {}", dump_member(member)));
+        }
+        text.push(')');
+        text
+    }
+
+    fn dump_accessor(kind: &str, accessor: &Accessor) -> String {
+        match &accessor.body {
+            Some(body) => format!("({kind} {})", dump_stmt(body)),
+            None => format!("({kind} ;)"),
+        }
+    }
+
+    fn dump_namespace_member(member: &NamespaceMember) -> String {
+        match member {
+            NamespaceMember::Type(declaration) => dump_type_decl(declaration),
+            NamespaceMember::Enum(declaration) => {
+                let mut text = String::from("(enum");
+                for modifier in &declaration.modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(" {}", declaration.name));
+                if let Some(base) = &declaration.base {
+                    text.push_str(&format!(" : {}", dump_type(base)));
+                }
+                for enum_member in &declaration.members {
+                    match &enum_member.value {
+                        Some(value) => {
+                            text.push_str(&format!(" {}={}", enum_member.name, dump(value)));
+                        }
+                        None => text.push_str(&format!(" {}", enum_member.name)),
+                    }
+                }
+                text.push(')');
+                text
+            }
+            NamespaceMember::Delegate(declaration) => {
+                let mut text = String::from("(delegate");
+                for modifier in &declaration.modifiers {
+                    text.push_str(&format!(" {}", modifier_name(*modifier)));
+                }
+                text.push_str(&format!(
+                    " {} {} ({})",
+                    dump_type(&declaration.return_type),
+                    declaration.name,
+                    dump_params(&declaration.parameters)
+                ));
+                text.push(')');
+                text
+            }
+            NamespaceMember::Namespace(declaration) => {
+                let mut text = format!("(namespace {}", dump_qname(&declaration.name));
+                for using in &declaration.usings {
+                    text.push_str(&format!(" {}", dump_using(using)));
+                }
+                for member in &declaration.members {
+                    text.push_str(&format!(" {}", dump_namespace_member(member)));
+                }
+                text.push(')');
+                text
+            }
+        }
+    }
+
+    fn dump_unit(unit: &CompilationUnit) -> String {
+        let mut parts = String::new();
+        let mut first = true;
+        for using in &unit.usings {
+            if !first {
+                parts.push(' ');
+            }
+            first = false;
+            parts.push_str(&dump_using(using));
+        }
+        for member in &unit.members {
+            if !first {
+                parts.push(' ');
+            }
+            first = false;
+            parts.push_str(&dump_namespace_member(member));
+        }
+        parts
+    }
+
+    fn unit_tree(source: &str) -> String {
+        let parsed = parse_compilation_unit(source);
+        assert!(
+            parsed.diagnostics.is_empty(),
+            "unexpected diagnostics for {source:?}: {:?}",
+            parsed.diagnostics
+        );
+        dump_unit(&parsed.unit)
+    }
+
+    fn unit_codes(source: &str) -> Vec<u16> {
+        parse_compilation_unit(source)
+            .diagnostics
+            .iter()
+            .map(Diagnostic::code)
+            .collect()
+    }
+
+    #[test]
+    fn using_directives_and_namespaces() {
+        assert_eq!(unit_tree("using System;"), "(using System)");
+        assert_eq!(
+            unit_tree("using System.Collections;"),
+            "(using System.Collections)"
+        );
+        assert_eq!(
+            unit_tree("using IO = System.IO;"),
+            "(using-alias IO System.IO)"
+        );
+        assert_eq!(unit_tree("namespace N {}"), "(namespace N)");
+        assert_eq!(
+            unit_tree("namespace A.B { using System; }"),
+            "(namespace A.B (using System))"
+        );
+    }
+
+    #[test]
+    fn classes_with_fields_and_methods() {
+        assert_eq!(unit_tree("class C {}"), "(class C)");
+        assert_eq!(
+            unit_tree("public sealed class C : B, I {}"),
+            "(class public sealed C : B I)"
+        );
+        assert_eq!(unit_tree("class C { int x; }"), "(class C (field int x))");
+        assert_eq!(
+            unit_tree("class C { public int x = 0, y; }"),
+            "(class C (field public int x=0 y))"
+        );
+        assert_eq!(
+            unit_tree("class C { void M() {} }"),
+            "(class C (method void M () (block)))"
+        );
+        assert_eq!(
+            unit_tree("class C { public static int Add(int a, int b) { return a + b; } }"),
+            "(class C (method public static int Add (int a, int b) (block (return (+ a b)))))"
+        );
+        assert_eq!(
+            unit_tree("interface I { void M(); }"),
+            "(interface I (method void M () ;))"
+        );
+    }
+
+    #[test]
+    fn constructors_and_parameter_modifiers() {
+        assert_eq!(
+            unit_tree("class C { C() {} }"),
+            "(class C (ctor C () (block)))"
+        );
+        assert_eq!(
+            unit_tree("class C { public C(int x) {} }"),
+            "(class C (ctor public C (int x) (block)))"
+        );
+        assert_eq!(
+            unit_tree("class C { void M(ref int a, out int b, params int[] xs) {} }"),
+            "(class C (method void M (ref int a, out int b, params int[] xs) (block)))"
+        );
+    }
+
+    #[test]
+    fn a_whole_hello_world_program_parses() {
+        let source = "using System; namespace Hello { class Program { \
+                      static void Main() { System.Console.WriteLine(\"Hi\"); } } }";
+        assert_eq!(
+            unit_tree(source),
+            "(using System) (namespace Hello (class Program (method static void Main () \
+             (block (expr (call (. (. System Console) WriteLine) str))))))"
+        );
+    }
+
+    #[test]
+    fn declaration_diagnostics_match_the_reference_compiler() {
+        assert_eq!(unit_codes("class C { int x }"), vec![1002]);
+        assert_eq!(unit_codes("class C {"), vec![1513]);
+    }
+
+    #[test]
+    fn enum_declarations() {
+        assert_eq!(
+            unit_tree("enum Color { Red, Green, Blue }"),
+            "(enum Color Red Green Blue)"
+        );
+        assert_eq!(
+            unit_tree("enum E : byte { A = 1, B = 2, }"),
+            "(enum E : byte A=1 B=2)"
+        );
+        assert_eq!(unit_tree("public enum E {}"), "(enum public E)");
+    }
+
+    #[test]
+    fn delegate_declarations() {
+        assert_eq!(
+            unit_tree("delegate void Handler(object sender, int code);"),
+            "(delegate void Handler (object sender, int code))"
+        );
+        assert_eq!(
+            unit_tree("public delegate int F();"),
+            "(delegate public int F ())"
+        );
+    }
+
+    #[test]
+    fn properties() {
+        assert_eq!(
+            unit_tree("class C { int X { get; set; } }"),
+            "(class C (property int X (get ;) (set ;)))"
+        );
+        assert_eq!(
+            unit_tree("class C { int X { get { return x; } } }"),
+            "(class C (property int X (get (block (return x)))))"
+        );
+        assert_eq!(
+            unit_tree("class C { public int P { get { return 1; } set {} } }"),
+            "(class C (property public int P (get (block (return 1))) (set (block))))"
+        );
+    }
+
+    #[test]
+    fn nested_types() {
+        assert_eq!(
+            unit_tree("class Outer { class Inner {} }"),
+            "(class Outer (class Inner))"
+        );
+        assert_eq!(
+            unit_tree("class C { enum E { A } }"),
+            "(class C (enum E A))"
+        );
+        assert_eq!(
+            unit_tree("namespace N { class C { delegate void D(); } }"),
+            "(namespace N (class C (delegate void D ())))"
+        );
     }
 }
