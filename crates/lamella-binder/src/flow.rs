@@ -255,6 +255,11 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
                 collect_uses(argument, used);
             }
         }
+        BoundExprKind::DelegateCreation { receiver, .. } => {
+            if let Some(receiver) = receiver {
+                collect_uses(receiver, used);
+            }
+        }
         BoundExprKind::Binary { left, right, .. } => {
             collect_uses(left, used);
             collect_uses(right, used);
@@ -686,6 +691,11 @@ impl Analyzer<'_> {
             BoundExprKind::ObjectCreation { arguments, .. } => {
                 for argument in arguments {
                     self.expression(argument, assigned, span);
+                }
+            }
+            BoundExprKind::DelegateCreation { receiver, .. } => {
+                if let Some(receiver) = receiver {
+                    self.expression(receiver, assigned, span);
                 }
             }
             BoundExprKind::Binary { left, right, .. } => {

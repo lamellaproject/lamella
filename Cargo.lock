@@ -151,6 +151,7 @@ dependencies = [
 name = "lamella-wasm"
 version = "0.0.0"
 dependencies = [
+ "lamella-assemble",
  "lamella-dap",
  "lamella-load",
  "lamella-metadata",

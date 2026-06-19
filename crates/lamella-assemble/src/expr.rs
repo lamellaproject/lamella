@@ -105,6 +105,18 @@ pub fn emit_expression(
             arguments,
             constructor,
         } => emit_new(constructor.as_ref(), arguments, frame, tokens, out),
+        BoundExprKind::DelegateCreation {
+            delegate_type,
+            target,
+            receiver,
+        } => emit_delegate_creation(
+            delegate_type,
+            target,
+            receiver.as_deref(),
+            frame,
+            tokens,
+            out,
+        ),
         BoundExprKind::ArrayCreation { lengths } => {
             emit_array_creation(&expr.ty, lengths, frame, tokens, out)
         }
@@ -313,6 +325,38 @@ fn emit_new(
     Ok(())
 }
 
+/// Lowers `new D(method)`: push the target object (`ldnull` for a static target, else
+/// the receiver), the function pointer (`ldftn target`), then `newobj D::.ctor`.
+fn emit_delegate_creation(
+    delegate_type: &TypeSymbol,
+    target: &lamella_binder::MethodReference,
+    receiver: Option<&BoundExpr>,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    match receiver {
+        Some(receiver) => emit_expression(receiver, frame, tokens, out)?,
+        None => out.push(Instruction::simple(Opcode::Ldnull)),
+    }
+    let target_token = tokens
+        .method(&target.declaring_type, &target.name, &target.parameters)
+        .ok_or(EmitError::Unsupported(
+            "delegate target outside this module",
+        ))?;
+    out.push(Instruction::new(
+        Opcode::Ldftn,
+        Operand::Token(target_token),
+    ));
+    let ctor_token = tokens
+        .method(delegate_type, ".ctor", &[])
+        .ok_or(EmitError::Unsupported(
+            "delegate constructor was not emitted",
+        ))?;
+    out.push(Instruction::new(Opcode::Newobj, Operand::Token(ctor_token)));
+    Ok(())
+}
+
 /// Lowers a call. An instance call pushes the receiver first and dispatches with
 /// `callvirt`; a static call uses `call`. Then the arguments are pushed and the
 /// target named by token. Same-module targets only for now; external calls follow.
@@ -341,7 +385,7 @@ fn emit_call(
                     emit_expression(receiver, frame, tokens, out)?;
                 }
             }
-            _ => return Err(EmitError::Unsupported("an instance call with no receiver")),
+            _ => emit_expression(callee, frame, tokens, out)?,
         }
     }
     for argument in arguments {

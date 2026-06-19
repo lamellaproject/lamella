@@ -159,6 +159,7 @@ fn lower_inst(
         | Inst::InitStruct
         | Inst::FieldLoad { .. }
         | Inst::FieldStore { .. }
+        | Inst::FieldAddr { .. }
         | Inst::CopyStruct { .. } => return Err(LowerError::CallUnsupported),
         Inst::Call { .. } => return Err(LowerError::CallUnsupported),
         Inst::SemihostWrite { .. } => return Err(LowerError::CallUnsupported),
@@ -440,8 +441,15 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::FieldLoad { base, offset } => {
-            enc.ldr_sp(Reg::R0, slot(*base) + *offset as u16)
-                .map_err(|_| LowerError::TooManyValues)?;
+            if matches!(value_types.get(base.0 as usize), Some(MirType::ManagedPtr)) {
+                enc.ldr_sp(Reg::R0, slot(*base))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R0, Reg::R0, *offset as u16)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                enc.ldr_sp(Reg::R0, slot(*base) + *offset as u16)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
         }
         Inst::FieldStore {
             base,
@@ -450,7 +458,18 @@ fn lower_spilled_inst(
         } => {
             enc.ldr_sp(Reg::R0, slot(*value))
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.str_sp(Reg::R0, slot(*base) + *offset as u16)
+            if matches!(value_types.get(base.0 as usize), Some(MirType::ManagedPtr)) {
+                enc.ldr_sp(Reg::R1, slot(*base))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R0, Reg::R1, *offset as u16)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                enc.str_sp(Reg::R0, slot(*base) + *offset as u16)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+        }
+        Inst::FieldAddr { base, offset } => {
+            enc.add_sp_imm(Reg::R0, slot(*base) + *offset as u16)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::InitStruct | Inst::CopyStruct { .. } => {}
@@ -740,15 +759,16 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     if func
         .value_types
         .iter()
-        .any(|ty| ty.is_float() || ty.is_gc_reference())
+        .any(|ty| ty.is_float() || matches!(ty, MirType::ObjectRef))
     {
         return Err(LowerError::NonIntegerValue);
     }
-    if func
-        .value_types
-        .iter()
-        .any(|ty| matches!(ty, MirType::I64 | MirType::ValueType { .. }))
-    {
+    if func.value_types.iter().any(|ty| {
+        matches!(
+            ty,
+            MirType::I64 | MirType::ValueType { .. } | MirType::ManagedPtr
+        )
+    }) {
         return Ok(Assignment::Spilled);
     }
     if func.blocks.iter().any(|b| {

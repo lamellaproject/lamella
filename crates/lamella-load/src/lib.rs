@@ -20,10 +20,11 @@ use lamella_ves::intrinsics::{
     console_write_line_empty, console_write_line_int32, console_write_line_int64,
     console_write_line_object, delegate_combine, delegate_remove, double_to_string,
     enum_is_defined, enum_parse, exception_ctor, exception_get_message, gc_collect,
-    int32_to_string, int64_to_string, object_ctor, object_to_string, reregister_finalize,
-    string_concat, string_concat3, string_equals, string_get_chars, string_get_length,
-    string_is_null_or_empty, string_not_equals, string_substring, string_substring_len,
-    suppress_finalize, type_from_handle, wait_for_pending_finalizers,
+    int32_to_string, int64_to_string, md_array_get, md_array_get_length, md_array_length,
+    md_array_set, object_ctor, object_to_string, reregister_finalize, string_concat,
+    string_concat3, string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
+    string_not_equals, string_substring, string_substring_len, suppress_finalize, type_from_handle,
+    wait_for_pending_finalizers,
 };
 use lamella_ves::{IntrinsicFn, MethodId, Module, Value};
 
@@ -32,6 +33,7 @@ const TYPE_DEF: u8 = 0x02;
 const FIELD: u8 = 0x04;
 const METHOD_DEF: u8 = 0x06;
 const MEMBER_REF: u8 = 0x0A;
+const TYPE_SPEC: u8 = 0x1B;
 
 const METHOD_VIRTUAL: u32 = 0x0040;
 const METHOD_NEWSLOT: u32 = 0x0100;
@@ -228,28 +230,43 @@ fn bind_bcl_calls(assembly: &Assembly, module: &mut Module, tokens: &BTreeSet<To
             continue;
         };
         let parent = member.parent();
-        if parent.table() != TYPE_REF {
-            continue;
-        }
-        let Some(parent_type) = assembly
-            .type_ref(parent.row())
-            .and_then(|type_ref| type_ref.name())
-        else {
-            continue;
-        };
         let signature = member.method_signature();
-        let Some(function) = bcl_intrinsic(
-            parent_type.namespace,
-            parent_type.name,
-            method_name,
-            signature.as_ref(),
-        ) else {
+        let arg_count = u16::try_from(
+            signature
+                .as_ref()
+                .map_or(0, |sig| sig.parameters.len() + usize::from(sig.has_this)),
+        )
+        .unwrap_or(u16::MAX);
+
+        let function = if parent.table() == TYPE_SPEC {
+            match method_name {
+                ".ctor" => {
+                    let rank = signature.as_ref().map_or(0, |sig| sig.parameters.len());
+                    module.mark_md_array_ctor(*token, u16::try_from(rank).unwrap_or(0));
+                    continue;
+                }
+                "Get" => Some(md_array_get as IntrinsicFn),
+                "Set" => Some(md_array_set as IntrinsicFn),
+                _ => continue,
+            }
+        } else if parent.table() == TYPE_REF {
+            assembly
+                .type_ref(parent.row())
+                .and_then(|type_ref| type_ref.name())
+                .and_then(|parent_type| {
+                    bcl_intrinsic(
+                        parent_type.namespace,
+                        parent_type.name,
+                        method_name,
+                        signature.as_ref(),
+                    )
+                })
+        } else {
             continue;
         };
-        let arg_count = signature
-            .as_ref()
-            .map_or(0, |sig| sig.parameters.len() + usize::from(sig.has_this));
-        let arg_count = u16::try_from(arg_count).unwrap_or(u16::MAX);
+        let Some(function) = function else {
+            continue;
+        };
         let id = match bound.get(&(function as usize, arg_count)) {
             Some(&id) => id,
             None => {
@@ -295,6 +312,8 @@ fn bcl_intrinsic(
         ("Type", "GetTypeFromHandle") => Some(type_from_handle),
         ("Enum", "Parse") => Some(enum_parse),
         ("Enum", "IsDefined") => Some(enum_is_defined),
+        ("Array", "get_Length") => Some(md_array_length),
+        ("Array", "GetLength") => Some(md_array_get_length),
         ("Int32", "ToString") => to_string_overload(int32_to_string, signature),
         ("Boolean", "ToString") => to_string_overload(boolean_to_string, signature),
         ("Char", "ToString") => to_string_overload(char_to_string, signature),

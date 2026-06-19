@@ -22,8 +22,8 @@ use lamella_pe::{
     local_signature, method_signature, property_signature,
 };
 use lamella_syntax::ast::{
-    CompilationUnit, Literal, Member, Modifier, NamespaceMember, Parameter, QualifiedName,
-    TypeDecl, TypeKind, UsingDirective, UsingKind, VariableDeclarator,
+    CompilationUnit, DelegateDecl, Literal, Member, Modifier, NamespaceMember, Parameter,
+    QualifiedName, TypeDecl, TypeKind, UsingDirective, UsingKind, VariableDeclarator,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
 use lamella_syntax::parser::parse_compilation_unit;
@@ -45,6 +45,10 @@ const METHOD_ABSTRACT: u16 = 0x0400;
 const INTERFACE_FLAGS: u32 = 0x0000_0001 | 0x0000_0020 | 0x0000_0080;
 const IFACE_METHOD_FLAGS: u16 =
     METHOD_PUBLIC | METHOD_VIRTUAL | METHOD_ABSTRACT | METHOD_NEWSLOT | METHOD_HIDEBYSIG;
+const DELEGATE_TYPE_FLAGS: u32 = 0x0000_0001 | 0x0000_0100;
+const DELEGATE_CTOR_FLAGS: u16 = METHOD_PUBLIC | METHOD_HIDEBYSIG | 0x0800 | 0x1000;
+const DELEGATE_INVOKE_FLAGS: u16 =
+    METHOD_PUBLIC | METHOD_HIDEBYSIG | METHOD_VIRTUAL | METHOD_NEWSLOT;
 const FIELD_PUBLIC: u16 = 0x0006;
 const FIELD_STATIC: u16 = 0x0010;
 const CTOR_FLAGS: u16 = 0x0006 | 0x0800 | 0x1000;
@@ -329,7 +333,10 @@ fn emit_namespace(
                     debug,
                 )?;
             }
-            NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
+            NamespaceMember::Delegate(declaration) => {
+                emit_delegate(image, tokens, namespace, declaration)?;
+            }
+            NamespaceMember::Enum(_) => {}
         }
     }
     binder.restore_import_scope(scope);
@@ -366,6 +373,32 @@ fn emit_interface(
             image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS);
         }
     }
+    Ok(())
+}
+
+/// Emits a delegate as a sealed class extending `System.MulticastDelegate`, with its
+/// runtime-implemented `.ctor(object, native int)` and `Invoke(params) -> ret`. The
+/// runtime supplies both bodies; `new D(method)` is `ldftn` + `newobj .ctor`, and
+/// `d(args)` is `callvirt Invoke`.
+fn emit_delegate(
+    image: &mut ImageBuilder,
+    tokens: &Tokens,
+    namespace: &str,
+    declaration: &DelegateDecl,
+) -> Result<(), crate::EmitError> {
+    let base = image.type_ref("System", "MulticastDelegate");
+    image.add_type(namespace, &declaration.name, base, DELEGATE_TYPE_FLAGS);
+    let ctor_signature =
+        method_signature(true, &[TypeSig::Object, TypeSig::NativeInt], &TypeSig::Void);
+    image.add_runtime_method(".ctor", &ctor_signature, DELEGATE_CTOR_FLAGS);
+    let return_sig = type_sig(tokens, &bind_type(&declaration.return_type))?;
+    let parameter_sigs: Vec<TypeSig> = declaration
+        .parameters
+        .iter()
+        .map(|parameter| type_sig(tokens, &bind_type(&parameter.ty)))
+        .collect::<Result<_, _>>()?;
+    let invoke_signature = method_signature(true, &parameter_sigs, &return_sig);
+    image.add_runtime_method("Invoke", &invoke_signature, DELEGATE_INVOKE_FLAGS);
     Ok(())
 }
 
@@ -1401,7 +1434,30 @@ fn collect_tokens(
             NamespaceMember::Enum(declaration) => {
                 tokens.insert_enum(&named_symbol(namespace, &declaration.name));
             }
-            NamespaceMember::Delegate(_) => {}
+            NamespaceMember::Delegate(declaration) => {
+                let declaring = named_symbol(namespace, &declaration.name);
+                *next_type += 1;
+                tokens.insert_type(&declaring, Token::new(TYPE_DEF, *next_type));
+                *next_method += 1;
+                tokens.insert_method(
+                    &declaring,
+                    ".ctor",
+                    &[],
+                    Token::new(METHOD_DEF, *next_method),
+                );
+                *next_method += 1;
+                let params: Vec<TypeSymbol> = declaration
+                    .parameters
+                    .iter()
+                    .map(|p| bind_type(&p.ty))
+                    .collect();
+                tokens.insert_method(
+                    &declaring,
+                    "Invoke",
+                    &params,
+                    Token::new(METHOD_DEF, *next_method),
+                );
+            }
         }
     }
 }
@@ -1702,6 +1758,19 @@ mod tests {
         )
         .unit;
         let result = compile_unit(&unit, "c.dll", "c");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_delegate_creation_and_invocation() {
+        let unit = parse_compilation_unit(
+            "delegate int D(int x); \
+             class P { static int Twice(int x) { return x * 2; } \
+                static int Main() { D d = new D(Twice); return d(21); } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "d.dll", "d");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert!(result.image.is_some(), "{:?}", result.emit_error);
     }

@@ -166,6 +166,15 @@ pub enum Inst {
         /// The scalar value to store (its width comes from its type).
         value: ValueId,
     },
+    /// The address of the value-type `base`'s field at byte `offset` -- the CLI's `ldflda`
+    /// once the address escapes (e.g. as an instance method's `this`). The result is a
+    /// managed pointer; the lowering materializes `&base + offset`.
+    FieldAddr {
+        /// The value-type instance whose field address is taken.
+        base: ValueId,
+        /// The field's byte offset within the value type.
+        offset: u32,
+    },
     /// Copies the value-type `src` to the instance this defines -- the CLI's `ldobj`/`stobj`
     /// value copy (struct assignment, pass-by-value). The result is the copy; its size comes
     /// from the result's [`MirType`].

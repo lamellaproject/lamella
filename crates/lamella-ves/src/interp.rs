@@ -150,6 +150,9 @@ struct Frame {
     current_exception: Option<ObjectRef>,
     /// An in-progress `finally` chain (from a `leave` or an exception unwind).
     pending: Option<PendingFinally>,
+    /// A `filter` expression being evaluated mid-unwind: the exception, the handler to
+    /// enter if it accepts, and where to resume the search if it rejects.
+    pending_filter: Option<PendingFilter>,
     /// A multicast-delegate invocation in progress: the remaining `(target, method)`
     /// invocations and the shared arguments, so each is called as the previous returns.
     multicast: Option<Multicast>,
@@ -165,6 +168,9 @@ enum Flow {
     Next,
     /// The method returned, with its result if any.
     Return(Option<Value>),
+    /// `jmp`: replace the current frame with a tail call to this method, reusing the
+    /// current frame's arguments.
+    Jmp(MethodId),
     /// The method called another; its frame must be pushed.
     Call {
         /// The callee.
@@ -191,6 +197,9 @@ enum Flow {
     Leave(usize),
     /// An `endfinally`: the current `finally` block is done; resume the chain.
     EndFinally,
+    /// `endfilter`: a filter expression finished; the bool is whether it accepts (catch)
+    /// or rejects (continue the handler search).
+    EndFilter(bool),
     /// `ldfld` through a managed pointer (`&`): read a field of the value-type instance
     /// at `location`, which lives in the call stack `step` cannot reach.
     LoadField {
@@ -269,6 +278,20 @@ struct PendingFinally {
     then: AfterFinally,
 }
 
+/// A `filter` expression being evaluated during the handler search for an exception.
+struct PendingFilter {
+    /// The exception being filtered.
+    exception: ObjectRef,
+    /// The handler to enter if the filter accepts (leaves a non-zero result).
+    handler: usize,
+    /// The filter's try region, for the finallys to run before entering its handler.
+    filter_try: InstructionRange,
+    /// The clause index to resume the search from if the filter rejects.
+    resume: usize,
+    /// The original fault site, preserved across the filter's evaluation.
+    fault_ip: usize,
+}
+
 /// Runs a single method that makes no calls, returning the value its `ret` leaves
 /// on the stack (`None` for a void return).
 ///
@@ -292,6 +315,8 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
             Flow::Throw(_) => return Err(Trap::Unsupported(Opcode::Throw)),
             Flow::Leave(_) => return Err(Trap::Unsupported(Opcode::Leave)),
             Flow::EndFinally => return Err(Trap::Unsupported(Opcode::Endfinally)),
+            Flow::EndFilter(_) => return Err(Trap::Unsupported(Opcode::Endfilter)),
+            Flow::Jmp(_) => return Err(Trap::Unsupported(Opcode::Jmp)),
             Flow::LoadField { .. } => return Err(Trap::Unsupported(Opcode::Ldfld)),
             Flow::StoreField { .. } => return Err(Trap::Unsupported(Opcode::Stfld)),
             Flow::InitObj { .. } => return Err(Trap::Unsupported(Opcode::Initobj)),
@@ -537,6 +562,13 @@ impl Session {
                     }
                 }
             }
+            Flow::Jmp(target) => {
+                let args = frames.last().ok_or(Trap::StackUnderflow)?.args.clone();
+                frames.pop();
+                let frame = new_frame(module, target, args)?;
+                frames.push(frame);
+                Ok(Status::Running)
+            }
             Flow::Call { method, args } => match module.method(method) {
                 Some(Method::Managed { .. }) => {
                     if frames.len() >= MAX_CALL_DEPTH {
@@ -621,6 +653,40 @@ impl Session {
                         begin_finallys(frames, module, vm, finallys, then)
                     }
                     None => Err(Trap::Unsupported(Opcode::Endfinally)),
+                }
+            }
+            Flow::EndFilter(accept) => {
+                let pending = frames
+                    .last_mut()
+                    .ok_or(Trap::StackUnderflow)?
+                    .pending_filter
+                    .take();
+                match pending {
+                    Some(filter) if accept => {
+                        let method = frames.last().ok_or(Trap::StackUnderflow)?.method;
+                        let handlers = method_handlers(module, method)?;
+                        let finallys =
+                            finallys_inside(handlers, filter.fault_ip, filter.filter_try);
+                        begin_finallys(
+                            frames,
+                            module,
+                            vm,
+                            finallys,
+                            AfterFinally::Catch {
+                                handler: filter.handler,
+                                exception: filter.exception,
+                            },
+                        )
+                    }
+                    Some(filter) => raise_from(
+                        frames,
+                        module,
+                        vm,
+                        filter.exception,
+                        filter.resume,
+                        filter.fault_ip,
+                    ),
+                    None => Err(Trap::Unsupported(Opcode::Endfilter)),
                 }
             }
             Flow::LoadField { location, field } => {
@@ -714,6 +780,7 @@ fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<
         Location::Field { object, slot } => vm.heap().instance_field(object, slot),
         Location::Element { array, index } => vm.heap().array_get(array, index),
         Location::Static { slot } => vm.static_field(slot),
+        Location::Boxed { object } => vm.heap().boxed_value(object),
     }
 }
 
@@ -753,6 +820,11 @@ fn write_location_value(
             vm.set_static_field(slot, value);
             Ok(())
         }
+        Location::Boxed { object } => vm
+            .heap_mut()
+            .set_boxed_value(object, value)
+            .then_some(())
+            .ok_or(Trap::NullReference),
     }
 }
 
@@ -902,6 +974,7 @@ fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
         Trap::IndexOutOfRange(_) => "Index was outside the bounds of the array.",
         Trap::InvalidCast => "Unable to cast object to the target type.",
         Trap::InvalidArgument => "Requested value was not found.",
+        Trap::Overflow => "Arithmetic operation resulted in an overflow.",
         _ => return None,
     };
     let exception = vm.heap_mut().alloc_instance(EXTERNAL_TYPE_ID, Vec::new());
@@ -925,26 +998,73 @@ fn raise(
         return Err(Trap::UnhandledException);
     };
     let fault_ip = frame.ip.saturating_sub(1);
+    raise_from(frames, module, vm, exception, 0, fault_ip)
+}
+
+/// Searches this frame's handler clauses, from index `from`, for one that catches
+/// `exception` -- a type-matching `catch`, or a `filter` whose expression evaluates to
+/// true. A filter is evaluated inline: the frame runs its expression and `endfilter`
+/// resumes the search here (a rejecting filter continuing from the next clause). With no
+/// catcher, the finallys and faults covering the fault run and the frame unwinds.
+fn raise_from(
+    frames: &mut Vec<Frame>,
+    module: &Module,
+    vm: &Vm,
+    exception: ObjectRef,
+    from: usize,
+    fault_ip: usize,
+) -> Result<Status, Trap> {
+    let Some(frame) = frames.last() else {
+        return Err(Trap::UnhandledException);
+    };
     let handlers = method_handlers(module, frame.method)?;
-    if let Some((handler, catch_try)) = matching_catch(module, vm, handlers, fault_ip, exception) {
-        let finallys = finallys_inside(handlers, fault_ip, catch_try);
-        begin_finallys(
-            frames,
-            module,
-            vm,
-            finallys,
-            AfterFinally::Catch { handler, exception },
-        )
-    } else {
-        let finallys = finallys_covering(handlers, fault_ip);
-        begin_finallys(
-            frames,
-            module,
-            vm,
-            finallys,
-            AfterFinally::Unwind(exception),
-        )
+    for (index, clause) in handlers.iter().enumerate().skip(from) {
+        if !covers(clause.try_range, fault_ip) {
+            continue;
+        }
+        match &clause.kind {
+            EhKind::Catch(type_token) => {
+                if catch_matches(module, vm, *type_token, exception) {
+                    let finallys = finallys_inside(handlers, fault_ip, clause.try_range);
+                    return begin_finallys(
+                        frames,
+                        module,
+                        vm,
+                        finallys,
+                        AfterFinally::Catch {
+                            handler: clause.handler_range.start as usize,
+                            exception,
+                        },
+                    );
+                }
+            }
+            EhKind::Filter { filter_start } => {
+                let pending = PendingFilter {
+                    exception,
+                    handler: clause.handler_range.start as usize,
+                    filter_try: clause.try_range,
+                    resume: index + 1,
+                    fault_ip,
+                };
+                let start = *filter_start as usize;
+                let frame = frames.last_mut().ok_or(Trap::StackUnderflow)?;
+                frame.stack.clear();
+                frame.stack.push(Value::Object(exception));
+                frame.ip = start;
+                frame.pending_filter = Some(pending);
+                return Ok(Status::Running);
+            }
+            EhKind::Finally | EhKind::Fault => {}
+        }
     }
+    let finallys = finallys_covering(handlers, fault_ip);
+    begin_finallys(
+        frames,
+        module,
+        vm,
+        finallys,
+        AfterFinally::Unwind(exception),
+    )
 }
 
 /// Runs the next pending `finally` (if any), else performs the chain's continuation.
@@ -994,27 +1114,6 @@ fn complete_finally(
     }
 }
 
-/// The first catch clause whose try region covers `fault_ip` and whose type matches
-/// `exception` -- its handler start and try range (for finding nested finallys).
-fn matching_catch(
-    module: &Module,
-    vm: &Vm,
-    handlers: &[EhClause],
-    fault_ip: usize,
-    exception: ObjectRef,
-) -> Option<(usize, InstructionRange)> {
-    for clause in handlers {
-        if let EhKind::Catch(type_token) = &clause.kind {
-            if covers(clause.try_range, fault_ip)
-                && catch_matches(module, vm, *type_token, exception)
-            {
-                return Some((clause.handler_range.start as usize, clause.try_range));
-            }
-        }
-    }
-    None
-}
-
 /// Whether `ip` lies in the half-open `[start, end)` instruction range.
 fn covers(range: InstructionRange, ip: usize) -> bool {
     (range.start as usize) <= ip && ip < (range.end as usize)
@@ -1023,7 +1122,7 @@ fn covers(range: InstructionRange, ip: usize) -> bool {
 /// The finally handlers a `leave` from `from_ip` to `target` exits: those whose try
 /// covers `from_ip` but not `target`. Ordered so `pop` yields innermost first.
 fn finallys_exited(handlers: &[EhClause], from_ip: usize, target: usize) -> Vec<usize> {
-    finally_handlers(handlers, |clause| {
+    finally_handlers(handlers, false, |clause| {
         covers(clause.try_range, from_ip) && !covers(clause.try_range, target)
     })
 }
@@ -1031,7 +1130,7 @@ fn finallys_exited(handlers: &[EhClause], from_ip: usize, target: usize) -> Vec<
 /// The finally handlers in this frame covering `fault_ip` (run as the frame unwinds
 /// when it has no matching catch).
 fn finallys_covering(handlers: &[EhClause], fault_ip: usize) -> Vec<usize> {
-    finally_handlers(handlers, |clause| covers(clause.try_range, fault_ip))
+    finally_handlers(handlers, true, |clause| covers(clause.try_range, fault_ip))
 }
 
 /// The finally handlers nested between `fault_ip` and a catch -- covering the fault
@@ -1041,19 +1140,29 @@ fn finallys_inside(
     fault_ip: usize,
     catch_try: InstructionRange,
 ) -> Vec<usize> {
-    finally_handlers(handlers, |clause| {
+    finally_handlers(handlers, true, |clause| {
         covers(clause.try_range, fault_ip)
             && clause.try_range.start >= catch_try.start
             && clause.try_range.end <= catch_try.end
     })
 }
 
-/// The handler starts of the finally clauses kept by `keep`, ordered outermost-first
-/// so that `pop` runs them innermost-first.
-fn finally_handlers(handlers: &[EhClause], keep: impl Fn(&EhClause) -> bool) -> Vec<usize> {
+/// The handler starts of the finally clauses -- and, when `include_fault` (an exception
+/// unwind, not a `leave`), the fault clauses -- kept by `keep`, ordered outermost-first so
+/// that `pop` runs them innermost-first. A fault handler runs like a finally during unwind
+/// and ends with `endfault` (the same opcode as `endfinally`).
+fn finally_handlers(
+    handlers: &[EhClause],
+    include_fault: bool,
+    keep: impl Fn(&EhClause) -> bool,
+) -> Vec<usize> {
     let mut clauses: Vec<&EhClause> = handlers
         .iter()
-        .filter(|clause| matches!(clause.kind, EhKind::Finally) && keep(clause))
+        .filter(|clause| {
+            let runs = matches!(clause.kind, EhKind::Finally)
+                || (include_fault && matches!(clause.kind, EhKind::Fault));
+            runs && keep(clause)
+        })
         .collect();
     clauses.sort_by_key(|clause| clause.try_range.start);
     clauses
@@ -1142,7 +1251,17 @@ fn step(
             slot: var_operand(instruction)? as usize,
         })),
 
-        Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Rem => {
+        Opcode::Add
+        | Opcode::Sub
+        | Opcode::Mul
+        | Opcode::Div
+        | Opcode::Rem
+        | Opcode::AddOvf
+        | Opcode::AddOvfUn
+        | Opcode::SubOvf
+        | Opcode::SubOvfUn
+        | Opcode::MulOvf
+        | Opcode::MulOvfUn => {
             let (a, b) = frame.pop2()?;
             frame.stack.push(binary_numeric(opcode, a, b)?);
         }
@@ -1162,6 +1281,14 @@ fn step(
             let value = frame.pop()?;
             frame.stack.push(bitwise_not(value)?);
         }
+        Opcode::Ckfinite => {
+            let value = frame.pop()?;
+            match value {
+                Value::Float(x) if x.is_finite() => frame.stack.push(value),
+                Value::Float(_) => return Err(Trap::Overflow),
+                _ => return Err(Trap::TypeMismatch(Opcode::Ckfinite)),
+            }
+        }
 
         Opcode::ConvI1
         | Opcode::ConvI2
@@ -1178,6 +1305,29 @@ fn step(
         | Opcode::ConvRUn => {
             let value = frame.pop()?;
             frame.stack.push(convert(opcode, value)?);
+        }
+        Opcode::ConvOvfI1
+        | Opcode::ConvOvfI1Un
+        | Opcode::ConvOvfU1
+        | Opcode::ConvOvfU1Un
+        | Opcode::ConvOvfI2
+        | Opcode::ConvOvfI2Un
+        | Opcode::ConvOvfU2
+        | Opcode::ConvOvfU2Un
+        | Opcode::ConvOvfI4
+        | Opcode::ConvOvfI4Un
+        | Opcode::ConvOvfU4
+        | Opcode::ConvOvfU4Un
+        | Opcode::ConvOvfI8
+        | Opcode::ConvOvfI8Un
+        | Opcode::ConvOvfU8
+        | Opcode::ConvOvfU8Un
+        | Opcode::ConvOvfI
+        | Opcode::ConvOvfIUn
+        | Opcode::ConvOvfU
+        | Opcode::ConvOvfUUn => {
+            let value = frame.pop()?;
+            frame.stack.push(convert_checked(opcode, value)?);
         }
 
         Opcode::Ceq | Opcode::Cgt | Opcode::CgtUn | Opcode::Clt | Opcode::CltUn => {
@@ -1331,6 +1481,25 @@ fn step(
             return Ok(Flow::Call { method, args });
         }
 
+        Opcode::Calli => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::Calli))?;
+            let pointer = function_pointer(frame.pop()?)?;
+            let arg_count = module
+                .method(pointer)
+                .ok_or(Trap::NoSuchMethod(pointer))?
+                .arg_count();
+            let args = frame.take_args(arg_count)?;
+            return Ok(Flow::Call {
+                method: pointer,
+                args,
+            });
+        }
+        Opcode::Jmp => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::Jmp))?;
+            let token = token_operand(instruction)?;
+            let target = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
+            return Ok(Flow::Jmp(target));
+        }
         Opcode::Ldftn => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldftn))?;
             let token = token_operand(instruction)?;
@@ -1356,6 +1525,20 @@ fn step(
                 let target = frame.pop()?;
                 let delegate = vm.heap_mut().alloc_delegate(target, method);
                 frame.stack.push(Value::Object(delegate));
+                return Ok(Flow::Next);
+            }
+            if let Some(rank) = module.md_array_ctor_rank(token) {
+                let lengths = frame.take_args(rank)?;
+                let dims: Vec<i32> = lengths
+                    .iter()
+                    .map(|value| match value {
+                        Value::Int32(n) => *n,
+                        Value::Int64(n) | Value::NativeInt(n) => *n as i32,
+                        _ => 0,
+                    })
+                    .collect();
+                let array = vm.heap_mut().alloc_md_array(dims);
+                frame.stack.push(Value::Object(array));
                 return Ok(Flow::Next);
             }
             let ctor = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
@@ -1519,6 +1702,37 @@ fn step(
             frame.pending_constraint = Some(token_operand(instruction)?);
         }
         Opcode::Readonly => {}
+        Opcode::Volatile | Opcode::Unaligned | Opcode::Tail => {}
+        Opcode::LdindI1
+        | Opcode::LdindU1
+        | Opcode::LdindI2
+        | Opcode::LdindU2
+        | Opcode::LdindI4
+        | Opcode::LdindU4
+        | Opcode::LdindI8
+        | Opcode::LdindI
+        | Opcode::LdindR4
+        | Opcode::LdindR8
+        | Opcode::LdindRef => match frame.pop()? {
+            Value::ByRef(location) => return Ok(Flow::LoadObj { location }),
+            Value::Null => return Err(Trap::NullReference),
+            _ => return Err(Trap::TypeMismatch(Opcode::LdindI4)),
+        },
+        Opcode::StindI1
+        | Opcode::StindI2
+        | Opcode::StindI4
+        | Opcode::StindI8
+        | Opcode::StindI
+        | Opcode::StindR4
+        | Opcode::StindR8
+        | Opcode::StindRef => {
+            let value = frame.pop()?;
+            match frame.pop()? {
+                Value::ByRef(location) => return Ok(Flow::StoreObj { location, value }),
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::StindI4)),
+            }
+        }
         Opcode::Ldtoken => {
             let token = token_operand(instruction)?;
             frame.stack.push(Value::NativeInt(i64::from(token.0)));
@@ -1568,6 +1782,12 @@ fn step(
             let value = frame.pop()?;
             let reference = vm.heap_mut().alloc_boxed(token.0, value);
             frame.stack.push(Value::Object(reference));
+        }
+        Opcode::Unbox => {
+            let reference = object_ref(frame.pop()?, Opcode::Unbox)?;
+            frame
+                .stack
+                .push(Value::ByRef(Location::Boxed { object: reference }));
         }
         Opcode::UnboxAny => {
             let reference = object_ref(frame.pop()?, Opcode::UnboxAny)?;
@@ -1648,6 +1868,11 @@ fn step(
         }
         #[cfg(feature = "exceptions")]
         Opcode::Endfinally => return Ok(Flow::EndFinally),
+        #[cfg(feature = "exceptions")]
+        Opcode::Endfilter => {
+            let accept = matches!(frame.pop()?, Value::Int32(n) if n != 0);
+            return Ok(Flow::EndFilter(accept));
+        }
 
         Opcode::Ret => return Ok(Flow::Return(frame.stack.pop())),
 
@@ -1667,6 +1892,7 @@ impl Frame {
             new_object: None,
             current_exception: None,
             pending: None,
+            pending_filter: None,
             multicast: None,
             pending_constraint: None,
         }
@@ -1817,6 +2043,12 @@ fn integer_op_32(opcode: Opcode, x: i32, y: i32) -> Result<i32, Trap> {
         Opcode::Add => x.wrapping_add(y),
         Opcode::Sub => x.wrapping_sub(y),
         Opcode::Mul => x.wrapping_mul(y),
+        Opcode::AddOvf => x.checked_add(y).ok_or(Trap::Overflow)?,
+        Opcode::SubOvf => x.checked_sub(y).ok_or(Trap::Overflow)?,
+        Opcode::MulOvf => x.checked_mul(y).ok_or(Trap::Overflow)?,
+        Opcode::AddOvfUn => (x as u32).checked_add(y as u32).ok_or(Trap::Overflow)? as i32,
+        Opcode::SubOvfUn => (x as u32).checked_sub(y as u32).ok_or(Trap::Overflow)? as i32,
+        Opcode::MulOvfUn => (x as u32).checked_mul(y as u32).ok_or(Trap::Overflow)? as i32,
         Opcode::And => x & y,
         Opcode::Or => x | y,
         Opcode::Xor => x ^ y,
@@ -1833,6 +2065,12 @@ fn integer_op_64(opcode: Opcode, x: i64, y: i64) -> Result<i64, Trap> {
         Opcode::Add => x.wrapping_add(y),
         Opcode::Sub => x.wrapping_sub(y),
         Opcode::Mul => x.wrapping_mul(y),
+        Opcode::AddOvf => x.checked_add(y).ok_or(Trap::Overflow)?,
+        Opcode::SubOvf => x.checked_sub(y).ok_or(Trap::Overflow)?,
+        Opcode::MulOvf => x.checked_mul(y).ok_or(Trap::Overflow)?,
+        Opcode::AddOvfUn => (x as u64).checked_add(y as u64).ok_or(Trap::Overflow)? as i64,
+        Opcode::SubOvfUn => (x as u64).checked_sub(y as u64).ok_or(Trap::Overflow)? as i64,
+        Opcode::MulOvfUn => (x as u64).checked_mul(y as u64).ok_or(Trap::Overflow)? as i64,
         Opcode::And => x & y,
         Opcode::Or => x | y,
         Opcode::Xor => x ^ y,
@@ -1963,6 +2201,60 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Opcode::ConvI => Value::NativeInt(source),
         Opcode::ConvU => Value::NativeInt(zero_extended),
         _ => return Err(Trap::Unsupported(opcode)),
+    })
+}
+
+/// The checked conversions `conv.ovf.*`: like [`convert`] but yielding [`Trap::Overflow`]
+/// (the `OverflowException` site) when the source does not fit the target type. The `.un`
+/// forms read the source as unsigned.
+fn convert_checked(opcode: Opcode, value: Value) -> Result<Value, Trap> {
+    let unsigned_source = matches!(
+        opcode,
+        Opcode::ConvOvfI1Un
+            | Opcode::ConvOvfI2Un
+            | Opcode::ConvOvfI4Un
+            | Opcode::ConvOvfI8Un
+            | Opcode::ConvOvfU1Un
+            | Opcode::ConvOvfU2Un
+            | Opcode::ConvOvfU4Un
+            | Opcode::ConvOvfU8Un
+            | Opcode::ConvOvfIUn
+            | Opcode::ConvOvfUUn
+    );
+    let source: i128 = match value {
+        Value::Int32(x) if unsigned_source => i128::from(x as u32),
+        Value::Int32(x) => i128::from(x),
+        Value::Int64(x) | Value::NativeInt(x) if unsigned_source => i128::from(x as u64),
+        Value::Int64(x) | Value::NativeInt(x) => i128::from(x),
+        Value::Float(f) => f as i128,
+        _ => return Err(Trap::TypeMismatch(opcode)),
+    };
+    let (min, max): (i128, i128) = match opcode {
+        Opcode::ConvOvfI1 | Opcode::ConvOvfI1Un => (i128::from(i8::MIN), i128::from(i8::MAX)),
+        Opcode::ConvOvfU1 | Opcode::ConvOvfU1Un => (0, i128::from(u8::MAX)),
+        Opcode::ConvOvfI2 | Opcode::ConvOvfI2Un => (i128::from(i16::MIN), i128::from(i16::MAX)),
+        Opcode::ConvOvfU2 | Opcode::ConvOvfU2Un => (0, i128::from(u16::MAX)),
+        Opcode::ConvOvfI4 | Opcode::ConvOvfI4Un => (i128::from(i32::MIN), i128::from(i32::MAX)),
+        Opcode::ConvOvfU4 | Opcode::ConvOvfU4Un => (0, i128::from(u32::MAX)),
+        Opcode::ConvOvfI8 | Opcode::ConvOvfI8Un | Opcode::ConvOvfI | Opcode::ConvOvfIUn => {
+            (i128::from(i64::MIN), i128::from(i64::MAX))
+        }
+        Opcode::ConvOvfU8 | Opcode::ConvOvfU8Un | Opcode::ConvOvfU | Opcode::ConvOvfUUn => {
+            (0, i128::from(u64::MAX))
+        }
+        _ => return Err(Trap::Unsupported(opcode)),
+    };
+    if source < min || source > max {
+        return Err(Trap::Overflow);
+    }
+    Ok(match opcode {
+        Opcode::ConvOvfI8 | Opcode::ConvOvfI8Un | Opcode::ConvOvfU8 | Opcode::ConvOvfU8Un => {
+            Value::Int64(source as i64)
+        }
+        Opcode::ConvOvfI | Opcode::ConvOvfIUn | Opcode::ConvOvfU | Opcode::ConvOvfUUn => {
+            Value::NativeInt(source as i64)
+        }
+        _ => Value::Int32(source as i32),
     })
 }
 
@@ -2248,6 +2540,9 @@ impl Session {
                         }
                         AfterFinally::Goto(_) => {}
                     }
+                }
+                if let Some(filter) = &mut frame.pending_filter {
+                    visit_ref(&mut filter.exception, visit);
                 }
                 if let Some((invocations, params)) = &mut frame.multicast {
                     for (target, _) in invocations.iter_mut() {

@@ -69,11 +69,19 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             model.insert(info);
         }
         NamespaceMember::Delegate(declaration) => {
-            model.insert(TypeInfo::new(
-                namespace,
-                &declaration.name,
-                TypeKind::Delegate,
-            ));
+            let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Delegate);
+            info.methods.push(MethodSymbol {
+                name: "Invoke".into(),
+                return_type: bind_type(&declaration.return_type),
+                parameters: declaration
+                    .parameters
+                    .iter()
+                    .map(|p| bind_type(&p.ty))
+                    .collect(),
+                is_static: false,
+                accessibility: Accessibility::Public,
+            });
+            model.insert(info);
         }
     }
 }

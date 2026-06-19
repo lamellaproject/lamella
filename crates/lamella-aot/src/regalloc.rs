@@ -184,6 +184,9 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *base, ip);
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
+                Inst::FieldAddr { base, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *base, ip);
+                }
                 Inst::CopyStruct { src } => {
                     mark(&mut lo, &mut hi, &mut defined, *src, ip);
                 }
@@ -374,6 +377,7 @@ fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*base);
             f(*value);
         }
+        Inst::FieldAddr { base, .. } => f(*base),
         Inst::CopyStruct { src } => f(*src),
         Inst::SemihostWrite { .. } => {}
     }

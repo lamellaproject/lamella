@@ -123,6 +123,9 @@ pub struct Module {
     /// Tokens of enum types whose underlying type is 64-bit (long / ulong), so `Enum.Parse`
     /// boxes their values as int64 to match the declared type.
     enum_wide: BTreeSet<u32>,
+    /// `newobj` tokens that construct a multi-dimensional array (an array TypeSpec's
+    /// `.ctor`), mapped to the array's rank -- newobj allocates from that many lengths.
+    md_array_ctors: BTreeMap<u32, u16>,
 }
 
 impl Module {
@@ -443,6 +446,18 @@ impl Module {
     #[must_use]
     pub fn is_delegate_ctor(&self, token: Token) -> bool {
         self.delegate_ctors.contains(&token.0)
+    }
+
+    /// Marks `token` as a multi-dimensional array constructor of the given `rank`, so
+    /// `newobj` allocates the array from that many length arguments.
+    pub fn mark_md_array_ctor(&mut self, token: Token, rank: u16) {
+        self.md_array_ctors.insert(token.0, rank);
+    }
+
+    /// The rank of the multi-dimensional array `token` constructs, if it constructs one.
+    #[must_use]
+    pub fn md_array_ctor_rank(&self, token: Token) -> Option<u16> {
+        self.md_array_ctors.get(&token.0).copied()
     }
 
     /// Marks `token` as a delegate `Invoke` taking `param_count` parameters.

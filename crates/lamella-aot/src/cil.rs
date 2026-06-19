@@ -26,6 +26,8 @@ pub enum CilError {
     /// into a merge block (which would need its edge split), an entry block reached
     /// by a back-edge, or a block that runs off the end of the method.
     UnsupportedControlFlow,
+    /// A method selected for module lowering has no CIL body (abstract or extern).
+    MissingBody,
 }
 
 /// What a `call`'s target is, recovered from its metadata token by a [`CallResolver`].
@@ -50,6 +52,9 @@ pub struct CallInfo {
     pub args: usize,
     /// Whether the call pushes a return value onto the stack.
     pub has_result: bool,
+    /// The result's [`MirType`] when `has_result` (so a value-type return types correctly);
+    /// `None` falls back to `int32`.
+    pub result_type: Option<MirType>,
     /// The resolved target.
     pub target: CallTarget,
 }
@@ -180,7 +185,7 @@ fn lower_with_source(
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
         let mut il_index: Vec<u32> = Vec::new();
         let mut terminator: Option<Terminator> = None;
-        let mut last_local_addr: Option<usize> = None;
+        let mut last_local_addr: Option<(usize, u32)> = None;
 
         for i in start..end {
             let inst = &code[i];
@@ -440,7 +445,7 @@ fn apply_value_op(
     insts: &mut Vec<(ValueId, Inst)>,
     strings: &mut Vec<(ValueId, Box<[u8]>)>,
     resolver: &dyn CallResolver,
-    last_local_addr: &mut Option<usize>,
+    last_local_addr: &mut Option<(usize, u32)>,
 ) -> Result<(), CilError> {
     match inst.opcode {
         Opcode::Nop => {}
@@ -464,15 +469,15 @@ fn apply_value_op(
             };
             push_local(value_types, locals, stack, insts, *n as usize)?;
         }
-        Opcode::Stloc0 => store_local(locals, stack, 0)?,
-        Opcode::Stloc1 => store_local(locals, stack, 1)?,
-        Opcode::Stloc2 => store_local(locals, stack, 2)?,
-        Opcode::Stloc3 => store_local(locals, stack, 3)?,
+        Opcode::Stloc0 => store_local(value_types, locals, stack, insts, 0)?,
+        Opcode::Stloc1 => store_local(value_types, locals, stack, insts, 1)?,
+        Opcode::Stloc2 => store_local(value_types, locals, stack, insts, 2)?,
+        Opcode::Stloc3 => store_local(value_types, locals, stack, insts, 3)?,
         Opcode::StlocS | Opcode::Stloc => {
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            store_local(locals, stack, *n as usize)?;
+            store_local(value_types, locals, stack, insts, *n as usize)?;
         }
         Opcode::LdcI4M1 => push_const(value_types, stack, insts, -1),
         Opcode::LdcI40 => push_const(value_types, stack, insts, 0),
@@ -523,6 +528,7 @@ fn apply_value_op(
         Opcode::Cgt => compare(value_types, stack, insts, CmpOp::SignedGt)?,
         Opcode::CgtUn => compare(value_types, stack, insts, CmpOp::UnsignedGt)?,
         Opcode::Clt => compare(value_types, stack, insts, CmpOp::SignedLt)?,
+        Opcode::CltUn => compare(value_types, stack, insts, CmpOp::UnsignedLt)?,
         Opcode::Neg => {
             let x = stack.pop().ok_or(CilError::StackUnderflow)?;
             let zero = new_value(value_types, MirType::I32);
@@ -604,14 +610,27 @@ fn apply_value_op(
             let info = resolver
                 .resolve(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
+            let this = last_local_addr
+                .take()
+                .map(|(n, off)| -> Result<ValueId, CilError> {
+                    let base = locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?;
+                    let ptr = new_value(value_types, MirType::ManagedPtr);
+                    insts.push((ptr, Inst::FieldAddr { base, offset: off }));
+                    Ok(ptr)
+                })
+                .transpose()?;
+            let explicit = info.args.saturating_sub(this.is_some() as usize);
             let mut call_args = Vec::with_capacity(info.args);
-            for _ in 0..info.args {
+            for _ in 0..explicit {
                 call_args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
             }
             call_args.reverse();
+            if let Some(this) = this {
+                call_args.insert(0, this);
+            }
             match info.target {
                 CallTarget::Internal(callee) => {
-                    let result = new_value(value_types, MirType::I32);
+                    let result = new_value(value_types, info.result_type.unwrap_or(MirType::I32));
                     insts.push((
                         result,
                         Inst::Call {
@@ -648,10 +667,17 @@ fn apply_value_op(
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            *last_local_addr = Some(*n as usize);
+            *last_local_addr = Some((*n as usize, 0));
+        }
+        Opcode::Ldflda => {
+            let (n, offset) = last_local_addr.take().ok_or(CilError::BadOperand)?;
+            let field = resolver
+                .field_offset(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            *last_local_addr = Some((n, offset + field));
         }
         Opcode::Initobj => {
-            let n = last_local_addr.take().ok_or(CilError::BadOperand)?;
+            let (n, _) = last_local_addr.take().ok_or(CilError::BadOperand)?;
             let size = resolver
                 .value_type_size(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
@@ -666,22 +692,34 @@ fn apply_value_op(
             *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(zeroed);
         }
         Opcode::Ldfld => {
-            let n = last_local_addr.take().ok_or(CilError::BadOperand)?;
-            let base = locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?;
-            let offset = resolver
-                .field_offset(&inst.operand)
-                .ok_or(CilError::BadOperand)?;
+            let (base, base_offset) = match last_local_addr.take() {
+                Some((n, off)) => (
+                    locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?,
+                    off,
+                ),
+                None => (stack.pop().ok_or(CilError::StackUnderflow)?, 0),
+            };
+            let offset = base_offset
+                + resolver
+                    .field_offset(&inst.operand)
+                    .ok_or(CilError::BadOperand)?;
             let result = new_value(value_types, MirType::I32);
             insts.push((result, Inst::FieldLoad { base, offset }));
             stack.push(result);
         }
         Opcode::Stfld => {
-            let n = last_local_addr.take().ok_or(CilError::BadOperand)?;
-            let base = locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?;
-            let offset = resolver
-                .field_offset(&inst.operand)
-                .ok_or(CilError::BadOperand)?;
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let (base, base_offset) = match last_local_addr.take() {
+                Some((n, off)) => (
+                    locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?,
+                    off,
+                ),
+                None => (stack.pop().ok_or(CilError::StackUnderflow)?, 0),
+            };
+            let offset = base_offset
+                + resolver
+                    .field_offset(&inst.operand)
+                    .ok_or(CilError::BadOperand)?;
             let placeholder = new_value(value_types, MirType::I32);
             insts.push((
                 placeholder,
@@ -895,13 +933,25 @@ fn push_local(
 
 /// Stores the stack top into local slot `index`.
 fn store_local(
+    value_types: &mut Vec<MirType>,
     locals: &mut [Option<ValueId>],
     stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
     index: usize,
 ) -> Result<(), CilError> {
     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
-    let slot = locals.get_mut(index).ok_or(CilError::BadOperand)?;
-    *slot = Some(value);
+    let stored = if matches!(
+        value_types.get(value.index()),
+        Some(MirType::ValueType { .. })
+    ) {
+        let ty = value_types[value.index()];
+        let copy = new_value(value_types, ty);
+        insts.push((copy, Inst::CopyStruct { src: value }));
+        copy
+    } else {
+        value
+    };
+    *locals.get_mut(index).ok_or(CilError::BadOperand)? = Some(stored);
     Ok(())
 }
 
@@ -913,6 +963,38 @@ mod control_flow {
 
     use alloc::collections::BTreeSet;
     use lamella_cil::{Instruction, Opcode, Operand};
+
+    #[test]
+    fn lowers_unsigned_less_than() {
+        use super::*;
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI4M1),
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::simple(Opcode::CltUn),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).expect("lower clt.un");
+        assert!(
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(
+                    i,
+                    Inst::Compare {
+                        op: CmpOp::UnsignedLt,
+                        ..
+                    }
+                ))
+        );
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
 
     #[test]
     fn lowers_struct_field_access() {
@@ -1127,6 +1209,7 @@ mod tests {
                 Some(CallInfo {
                     args: 2,
                     has_result: true,
+                    result_type: None,
                     target: CallTarget::Internal(7),
                 })
             }
@@ -1161,6 +1244,7 @@ mod tests {
                 Some(CallInfo {
                     args: 1,
                     has_result: false,
+                    result_type: None,
                     target: CallTarget::Intrinsic(Intrinsic::DebugWriteLine),
                 })
             }

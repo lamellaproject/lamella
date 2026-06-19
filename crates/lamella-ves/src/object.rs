@@ -37,6 +37,15 @@ pub enum Object {
         /// The elements, indexed 0..len.
         elements: Vec<Value>,
     },
+    /// A multi-dimensional (rectangular) array (II.14.2): its per-dimension lengths and
+    /// its elements in row-major order. Accessed via `Get`/`Set`/`.ctor` calls on the
+    /// array type, not the `ldelem`/`stelem` opcodes.
+    MdArray {
+        /// The length of each dimension.
+        dims: Box<[i32]>,
+        /// The elements, row-major; one per product-of-dims slot.
+        elements: Box<[Value]>,
+    },
     /// A boxed value type (III.4.1 `box`): a heap copy of a value-type value, tagged
     /// with the value type's token so `unbox` / `unbox.any` and casts can recover it.
     Boxed {
@@ -126,6 +135,7 @@ impl Heap {
             Object::Str(chars) => Some(chars),
             Object::Instance { .. }
             | Object::Array { .. }
+            | Object::MdArray { .. }
             | Object::Boxed { .. }
             | Object::Delegate { .. } => None,
         }
@@ -145,6 +155,7 @@ impl Heap {
             Object::Instance { fields, .. } => fields.get(slot as usize).cloned(),
             Object::Str(_)
             | Object::Array { .. }
+            | Object::MdArray { .. }
             | Object::Boxed { .. }
             | Object::Delegate { .. } => None,
         }
@@ -173,6 +184,7 @@ impl Heap {
             Object::Instance { type_id, .. } => Some(*type_id),
             Object::Str(_)
             | Object::Array { .. }
+            | Object::MdArray { .. }
             | Object::Boxed { .. }
             | Object::Delegate { .. } => None,
         }
@@ -195,6 +207,18 @@ impl Heap {
         match self.get(reference)? {
             Object::Boxed { value, .. } => Some(value.clone()),
             _ => None,
+        }
+    }
+
+    /// Stores `value` into the box at `reference` (for `unbox` + `stobj`/`stind`); returns
+    /// `false` if `reference` is not a box.
+    pub fn set_boxed_value(&mut self, reference: ObjectRef, value: Value) -> bool {
+        match self.objects.get_mut(reference.0 as usize) {
+            Some(Object::Boxed { value: slot, .. }) => {
+                *slot = value;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -224,6 +248,18 @@ impl Heap {
     pub fn array_len(&self, reference: ObjectRef) -> Option<usize> {
         match self.get(reference)? {
             Object::Array { elements } => Some(elements.len()),
+            Object::MdArray { elements, .. } => Some(elements.len()),
+            _ => None,
+        }
+    }
+
+    /// The length of dimension `dim` of the array at `reference` (a multi-dimensional
+    /// array's per-dimension length, or a single-dimension array's length at `dim == 0`).
+    #[must_use]
+    pub fn array_dimension(&self, reference: ObjectRef, dim: i32) -> Option<i32> {
+        match self.get(reference)? {
+            Object::MdArray { dims, .. } => dims.get(usize::try_from(dim).ok()?).copied(),
+            Object::Array { elements } if dim == 0 => i32::try_from(elements.len()).ok(),
             _ => None,
         }
     }
@@ -252,6 +288,62 @@ impl Heap {
             _ => false,
         }
     }
+
+    /// Allocates a multi-dimensional array with the given per-dimension lengths (elements
+    /// zero-initialized to int32 zero) and returns a reference.
+    pub fn alloc_md_array(&mut self, dims: Vec<i32>) -> ObjectRef {
+        let total: usize = dims.iter().map(|&d| d.max(0) as usize).product();
+        let elements = alloc::vec![Value::Int32(0); total].into_boxed_slice();
+        self.alloc(Object::MdArray {
+            dims: dims.into_boxed_slice(),
+            elements,
+        })
+    }
+
+    /// The element at `indices` (row-major) of the multi-dimensional array at `reference`,
+    /// if it is such an array with every index in bounds.
+    #[must_use]
+    pub fn md_array_get(&self, reference: ObjectRef, indices: &[i32]) -> Option<Value> {
+        let Object::MdArray { dims, elements } = self.get(reference)? else {
+            return None;
+        };
+        elements.get(md_flat_index(dims, indices)?).cloned()
+    }
+
+    /// Stores `value` at `indices` of the multi-dimensional array at `reference`; returns
+    /// `false` if `reference` is not such an array or an index is out of range.
+    pub fn md_array_set(&mut self, reference: ObjectRef, indices: &[i32], value: Value) -> bool {
+        let Some(Object::MdArray { dims, elements }) = self.objects.get_mut(reference.0 as usize)
+        else {
+            return false;
+        };
+        let Some(flat) = md_flat_index(dims, indices) else {
+            return false;
+        };
+        match elements.get_mut(flat) {
+            Some(slot) => {
+                *slot = value;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The row-major flat index for `indices` in an array of shape `dims`, or `None` if the
+/// ranks differ or any index is out of range.
+fn md_flat_index(dims: &[i32], indices: &[i32]) -> Option<usize> {
+    if indices.len() != dims.len() {
+        return None;
+    }
+    let mut flat: usize = 0;
+    for (&dim, &index) in dims.iter().zip(indices) {
+        if index < 0 || index >= dim {
+            return None;
+        }
+        flat = flat * (dim as usize) + (index as usize);
+    }
+    Some(flat)
 }
 
 /// The mark-compact garbage collector (the `gc` feature -- `surface.gc = collected`).
@@ -395,6 +487,7 @@ fn collect_refs<F: FnMut(ObjectRef)>(value: &Value, visit: &mut F) {
         Value::Object(reference) => visit(*reference),
         Value::ByRef(Location::Field { object, .. }) => visit(*object),
         Value::ByRef(Location::Element { array, .. }) => visit(*array),
+        Value::ByRef(Location::Boxed { object }) => visit(*object),
         Value::Struct(fields) => fields.iter().for_each(|field| collect_refs(field, visit)),
         _ => {}
     }
@@ -406,6 +499,7 @@ fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
     match object {
         Object::Instance { fields, .. } => fields.iter().for_each(|f| collect_refs(f, visit)),
         Object::Array { elements } => elements.iter().for_each(|e| collect_refs(e, visit)),
+        Object::MdArray { elements, .. } => elements.iter().for_each(|e| collect_refs(e, visit)),
         Object::Boxed { value, .. } => collect_refs(value, visit),
         Object::Delegate { invocations } => invocations
             .iter()
@@ -421,6 +515,7 @@ fn remap_value(value: &mut Value, remap: &[Option<u32>]) {
         Value::Object(reference) => remap_ref(reference, remap),
         Value::ByRef(Location::Field { object, .. }) => remap_ref(object, remap),
         Value::ByRef(Location::Element { array, .. }) => remap_ref(array, remap),
+        Value::ByRef(Location::Boxed { object }) => remap_ref(object, remap),
         Value::Struct(fields) => fields.iter_mut().for_each(|f| remap_value(f, remap)),
         _ => {}
     }
@@ -432,6 +527,7 @@ fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
     match object {
         Object::Instance { fields, .. } => fields.iter_mut().for_each(|f| remap_value(f, remap)),
         Object::Array { elements } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
+        Object::MdArray { elements, .. } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
         Object::Boxed { value, .. } => remap_value(value, remap),
         Object::Delegate { invocations } => invocations
             .iter_mut()

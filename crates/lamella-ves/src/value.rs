@@ -72,6 +72,11 @@ pub enum Location {
         /// The static-field storage slot.
         slot: usize,
     },
+    /// The value inside a box -- the managed pointer `unbox` yields for in-place access.
+    Boxed {
+        /// The boxed object.
+        object: ObjectRef,
+    },
 }
 
 impl Value {

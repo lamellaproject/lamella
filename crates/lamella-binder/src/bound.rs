@@ -147,6 +147,17 @@ pub enum BoundExprKind {
         /// The constructor overload resolution chose, when it succeeded.
         constructor: Option<MethodReference>,
     },
+    /// A delegate creation `new D(methodGroup)` (14.5.10.3): a method group converts to
+    /// the delegate `D`. Its type is `D`. Emits `ldftn target` (with the receiver, or
+    /// `ldnull` for a static target) then `newobj D::.ctor`.
+    DelegateCreation {
+        /// The delegate type being created.
+        delegate_type: TypeSymbol,
+        /// The method the delegate targets.
+        target: MethodReference,
+        /// The receiver for an instance target; `None` for a static one.
+        receiver: Option<Box<BoundExpr>>,
+    },
     /// A binary operation on two bound operands (14.7-14.12).
     Binary {
         /// The operator.
@@ -1058,7 +1069,7 @@ impl Binder {
             BoundExprKind::MethodGroup { receiver, .. } => Some(receiver_category(receiver)),
             _ => None,
         };
-        let resolved = match group {
+        let mut resolved = match group {
             Some((receiver_ty, name))
                 if !arguments.iter().any(|argument| argument.ty.is_error()) =>
             {
@@ -1085,6 +1096,21 @@ impl Binder {
             }
             _ => None,
         };
+        if resolved.is_none() && !arguments.iter().any(|argument| argument.ty.is_error()) {
+            if let Some(invoke) = self
+                .type_info_of(&callee.ty)
+                .filter(|info| info.kind == TypeKind::Delegate)
+                .and_then(|info| info.methods.iter().find(|m| &*m.name == "Invoke").cloned())
+            {
+                resolved = Some(MethodReference {
+                    declaring_type: callee.ty.clone(),
+                    name: "Invoke".into(),
+                    parameters: invoke.parameters,
+                    return_type: invoke.return_type,
+                    is_static: false,
+                });
+            }
+        }
         if let (Some(kind), Some(method)) = (receiver_kind, &resolved) {
             self.check_static_instance(
                 kind,
@@ -1200,6 +1226,12 @@ impl Binder {
             .iter()
             .map(|argument| self.bind_expression(argument))
             .collect();
+        if self
+            .type_info_of(&target_ty)
+            .is_some_and(|info| info.kind == TypeKind::Delegate)
+        {
+            return self.bind_delegate_creation(&target_ty, &arguments, span);
+        }
         let mut constructor = None;
         let ty = if target_ty.is_error() {
             TypeSymbol::Error
@@ -1232,6 +1264,64 @@ impl Binder {
                 constructor,
             },
             ty,
+        }
+    }
+
+    /// Binds `new D(methodGroup)`: the method group converts to delegate `D` when a
+    /// method named in it matches `D`'s `Invoke` signature (same parameters and return).
+    /// A static target carries no receiver; an instance target keeps its receiver.
+    fn bind_delegate_creation(
+        &mut self,
+        delegate_ty: &TypeSymbol,
+        arguments: &[BoundExpr],
+        _span: Span,
+    ) -> BoundExpr {
+        let recover = BoundExpr {
+            kind: BoundExprKind::ObjectCreation {
+                arguments: Vec::new(),
+                constructor: None,
+            },
+            ty: delegate_ty.clone(),
+        };
+        let Some(invoke) = self
+            .type_info_of(delegate_ty)
+            .and_then(|info| info.methods.iter().find(|m| &*m.name == "Invoke").cloned())
+        else {
+            return recover;
+        };
+        let [argument] = arguments else {
+            return recover;
+        };
+        let BoundExprKind::MethodGroup { receiver, name } = &argument.kind else {
+            return recover;
+        };
+        let receiver_ty = receiver.ty.clone();
+        let Some(target) = self
+            .methods_in_chain(&receiver_ty, name)
+            .into_iter()
+            .find(|m| m.parameters == invoke.parameters && m.return_type == invoke.return_type)
+        else {
+            return recover;
+        };
+        let declaring = self.declaring_type_in_chain(&receiver_ty, name, &target.parameters);
+        let bound_receiver = if target.is_static {
+            None
+        } else {
+            Some(receiver.clone())
+        };
+        BoundExpr {
+            kind: BoundExprKind::DelegateCreation {
+                delegate_type: delegate_ty.clone(),
+                target: MethodReference {
+                    declaring_type: declaring,
+                    name: target.name.clone(),
+                    parameters: target.parameters.clone(),
+                    return_type: target.return_type,
+                    is_static: target.is_static,
+                },
+                receiver: bound_receiver,
+            },
+            ty: delegate_ty.clone(),
         }
     }
 

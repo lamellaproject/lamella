@@ -888,6 +888,90 @@ fn string_value(vm: &Vm, arg: Option<&Value>) -> Option<String> {
     }
 }
 
+/// `T[,]::Get(i0, i1, ...)`: the element of a multi-dimensional array at the given indices.
+///
+/// # Errors
+/// [`Trap::NullReference`] for a null array; [`Trap::IndexOutOfRange`] if an index is out of
+/// range (or the rank does not match).
+pub fn md_array_get(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(array)) = args.first() else {
+        return Err(Trap::NullReference);
+    };
+    let indices = int_indices(&args[1..]);
+    vm.heap()
+        .md_array_get(array, &indices)
+        .map(Some)
+        .ok_or_else(|| Trap::IndexOutOfRange(indices.first().copied().unwrap_or(0)))
+}
+
+/// `T[,]::Set(i0, i1, ..., value)`: stores `value` at the given indices.
+///
+/// # Errors
+/// [`Trap::NullReference`] for a null array; [`Trap::IndexOutOfRange`] if an index is out of
+/// range (or the rank does not match).
+pub fn md_array_set(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(array)) = args.first() else {
+        return Err(Trap::NullReference);
+    };
+    let split = args.len().saturating_sub(1);
+    let indices = int_indices(&args[1..split]);
+    let value = args.get(split).cloned().unwrap_or(Value::Null);
+    if vm.heap_mut().md_array_set(array, &indices, value) {
+        Ok(None)
+    } else {
+        Err(Trap::IndexOutOfRange(indices.first().copied().unwrap_or(0)))
+    }
+}
+
+/// The integer indices of a multi-dimensional array access (int32 / native-int values).
+fn int_indices(values: &[Value]) -> Vec<i32> {
+    values
+        .iter()
+        .map(|value| match value {
+            Value::Int32(n) => *n,
+            Value::Int64(n) | Value::NativeInt(n) => *n as i32,
+            _ => 0,
+        })
+        .collect()
+}
+
+/// `Array::get_Length` (the `Length` property): the total number of elements.
+///
+/// # Errors
+/// [`Trap::NullReference`] for a null array.
+pub fn md_array_length(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(array)) = args.first() else {
+        return Err(Trap::NullReference);
+    };
+    let length = i32::try_from(vm.heap().array_len(array).unwrap_or(0)).unwrap_or(i32::MAX);
+    Ok(Some(Value::Int32(length)))
+}
+
+/// `Array::GetLength(dim)`: the length of the given dimension.
+///
+/// # Errors
+/// [`Trap::NullReference`] for a null array.
+pub fn md_array_get_length(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(array)) = args.first() else {
+        return Err(Trap::NullReference);
+    };
+    let dim = match args.get(1) {
+        Some(Value::Int32(n)) => *n,
+        _ => 0,
+    };
+    Ok(Some(Value::Int32(
+        vm.heap().array_dimension(array, dim).unwrap_or(0),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

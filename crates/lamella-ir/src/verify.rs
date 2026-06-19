@@ -182,6 +182,9 @@ fn check_inst(
             use_value(func, defined, *base, errors);
             use_value(func, defined, *value, errors);
         }
+        Inst::FieldAddr { base, .. } => {
+            use_value(func, defined, *base, errors);
+        }
         Inst::CopyStruct { src } => {
             use_value(func, defined, *src, errors);
         }

@@ -359,9 +359,27 @@ impl ImageBuilder {
         Token::new(table::METHOD_DEF, row)
     }
 
-    /// Adds an abstract `MethodDef` (RVA 0, no body) -- an interface method or an
-    /// abstract class method. `flags` carries Abstract | Virtual.
+    /// Adds an abstract `MethodDef` (RVA 0, no body, IL impl) -- an interface method or
+    /// an abstract class method. `flags` carries Abstract | Virtual.
     pub fn add_abstract_method(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {
+        self.add_bodyless_method(name, signature, flags, 0)
+    }
+
+    /// Adds a runtime-implemented `MethodDef` (RVA 0, no body, `Runtime` impl) -- a
+    /// delegate's `.ctor` or `Invoke`, whose body the runtime supplies.
+    pub fn add_runtime_method(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {
+        self.add_bodyless_method(name, signature, flags, 0x0003)
+    }
+
+    /// A `MethodDef` with no IL body (RVA 0); `impl_flags` is 0 (IL/abstract) or
+    /// `0x0003` (`Runtime`).
+    fn add_bodyless_method(
+        &mut self,
+        name: &str,
+        signature: &[u8],
+        flags: u16,
+        impl_flags: u16,
+    ) -> Token {
         let name = self.strings.intern(name);
         let signature = self.blobs.intern(signature);
         let first_param = self.tables.row_count(table::PARAM) + 1;
@@ -369,7 +387,7 @@ impl ImageBuilder {
             table::METHOD_DEF,
             alloc::vec![
                 Column::U32(0),
-                Column::U16(0),
+                Column::U16(impl_flags),
                 Column::U16(flags),
                 Column::StringRef(name),
                 Column::BlobRef(signature),
