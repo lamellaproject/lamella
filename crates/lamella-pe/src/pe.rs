@@ -50,16 +50,57 @@ pub fn write_pe(metadata: &[u8], entry_point_token: u32, is_dll: bool) -> Vec<u8
     write_image(&text, is_dll)
 }
 
+/// The size of one `IMAGE_DEBUG_DIRECTORY` entry (II PE/COFF).
+const DEBUG_DIRECTORY_SIZE: u32 = 28;
+
 /// Writes the PE headers around a prebuilt `.text` section whose CLI header sits
 /// at its start (so the COM-descriptor directory points at [`TEXT_RVA`]).
 #[must_use]
 pub fn write_image(text: &[u8], is_dll: bool) -> Vec<u8> {
-    let text_virtual_size = text.len() as u32;
-    let text_raw_size = align(text_virtual_size, FILE_ALIGNMENT);
+    write_image_with_debug(text, is_dll, None)
+}
 
+/// Builds one `IMAGE_DEBUG_DIRECTORY` entry of type `CODEVIEW` (2), addressing the
+/// CodeView record by both RVA and file offset.
+fn debug_directory_entry(
+    address_of_raw_data: u32,
+    pointer_to_raw_data: u32,
+    size_of_data: u32,
+) -> [u8; DEBUG_DIRECTORY_SIZE as usize] {
+    let mut entry = [0u8; DEBUG_DIRECTORY_SIZE as usize];
+    put_u32(&mut entry, 12, 2);
+    put_u32(&mut entry, 16, size_of_data);
+    put_u32(&mut entry, 20, address_of_raw_data);
+    put_u32(&mut entry, 24, pointer_to_raw_data);
+    entry
+}
+
+/// Writes the PE headers around `text`, optionally appending a debug directory and
+/// `codeview` record (an `RSDS` blob) so a debugger can find and match the PDB.
+#[must_use]
+pub fn write_image_with_debug(text: &[u8], is_dll: bool, codeview: Option<&[u8]>) -> Vec<u8> {
     let optional_start = (PE_OFFSET + 4 + 20) as usize;
     let headers_end = optional_start as u32 + OPTIONAL_HEADER_SIZE + 40;
     let size_of_headers = align(headers_end, FILE_ALIGNMENT);
+
+    let mut body = Vec::from(text);
+    let mut debug_directory = None;
+    if let Some(codeview) = codeview {
+        let entry_offset = body.len() as u32;
+        let data_offset = entry_offset + DEBUG_DIRECTORY_SIZE;
+        let entry = debug_directory_entry(
+            TEXT_RVA + data_offset,
+            size_of_headers + data_offset,
+            codeview.len() as u32,
+        );
+        body.extend_from_slice(&entry);
+        body.extend_from_slice(codeview);
+        debug_directory = Some((TEXT_RVA + entry_offset, DEBUG_DIRECTORY_SIZE));
+    }
+
+    let text = body.as_slice();
+    let text_virtual_size = text.len() as u32;
+    let text_raw_size = align(text_virtual_size, FILE_ALIGNMENT);
     let size_of_image = align(TEXT_RVA + text_virtual_size, SECTION_ALIGNMENT);
 
     let mut out = vec![0u8; size_of_headers as usize];
@@ -98,6 +139,11 @@ pub fn write_image(text: &[u8], is_dll: bool) -> Vec<u8> {
     let cli_directory = opt + 0x60 + 14 * 8;
     put_u32(&mut out, cli_directory, TEXT_RVA);
     put_u32(&mut out, cli_directory + 4, CLI_HEADER_SIZE);
+    if let Some((rva, size)) = debug_directory {
+        let debug = opt + 0x60 + 6 * 8;
+        put_u32(&mut out, debug, rva);
+        put_u32(&mut out, debug + 4, size);
+    }
 
     let section = opt + OPTIONAL_HEADER_SIZE as usize;
     out[section..section + 5].copy_from_slice(b".text");

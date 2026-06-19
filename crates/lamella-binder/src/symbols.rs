@@ -22,6 +22,22 @@ pub enum TypeKind {
     Delegate,
 }
 
+/// A member's declared accessibility (10.5.1). The default for a class member is
+/// [`Accessibility::Private`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Accessibility {
+    /// `public` -- accessible everywhere.
+    Public,
+    /// `protected` -- the declaring type and its derived types.
+    Protected,
+    /// `internal` -- the declaring assembly.
+    Internal,
+    /// `protected internal` -- protected or internal.
+    ProtectedInternal,
+    /// `private` -- the declaring type only.
+    Private,
+}
+
 /// A field of a type (17.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldSymbol {
@@ -31,6 +47,8 @@ pub struct FieldSymbol {
     pub ty: TypeSymbol,
     /// Whether the field is `static`.
     pub is_static: bool,
+    /// The field's accessibility.
+    pub accessibility: Accessibility,
 }
 
 /// A property of a type (17.6), reduced to its name and type.
@@ -42,6 +60,8 @@ pub struct PropertySymbol {
     pub ty: TypeSymbol,
     /// Whether the property is `static`.
     pub is_static: bool,
+    /// The property's accessibility.
+    pub accessibility: Accessibility,
 }
 
 /// A method of a type (17.5), reduced to what overload resolution needs.
@@ -55,6 +75,8 @@ pub struct MethodSymbol {
     pub parameters: Vec<TypeSymbol>,
     /// Whether the method is `static`.
     pub is_static: bool,
+    /// The method's accessibility.
+    pub accessibility: Accessibility,
 }
 
 /// A named type with its members.
@@ -239,24 +261,28 @@ mod tests {
             name: "count".into(),
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
+            accessibility: Accessibility::Public,
         });
         info.methods.push(MethodSymbol {
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
             is_static: false,
+            accessibility: Accessibility::Public,
         });
         info.methods.push(MethodSymbol {
             name: "Scale".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Int32)],
             is_static: false,
+            accessibility: Accessibility::Public,
         });
         info.methods.push(MethodSymbol {
             name: "Scale".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Double)],
             is_static: false,
+            accessibility: Accessibility::Public,
         });
         info
     }

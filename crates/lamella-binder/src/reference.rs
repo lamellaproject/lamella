@@ -1,7 +1,7 @@
 //! Loading a reference assembly's types into the binder's [`Model`].
 
 use crate::special::SpecialType;
-use crate::symbols::{FieldSymbol, MethodSymbol, Model, TypeInfo, TypeKind};
+use crate::symbols::{Accessibility, FieldSymbol, MethodSymbol, Model, TypeInfo, TypeKind};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -48,6 +48,7 @@ fn type_info(assembly: &Assembly, type_def: &lamella_metadata::TypeDef) -> Optio
                 name: field_name.into(),
                 ty: sigtype_to_symbol(assembly, &signature),
                 is_static: false,
+                accessibility: Accessibility::Public,
             });
         }
     }
@@ -64,6 +65,7 @@ fn type_info(assembly: &Assembly, type_def: &lamella_metadata::TypeDef) -> Optio
                 .map(|parameter| sigtype_to_symbol(assembly, parameter))
                 .collect(),
             is_static: !signature.has_this,
+            accessibility: Accessibility::Public,
         };
         if method_name == ".ctor" {
             info.constructors.push(symbol);

@@ -1,0 +1,11 @@
+[package]
+name = "lamella-debug-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The DebugBackend trait: the seam a debug target implements behind the DAP adapter."
+
+[lints]
+workspace = true

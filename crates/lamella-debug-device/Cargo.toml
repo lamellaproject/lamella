@@ -1,0 +1,15 @@
+[package]
+name = "lamella-debug-device"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "An on-device DebugBackend: drives a halted Cortex-M target over the Lamella CMSIS-DAP stack, so the lamella-dap adapter (and VS Code) can debug AOT-compiled code on real hardware."
+
+[lints]
+workspace = true
+
+[dependencies]
+lamella-debug-backend = { path = "../lamella-debug-backend" }
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }

@@ -4,12 +4,16 @@ use crate::heap::compress_u32;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+use lamella_metadata::CodedIndex;
 use lamella_metadata::signature::{calling, element};
+use lamella_token::Token;
 
 /// The leading byte of a `DEFAULT` (non-instance) method signature (II.23.2.1).
 const DEFAULT: u8 = 0x00;
 /// The leading byte of a local-variable signature (II.23.2.6).
 const LOCAL_SIG: u8 = 0x07;
+/// The leading byte of a property signature (II.23.2.5).
+const PROPERTY: u8 = 0x08;
 
 /// A type as it appears in a signature blob (II.23.2.12).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,10 +48,10 @@ pub enum TypeSig {
     String,
     /// `object`.
     Object,
-    /// A reference type, carrying its `TypeDefOrRef` coded index.
-    Class(u32),
-    /// A value type, carrying its `TypeDefOrRef` coded index.
-    ValueType(u32),
+    /// A reference type, carrying the token of its `TypeDef`/`TypeRef`.
+    Class(Token),
+    /// A value type, carrying the token of its `TypeDef`/`TypeRef`.
+    ValueType(Token),
     /// A single-dimension zero-based array of the element type.
     SzArray(Box<TypeSig>),
 }
@@ -69,13 +73,13 @@ fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
         TypeSig::Double => out.push(element::R8),
         TypeSig::String => out.push(element::STRING),
         TypeSig::Object => out.push(element::OBJECT),
-        TypeSig::Class(coded) => {
+        TypeSig::Class(token) => {
             out.push(element::CLASS);
-            compress_u32(*coded, out);
+            compress_u32(CodedIndex::TypeDefOrRef.encode(*token), out);
         }
-        TypeSig::ValueType(coded) => {
+        TypeSig::ValueType(token) => {
             out.push(element::VALUETYPE);
-            compress_u32(*coded, out);
+            compress_u32(CodedIndex::TypeDefOrRef.encode(*token), out);
         }
         TypeSig::SzArray(elem) => {
             out.push(element::SZARRAY);
@@ -117,6 +121,20 @@ pub fn field_signature(field_type: &TypeSig) -> Vec<u8> {
     out
 }
 
+/// Encodes a property signature (II.23.2.5): the `PROPERTY` convention (with the
+/// instance flag), zero index parameters, then the property type.
+#[must_use]
+pub fn property_signature(has_this: bool, property_type: &TypeSig) -> Vec<u8> {
+    let mut out = vec![if has_this {
+        PROPERTY | calling::HAS_THIS
+    } else {
+        PROPERTY
+    }];
+    compress_u32(0, &mut out);
+    encode_type(property_type, &mut out);
+    out
+}
+
 /// Encodes a local-variable signature: the locals of a method body, in slot order
 /// (II.23.2.6).
 #[must_use]
@@ -142,7 +160,10 @@ mod tests {
             type_signature(&TypeSig::SzArray(Box::new(TypeSig::Int32))),
             [0x1D, 0x08]
         );
-        assert_eq!(type_signature(&TypeSig::Class(0x49)), [0x12, 0x49]);
+        assert_eq!(
+            type_signature(&TypeSig::Class(Token::new(0x02, 18))),
+            [0x12, 0x48]
+        );
     }
 
     #[test]

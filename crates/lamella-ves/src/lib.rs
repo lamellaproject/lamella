@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod interp;
+#[cfg(feature = "bcl")]
 pub mod intrinsics;
 pub mod module;
 pub mod object;

@@ -152,6 +152,9 @@ fn check_inst(
             use_value(func, defined, *address, errors);
             use_value(func, defined, *value, errors);
         }
+        Inst::Load { address } => {
+            use_value(func, defined, *address, errors);
+        }
     }
 }
 

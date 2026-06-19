@@ -113,7 +113,7 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, Message::Event(e) if e.event == "terminated"))
         );
-        assert_eq!(debugger.vm().output_string(), "hi\n");
+        assert_eq!(debugger.output_string(), "hi\n");
     }
 
     #[test]

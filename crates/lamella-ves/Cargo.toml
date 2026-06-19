@@ -11,5 +11,17 @@ description = "The Lamella virtual execution system: a CIL interpreter implement
 lamella-cil = { path = "../lamella-cil" }
 lamella-token = { path = "../lamella-token" }
 
+[features]
+default = ["bcl", "exceptions"]
+# The BCL intrinsics (System.Console / System.String / Object..ctor). Off => the
+# minimal interpreter core (arithmetic, control flow, the object model) with no BCL
+# surface -- the smallest build for a constrained target. The runtime side of a
+# capability-profile surface knob.
+bcl = []
+# Structured exception handling (throw / try-catch / finally). Off => those opcodes
+# are unsupported and the unwinder is stripped under LTO -- the smallest tier, where a
+# fault terminates rather than unwinds. A capability-profile knob.
+exceptions = []
+
 [lints]
 workspace = true

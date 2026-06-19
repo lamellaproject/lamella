@@ -9,6 +9,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "lamella-alloc"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-aot"
 version = "0.0.0"
 dependencies = [
@@ -51,16 +55,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-cmsis-dap"
+version = "0.0.0"
+dependencies = [
+ "lamella-usbhid",
+]
+
+[[package]]
 name = "lamella-dap"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-debug-backend",
  "lamella-load",
  "lamella-metadata",
  "lamella-token",
  "lamella-ves",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "lamella-debug-backend"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-debug-device"
+version = "0.0.0"
+dependencies = [
+ "lamella-cmsis-dap",
+ "lamella-debug-backend",
 ]
 
 [[package]]
@@ -103,6 +127,10 @@ version = "0.0.0"
 
 [[package]]
 name = "lamella-token"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-usbhid"
 version = "0.0.0"
 
 [[package]]

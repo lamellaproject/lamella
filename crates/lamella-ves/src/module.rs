@@ -5,7 +5,8 @@ use crate::interp::Vm;
 use crate::trap::Trap;
 use crate::value::Value;
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_cil::MethodBodyImage;
 use lamella_token::Token;
@@ -27,6 +28,10 @@ struct TypeInfo {
     vtable: Box<[MethodId]>,
     /// The base type, for subtype checks (`None` for an Object/external base).
     base: Option<TypeId>,
+    /// This type's virtual / interface-implementing methods (including inherited)
+    /// keyed by a signature key (name + parameter types), for interface and
+    /// abstract-method dispatch where the static target carries no vtable slot.
+    sig_methods: BTreeMap<String, MethodId>,
 }
 
 /// A native (runtime-implemented) method: the intrinsic ABI.
@@ -82,6 +87,9 @@ pub struct Module {
     method_type: BTreeMap<MethodId, TypeId>,
     /// An `ldfld`/`stfld` field token mapped to its instance-field slot.
     field_slots: BTreeMap<u32, u32>,
+    /// An instance-field token mapped to its declaring type, so a `stfld` through a
+    /// managed pointer can size the value-type instance it materializes.
+    field_types: BTreeMap<u32, TypeId>,
     /// A `newarr` element-type token mapped to its elements' zero value.
     array_defaults: BTreeMap<u32, Value>,
     /// A virtual method's vtable slot (only virtual methods appear).
@@ -94,6 +102,16 @@ pub struct Module {
     static_ctors: Vec<MethodId>,
     /// A `TypeDef` token mapped to its [`TypeId`] (for `castclass` / `isinst`).
     type_tokens: BTreeMap<u32, TypeId>,
+    /// A `callvirt` token mapped to its target's `(signature key, arg count)`, for
+    /// dispatching interface / abstract methods whose target has no vtable slot (and
+    /// may have no resolvable body).
+    call_targets: BTreeMap<u32, (String, u16)>,
+    /// `newobj` tokens that construct a delegate (a delegate type's `.ctor`): instead
+    /// of running a constructor, the (target, method) on the stack become a delegate.
+    delegate_ctors: BTreeSet<u32>,
+    /// A delegate type's `Invoke` token mapped to its parameter count, so `callvirt` on
+    /// it calls the delegate's bound method with the bound target.
+    delegate_invokes: BTreeMap<u32, u16>,
 }
 
 impl Module {
@@ -157,6 +175,7 @@ impl Module {
             field_defaults: field_defaults.into_boxed_slice(),
             vtable: Box::default(),
             base: None,
+            sig_methods: BTreeMap::new(),
         });
         id
     }
@@ -170,6 +189,17 @@ impl Module {
     /// Binds an `ldfld`/`stfld` field token to its instance-field slot.
     pub fn bind_field(&mut self, token: Token, slot: u32) {
         self.field_slots.insert(token.0, slot);
+    }
+
+    /// Records the declaring type of an instance-field token.
+    pub fn bind_field_type(&mut self, token: Token, type_id: TypeId) {
+        self.field_types.insert(token.0, type_id);
+    }
+
+    /// The declaring type of a field token, if recorded.
+    #[must_use]
+    pub fn field_type(&self, token: Token) -> Option<TypeId> {
+        self.field_types.get(&token.0).copied()
     }
 
     /// The declaring type of `method`, if recorded.
@@ -208,7 +238,7 @@ impl Module {
     /// The zero value of a `newarr` element-type token's elements, if bound.
     #[must_use]
     pub fn array_default(&self, token: Token) -> Option<Value> {
-        self.array_defaults.get(&token.0).copied()
+        self.array_defaults.get(&token.0).cloned()
     }
 
     /// Sets `type_id`'s virtual method table (slot -> implementation).
@@ -301,5 +331,60 @@ impl Module {
             }
         }
         false
+    }
+
+    /// Records `type_id`'s methods keyed by signature, for interface / abstract
+    /// dispatch (the map should include inherited methods).
+    pub fn set_sig_methods(&mut self, type_id: TypeId, methods: BTreeMap<String, MethodId>) {
+        if let Some(info) = self.types.get_mut(type_id as usize) {
+            info.sig_methods = methods;
+        }
+    }
+
+    /// The method of `type_id` matching `sig_key` -- the `callvirt` target for an
+    /// interface or abstract method on a `this` of that runtime type.
+    #[must_use]
+    pub fn sig_dispatch(&self, type_id: TypeId, sig_key: &str) -> Option<MethodId> {
+        self.types
+            .get(type_id as usize)?
+            .sig_methods
+            .get(sig_key)
+            .copied()
+    }
+
+    /// Records a `callvirt` token's target signature key and argument count, for
+    /// dispatching a method with no vtable slot / no resolvable body.
+    pub fn bind_call_target(&mut self, token: Token, sig_key: String, arg_count: u16) {
+        self.call_targets.insert(token.0, (sig_key, arg_count));
+    }
+
+    /// A `callvirt` token's target signature key and argument count, if recorded.
+    #[must_use]
+    pub fn call_target(&self, token: Token) -> Option<(&str, u16)> {
+        self.call_targets
+            .get(&token.0)
+            .map(|(key, count)| (key.as_str(), *count))
+    }
+
+    /// Marks `token` as a delegate constructor, so `newobj` on it builds a delegate.
+    pub fn mark_delegate_ctor(&mut self, token: Token) {
+        self.delegate_ctors.insert(token.0);
+    }
+
+    /// Whether `token` constructs a delegate.
+    #[must_use]
+    pub fn is_delegate_ctor(&self, token: Token) -> bool {
+        self.delegate_ctors.contains(&token.0)
+    }
+
+    /// Marks `token` as a delegate `Invoke` taking `param_count` parameters.
+    pub fn mark_delegate_invoke(&mut self, token: Token, param_count: u16) {
+        self.delegate_invokes.insert(token.0, param_count);
+    }
+
+    /// The parameter count of the delegate `Invoke` named by `token`, if it is one.
+    #[must_use]
+    pub fn delegate_invoke(&self, token: Token) -> Option<u16> {
+        self.delegate_invokes.get(&token.0).copied()
     }
 }

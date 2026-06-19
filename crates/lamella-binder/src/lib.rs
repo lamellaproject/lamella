@@ -21,10 +21,11 @@ pub mod types;
 
 pub use bind::bind_type;
 pub use bound::{
-    Binder, BoundExpr, BoundExprKind, ConversionKind, MethodReference, bind_expression,
+    Binder, BoundExpr, BoundExprKind, ConversionKind, FieldReference, MethodReference,
+    bind_expression,
 };
 pub use conversion::has_implicit_conversion;
-pub use declaration::{collect_model, collect_types};
+pub use declaration::{collect_into, collect_model, collect_types};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use flow::{always_exits, check_definite_assignment};
 pub use program::{

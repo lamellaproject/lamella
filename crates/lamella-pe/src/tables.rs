@@ -61,6 +61,7 @@ pub enum Column {
 #[derive(Default, Debug)]
 pub struct TableStream {
     rows: BTreeMap<u8, Vec<Vec<Column>>>,
+    sorted: u64,
 }
 
 impl TableStream {
@@ -75,6 +76,14 @@ impl TableStream {
         let rows = self.rows.entry(table).or_default();
         rows.push(columns);
         rows.len() as u32
+    }
+
+    /// Records that `table` is emitted in sorted key order, so its bit is set in the
+    /// `#~` sorted mask. Some readers reject a sorted-by-spec table (e.g. the PDB's
+    /// `LocalScope`) that does not claim it. The caller must actually add the rows
+    /// in order.
+    pub fn mark_sorted(&mut self, table: u8) {
+        self.sorted |= 1u64 << table;
     }
 
     /// The number of rows in `table`.
@@ -101,7 +110,7 @@ impl TableStream {
         out.push(heaps.flags());
         out.push(1);
         out.extend_from_slice(&valid.to_le_bytes());
-        out.extend_from_slice(&0u64.to_le_bytes());
+        out.extend_from_slice(&(self.sorted & valid).to_le_bytes());
 
         for table in 0u8..64 {
             if valid & (1u64 << table) != 0 {

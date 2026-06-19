@@ -139,6 +139,10 @@ fn lower_inst(
             enc.str_imm(assign(*value), assign(*address), 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::Load { address } => {
+            enc.ldr_imm(assign(result), assign(*address), 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
         Inst::Call { .. } => return Err(LowerError::CallUnsupported),
     }
     Ok(())
@@ -261,6 +265,12 @@ fn lower_spilled_inst(
             enc.str_imm(Reg::R1, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::Load { address } => {
+            enc.ldr_sp(Reg::R0, slot(*address))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R0, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
     }
     Ok(())
 }
@@ -274,6 +284,8 @@ fn lower_spilled_into(
     func: &Function,
     enc: &mut Encoder,
     func_labels: &[Label],
+    source_map: &[Vec<u32>],
+    line_table: &mut Vec<(u32, u32)>,
 ) -> Result<(), LowerError> {
     let has_calls = func
         .blocks
@@ -314,10 +326,16 @@ fn lower_spilled_into(
 
     for (index, block) in func.blocks.iter().enumerate() {
         enc.bind_label(block_labels[index]);
-        for (result, inst) in &block.insts {
+        for (inst_pos, (result, inst)) in block.insts.iter().enumerate() {
+            if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
+                line_table.push((enc.position(), cil));
+            }
             lower_spilled_inst(enc, &mut pool, &slot, inst, func_labels)?;
             enc.str_sp(Reg::R0, slot(*result))
                 .map_err(|_| LowerError::TooManyValues)?;
+        }
+        if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
+            line_table.push((enc.position(), cil));
         }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
@@ -489,6 +507,8 @@ fn lower_into(
     regs: &[Reg],
     saved: u8,
     func_labels: &[Label],
+    source_map: &[Vec<u32>],
+    line_table: &mut Vec<(u32, u32)>,
 ) -> Result<(), LowerError> {
     let assign = |v: ValueId| regs.get(v.index()).copied().unwrap_or(Reg::R0);
     let has_calls = func
@@ -522,7 +542,10 @@ fn lower_into(
         } else {
             &block.insts[..]
         };
-        for (result, inst) in body {
+        for (inst_pos, (result, inst)) in body.iter().enumerate() {
+            if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
+                line_table.push((enc.position(), cil));
+            }
             if let Inst::Call { callee, args } = inst {
                 lower_call(enc, &assign, *result, *callee, args, func_labels)?;
             } else {
@@ -530,6 +553,9 @@ fn lower_into(
             }
         }
 
+        if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
+            line_table.push((enc.position(), cil));
+        }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
                 if let Some(v) = value {
@@ -615,17 +641,60 @@ fn lower_into(
     Ok(())
 }
 
+/// Maps native code offsets to CIL instruction indices, ascending by offset, so a
+/// debugger can take a native PC and recover the CIL instruction being executed. Built
+/// by [`lower_debug`] from a `cil::CilSourceMap`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineTable(pub Vec<(u32, u32)>);
+
+impl LineTable {
+    /// The CIL instruction index whose native code contains `offset` -- the last entry
+    /// at or before it, or `None` if `offset` precedes all code.
+    pub fn cil_index_at(&self, offset: u32) -> Option<u32> {
+        self.0
+            .iter()
+            .rev()
+            .find(|&&(start, _)| start <= offset)
+            .map(|&(_, cil)| cil)
+    }
+}
+
 /// Lowers a single function to ARM32 machine code. A function that calls another
 /// must go through [`lower_module`], which resolves the call targets.
 pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
     let mut enc = Encoder::new();
+    let mut _lines = Vec::new();
     match prepare(func)? {
-        Assignment::Registers { regs, saved } => lower_into(func, &mut enc, &regs, saved, &[])?,
-        Assignment::Spilled => lower_spilled_into(func, &mut enc, &[])?,
+        Assignment::Registers { regs, saved } => {
+            lower_into(func, &mut enc, &regs, saved, &[], &[], &mut _lines)?
+        }
+        Assignment::Spilled => lower_spilled_into(func, &mut enc, &[], &[], &mut _lines)?,
     }
     enc.finish()
         .map(|assembled| assembled.bytes)
         .map_err(|_| LowerError::CodeTooLarge)
+}
+
+/// Lowers a function and also returns a [`LineTable`] mapping native code offsets to the
+/// CIL instruction indices in `source_map` (from `cil::lower_method_debug`), so a native
+/// PC recovers to a CIL position.
+pub fn lower_debug(
+    func: &Function,
+    source_map: &[Vec<u32>],
+) -> Result<(Vec<u8>, LineTable), LowerError> {
+    let mut enc = Encoder::new();
+    let mut lines = Vec::new();
+    match prepare(func)? {
+        Assignment::Registers { regs, saved } => {
+            lower_into(func, &mut enc, &regs, saved, &[], source_map, &mut lines)?
+        }
+        Assignment::Spilled => lower_spilled_into(func, &mut enc, &[], source_map, &mut lines)?,
+    }
+    let bytes = enc
+        .finish()
+        .map(|assembled| assembled.bytes)
+        .map_err(|_| LowerError::CodeTooLarge)?;
+    Ok((bytes, LineTable(lines)))
 }
 
 /// Lowers a whole program -- several functions concatenated into one image, the
@@ -634,13 +703,16 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
 pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
+    let mut _lines = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
         enc.bind_label(func_labels[index]);
         match prepare(func)? {
             Assignment::Registers { regs, saved } => {
-                lower_into(func, &mut enc, &regs, saved, &func_labels)?;
+                lower_into(func, &mut enc, &regs, saved, &func_labels, &[], &mut _lines)?;
             }
-            Assignment::Spilled => lower_spilled_into(func, &mut enc, &func_labels)?,
+            Assignment::Spilled => {
+                lower_spilled_into(func, &mut enc, &func_labels, &[], &mut _lines)?;
+            }
         }
     }
     enc.finish()
@@ -729,6 +801,54 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         let bytes = lower(&func).unwrap();
         assert!(bytes.windows(2).any(|w| w[1] == 0x60));
+    }
+
+    #[test]
+    fn lowers_an_mmio_load() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::ConstInt { ty: MirType::I32, value: 0x5000_0510 }),
+                    (ValueId(1), Inst::Load { address: ValueId(0) }),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(bytes.windows(2).any(|w| w[1] == 0x68));
+    }
+
+    #[test]
+    fn lower_debug_builds_a_line_table() {
+        let func = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::ConstInt { ty: MirType::I32, value: 0x5000_0508 }),
+                    (ValueId(1), Inst::ConstInt { ty: MirType::I32, value: 0x2000 }),
+                    (ValueId(2), Inst::Store { address: ValueId(0), value: ValueId(1) }),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let source_map = vec![vec![2u32, 4, 6]];
+        let (bytes, table) = lower_debug(&func, &source_map).unwrap();
+        assert!(!bytes.is_empty());
+        assert_eq!(table.0.first().map(|&(_, cil)| cil), Some(2));
+        assert!(table.0.windows(2).all(|w| w[0].0 <= w[1].0));
+        assert!(table.0.iter().all(|&(_, cil)| matches!(cil, 2 | 4 | 6)));
+        let first = table.0.first().unwrap().0;
+        assert_eq!(table.cil_index_at(first), Some(2));
     }
 
     #[test]

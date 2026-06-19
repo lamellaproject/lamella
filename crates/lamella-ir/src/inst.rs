@@ -101,4 +101,10 @@ pub enum Inst {
         /// The value to write there.
         value: ValueId,
     },
+    /// Loads the 32-bit value at the memory address held in `address` -- the
+    /// memory-mapped-I/O read primitive. The instruction's result is the loaded value.
+    Load {
+        /// The value holding the source address.
+        address: ValueId,
+    },
 }

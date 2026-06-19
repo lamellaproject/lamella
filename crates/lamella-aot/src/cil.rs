@@ -26,7 +26,7 @@ pub enum CilError {
 /// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`] by abstract
 /// interpretation: the CIL is split into basic blocks, the evaluation stack and
 /// locals are tracked per block, and join points (merges) become block parameters.
-pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
+fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap), CilError> {
     let code = &body.code;
     let blocks = control_flow::discover_blocks(code);
     let preds = control_flow::predecessors(code, &blocks);
@@ -59,6 +59,7 @@ pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
     }
 
     let mut mir_blocks: Vec<BasicBlock> = Vec::with_capacity(blocks.len());
+    let mut source_map: Vec<Vec<u32>> = Vec::with_capacity(blocks.len());
     let mut exit_locals: Vec<Vec<Option<ValueId>>> = vec![Vec::new(); blocks.len()];
 
     for (b, &(start, end)) in blocks.iter().enumerate() {
@@ -80,11 +81,13 @@ pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
 
         let mut stack: Vec<ValueId> = Vec::new();
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+        let mut il_index: Vec<u32> = Vec::new();
         let mut terminator: Option<Terminator> = None;
 
         for i in start..end {
             let inst = &code[i];
             let is_last = i + 1 == end;
+            let before = insts.len();
             if is_last && inst.opcode == Opcode::Ret {
                 terminator = Some(Terminator::Return(stack.pop()));
             } else if is_last && control_flow::branch_kind(inst.opcode).is_some() {
@@ -109,6 +112,9 @@ pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
                     &mut insts,
                 )?;
             }
+            for _ in before..insts.len() {
+                il_index.push(i as u32);
+            }
         }
 
         let terminator = match terminator {
@@ -132,12 +138,17 @@ pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
             }
         };
 
+        while il_index.len() < insts.len() {
+            il_index.push(end.saturating_sub(1) as u32);
+        }
+
         exit_locals[b] = locals.clone();
         mir_blocks.push(BasicBlock {
             params: block_params[b].clone(),
             insts,
             terminator: Some(terminator),
         });
+        source_map.push(il_index);
     }
 
     let ret = mir_blocks.iter().find_map(|blk| match &blk.terminator {
@@ -145,13 +156,33 @@ pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
         _ => None,
     });
 
-    Ok(Function {
+    let function = Function {
         params: (0..arg_count).map(|_| MirType::I32).collect(),
         ret,
         value_types,
         entry: BlockId(0),
         blocks: mir_blocks,
-    })
+    };
+    Ok((function, CilSourceMap(source_map)))
+}
+
+/// The CIL instruction index each MIR instruction was lowered from, indexed by block
+/// then by instruction within the block -- the lowering's half of the native-to-source
+/// mapping. The target lowering pairs these with native code offsets to build a line
+/// table; the compiler's sequence points then carry a CIL offset to a source line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CilSourceMap(pub Vec<Vec<u32>>);
+
+/// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`]. See
+/// [`lower_method_debug`] for the accompanying [`CilSourceMap`].
+pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
+    lower_with_source(body).map(|(function, _)| function)
+}
+
+/// Lowers a method body, also returning the [`CilSourceMap`] tying each MIR
+/// instruction back to the CIL instruction it came from.
+pub fn lower_method_debug(body: &MethodBodyImage) -> Result<(Function, CilSourceMap), CilError> {
+    lower_with_source(body)
 }
 
 /// Defines a fresh MIR value of `ty` and returns its id.
@@ -343,6 +374,12 @@ fn apply_value_op(
             let address = stack.pop().ok_or(CilError::StackUnderflow)?;
             let result = new_value(value_types, MirType::I32);
             insts.push((result, Inst::Store { address, value }));
+        }
+        Opcode::LdindI4 | Opcode::LdindU4 => {
+            let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::I32);
+            insts.push((result, Inst::Load { address }));
+            stack.push(result);
         }
         other => return Err(CilError::Unsupported(other)),
     }

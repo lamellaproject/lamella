@@ -28,15 +28,16 @@ impl Frame {
         Frame::default()
     }
 
-    /// Builds the frame for a method: the parameters in order, then the locals the
-    /// body declares.
+    /// Builds the frame for a method: the parameters in order from `arg_base` (1
+    /// for an instance method, whose argument 0 is `this`; 0 for a static method),
+    /// then the locals the body declares.
     #[must_use]
-    pub fn build(parameters: &[Box<str>], body: &BoundStmt) -> Frame {
+    pub fn build(parameters: &[Box<str>], body: &BoundStmt, arg_base: u16) -> Frame {
         let mut frame = Frame::default();
         for (index, name) in parameters.iter().enumerate() {
             frame
                 .slots
-                .insert(name.clone(), Slot::Argument(index as u16));
+                .insert(name.clone(), Slot::Argument(index as u16 + arg_base));
         }
         frame.collect_locals(body);
         frame
@@ -58,6 +59,19 @@ impl Frame {
     #[must_use]
     pub fn local_types(&self) -> &[TypeSymbol] {
         &self.local_types
+    }
+
+    /// The local-variable names in slot order, for debug info. (Parallel to
+    /// [`Frame::local_types`].)
+    #[must_use]
+    pub fn local_names(&self) -> Vec<Box<str>> {
+        let mut names = alloc::vec![Box::<str>::from(""); self.local_types.len()];
+        for (name, slot) in &self.slots {
+            if let Slot::Local(index) = slot {
+                names[*index as usize] = name.clone();
+            }
+        }
+        names
     }
 
     fn declare_local(&mut self, name: &str, ty: &TypeSymbol) {

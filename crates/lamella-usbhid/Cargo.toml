@@ -1,0 +1,11 @@
+[package]
+name = "lamella-usbhid"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cross-platform USB-HID transport (macOS, Linux, Windows) for CMSIS-DAP debug probes, implemented against each OS's native HID API with no external crates."
+
+[lints]
+workspace = true

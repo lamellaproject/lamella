@@ -10,6 +10,9 @@ description = "A Debug Adapter Protocol server over the Lamella interpreter (hos
 # Host-side debugger; std and external deps are allowed here (User-approved), unlike
 # the no_std libraries. serde_json carries the DAP JSON wire format.
 [dependencies]
+# The backend seam (the DebugBackend trait): a dependency-free leaf crate so an
+# on-device backend can implement it without pulling the interpreter or the JSON layer.
+lamella-debug-backend = { path = "../lamella-debug-backend" }
 lamella-ves = { path = "../lamella-ves" }
 # disassemble renders CIL opcodes/operands.
 lamella-cil = { path = "../lamella-cil" }

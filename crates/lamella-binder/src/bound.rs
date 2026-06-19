@@ -6,7 +6,7 @@ use crate::conversion::{can_cast, converts};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::resolve::{TypeTable, resolve_type};
 use crate::special::SpecialType;
-use crate::symbols::{MethodSymbol, Model, TypeInfo, TypeKind};
+use crate::symbols::{Accessibility, MethodSymbol, Model, TypeInfo, TypeKind};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -26,6 +26,22 @@ pub struct BoundExpr {
     pub kind: BoundExprKind,
     /// The expression's type (`TypeSymbol::Error` when binding failed).
     pub ty: TypeSymbol,
+}
+
+/// The field an access resolved to, recorded so emission can name it with a
+/// metadata token and choose `ldfld`/`stfld` versus `ldsfld`/`stsfld`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldReference {
+    /// The type that declares the field.
+    pub declaring_type: TypeSymbol,
+    /// The field name.
+    pub name: Box<str>,
+    /// The field's type.
+    pub ty: TypeSymbol,
+    /// Whether the field is `static`.
+    pub is_static: bool,
+    /// The field's accessibility.
+    pub accessibility: Accessibility,
 }
 
 /// The method an invocation resolved to, recorded so emission can name it with a
@@ -80,6 +96,8 @@ pub enum BoundExprKind {
         receiver: Box<BoundExpr>,
         /// The field name.
         name: Box<str>,
+        /// The resolved field, recorded for emission.
+        field: Option<FieldReference>,
     },
     /// Access to a property through a receiver (14.5.4); the expression's type is
     /// the property's.
@@ -123,6 +141,8 @@ pub enum BoundExprKind {
     ObjectCreation {
         /// The constructor arguments.
         arguments: Vec<BoundExpr>,
+        /// The constructor overload resolution chose, when it succeeded.
+        constructor: Option<MethodReference>,
     },
     /// A binary operation on two bound operands (14.7-14.12).
     Binary {
@@ -876,20 +896,31 @@ impl Binder {
             return error_expr();
         }
         match self.resolve_member(&receiver.ty, name) {
-            MemberResolution::Field(ty) => BoundExpr {
-                kind: BoundExprKind::FieldAccess {
-                    receiver: Box::new(receiver),
-                    name: name.into(),
-                },
+            MemberResolution::Field(field) => {
+                self.check_accessible(&field.declaring_type, field.accessibility, name, span);
+                BoundExpr {
+                    ty: field.ty.clone(),
+                    kind: BoundExprKind::FieldAccess {
+                        receiver: Box::new(receiver),
+                        name: name.into(),
+                        field: Some(field),
+                    },
+                }
+            }
+            MemberResolution::Property {
+                declaring_type,
                 ty,
-            },
-            MemberResolution::Property(ty) => BoundExpr {
-                kind: BoundExprKind::PropertyAccess {
-                    receiver: Box::new(receiver),
-                    name: name.into(),
-                },
-                ty,
-            },
+                accessibility,
+            } => {
+                self.check_accessible(&declaring_type, accessibility, name, span);
+                BoundExpr {
+                    kind: BoundExprKind::PropertyAccess {
+                        receiver: Box::new(receiver),
+                        name: name.into(),
+                    },
+                    ty,
+                }
+            }
             MemberResolution::MethodGroup => BoundExpr {
                 kind: BoundExprKind::MethodGroup {
                     receiver: Box::new(receiver),
@@ -937,7 +968,7 @@ impl Binder {
                     .iter()
                     .map(|argument| argument.ty.clone())
                     .collect();
-                self.resolve_call(&name, &candidates, &argument_types, span)
+                self.resolve_call(&name, &receiver_ty, &candidates, &argument_types, span)
                     .map(|method| MethodReference {
                         declaring_type: receiver_ty,
                         name: method.name,
@@ -966,12 +997,16 @@ impl Binder {
     fn resolve_call(
         &mut self,
         name: &str,
+        declaring: &TypeSymbol,
         candidates: &[MethodSymbol],
         argument_types: &[TypeSymbol],
         span: Span,
     ) -> Option<MethodSymbol> {
         match resolve_overload(&self.model, candidates, argument_types) {
-            OverloadResult::Resolved(method) => Some(method),
+            OverloadResult::Resolved(method) => {
+                self.check_accessible(declaring, method.accessibility, name, span);
+                Some(method)
+            }
             OverloadResult::Ambiguous => {
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::AmbiguousCall {
@@ -1050,6 +1085,7 @@ impl Binder {
             .iter()
             .map(|argument| self.bind_expression(argument))
             .collect();
+        let mut constructor = None;
         let ty = if target_ty.is_error() {
             TypeSymbol::Error
         } else {
@@ -1062,13 +1098,24 @@ impl Binder {
                         .iter()
                         .map(|argument| argument.ty.clone())
                         .collect();
-                    self.check_constructor(&target_ty, &constructors, &argument_types, span);
+                    constructor = self
+                        .check_constructor(&target_ty, &constructors, &argument_types, span)
+                        .map(|chosen| MethodReference {
+                            declaring_type: target_ty.clone(),
+                            name: ".ctor".into(),
+                            parameters: chosen.parameters,
+                            return_type: TypeSymbol::Special(SpecialType::Void),
+                            is_static: false,
+                        });
                 }
             }
             target_ty
         };
         BoundExpr {
-            kind: BoundExprKind::ObjectCreation { arguments },
+            kind: BoundExprKind::ObjectCreation {
+                arguments,
+                constructor,
+            },
             ty,
         }
     }
@@ -1081,9 +1128,9 @@ impl Binder {
         constructors: &[MethodSymbol],
         argument_types: &[TypeSymbol],
         span: Span,
-    ) {
+    ) -> Option<MethodSymbol> {
         match resolve_overload(&self.model, constructors, argument_types) {
-            OverloadResult::Resolved(_) => {}
+            OverloadResult::Resolved(constructor) => return Some(constructor),
             OverloadResult::WrongArgumentCount => self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::NoConstructor {
                     type_name: target.to_string().into(),
@@ -1108,6 +1155,42 @@ impl Binder {
                 span,
             )),
         }
+        None
+    }
+
+    /// Whether a member of `declaring` with this accessibility is reachable from
+    /// the current context (10.5.1). Public, protected, and internal are treated
+    /// as accessible for now; `private` requires the access to be from the
+    /// declaring type itself.
+    fn is_accessible(&self, declaring: &TypeSymbol, accessibility: Accessibility) -> bool {
+        match accessibility {
+            Accessibility::Public
+            | Accessibility::Protected
+            | Accessibility::Internal
+            | Accessibility::ProtectedInternal => true,
+            Accessibility::Private => self.current_type.as_ref() == Some(declaring),
+        }
+    }
+
+    /// Reports `CS0122` when a member is not accessible from the current context.
+    fn check_accessible(
+        &mut self,
+        declaring: &TypeSymbol,
+        accessibility: Accessibility,
+        member: &str,
+        span: Span,
+    ) {
+        if !self.is_accessible(declaring, accessibility) {
+            let mut qualified = declaring.to_string();
+            qualified.push('.');
+            qualified.push_str(member);
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::Inaccessible {
+                    member: qualified.into(),
+                },
+                span,
+            ));
+        }
     }
 
     /// Looks a member up on a type, walking the base-class chain (14.3, 14.5.4).
@@ -1118,10 +1201,20 @@ impl Binder {
         }
         while let Some(info) = current {
             if let Some(field) = info.find_field(name) {
-                return MemberResolution::Field(field.ty.clone());
+                return MemberResolution::Field(FieldReference {
+                    declaring_type: type_symbol_in(&info.namespace, &info.name),
+                    name: field.name.clone(),
+                    ty: field.ty.clone(),
+                    is_static: field.is_static,
+                    accessibility: field.accessibility,
+                });
             }
             if let Some(property) = info.find_property(name) {
-                return MemberResolution::Property(property.ty.clone());
+                return MemberResolution::Property {
+                    declaring_type: type_symbol_in(&info.namespace, &info.name),
+                    ty: property.ty.clone(),
+                    accessibility: property.accessibility,
+                };
             }
             if info.methods_named(name).next().is_some() {
                 return MemberResolution::MethodGroup;
@@ -1160,22 +1253,23 @@ impl Binder {
         }
         if let Some(current) = self.current_type.clone() {
             match self.resolve_member(&current, name) {
-                MemberResolution::Field(field_ty) => {
+                MemberResolution::Field(field) => {
                     return BoundExpr {
+                        ty: field.ty.clone(),
                         kind: BoundExprKind::FieldAccess {
                             receiver: Box::new(self.this_expr()),
                             name: name.into(),
+                            field: Some(field),
                         },
-                        ty: field_ty,
                     };
                 }
-                MemberResolution::Property(property_ty) => {
+                MemberResolution::Property { ty, .. } => {
                     return BoundExpr {
                         kind: BoundExprKind::PropertyAccess {
                             receiver: Box::new(self.this_expr()),
                             name: name.into(),
                         },
-                        ty: property_ty,
+                        ty,
                     };
                 }
                 MemberResolution::MethodGroup => {
@@ -1326,10 +1420,17 @@ fn binary_result_type(
 
 /// The outcome of looking a member up on a type.
 enum MemberResolution {
-    /// A field, with its type.
-    Field(TypeSymbol),
-    /// A property, with its type.
-    Property(TypeSymbol),
+    /// A field, with its resolved reference.
+    Field(FieldReference),
+    /// A property, with its declaring type, type, and accessibility.
+    Property {
+        /// The type that declares the property.
+        declaring_type: TypeSymbol,
+        /// The property's type.
+        ty: TypeSymbol,
+        /// The property's accessibility.
+        accessibility: Accessibility,
+    },
     /// One or more methods of that name (a method group).
     MethodGroup,
     /// The type is known but has no such member; carries the type's display name.
@@ -1935,12 +2036,14 @@ mod tests {
             name: "count".into(),
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
+            accessibility: crate::symbols::Accessibility::Public,
         });
         widget.methods.push(MethodSymbol {
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
             is_static: false,
+            accessibility: crate::symbols::Accessibility::Public,
         });
         model.insert(widget);
 
@@ -2016,12 +2119,14 @@ mod tests {
             name: "count".into(),
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
+            accessibility: crate::symbols::Accessibility::Public,
         });
         widget.methods.push(MethodSymbol {
             name: "Area".into(),
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
             is_static: false,
+            accessibility: crate::symbols::Accessibility::Public,
         });
         let mut model = Model::new();
         model.insert(widget);
@@ -2058,8 +2163,8 @@ mod tests {
         use lamella_syntax::parser::parse_compilation_unit;
 
         let unit = parse_compilation_unit(
-            "class Animal { int legs; int Speed() { } } \
-             class Dog : Animal { string breed; }",
+            "class Animal { public int legs; public int Speed() { } } \
+             class Dog : Animal { public string breed; }",
         )
         .unit;
         let model = collect_model(&unit);
@@ -2088,7 +2193,7 @@ mod tests {
         use lamella_syntax::parser::parse_compilation_unit;
 
         let unit = parse_compilation_unit(
-            "class Animal { int Speed() { return 0; } } class Dog : Animal { }",
+            "class Animal { public int Speed() { return 0; } } class Dog : Animal { }",
         )
         .unit;
         let model = collect_model(&unit);
@@ -2107,9 +2212,10 @@ mod tests {
         use crate::declaration::collect_model;
         use lamella_syntax::parser::parse_compilation_unit;
 
-        let unit =
-            parse_compilation_unit("class Calc { static int Zero; static int Pi() { return 3; } }")
-                .unit;
+        let unit = parse_compilation_unit(
+            "class Calc { public static int Zero; public static int Pi() { return 3; } }",
+        )
+        .unit;
         let model = collect_model(&unit);
         let mut binder = Binder::with_model(model);
         binder.enter_scope();
@@ -2213,7 +2319,7 @@ mod tests {
         use lamella_syntax::parser::parse_compilation_unit;
 
         let unit = parse_compilation_unit(
-            "class Box { int Width { get { return 0; } set { } } int height; }",
+            "class Box { public int Width { get { return 0; } set { } } public int height; }",
         )
         .unit;
         let model = collect_model(&unit);
@@ -2236,7 +2342,7 @@ mod tests {
         use lamella_syntax::parser::parse_compilation_unit;
 
         let unit = parse_compilation_unit(
-            "class Animal { } class Dog : Animal { } class Pen { void Hold(Animal a) { } }",
+            "class Animal { } class Dog : Animal { } class Pen { public void Hold(Animal a) { } }",
         )
         .unit;
         let model = collect_model(&unit);
@@ -2365,6 +2471,7 @@ mod tests {
                 return_type,
                 parameters,
                 is_static: false,
+                accessibility: crate::symbols::Accessibility::Public,
             }
         }
         let int = TypeSymbol::Special(SpecialType::Int32);
@@ -2417,6 +2524,35 @@ mod tests {
     }
 
     #[test]
+    fn private_member_access_from_outside_is_cs0122() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes(
+                "class Counter { int Bump() { return 0; } } \
+                 class Program { static int Run() { Counter c = new Counter(); return c.Bump(); } }"
+            ),
+            [122]
+        );
+        assert_eq!(
+            codes(
+                "class Counter { public int Bump() { return 0; } } \
+                 class Program { static int Run() { Counter c = new Counter(); return c.Bump(); } }"
+            ),
+            []
+        );
+    }
+
+    #[test]
     fn a_call_records_its_resolved_method() {
         use crate::symbols::{MethodSymbol, TypeInfo, TypeKind};
 
@@ -2427,6 +2563,7 @@ mod tests {
             return_type: int.clone(),
             parameters: alloc::vec![int.clone()],
             is_static: false,
+            accessibility: crate::symbols::Accessibility::Public,
         });
         let mut model = Model::new();
         model.insert(calc);

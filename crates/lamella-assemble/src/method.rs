@@ -3,11 +3,31 @@
 
 use crate::expr::{EmitError, emit_expression, emit_local};
 use crate::frame::{Frame, Slot};
+use crate::tokens::Tokens;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use lamella_binder::{BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, TypeSymbol};
+use lamella_binder::{BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, SpecialType, TypeSymbol};
 use lamella_cil::{Instruction, Opcode, Operand};
 use lamella_syntax::ast::{AssignmentOperator, PostfixOperator, UnaryOperator};
+use lamella_syntax::span::Span;
+
+/// A statement's first instruction index paired with its source span -- the raw
+/// material the debug-info writer turns into a source-line mapping.
+pub type SequencePoint = (u32, Span);
+
+/// A method body's emitted CIL plus what later stages need from it: the local
+/// types (for the local-variable signature) and the sequence points, which the
+/// debug-info writer turns into source-line mappings.
+pub struct EmittedBody {
+    /// The lowered instruction stream.
+    pub code: Vec<Instruction>,
+    /// The local-variable types in slot order.
+    pub local_types: Vec<TypeSymbol>,
+    /// The local-variable names in slot order (parallel to `local_types`).
+    pub local_names: Vec<Box<str>>,
+    /// One sequence point per statement, in emission order.
+    pub sequence_points: Vec<SequencePoint>,
+}
 
 /// The enclosing loop's branch targets, for `break` and `continue`.
 struct LoopContext {
@@ -15,14 +35,14 @@ struct LoopContext {
     break_label: usize,
 }
 
-/// Tracks branch labels and backpatches their targets. A label is a reserved slot
-/// whose instruction index is filled in by [`Labels::place`]; a branch records
-/// itself for backpatching once that index is known.
+/// Tracks branch labels (backpatched once known) and the sequence points recorded
+/// at statement boundaries during emission.
 #[derive(Default)]
 struct Labels {
     positions: Vec<Option<u32>>,
     pending: Vec<(usize, usize)>,
     loops: Vec<LoopContext>,
+    points: Vec<SequencePoint>,
 }
 
 impl Labels {
@@ -49,7 +69,6 @@ impl Labels {
     }
 }
 
-/// Lowers a bound method body to CIL. `parameters` are the argument names in
 /// The maximum evaluation-stack depth a straight-line/structured body reaches --
 /// the method's `.maxstack` (II.25.4.3). Computed by tracking the running depth
 /// from each instruction's net stack effect; our emitter keeps the stack balanced
@@ -70,7 +89,15 @@ pub fn max_stack(code: &[Instruction]) -> u16 {
 /// the emitter produces.
 fn stack_effect(opcode: Opcode) -> i32 {
     match opcode {
-        Opcode::LdcI4 | Opcode::LdcI8 | Opcode::Ldnull | Opcode::Ldarg | Opcode::Ldloc => 1,
+        Opcode::LdcI4
+        | Opcode::LdcI8
+        | Opcode::Ldnull
+        | Opcode::Ldarg
+        | Opcode::Ldloc
+        | Opcode::Ldsfld
+        | Opcode::Newobj
+        | Opcode::Call
+        | Opcode::Callvirt => 1,
         Opcode::Add
         | Opcode::Sub
         | Opcode::Mul
@@ -86,6 +113,7 @@ fn stack_effect(opcode: Opcode) -> i32 {
         | Opcode::Clt => -1,
         Opcode::Stloc
         | Opcode::Starg
+        | Opcode::Stsfld
         | Opcode::Pop
         | Opcode::Brfalse
         | Opcode::Brtrue
@@ -94,63 +122,80 @@ fn stack_effect(opcode: Opcode) -> i32 {
     }
 }
 
+/// Lowers a bound method body to CIL. `parameters` are the argument names in
 /// source order; the body's locals take the slots after them.
 pub fn emit_method(
     parameters: &[Box<str>],
     body: &BoundStmt,
 ) -> Result<Vec<Instruction>, EmitError> {
-    lower(&Frame::build(parameters, body), body)
+    Ok(lower(&Frame::build(parameters, body, 0), &Tokens::new(), body)?.0)
 }
 
-/// Lowers a method body and also reports its local types in slot order, so the
-/// caller can build the local-variable signature.
+/// Lowers a method body and reports its local types (for the local signature) and
+/// sequence points (for debug info). `tokens` resolves members; `arg_base` is 1 for
+/// an instance method (argument 0 is `this`), else 0.
 pub fn emit_body(
     parameters: &[Box<str>],
     body: &BoundStmt,
-) -> Result<(Vec<Instruction>, Vec<TypeSymbol>), EmitError> {
-    let frame = Frame::build(parameters, body);
-    let code = lower(&frame, body)?;
-    Ok((code, frame.local_types().to_vec()))
+    tokens: &Tokens,
+    arg_base: u16,
+) -> Result<EmittedBody, EmitError> {
+    let frame = Frame::build(parameters, body, arg_base);
+    let (code, sequence_points) = lower(&frame, tokens, body)?;
+    Ok(EmittedBody {
+        code,
+        local_types: frame.local_types().to_vec(),
+        local_names: frame.local_names(),
+        sequence_points,
+    })
 }
 
-fn lower(frame: &Frame, body: &BoundStmt) -> Result<Vec<Instruction>, EmitError> {
+fn lower(
+    frame: &Frame,
+    tokens: &Tokens,
+    body: &BoundStmt,
+) -> Result<(Vec<Instruction>, Vec<SequencePoint>), EmitError> {
     let mut labels = Labels::default();
     let mut out = Vec::new();
-    emit_statement(body, frame, &mut labels, &mut out)?;
+    emit_statement(body, frame, tokens, &mut labels, &mut out)?;
     let end = out.len() as u32;
     let branch_to_end = labels.positions.contains(&Some(end));
     if branch_to_end || out.last().map(|instruction| instruction.opcode) != Some(Opcode::Ret) {
         out.push(Instruction::simple(Opcode::Ret));
     }
     labels.backpatch(&mut out);
-    Ok(out)
+    Ok((out, labels.points))
 }
 
 fn emit_statement(
     stmt: &BoundStmt,
     frame: &Frame,
+    tokens: &Tokens,
     labels: &mut Labels,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if !matches!(stmt.kind, BoundStmtKind::Block(_) | BoundStmtKind::Empty) {
+        labels.points.push((out.len() as u32, stmt.span));
+    }
     match &stmt.kind {
         BoundStmtKind::Empty => {}
         BoundStmtKind::Block(statements) => {
             for statement in statements {
-                emit_statement(statement, frame, labels, out)?;
+                emit_statement(statement, frame, tokens, labels, out)?;
             }
         }
         BoundStmtKind::Local { declarators, .. } => {
             for declarator in declarators {
                 if let Some(initializer) = &declarator.initializer {
-                    emit_expression(initializer, frame, out)?;
+                    emit_expression(initializer, frame, tokens, out)?;
                     store_to(frame, &declarator.name, out)?;
                 }
             }
         }
-        BoundStmtKind::Expression(expr) => emit_statement_expression(expr, frame, out)?,
+        BoundStmtKind::Expression(expr) => emit_statement_expression(expr, frame, tokens, out)?,
         BoundStmtKind::Return(value) => {
             if let Some(value) = value {
-                emit_expression(value, frame, out)?;
+                emit_expression(value, frame, tokens, out)?;
             }
             out.push(Instruction::simple(Opcode::Ret));
         }
@@ -163,20 +208,21 @@ fn emit_statement(
             then_branch,
             else_branch.as_deref(),
             frame,
+            tokens,
             labels,
             out,
         )?,
         BoundStmtKind::While { condition, body } => {
             let start = labels.label();
             labels.place(start, out);
-            emit_expression(condition, frame, out)?;
+            emit_expression(condition, frame, tokens, out)?;
             let end = labels.label();
             labels.branch(Opcode::Brfalse, end, out);
             labels.loops.push(LoopContext {
                 continue_label: start,
                 break_label: end,
             });
-            emit_statement(body, frame, labels, out)?;
+            emit_statement(body, frame, tokens, labels, out)?;
             labels.loops.pop();
             labels.branch(Opcode::Br, start, out);
             labels.place(end, out);
@@ -190,10 +236,10 @@ fn emit_statement(
                 continue_label: test,
                 break_label: end,
             });
-            emit_statement(body, frame, labels, out)?;
+            emit_statement(body, frame, tokens, labels, out)?;
             labels.loops.pop();
             labels.place(test, out);
-            emit_expression(condition, frame, out)?;
+            emit_expression(condition, frame, tokens, out)?;
             labels.branch(Opcode::Brtrue, start, out);
             labels.place(end, out);
         }
@@ -208,6 +254,7 @@ fn emit_statement(
             iterators,
             body,
             frame,
+            tokens,
             labels,
             out,
         )?,
@@ -220,7 +267,7 @@ fn emit_statement(
             labels.branch(Opcode::Br, target, out);
         }
         BoundStmtKind::Checked(inner) | BoundStmtKind::Unchecked(inner) => {
-            emit_statement(inner, frame, labels, out)?;
+            emit_statement(inner, frame, tokens, labels, out)?;
         }
         _ => {
             return Err(EmitError::Unsupported(
@@ -231,53 +278,57 @@ fn emit_statement(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_if(
     condition: &BoundExpr,
     then_branch: &BoundStmt,
     else_branch: Option<&BoundStmt>,
     frame: &Frame,
+    tokens: &Tokens,
     labels: &mut Labels,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
-    emit_expression(condition, frame, out)?;
+    emit_expression(condition, frame, tokens, out)?;
     match else_branch {
         None => {
             let end = labels.label();
             labels.branch(Opcode::Brfalse, end, out);
-            emit_statement(then_branch, frame, labels, out)?;
+            emit_statement(then_branch, frame, tokens, labels, out)?;
             labels.place(end, out);
         }
         Some(else_branch) => {
             let else_label = labels.label();
             labels.branch(Opcode::Brfalse, else_label, out);
-            emit_statement(then_branch, frame, labels, out)?;
+            emit_statement(then_branch, frame, tokens, labels, out)?;
             let end = labels.label();
             labels.branch(Opcode::Br, end, out);
             labels.place(else_label, out);
-            emit_statement(else_branch, frame, labels, out)?;
+            emit_statement(else_branch, frame, tokens, labels, out)?;
             labels.place(end, out);
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_for(
     initializer: &[BoundStmt],
     condition: Option<&BoundExpr>,
     iterators: &[BoundExpr],
     body: &BoundStmt,
     frame: &Frame,
+    tokens: &Tokens,
     labels: &mut Labels,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     for statement in initializer {
-        emit_statement(statement, frame, labels, out)?;
+        emit_statement(statement, frame, tokens, labels, out)?;
     }
     let start = labels.label();
     labels.place(start, out);
     let end = labels.label();
     if let Some(condition) = condition {
-        emit_expression(condition, frame, out)?;
+        emit_expression(condition, frame, tokens, out)?;
         labels.branch(Opcode::Brfalse, end, out);
     }
     let step = labels.label();
@@ -285,11 +336,11 @@ fn emit_for(
         continue_label: step,
         break_label: end,
     });
-    emit_statement(body, frame, labels, out)?;
+    emit_statement(body, frame, tokens, labels, out)?;
     labels.loops.pop();
     labels.place(step, out);
     for iterator in iterators {
-        emit_statement_expression(iterator, frame, out)?;
+        emit_statement_expression(iterator, frame, tokens, out)?;
     }
     labels.branch(Opcode::Br, start, out);
     labels.place(end, out);
@@ -312,6 +363,7 @@ fn loop_target(
 fn emit_statement_expression(
     expr: &BoundExpr,
     frame: &Frame,
+    tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     match &expr.kind {
@@ -321,8 +373,31 @@ fn emit_statement_expression(
             value,
         } => {
             if let BoundExprKind::Local(name) = &target.kind {
-                emit_expression(value, frame, out)?;
+                emit_expression(value, frame, tokens, out)?;
                 return store_to(frame, name, out);
+            }
+            if let BoundExprKind::FieldAccess {
+                receiver, field, ..
+            } = &target.kind
+            {
+                return crate::expr::emit_field_store(
+                    field.as_ref(),
+                    receiver,
+                    value,
+                    frame,
+                    tokens,
+                    out,
+                );
+            }
+            if let BoundExprKind::ElementAccess { receiver, indices } = &target.kind {
+                return crate::expr::emit_element_store(
+                    &target.ty, receiver, indices, value, frame, tokens, out,
+                );
+            }
+            if let BoundExprKind::PropertyAccess { receiver, name } = &target.kind {
+                return crate::expr::emit_property_store(
+                    &target.ty, receiver, name, value, frame, tokens, out,
+                );
             }
         }
         BoundExprKind::Postfix { operator, operand } => {
@@ -340,8 +415,10 @@ fn emit_statement_expression(
         }
         _ => {}
     }
-    emit_expression(expr, frame, out)?;
-    out.push(Instruction::simple(Opcode::Pop));
+    emit_expression(expr, frame, tokens, out)?;
+    if !matches!(expr.ty, TypeSymbol::Special(SpecialType::Void)) {
+        out.push(Instruction::simple(Opcode::Pop));
+    }
     Ok(())
 }
 
@@ -434,6 +511,21 @@ mod tests {
             ]
         );
         assert_eq!(target(&body[3]), 7);
+    }
+
+    #[test]
+    fn emission_records_a_sequence_point_per_statement() {
+        let body = parse_statement("{ int x = 1; return x; }").statement;
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &body);
+        let emitted = emit_body(&[], &bound, &Tokens::new(), 0).expect("should lower");
+
+        let offsets: Vec<u32> = emitted
+            .sequence_points
+            .iter()
+            .map(|(offset, _)| *offset)
+            .collect();
+        assert_eq!(offsets, [0, 2]);
+        assert!(emitted.sequence_points[0].1.start < emitted.sequence_points[1].1.start);
     }
 
     #[test]

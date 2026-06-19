@@ -267,6 +267,7 @@ mod tests {
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::String)],
             is_static: true,
+            accessibility: crate::symbols::Accessibility::Public,
         });
         bcl.insert(console);
 

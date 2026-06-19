@@ -3,11 +3,13 @@
 use crate::module::{Method, MethodId, Module};
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
-use crate::value::Value;
-use alloc::collections::BTreeSet;
+use crate::value::{Location, Value};
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
-use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand};
+use lamella_cil::{
+    EhClause, EhKind, Instruction, InstructionRange, MethodBodyImage, Opcode, Operand,
+};
 use lamella_token::Token;
 
 /// The maximum depth of the call stack before [`Trap::CallStackOverflow`]. Bounds
@@ -26,6 +28,10 @@ pub struct Vm {
     heap: Heap,
     output: Vec<u16>,
     statics: Vec<Value>,
+    /// The message string of each exception object, kept as runtime side-state so
+    /// `Exception.Message` works without modeling mscorlib's field layout (and so the
+    /// message-stripping knob has one place to act). Keyed by the exception object.
+    exception_messages: BTreeMap<ObjectRef, ObjectRef>,
 }
 
 impl Vm {
@@ -75,7 +81,7 @@ impl Vm {
     /// The value of static field `slot`, if storage holds it.
     #[must_use]
     pub fn static_field(&self, slot: usize) -> Option<Value> {
-        self.statics.get(slot).copied()
+        self.statics.get(slot).cloned()
     }
 
     /// Stores `value` into static field `slot` (a no-op if out of range).
@@ -83,6 +89,18 @@ impl Vm {
         if let Some(target) = self.statics.get_mut(slot) {
             *target = value;
         }
+    }
+
+    /// Records `message` (a heap string) as `exception`'s message, for
+    /// `Exception.Message`.
+    pub fn set_exception_message(&mut self, exception: ObjectRef, message: ObjectRef) {
+        self.exception_messages.insert(exception, message);
+    }
+
+    /// The recorded message string of `exception`, if any.
+    #[must_use]
+    pub fn exception_message(&self, exception: ObjectRef) -> Option<ObjectRef> {
+        self.exception_messages.get(&exception).copied()
     }
 }
 
@@ -99,9 +117,15 @@ struct Frame {
     /// the caller's stack when the frame returns (a ctor returns `void`, but the
     /// object reference is `newobj`'s result).
     new_object: Option<ObjectRef>,
+    /// The exception currently being handled in a catch block of this frame, so
+    /// `rethrow` can re-propagate it.
+    current_exception: Option<ObjectRef>,
+    /// An in-progress `finally` chain (from a `leave` or an exception unwind).
+    pending: Option<PendingFinally>,
 }
 
 /// What executing one instruction decided.
+#[cfg_attr(not(feature = "exceptions"), allow(dead_code))]
 enum Flow {
     /// Continue with the next instruction (or wherever a branch set `ip`).
     Next,
@@ -125,6 +149,55 @@ enum Flow {
         /// The constructor arguments (without `this`), from the caller's stack.
         args: Vec<Value>,
     },
+    /// A `throw` or `rethrow` is propagating an exception; the call stack must be
+    /// searched for a handler.
+    Throw(ObjectRef),
+    /// A `leave`: exit a protected/handler region to this instruction index, after
+    /// running any `finally` blocks being exited.
+    Leave(usize),
+    /// An `endfinally`: the current `finally` block is done; resume the chain.
+    EndFinally,
+    /// `ldfld` through a managed pointer (`&`): read a field of the value-type instance
+    /// at `location`, which lives in the call stack `step` cannot reach.
+    LoadField {
+        /// The struct's location (a frame local/arg, or heap storage).
+        location: Location,
+        /// The field token (resolved to a slot by `advance`).
+        field: Token,
+    },
+    /// `stfld` through a managed pointer (`&`): write a field of the value-type instance
+    /// at `location`, materializing the struct if the slot is still empty.
+    StoreField {
+        /// The struct's location.
+        location: Location,
+        /// The field token.
+        field: Token,
+        /// The value to store.
+        value: Value,
+    },
+}
+
+/// What to do once a chain of `finally` blocks (run by a `leave` or an exception)
+/// finishes.
+enum AfterFinally {
+    /// A `leave`: branch to this instruction index.
+    Goto(usize),
+    /// The exception was caught in this frame: enter the catch handler with it.
+    Catch {
+        /// The catch handler's first instruction.
+        handler: usize,
+        /// The exception to hand the handler.
+        exception: ObjectRef,
+    },
+    /// The exception was not caught in this frame: pop the frame and keep unwinding.
+    Unwind(ObjectRef),
+}
+
+/// A frame's in-progress `finally` chain: the remaining handler starts to run
+/// (innermost first, via `pop`) and what to do once they are all done.
+struct PendingFinally {
+    finallys: Vec<usize>,
+    then: AfterFinally,
 }
 
 /// Runs a single method that makes no calls, returning the value its `ret` leaves
@@ -142,11 +215,16 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
     loop {
         let instruction = body.code.get(frame.ip).ok_or(Trap::FellThroughEnd)?;
         frame.ip += 1;
-        match step(&mut frame, &body.code, None, &mut vm, instruction)? {
+        match step(&mut frame, 0, &body.code, None, &mut vm, instruction)? {
             Flow::Next => {}
             Flow::Return(result) => return Ok(result),
             Flow::Call { .. } => return Err(Trap::Unsupported(Opcode::Call)),
             Flow::NewObj { .. } => return Err(Trap::Unsupported(Opcode::Newobj)),
+            Flow::Throw(_) => return Err(Trap::Unsupported(Opcode::Throw)),
+            Flow::Leave(_) => return Err(Trap::Unsupported(Opcode::Leave)),
+            Flow::EndFinally => return Err(Trap::Unsupported(Opcode::Endfinally)),
+            Flow::LoadField { .. } => return Err(Trap::Unsupported(Opcode::Ldfld)),
+            Flow::StoreField { .. } => return Err(Trap::Unsupported(Opcode::Stfld)),
         }
     }
 }
@@ -256,7 +334,7 @@ impl Session {
     /// Returns a [`Trap`] if the instruction faults.
     pub fn step(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
         if let Some(result) = &self.result {
-            return Ok(Status::Done(*result));
+            return Ok(Status::Done(result.clone()));
         }
         self.advance(module, vm)
     }
@@ -270,7 +348,7 @@ impl Session {
     pub fn resume(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
         loop {
             if let Some(result) = &self.result {
-                return Ok(Status::Done(*result));
+                return Ok(Status::Done(result.clone()));
             }
             if self.at_breakpoint() {
                 return Ok(Status::Paused);
@@ -288,7 +366,7 @@ impl Session {
     pub fn run(&mut self, module: &Module, vm: &mut Vm) -> Result<Option<Value>, Trap> {
         loop {
             if let Some(result) = &self.result {
-                return Ok(*result);
+                return Ok(result.clone());
             }
             self.advance(module, vm)?;
         }
@@ -326,13 +404,25 @@ impl Session {
     /// pushes a managed frame or invokes an intrinsic.
     fn advance(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
         let Session { frames, result, .. } = self;
-        let Some(top) = frames.last_mut() else {
-            return Ok(Status::Done(None));
+        let current = match frames.len() {
+            0 => return Ok(Status::Done(None)),
+            len => len - 1,
         };
+        let top = &mut frames[current];
         let code = method_code(module, top.method)?;
         let instruction = code.get(top.ip).ok_or(Trap::FellThroughEnd)?;
         top.ip += 1;
-        match step(top, code, Some(module), vm, instruction)? {
+        let flow = match step(top, current, code, Some(module), vm, instruction) {
+            Ok(flow) => flow,
+            #[cfg(feature = "exceptions")]
+            Err(trap) => match catchable_fault(&trap, vm) {
+                Some(exception) => Flow::Throw(exception),
+                None => return Err(trap),
+            },
+            #[cfg(not(feature = "exceptions"))]
+            Err(trap) => return Err(trap),
+        };
+        match flow {
             Flow::Next => Ok(Status::Running),
             Flow::Return(value) => {
                 let returned_object = frames.pop().and_then(|frame| frame.new_object);
@@ -346,7 +436,7 @@ impl Session {
                         Ok(Status::Running)
                     }
                     None => {
-                        *result = Some(value);
+                        *result = Some(value.clone());
                         Ok(Status::Done(value))
                     }
                 }
@@ -400,7 +490,135 @@ impl Session {
                 }
                 None => Err(Trap::NoSuchMethod(ctor)),
             },
+            Flow::Throw(exception) => raise(frames, module, vm, exception),
+            Flow::Leave(target) => {
+                let finallys = {
+                    let method = frames.last().ok_or(Trap::StackUnderflow)?.method;
+                    let handlers = method_handlers(module, method)?;
+                    let frame = frames.last_mut().ok_or(Trap::StackUnderflow)?;
+                    frame.stack.clear();
+                    let leave_ip = frame.ip.saturating_sub(1);
+                    finallys_exited(handlers, leave_ip, target)
+                };
+                begin_finallys(frames, module, vm, finallys, AfterFinally::Goto(target))
+            }
+            Flow::EndFinally => {
+                let pending = frames
+                    .last_mut()
+                    .ok_or(Trap::StackUnderflow)?
+                    .pending
+                    .take();
+                match pending {
+                    Some(PendingFinally { finallys, then }) => {
+                        begin_finallys(frames, module, vm, finallys, then)
+                    }
+                    None => Err(Trap::Unsupported(Opcode::Endfinally)),
+                }
+            }
+            Flow::LoadField { location, field } => {
+                let slot = module
+                    .field_slot(field)
+                    .ok_or(Trap::UnresolvedField(field))?;
+                let value = read_field_at(frames, location, slot)?;
+                frames
+                    .get_mut(current)
+                    .ok_or(Trap::StackUnderflow)?
+                    .stack
+                    .push(value);
+                Ok(Status::Running)
+            }
+            Flow::StoreField {
+                location,
+                field,
+                value,
+            } => {
+                let slot = module
+                    .field_slot(field)
+                    .ok_or(Trap::UnresolvedField(field))?;
+                let type_id = module
+                    .field_type(field)
+                    .ok_or(Trap::UnresolvedField(field))?;
+                let shape = module
+                    .type_field_defaults(type_id)
+                    .ok_or(Trap::UnresolvedField(field))?
+                    .to_vec();
+                write_field_at(frames, location, slot, &shape, value)?;
+                Ok(Status::Running)
+            }
         }
+    }
+}
+
+/// Reads field `slot` of the value-type instance at `location` (zero if the slot has
+/// not been materialized into a struct yet -- an `init_locals` zero).
+fn read_field_at(frames: &[Frame], location: Location, slot: u32) -> Result<Value, Trap> {
+    match struct_value_at(frames, location)? {
+        Some(Value::Struct(fields)) => Ok(fields
+            .get(slot as usize)
+            .cloned()
+            .unwrap_or(Value::Int32(0))),
+        _ => Ok(Value::Int32(0)),
+    }
+}
+
+/// The value at a managed-pointer `location` in the call stack (a frame local/arg).
+/// Heap and static locations are not pointer-into-struct targets yet.
+fn struct_value_at(frames: &[Frame], location: Location) -> Result<Option<&Value>, Trap> {
+    match location {
+        Location::Local { frame, slot } => Ok(frames.get(frame).and_then(|f| f.locals.get(slot))),
+        Location::Arg { frame, slot } => Ok(frames.get(frame).and_then(|f| f.args.get(slot))),
+        _ => Err(Trap::Unsupported(Opcode::Ldfld)),
+    }
+}
+
+/// Writes `value` into field `slot` of the value-type instance at `location`,
+/// materializing it from `shape` (the declaring type's zero fields) if it is not yet a
+/// struct, and growing the slot vector to reach it.
+fn write_field_at(
+    frames: &mut [Frame],
+    location: Location,
+    slot: u32,
+    shape: &[Value],
+    value: Value,
+) -> Result<(), Trap> {
+    let fields = match location {
+        Location::Local { frame, slot: local } => {
+            let frame = frames
+                .get_mut(frame)
+                .ok_or(Trap::Unsupported(Opcode::Stfld))?;
+            ensure_struct_slot(&mut frame.locals, local, shape)
+        }
+        Location::Arg { frame, slot: arg } => {
+            let frame = frames
+                .get_mut(frame)
+                .ok_or(Trap::Unsupported(Opcode::Stfld))?;
+            ensure_struct_slot(&mut frame.args, arg, shape)
+        }
+        _ => return Err(Trap::Unsupported(Opcode::Stfld)),
+    };
+    if let Some(target) = fields.get_mut(slot as usize) {
+        *target = value;
+    }
+    Ok(())
+}
+
+/// Ensures `vec[slot]` holds a value-type instance (sized from `shape`), growing the
+/// vector and materializing the struct as needed, and returns its fields.
+fn ensure_struct_slot<'v>(
+    vec: &'v mut Vec<Value>,
+    slot: usize,
+    shape: &[Value],
+) -> &'v mut [Value] {
+    while vec.len() <= slot {
+        vec.push(Value::Null);
+    }
+    if !matches!(vec[slot], Value::Struct(_)) {
+        vec[slot] = Value::Struct(shape.to_vec().into_boxed_slice());
+    }
+    if let Value::Struct(fields) = &mut vec[slot] {
+        fields
+    } else {
+        &mut []
     }
 }
 
@@ -420,8 +638,206 @@ fn method_code(module: &Module, id: MethodId) -> Result<&[Instruction], Trap> {
     }
 }
 
+/// The exception-handling clauses of a managed method.
+fn method_handlers(module: &Module, id: MethodId) -> Result<&[EhClause], Trap> {
+    match module.method(id) {
+        Some(Method::Managed { body, .. }) => Ok(&body.handlers[..]),
+        _ => Err(Trap::NoSuchMethod(id)),
+    }
+}
+
+/// A reserved type id for runtime-fault exception objects (divide-by-zero, etc.). No
+/// loaded type has this id, so `catch (SomeUserType)` will not match a fault, while
+/// `catch (Exception)` / a catch-all (unresolvable catch types) will.
+#[cfg(feature = "exceptions")]
+const FAULT_TYPE_ID: u32 = u32::MAX;
+
+/// Converts a catchable runtime fault into a thrown exception object (carrying a
+/// default message), or returns `None` for traps that should still abort execution
+/// (a stack overflow, an unresolved token, malformed CIL, ...).
+#[cfg(feature = "exceptions")]
+fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
+    let text = match trap {
+        Trap::DivideByZero => "Attempted to divide by zero.",
+        Trap::NullReference => "Object reference not set to an instance of an object.",
+        Trap::IndexOutOfRange(_) => "Index was outside the bounds of the array.",
+        Trap::InvalidCast => "Unable to cast object to the target type.",
+        _ => return None,
+    };
+    let exception = vm.heap_mut().alloc_instance(FAULT_TYPE_ID, Vec::new());
+    let chars: Vec<u16> = text.bytes().map(u16::from).collect();
+    let message = vm.heap_mut().alloc_string(&chars);
+    vm.set_exception_message(exception, message);
+    Some(exception)
+}
+
+/// Propagates `exception`: searches the call stack from the top for a catch handler
+/// whose try region covers the faulting instruction and whose type matches, entering
+/// it (eval stack cleared, exception pushed). Frames with no handler are unwound.
+/// Returns [`Trap::UnhandledException`] if the stack is exhausted.
+fn raise(
+    frames: &mut Vec<Frame>,
+    module: &Module,
+    vm: &Vm,
+    exception: ObjectRef,
+) -> Result<Status, Trap> {
+    let Some(frame) = frames.last() else {
+        return Err(Trap::UnhandledException);
+    };
+    let fault_ip = frame.ip.saturating_sub(1);
+    let handlers = method_handlers(module, frame.method)?;
+    if let Some((handler, catch_try)) = matching_catch(module, vm, handlers, fault_ip, exception) {
+        let finallys = finallys_inside(handlers, fault_ip, catch_try);
+        begin_finallys(
+            frames,
+            module,
+            vm,
+            finallys,
+            AfterFinally::Catch { handler, exception },
+        )
+    } else {
+        let finallys = finallys_covering(handlers, fault_ip);
+        begin_finallys(
+            frames,
+            module,
+            vm,
+            finallys,
+            AfterFinally::Unwind(exception),
+        )
+    }
+}
+
+/// Runs the next pending `finally` (if any), else performs the chain's continuation.
+fn begin_finallys(
+    frames: &mut Vec<Frame>,
+    module: &Module,
+    vm: &Vm,
+    mut finallys: Vec<usize>,
+    then: AfterFinally,
+) -> Result<Status, Trap> {
+    match finallys.pop() {
+        Some(next) => {
+            let frame = frames.last_mut().ok_or(Trap::StackUnderflow)?;
+            frame.ip = next;
+            frame.pending = Some(PendingFinally { finallys, then });
+            Ok(Status::Running)
+        }
+        None => complete_finally(frames, module, vm, then),
+    }
+}
+
+/// Performs a finished finally chain's continuation: branch (`leave`), enter the
+/// catch, or pop the frame and keep unwinding.
+fn complete_finally(
+    frames: &mut Vec<Frame>,
+    module: &Module,
+    vm: &Vm,
+    then: AfterFinally,
+) -> Result<Status, Trap> {
+    match then {
+        AfterFinally::Goto(target) => {
+            frames.last_mut().ok_or(Trap::StackUnderflow)?.ip = target;
+            Ok(Status::Running)
+        }
+        AfterFinally::Catch { handler, exception } => {
+            let frame = frames.last_mut().ok_or(Trap::StackUnderflow)?;
+            frame.stack.clear();
+            frame.stack.push(Value::Object(exception));
+            frame.current_exception = Some(exception);
+            frame.ip = handler;
+            Ok(Status::Running)
+        }
+        AfterFinally::Unwind(exception) => {
+            frames.pop();
+            raise(frames, module, vm, exception)
+        }
+    }
+}
+
+/// The first catch clause whose try region covers `fault_ip` and whose type matches
+/// `exception` -- its handler start and try range (for finding nested finallys).
+fn matching_catch(
+    module: &Module,
+    vm: &Vm,
+    handlers: &[EhClause],
+    fault_ip: usize,
+    exception: ObjectRef,
+) -> Option<(usize, InstructionRange)> {
+    for clause in handlers {
+        if let EhKind::Catch(type_token) = &clause.kind {
+            if covers(clause.try_range, fault_ip)
+                && catch_matches(module, vm, *type_token, exception)
+            {
+                return Some((clause.handler_range.start as usize, clause.try_range));
+            }
+        }
+    }
+    None
+}
+
+/// Whether `ip` lies in the half-open `[start, end)` instruction range.
+fn covers(range: InstructionRange, ip: usize) -> bool {
+    (range.start as usize) <= ip && ip < (range.end as usize)
+}
+
+/// The finally handlers a `leave` from `from_ip` to `target` exits: those whose try
+/// covers `from_ip` but not `target`. Ordered so `pop` yields innermost first.
+fn finallys_exited(handlers: &[EhClause], from_ip: usize, target: usize) -> Vec<usize> {
+    finally_handlers(handlers, |clause| {
+        covers(clause.try_range, from_ip) && !covers(clause.try_range, target)
+    })
+}
+
+/// The finally handlers in this frame covering `fault_ip` (run as the frame unwinds
+/// when it has no matching catch).
+fn finallys_covering(handlers: &[EhClause], fault_ip: usize) -> Vec<usize> {
+    finally_handlers(handlers, |clause| covers(clause.try_range, fault_ip))
+}
+
+/// The finally handlers nested between `fault_ip` and a catch -- covering the fault
+/// and lying within the catch's try region -- run before entering the catch.
+fn finallys_inside(
+    handlers: &[EhClause],
+    fault_ip: usize,
+    catch_try: InstructionRange,
+) -> Vec<usize> {
+    finally_handlers(handlers, |clause| {
+        covers(clause.try_range, fault_ip)
+            && clause.try_range.start >= catch_try.start
+            && clause.try_range.end <= catch_try.end
+    })
+}
+
+/// The handler starts of the finally clauses kept by `keep`, ordered outermost-first
+/// so that `pop` runs them innermost-first.
+fn finally_handlers(handlers: &[EhClause], keep: impl Fn(&EhClause) -> bool) -> Vec<usize> {
+    let mut clauses: Vec<&EhClause> = handlers
+        .iter()
+        .filter(|clause| matches!(clause.kind, EhKind::Finally) && keep(clause))
+        .collect();
+    clauses.sort_by_key(|clause| clause.try_range.start);
+    clauses
+        .into_iter()
+        .map(|clause| clause.handler_range.start as usize)
+        .collect()
+}
+
+/// Whether a `catch` of `type_token` catches `exception`: a same-module type matches
+/// when the exception's runtime type is a subtype; a catch type this module cannot
+/// resolve (`System.Exception` / `System.Object`) is treated as catch-all.
+fn catch_matches(module: &Module, vm: &Vm, type_token: Token, exception: ObjectRef) -> bool {
+    match module.type_id_of(type_token) {
+        Some(catch_type) => vm
+            .heap()
+            .type_of(exception)
+            .is_some_and(|exception_type| module.is_subtype(exception_type, catch_type)),
+        None => true,
+    }
+}
+
 fn step(
     frame: &mut Frame,
+    frame_index: usize,
     code: &[Instruction],
     module: Option<&Module>,
     vm: &mut Vm,
@@ -434,7 +850,7 @@ fn step(
             frame.pop()?;
         }
         Opcode::Dup => {
-            let top = *frame.stack.last().ok_or(Trap::StackUnderflow)?;
+            let top = frame.stack.last().ok_or(Trap::StackUnderflow)?.clone();
             frame.stack.push(top);
         }
 
@@ -477,6 +893,14 @@ fn step(
         Opcode::Stloc3 => frame.store_local(3)?,
         Opcode::StlocS | Opcode::Stloc => frame.store_local(var_operand(instruction)?)?,
         Opcode::StargS | Opcode::Starg => frame.store_arg(var_operand(instruction)?)?,
+        Opcode::LdlocaS | Opcode::Ldloca => frame.stack.push(Value::ByRef(Location::Local {
+            frame: frame_index,
+            slot: var_operand(instruction)? as usize,
+        })),
+        Opcode::LdargaS | Opcode::Ldarga => frame.stack.push(Value::ByRef(Location::Arg {
+            frame: frame_index,
+            slot: var_operand(instruction)? as usize,
+        })),
 
         Opcode::Add | Opcode::Sub | Opcode::Mul | Opcode::Div | Opcode::Rem => {
             let (a, b) = frame.pop2()?;
@@ -598,29 +1022,77 @@ fn step(
         Opcode::Callvirt => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Callvirt))?;
             let token = token_operand(instruction)?;
-            let static_method = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
-            let arg_count = module
-                .method(static_method)
-                .ok_or(Trap::NoSuchMethod(static_method))?
-                .arg_count();
-            let args = frame.take_args(arg_count)?;
-            let method = match module.method_slot(static_method) {
-                Some(slot) => {
-                    let this =
-                        object_ref(*args.first().ok_or(Trap::StackUnderflow)?, Opcode::Callvirt)?;
-                    vm.heap()
-                        .type_of(this)
-                        .and_then(|type_id| module.vtable_entry(type_id, slot))
-                        .unwrap_or(static_method)
+            if let Some(param_count) = module.delegate_invoke(token) {
+                let args = frame.take_args(param_count + 1)?;
+                let delegate = object_ref(
+                    args.first().ok_or(Trap::StackUnderflow)?.clone(),
+                    Opcode::Callvirt,
+                )?;
+                let (target, method) = vm
+                    .heap()
+                    .delegate_target(delegate)
+                    .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
+                let mut call_args = Vec::with_capacity(args.len());
+                if !matches!(target, Value::Null) {
+                    call_args.push(target);
                 }
-                None => static_method,
+                call_args.extend_from_slice(&args[1..]);
+                return Ok(Flow::Call {
+                    method,
+                    args: call_args,
+                });
+            }
+            let static_method = module.resolve(token);
+            let target_info = module.call_target(token);
+            let arg_count = match target_info {
+                Some((_, count)) => count,
+                None => {
+                    let method = static_method.ok_or(Trap::UnresolvedCall(token))?;
+                    module
+                        .method(method)
+                        .ok_or(Trap::NoSuchMethod(method))?
+                        .arg_count()
+                }
             };
+            let args = frame.take_args(arg_count)?;
+            let this = object_ref(
+                args.first().ok_or(Trap::StackUnderflow)?.clone(),
+                Opcode::Callvirt,
+            )?;
+            let runtime_type = vm.heap().type_of(this);
+            let sig_key = target_info.map(|(key, _)| key);
+            let method = resolve_callvirt(module, static_method, sig_key, runtime_type)
+                .ok_or(Trap::UnresolvedCall(token))?;
             return Ok(Flow::Call { method, args });
+        }
+
+        Opcode::Ldftn => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::Ldftn))?;
+            let token = token_operand(instruction)?;
+            let method = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
+            frame.stack.push(Value::NativeInt(i64::from(method)));
+        }
+        Opcode::Ldvirtftn => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::Ldvirtftn))?;
+            let token = token_operand(instruction)?;
+            let this = object_ref(frame.pop()?, Opcode::Ldvirtftn)?;
+            let runtime_type = vm.heap().type_of(this);
+            let sig_key = module.call_target(token).map(|(key, _)| key);
+            let method = resolve_callvirt(module, module.resolve(token), sig_key, runtime_type)
+                .ok_or(Trap::UnresolvedCall(token))?;
+            frame.stack.push(Value::NativeInt(i64::from(method)));
         }
 
         Opcode::Newobj => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Newobj))?;
             let token = token_operand(instruction)?;
+            if module.is_delegate_ctor(token) {
+                let method = function_pointer(frame.pop()?)?;
+                let target = frame.pop()?;
+                let delegate = vm.heap_mut().alloc_delegate(target, method);
+                frame.stack.push(Value::Object(delegate));
+                return Ok(Flow::Next);
+            }
             let ctor = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
             let type_id = module.method_type(ctor).ok_or(Trap::NoSuchMethod(ctor))?;
             let defaults = module
@@ -643,12 +1115,30 @@ fn step(
             let slot = module
                 .field_slot(token)
                 .ok_or(Trap::UnresolvedField(token))?;
-            let object = object_ref(frame.pop()?, Opcode::Ldfld)?;
-            let value = vm
-                .heap()
-                .instance_field(object, slot)
-                .ok_or(Trap::UnresolvedField(token))?;
-            frame.stack.push(value);
+            match frame.pop()? {
+                Value::Object(object) => {
+                    let value = vm
+                        .heap()
+                        .instance_field(object, slot)
+                        .ok_or(Trap::UnresolvedField(token))?;
+                    frame.stack.push(value);
+                }
+                Value::ByRef(location) => {
+                    return Ok(Flow::LoadField {
+                        location,
+                        field: token,
+                    });
+                }
+                Value::Struct(fields) => {
+                    let value = fields
+                        .get(slot as usize)
+                        .cloned()
+                        .ok_or(Trap::UnresolvedField(token))?;
+                    frame.stack.push(value);
+                }
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::Ldfld)),
+            }
         }
         Opcode::Stfld => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Stfld))?;
@@ -657,9 +1147,21 @@ fn step(
                 .field_slot(token)
                 .ok_or(Trap::UnresolvedField(token))?;
             let value = frame.pop()?;
-            let object = object_ref(frame.pop()?, Opcode::Stfld)?;
-            if !vm.heap_mut().set_instance_field(object, slot, value) {
-                return Err(Trap::UnresolvedField(token));
+            match frame.pop()? {
+                Value::Object(object) => {
+                    if !vm.heap_mut().set_instance_field(object, slot, value) {
+                        return Err(Trap::UnresolvedField(token));
+                    }
+                }
+                Value::ByRef(location) => {
+                    return Ok(Flow::StoreField {
+                        location,
+                        field: token,
+                        value,
+                    });
+                }
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::Stfld)),
             }
         }
 
@@ -688,7 +1190,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Castclass))?;
             let token = token_operand(instruction)?;
             let value = frame.pop()?;
-            if !cast_matches(module, vm, value, token) {
+            if !cast_matches(module, vm, &value, token) {
                 return Err(Trap::InvalidCast);
             }
             frame.stack.push(value);
@@ -698,8 +1200,20 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Isinst))?;
             let token = token_operand(instruction)?;
             let value = frame.pop()?;
-            let matched = !matches!(value, Value::Null) && cast_matches(module, vm, value, token);
+            let matched = !matches!(value, Value::Null) && cast_matches(module, vm, &value, token);
             frame.stack.push(if matched { value } else { Value::Null });
+        }
+
+        Opcode::Box => {
+            let token = token_operand(instruction)?;
+            let value = frame.pop()?;
+            let reference = vm.heap_mut().alloc_boxed(token.0, value);
+            frame.stack.push(Value::Object(reference));
+        }
+        Opcode::UnboxAny => {
+            let reference = object_ref(frame.pop()?, Opcode::UnboxAny)?;
+            let value = vm.heap().boxed_value(reference).ok_or(Trap::InvalidCast)?;
+            frame.stack.push(value);
         }
 
         Opcode::Newarr => {
@@ -757,6 +1271,25 @@ fn step(
             }
         }
 
+        #[cfg(feature = "exceptions")]
+        Opcode::Throw => {
+            let exception = object_ref(frame.pop()?, Opcode::Throw)?;
+            return Ok(Flow::Throw(exception));
+        }
+        #[cfg(feature = "exceptions")]
+        Opcode::Rethrow => {
+            let exception = frame
+                .current_exception
+                .ok_or(Trap::Unsupported(Opcode::Rethrow))?;
+            return Ok(Flow::Throw(exception));
+        }
+        #[cfg(feature = "exceptions")]
+        Opcode::Leave | Opcode::LeaveS => {
+            return Ok(Flow::Leave(branch_target(instruction, code.len())?));
+        }
+        #[cfg(feature = "exceptions")]
+        Opcode::Endfinally => return Ok(Flow::EndFinally),
+
         Opcode::Ret => return Ok(Flow::Return(frame.stack.pop())),
 
         other => return Err(Trap::Unsupported(other)),
@@ -773,6 +1306,8 @@ impl Frame {
             locals: Vec::new(),
             args,
             new_object: None,
+            current_exception: None,
+            pending: None,
         }
     }
 
@@ -799,10 +1334,11 @@ impl Frame {
     }
 
     fn load_arg(&mut self, slot: u16) -> Result<(), Trap> {
-        let value = *self
+        let value = self
             .args
             .get(slot as usize)
-            .ok_or(Trap::ArgumentOutOfRange(slot))?;
+            .ok_or(Trap::ArgumentOutOfRange(slot))?
+            .clone();
         self.stack.push(value);
         Ok(())
     }
@@ -811,7 +1347,7 @@ impl Frame {
         let value = self
             .locals
             .get(slot as usize)
-            .copied()
+            .cloned()
             .unwrap_or(Value::Int32(0));
         self.stack.push(value);
     }
@@ -887,7 +1423,8 @@ fn wrap_int(kind: IntKind, value: i64) -> Value {
 /// `add`, `sub`, `mul`, `div`, `rem`: floating point when both operands are
 /// floats, otherwise integer.
 fn binary_numeric(opcode: Opcode, a: Value, b: Value) -> Result<Value, Trap> {
-    if let (Value::Float(x), Value::Float(y)) = (a, b) {
+    if let (Value::Float(x), Value::Float(y)) = (&a, &b) {
+        let (x, y) = (*x, *y);
         let result = match opcode {
             Opcode::Add => x + y,
             Opcode::Sub => x - y,
@@ -995,7 +1532,9 @@ fn negate(value: Value) -> Result<Value, Trap> {
         Value::Int64(x) => Ok(Value::Int64(x.wrapping_neg())),
         Value::NativeInt(x) => Ok(Value::NativeInt(x.wrapping_neg())),
         Value::Float(x) => Ok(Value::Float(-x)),
-        Value::Object(_) | Value::Null => Err(Trap::TypeMismatch(Opcode::Neg)),
+        Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
+            Err(Trap::TypeMismatch(Opcode::Neg))
+        }
     }
 }
 
@@ -1042,7 +1581,9 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Value::Int64(x) => (x, false),
         Value::NativeInt(x) => (x, false),
         Value::Float(f) => (f as i64, false),
-        Value::Object(_) | Value::Null => return Err(Trap::TypeMismatch(opcode)),
+        Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
+            return Err(Trap::TypeMismatch(opcode));
+        }
     };
     let zero_extended = if from_32 {
         i64::from(source as u32)
@@ -1098,7 +1639,8 @@ fn relation_of(opcode: Opcode) -> Option<(Relation, bool)> {
 /// with the unordered (NaN) result chosen by the `.un` variant.
 fn compare(opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
     let (relation, unordered_or_unsigned) = relation_of(opcode).ok_or(Trap::Unsupported(opcode))?;
-    if let (Value::Float(x), Value::Float(y)) = (a, b) {
+    if let (Value::Float(x), Value::Float(y)) = (&a, &b) {
+        let (x, y) = (*x, *y);
         if x.is_nan() || y.is_nan() {
             return Ok(unordered_or_unsigned && !matches!(relation, Relation::Equal));
         }
@@ -1208,14 +1750,49 @@ fn object_ref(value: Value, opcode: Opcode) -> Result<ObjectRef, Trap> {
     }
 }
 
+/// Extracts a method id from a function pointer: `ldftn` / `ldvirtftn` push the method
+/// id as a native int, and a delegate constructor consumes it.
+fn function_pointer(value: Value) -> Result<MethodId, Trap> {
+    match value {
+        Value::NativeInt(method) => Ok(method as MethodId),
+        _ => Err(Trap::TypeMismatch(Opcode::Newobj)),
+    }
+}
+
+/// Resolves a `callvirt` target on a `this` of `runtime_type`: a class virtual via the
+/// runtime type's vtable slot, else an interface/abstract method by signature key,
+/// else the static target (a non-virtual instance method, or a string/array `this`).
+fn resolve_callvirt(
+    module: &Module,
+    static_method: Option<MethodId>,
+    sig_key: Option<&str>,
+    runtime_type: Option<u32>,
+) -> Option<MethodId> {
+    if let Some(method) = static_method {
+        if let Some(slot) = module.method_slot(method) {
+            return Some(
+                runtime_type
+                    .and_then(|type_id| module.vtable_entry(type_id, slot))
+                    .unwrap_or(method),
+            );
+        }
+    }
+    if let (Some(key), Some(type_id)) = (sig_key, runtime_type) {
+        if let Some(method) = module.sig_dispatch(type_id, key) {
+            return Some(method);
+        }
+    }
+    static_method
+}
+
 /// Whether `value` can be `castclass`/`isinst` to `token`'s type: null matches; a
 /// reference matches when its runtime type is a subtype of the target. Cases this
 /// module cannot verify -- an external target type, or a string/array object with no
 /// declared type -- are treated as a match (unverified).
-fn cast_matches(module: &Module, vm: &Vm, value: Value, token: Token) -> bool {
+fn cast_matches(module: &Module, vm: &Vm, value: &Value, token: Token) -> bool {
     let reference = match value {
         Value::Null => return true,
-        Value::Object(reference) => reference,
+        Value::Object(reference) => *reference,
         _ => return false,
     };
     match (module.type_id_of(token), vm.heap().type_of(reference)) {
@@ -1846,7 +2423,7 @@ mod tests {
     }
 
     #[test]
-    fn array_index_out_of_range_traps() {
+    fn array_index_out_of_range_throws() {
         let elem = Token(0x0100_0005);
         let mut module = Module::new();
         module.bind_array_default(elem, Value::Int32(0));
@@ -1862,7 +2439,7 @@ mod tests {
         );
         assert_eq!(
             super::run(&module, &mut Vm::new(), main, Vec::new()),
-            Err(Trap::IndexOutOfRange(5))
+            Err(Trap::UnhandledException)
         );
     }
 
@@ -1942,11 +2519,11 @@ mod tests {
     }
 
     #[test]
-    fn castclass_to_an_unrelated_type_traps() {
+    fn castclass_to_an_unrelated_type_throws() {
         let (module, main) = cast_program(Opcode::Castclass);
         assert_eq!(
             super::run(&module, &mut Vm::new(), main, Vec::new()),
-            Err(Trap::InvalidCast)
+            Err(Trap::UnhandledException)
         );
     }
 
@@ -1978,6 +2555,28 @@ mod tests {
             0,
         );
         (module, main)
+    }
+
+    #[test]
+    fn an_unhandled_exception_traps() {
+        let e_ctor = Token(0x0600_0050);
+        let mut module = Module::new();
+        let e = module.add_type(vec![]);
+        let ctor = module.add_method(method(vec![ret()]), 1);
+        module.set_method_type(ctor, e);
+        module.bind_token(e_ctor, ctor);
+        let main = module.add_method(
+            method(vec![
+                Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
+                Instruction::simple(Opcode::Throw),
+                ret(),
+            ]),
+            0,
+        );
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Err(Trap::UnhandledException)
+        );
     }
 
     fn ret() -> Instruction {

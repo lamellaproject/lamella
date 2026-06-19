@@ -394,6 +394,36 @@ pub fn object_ctor(_vm: &mut Vm, _args: &[Value]) -> Result<Option<Value>, Trap>
     Ok(None)
 }
 
+/// `System.Exception..ctor()` / `.ctor(string)` / `.ctor(string, Exception)`: records
+/// the message argument (if a string is present) as the exception's message; the inner
+/// exception is dropped for now. `this` is the exception object (arg 0).
+///
+/// # Errors
+/// Never errors (an absent or non-string message is simply not recorded).
+pub fn exception_ctor(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    if let (Some(&Value::Object(this)), Some(&Value::Object(message))) = (args.first(), args.get(1))
+    {
+        vm.set_exception_message(this, message);
+    }
+    Ok(None)
+}
+
+/// `System.Exception.get_Message`: the stored message string, or an empty string if
+/// none was given (`Message` is conventionally non-null). `this` is the exception.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `this` is not an object reference.
+pub fn exception_get_message(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(this)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let message = match vm.exception_message(this) {
+        Some(message) => message,
+        None => vm.heap_mut().alloc_string(&[]),
+    };
+    Ok(Some(Value::Object(message)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

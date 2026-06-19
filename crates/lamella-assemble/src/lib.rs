@@ -6,11 +6,18 @@
 extern crate alloc;
 
 pub mod compile;
+pub mod debug;
 pub mod expr;
 pub mod frame;
 pub mod method;
+pub mod tokens;
 
-pub use compile::{Compilation, compile_unit};
+pub use compile::{
+    Compilation, Diagnostic, compile_source, compile_unit, compile_unit_with_debug,
+    compile_unit_with_references,
+};
+pub use debug::{LineMap, SpanLines};
 pub use expr::{EmitError, emit_expression};
 pub use frame::{Frame, Slot};
-pub use method::{emit_method, max_stack};
+pub use method::{EmittedBody, SequencePoint, emit_method, max_stack};
+pub use tokens::Tokens;

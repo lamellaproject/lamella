@@ -22,6 +22,28 @@ pub fn compress_u32(value: u32, out: &mut Vec<u8>) {
     }
 }
 
+/// Appends `value` in the compressed *signed* integer encoding (II.23.2): the value
+/// is rotated left by one within its bit-width so the sign lands in the low bit. The
+/// width is chosen by the value's range (not the rotated magnitude, since a boundary
+/// like `-2^13` rotates to a small number that must still occupy two bytes).
+pub fn compress_i32(value: i32, out: &mut Vec<u8>) {
+    let sign = u32::from(value < 0);
+    if (-(1 << 6)..(1 << 6)).contains(&value) {
+        let n = ((value & 0x3F) as u32) << 1 | sign;
+        out.push(n as u8);
+    } else if (-(1 << 13)..(1 << 13)).contains(&value) {
+        let n = ((value & 0x1FFF) as u32) << 1 | sign;
+        out.push((n >> 8) as u8 | 0x80);
+        out.push(n as u8);
+    } else {
+        let n = ((value & 0x0FFF_FFFF) as u32) << 1 | sign;
+        out.push((n >> 24) as u8 | 0xC0);
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+        out.push(n as u8);
+    }
+}
+
 /// Builds the `#Strings` heap: the empty string sits at offset 0, and every other
 /// distinct string is stored once as its UTF-8 bytes plus a null terminator.
 #[derive(Debug)]
@@ -252,6 +274,24 @@ mod tests {
         assert_eq!(compressed(0x3FFF), [0xBF, 0xFF]);
         assert_eq!(compressed(0x4000), [0xC0, 0x00, 0x40, 0x00]);
         assert_eq!(compressed(0x1FFF_FFFF), [0xDF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    fn compressed_signed(value: i32) -> Vec<u8> {
+        let mut out = Vec::new();
+        compress_i32(value, &mut out);
+        out
+    }
+
+    #[test]
+    fn signed_compression_matches_the_spec_examples() {
+        assert_eq!(compressed_signed(3), [0x06]);
+        assert_eq!(compressed_signed(-3), [0x7B]);
+        assert_eq!(compressed_signed(64), [0x80, 0x80]);
+        assert_eq!(compressed_signed(-64), [0x01]);
+        assert_eq!(compressed_signed(8192), [0xC0, 0x00, 0x40, 0x00]);
+        assert_eq!(compressed_signed(-8192), [0x80, 0x01]);
+        assert_eq!(compressed_signed(268_435_455), [0xDF, 0xFF, 0xFF, 0xFE]);
+        assert_eq!(compressed_signed(-268_435_456), [0xC0, 0x00, 0x00, 0x01]);
     }
 
     #[test]

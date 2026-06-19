@@ -11,11 +11,9 @@ description = "CIL emission for C# 1.0: lowering the binder's bound tree to CIL.
 lamella-syntax = { path = "../lamella-syntax" }
 lamella-binder = { path = "../lamella-binder" }
 lamella-cil = { path = "../lamella-cil" }
+lamella-metadata = { path = "../lamella-metadata" }
 lamella-pe = { path = "../lamella-pe" }
 lamella-token = { path = "../lamella-token" }
-
-[dev-dependencies]
-lamella-metadata = { path = "../lamella-metadata" }
 
 [lints]
 workspace = true

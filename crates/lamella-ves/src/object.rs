@@ -35,6 +35,23 @@ pub enum Object {
         /// The elements, indexed 0..len.
         elements: Vec<Value>,
     },
+    /// A boxed value type (III.4.1 `box`): a heap copy of a value-type value, tagged
+    /// with the value type's token so `unbox` / `unbox.any` and casts can recover it.
+    Boxed {
+        /// The boxed value type's token (from the `box` instruction).
+        type_token: u32,
+        /// The boxed value (a copy of the value-type value).
+        value: Value,
+    },
+    /// A delegate (II.14.6): a bound method -- an optional target object and the method
+    /// it calls. Constructed by `newobj` on a delegate type, invoked by its `Invoke`.
+    Delegate {
+        /// The bound target: a `Value::Object` for an instance method, `Value::Null`
+        /// for a static method.
+        target: Value,
+        /// The method the delegate invokes.
+        method: u32,
+    },
 }
 
 /// The managed heap: an append-only arena of [`Object`]s.
@@ -74,7 +91,10 @@ impl Heap {
     pub fn as_string(&self, reference: ObjectRef) -> Option<&[u16]> {
         match self.get(reference)? {
             Object::Str(chars) => Some(chars),
-            Object::Instance { .. } | Object::Array { .. } => None,
+            Object::Instance { .. }
+            | Object::Array { .. }
+            | Object::Boxed { .. }
+            | Object::Delegate { .. } => None,
         }
     }
 
@@ -89,8 +109,11 @@ impl Heap {
     #[must_use]
     pub fn instance_field(&self, reference: ObjectRef, slot: u32) -> Option<Value> {
         match self.get(reference)? {
-            Object::Instance { fields, .. } => fields.get(slot as usize).copied(),
-            Object::Str(_) | Object::Array { .. } => None,
+            Object::Instance { fields, .. } => fields.get(slot as usize).cloned(),
+            Object::Str(_)
+            | Object::Array { .. }
+            | Object::Boxed { .. }
+            | Object::Delegate { .. } => None,
         }
     }
 
@@ -115,7 +138,10 @@ impl Heap {
     pub fn type_of(&self, reference: ObjectRef) -> Option<u32> {
         match self.get(reference)? {
             Object::Instance { type_id, .. } => Some(*type_id),
-            Object::Str(_) | Object::Array { .. } => None,
+            Object::Str(_)
+            | Object::Array { .. }
+            | Object::Boxed { .. }
+            | Object::Delegate { .. } => None,
         }
     }
 
@@ -123,6 +149,34 @@ impl Heap {
     /// type's zero value) and returns a reference.
     pub fn alloc_array(&mut self, elements: Vec<Value>) -> ObjectRef {
         self.alloc(Object::Array { elements })
+    }
+
+    /// Allocates a boxed value type tagged with `type_token` and returns a reference.
+    pub fn alloc_boxed(&mut self, type_token: u32, value: Value) -> ObjectRef {
+        self.alloc(Object::Boxed { type_token, value })
+    }
+
+    /// The value inside the box at `reference`, if it is a box.
+    #[must_use]
+    pub fn boxed_value(&self, reference: ObjectRef) -> Option<Value> {
+        match self.get(reference)? {
+            Object::Boxed { value, .. } => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    /// Allocates a delegate binding `target` to `method` and returns a reference.
+    pub fn alloc_delegate(&mut self, target: Value, method: u32) -> ObjectRef {
+        self.alloc(Object::Delegate { target, method })
+    }
+
+    /// The `(target, method)` of the delegate at `reference`, if it is a delegate.
+    #[must_use]
+    pub fn delegate_target(&self, reference: ObjectRef) -> Option<(Value, u32)> {
+        match self.get(reference)? {
+            Object::Delegate { target, method } => Some((target.clone(), *method)),
+            _ => None,
+        }
     }
 
     /// The length of the array at `reference`, if it is an array.
@@ -139,7 +193,7 @@ impl Heap {
     #[must_use]
     pub fn array_get(&self, reference: ObjectRef, index: usize) -> Option<Value> {
         match self.get(reference)? {
-            Object::Array { elements } => elements.get(index).copied(),
+            Object::Array { elements } => elements.get(index).cloned(),
             _ => None,
         }
     }

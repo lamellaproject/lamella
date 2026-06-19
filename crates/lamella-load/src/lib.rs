@@ -17,9 +17,9 @@ use lamella_ves::intrinsics::{
     console_write, console_write_bool, console_write_char, console_write_double,
     console_write_int32, console_write_int64, console_write_line, console_write_line_bool,
     console_write_line_char, console_write_line_double, console_write_line_empty,
-    console_write_line_int32, console_write_line_int64, object_ctor, string_concat, string_concat3,
-    string_equals, string_get_chars, string_get_length, string_is_null_or_empty, string_not_equals,
-    string_substring, string_substring_len,
+    console_write_line_int32, console_write_line_int64, exception_ctor, exception_get_message,
+    object_ctor, string_concat, string_concat3, string_equals, string_get_chars, string_get_length,
+    string_is_null_or_empty, string_not_equals, string_substring, string_substring_len,
 };
 use lamella_ves::{IntrinsicFn, MethodId, Module, Value};
 
@@ -80,6 +80,8 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
     let mut string_tokens = BTreeSet::new();
     let mut bcl_call_tokens = BTreeSet::new();
     let mut newarr_tokens = BTreeSet::new();
+    let mut callvirt_tokens = BTreeSet::new();
+    let mut methoddef_sigs: BTreeMap<u32, (String, Vec<SigType>)> = BTreeMap::new();
     let mut type_extends: Vec<Token> = Vec::new();
     let mut type_virtuals: Vec<Vec<VirtualMethod>> = Vec::new();
     let mut own_fields: Vec<Vec<(Token, Value)>> = Vec::new();
@@ -99,13 +101,31 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
             own.push((token, default_field_value(field.signature())));
         }
         let type_id = module.add_type(Vec::new());
+        for (token, _) in &own {
+            module.bind_field_type(*token, type_id);
+        }
         own_fields.push(own);
         type_extends.push(type_def.extends());
 
         let mut virtuals = Vec::new();
+        let is_delegate = is_delegate_type(assembly, type_def.extends());
         for method in type_def.methods() {
             method_row += 1;
             let token = Token::new(METHOD_DEF, method_row);
+            let name: String = method.name().unwrap_or("").into();
+            let params: Vec<SigType> = method
+                .signature()
+                .map(|sig| sig.parameters)
+                .unwrap_or_default();
+            methoddef_sigs.insert(method_row, (name.clone(), params.clone()));
+            if is_delegate {
+                if name == ".ctor" {
+                    module.mark_delegate_ctor(token);
+                } else if name == "Invoke" {
+                    let count = u16::try_from(params.len()).unwrap_or(u16::MAX);
+                    module.mark_delegate_invoke(token, count);
+                }
+            }
             let Some(body) = method.body() else {
                 continue;
             };
@@ -115,9 +135,13 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
                         Opcode::Ldstr => {
                             string_tokens.insert(*operand);
                         }
-                        Opcode::Call | Opcode::Callvirt | Opcode::Newobj
-                            if operand.table() == MEMBER_REF =>
-                        {
+                        Opcode::Callvirt => {
+                            callvirt_tokens.insert(*operand);
+                            if operand.table() == MEMBER_REF {
+                                bcl_call_tokens.insert(*operand);
+                            }
+                        }
+                        Opcode::Call | Opcode::Newobj if operand.table() == MEMBER_REF => {
                             bcl_call_tokens.insert(*operand);
                         }
                         Opcode::Newarr => {
@@ -130,17 +154,14 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
             let id = module.add_method(body, arg_count(&method));
             module.bind_token(token, id);
             module.set_method_type(id, type_id);
-            if method.name() == Some(".cctor") {
+            if name == ".cctor" {
                 module.add_static_ctor(id);
             }
             if method.flags() & METHOD_VIRTUAL != 0 {
                 virtuals.push(VirtualMethod {
                     id,
-                    name: method.name().unwrap_or("").into(),
-                    params: method
-                        .signature()
-                        .map(|sig| sig.parameters)
-                        .unwrap_or_default(),
+                    name,
+                    params,
                     newslot: method.flags() & METHOD_NEWSLOT != 0,
                 });
             }
@@ -157,6 +178,8 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
     bind_array_defaults(assembly, &mut module, &newarr_tokens);
     build_field_layouts(&mut module, &type_extends, &own_fields);
     build_vtables(&mut module, &type_extends, &type_virtuals);
+    build_sig_methods(&mut module, &type_extends, &type_virtuals);
+    bind_call_targets(&mut module, assembly, &callvirt_tokens, &methoddef_sigs);
     bind_types(&mut module, &type_extends);
     Ok(Program { module, entry })
 }
@@ -242,6 +265,8 @@ fn bcl_intrinsic(
         ("String", "IsNullOrEmpty") => string_is_null_or_empty_overload(signature),
         ("String", "Substring") => string_substring_overload(signature),
         ("Object", ".ctor") => object_ctor_overload(signature),
+        ("Exception", ".ctor") => Some(exception_ctor),
+        ("Exception", "get_Message") => Some(exception_get_message),
         _ => None,
     }
 }
@@ -257,7 +282,8 @@ fn object_ctor_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
 
 /// The zero value a freshly allocated instance field of this signature holds
 /// (ECMA-335 III.4.21 zero-initializes instances): the numeric zero of its width,
-/// or null for a reference.
+/// or null for a reference. Value types other than these primitives are not laid out
+/// inline yet, so they fall back to null.
 fn default_field_value(signature: Option<SigType>) -> Value {
     match signature {
         Some(SigType::I8 | SigType::U8) => Value::Int64(0),
@@ -341,7 +367,11 @@ fn field_layout(
         Some(base) => field_layout(base, extends, own_fields, memo),
         None => Vec::new(),
     };
-    layout.extend(own_fields[type_id].iter().map(|(_, default)| *default));
+    layout.extend(
+        own_fields[type_id]
+            .iter()
+            .map(|(_, default)| default.clone()),
+    );
     memo[type_id] = Some(layout.clone());
     layout
 }
@@ -364,11 +394,100 @@ struct VtableSlot {
     method: MethodId,
 }
 
+/// Whether a type extends `System.MulticastDelegate` / `System.Delegate` -- i.e. is a
+/// delegate type, whose runtime-provided `.ctor` / `Invoke` the loader records.
+fn is_delegate_type(assembly: &Assembly, extends: Token) -> bool {
+    if extends.table() != TYPE_REF {
+        return false;
+    }
+    assembly
+        .type_ref(extends.row())
+        .and_then(|type_ref| type_ref.name())
+        .is_some_and(|name| matches!(name.name, "MulticastDelegate" | "Delegate"))
+}
+
+/// A signature key (method name + parameter types) for interface / abstract dispatch.
+/// The same key is computed for a `callvirt` target and for the implementing method,
+/// so they match; the `{:?}` of the parameter list is a stable, distinct encoding.
+fn sig_encode(name: &str, params: &[SigType]) -> String {
+    alloc::format!("{name}|{params:?}")
+}
+
+/// Builds each type's signature-keyed method map (its virtual / interface-implementing
+/// methods, including inherited, keyed by [`sig_encode`]), for dispatching `callvirt`
+/// to an interface or abstract method on a value of that runtime type.
+fn build_sig_methods(module: &mut Module, extends: &[Token], virtuals: &[Vec<VirtualMethod>]) {
+    let mut memo: Vec<Option<BTreeMap<String, MethodId>>> = alloc::vec![None; extends.len()];
+    for type_id in 0..extends.len() {
+        let methods = compute_sig_methods(type_id, extends, virtuals, &mut memo);
+        if !methods.is_empty() {
+            module.set_sig_methods(type_id as u32, methods);
+        }
+    }
+}
+
+/// The memoized signature-keyed method map of `type_id`: its base's map plus its own
+/// virtual methods (a derived method's key replaces the inherited one).
+fn compute_sig_methods(
+    type_id: usize,
+    extends: &[Token],
+    virtuals: &[Vec<VirtualMethod>],
+    memo: &mut [Option<BTreeMap<String, MethodId>>],
+) -> BTreeMap<String, MethodId> {
+    if let Some(methods) = &memo[type_id] {
+        return methods.clone();
+    }
+    let mut methods = match base_type_id(extends[type_id], extends.len()) {
+        Some(base) => compute_sig_methods(base, extends, virtuals, memo),
+        None => BTreeMap::new(),
+    };
+    for method in &virtuals[type_id] {
+        methods.insert(sig_encode(&method.name, &method.params), method.id);
+    }
+    memo[type_id] = Some(methods.clone());
+    methods
+}
+
+/// Records each `callvirt` token's target signature key and argument count, so the
+/// interpreter can dispatch interface / abstract methods (whose target may resolve to
+/// no body). The target name + signature come from the MethodDef table (collected
+/// during loading) or a MemberRef; `callvirt` is always on an instance, so the arg
+/// count is the parameters plus `this`.
+fn bind_call_targets(
+    module: &mut Module,
+    assembly: &Assembly,
+    tokens: &BTreeSet<Token>,
+    methoddef_sigs: &BTreeMap<u32, (String, Vec<SigType>)>,
+) {
+    for token in tokens {
+        let (key, param_count) = match token.table() {
+            METHOD_DEF => match methoddef_sigs.get(&token.row()) {
+                Some((name, params)) => (sig_encode(name, params), params.len()),
+                None => continue,
+            },
+            MEMBER_REF => {
+                let Some(member) = assembly.member_ref(token.row()) else {
+                    continue;
+                };
+                let name = member.name().unwrap_or("");
+                let params = member
+                    .method_signature()
+                    .map(|sig| sig.parameters)
+                    .unwrap_or_default();
+                (sig_encode(name, &params), params.len())
+            }
+            _ => continue,
+        };
+        let arg_count = u16::try_from(param_count + 1).unwrap_or(u16::MAX);
+        module.bind_call_target(*token, key, arg_count);
+    }
+}
+
 /// Builds each type's virtual method table and records each virtual method's slot,
 /// following single inheritance (II.12.2): a type's table extends its base's, a
 /// `newslot` method appends a slot, and an override (matched by name + parameter
-/// types) replaces the inherited slot. Abstract methods (no body, hence no id) are
-/// not modeled, so dispatch through an abstract base declaration is unsupported.
+/// types) replaces the inherited slot. (Abstract / interface dispatch goes through the
+/// signature-keyed map instead; see [`build_sig_methods`].)
 fn build_vtables(module: &mut Module, extends: &[Token], virtuals: &[Vec<VirtualMethod>]) {
     let mut memo: Vec<Option<Vec<VtableSlot>>> = alloc::vec![None; extends.len()];
     let mut method_slots: BTreeMap<MethodId, u32> = BTreeMap::new();

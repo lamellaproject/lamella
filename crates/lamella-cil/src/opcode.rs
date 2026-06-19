@@ -325,6 +325,7 @@ opcodes! {
         StelemR4 = 0xA0, "stelem.r4", None;
         StelemR8 = 0xA1, "stelem.r8", None;
         StelemRef = 0xA2, "stelem.ref", None;
+        UnboxAny = 0xA5, "unbox.any", Token;
         ConvOvfI1 = 0xB3, "conv.ovf.i1", None;
         ConvOvfU1 = 0xB4, "conv.ovf.u1", None;
         ConvOvfI2 = 0xB5, "conv.ovf.i2", None;
@@ -418,8 +419,8 @@ mod tests {
     use alloc::collections::BTreeSet;
 
     #[test]
-    fn there_are_213_opcodes() {
-        assert_eq!(Opcode::all().len(), 213);
+    fn there_are_214_opcodes() {
+        assert_eq!(Opcode::all().len(), 214);
     }
 
     #[test]
@@ -465,7 +466,7 @@ mod tests {
             .filter(|op| matches!(op.encoding(), Encoding::Extended(_)))
             .count();
         assert_eq!(two_byte, 25);
-        assert_eq!(Opcode::all().len() - two_byte, 188);
+        assert_eq!(Opcode::all().len() - two_byte, 189);
     }
 
     #[test]

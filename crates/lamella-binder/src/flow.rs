@@ -288,7 +288,7 @@ impl Analyzer {
                     self.expression(length, assigned, span);
                 }
             }
-            BoundExprKind::ObjectCreation { arguments } => {
+            BoundExprKind::ObjectCreation { arguments, .. } => {
                 for argument in arguments {
                     self.expression(argument, assigned, span);
                 }

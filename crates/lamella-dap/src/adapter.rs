@@ -1,55 +1,51 @@
-//! The debug adapter: translates DAP requests into actions on a
-//! [`lamella_ves::Session`] and produces the responses and events DAP expects.
+//! The debug adapter: translates DAP requests into calls on a [`DebugBackend`] and
+//! produces the responses and events DAP expects.
 
+use crate::interp_backend::InterpreterBackend;
 use crate::protocol::{Event, Message, Request, Response};
-use lamella_cil::{Instruction, Operand};
-use lamella_ves::{Module, Status, Trap, Value, Vm};
+use lamella_debug_backend::{DebugBackend, Scope, Stop};
+use lamella_ves::Module;
 use serde_json::{Value as Json, json};
 
-/// A debug session over one program: the module being debugged, the runtime
-/// context, and the running [`lamella_ves::Session`] once launched.
+pub use crate::interp_backend::{decode_address, encode_address};
+
+/// A debug session: the target behind the [`DebugBackend`] seam plus the adapter's
+/// own DAP bookkeeping.
 pub struct Debugger {
-    module: Module,
-    entry: u32,
-    vm: Vm,
-    session: Option<lamella_ves::Session>,
-    /// The current instruction breakpoints, as `(method, instruction)`. Held here
-    /// so they survive across `launch` (which creates the session) and re-apply.
-    breakpoints: Vec<(u32, u32)>,
-    /// How many UTF-16 code units of the program's console output have already been
-    /// forwarded to the client as `output` events.
-    output_sent: usize,
+    backend: Box<dyn DebugBackend>,
+    /// All console output forwarded to the client so far (also exposed for tests).
+    output: String,
+    /// Whether `launch` has started the target (so `pause` can report a stop).
+    launched: bool,
     /// Whether `launch` asked to stop at the entry point instead of running.
     stop_on_entry: bool,
     out_seq: i64,
 }
 
 impl Debugger {
-    /// Creates a debugger that owns `module`, whose program entry point is `entry`.
-    ///
-    /// The caller provides the loaded program (the server binary loads it from the
-    /// command line; the WASM agent from the bytes it is handed). Owning the module
-    /// -- rather than borrowing it -- is what lets the session and the module live
-    /// in one value behind a handle, and enables reading the program from the DAP
-    /// `launch` request in future.
+    /// Creates a debugger over the interpreter, owning `module`, entered at `entry`.
     #[must_use]
     pub fn new(module: Module, entry: u32) -> Debugger {
+        Debugger::with_backend(Box::new(InterpreterBackend::new(module, entry)))
+    }
+
+    /// Creates a debugger over any [`DebugBackend`] -- the interpreter, or an on-device
+    /// target. This is the seam an on-device adapter constructs.
+    #[must_use]
+    pub fn with_backend(backend: Box<dyn DebugBackend>) -> Debugger {
         Debugger {
-            module,
-            entry,
-            vm: Vm::new(),
-            session: None,
-            breakpoints: Vec::new(),
-            output_sent: 0,
+            backend,
+            output: String::new(),
+            launched: false,
             stop_on_entry: false,
             out_seq: 0,
         }
     }
 
-    /// The runtime context, for inspecting console output after a run.
+    /// All console output the program has produced and the adapter has forwarded.
     #[must_use]
-    pub fn vm(&self) -> &Vm {
-        &self.vm
+    pub fn output_string(&self) -> &str {
+        &self.output
     }
 
     /// Handles one DAP request, returning the response followed by any events.
@@ -65,7 +61,7 @@ impl Debugger {
                 if self.stop_on_entry {
                     events.push(("stopped", Some(stopped("entry"))));
                 } else {
-                    self.resume(&mut events);
+                    self.run(Action::Resume, &mut events);
                 }
                 (true, None)
             }
@@ -80,23 +76,23 @@ impl Debugger {
                 Some(self.variables(arg_u32(request, "variablesReference"))),
             ),
             "continue" => {
-                self.resume(&mut events);
+                self.run(Action::Resume, &mut events);
                 (true, Some(json!({ "allThreadsContinued": true })))
             }
             "stepIn" => {
-                self.step_in(&mut events);
+                self.run(Action::StepIn, &mut events);
                 (true, None)
             }
             "next" => {
-                self.step_over(&mut events);
+                self.run(Action::StepOver, &mut events);
                 (true, None)
             }
             "stepOut" => {
-                self.step_out(&mut events);
+                self.run(Action::StepOut, &mut events);
                 (true, None)
             }
             "pause" => {
-                if self.session.is_some() {
+                if self.launched {
                     events.push(("stopped", Some(stopped("pause"))));
                 }
                 (true, None)
@@ -123,19 +119,12 @@ impl Debugger {
             .and_then(|arguments| arguments.get("stopOnEntry"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
-        match lamella_ves::Session::new(&self.module, self.entry, Vec::new()) {
-            Ok(session) => {
-                self.session = Some(session);
-                self.apply_breakpoints();
-                true
-            }
-            Err(_) => false,
-        }
+        self.launched = self.backend.launch();
+        self.launched
     }
 
-    /// Replaces the program's instruction breakpoints. Each breakpoint addresses a
-    /// CIL instruction by `(method, instruction)`, encoded in the
-    /// `instructionReference` (see [`encode_address`]); no source mapping needed.
+    /// Replaces the instruction breakpoints. Each is an opaque code address carried in
+    /// the `instructionReference` (the backend interprets it); no source mapping needed.
     fn set_instruction_breakpoints(&mut self, request: &Request) -> Json {
         let specs = request
             .arguments
@@ -144,7 +133,7 @@ impl Debugger {
             .and_then(Json::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut parsed = Vec::new();
+        let mut addresses = Vec::new();
         let mut results = Vec::new();
         for spec in &specs {
             let address = spec
@@ -155,149 +144,86 @@ impl Debugger {
             match address {
                 Some(base) => {
                     let address = base.wrapping_add(offset as u64);
-                    let (method, instruction) = decode_address(address);
-                    parsed.push((method, instruction));
-                    results.push(json!({ "verified": true, "instructionReference": alloc_int(address as i64) }));
+                    addresses.push(address);
+                    results.push(
+                        json!({ "verified": true, "instructionReference": address.to_string() }),
+                    );
                 }
                 None => results.push(json!({ "verified": false })),
             }
         }
-        self.breakpoints = parsed;
-        self.apply_breakpoints();
+        self.backend.set_breakpoints(&addresses);
         json!({ "breakpoints": results })
     }
 
-    fn apply_breakpoints(&mut self) {
-        let Debugger {
-            session,
-            breakpoints,
-            ..
-        } = self;
-        if let Some(session) = session.as_mut() {
-            session.clear_breakpoints();
-            for (method, instruction) in breakpoints.iter() {
-                session.add_breakpoint(*method, *instruction);
+    /// Runs the target for one command and emits the resulting output + stop/terminate
+    /// events.
+    fn run(&mut self, action: Action, events: &mut Vec<(&'static str, Option<Json>)>) {
+        let stop = match action {
+            Action::Resume => self.backend.resume(),
+            Action::StepIn => self.backend.step(),
+            Action::StepOver => self.step_to_depth(|depth, start| depth <= start),
+            Action::StepOut => self.step_to_depth(|depth, start| depth < start),
+        };
+        self.finish(stop, events);
+    }
+
+    /// Single-steps until `reached(current_depth, start_depth)` -- `next` stops once
+    /// back at or above the start depth (a stepped-over call has returned), `stepOut`
+    /// once below it (the current method has returned).
+    fn step_to_depth(&mut self, reached: impl Fn(usize, usize) -> bool) -> Stop {
+        let start = self.backend.depth();
+        loop {
+            match self.backend.step() {
+                Stop::Done => break Stop::Done,
+                Stop::Fault(message) => break Stop::Fault(message),
+                _ if reached(self.backend.depth(), start) => break Stop::Step,
+                _ => {}
             }
         }
     }
 
-    fn resume(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
-        let Debugger {
-            session,
-            vm,
-            output_sent,
-            module,
-            ..
-        } = self;
-        let Some(session) = session.as_mut() else {
-            return;
-        };
-        if session.is_at_breakpoint() {
-            match session.step(module, vm) {
-                Ok(Status::Done(_)) => return finish(Run::Done, vm, output_sent, events),
-                Ok(_) => {}
-                Err(trap) => return finish(Run::Fault(trap), vm, output_sent, events),
+    /// Flushes new program output as an `output` event, then emits the event for the
+    /// stop -- so console output precedes the stop or terminate it accompanies.
+    fn finish(&mut self, stop: Stop, events: &mut Vec<(&'static str, Option<Json>)>) {
+        if let Some(text) = self.backend.take_output() {
+            self.output.push_str(&text);
+            events.push((
+                "output",
+                Some(json!({ "category": "stdout", "output": text })),
+            ));
+        }
+        match stop {
+            Stop::Breakpoint => events.push(("stopped", Some(stopped("breakpoint")))),
+            Stop::Step => events.push(("stopped", Some(stopped("step")))),
+            Stop::Done => {
+                events.push(("exited", Some(json!({ "exitCode": 0 }))));
+                events.push(("terminated", None));
+            }
+            Stop::Fault(message) => {
+                events.push((
+                    "output",
+                    Some(json!({ "category": "stderr", "output": format!("{message}\n") })),
+                ));
+                events.push(("terminated", None));
             }
         }
-        let run = match session.resume(module, vm) {
-            Ok(Status::Paused | Status::Running) => Run::Stopped("breakpoint"),
-            Ok(Status::Done(_)) => Run::Done,
-            Err(trap) => Run::Fault(trap),
-        };
-        finish(run, vm, output_sent, events);
-    }
-
-    /// `stepIn`: execute exactly one instruction, descending into any call.
-    fn step_in(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
-        let Debugger {
-            session,
-            vm,
-            output_sent,
-            module,
-            ..
-        } = self;
-        let Some(session) = session.as_mut() else {
-            return;
-        };
-        let run = match session.step(module, vm) {
-            Ok(Status::Done(_)) => Run::Done,
-            Ok(Status::Running | Status::Paused) => Run::Stopped("step"),
-            Err(trap) => Run::Fault(trap),
-        };
-        finish(run, vm, output_sent, events);
-    }
-
-    /// `next`: step one instruction, but run any call it makes to completion
-    /// (stop once the stack is no deeper than it began).
-    fn step_over(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
-        let Debugger {
-            session,
-            vm,
-            output_sent,
-            module,
-            ..
-        } = self;
-        let Some(session) = session.as_mut() else {
-            return;
-        };
-        let target_depth = session.depth();
-        let run = loop {
-            match session.step(module, vm) {
-                Ok(Status::Done(_)) => break Run::Done,
-                Ok(Status::Running | Status::Paused) if session.depth() <= target_depth => {
-                    break Run::Stopped("step");
-                }
-                Ok(_) => {}
-                Err(trap) => break Run::Fault(trap),
-            }
-        };
-        finish(run, vm, output_sent, events);
-    }
-
-    /// `stepOut`: run until the current method returns to its caller.
-    fn step_out(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
-        let Debugger {
-            session,
-            vm,
-            output_sent,
-            module,
-            ..
-        } = self;
-        let Some(session) = session.as_mut() else {
-            return;
-        };
-        let target_depth = session.depth();
-        let run = loop {
-            match session.step(module, vm) {
-                Ok(Status::Done(_)) => break Run::Done,
-                Ok(Status::Running | Status::Paused) if session.depth() < target_depth => {
-                    break Run::Stopped("step");
-                }
-                Ok(_) => {}
-                Err(trap) => break Run::Fault(trap),
-            }
-        };
-        finish(run, vm, output_sent, events);
     }
 
     fn stack_trace(&self) -> Json {
-        let Some(session) = self.session.as_ref() else {
-            return json!({ "stackFrames": [], "totalFrames": 0 });
-        };
-        let mut frames = Vec::new();
-        for index in (0..session.depth()).rev() {
-            if let Some(frame) = session.frame(index) {
-                frames.push(json!({
-                    "id": index,
-                    "name": alloc_method_name(frame.method, frame.ip),
-                    "line": frame.ip + 1,
-                    "column": 1,
-                    "instructionPointerReference": encode_address(frame.method, frame.ip).to_string(),
-                }));
-            }
+        let frames = self.backend.stack();
+        let mut out = Vec::with_capacity(frames.len());
+        for (index, frame) in frames.iter().enumerate().rev() {
+            out.push(json!({
+                "id": index,
+                "name": frame.name,
+                "line": frame.line,
+                "column": 1,
+                "instructionPointerReference": frame.address.to_string(),
+            }));
         }
-        let total = frames.len();
-        json!({ "stackFrames": frames, "totalFrames": total })
+        let total = out.len();
+        json!({ "stackFrames": out, "totalFrames": total })
     }
 
     fn scopes(&self, frame_id: u32) -> Json {
@@ -310,31 +236,24 @@ impl Debugger {
     }
 
     fn variables(&self, reference: u32) -> Json {
-        let Some(session) = self.session.as_ref() else {
-            return json!({ "variables": [] });
-        };
         if reference == 0 {
             return json!({ "variables": [] });
         }
         let frame_index = ((reference - 1) / 3) as usize;
-        let kind = (reference - 1) % 3;
-        let Some(frame) = session.frame(frame_index) else {
-            return json!({ "variables": [] });
+        let scope = match (reference - 1) % 3 {
+            0 => Scope::Arguments,
+            1 => Scope::Locals,
+            _ => Scope::Stack,
         };
-        let (slot_prefix, values) = match kind {
-            0 => ("arg", frame.args),
-            1 => ("local", frame.locals),
-            _ => ("stack", frame.stack),
-        };
-        let variables: Vec<Json> = values
+        let variables: Vec<Json> = self
+            .backend
+            .variables(frame_index, scope)
             .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                let (text, kind) = format_value(&self.vm, *value);
+            .map(|variable| {
                 json!({
-                    "name": alloc_slot_name(slot_prefix, index),
-                    "value": text,
-                    "type": kind,
+                    "name": variable.name,
+                    "value": variable.value,
+                    "type": variable.kind,
                     "variablesReference": 0,
                 })
             })
@@ -342,8 +261,8 @@ impl Debugger {
         json!({ "variables": variables })
     }
 
-    /// Lists CIL instructions starting at the `memoryReference` address, returning
-    /// each with its own address so the client can set instruction breakpoints.
+    /// Lists code starting near the `memoryReference` address, each entry with its own
+    /// address so the client can set instruction breakpoints.
     fn disassemble(&self, request: &Request) -> Json {
         let arguments = request.arguments.as_ref();
         let reference = arguments
@@ -353,8 +272,7 @@ impl Debugger {
         let Some(reference) = reference else {
             return json!({ "instructions": [] });
         };
-        let (method, base_ip) = decode_address(reference);
-        let instruction_offset = arguments
+        let offset = arguments
             .and_then(|args| args.get("instructionOffset"))
             .and_then(Json::as_i64)
             .unwrap_or(0);
@@ -362,32 +280,14 @@ impl Debugger {
             .and_then(|args| args.get("instructionCount"))
             .and_then(Json::as_u64)
             .unwrap_or(0)
-            .min(4096);
-
-        let code = self.method_code(method);
-        let mut instructions = Vec::new();
-        for step in 0..count {
-            let ip = i64::from(base_ip) + instruction_offset + step as i64;
-            let address = if ip >= 0 {
-                encode_address(method, ip as u32)
-            } else {
-                0
-            };
-            let text = match (code, usize::try_from(ip)) {
-                (Some(code), Ok(index)) if index < code.len() => format_instruction(&code[index]),
-                _ => "(out of range)".to_owned(),
-            };
-            instructions.push(json!({ "address": address.to_string(), "instruction": text }));
-        }
+            .min(4096) as usize;
+        let instructions: Vec<Json> = self
+            .backend
+            .disassemble(reference, offset, count)
+            .iter()
+            .map(|entry| json!({ "address": entry.address.to_string(), "instruction": entry.text }))
+            .collect();
         json!({ "instructions": instructions })
-    }
-
-    /// The CIL of a loaded method, or `None` for an intrinsic or unknown method.
-    fn method_code(&self, method: u32) -> Option<&[Instruction]> {
-        match self.module.method(method)? {
-            lamella_ves::Method::Managed { body, .. } => Some(&body.code[..]),
-            lamella_ves::Method::Intrinsic { .. } => None,
-        }
     }
 
     fn response(&mut self, request: &Request, success: bool, body: Option<Json>) -> Message {
@@ -412,57 +312,12 @@ impl Debugger {
     }
 }
 
-/// The outcome of running the interpreter for one command, before output is
-/// flushed and the matching event emitted.
-enum Run {
-    /// Paused, with the DAP stop reason (`breakpoint` or `step`).
-    Stopped(&'static str),
-    /// The program ran to completion.
-    Done,
-    /// A trap ended the run.
-    Fault(Trap),
-}
-
-/// Flushes any new program output as an `output` event, then emits the event for
-/// `run` -- so console output precedes the stop or terminate it accompanies.
-fn finish(
-    run: Run,
-    vm: &Vm,
-    output_sent: &mut usize,
-    events: &mut Vec<(&'static str, Option<Json>)>,
-) {
-    flush_output(vm, output_sent, events);
-    match run {
-        Run::Stopped(reason) => events.push(("stopped", Some(stopped(reason)))),
-        Run::Done => terminate(events),
-        Run::Fault(trap) => fault(events, &trap),
-    }
-}
-
-/// Emits an `output` event for console output produced since the last flush.
-fn flush_output(vm: &Vm, output_sent: &mut usize, events: &mut Vec<(&'static str, Option<Json>)>) {
-    let output = vm.output();
-    if output.len() > *output_sent {
-        let text = String::from_utf16_lossy(&output[*output_sent..]);
-        events.push((
-            "output",
-            Some(json!({ "category": "stdout", "output": text })),
-        ));
-        *output_sent = output.len();
-    }
-}
-
-fn terminate(events: &mut Vec<(&'static str, Option<Json>)>) {
-    events.push(("exited", Some(json!({ "exitCode": 0 }))));
-    events.push(("terminated", None));
-}
-
-fn fault(events: &mut Vec<(&'static str, Option<Json>)>, trap: &lamella_ves::Trap) {
-    events.push((
-        "output",
-        Some(json!({ "category": "stderr", "output": alloc_trap_line(trap) })),
-    ));
-    events.push(("terminated", None));
+/// One execution command, resolved by [`Debugger::run`] into backend calls.
+enum Action {
+    Resume,
+    StepIn,
+    StepOver,
+    StepOut,
 }
 
 fn stopped(reason: &str) -> Json {
@@ -475,37 +330,6 @@ fn capabilities() -> Json {
         "supportsInstructionBreakpoints": true,
         "supportsDisassembleRequest": true,
     })
-}
-
-/// Renders one CIL instruction as a mnemonic and its operand, for disassembly.
-fn format_instruction(instruction: &Instruction) -> String {
-    let mnemonic = instruction.opcode.mnemonic();
-    match &instruction.operand {
-        Operand::None => mnemonic.to_owned(),
-        Operand::Int8(value) => format!("{mnemonic} {value}"),
-        Operand::Int32(value) => format!("{mnemonic} {value}"),
-        Operand::Int64(value) => format!("{mnemonic} {value}"),
-        Operand::Float32(value) => format!("{mnemonic} {value}"),
-        Operand::Float64(value) => format!("{mnemonic} {value}"),
-        Operand::Variable(slot) => format!("{mnemonic} {slot}"),
-        Operand::Target(target) => format!("{mnemonic} -> {target}"),
-        Operand::Switch(targets) => format!("{mnemonic} ({} targets)", targets.len()),
-        Operand::Token(token) => format!("{mnemonic} 0x{:08X}", token.0),
-        Operand::Alignment(align) => format!("{mnemonic} {align}"),
-    }
-}
-
-/// Encodes a CIL location `(method, instruction)` as a single instruction address
-/// for DAP: the method in the high 32 bits, the instruction index in the low 32.
-#[must_use]
-pub fn encode_address(method: lamella_ves::MethodId, instruction: u32) -> u64 {
-    (u64::from(method) << 32) | u64::from(instruction)
-}
-
-/// The inverse of [`encode_address`].
-#[must_use]
-pub fn decode_address(address: u64) -> (u32, u32) {
-    ((address >> 32) as u32, (address & 0xFFFF_FFFF) as u32)
 }
 
 fn unverified_breakpoints(request: &Request) -> Json {
@@ -521,20 +345,6 @@ fn unverified_breakpoints(request: &Request) -> Json {
     json!({ "breakpoints": breakpoints })
 }
 
-fn format_value(vm: &Vm, value: Value) -> (String, String) {
-    match value {
-        Value::Int32(n) => (alloc_int(i64::from(n)), "int".to_owned()),
-        Value::Int64(n) => (alloc_int(n), "long".to_owned()),
-        Value::NativeInt(n) => (alloc_int(n), "native int".to_owned()),
-        Value::Float(f) => (alloc_float(f), "double".to_owned()),
-        Value::Object(reference) => match vm.heap().as_string(reference) {
-            Some(chars) => (alloc_quoted(chars), "string".to_owned()),
-            None => ("object".to_owned(), "object".to_owned()),
-        },
-        Value::Null => ("null".to_owned(), "object".to_owned()),
-    }
-}
-
 fn arg_u32(request: &Request, field: &str) -> u32 {
     request
         .arguments
@@ -542,31 +352,6 @@ fn arg_u32(request: &Request, field: &str) -> u32 {
         .and_then(|args| args.get(field))
         .and_then(Json::as_u64)
         .unwrap_or(0) as u32
-}
-
-
-fn alloc_method_name(method: lamella_ves::MethodId, ip: u32) -> String {
-    format!("method#{method} @{ip}")
-}
-
-fn alloc_slot_name(prefix: &str, index: usize) -> String {
-    format!("{prefix}{index}")
-}
-
-fn alloc_int(value: i64) -> String {
-    value.to_string()
-}
-
-fn alloc_float(value: f64) -> String {
-    value.to_string()
-}
-
-fn alloc_quoted(chars: &[u16]) -> String {
-    format!("\"{}\"", String::from_utf16_lossy(chars))
-}
-
-fn alloc_trap_line(trap: &lamella_ves::Trap) -> String {
-    format!("{trap}\n")
 }
 
 #[cfg(test)]
@@ -651,7 +436,7 @@ mod tests {
             out.iter()
                 .any(|m| matches!(m, Message::Event(e) if e.event == "terminated"))
         );
-        assert_eq!(dbg.vm().output_string(), "hi\n");
+        assert_eq!(dbg.output_string(), "hi\n");
     }
 
     #[test]

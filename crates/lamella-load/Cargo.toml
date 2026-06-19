@@ -11,7 +11,7 @@ description = "Loads an ECMA-335 assembly into a runnable lamella-ves module."
 lamella-cil = { path = "../lamella-cil" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-token = { path = "../lamella-token" }
-lamella-ves = { path = "../lamella-ves" }
+lamella-ves = { path = "../lamella-ves", features = ["bcl", "exceptions"] }
 
 [lints]
 workspace = true

@@ -4,7 +4,9 @@
 use crate::bind::bind_type;
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
-use crate::symbols::{FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind};
+use crate::symbols::{
+    Accessibility, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind,
+};
 use crate::types::TypeSymbol;
 use alloc::string::String;
 use lamella_syntax::ast::{
@@ -53,6 +55,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     name: member.name.clone(),
                     ty: enum_ty.clone(),
                     is_static: true,
+                    accessibility: Accessibility::Public,
                 });
             }
             model.insert(info);
@@ -82,11 +85,13 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             } => {
                 let field_ty = bind_type(ty);
                 let is_static = is_static(modifiers);
+                let accessibility = accessibility_of(modifiers);
                 for declarator in declarators {
                     info.fields.push(FieldSymbol {
                         name: declarator.name.clone(),
                         ty: field_ty.clone(),
                         is_static,
+                        accessibility,
                     });
                 }
             }
@@ -101,6 +106,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
                 is_static: is_static(modifiers),
+                accessibility: accessibility_of(modifiers),
             }),
             Member::Property {
                 modifiers,
@@ -111,6 +117,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 name: name.clone(),
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
+                accessibility: accessibility_of(modifiers),
             }),
             Member::Constructor {
                 modifiers,
@@ -134,6 +141,7 @@ fn constructor(parameters: &[lamella_syntax::ast::Parameter]) -> MethodSymbol {
         return_type: TypeSymbol::Special(SpecialType::Void),
         parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
         is_static: false,
+        accessibility: Accessibility::Public,
     }
 }
 
@@ -160,6 +168,24 @@ fn map_kind(kind: SyntaxTypeKind) -> TypeKind {
 
 fn is_static(modifiers: &[Modifier]) -> bool {
     modifiers.contains(&Modifier::Static)
+}
+
+/// The accessibility a member's modifiers declare; a class member with none is
+/// `private` (10.5.1).
+fn accessibility_of(modifiers: &[Modifier]) -> Accessibility {
+    let protected = modifiers.contains(&Modifier::Protected);
+    let internal = modifiers.contains(&Modifier::Internal);
+    if modifiers.contains(&Modifier::Public) {
+        Accessibility::Public
+    } else if protected && internal {
+        Accessibility::ProtectedInternal
+    } else if protected {
+        Accessibility::Protected
+    } else if internal {
+        Accessibility::Internal
+    } else {
+        Accessibility::Private
+    }
 }
 
 /// Appends a (possibly dotted) namespace declaration name to the enclosing

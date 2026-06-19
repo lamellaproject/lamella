@@ -42,17 +42,24 @@ pub fn metadata_root(
         streams.push(("#GUID", guids));
     }
     streams.push(("#Blob", blob));
+    metadata_root_from_streams(version, &streams)
+}
 
+/// Assembles the metadata root around `streams`, in the given order. The caller
+/// orders them (e.g. a Portable PDB leads with `#Pdb`); this lays out the `BSJB`
+/// header, the stream directory, and the four-byte-padded bodies.
+#[must_use]
+pub fn metadata_root_from_streams(version: &str, streams: &[(&str, &[u8])]) -> Vec<u8> {
     let version_len = align4(version.len() + 1);
 
     let mut header_size = 4 + 2 + 2 + 4 + 4 + version_len + 2 + 2;
-    for (name, _) in &streams {
+    for (name, _) in streams {
         header_size += 8 + padded_name(name).len();
     }
 
     let mut offset = header_size;
     let mut offsets = Vec::with_capacity(streams.len());
-    for (_, bytes) in &streams {
+    for (_, bytes) in streams {
         offsets.push(offset);
         offset += align4(bytes.len());
     }
@@ -75,7 +82,7 @@ pub fn metadata_root(
         out.extend_from_slice(&padded_name(name));
     }
 
-    for (_, bytes) in &streams {
+    for (_, bytes) in streams {
         out.extend_from_slice(bytes);
         while out.len() % 4 != 0 {
             out.push(0);

@@ -108,6 +108,11 @@ pub enum DiagnosticKind {
         /// The method name.
         method: Box<str>,
     },
+    /// `CS0122`: the member is inaccessible due to its protection level.
+    Inaccessible {
+        /// The qualified member name.
+        member: Box<str>,
+    },
     /// `CS0021`: a value of this type cannot be indexed with `[]`.
     CannotIndex {
         /// The type that was indexed.
@@ -181,6 +186,7 @@ impl DiagnosticKind {
             DiagnosticKind::NoOverloadForArgumentCount { .. } => 1501,
             DiagnosticKind::ArgumentConversion { .. } => 1503,
             DiagnosticKind::AmbiguousCall { .. } => 121,
+            DiagnosticKind::Inaccessible { .. } => 122,
             DiagnosticKind::CannotIndex { .. } => 21,
             DiagnosticKind::NoConstructor { .. } => 1729,
             DiagnosticKind::ReturnValueInVoidMethod { .. } => 127,
@@ -241,6 +247,9 @@ impl fmt::Display for DiagnosticKind {
             ),
             DiagnosticKind::AmbiguousCall { method } => {
                 write!(f, "The call is ambiguous between overloads of '{method}'")
+            }
+            DiagnosticKind::Inaccessible { member } => {
+                write!(f, "'{member}' is inaccessible due to its protection level")
             }
             DiagnosticKind::CannotIndex { type_name } => write!(
                 f,
