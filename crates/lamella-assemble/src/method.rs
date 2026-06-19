@@ -1,14 +1,14 @@
 //! Lowering a bound method body to a CIL instruction stream (ECMA-335 1st ed,
 //! Partition III).
 
-use crate::expr::{EmitError, emit_expression, emit_local};
+use crate::expr::{EmitError, emit_expression, emit_local, ldelem_opcode};
 use crate::frame::{Frame, Slot};
 use crate::tokens::Tokens;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use lamella_binder::{
-    BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, SpecialType, TypeSymbol,
-    always_exits,
+    BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, BoundSwitchLabel, SpecialType,
+    TypeSymbol, always_exits,
 };
 use lamella_cil::{EhClause, EhKind, Instruction, InstructionRange, Opcode, Operand};
 use lamella_syntax::ast::{AssignmentOperator, PostfixOperator, UnaryOperator};
@@ -34,10 +34,13 @@ pub struct EmittedBody {
     pub handlers: Vec<EhClause>,
 }
 
-/// The enclosing loop's branch targets, for `break` and `continue`.
+/// The enclosing loop's (or switch's) branch targets, for `break` and `continue`.
+/// `break` leaves the innermost loop or switch; `continue` targets the innermost
+/// loop, skipping any switch in between.
 struct LoopContext {
     continue_label: usize,
     break_label: usize,
+    is_switch: bool,
 }
 
 /// A method's return epilogue, used when the body has a `try`: a `return` cannot
@@ -107,6 +110,8 @@ fn stack_effect(opcode: Opcode) -> i32 {
     match opcode {
         Opcode::LdcI4
         | Opcode::LdcI8
+        | Opcode::LdcR4
+        | Opcode::LdcR8
         | Opcode::Ldnull
         | Opcode::Ldarg
         | Opcode::Ldloc
@@ -237,14 +242,16 @@ fn contains_try(stmt: &BoundStmt) -> bool {
         | Kind::Using { body, .. }
         | Kind::Labeled { body, .. } => contains_try(body),
         Kind::Checked(inner) | Kind::Unchecked(inner) => contains_try(inner),
-        Kind::Switch { sections, .. } => sections.iter().flatten().any(contains_try),
+        Kind::Switch { sections, .. } => sections
+            .iter()
+            .any(|section| section.statements.iter().any(contains_try)),
         _ => false,
     }
 }
 
 fn emit_statement(
     stmt: &BoundStmt,
-    frame: &Frame,
+    frame: &mut Frame,
     tokens: &Tokens,
     labels: &mut Labels,
     out: &mut Vec<Instruction>,
@@ -304,6 +311,7 @@ fn emit_statement(
             labels.loops.push(LoopContext {
                 continue_label: start,
                 break_label: end,
+                is_switch: false,
             });
             emit_statement(body, frame, tokens, labels, out)?;
             labels.loops.pop();
@@ -318,6 +326,7 @@ fn emit_statement(
             labels.loops.push(LoopContext {
                 continue_label: test,
                 break_label: end,
+                is_switch: false,
             });
             emit_statement(body, frame, tokens, labels, out)?;
             labels.loops.pop();
@@ -342,11 +351,11 @@ fn emit_statement(
             out,
         )?,
         BoundStmtKind::Break => {
-            let target = loop_target(labels, |context| context.break_label)?;
+            let target = loop_target(labels, false, |context| context.break_label)?;
             labels.branch(Opcode::Br, target, out);
         }
         BoundStmtKind::Continue => {
-            let target = loop_target(labels, |context| context.continue_label)?;
+            let target = loop_target(labels, true, |context| context.continue_label)?;
             labels.branch(Opcode::Br, target, out);
         }
         BoundStmtKind::Checked(inner) | BoundStmtKind::Unchecked(inner) => {
@@ -372,6 +381,109 @@ fn emit_statement(
             labels,
             out,
         )?,
+        BoundStmtKind::Switch {
+            expression,
+            sections,
+        } => {
+            let temp = frame.reserve_local(&expression.ty);
+            emit_expression(expression, frame, tokens, out)?;
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(temp)));
+
+            let long = matches!(
+                expression.ty,
+                TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
+            );
+            let section_labels: Vec<usize> = sections.iter().map(|_| labels.label()).collect();
+            let end = labels.label();
+            let mut default_label = None;
+
+            for (index, section) in sections.iter().enumerate() {
+                for label in &section.labels {
+                    match label {
+                        BoundSwitchLabel::Case(value) => {
+                            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(temp)));
+                            let constant = if long {
+                                Instruction::new(Opcode::LdcI8, Operand::Int64(*value))
+                            } else {
+                                Instruction::new(Opcode::LdcI4, Operand::Int32(*value as i32))
+                            };
+                            out.push(constant);
+                            out.push(Instruction::simple(Opcode::Ceq));
+                            labels.branch(Opcode::Brtrue, section_labels[index], out);
+                        }
+                        BoundSwitchLabel::Default => default_label = Some(section_labels[index]),
+                    }
+                }
+            }
+            labels.branch(Opcode::Br, default_label.unwrap_or(end), out);
+
+            labels.loops.push(LoopContext {
+                continue_label: end,
+                break_label: end,
+                is_switch: true,
+            });
+            for (index, section) in sections.iter().enumerate() {
+                labels.place(section_labels[index], out);
+                for statement in &section.statements {
+                    emit_statement(statement, frame, tokens, labels, out)?;
+                }
+            }
+            labels.loops.pop();
+            labels.place(end, out);
+        }
+        BoundStmtKind::ForEach {
+            name,
+            collection,
+            body,
+            ..
+        } => {
+            let TypeSymbol::Array { element, .. } = &collection.ty else {
+                return Err(EmitError::Unsupported(
+                    "foreach over a non-array collection is not lowered yet",
+                ));
+            };
+            let load_element = ldelem_opcode(element)?;
+            let array = frame.reserve_local(&collection.ty);
+            let index = frame.reserve_local(&TypeSymbol::Special(SpecialType::Int32));
+
+            emit_expression(collection, frame, tokens, out)?;
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(array)));
+            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(index)));
+
+            let test = labels.label();
+            let step = labels.label();
+            let end = labels.label();
+
+            labels.place(test, out);
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
+            out.push(Instruction::simple(Opcode::Ldlen));
+            out.push(Instruction::simple(Opcode::ConvI4));
+            out.push(Instruction::simple(Opcode::Clt));
+            labels.branch(Opcode::Brfalse, end, out);
+
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
+            out.push(Instruction::simple(load_element));
+            store_to(frame, name, out)?;
+
+            labels.loops.push(LoopContext {
+                continue_label: step,
+                break_label: end,
+                is_switch: false,
+            });
+            emit_statement(body, frame, tokens, labels, out)?;
+            labels.loops.pop();
+
+            labels.place(step, out);
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
+            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
+            out.push(Instruction::simple(Opcode::Add));
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(index)));
+            labels.branch(Opcode::Br, test, out);
+            labels.place(end, out);
+        }
         _ => {
             return Err(EmitError::Unsupported(
                 "this statement form is not lowered yet",
@@ -389,7 +501,7 @@ fn emit_try(
     body: &BoundStmt,
     catches: &[BoundCatch],
     finally: Option<&BoundStmt>,
-    frame: &Frame,
+    frame: &mut Frame,
     tokens: &Tokens,
     labels: &mut Labels,
     out: &mut Vec<Instruction>,
@@ -461,7 +573,7 @@ fn emit_if(
     condition: &BoundExpr,
     then_branch: &BoundStmt,
     else_branch: Option<&BoundStmt>,
-    frame: &Frame,
+    frame: &mut Frame,
     tokens: &Tokens,
     labels: &mut Labels,
     out: &mut Vec<Instruction>,
@@ -494,7 +606,7 @@ fn emit_for(
     condition: Option<&BoundExpr>,
     iterators: &[BoundExpr],
     body: &BoundStmt,
-    frame: &Frame,
+    frame: &mut Frame,
     tokens: &Tokens,
     labels: &mut Labels,
     out: &mut Vec<Instruction>,
@@ -513,6 +625,7 @@ fn emit_for(
     labels.loops.push(LoopContext {
         continue_label: step,
         break_label: end,
+        is_switch: false,
     });
     emit_statement(body, frame, tokens, labels, out)?;
     labels.loops.pop();
@@ -527,11 +640,14 @@ fn emit_for(
 
 fn loop_target(
     labels: &Labels,
+    skip_switch: bool,
     select: impl Fn(&LoopContext) -> usize,
 ) -> Result<usize, EmitError> {
     labels
         .loops
-        .last()
+        .iter()
+        .rev()
+        .find(|context| !(skip_switch && context.is_switch))
         .map(select)
         .ok_or(EmitError::Unsupported("break/continue outside a loop"))
 }

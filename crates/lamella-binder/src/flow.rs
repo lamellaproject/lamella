@@ -2,7 +2,7 @@
 
 use crate::bound::{BoundExpr, BoundExprKind};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::statement::{BoundStmt, BoundStmtKind};
+use crate::statement::{BoundStmt, BoundStmtKind, BoundSwitchLabel};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
@@ -35,6 +35,15 @@ pub fn always_exits(stmt: &BoundStmt) -> bool {
         } => {
             finally.as_ref().is_some_and(|block| always_exits(block))
                 || (always_exits(body) && catches.iter().all(|catch| always_exits(&catch.body)))
+        }
+        Kind::Switch { sections, .. } => {
+            let has_default = sections
+                .iter()
+                .any(|section| section.labels.contains(&BoundSwitchLabel::Default));
+            has_default
+                && sections
+                    .iter()
+                    .all(|section| section.statements.iter().any(always_exits))
         }
         _ => false,
     }
@@ -198,7 +207,7 @@ impl Analyzer {
                 let mut assigned = assigned;
                 self.expression(expression, &mut assigned, span);
                 for section in sections {
-                    self.block(section, assigned.clone());
+                    self.block(&section.statements, assigned.clone());
                 }
                 Flow::Reaches(assigned)
             }

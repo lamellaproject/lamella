@@ -895,9 +895,17 @@ impl Binder {
         if receiver.ty.is_error() {
             return error_expr();
         }
+        let receiver_kind = receiver_category(&receiver);
         match self.resolve_member(&receiver.ty, name) {
             MemberResolution::Field(field) => {
                 self.check_accessible(&field.declaring_type, field.accessibility, name, span);
+                self.check_static_instance(
+                    receiver_kind,
+                    field.is_static,
+                    &field.declaring_type,
+                    name,
+                    span,
+                );
                 BoundExpr {
                     ty: field.ty.clone(),
                     kind: BoundExprKind::FieldAccess {
@@ -911,8 +919,10 @@ impl Binder {
                 declaring_type,
                 ty,
                 accessibility,
+                is_static,
             } => {
                 self.check_accessible(&declaring_type, accessibility, name, span);
+                self.check_static_instance(receiver_kind, is_static, &declaring_type, name, span);
                 BoundExpr {
                     kind: BoundExprKind::PropertyAccess {
                         receiver: Box::new(receiver),
@@ -959,6 +969,10 @@ impl Binder {
             }
             _ => None,
         };
+        let receiver_kind = match &callee.kind {
+            BoundExprKind::MethodGroup { receiver, .. } => Some(receiver_category(receiver)),
+            _ => None,
+        };
         let resolved = match group {
             Some((receiver_ty, name))
                 if !arguments.iter().any(|argument| argument.ty.is_error()) =>
@@ -979,6 +993,15 @@ impl Binder {
             }
             _ => None,
         };
+        if let (Some(kind), Some(method)) = (receiver_kind, &resolved) {
+            self.check_static_instance(
+                kind,
+                method.is_static,
+                &method.declaring_type,
+                &method.name,
+                span,
+            );
+        }
         let ty = resolved
             .as_ref()
             .map_or(TypeSymbol::Error, |method| method.return_type.clone());
@@ -1193,6 +1216,29 @@ impl Binder {
         }
     }
 
+    /// Reports the static/instance mismatch of accessing a member through `receiver`
+    /// (`CS0120` for an instance member named through a type, `CS0176` for a static
+    /// member through an instance). An access through `this`/`base` is exempt.
+    fn check_static_instance(
+        &mut self,
+        receiver: Receiver,
+        is_static: bool,
+        declaring: &TypeSymbol,
+        member: &str,
+        span: Span,
+    ) {
+        let kind = match receiver {
+            Receiver::ViaType if !is_static => DiagnosticKind::ObjectReferenceRequired {
+                member: qualified_member(declaring, member),
+            },
+            Receiver::Instance if is_static => DiagnosticKind::StaticMemberViaInstance {
+                member: qualified_member(declaring, member),
+            },
+            _ => return,
+        };
+        self.diagnostics.push(Diagnostic::new(kind, span));
+    }
+
     /// Looks a member up on a type, walking the base-class chain (14.3, 14.5.4).
     fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
         let mut current = self.type_info_of(ty);
@@ -1214,6 +1260,7 @@ impl Binder {
                     declaring_type: type_symbol_in(&info.namespace, &info.name),
                     ty: property.ty.clone(),
                     accessibility: property.accessibility,
+                    is_static: property.is_static,
                 };
             }
             if info.methods_named(name).next().is_some() {
@@ -1419,10 +1466,38 @@ fn binary_result_type(
 }
 
 /// The outcome of looking a member up on a type.
+/// How a member-access receiver was written, for the static/instance check.
+#[derive(Clone, Copy)]
+enum Receiver {
+    /// Through a type name, e.g. `Type.Member`.
+    ViaType,
+    /// Through `this`/`base` (implicit or explicit): no static/instance error.
+    ImplicitThis,
+    /// Through an instance value, e.g. `obj.Member`.
+    Instance,
+}
+
+/// Categorizes a bound receiver for the static/instance check (CS0120/CS0176).
+fn receiver_category(receiver: &BoundExpr) -> Receiver {
+    match &receiver.kind {
+        BoundExprKind::TypeReference(_) => Receiver::ViaType,
+        BoundExprKind::This | BoundExprKind::Base => Receiver::ImplicitThis,
+        _ => Receiver::Instance,
+    }
+}
+
+/// `Type.member`, for a diagnostic message.
+fn qualified_member(declaring: &TypeSymbol, member: &str) -> Box<str> {
+    let mut qualified = declaring.to_string();
+    qualified.push('.');
+    qualified.push_str(member);
+    qualified.into()
+}
+
 enum MemberResolution {
     /// A field, with its resolved reference.
     Field(FieldReference),
-    /// A property, with its declaring type, type, and accessibility.
+    /// A property, with its declaring type, type, accessibility, and staticness.
     Property {
         /// The type that declares the property.
         declaring_type: TypeSymbol,
@@ -1430,6 +1505,8 @@ enum MemberResolution {
         ty: TypeSymbol,
         /// The property's accessibility.
         accessibility: Accessibility,
+        /// Whether the property is `static`.
+        is_static: bool,
     },
     /// One or more methods of that name (a method group).
     MethodGroup,
@@ -1782,7 +1859,7 @@ fn unary_operator_symbol(operator: UnaryOperator) -> &'static str {
 fn literal_type(literal: &Literal) -> TypeSymbol {
     let special = match literal {
         Literal::Integer { value, suffix } => integer_literal_type(*value, *suffix),
-        Literal::Real { suffix } => match suffix {
+        Literal::Real { suffix, .. } => match suffix {
             RealSuffix::Float => SpecialType::Single,
             RealSuffix::Decimal => SpecialType::Decimal,
             RealSuffix::Double | RealSuffix::None => SpecialType::Double,
@@ -2547,6 +2624,71 @@ mod tests {
             codes(
                 "class Counter { public int Bump() { return 0; } } \
                  class Program { static int Run() { Counter c = new Counter(); return c.Bump(); } }"
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn static_instance_mismatch_is_cs0120_and_cs0176() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes(
+                "class A { public int I() { return 1; } } \
+                 class C { static int Run() { return A.I(); } }"
+            ),
+            [120]
+        );
+        assert_eq!(
+            codes(
+                "class A { public static int S() { return 1; } } \
+                 class C { static int Run() { A a = new A(); return a.S(); } }"
+            ),
+            [176]
+        );
+        assert_eq!(
+            codes(
+                "class A { public static int S() { return 1; } public int I() { return 1; } } \
+                 class C { static int Run() { A a = new A(); return A.S() + a.I(); } }"
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn switch_binds_constant_cases_and_flags_a_non_constant_label() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes(
+                "class C { static int Run() { int x = 1; int y = 2; \
+                 switch (x) { case y: return 1; default: return 0; } } }"
+            ),
+            [150]
+        );
+        assert_eq!(
+            codes(
+                "class C { static int Run() { int x = 1; \
+                 switch (x) { case 1: return 1; default: return 0; } } }"
             ),
             []
         );

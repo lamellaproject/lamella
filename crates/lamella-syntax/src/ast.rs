@@ -951,9 +951,11 @@ pub enum Literal {
         /// The `U`/`L` suffix, if any.
         suffix: IntegerSuffix,
     },
-    /// A real literal: only the suffix is kept; binding computes the value with
-    /// the target type's rounding.
+    /// A real literal: its value as `f64` bits (see [`f64::from_bits`]; stored as
+    /// bits so the AST stays `Eq`) and the type suffix.
     Real {
+        /// The value's `f64` bit pattern.
+        bits: u64,
         /// The `F`/`D`/`M` suffix, if any.
         suffix: RealSuffix,
     },

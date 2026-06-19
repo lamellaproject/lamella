@@ -84,7 +84,9 @@ name = "lamella-debug-device"
 version = "0.0.0"
 dependencies = [
  "lamella-cmsis-dap",
+ "lamella-dap",
  "lamella-debug-backend",
+ "lamella-usbhid",
 ]
 
 [[package]]

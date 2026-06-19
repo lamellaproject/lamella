@@ -1,12 +1,15 @@
 //! The debug adapter: translates DAP requests into calls on a [`DebugBackend`] and
 //! produces the responses and events DAP expects.
 
+#[cfg(feature = "interpreter")]
 use crate::interp_backend::InterpreterBackend;
 use crate::protocol::{Event, Message, Request, Response};
 use lamella_debug_backend::{DebugBackend, Scope, Stop};
+#[cfg(feature = "interpreter")]
 use lamella_ves::Module;
 use serde_json::{Value as Json, json};
 
+#[cfg(feature = "interpreter")]
 pub use crate::interp_backend::{decode_address, encode_address};
 
 /// A debug session: the target behind the [`DebugBackend`] seam plus the adapter's
@@ -19,11 +22,15 @@ pub struct Debugger {
     launched: bool,
     /// Whether `launch` asked to stop at the entry point instead of running.
     stop_on_entry: bool,
+    /// Whether a resume-now backend left the target running, so the serve loop polls for
+    /// the async stop. Always false for the synchronous interpreter backend.
+    running: bool,
     out_seq: i64,
 }
 
 impl Debugger {
     /// Creates a debugger over the interpreter, owning `module`, entered at `entry`.
+    #[cfg(feature = "interpreter")]
     #[must_use]
     pub fn new(module: Module, entry: u32) -> Debugger {
         Debugger::with_backend(Box::new(InterpreterBackend::new(module, entry)))
@@ -38,6 +45,7 @@ impl Debugger {
             output: String::new(),
             launched: false,
             stop_on_entry: false,
+            running: false,
             out_seq: 0,
         }
     }
@@ -46,6 +54,36 @@ impl Debugger {
     #[must_use]
     pub fn output_string(&self) -> &str {
         &self.output
+    }
+
+    /// Whether a resume-now backend left the target running, so the serve loop should
+    /// [`poll`](Debugger::poll) for the eventual stop. Always false for the synchronous
+    /// interpreter backend (which finishes inside the request that resumed it).
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Polls a target a resume-now backend left running: the output + stop events once
+    /// it halts, or empty while it is still going. The serve loop calls this while
+    /// [`is_running`](Debugger::is_running) holds; the backend's `poll` may block until
+    /// the target halts, so this does not busy-wait.
+    #[must_use]
+    pub fn poll(&mut self) -> Vec<Message> {
+        let mut events: Vec<(&'static str, Option<Json>)> = Vec::new();
+        if self.running {
+            match self.backend.poll() {
+                Stop::Running => self.flush_output(&mut events),
+                stop => {
+                    self.running = false;
+                    self.finish(stop, &mut events);
+                }
+            }
+        }
+        events
+            .into_iter()
+            .map(|(event, body)| self.event(event, body))
+            .collect()
     }
 
     /// Handles one DAP request, returning the response followed by any events.
@@ -165,7 +203,12 @@ impl Debugger {
             Action::StepOver => self.step_to_depth(|depth, start| depth <= start),
             Action::StepOut => self.step_to_depth(|depth, start| depth < start),
         };
-        self.finish(stop, events);
+        if matches!(stop, Stop::Running) {
+            self.running = true;
+            self.flush_output(events);
+        } else {
+            self.finish(stop, events);
+        }
     }
 
     /// Single-steps until `reached(current_depth, start_depth)` -- `next` stops once
@@ -177,6 +220,7 @@ impl Debugger {
             match self.backend.step() {
                 Stop::Done => break Stop::Done,
                 Stop::Fault(message) => break Stop::Fault(message),
+                Stop::Running => break Stop::Running,
                 _ if reached(self.backend.depth(), start) => break Stop::Step,
                 _ => {}
             }
@@ -186,13 +230,7 @@ impl Debugger {
     /// Flushes new program output as an `output` event, then emits the event for the
     /// stop -- so console output precedes the stop or terminate it accompanies.
     fn finish(&mut self, stop: Stop, events: &mut Vec<(&'static str, Option<Json>)>) {
-        if let Some(text) = self.backend.take_output() {
-            self.output.push_str(&text);
-            events.push((
-                "output",
-                Some(json!({ "category": "stdout", "output": text })),
-            ));
-        }
+        self.flush_output(events);
         match stop {
             Stop::Breakpoint => events.push(("stopped", Some(stopped("breakpoint")))),
             Stop::Step => events.push(("stopped", Some(stopped("step")))),
@@ -200,6 +238,7 @@ impl Debugger {
                 events.push(("exited", Some(json!({ "exitCode": 0 }))));
                 events.push(("terminated", None));
             }
+            Stop::Running => {}
             Stop::Fault(message) => {
                 events.push((
                     "output",
@@ -207,6 +246,18 @@ impl Debugger {
                 ));
                 events.push(("terminated", None));
             }
+        }
+    }
+
+    /// Forwards any new program output as an `output` event (so console output precedes
+    /// the stop or terminate it accompanies).
+    fn flush_output(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
+        if let Some(text) = self.backend.take_output() {
+            self.output.push_str(&text);
+            events.push((
+                "output",
+                Some(json!({ "category": "stdout", "output": text })),
+            ));
         }
     }
 
@@ -354,7 +405,7 @@ fn arg_u32(request: &Request, field: &str) -> u32 {
         .unwrap_or(0) as u32
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "interpreter"))]
 mod tests {
     use super::*;
     use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand};

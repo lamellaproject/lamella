@@ -1838,9 +1838,9 @@ impl Parser {
                 self.bump();
                 Expr::new(ExprKind::Literal(Literal::Integer { value, suffix }), span)
             }
-            TokenKind::RealLiteral { suffix } => {
+            TokenKind::RealLiteral { bits, suffix } => {
                 self.bump();
-                Expr::new(ExprKind::Literal(Literal::Real { suffix }), span)
+                Expr::new(ExprKind::Literal(Literal::Real { bits, suffix }), span)
             }
             TokenKind::CharacterLiteral(unit) => {
                 self.bump();

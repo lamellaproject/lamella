@@ -9,7 +9,8 @@ use alloc::boxed::Box;
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    CatchClause, Expr, ForInitializer, Stmt, StmtKind, TypeRef, UsingResource, VariableDeclarator,
+    CatchClause, Expr, ExprKind, ForInitializer, Literal, Stmt, StmtKind, SwitchLabel, TypeRef,
+    UnaryOperator, UsingResource, VariableDeclarator,
 };
 use lamella_syntax::span::Span;
 
@@ -94,13 +95,13 @@ pub enum BoundStmtKind {
     Continue,
     /// A `throw` statement (15.9.5), with the thrown expression if any.
     Throw(Option<BoundExpr>),
-    /// A `switch` statement (15.7.2); each inner list is one section's bound
-    /// statements. Case-label constant checking is deferred.
+    /// A `switch` statement (15.7.2): the governing expression and the sections,
+    /// each carrying its bound `case`/`default` labels and statements.
     Switch {
         /// The governing expression.
         expression: BoundExpr,
-        /// The bound statements of each section, in order.
-        sections: Vec<Vec<BoundStmt>>,
+        /// The sections, in order.
+        sections: Vec<BoundSwitchSection>,
     },
     /// A `try` statement (15.10).
     Try {
@@ -141,6 +142,25 @@ pub enum BoundStmtKind {
     Goto,
     /// A statement form not yet bound, for recovery.
     Error,
+}
+
+/// A bound `switch` section (15.7.2): its labels and statements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundSwitchSection {
+    /// The `case`/`default` labels introducing the section.
+    pub labels: Vec<BoundSwitchLabel>,
+    /// The statements run when a label matches.
+    pub statements: Vec<BoundStmt>,
+}
+
+/// A bound `switch` label (15.7.2): a case constant (an integral/char value as
+/// `i64`) or the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundSwitchLabel {
+    /// `case constant:` -- the constant's value.
+    Case(i64),
+    /// `default:`.
+    Default,
 }
 
 /// A bound `catch` clause (15.10): the caught type, the bound exception variable
@@ -247,12 +267,17 @@ impl Binder {
                 self.enter_scope();
                 let sections = sections
                     .iter()
-                    .map(|section| {
-                        section
+                    .map(|section| BoundSwitchSection {
+                        labels: section
+                            .labels
+                            .iter()
+                            .map(|label| self.bind_switch_label(label))
+                            .collect(),
+                        statements: section
                             .statements
                             .iter()
                             .map(|statement| self.bind_statement(statement))
-                            .collect()
+                            .collect(),
                     })
                     .collect();
                 self.exit_scope();
@@ -293,6 +318,21 @@ impl Binder {
         BoundStmt {
             kind,
             span: stmt.span,
+        }
+    }
+
+    /// Binds a `switch` label: a `case` constant to its value, or `default`. A
+    /// non-constant case is `CS0150`, recovered as `case 0`.
+    fn bind_switch_label(&mut self, label: &SwitchLabel) -> BoundSwitchLabel {
+        match label {
+            SwitchLabel::Default => BoundSwitchLabel::Default,
+            SwitchLabel::Case(expr) => match case_constant(expr) {
+                Some(value) => BoundSwitchLabel::Case(value),
+                None => {
+                    self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, expr.span));
+                    BoundSwitchLabel::Case(0)
+                }
+            },
         }
     }
 
@@ -421,6 +461,21 @@ impl Binder {
                 span,
             ));
         }
+    }
+}
+
+/// Evaluates a `case` label's constant expression to an integral/char value. Only
+/// the v1 constant forms are recognized: integer and character literals, and a
+/// negated one. Anything else (a non-constant, or an unsupported form) is `None`.
+fn case_constant(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Literal(Literal::Integer { value, .. }) => i64::try_from(*value).ok(),
+        ExprKind::Literal(Literal::Character(unit)) => Some(i64::from(*unit)),
+        ExprKind::Unary {
+            operator: UnaryOperator::Minus,
+            operand,
+        } => case_constant(operand).map(|value| -value),
+        _ => None,
     }
 }
 

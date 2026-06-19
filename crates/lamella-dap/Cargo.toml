@@ -13,16 +13,29 @@ description = "A Debug Adapter Protocol server over the Lamella interpreter (hos
 # The backend seam (the DebugBackend trait): a dependency-free leaf crate so an
 # on-device backend can implement it without pulling the interpreter or the JSON layer.
 lamella-debug-backend = { path = "../lamella-debug-backend" }
-lamella-ves = { path = "../lamella-ves" }
-# disassemble renders CIL opcodes/operands.
-lamella-cil = { path = "../lamella-cil" }
-# The server binary loads a program to debug; the library does not need these.
-lamella-load = { path = "../lamella-load" }
-lamella-metadata = { path = "../lamella-metadata" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The interpreter debug backend + the CIL server binary -- behind the `interpreter`
+# feature so a DEVICE DAP server (DeviceBackend over CMSIS-DAP) links the adapter + serve
+# WITHOUT the interpreter.
+lamella-ves = { path = "../lamella-ves", optional = true }
+lamella-cil = { path = "../lamella-cil", optional = true }
+lamella-load = { path = "../lamella-load", optional = true }
+lamella-metadata = { path = "../lamella-metadata", optional = true }
 
-# The adapter tests build hand-written programs, which also needs the token model.
+[features]
+default = ["interpreter"]
+# The interpreter backend (InterpreterBackend) + the `lamella-dap` CIL server binary.
+# Off => a trait-only adapter + serve layer a device backend plugs into; no interpreter.
+interpreter = ["dep:lamella-ves", "dep:lamella-cil", "dep:lamella-load", "dep:lamella-metadata"]
+
+# The CIL server binary needs the interpreter; a device server is a separate binary.
+[[bin]]
+name = "lamella-dap"
+path = "src/main.rs"
+required-features = ["interpreter"]
+
+# The adapter/serve tests build hand-written interpreter programs (interpreter-gated).
 [dev-dependencies]
 lamella-token = { path = "../lamella-token" }
 

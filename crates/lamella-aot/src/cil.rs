@@ -1,5 +1,6 @@
 //! Lowering CIL method bodies to the middle IR by abstract interpretation.
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -17,16 +18,73 @@ pub enum CilError {
     BadOperand,
     /// A CIL opcode this lowering does not handle yet.
     Unsupported(Opcode),
+    /// A `call` target token could not be resolved (no [`CallResolver`] mapping).
+    UnresolvedCall,
     /// A control-flow shape this lowering does not handle yet: a conditional branch
     /// into a merge block (which would need its edge split), an entry block reached
     /// by a back-edge, or a block that runs off the end of the method.
     UnsupportedControlFlow,
 }
 
+/// What a `call`'s target is, recovered from its metadata token by a [`CallResolver`].
+pub enum CallTarget {
+    /// A method within this program, by function index -- lowered to a direct call.
+    Internal(u32),
+    /// A recognized BCL method, lowered to a backend intrinsic instead of a call.
+    Intrinsic(Intrinsic),
+}
+
+/// A BCL method the AOT lowers specially rather than as a managed call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Intrinsic {
+    /// `System.Diagnostics.Debug.WriteLine(string)` -> semihosting output.
+    DebugWriteLine,
+}
+
+/// What the lowering needs about a `call` target: how many arguments to pop, whether it
+/// yields a value, and what it resolves to.
+pub struct CallInfo {
+    /// The number of arguments the callee takes (popped from the evaluation stack).
+    pub args: usize,
+    /// Whether the call pushes a return value onto the stack.
+    pub has_result: bool,
+    /// The resolved target.
+    pub target: CallTarget,
+}
+
+/// Resolves a `call`'s metadata token to a [`CallInfo`]. The lowering owns this seam; the
+/// implementation (over `lamella-metadata`) lives in the caller, so CIL->MIR lowering
+/// needs no metadata of its own and stays testable against a mock.
+pub trait CallResolver {
+    /// Resolves a `call`'s operand (its metadata token) to a [`CallInfo`], or `None` if
+    /// the target is unknown or unsupported.
+    fn resolve(&self, operand: &Operand) -> Option<CallInfo>;
+
+    /// Resolves an `ldstr`'s operand (a `#US` user-string token) to the string's bytes,
+    /// or `None`. Defaults to `None` for resolvers that handle only calls; the lowering
+    /// adds the newline and NUL terminator semihosting needs.
+    fn user_string(&self, _operand: &Operand) -> Option<Box<[u8]>> {
+        None
+    }
+}
+
+/// A [`CallResolver`] for call-free bodies: every resolution fails. The default for the
+/// existing entry points, which lower methods that make no calls (the MMIO drivers).
+pub struct NoCalls;
+
+impl CallResolver for NoCalls {
+    fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+        None
+    }
+}
+
 /// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`] by abstract
 /// interpretation: the CIL is split into basic blocks, the evaluation stack and
 /// locals are tracked per block, and join points (merges) become block parameters.
-fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap), CilError> {
+fn lower_with_source(
+    body: &MethodBodyImage,
+    resolver: &dyn CallResolver,
+) -> Result<(Function, CilSourceMap), CilError> {
     let code = &body.code;
     let mut byte_offsets: Vec<u32> = Vec::with_capacity(code.len());
     let mut running = 0u32;
@@ -54,6 +112,7 @@ fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap),
     }
 
     let mut value_types: Vec<MirType> = Vec::new();
+    let mut strings: Vec<(ValueId, Box<[u8]>)> = Vec::new();
     let args: Vec<ValueId> = (0..arg_count)
         .map(|_| new_value(&mut value_types, MirType::I32))
         .collect();
@@ -124,6 +183,8 @@ fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap),
                     &mut locals,
                     &args,
                     &mut insts,
+                    &mut strings,
+                    resolver,
                 )?;
             }
             for _ in before..insts.len() {
@@ -153,7 +214,12 @@ fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap),
         };
 
         while il_index.len() < insts.len() {
-            il_index.push(byte_offsets.get(end.saturating_sub(1)).copied().unwrap_or(0));
+            il_index.push(
+                byte_offsets
+                    .get(end.saturating_sub(1))
+                    .copied()
+                    .unwrap_or(0),
+            );
         }
 
         exit_locals[b] = locals.clone();
@@ -190,13 +256,23 @@ pub struct CilSourceMap(pub Vec<Vec<u32>>);
 /// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`]. See
 /// [`lower_method_debug`] for the accompanying [`CilSourceMap`].
 pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
-    lower_with_source(body).map(|(function, _)| function)
+    lower_with_source(body, &NoCalls).map(|(function, _)| function)
 }
 
 /// Lowers a method body, also returning the [`CilSourceMap`] tying each MIR
 /// instruction back to the CIL instruction it came from.
 pub fn lower_method_debug(body: &MethodBodyImage) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body)
+    lower_with_source(body, &NoCalls)
+}
+
+/// Lowers a method body that makes calls, using `resolver` to map each `call`'s token to
+/// its target -- an internal callee or a recognized [`Intrinsic`] -- and returns the
+/// [`CilSourceMap`] as well. See [`CallResolver`].
+pub fn lower_method_debug_with(
+    body: &MethodBodyImage,
+    resolver: &dyn CallResolver,
+) -> Result<(Function, CilSourceMap), CilError> {
+    lower_with_source(body, resolver)
 }
 
 /// Defines a fresh MIR value of `ty` and returns its id.
@@ -257,6 +333,7 @@ fn compare(
 
 /// Applies one value-producing CIL instruction to the abstract state. Control-flow
 /// terminators (`ret` and the branches) are handled by the caller, not here.
+#[allow(clippy::too_many_arguments)]
 fn apply_value_op(
     inst: &Instruction,
     value_types: &mut Vec<MirType>,
@@ -264,6 +341,8 @@ fn apply_value_op(
     locals: &mut [Option<ValueId>],
     args: &[ValueId],
     insts: &mut Vec<(ValueId, Inst)>,
+    strings: &mut Vec<(ValueId, Box<[u8]>)>,
+    resolver: &dyn CallResolver,
 ) -> Result<(), CilError> {
     match inst.opcode {
         Opcode::Nop => {}
@@ -394,6 +473,47 @@ fn apply_value_op(
             let result = new_value(value_types, MirType::I32);
             insts.push((result, Inst::Load { address }));
             stack.push(result);
+        }
+        Opcode::Ldstr => {
+            let bytes = resolver
+                .user_string(&inst.operand)
+                .ok_or(CilError::UnresolvedCall)?;
+            let value = new_value(value_types, MirType::I32);
+            strings.push((value, bytes));
+            stack.push(value);
+        }
+        Opcode::Call => {
+            let info = resolver
+                .resolve(&inst.operand)
+                .ok_or(CilError::UnresolvedCall)?;
+            let mut call_args = Vec::with_capacity(info.args);
+            for _ in 0..info.args {
+                call_args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+            }
+            call_args.reverse();
+            match info.target {
+                CallTarget::Internal(callee) => {
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((result, Inst::Call { callee, args: call_args }));
+                    if info.has_result {
+                        stack.push(result);
+                    }
+                }
+                CallTarget::Intrinsic(Intrinsic::DebugWriteLine) => {
+                    let string_value = *call_args.first().ok_or(CilError::StackUnderflow)?;
+                    let bytes = strings
+                        .iter()
+                        .rev()
+                        .find(|(v, _)| *v == string_value)
+                        .map(|(_, b)| b.clone())
+                        .ok_or(CilError::UnresolvedCall)?;
+                    let mut text = bytes.into_vec();
+                    text.push(b'\n');
+                    text.push(0);
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((result, Inst::SemihostWrite { text: text.into_boxed_slice() }));
+                }
+            }
         }
         other => return Err(CilError::Unsupported(other)),
     }
@@ -756,6 +876,76 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.value_types.len(), 3);
         assert_eq!(func.ret, Some(MirType::I32));
+    }
+
+    #[test]
+    fn lowers_a_call_through_the_resolver() {
+        struct TwoArgReturning;
+        impl CallResolver for TwoArgReturning {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 2,
+                    has_result: true,
+                    target: CallTarget::Internal(7),
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::simple(Opcode::LdcI44),
+                Instruction::new(Opcode::Call, Operand::None),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &TwoArgReturning).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let call = func.blocks[0].insts.iter().find_map(|(_, i)| match i {
+            Inst::Call { callee, args } => Some((*callee, args.len())),
+            _ => None,
+        });
+        assert_eq!(call, Some((7, 2)));
+    }
+
+    #[test]
+    fn lowers_debug_writeline_to_semihosting() {
+        struct DebugMock;
+        impl CallResolver for DebugMock {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: false,
+                    target: CallTarget::Intrinsic(Intrinsic::DebugWriteLine),
+                })
+            }
+            fn user_string(&self, _operand: &Operand) -> Option<Box<[u8]>> {
+                Some(b"Hi".to_vec().into_boxed_slice())
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldstr, Operand::None),
+                Instruction::new(Opcode::Call, Operand::None),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &DebugMock).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let text = func.blocks[0].insts.iter().find_map(|(_, i)| match i {
+            Inst::SemihostWrite { text } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some(&b"Hi\n\0"[..]));
     }
 
     #[test]

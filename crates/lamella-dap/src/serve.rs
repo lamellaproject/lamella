@@ -25,6 +25,15 @@ pub fn serve<R: BufRead, W: Write>(
         for reply in debugger.handle(&request) {
             write_message(writer, &reply)?;
         }
+        while debugger.is_running() {
+            let polled = debugger.poll();
+            if polled.is_empty() {
+                break;
+            }
+            for reply in polled {
+                write_message(writer, &reply)?;
+            }
+        }
         if disconnecting {
             break;
         }
@@ -32,7 +41,7 @@ pub fn serve<R: BufRead, W: Write>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "interpreter"))]
 mod tests {
     use super::*;
     use crate::protocol::{Message, Request};

@@ -13,3 +13,7 @@ workspace = true
 [dependencies]
 lamella-debug-backend = { path = "../lamella-debug-backend" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+
+# The device DAP server binary links the adapter + wire protocol WITHOUT the interpreter.
+lamella-dap = { path = "../lamella-dap", default-features = false }
+lamella-usbhid = { path = "../lamella-usbhid" }

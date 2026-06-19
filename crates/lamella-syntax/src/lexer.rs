@@ -894,8 +894,9 @@ impl<'a> Lexer<'a> {
             self.bump();
             self.consume_decimal_digits();
             self.consume_exponent();
+            let bits = self.parse_real_value(&self.source[start..self.position], start);
             let suffix = self.try_consume_real_suffix().unwrap_or(RealSuffix::None);
-            return TokenKind::RealLiteral { suffix };
+            return TokenKind::RealLiteral { bits, suffix };
         }
 
         if self.peek() == Some('0') && matches!(self.peek_second(), Some('x' | 'X')) {
@@ -927,15 +928,29 @@ impl<'a> Lexer<'a> {
         }
 
         if is_real {
+            let bits = self.parse_real_value(&self.source[start..self.position], start);
             let suffix = self.try_consume_real_suffix().unwrap_or(RealSuffix::None);
-            TokenKind::RealLiteral { suffix }
+            TokenKind::RealLiteral { bits, suffix }
         } else if let Some(suffix) = self.try_consume_real_suffix() {
-            TokenKind::RealLiteral { suffix }
+            let bits = self.parse_real_value(&self.source[start..integer_digits_end], start);
+            TokenKind::RealLiteral { bits, suffix }
         } else {
             let digits = &self.source[digits_start..integer_digits_end];
             let suffix = self.consume_integer_suffix();
             let value = self.parse_integer_value(digits, 10, start);
             TokenKind::IntegerLiteral { value, suffix }
+        }
+    }
+
+    /// Parses a real-literal's numeric text (without its suffix) to an `f64`,
+    /// returning its bit pattern. A value the `f64` parser rejects is `MalformedNumericLiteral`.
+    fn parse_real_value(&mut self, text: &str, start: usize) -> u64 {
+        match text.parse::<f64>() {
+            Ok(value) => value.to_bits(),
+            Err(_) => {
+                self.report(DiagnosticKind::MalformedNumericLiteral, start);
+                0
+            }
         }
     }
 
@@ -1117,8 +1132,11 @@ mod tests {
         TokenKind::IntegerLiteral { value, suffix }
     }
 
-    fn real(suffix: RealSuffix) -> TokenKind {
-        TokenKind::RealLiteral { suffix }
+    fn real(value: f64, suffix: RealSuffix) -> TokenKind {
+        TokenKind::RealLiteral {
+            bits: value.to_bits(),
+            suffix,
+        }
     }
 
     #[test]
@@ -1188,31 +1206,31 @@ mod tests {
     fn real_literals_in_their_several_forms() {
         assert_eq!(
             kinds("1.5"),
-            vec![real(RealSuffix::None), TokenKind::EndOfFile]
+            vec![real(1.5, RealSuffix::None), TokenKind::EndOfFile]
         );
         assert_eq!(
             kinds(".5"),
-            vec![real(RealSuffix::None), TokenKind::EndOfFile]
+            vec![real(0.5, RealSuffix::None), TokenKind::EndOfFile]
         );
         assert_eq!(
             kinds("1e10"),
-            vec![real(RealSuffix::None), TokenKind::EndOfFile]
+            vec![real(1e10, RealSuffix::None), TokenKind::EndOfFile]
         );
         assert_eq!(
             kinds("1.5E-3"),
-            vec![real(RealSuffix::None), TokenKind::EndOfFile]
+            vec![real(1.5e-3, RealSuffix::None), TokenKind::EndOfFile]
         );
         assert_eq!(
             kinds("1f"),
-            vec![real(RealSuffix::Float), TokenKind::EndOfFile]
+            vec![real(1.0, RealSuffix::Float), TokenKind::EndOfFile]
         );
         assert_eq!(
             kinds("2.0d"),
-            vec![real(RealSuffix::Double), TokenKind::EndOfFile]
+            vec![real(2.0, RealSuffix::Double), TokenKind::EndOfFile]
         );
         assert_eq!(
             kinds("3m"),
-            vec![real(RealSuffix::Decimal), TokenKind::EndOfFile]
+            vec![real(3.0, RealSuffix::Decimal), TokenKind::EndOfFile]
         );
     }
 

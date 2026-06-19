@@ -446,11 +446,11 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     if func.value_types.iter().any(|ty| !ty.is_integer()) {
         return Err(LowerError::NonIntegerValue);
     }
-    if func
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::SemihostWrite { .. })))
-    {
+    if func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|(_, i)| matches!(i, Inst::SemihostWrite { .. }))
+    }) {
         return Ok(Assignment::Spilled);
     }
     let has_calls = func
@@ -871,14 +871,19 @@ mod tests {
                 params: Vec::new(),
                 insts: vec![(
                     ValueId(0),
-                    Inst::SemihostWrite { text: b"Hi\0".to_vec().into_boxed_slice() },
+                    Inst::SemihostWrite {
+                        text: b"Hi\0".to_vec().into_boxed_slice(),
+                    },
                 )],
                 terminator: Some(Terminator::Return(None)),
             }],
         };
         assert!(lamella_ir::verify(&func).is_ok());
         let bytes = lower(&func).unwrap();
-        assert!(bytes.windows(2).any(|w| w == [0xAB, 0xBE]), "BKPT 0xAB present");
+        assert!(
+            bytes.windows(2).any(|w| w == [0xAB, 0xBE]),
+            "BKPT 0xAB present"
+        );
         assert!(bytes.windows(3).any(|w| w == b"Hi\0"), "string in the pool");
     }
 

@@ -156,6 +156,13 @@ impl Frame {
                     self.collect_locals(finally);
                 }
             }
+            BoundStmtKind::Switch { sections, .. } => {
+                for section in sections {
+                    for statement in &section.statements {
+                        self.collect_locals(statement);
+                    }
+                }
+            }
             _ => {}
         }
     }

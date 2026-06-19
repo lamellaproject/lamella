@@ -211,7 +211,7 @@ pub(crate) fn emit_element_store(
 }
 
 /// The `ldelem.*` opcode for reading an element of the given type.
-fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError> {
+pub(crate) fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError> {
     Ok(match element_ty {
         TypeSymbol::Special(special) => match special {
             SpecialType::SByte => Opcode::LdelemI1,
@@ -533,10 +533,24 @@ fn emit_literal(
             ))?;
             out.push(Instruction::new(Opcode::Ldstr, Operand::Token(token)));
         }
-        Literal::Real { .. } => {
-            return Err(EmitError::Unsupported(
-                "real literal (value not retained by the parser)",
-            ));
+        Literal::Real { bits, .. } => {
+            let value = f64::from_bits(*bits);
+            match ty {
+                TypeSymbol::Special(SpecialType::Single) => {
+                    out.push(Instruction::new(
+                        Opcode::LdcR4,
+                        Operand::Float32(value as f32),
+                    ));
+                }
+                TypeSymbol::Special(SpecialType::Double) => {
+                    out.push(Instruction::new(Opcode::LdcR8, Operand::Float64(value)));
+                }
+                _ => {
+                    return Err(EmitError::Unsupported(
+                        "decimal literals are not lowered yet",
+                    ));
+                }
+            }
         }
     }
     Ok(())

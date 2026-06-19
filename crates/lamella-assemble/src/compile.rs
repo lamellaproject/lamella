@@ -722,6 +722,23 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
                 mint_references(finally, image, tokens);
             }
         }
+        BoundStmtKind::Switch {
+            expression,
+            sections,
+        } => {
+            mint_in_expr(expression, image, tokens);
+            for section in sections {
+                for statement in &section.statements {
+                    mint_references(statement, image, tokens);
+                }
+            }
+        }
+        BoundStmtKind::ForEach {
+            collection, body, ..
+        } => {
+            mint_in_expr(collection, image, tokens);
+            mint_references(body, image, tokens);
+        }
         _ => {}
     }
 }
@@ -1306,11 +1323,96 @@ mod tests {
     }
 
     #[test]
+    fn pdb_queries_map_source_lines_and_breakpoints() {
+        let source = "class Program\n{\n    static int Main()\n    {\n        int x = 6;\n        return x * 7;\n    }\n}\n";
+        let unit = parse_compilation_unit(source).unit;
+        let pdb_bytes = compile_unit_with_debug(&unit, "app.dll", "app", &[], source, "app.cs")
+            .pdb
+            .expect("a pdb");
+        let pdb = lamella_metadata::PortablePdb::read(&pdb_bytes).expect("read the pdb");
+
+        let points = pdb.sequence_points(2);
+        assert_eq!(
+            points.iter().map(|p| p.start_line).collect::<Vec<_>>(),
+            [5, 6]
+        );
+
+        assert_eq!(
+            pdb.source_location(2, points[1].il_offset)
+                .unwrap()
+                .start_line,
+            6
+        );
+        assert_eq!(pdb.source_location(2, 0).unwrap().start_line, 5);
+        assert!(pdb.method_document(2).unwrap().contains("app.cs"));
+
+        assert_eq!(
+            pdb.resolve_breakpoint("app.cs", 6),
+            Some((2, points[1].il_offset))
+        );
+    }
+
+    #[test]
     fn release_build_emits_no_pdb() {
         let unit = parse_compilation_unit("class Program { static int Main() { return 0; } }").unit;
         let result = compile_unit(&unit, "app.dll", "app");
         assert!(result.image.is_some());
         assert!(result.pdb.is_none());
+    }
+
+    #[test]
+    fn compiles_foreach_over_an_array() {
+        let unit = parse_compilation_unit(
+            "class Program { \
+                static int Main() { \
+                    int[] a = new int[3]; a[0] = 20; a[1] = 14; a[2] = 8; \
+                    int sum = 0; \
+                    foreach (int x in a) { sum = sum + x; } \
+                    return sum; \
+                } \
+             }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "fe.dll", "fe");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_switch() {
+        let unit = parse_compilation_unit(
+            "class Program { \
+                static int Main() { \
+                    int x = 2; \
+                    switch (x) { \
+                        case 1: return 10; \
+                        case 2: return 42; \
+                        default: return 0; \
+                    } \
+                } \
+             }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "s.dll", "s");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_real_literals() {
+        let unit = parse_compilation_unit(
+            "class Program { \
+                static int Main() { \
+                    double d = 42.0; float f = 1.5f; \
+                    if (d > 41.5) { return 42; } \
+                    return 0; \
+                } \
+             }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "r.dll", "r");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
     }
 
     #[test]

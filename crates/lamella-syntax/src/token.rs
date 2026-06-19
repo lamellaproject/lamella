@@ -246,9 +246,12 @@ pub enum TokenKind {
         /// The `U` and/or `L` suffix, if any.
         suffix: IntegerSuffix,
     },
-    /// A real literal (9.4.4.3). Only the suffix is kept here; the numeric value
-    /// is computed during binding, where the target type's rounding applies.
+    /// A real literal (9.4.4.3): its value as `f64` bits (see [`f64::from_bits`];
+    /// stored as bits so the token stays `Eq`/`Hash`) and the type suffix. A `float`
+    /// narrows the value at emit; `decimal` keeps the bits but is not lowered yet.
     RealLiteral {
+        /// The value's `f64` bit pattern. On a malformed literal this is 0.
+        bits: u64,
         /// The `F`, `D`, or `M` suffix, if any.
         suffix: RealSuffix,
     },

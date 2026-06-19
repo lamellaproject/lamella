@@ -116,6 +116,62 @@ impl<'a> PortablePdb<'a> {
         variables
     }
 
+    /// The number of methods with a debug row (parallel to the `MethodDef` table).
+    /// A consumer iterates `1..=method_count()` to scan every method.
+    #[must_use]
+    pub fn method_count(&self) -> u32 {
+        self.tables.row_count(table::METHOD_DEBUG_INFORMATION)
+    }
+
+    /// The source document of the method at `method_rid` (its `MethodDef` row), if
+    /// it has debug info.
+    #[must_use]
+    pub fn method_document(&self, method_rid: u32) -> Option<String> {
+        let row = self
+            .tables
+            .row(table::METHOD_DEBUG_INFORMATION, method_rid)?;
+        let document = row.raw(0);
+        if document == 0 {
+            return None;
+        }
+        self.document_name(document)
+    }
+
+    /// The sequence point whose range covers `il_offset` in the method at
+    /// `method_rid` -- the source line a debugger shows for an instruction at that
+    /// offset (the last non-hidden point at or before it). The IL -> source half of
+    /// the map, for a `stackTrace` frame's source location.
+    #[must_use]
+    pub fn source_location(&self, method_rid: u32, il_offset: u32) -> Option<SequencePoint> {
+        self.sequence_points(method_rid)
+            .into_iter()
+            .rfind(|point| !point.is_hidden && point.il_offset <= il_offset)
+    }
+
+    /// The `(method_rid, il_offset)` a source breakpoint at `line` in `document`
+    /// binds to: the first non-hidden point on or after `line` in that document. The
+    /// source -> IL half of the map, for resolving `setBreakpoints`.
+    #[must_use]
+    pub fn resolve_breakpoint(&self, document: &str, line: u32) -> Option<(u32, u32)> {
+        let mut best: Option<(u32, u32, u32)> = None;
+        for method_rid in 1..=self.method_count() {
+            if self.method_document(method_rid).as_deref() != Some(document) {
+                continue;
+            }
+            for point in self.sequence_points(method_rid) {
+                if point.is_hidden || point.start_line < line {
+                    continue;
+                }
+                if best.is_none_or(|(best_line, _, best_il)| {
+                    (point.start_line, point.il_offset) < (best_line, best_il)
+                }) {
+                    best = Some((point.start_line, method_rid, point.il_offset));
+                }
+            }
+        }
+        best.map(|(_, method_rid, il_offset)| (method_rid, il_offset))
+    }
+
     /// Reconstructs a document name from its blob: a separator byte followed by a
     /// run of `#Blob`-heap part indices, the parts joined by the separator (a `0`
     /// separator joins with nothing -- the common single-part case).

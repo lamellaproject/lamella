@@ -113,6 +113,18 @@ pub enum DiagnosticKind {
         /// The qualified member name.
         member: Box<str>,
     },
+    /// `CS0150`: a constant value was expected (e.g. a non-constant `case` label).
+    ConstantExpected,
+    /// `CS0120`: an instance member was named through a type, with no object.
+    ObjectReferenceRequired {
+        /// The qualified member name.
+        member: Box<str>,
+    },
+    /// `CS0176`: a static member was accessed through an instance.
+    StaticMemberViaInstance {
+        /// The qualified member name.
+        member: Box<str>,
+    },
     /// `CS0021`: a value of this type cannot be indexed with `[]`.
     CannotIndex {
         /// The type that was indexed.
@@ -187,6 +199,9 @@ impl DiagnosticKind {
             DiagnosticKind::ArgumentConversion { .. } => 1503,
             DiagnosticKind::AmbiguousCall { .. } => 121,
             DiagnosticKind::Inaccessible { .. } => 122,
+            DiagnosticKind::ConstantExpected => 150,
+            DiagnosticKind::ObjectReferenceRequired { .. } => 120,
+            DiagnosticKind::StaticMemberViaInstance { .. } => 176,
             DiagnosticKind::CannotIndex { .. } => 21,
             DiagnosticKind::NoConstructor { .. } => 1729,
             DiagnosticKind::ReturnValueInVoidMethod { .. } => 127,
@@ -251,6 +266,16 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::Inaccessible { member } => {
                 write!(f, "'{member}' is inaccessible due to its protection level")
             }
+            DiagnosticKind::ConstantExpected => write!(f, "A constant value is expected"),
+            DiagnosticKind::ObjectReferenceRequired { member } => write!(
+                f,
+                "An object reference is required for the non-static member '{member}'"
+            ),
+            DiagnosticKind::StaticMemberViaInstance { member } => write!(
+                f,
+                "Member '{member}' cannot be accessed with an instance reference; \
+                 qualify it with a type name instead"
+            ),
             DiagnosticKind::CannotIndex { type_name } => write!(
                 f,
                 "Cannot apply indexing with [] to an expression of type '{type_name}'"

@@ -1,5 +1,7 @@
 //! The managed heap and the reference-type object model.
 
+#[cfg(feature = "gc")]
+use crate::value::Location;
 use crate::value::Value;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -217,6 +219,157 @@ impl Heap {
             },
             _ => false,
         }
+    }
+}
+
+/// The mark-compact garbage collector (the `gc` feature -- `surface.gc = collected`).
+///
+/// A precise, moving, stop-the-world collector over the index-based arena: it marks the
+/// objects reachable from the roots, compacts the survivors (renumbering -- an
+/// `ObjectRef` is an arena index), and rewrites every reference. `enumerate_roots` visits
+/// each root value mutably; the caller exposes the interpreter frames, statics, and any
+/// other root state. It is called twice -- once to mark, once to relocate.
+#[cfg(feature = "gc")]
+impl Heap {
+    /// The number of objects currently in the arena.
+    #[must_use]
+    pub fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Reclaims every object unreachable from the roots and compacts the survivors.
+    pub fn collect<R>(&mut self, mut enumerate_roots: R)
+    where
+        R: FnMut(&mut dyn FnMut(&mut Value)),
+    {
+        let count = self.objects.len();
+        let mut live = alloc::vec![false; count];
+        let mut work: Vec<usize> = Vec::new();
+        let mark = |index: usize, live: &mut [bool], work: &mut Vec<usize>| {
+            if index < count && !live[index] {
+                live[index] = true;
+                work.push(index);
+            }
+        };
+        enumerate_roots(&mut |value| {
+            collect_refs(value, &mut |reference| {
+                mark(reference.0 as usize, &mut live, &mut work);
+            });
+        });
+        while let Some(index) = work.pop() {
+            let mut children: Vec<usize> = Vec::new();
+            object_refs(&self.objects[index], &mut |reference| {
+                children.push(reference.0 as usize);
+            });
+            for child in children {
+                mark(child, &mut live, &mut work);
+            }
+        }
+        let mut remap: Vec<Option<u32>> = alloc::vec![None; count];
+        let mut next = 0u32;
+        for (slot, &alive) in remap.iter_mut().zip(live.iter()) {
+            if alive {
+                *slot = Some(next);
+                next += 1;
+            }
+        }
+        let old = core::mem::take(&mut self.objects);
+        for (index, mut object) in old.into_iter().enumerate() {
+            if live[index] {
+                remap_object(&mut object, &remap);
+                self.objects.push(object);
+            }
+        }
+        enumerate_roots(&mut |value| remap_value(value, &remap));
+    }
+}
+
+/// Visits each heap reference inside a value -- an object reference, a heap-pointing
+/// byref, or (recursively) a value-type's fields.
+#[cfg(feature = "gc")]
+fn collect_refs<F: FnMut(ObjectRef)>(value: &Value, visit: &mut F) {
+    match value {
+        Value::Object(reference) => visit(*reference),
+        Value::ByRef(Location::Field { object, .. }) => visit(*object),
+        Value::ByRef(Location::Element { array, .. }) => visit(*array),
+        Value::Struct(fields) => fields.iter().for_each(|field| collect_refs(field, visit)),
+        _ => {}
+    }
+}
+
+/// Visits each heap reference inside an object.
+#[cfg(feature = "gc")]
+fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
+    match object {
+        Object::Instance { fields, .. } => fields.iter().for_each(|f| collect_refs(f, visit)),
+        Object::Array { elements } => elements.iter().for_each(|e| collect_refs(e, visit)),
+        Object::Boxed { value, .. } => collect_refs(value, visit),
+        Object::Delegate { invocations } => invocations
+            .iter()
+            .for_each(|(target, _)| collect_refs(target, visit)),
+        Object::Str(_) => {}
+    }
+}
+
+/// Rewrites each heap reference inside a value to its compacted position.
+#[cfg(feature = "gc")]
+fn remap_value(value: &mut Value, remap: &[Option<u32>]) {
+    match value {
+        Value::Object(reference) => remap_ref(reference, remap),
+        Value::ByRef(Location::Field { object, .. }) => remap_ref(object, remap),
+        Value::ByRef(Location::Element { array, .. }) => remap_ref(array, remap),
+        Value::Struct(fields) => fields.iter_mut().for_each(|f| remap_value(f, remap)),
+        _ => {}
+    }
+}
+
+/// Rewrites each heap reference inside an object to its compacted position.
+#[cfg(feature = "gc")]
+fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
+    match object {
+        Object::Instance { fields, .. } => fields.iter_mut().for_each(|f| remap_value(f, remap)),
+        Object::Array { elements } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
+        Object::Boxed { value, .. } => remap_value(value, remap),
+        Object::Delegate { invocations } => invocations
+            .iter_mut()
+            .for_each(|(target, _)| remap_value(target, remap)),
+        Object::Str(_) => {}
+    }
+}
+
+/// Rewrites one reference via the compaction map (left unchanged if its target is gone).
+#[cfg(feature = "gc")]
+fn remap_ref(reference: &mut ObjectRef, remap: &[Option<u32>]) {
+    if let Some(Some(new)) = remap.get(reference.0 as usize) {
+        reference.0 = *new;
+    }
+}
+
+#[cfg(all(test, feature = "gc"))]
+mod gc_tests {
+    use super::*;
+
+    #[test]
+    fn collect_reclaims_unreachable_and_relocates_live() {
+        let mut heap = Heap::new();
+        let kept = heap.alloc_string(&[b'a' as u16]);
+        let _garbage = heap.alloc_string(&[b'x' as u16]);
+        let root = heap.alloc_instance(7, alloc::vec![Value::Object(kept)]);
+        assert_eq!(heap.object_count(), 3);
+
+        let mut roots = alloc::vec![Value::Object(root)];
+        heap.collect(|visit| roots.iter_mut().for_each(visit));
+
+        assert_eq!(heap.object_count(), 2);
+        let root = match &roots[0] {
+            Value::Object(reference) => *reference,
+            other => panic!("root not an object: {other:?}"),
+        };
+        let kept = match heap.instance_field(root, 0).unwrap() {
+            Value::Object(reference) => reference,
+            other => panic!("field not an object: {other:?}"),
+        };
+        assert_eq!(heap.as_string(kept), Some(&[b'a' as u16][..]));
     }
 }
 

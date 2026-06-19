@@ -34,6 +34,8 @@ pub use program::{
 pub use reference::load_assembly;
 pub use resolve::{TypeTable, resolve_type};
 pub use special::SpecialType;
-pub use statement::{BoundCatch, BoundDeclarator, BoundStmt, BoundStmtKind};
+pub use statement::{
+    BoundCatch, BoundDeclarator, BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection,
+};
 pub use symbols::{FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind};
 pub use types::TypeSymbol;

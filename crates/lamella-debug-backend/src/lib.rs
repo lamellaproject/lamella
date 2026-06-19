@@ -28,6 +28,15 @@ pub trait DebugBackend {
     /// `step-over` / `step-out` from this plus [`DebugBackend::depth`]).
     fn step(&mut self) -> Stop;
 
+    /// Polls a target a previous `resume`/`step` left [`Stop::Running`]: returns
+    /// `Running` while it is still going, or the eventual stop (so the adapter can then
+    /// emit the stopped event). The default suits a synchronous backend -- the
+    /// interpreter finishes inside `resume`/`step` and never returns `Running` -- so it
+    /// is never polled; a free-running device overrides this to read its halt state.
+    fn poll(&mut self) -> Stop {
+        Stop::Done
+    }
+
     /// The current call depth, so the adapter can express depth-relative stepping
     /// (`next` stays at or above the start depth, `stepOut` runs until below it). A
     /// backend without unwinding may report `1` (then `next`/`stepOut` degrade to step).
@@ -78,6 +87,12 @@ pub enum Stop {
     Step,
     /// The program ran to completion.
     Done,
+    /// The target is now running and has not stopped yet: a resume-now backend (a
+    /// free-running device) returns this rather than blocking. The adapter emits no
+    /// stopped event and polls ([`DebugBackend::poll`]) for the eventual stop; a
+    /// synchronous backend (the interpreter, which finishes inside `resume`) never
+    /// returns it.
+    Running,
     /// A fault ended the run, with a human-readable description.
     Fault(String),
 }
