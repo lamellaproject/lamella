@@ -3,7 +3,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand};
+use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, OperandKind};
 use lamella_ir::{BasicBlock, BinOp, BlockId, CmpOp, Function, Inst, MirType, Terminator, ValueId};
 
 /// Why a method body could not be lowered to MIR.
@@ -28,6 +28,20 @@ pub enum CilError {
 /// locals are tracked per block, and join points (merges) become block parameters.
 fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap), CilError> {
     let code = &body.code;
+    let mut byte_offsets: Vec<u32> = Vec::with_capacity(code.len());
+    let mut running = 0u32;
+    for instr in code.iter() {
+        byte_offsets.push(running);
+        let opcode = instr.opcode.encoding().byte_len() as u32;
+        let operand = match instr.opcode.operand_kind() {
+            OperandKind::Switch => match &instr.operand {
+                Operand::Switch(targets) => 4 + targets.len() as u32 * 4,
+                _ => 4,
+            },
+            kind => kind.fixed_operand_len().unwrap_or(0) as u32,
+        };
+        running = running.wrapping_add(opcode + operand);
+    }
     let blocks = control_flow::discover_blocks(code);
     let preds = control_flow::predecessors(code, &blocks);
     let (arg_count, local_count) = scan_slots(code);
@@ -113,7 +127,7 @@ fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap),
                 )?;
             }
             for _ in before..insts.len() {
-                il_index.push(i as u32);
+                il_index.push(byte_offsets[i]);
             }
         }
 
@@ -139,7 +153,7 @@ fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap),
         };
 
         while il_index.len() < insts.len() {
-            il_index.push(end.saturating_sub(1) as u32);
+            il_index.push(byte_offsets.get(end.saturating_sub(1)).copied().unwrap_or(0));
         }
 
         exit_locals[b] = locals.clone();
@@ -166,10 +180,10 @@ fn lower_with_source(body: &MethodBodyImage) -> Result<(Function, CilSourceMap),
     Ok((function, CilSourceMap(source_map)))
 }
 
-/// The CIL instruction index each MIR instruction was lowered from, indexed by block
-/// then by instruction within the block -- the lowering's half of the native-to-source
-/// mapping. The target lowering pairs these with native code offsets to build a line
-/// table; the compiler's sequence points then carry a CIL offset to a source line.
+/// The CIL byte offset each MIR instruction was lowered from, indexed by block then by
+/// instruction within the block -- the lowering's half of the native-to-source mapping.
+/// The target lowering pairs these with native code offsets to build a line table; the
+/// compiler's sequence points then carry a CIL byte offset to a source line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CilSourceMap(pub Vec<Vec<u32>>);
 

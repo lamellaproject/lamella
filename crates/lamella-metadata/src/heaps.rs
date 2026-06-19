@@ -39,6 +39,26 @@ pub fn read_compressed_u32(bytes: &[u8]) -> Result<(u32, usize), HeapError> {
     }
 }
 
+/// Reads a compressed *signed* integer (II.23.2), returning its value and length.
+/// The value is the unsigned form rotated right by one (the sign sits in the low
+/// bit) and sign-extended from the high bit of its width (7, 14, or 28 magnitude
+/// bits for a 1-, 2-, or 4-byte encoding).
+pub fn read_compressed_i32(bytes: &[u8]) -> Result<(i32, usize), HeapError> {
+    let (value, length) = read_compressed_u32(bytes)?;
+    let magnitude_bits = match length {
+        1 => 6,
+        2 => 13,
+        _ => 28,
+    };
+    let magnitude = (value >> 1) as i32;
+    let result = if value & 1 != 0 {
+        magnitude - (1 << magnitude_bits)
+    } else {
+        magnitude
+    };
+    Ok((result, length))
+}
+
 /// Returns the length-prefixed run at `offset`: a compressed-integer length then
 /// that many bytes. Shared by the `#Blob` and `#US` heaps (II.24.2.4).
 fn length_prefixed(bytes: &[u8], offset: u32) -> Result<&[u8], HeapError> {
@@ -163,6 +183,27 @@ mod tests {
         assert_eq!(
             read_compressed_u32(&[0xDF, 0xFF, 0xFF, 0xFF]),
             Ok((0x1FFF_FFFF, 4))
+        );
+    }
+
+    #[test]
+    fn signed_compressed_integers_decode_per_the_spec() {
+        assert_eq!(read_compressed_i32(&[0x06]), Ok((3, 1)));
+        assert_eq!(read_compressed_i32(&[0x7B]), Ok((-3, 1)));
+        assert_eq!(read_compressed_i32(&[0x80, 0x80]), Ok((64, 2)));
+        assert_eq!(read_compressed_i32(&[0x01]), Ok((-64, 1)));
+        assert_eq!(
+            read_compressed_i32(&[0xC0, 0x00, 0x40, 0x00]),
+            Ok((8192, 4))
+        );
+        assert_eq!(read_compressed_i32(&[0x80, 0x01]), Ok((-8192, 2)));
+        assert_eq!(
+            read_compressed_i32(&[0xDF, 0xFF, 0xFF, 0xFE]),
+            Ok((268_435_455, 4))
+        );
+        assert_eq!(
+            read_compressed_i32(&[0xC0, 0x00, 0x00, 0x01]),
+            Ok((-268_435_456, 4))
         );
     }
 

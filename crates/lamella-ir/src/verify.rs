@@ -155,6 +155,8 @@ fn check_inst(
         Inst::Load { address } => {
             use_value(func, defined, *address, errors);
         }
+        Inst::SemihostWrite { .. } => {
+        }
     }
 }
 

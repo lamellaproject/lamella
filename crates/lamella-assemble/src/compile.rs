@@ -464,7 +464,8 @@ fn emit_method_body(
         local_types,
         local_names,
         sequence_points,
-    } = emit_body(&parameter_names, &bound, tokens, arg_base)?;
+        handlers,
+    } = emit_body(&parameter_names, &bound, tokens, arg_base, return_symbol)?;
     let local_var_sig = if local_types.is_empty() {
         None
     } else {
@@ -488,12 +489,17 @@ fn emit_method_body(
         })
         .transpose()?;
 
+    let max_stack = if handlers.is_empty() {
+        max_stack(&code)
+    } else {
+        max_stack(&code).max(1)
+    };
     let body_image = MethodBodyImage {
-        max_stack: max_stack(&code),
+        max_stack,
         init_locals: local_var_sig.is_some(),
         local_var_sig,
         code: code.into_boxed_slice(),
-        handlers: Box::new([]),
+        handlers: handlers.into_boxed_slice(),
     };
     let body_bytes = write_method_body(&body_image)
         .map_err(|_| crate::EmitError::Unsupported("method body could not be written"))?;
@@ -697,6 +703,25 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
         BoundStmtKind::Checked(inner) | BoundStmtKind::Unchecked(inner) => {
             mint_references(inner, image, tokens);
         }
+        BoundStmtKind::Throw(Some(expr)) => mint_in_expr(expr, image, tokens),
+        BoundStmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            mint_references(body, image, tokens);
+            for catch in catches {
+                let ty = catch
+                    .exception_type
+                    .clone()
+                    .unwrap_or(TypeSymbol::Special(SpecialType::Object));
+                mint_type_token(image, tokens, &ty);
+                mint_references(&catch.body, image, tokens);
+            }
+            if let Some(finally) = finally {
+                mint_references(finally, image, tokens);
+            }
+        }
         _ => {}
     }
 }
@@ -738,9 +763,25 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 }
             }
         }
-        BoundExprKind::ObjectCreation { arguments, .. } => {
+        BoundExprKind::ObjectCreation {
+            arguments,
+            constructor,
+        } => {
             for argument in arguments {
                 mint_in_expr(argument, image, tokens);
+            }
+            if let Some(constructor) = constructor {
+                if tokens.type_token(&constructor.declaring_type).is_none()
+                    && tokens
+                        .method(
+                            &constructor.declaring_type,
+                            &constructor.name,
+                            &constructor.parameters,
+                        )
+                        .is_none()
+                {
+                    mint_member_ref(constructor, image, tokens);
+                }
             }
         }
         BoundExprKind::FieldAccess { receiver, .. }
@@ -1247,11 +1288,96 @@ mod tests {
     }
 
     #[test]
+    fn portable_pdb_round_trips_through_the_metadata_reader() {
+        let source = "class Program { static int Main() { int x = 6; return x * 7; } }";
+        let unit = parse_compilation_unit(source).unit;
+        let pdb_bytes = compile_unit_with_debug(&unit, "app.dll", "app", &[], source, "app.cs")
+            .pdb
+            .expect("a pdb");
+        let pdb = lamella_metadata::PortablePdb::read(&pdb_bytes).expect("read the pdb");
+
+        assert!(pdb.document_name(1).unwrap().contains("app.cs"));
+        assert!((1..=3).any(|rid| !pdb.sequence_points(rid).is_empty()));
+        assert!(
+            (1..=3)
+                .flat_map(|rid| pdb.local_variables(rid))
+                .any(|local| local.index == 0 && local.name == "x")
+        );
+    }
+
+    #[test]
     fn release_build_emits_no_pdb() {
         let unit = parse_compilation_unit("class Program { static int Main() { return 0; } }").unit;
         let result = compile_unit(&unit, "app.dll", "app");
         assert!(result.image.is_some());
         assert!(result.pdb.is_none());
+    }
+
+    #[test]
+    fn compiles_try_catch_with_a_return_inside() {
+        let unit = parse_compilation_unit(
+            "class Program { \
+                static int Main() { \
+                    try { int x = 0; return 10 / x; } catch { return 42; } \
+                } \
+             }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "t.dll", "t");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_try_finally() {
+        let unit = parse_compilation_unit(
+            "class Program { \
+                static int result; \
+                static int Main() { \
+                    try { result = 10; } finally { result = result + 32; } \
+                    return result; \
+                } \
+             }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "t.dll", "t");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn resolve_method_reads_call_targets_back() {
+        let unit = parse_compilation_unit(
+            "class Program { \
+                static int Helper() { return 5; } \
+                static int Main() { return Helper(); } \
+             }",
+        )
+        .unit;
+        let image = compile_unit(&unit, "p.dll", "p").image.expect("an image");
+        let assembly = lamella_metadata::Assembly::read(&image).expect("read");
+
+        let helper = (1..=4)
+            .filter_map(|rid| assembly.resolve_method(Token::new(0x06, rid)))
+            .find(|method| method.name == Some("Helper"))
+            .expect("Helper resolves");
+        assert!(matches!(
+            helper.kind,
+            lamella_metadata::MethodKind::Definition(_)
+        ));
+        assert_eq!(helper.declaring_type.map(|name| name.name), Some("Program"));
+
+        let object_ctor = assembly
+            .resolve_method(Token::new(0x0A, 1))
+            .expect("a member reference");
+        assert_eq!(object_ctor.name, Some(".ctor"));
+        assert_eq!(
+            object_ctor
+                .declaring_type
+                .map(|name| (name.namespace, name.name)),
+            Some(("System", "Object"))
+        );
+        assert_eq!(object_ctor.kind, lamella_metadata::MethodKind::Reference);
     }
 
     #[test]

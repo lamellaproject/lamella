@@ -104,6 +104,13 @@ impl Vm {
     }
 }
 
+/// A multicast delegate's bound method: a `(target, method)` pair.
+type Invocation = (Value, u32);
+
+/// A multicast `Invoke` in progress: the remaining invocations and the arguments each
+/// is called with.
+type Multicast = (Vec<Invocation>, Vec<Value>);
+
 /// One activation frame: the evaluation stack, the local variables, the
 /// arguments, the instruction pointer, and which method is running, for a single
 /// method invocation.
@@ -122,6 +129,9 @@ struct Frame {
     current_exception: Option<ObjectRef>,
     /// An in-progress `finally` chain (from a `leave` or an exception unwind).
     pending: Option<PendingFinally>,
+    /// A multicast-delegate invocation in progress: the remaining `(target, method)`
+    /// invocations and the shared arguments, so each is called as the previous returns.
+    multicast: Option<Multicast>,
 }
 
 /// What executing one instruction decided.
@@ -175,6 +185,34 @@ enum Flow {
         /// The value to store.
         value: Value,
     },
+    /// `initobj`: zero-initialize the value-type instance at `location` (a default
+    /// struct).
+    InitObj {
+        /// The location to initialize.
+        location: Location,
+        /// The value type's token (giving its zero fields).
+        kind: Token,
+    },
+    /// `ldobj`: load the value-type instance at `location` onto the evaluation stack.
+    LoadObj {
+        /// The location to read.
+        location: Location,
+    },
+    /// `stobj`: store a value-type instance through a managed pointer to `location`.
+    StoreObj {
+        /// The location to write.
+        location: Location,
+        /// The value to store.
+        value: Value,
+    },
+    /// A multicast delegate's `Invoke`: call each `(target, method)` in turn (each with
+    /// `params`); the delegate's result is the last one's.
+    InvokeMulticast {
+        /// The bound methods to call, in order.
+        invocations: Vec<(Value, u32)>,
+        /// The arguments shared by every call (the delegate's parameters).
+        params: Vec<Value>,
+    },
 }
 
 /// What to do once a chain of `finally` blocks (run by a `leave` or an exception)
@@ -225,6 +263,10 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
             Flow::EndFinally => return Err(Trap::Unsupported(Opcode::Endfinally)),
             Flow::LoadField { .. } => return Err(Trap::Unsupported(Opcode::Ldfld)),
             Flow::StoreField { .. } => return Err(Trap::Unsupported(Opcode::Stfld)),
+            Flow::InitObj { .. } => return Err(Trap::Unsupported(Opcode::Initobj)),
+            Flow::LoadObj { .. } => return Err(Trap::Unsupported(Opcode::Ldobj)),
+            Flow::StoreObj { .. } => return Err(Trap::Unsupported(Opcode::Stobj)),
+            Flow::InvokeMulticast { .. } => return Err(Trap::Unsupported(Opcode::Callvirt)),
         }
     }
 }
@@ -425,7 +467,22 @@ impl Session {
         match flow {
             Flow::Next => Ok(Status::Running),
             Flow::Return(value) => {
-                let returned_object = frames.pop().and_then(|frame| frame.new_object);
+                let returned = frames.pop();
+                if let Some((rest, params)) = returned.as_ref().and_then(|f| f.multicast.as_ref()) {
+                    if let Some(((target, method), remaining)) = rest.split_first() {
+                        let call_args = delegate_call_args(target, params);
+                        let (method, remaining, params) =
+                            (*method, remaining.to_vec(), params.clone());
+                        if frames.len() >= MAX_CALL_DEPTH {
+                            return Err(Trap::CallStackOverflow);
+                        }
+                        let mut next = new_frame(module, method, call_args)?;
+                        next.multicast = Some((remaining, params));
+                        frames.push(next);
+                        return Ok(Status::Running);
+                    }
+                }
+                let returned_object = returned.and_then(|frame| frame.new_object);
                 match frames.last_mut() {
                     Some(caller) => {
                         if let Some(object) = returned_object {
@@ -451,6 +508,7 @@ impl Session {
                 }
                 Some(Method::Intrinsic { func, .. }) => {
                     let func = *func;
+                    let args = deref_byref_args(frames, vm, args);
                     if let Some(value) = func(vm, &args)? {
                         frames
                             .last_mut()
@@ -519,7 +577,7 @@ impl Session {
                 let slot = module
                     .field_slot(field)
                     .ok_or(Trap::UnresolvedField(field))?;
-                let value = read_field_at(frames, location, slot)?;
+                let value = read_field_at(frames, vm, location, slot);
                 frames
                     .get_mut(current)
                     .ok_or(Trap::StackUnderflow)?
@@ -542,84 +600,178 @@ impl Session {
                     .type_field_defaults(type_id)
                     .ok_or(Trap::UnresolvedField(field))?
                     .to_vec();
-                write_field_at(frames, location, slot, &shape, value)?;
+                write_field_at(frames, vm, location, slot, &shape, value)?;
+                Ok(Status::Running)
+            }
+            Flow::InitObj { location, kind } => {
+                let value = match module
+                    .type_id_of(kind)
+                    .and_then(|type_id| module.type_field_defaults(type_id))
+                {
+                    Some(defaults) => Value::Struct(defaults.to_vec().into_boxed_slice()),
+                    None => Value::Int32(0),
+                };
+                write_location_value(frames, vm, location, value)?;
+                Ok(Status::Running)
+            }
+            Flow::LoadObj { location } => {
+                let value = read_byref(frames, vm, location);
+                frames
+                    .get_mut(current)
+                    .ok_or(Trap::StackUnderflow)?
+                    .stack
+                    .push(value);
+                Ok(Status::Running)
+            }
+            Flow::StoreObj { location, value } => {
+                write_location_value(frames, vm, location, value)?;
+                Ok(Status::Running)
+            }
+            Flow::InvokeMulticast {
+                mut invocations,
+                params,
+            } => {
+                if invocations.is_empty() {
+                    return Ok(Status::Running);
+                }
+                let (target, method) = invocations.remove(0);
+                let call_args = delegate_call_args(&target, &params);
+                if frames.len() >= MAX_CALL_DEPTH {
+                    return Err(Trap::CallStackOverflow);
+                }
+                let mut frame = new_frame(module, method, call_args)?;
+                frame.multicast = Some((invocations, params));
+                frames.push(frame);
                 Ok(Status::Running)
             }
         }
     }
 }
 
-/// Reads field `slot` of the value-type instance at `location` (zero if the slot has
-/// not been materialized into a struct yet -- an `init_locals` zero).
-fn read_field_at(frames: &[Frame], location: Location, slot: u32) -> Result<Value, Trap> {
-    match struct_value_at(frames, location)? {
-        Some(Value::Struct(fields)) => Ok(fields
-            .get(slot as usize)
-            .cloned()
-            .unwrap_or(Value::Int32(0))),
-        _ => Ok(Value::Int32(0)),
+/// The whole value at a managed-pointer `location` -- a frame local/arg, a heap
+/// object's field, an array element, or a static field -- if present.
+fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<Value> {
+    match location {
+        Location::Local { frame, slot } => {
+            frames.get(frame).and_then(|f| f.locals.get(slot)).cloned()
+        }
+        Location::Arg { frame, slot } => frames.get(frame).and_then(|f| f.args.get(slot)).cloned(),
+        Location::Field { object, slot } => vm.heap().instance_field(object, slot),
+        Location::Element { array, index } => vm.heap().array_get(array, index),
+        Location::Static { slot } => vm.static_field(slot),
     }
 }
 
-/// The value at a managed-pointer `location` in the call stack (a frame local/arg).
-/// Heap and static locations are not pointer-into-struct targets yet.
-fn struct_value_at(frames: &[Frame], location: Location) -> Result<Option<&Value>, Trap> {
+/// Writes the whole `value` at a managed-pointer `location`.
+fn write_location_value(
+    frames: &mut [Frame],
+    vm: &mut Vm,
+    location: Location,
+    value: Value,
+) -> Result<(), Trap> {
     match location {
-        Location::Local { frame, slot } => Ok(frames.get(frame).and_then(|f| f.locals.get(slot))),
-        Location::Arg { frame, slot } => Ok(frames.get(frame).and_then(|f| f.args.get(slot))),
-        _ => Err(Trap::Unsupported(Opcode::Ldfld)),
+        Location::Local { frame, slot } => {
+            let frame = frames
+                .get_mut(frame)
+                .ok_or(Trap::Unsupported(Opcode::Stobj))?;
+            set_slot(&mut frame.locals, slot, value);
+            Ok(())
+        }
+        Location::Arg { frame, slot } => {
+            let frame = frames
+                .get_mut(frame)
+                .ok_or(Trap::Unsupported(Opcode::Stobj))?;
+            set_slot(&mut frame.args, slot, value);
+            Ok(())
+        }
+        Location::Field { object, slot } => vm
+            .heap_mut()
+            .set_instance_field(object, slot, value)
+            .then_some(())
+            .ok_or(Trap::NullReference),
+        Location::Element { array, index } => vm
+            .heap_mut()
+            .array_set(array, index, value)
+            .then_some(())
+            .ok_or(Trap::IndexOutOfRange(index as i32)),
+        Location::Static { slot } => {
+            vm.set_static_field(slot, value);
+            Ok(())
+        }
     }
+}
+
+/// Reads field `slot` of the value-type instance at `location` (zero if the slot has
+/// not been materialized into a struct yet -- an `init_locals` zero).
+fn read_field_at(frames: &[Frame], vm: &Vm, location: Location, slot: u32) -> Value {
+    match read_location_value(frames, vm, location) {
+        Some(Value::Struct(fields)) => fields
+            .get(slot as usize)
+            .cloned()
+            .unwrap_or(Value::Int32(0)),
+        _ => Value::Int32(0),
+    }
+}
+
+/// Dereferences any managed-pointer argument to the value it points at, so an intrinsic
+/// (which works on values -- e.g. `Int32.ToString` on `&int`) sees the value, not the
+/// pointer.
+fn deref_byref_args(frames: &[Frame], vm: &Vm, args: Vec<Value>) -> Vec<Value> {
+    args.into_iter()
+        .map(|arg| match arg {
+            Value::ByRef(location) => read_byref(frames, vm, location),
+            other => other,
+        })
+        .collect()
+}
+
+/// The value a managed pointer refers to (for `ldobj` and intrinsic-argument deref);
+/// `Null` if the location holds nothing.
+fn read_byref(frames: &[Frame], vm: &Vm, location: Location) -> Value {
+    read_location_value(frames, vm, location).unwrap_or(Value::Null)
+}
+
+/// Stores `value` at `slot`, growing `slots` with `Null` placeholders to reach it.
+fn set_slot(slots: &mut Vec<Value>, slot: usize, value: Value) {
+    while slots.len() <= slot {
+        slots.push(Value::Null);
+    }
+    slots[slot] = value;
+}
+
+/// Builds a delegate invocation's arguments: the bound target (if any) ahead of the
+/// shared parameters -- an instance method receives `this`, a static method does not.
+fn delegate_call_args(target: &Value, params: &[Value]) -> Vec<Value> {
+    let mut call_args = Vec::with_capacity(params.len() + 1);
+    if !matches!(target, Value::Null) {
+        call_args.push(target.clone());
+    }
+    call_args.extend_from_slice(params);
+    call_args
 }
 
 /// Writes `value` into field `slot` of the value-type instance at `location`,
 /// materializing it from `shape` (the declaring type's zero fields) if it is not yet a
-/// struct, and growing the slot vector to reach it.
+/// struct. Reads the container, sets the field, writes it back -- so it serves a frame
+/// local/arg or a heap/static struct alike.
 fn write_field_at(
     frames: &mut [Frame],
+    vm: &mut Vm,
     location: Location,
     slot: u32,
     shape: &[Value],
     value: Value,
 ) -> Result<(), Trap> {
-    let fields = match location {
-        Location::Local { frame, slot: local } => {
-            let frame = frames
-                .get_mut(frame)
-                .ok_or(Trap::Unsupported(Opcode::Stfld))?;
-            ensure_struct_slot(&mut frame.locals, local, shape)
+    let mut container = read_location_value(frames, vm, location).unwrap_or(Value::Null);
+    if !matches!(container, Value::Struct(_)) {
+        container = Value::Struct(shape.to_vec().into_boxed_slice());
+    }
+    if let Value::Struct(fields) = &mut container {
+        if let Some(target) = fields.get_mut(slot as usize) {
+            *target = value;
         }
-        Location::Arg { frame, slot: arg } => {
-            let frame = frames
-                .get_mut(frame)
-                .ok_or(Trap::Unsupported(Opcode::Stfld))?;
-            ensure_struct_slot(&mut frame.args, arg, shape)
-        }
-        _ => return Err(Trap::Unsupported(Opcode::Stfld)),
-    };
-    if let Some(target) = fields.get_mut(slot as usize) {
-        *target = value;
     }
-    Ok(())
-}
-
-/// Ensures `vec[slot]` holds a value-type instance (sized from `shape`), growing the
-/// vector and materializing the struct as needed, and returns its fields.
-fn ensure_struct_slot<'v>(
-    vec: &'v mut Vec<Value>,
-    slot: usize,
-    shape: &[Value],
-) -> &'v mut [Value] {
-    while vec.len() <= slot {
-        vec.push(Value::Null);
-    }
-    if !matches!(vec[slot], Value::Struct(_)) {
-        vec[slot] = Value::Struct(shape.to_vec().into_boxed_slice());
-    }
-    if let Value::Struct(fields) = &mut vec[slot] {
-        fields
-    } else {
-        &mut []
-    }
+    write_location_value(frames, vm, location, container)
 }
 
 fn new_frame(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
@@ -1028,19 +1180,23 @@ fn step(
                     args.first().ok_or(Trap::StackUnderflow)?.clone(),
                     Opcode::Callvirt,
                 )?;
-                let (target, method) = vm
+                let invocations = vm
                     .heap()
-                    .delegate_target(delegate)
-                    .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
-                let mut call_args = Vec::with_capacity(args.len());
-                if !matches!(target, Value::Null) {
-                    call_args.push(target);
-                }
-                call_args.extend_from_slice(&args[1..]);
-                return Ok(Flow::Call {
-                    method,
-                    args: call_args,
-                });
+                    .delegate_invocations(delegate)
+                    .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?
+                    .to_vec();
+                let params = args.get(1..).unwrap_or_default().to_vec();
+                return match invocations.split_first() {
+                    Some(((target, method), [])) => Ok(Flow::Call {
+                        method: *method,
+                        args: delegate_call_args(target, &params),
+                    }),
+                    Some(_) => Ok(Flow::InvokeMulticast {
+                        invocations,
+                        params,
+                    }),
+                    None => Err(Trap::TypeMismatch(Opcode::Callvirt)),
+                };
             }
             let static_method = module.resolve(token);
             let target_info = module.call_target(token);
@@ -1162,6 +1318,70 @@ fn step(
                 }
                 Value::Null => return Err(Trap::NullReference),
                 _ => return Err(Trap::TypeMismatch(Opcode::Stfld)),
+            }
+        }
+        Opcode::Ldflda => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::Ldflda))?;
+            let token = token_operand(instruction)?;
+            let slot = module
+                .field_slot(token)
+                .ok_or(Trap::UnresolvedField(token))?;
+            match frame.pop()? {
+                Value::Object(object) => {
+                    frame
+                        .stack
+                        .push(Value::ByRef(Location::Field { object, slot }));
+                }
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::Unsupported(Opcode::Ldflda)),
+            }
+        }
+        Opcode::Ldsflda => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::Ldsflda))?;
+            let token = token_operand(instruction)?;
+            let slot = module
+                .static_field_slot(token)
+                .ok_or(Trap::UnresolvedField(token))?;
+            vm.init_statics(module.static_field_defaults());
+            frame.stack.push(Value::ByRef(Location::Static { slot }));
+        }
+        Opcode::Ldelema => {
+            let index = array_index(frame.pop()?, Opcode::Ldelema)?;
+            let array = object_ref(frame.pop()?, Opcode::Ldelema)?;
+            let len = vm
+                .heap()
+                .array_len(array)
+                .ok_or(Trap::TypeMismatch(Opcode::Ldelema))?;
+            let index = bounded_index(index, len)?;
+            frame
+                .stack
+                .push(Value::ByRef(Location::Element { array, index }));
+        }
+        Opcode::Initobj => {
+            let token = token_operand(instruction)?;
+            match frame.pop()? {
+                Value::ByRef(location) => {
+                    return Ok(Flow::InitObj {
+                        location,
+                        kind: token,
+                    });
+                }
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::Initobj)),
+            }
+        }
+        Opcode::Ldobj => match frame.pop()? {
+            Value::ByRef(location) => return Ok(Flow::LoadObj { location }),
+            other @ (Value::Struct(_) | Value::Object(_)) => frame.stack.push(other),
+            Value::Null => return Err(Trap::NullReference),
+            _ => return Err(Trap::TypeMismatch(Opcode::Ldobj)),
+        },
+        Opcode::Stobj => {
+            let value = frame.pop()?;
+            match frame.pop()? {
+                Value::ByRef(location) => return Ok(Flow::StoreObj { location, value }),
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::Stobj)),
             }
         }
 
@@ -1308,6 +1528,7 @@ impl Frame {
             new_object: None,
             current_exception: None,
             pending: None,
+            multicast: None,
         }
     }
 

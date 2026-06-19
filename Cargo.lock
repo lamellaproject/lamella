@@ -153,6 +153,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lcsc"
+version = "0.0.0"
+dependencies = [
+ "lamella-assemble",
+ "lamella-metadata",
+ "lamella-syntax",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

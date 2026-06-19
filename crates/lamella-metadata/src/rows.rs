@@ -79,6 +79,19 @@ pub fn columns(table_number: u8) -> Option<&'static [Col]> {
         table::GENERIC_PARAM => &[U16, U16, Coded(C::TypeOrMethodDef), Str],
         table::METHOD_SPEC => &[Coded(C::MethodDefOrRef), Blob],
         table::GENERIC_PARAM_CONSTRAINT => &[Idx(table::GENERIC_PARAM), Coded(C::TypeDefOrRef)],
+        table::DOCUMENT => &[Blob, Guid, Blob, Guid],
+        table::METHOD_DEBUG_INFORMATION => &[Idx(table::DOCUMENT), Blob],
+        table::LOCAL_SCOPE => &[
+            Idx(table::METHOD_DEF),
+            Idx(table::IMPORT_SCOPE),
+            Idx(table::LOCAL_VARIABLE),
+            Idx(table::LOCAL_CONSTANT),
+            U32,
+            U32,
+        ],
+        table::LOCAL_VARIABLE => &[U16, U16, Str],
+        table::LOCAL_CONSTANT => &[Str, Blob],
+        table::IMPORT_SCOPE => &[Idx(table::IMPORT_SCOPE), Blob],
         _ => return None,
     })
 }

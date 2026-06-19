@@ -6,8 +6,11 @@ use crate::frame::{Frame, Slot};
 use crate::tokens::Tokens;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use lamella_binder::{BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, SpecialType, TypeSymbol};
-use lamella_cil::{Instruction, Opcode, Operand};
+use lamella_binder::{
+    BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, SpecialType, TypeSymbol,
+    always_exits,
+};
+use lamella_cil::{EhClause, EhKind, Instruction, InstructionRange, Opcode, Operand};
 use lamella_syntax::ast::{AssignmentOperator, PostfixOperator, UnaryOperator};
 use lamella_syntax::span::Span;
 
@@ -27,12 +30,23 @@ pub struct EmittedBody {
     pub local_names: Vec<Box<str>>,
     /// One sequence point per statement, in emission order.
     pub sequence_points: Vec<SequencePoint>,
+    /// The exception-handling clauses for the method body's try statements.
+    pub handlers: Vec<EhClause>,
 }
 
 /// The enclosing loop's branch targets, for `break` and `continue`.
 struct LoopContext {
     continue_label: usize,
     break_label: usize,
+}
+
+/// A method's return epilogue, used when the body has a `try`: a `return` cannot
+/// `ret` from inside a protected region, so it parks its value in `return_slot`
+/// (when non-void) and `leave`s to `label`, where the single `ret` lives.
+#[derive(Clone, Copy)]
+struct Epilogue {
+    label: usize,
+    return_slot: Option<u16>,
 }
 
 /// Tracks branch labels (backpatched once known) and the sequence points recorded
@@ -43,6 +57,8 @@ struct Labels {
     pending: Vec<(usize, usize)>,
     loops: Vec<LoopContext>,
     points: Vec<SequencePoint>,
+    handlers: Vec<EhClause>,
+    epilogue: Option<Epilogue>,
 }
 
 impl Labels {
@@ -117,6 +133,7 @@ fn stack_effect(opcode: Opcode) -> i32 {
         | Opcode::Pop
         | Opcode::Brfalse
         | Opcode::Brtrue
+        | Opcode::Throw
         | Opcode::Ret => -1,
         _ => 0,
     }
@@ -128,43 +145,101 @@ pub fn emit_method(
     parameters: &[Box<str>],
     body: &BoundStmt,
 ) -> Result<Vec<Instruction>, EmitError> {
-    Ok(lower(&Frame::build(parameters, body, 0), &Tokens::new(), body)?.0)
+    let mut frame = Frame::build(parameters, body, 0);
+    Ok(lower(
+        &mut frame,
+        &Tokens::new(),
+        body,
+        &TypeSymbol::Special(SpecialType::Void),
+    )?
+    .0)
 }
 
 /// Lowers a method body and reports its local types (for the local signature) and
 /// sequence points (for debug info). `tokens` resolves members; `arg_base` is 1 for
-/// an instance method (argument 0 is `this`), else 0.
+/// an instance method (argument 0 is `this`), else 0; `return_type` is the method's
+/// return type, for the epilogue a `try` needs.
 pub fn emit_body(
     parameters: &[Box<str>],
     body: &BoundStmt,
     tokens: &Tokens,
     arg_base: u16,
+    return_type: &TypeSymbol,
 ) -> Result<EmittedBody, EmitError> {
-    let frame = Frame::build(parameters, body, arg_base);
-    let (code, sequence_points) = lower(&frame, tokens, body)?;
+    let mut frame = Frame::build(parameters, body, arg_base);
+    let lowered = lower(&mut frame, tokens, body, return_type)?;
     Ok(EmittedBody {
-        code,
+        code: lowered.0,
         local_types: frame.local_types().to_vec(),
         local_names: frame.local_names(),
-        sequence_points,
+        sequence_points: lowered.1,
+        handlers: lowered.2,
     })
 }
 
+/// A lowered body: the instruction stream, its sequence points, and its
+/// exception-handling clauses.
+type Lowered = (Vec<Instruction>, Vec<SequencePoint>, Vec<EhClause>);
+
 fn lower(
-    frame: &Frame,
+    frame: &mut Frame,
     tokens: &Tokens,
     body: &BoundStmt,
-) -> Result<(Vec<Instruction>, Vec<SequencePoint>), EmitError> {
+    return_type: &TypeSymbol,
+) -> Result<Lowered, EmitError> {
     let mut labels = Labels::default();
+    if contains_try(body) {
+        let return_slot = if matches!(return_type, TypeSymbol::Special(SpecialType::Void)) {
+            None
+        } else {
+            Some(frame.reserve_local(return_type))
+        };
+        let label = labels.label();
+        labels.epilogue = Some(Epilogue { label, return_slot });
+    }
+
     let mut out = Vec::new();
     emit_statement(body, frame, tokens, &mut labels, &mut out)?;
-    let end = out.len() as u32;
-    let branch_to_end = labels.positions.contains(&Some(end));
-    if branch_to_end || out.last().map(|instruction| instruction.opcode) != Some(Opcode::Ret) {
+
+    if let Some(Epilogue { label, return_slot }) = labels.epilogue {
+        labels.place(label, &out);
+        if let Some(slot) = return_slot {
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+        }
         out.push(Instruction::simple(Opcode::Ret));
+    } else {
+        let end = out.len() as u32;
+        let branch_to_end = labels.positions.contains(&Some(end));
+        if branch_to_end || out.last().map(|instruction| instruction.opcode) != Some(Opcode::Ret) {
+            out.push(Instruction::simple(Opcode::Ret));
+        }
     }
     labels.backpatch(&mut out);
-    Ok((out, labels.points))
+    Ok((out, labels.points, labels.handlers))
+}
+
+/// Whether `stmt` contains a `try` anywhere, so the body needs a return epilogue.
+fn contains_try(stmt: &BoundStmt) -> bool {
+    use BoundStmtKind as Kind;
+    match &stmt.kind {
+        Kind::Try { .. } => true,
+        Kind::Block(statements) => statements.iter().any(contains_try),
+        Kind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => contains_try(then_branch) || else_branch.as_deref().is_some_and(contains_try),
+        Kind::While { body, .. }
+        | Kind::DoWhile { body, .. }
+        | Kind::For { body, .. }
+        | Kind::ForEach { body, .. }
+        | Kind::Lock { body, .. }
+        | Kind::Using { body, .. }
+        | Kind::Labeled { body, .. } => contains_try(body),
+        Kind::Checked(inner) | Kind::Unchecked(inner) => contains_try(inner),
+        Kind::Switch { sections, .. } => sections.iter().flatten().any(contains_try),
+        _ => false,
+    }
 }
 
 fn emit_statement(
@@ -197,7 +272,15 @@ fn emit_statement(
             if let Some(value) = value {
                 emit_expression(value, frame, tokens, out)?;
             }
-            out.push(Instruction::simple(Opcode::Ret));
+            match labels.epilogue {
+                Some(Epilogue { label, return_slot }) => {
+                    if let Some(slot) = return_slot {
+                        out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+                    }
+                    labels.branch(Opcode::Leave, label, out);
+                }
+                None => out.push(Instruction::simple(Opcode::Ret)),
+            }
         }
         BoundStmtKind::If {
             condition,
@@ -269,12 +352,107 @@ fn emit_statement(
         BoundStmtKind::Checked(inner) | BoundStmtKind::Unchecked(inner) => {
             emit_statement(inner, frame, tokens, labels, out)?;
         }
+        BoundStmtKind::Throw(value) => match value {
+            Some(expr) => {
+                emit_expression(expr, frame, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Throw));
+            }
+            None => out.push(Instruction::simple(Opcode::Rethrow)),
+        },
+        BoundStmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => emit_try(
+            body,
+            catches,
+            finally.as_deref(),
+            frame,
+            tokens,
+            labels,
+            out,
+        )?,
         _ => {
             return Err(EmitError::Unsupported(
                 "this statement form is not lowered yet",
             ));
         }
     }
+    Ok(())
+}
+
+/// Lowers a `try` statement (15.10) to a protected region with catch and/or
+/// finally handlers, recorded as exception-handling clauses. Each region exits with
+/// `leave` to the instruction past the whole statement (the runtime runs any
+/// intervening `finally` on the way); a `finally` handler ends with `endfinally`.
+fn emit_try(
+    body: &BoundStmt,
+    catches: &[BoundCatch],
+    finally: Option<&BoundStmt>,
+    frame: &Frame,
+    tokens: &Tokens,
+    labels: &mut Labels,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let end = labels.label();
+
+    let try_start = out.len() as u32;
+    emit_statement(body, frame, tokens, labels, out)?;
+    if !always_exits(body) {
+        labels.branch(Opcode::Leave, end, out);
+    }
+    let try_range = InstructionRange {
+        start: try_start,
+        end: out.len() as u32,
+    };
+
+    for catch in catches {
+        let handler_start = out.len() as u32;
+        match catch.name.as_deref().and_then(|name| frame.slot(name)) {
+            Some(Slot::Local(slot)) => {
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+            }
+            _ => out.push(Instruction::simple(Opcode::Pop)),
+        }
+        emit_statement(&catch.body, frame, tokens, labels, out)?;
+        if !always_exits(&catch.body) {
+            labels.branch(Opcode::Leave, end, out);
+        }
+        let ty = catch
+            .exception_type
+            .clone()
+            .unwrap_or(TypeSymbol::Special(SpecialType::Object));
+        let token = tokens
+            .type_token(&ty)
+            .ok_or(EmitError::Unsupported("a catch clause's type has no token"))?;
+        labels.handlers.push(EhClause {
+            try_range,
+            handler_range: InstructionRange {
+                start: handler_start,
+                end: out.len() as u32,
+            },
+            kind: EhKind::Catch(token),
+        });
+    }
+
+    if let Some(finally) = finally {
+        let handler_start = out.len() as u32;
+        emit_statement(finally, frame, tokens, labels, out)?;
+        out.push(Instruction::simple(Opcode::Endfinally));
+        labels.handlers.push(EhClause {
+            try_range: InstructionRange {
+                start: try_start,
+                end: handler_start,
+            },
+            handler_range: InstructionRange {
+                start: handler_start,
+                end: out.len() as u32,
+            },
+            kind: EhKind::Finally,
+        });
+    }
+
+    labels.place(end, out);
     Ok(())
 }
 
@@ -517,7 +695,7 @@ mod tests {
     fn emission_records_a_sequence_point_per_statement() {
         let body = parse_statement("{ int x = 1; return x; }").statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &body);
-        let emitted = emit_body(&[], &bound, &Tokens::new(), 0).expect("should lower");
+        let emitted = emit_body(&[], &bound, &Tokens::new(), 0, &int()).expect("should lower");
 
         let offsets: Vec<u32> = emitted
             .sequence_points

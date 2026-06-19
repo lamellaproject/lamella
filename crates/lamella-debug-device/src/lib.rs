@@ -6,9 +6,7 @@
 use core::cell::RefCell;
 
 use lamella_cmsis_dap::{Dap, Transport};
-use lamella_debug_backend::{
-    DebugBackend, Disassembled, Frame, Register, Scope, Stop, Variable,
-};
+use lamella_debug_backend::{DebugBackend, Disassembled, Frame, Register, Scope, Stop, Variable};
 
 /// Drives a Cortex-M target over a CMSIS-DAP probe as a [`DebugBackend`]. The trait's
 /// inspection methods take `&self` (suited to the interpreter's in-memory state), so the
@@ -35,9 +33,9 @@ impl<T: Transport> DeviceBackend<T> {
         }
     }
 
-    /// The CIL instruction index whose native code contains `offset` (the last entry at
-    /// or before it).
-    fn cil_index_at(&self, offset: u32) -> u32 {
+    /// The CIL byte offset whose native code contains `offset` (the last entry at or
+    /// before it).
+    fn cil_offset_at(&self, offset: u32) -> u32 {
         self.lines
             .iter()
             .rev()
@@ -100,7 +98,7 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
 
     fn stack(&self) -> Vec<Frame> {
         let pc = self.dap.borrow_mut().read_core_reg(15).unwrap_or(0);
-        let cil = self.cil_index_at(pc.saturating_sub(self.base));
+        let cil = self.cil_offset_at(pc.saturating_sub(self.base));
         vec![Frame {
             address: u64::from(pc),
             name: self.name.clone(),
@@ -129,8 +127,8 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
 
     fn read_registers(&self) -> Vec<Register> {
         const NAMES: [&str; 17] = [
-            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11",
-            "r12", "sp", "lr", "pc", "xpsr",
+            "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "sp",
+            "lr", "pc", "xpsr",
         ];
         let mut dap = self.dap.borrow_mut();
         NAMES
@@ -153,7 +151,11 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
                 let addr = start.wrapping_add((i as u32) * 2);
                 let text = match dap.read_word(addr & !3) {
                     Ok(word) => {
-                        let half = if addr & 2 != 0 { word >> 16 } else { word & 0xffff };
+                        let half = if addr & 2 != 0 {
+                            word >> 16
+                        } else {
+                            word & 0xffff
+                        };
                         format!("{half:04x}")
                     }
                     Err(_) => "????".into(),

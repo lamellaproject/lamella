@@ -14,11 +14,13 @@ use lamella_cil::{Opcode, Operand};
 use lamella_metadata::{Assembly, Method, MethodSig, SigType};
 use lamella_token::Token;
 use lamella_ves::intrinsics::{
-    console_write, console_write_bool, console_write_char, console_write_double,
-    console_write_int32, console_write_int64, console_write_line, console_write_line_bool,
-    console_write_line_char, console_write_line_double, console_write_line_empty,
-    console_write_line_int32, console_write_line_int64, exception_ctor, exception_get_message,
-    object_ctor, string_concat, string_concat3, string_equals, string_get_chars, string_get_length,
+    boolean_to_string, char_to_string, console_write, console_write_bool, console_write_char,
+    console_write_double, console_write_int32, console_write_int64, console_write_line,
+    console_write_line_bool, console_write_line_char, console_write_line_double,
+    console_write_line_empty, console_write_line_int32, console_write_line_int64,
+    console_write_line_object, delegate_combine, delegate_remove, double_to_string, exception_ctor,
+    exception_get_message, int32_to_string, int64_to_string, object_ctor, object_to_string,
+    string_concat, string_concat3, string_equals, string_get_chars, string_get_length,
     string_is_null_or_empty, string_not_equals, string_substring, string_substring_len,
 };
 use lamella_ves::{IntrinsicFn, MethodId, Module, Value};
@@ -267,6 +269,14 @@ fn bcl_intrinsic(
         ("Object", ".ctor") => object_ctor_overload(signature),
         ("Exception", ".ctor") => Some(exception_ctor),
         ("Exception", "get_Message") => Some(exception_get_message),
+        ("Int32", "ToString") => to_string_overload(int32_to_string, signature),
+        ("Boolean", "ToString") => to_string_overload(boolean_to_string, signature),
+        ("Char", "ToString") => to_string_overload(char_to_string, signature),
+        ("Int64", "ToString") => to_string_overload(int64_to_string, signature),
+        ("Double", "ToString") => to_string_overload(double_to_string, signature),
+        ("Object", "ToString") => to_string_overload(object_to_string, signature),
+        ("Delegate", "Combine") => Some(delegate_combine),
+        ("Delegate", "Remove") => Some(delegate_remove),
         _ => None,
     }
 }
@@ -589,9 +599,22 @@ fn console_write_line_overload(signature: Option<&MethodSig>) -> Option<Intrinsi
         [SigType::Boolean] => console_write_line_bool,
         [SigType::Char] => console_write_line_char,
         [SigType::R8] => console_write_line_double,
+        [SigType::Object] => console_write_line_object,
         _ => return None,
     };
     Some(intrinsic)
+}
+
+/// The parameterless `ToString()` overload binds to `intrinsic`; the formatting
+/// overloads (`ToString(string)` / `ToString(IFormatProvider)`) are not modeled.
+fn to_string_overload(
+    intrinsic: IntrinsicFn,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [] => Some(intrinsic),
+        _ => None,
+    }
 }
 
 /// Picks the `Console.Write` overload (no line terminator) by its parameter type.

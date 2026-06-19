@@ -1,5 +1,6 @@
 //! MIR instructions and the operators they use.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::function::ValueId;
@@ -106,5 +107,12 @@ pub enum Inst {
     Load {
         /// The value holding the source address.
         address: ValueId,
+    },
+    /// Writes a NUL-terminated string to the host via an ARM semihosting `SYS_WRITE0`
+    /// request -- the `Debug.WriteLine` / console-output primitive. A side effect; the
+    /// instruction's result is a placeholder that callers ignore.
+    SemihostWrite {
+        /// The NUL-terminated bytes to emit.
+        text: Box<[u8]>,
     },
 }

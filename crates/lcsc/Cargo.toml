@@ -1,0 +1,19 @@
+[package]
+name = "lcsc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Lamella C# compiler driver: source files to a managed assembly (C# 1.0 / ISO-1)."
+
+# The compiler driver is a host CLI, so std is allowed here (unlike the no_std
+# front-end libraries). It reads files, decodes them the way csc does, compiles,
+# and reports diagnostics; no external dependencies.
+[dependencies]
+lamella-syntax = { path = "../lamella-syntax" }
+lamella-assemble = { path = "../lamella-assemble" }
+lamella-metadata = { path = "../lamella-metadata" }
+
+[lints]
+workspace = true

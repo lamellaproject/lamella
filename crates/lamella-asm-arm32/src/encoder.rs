@@ -724,6 +724,20 @@ impl Encoder {
         Ok(())
     }
 
+    /// `ADR Rd, <label>` -- form the PC-relative address of a label (`ADD Rd, PC, #imm`).
+    /// 16-bit encoding T1 (A6.7.7); the label must lie ahead, 4-byte aligned, within about
+    /// 1 KB. Resolved in [`Encoder::finish`], reusing the literal-pool relocation -- `ADR`
+    /// and a literal `LDR` share the PC-relative form, differing only in the opcode bits.
+    pub fn adr(&mut self, rd: Reg, target: Label) -> Result<(), AssembleError> {
+        if !rd.is_low() {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        let at = self.position();
+        self.fixups.push((at, RelocKind::ThumbLdrLit8, target.0));
+        self.emit_u16(0xA000 | (u16::from(rd.number()) << 8));
+        Ok(())
+    }
+
     /// `B <label>` -- unconditional branch to a bound label. 16-bit encoding T2
     /// (A6.7.10); the PC-relative offset is resolved in [`Encoder::finish`],
     /// reaching about +/-2 KB ([`AssembleError::BranchOutOfRange`] otherwise).
@@ -1048,6 +1062,18 @@ mod tests {
         let out = enc.finish().unwrap();
         assert_eq!(&out.bytes[0..2], &[0x00, 0x48]);
         assert_eq!(&out.bytes[4..8], &0xDEAD_BEEFu32.to_le_bytes());
+    }
+
+    #[test]
+    fn adr_resolves_to_a_pc_relative_address() {
+        let mut enc = Encoder::new();
+        let label = enc.new_label();
+        enc.adr(Reg::R1, label).unwrap();
+        enc.nop();
+        enc.bind_label(label);
+        enc.emit_word(0xDEAD_BEEF);
+        let out = enc.finish().unwrap();
+        assert_eq!(&out.bytes[0..2], &[0x00, 0xA1]);
     }
 
     #[test]

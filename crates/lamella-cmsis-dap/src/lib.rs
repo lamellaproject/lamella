@@ -444,9 +444,12 @@ mod tests {
         let regrdy = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00];
         let value = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0xef, 0xbe, 0xad, 0xde];
         let replies = vec![
-            ack.clone(), ack.clone(),
-            ack.clone(), regrdy,
-            ack.clone(), value,
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            regrdy,
+            ack.clone(),
+            value,
         ];
         let mut dap = Dap::new(Mock::new(replies));
         assert_eq!(dap.read_core_reg(15).unwrap(), 0xdead_beef);
@@ -457,9 +460,12 @@ mod tests {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
         let regrdy = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00];
         let replies = vec![
-            ack.clone(), ack.clone(),
-            ack.clone(), ack.clone(),
-            ack.clone(), regrdy,
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            regrdy,
         ];
         let mut dap = Dap::new(Mock::new(replies));
         dap.write_core_reg(0, 0xcafe_f00d).unwrap();
@@ -472,11 +478,16 @@ mod tests {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
         let ready = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00];
         let replies = vec![
-            ack.clone(), ack.clone(),
-            ack.clone(), ready.clone(),
-            ack.clone(), ack.clone(),
-            ack.clone(), ready,
-            ack.clone(), ack,
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ready.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ready,
+            ack.clone(),
+            ack,
         ];
         let mut dap = Dap::new(Mock::new(replies));
         dap.erase_flash_page(0x0003_f000).unwrap();
@@ -489,11 +500,16 @@ mod tests {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
         let ready = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00];
         let replies = vec![
-            ack.clone(), ack.clone(),
-            ack.clone(), ready.clone(),
-            ack.clone(), ack.clone(),
-            ack.clone(), ready,
-            ack.clone(), ack,
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ready.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ready,
+            ack.clone(),
+            ack,
         ];
         let mut dap = Dap::new(Mock::new(replies));
         dap.write_flash(0x0003_f000, &[0xcafe_babe]).unwrap();
@@ -507,7 +523,10 @@ mod tests {
         let mut dap = Dap::new(Mock::new(vec![ack.clone(), ack.clone(), ack.clone(), ack]));
         dap.reset_and_run().unwrap();
         assert_eq!(&dap.transport.sent[1][4..8], &0x05fa_0004u32.to_le_bytes());
-        assert_eq!(&dap.transport.sent[3][4..8], &(DBGKEY | C_DEBUGEN).to_le_bytes());
+        assert_eq!(
+            &dap.transport.sent[3][4..8],
+            &(DBGKEY | C_DEBUGEN).to_le_bytes()
+        );
     }
 
     #[test]

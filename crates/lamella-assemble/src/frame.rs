@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use lamella_binder::{BoundStmt, BoundStmtKind, TypeSymbol};
+use lamella_binder::{BoundStmt, BoundStmtKind, SpecialType, TypeSymbol};
 
 /// Where a named variable lives in a method frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +80,14 @@ impl Frame {
         self.local_types.push(ty.clone());
     }
 
+    /// Reserves an unnamed local of `ty` (a compiler temporary, such as the value a
+    /// `return` inside a `try` parks before leaving), returning its slot index.
+    pub fn reserve_local(&mut self, ty: &TypeSymbol) -> u16 {
+        let slot = self.local_types.len() as u16;
+        self.local_types.push(ty.clone());
+        slot
+    }
+
     fn collect_locals(&mut self, stmt: &BoundStmt) {
         match &stmt.kind {
             BoundStmtKind::Local { ty, declarators } => {
@@ -127,6 +135,26 @@ impl Frame {
             | BoundStmtKind::Labeled { body: inner, .. } => self.collect_locals(inner),
             BoundStmtKind::Lock { body, .. } | BoundStmtKind::Using { body, .. } => {
                 self.collect_locals(body);
+            }
+            BoundStmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                self.collect_locals(body);
+                for catch in catches {
+                    if let Some(name) = &catch.name {
+                        let ty = catch
+                            .exception_type
+                            .clone()
+                            .unwrap_or(TypeSymbol::Special(SpecialType::Object));
+                        self.declare_local(name, &ty);
+                    }
+                    self.collect_locals(&catch.body);
+                }
+                if let Some(finally) = finally {
+                    self.collect_locals(finally);
+                }
             }
             _ => {}
         }

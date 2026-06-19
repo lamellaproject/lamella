@@ -73,6 +73,20 @@ pub mod table {
     pub const METHOD_SPEC: u8 = 0x2B;
     /// `GenericParamConstraint` (II.22.21).
     pub const GENERIC_PARAM_CONSTRAINT: u8 = 0x2C;
+
+
+    /// `Document` (a source document).
+    pub const DOCUMENT: u8 = 0x30;
+    /// `MethodDebugInformation` (parallel to `MethodDef`: its sequence points).
+    pub const METHOD_DEBUG_INFORMATION: u8 = 0x31;
+    /// `LocalScope` (a method's local-variable scope).
+    pub const LOCAL_SCOPE: u8 = 0x32;
+    /// `LocalVariable` (a named local).
+    pub const LOCAL_VARIABLE: u8 = 0x33;
+    /// `LocalConstant` (a named constant local).
+    pub const LOCAL_CONSTANT: u8 = 0x34;
+    /// `ImportScope` (the `using` scope a `LocalScope` sits in).
+    pub const IMPORT_SCOPE: u8 = 0x35;
 }
 
 /// An error parsing the tables-stream header.

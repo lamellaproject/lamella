@@ -28,6 +28,14 @@ pub fn always_exits(stmt: &BoundStmt) -> bool {
         Kind::Lock { body, .. } | Kind::Using { body, .. } => always_exits(body),
         Kind::Checked(inner) | Kind::Unchecked(inner) => always_exits(inner),
         Kind::Labeled { body, .. } => always_exits(body),
+        Kind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            finally.as_ref().is_some_and(|block| always_exits(block))
+                || (always_exits(body) && catches.iter().all(|catch| always_exits(&catch.body)))
+        }
         _ => false,
     }
 }

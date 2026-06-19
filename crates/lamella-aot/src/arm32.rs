@@ -1,5 +1,6 @@
 //! Lowering the middle IR to ARMv6-M Thumb machine code.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use lamella_asm_arm32::{AssembleError, Cond, Encoder, Label, Reg};
@@ -144,6 +145,7 @@ fn lower_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::Call { .. } => return Err(LowerError::CallUnsupported),
+        Inst::SemihostWrite { .. } => return Err(LowerError::CallUnsupported),
     }
     Ok(())
 }
@@ -201,6 +203,7 @@ fn shift(
 fn lower_spilled_inst(
     enc: &mut Encoder,
     pool: &mut Vec<(Label, u32)>,
+    strings: &mut Vec<(Label, Box<[u8]>)>,
     slot: &impl Fn(ValueId) -> u16,
     inst: &Inst,
     func_labels: &[Label],
@@ -271,6 +274,15 @@ fn lower_spilled_inst(
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::SemihostWrite { text } => {
+            let entry = enc.new_label();
+            strings.push((entry, text.clone()));
+            enc.adr(Reg::R1, entry)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.movs_imm(Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bkpt(0xAB);
+        }
     }
     Ok(())
 }
@@ -300,6 +312,7 @@ fn lower_spilled_into(
     let slot = |v: ValueId| (v.0 as u16) * 4;
 
     let mut pool: Vec<(Label, u32)> = Vec::new();
+    let mut strings: Vec<(Label, Box<[u8]>)> = Vec::new();
     if has_calls {
         enc.push_registers(0, true);
     }
@@ -330,7 +343,7 @@ fn lower_spilled_into(
             if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
                 line_table.push((enc.position(), cil));
             }
-            lower_spilled_inst(enc, &mut pool, &slot, inst, func_labels)?;
+            lower_spilled_inst(enc, &mut pool, &mut strings, &slot, inst, func_labels)?;
             enc.str_sp(Reg::R0, slot(*result))
                 .map_err(|_| LowerError::TooManyValues)?;
         }
@@ -406,6 +419,11 @@ fn lower_spilled_into(
             enc.emit_word(value);
         }
     }
+    for (entry, text) in strings {
+        enc.align_to_word();
+        enc.bind_label(entry);
+        enc.emit_bytes(&text);
+    }
     Ok(())
 }
 
@@ -427,6 +445,13 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     }
     if func.value_types.iter().any(|ty| !ty.is_integer()) {
         return Err(LowerError::NonIntegerValue);
+    }
+    if func
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::SemihostWrite { .. })))
+    {
+        return Ok(Assignment::Spilled);
     }
     let has_calls = func
         .blocks
@@ -641,16 +666,16 @@ fn lower_into(
     Ok(())
 }
 
-/// Maps native code offsets to CIL instruction indices, ascending by offset, so a
+/// Maps native code offsets to CIL byte offsets, ascending by offset, so a
 /// debugger can take a native PC and recover the CIL instruction being executed. Built
 /// by [`lower_debug`] from a `cil::CilSourceMap`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineTable(pub Vec<(u32, u32)>);
 
 impl LineTable {
-    /// The CIL instruction index whose native code contains `offset` -- the last entry
-    /// at or before it, or `None` if `offset` precedes all code.
-    pub fn cil_index_at(&self, offset: u32) -> Option<u32> {
+    /// The CIL byte offset whose native code contains `offset` -- the last entry at or
+    /// before it, or `None` if `offset` precedes all code.
+    pub fn cil_offset_at(&self, offset: u32) -> Option<u32> {
         self.0
             .iter()
             .rev()
@@ -676,7 +701,7 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
 }
 
 /// Lowers a function and also returns a [`LineTable`] mapping native code offsets to the
-/// CIL instruction indices in `source_map` (from `cil::lower_method_debug`), so a native
+/// CIL byte offsets in `source_map` (from `cil::lower_method_debug`), so a native
 /// PC recovers to a CIL position.
 pub fn lower_debug(
     func: &Function,
@@ -813,8 +838,19 @@ mod tests {
             blocks: vec![BasicBlock {
                 params: Vec::new(),
                 insts: vec![
-                    (ValueId(0), Inst::ConstInt { ty: MirType::I32, value: 0x5000_0510 }),
-                    (ValueId(1), Inst::Load { address: ValueId(0) }),
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0x5000_0510,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Load {
+                            address: ValueId(0),
+                        },
+                    ),
                 ],
                 terminator: Some(Terminator::Return(Some(ValueId(1)))),
             }],
@@ -822,6 +858,28 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         let bytes = lower(&func).unwrap();
         assert!(bytes.windows(2).any(|w| w[1] == 0x68));
+    }
+
+    #[test]
+    fn lowers_a_semihost_write() {
+        let func = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::SemihostWrite { text: b"Hi\0".to_vec().into_boxed_slice() },
+                )],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(bytes.windows(2).any(|w| w == [0xAB, 0xBE]), "BKPT 0xAB present");
+        assert!(bytes.windows(3).any(|w| w == b"Hi\0"), "string in the pool");
     }
 
     #[test]
@@ -834,9 +892,27 @@ mod tests {
             blocks: vec![BasicBlock {
                 params: Vec::new(),
                 insts: vec![
-                    (ValueId(0), Inst::ConstInt { ty: MirType::I32, value: 0x5000_0508 }),
-                    (ValueId(1), Inst::ConstInt { ty: MirType::I32, value: 0x2000 }),
-                    (ValueId(2), Inst::Store { address: ValueId(0), value: ValueId(1) }),
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0x5000_0508,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0x2000,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Store {
+                            address: ValueId(0),
+                            value: ValueId(1),
+                        },
+                    ),
                 ],
                 terminator: Some(Terminator::Return(None)),
             }],
@@ -848,7 +924,7 @@ mod tests {
         assert!(table.0.windows(2).all(|w| w[0].0 <= w[1].0));
         assert!(table.0.iter().all(|&(_, cil)| matches!(cil, 2 | 4 | 6)));
         let first = table.0.first().unwrap().0;
-        assert_eq!(table.cil_index_at(first), Some(2));
+        assert_eq!(table.cil_offset_at(first), Some(2));
     }
 
     #[test]

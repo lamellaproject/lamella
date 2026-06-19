@@ -26,6 +26,31 @@ pub struct TypeName<'a> {
     pub name: &'a str,
 }
 
+/// A method a call token resolves to ([`Assembly::resolve_method`]): its name,
+/// declaring type, and signature, plus where it is defined.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedMethod<'a> {
+    /// The method's name.
+    pub name: Option<&'a str>,
+    /// The namespace and name of the type that declares it.
+    pub declaring_type: Option<TypeName<'a>>,
+    /// The decoded method signature.
+    pub signature: Option<MethodSig>,
+    /// Whether the method is defined here or referenced from elsewhere.
+    pub kind: MethodKind,
+}
+
+/// Where a resolved method lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodKind {
+    /// Defined in this assembly: the `MethodDef` row index, which an AOT lowering
+    /// maps to a compiled callee.
+    Definition(u32),
+    /// Referenced from another assembly (a `MemberRef`) -- e.g. a BCL method an AOT
+    /// backend recognizes as an intrinsic.
+    Reference,
+}
+
 /// A custom attribute applied to a target (II.22.10): the constructor it invokes
 /// and its raw argument blob (decoding the blob per II.23.3 is left to callers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +218,76 @@ impl<'a> Assembly<'a> {
     pub fn member_refs(&self) -> impl Iterator<Item = MemberRef<'a>> + '_ {
         (1..=self.tables.row_count(table::MEMBER_REF))
             .filter_map(move |index| self.member_ref(index))
+    }
+
+    /// The `MethodDef` at 1-based `index`, or `None` if out of range.
+    #[must_use]
+    pub fn method(&self, index: u32) -> Option<Method<'a>> {
+        if index == 0 || index > self.tables.row_count(table::METHOD_DEF) {
+            return None;
+        }
+        Some(Method {
+            assembly: *self,
+            index,
+        })
+    }
+
+    /// Resolves a `call`/`callvirt` method token to its target: the name, declaring
+    /// type, and signature, plus whether it is defined in this assembly (a
+    /// `MethodDef`) or referenced from another (a `MemberRef`). This is what a
+    /// consumer of decoded CIL -- an interpreter or an AOT lowering -- needs to bind
+    /// a call to its callee. Returns `None` for a token that is neither.
+    #[must_use]
+    pub fn resolve_method(&self, token: Token) -> Option<ResolvedMethod<'a>> {
+        match token.table() {
+            table::METHOD_DEF => {
+                let method = self.method(token.row())?;
+                Some(ResolvedMethod {
+                    name: method.name(),
+                    declaring_type: self
+                        .method_owner(token.row())
+                        .and_then(|owner| owner.name()),
+                    signature: method.signature(),
+                    kind: MethodKind::Definition(token.row()),
+                })
+            }
+            table::MEMBER_REF => {
+                let member = self.member_ref(token.row())?;
+                Some(ResolvedMethod {
+                    name: member.name(),
+                    declaring_type: self.parent_type_name(member.parent()),
+                    signature: member.method_signature(),
+                    kind: MethodKind::Reference,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The `TypeDef` that owns the method at `method_index`, found by the method
+    /// ranges the `TypeDef.MethodList` column delimits.
+    fn method_owner(&self, method_index: u32) -> Option<TypeDef<'a>> {
+        (1..=self.tables.row_count(table::TYPE_DEF)).find_map(|type_index| {
+            let (first, last) = self.child_range(table::TYPE_DEF, type_index, 5, table::METHOD_DEF);
+            (first..last).contains(&method_index).then_some(TypeDef {
+                assembly: *self,
+                index: type_index,
+            })
+        })
+    }
+
+    /// The namespace and name of a `MemberRef` parent that is a type (a `TypeRef`
+    /// or `TypeDef`); `None` for other parents.
+    fn parent_type_name(&self, parent: Token) -> Option<TypeName<'a>> {
+        match parent.table() {
+            table::TYPE_REF => self
+                .type_ref(parent.row())
+                .and_then(|type_ref| type_ref.name()),
+            table::TYPE_DEF => self
+                .type_def(parent.row())
+                .and_then(|type_def| type_def.name()),
+            _ => None,
+        }
     }
 
     /// The custom attributes applied to `parent`, from the `CustomAttribute`

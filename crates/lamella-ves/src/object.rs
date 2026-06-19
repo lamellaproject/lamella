@@ -43,14 +43,13 @@ pub enum Object {
         /// The boxed value (a copy of the value-type value).
         value: Value,
     },
-    /// A delegate (II.14.6): a bound method -- an optional target object and the method
-    /// it calls. Constructed by `newobj` on a delegate type, invoked by its `Invoke`.
+    /// A delegate (II.14.6): an invocation list of bound methods -- each a `(target,
+    /// method)` where the target is a `Value::Object` for an instance method or
+    /// `Value::Null` for a static one. A single-cast delegate has one entry; `Combine`
+    /// concatenates lists for multicast. `Invoke` calls them in order.
     Delegate {
-        /// The bound target: a `Value::Object` for an instance method, `Value::Null`
-        /// for a static method.
-        target: Value,
-        /// The method the delegate invokes.
-        method: u32,
+        /// The bound methods, called in order; the last one's result is the delegate's.
+        invocations: Vec<(Value, u32)>,
     },
 }
 
@@ -167,14 +166,21 @@ impl Heap {
 
     /// Allocates a delegate binding `target` to `method` and returns a reference.
     pub fn alloc_delegate(&mut self, target: Value, method: u32) -> ObjectRef {
-        self.alloc(Object::Delegate { target, method })
+        self.alloc(Object::Delegate {
+            invocations: alloc::vec![(target, method)],
+        })
     }
 
-    /// The `(target, method)` of the delegate at `reference`, if it is a delegate.
+    /// Allocates a (multicast) delegate with the given invocation list.
+    pub fn alloc_multicast(&mut self, invocations: Vec<(Value, u32)>) -> ObjectRef {
+        self.alloc(Object::Delegate { invocations })
+    }
+
+    /// The invocation list of the delegate at `reference`, if it is a delegate.
     #[must_use]
-    pub fn delegate_target(&self, reference: ObjectRef) -> Option<(Value, u32)> {
+    pub fn delegate_invocations(&self, reference: ObjectRef) -> Option<&[(Value, u32)]> {
         match self.get(reference)? {
-            Object::Delegate { target, method } => Some((target.clone(), *method)),
+            Object::Delegate { invocations } => Some(invocations),
             _ => None,
         }
     }
