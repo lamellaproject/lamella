@@ -49,6 +49,7 @@ fn type_info(assembly: &Assembly, type_def: &lamella_metadata::TypeDef) -> Optio
                 ty: sigtype_to_symbol(assembly, &signature),
                 is_static: false,
                 accessibility: Accessibility::Public,
+                constant: None,
             });
         }
     }

@@ -10,8 +10,8 @@ use crate::symbols::{
 use crate::types::TypeSymbol;
 use alloc::string::String;
 use lamella_syntax::ast::{
-    CompilationUnit, Member, Modifier, NamespaceMember, QualifiedName, TypeDecl,
-    TypeKind as SyntaxTypeKind,
+    CompilationUnit, Expr, ExprKind, Literal, Member, Modifier, NamespaceMember, QualifiedName,
+    TypeDecl, TypeKind as SyntaxTypeKind, UnaryOperator,
 };
 
 /// Builds the [`Model`] of every type and member declared in `unit`.
@@ -50,12 +50,20 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
         NamespaceMember::Enum(declaration) => {
             let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Enum);
             let enum_ty = named_symbol(namespace, &declaration.name);
+            let mut next_value: i64 = 0;
             for member in &declaration.members {
+                let value = member
+                    .value
+                    .as_ref()
+                    .and_then(enum_member_value)
+                    .unwrap_or(next_value);
+                next_value = value.wrapping_add(1);
                 info.fields.push(FieldSymbol {
                     name: member.name.clone(),
                     ty: enum_ty.clone(),
                     is_static: true,
                     accessibility: Accessibility::Public,
+                    constant: Some(value),
                 });
             }
             model.insert(info);
@@ -67,6 +75,21 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 TypeKind::Delegate,
             ));
         }
+    }
+}
+
+/// Evaluates an enum member's value expression to its underlying integral value.
+/// The v1 forms are an integer or character literal, optionally negated; anything
+/// else yields `None`, and the caller continues the auto-increment.
+fn enum_member_value(expr: &Expr) -> Option<i64> {
+    match &expr.kind {
+        ExprKind::Literal(Literal::Integer { value, .. }) => i64::try_from(*value).ok(),
+        ExprKind::Literal(Literal::Character(unit)) => Some(i64::from(*unit)),
+        ExprKind::Unary {
+            operator: UnaryOperator::Minus,
+            operand,
+        } => enum_member_value(operand).map(|value| -value),
+        _ => None,
     }
 }
 
@@ -92,6 +115,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         ty: field_ty.clone(),
                         is_static,
                         accessibility,
+                        constant: None,
                     });
                 }
             }

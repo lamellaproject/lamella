@@ -1,16 +1,16 @@
 //! Statement binding (ECMA-334 1st ed, clause 15).
 
 use crate::bind::bind_type;
-use crate::bound::{Binder, BoundExpr};
+use crate::bound::{Binder, BoundExpr, BoundExprKind};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
-use alloc::string::ToString;
+use alloc::format;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    CatchClause, Expr, ExprKind, ForInitializer, Literal, Stmt, StmtKind, SwitchLabel, TypeRef,
-    UnaryOperator, UsingResource, VariableDeclarator,
+    CatchClause, Expr, ExprKind, ForInitializer, Literal, Stmt, StmtKind, SwitchLabel,
+    SwitchSection, TypeRef, UnaryOperator, UsingResource, VariableDeclarator,
 };
 use lamella_syntax::span::Span;
 
@@ -195,7 +195,16 @@ impl Binder {
                 BoundStmtKind::Block(bound)
             }
             StmtKind::Empty => BoundStmtKind::Empty,
-            StmtKind::Expression(expr) => BoundStmtKind::Expression(self.bind_expression(expr)),
+            StmtKind::Expression(expr) => {
+                let bound = self.bind_expression(expr);
+                if !is_statement_expression(&bound.kind) {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::IllegalStatementExpression,
+                        expr.span,
+                    ));
+                }
+                BoundStmtKind::Expression(bound)
+            }
             StmtKind::LocalDeclaration { ty, declarators } => self.bind_local(ty, declarators),
             StmtKind::If {
                 condition,
@@ -263,27 +272,61 @@ impl Binder {
                 expression,
                 sections,
             } => {
+                let switch_span = expression.span;
                 let expression = self.bind_expression(expression);
                 self.enter_scope();
-                let sections = sections
-                    .iter()
-                    .map(|section| BoundSwitchSection {
-                        labels: section
-                            .labels
-                            .iter()
-                            .map(|label| self.bind_switch_label(label))
-                            .collect(),
-                        statements: section
-                            .statements
-                            .iter()
-                            .map(|statement| self.bind_statement(statement))
-                            .collect(),
-                    })
-                    .collect();
+                let mut seen_values: Vec<i64> = Vec::new();
+                let mut seen_default = false;
+                let mut bound_sections = Vec::with_capacity(sections.len());
+                for section in sections {
+                    let mut labels = Vec::with_capacity(section.labels.len());
+                    for label in &section.labels {
+                        let bound = self.bind_switch_label(label);
+                        let duplicate = match bound {
+                            BoundSwitchLabel::Case(value) if seen_values.contains(&value) => {
+                                Some(format!("case {value}").into())
+                            }
+                            BoundSwitchLabel::Case(value) => {
+                                seen_values.push(value);
+                                None
+                            }
+                            BoundSwitchLabel::Default if seen_default => {
+                                Some(Box::<str>::from("default"))
+                            }
+                            BoundSwitchLabel::Default => {
+                                seen_default = true;
+                                None
+                            }
+                        };
+                        if let Some(text) = duplicate {
+                            let span = match label {
+                                SwitchLabel::Case(expr) => expr.span,
+                                SwitchLabel::Default => section_anchor(section, switch_span),
+                            };
+                            self.report(Diagnostic::new(
+                                DiagnosticKind::DuplicateCaseLabel { label: text },
+                                span,
+                            ));
+                        }
+                        labels.push(bound);
+                    }
+                    let statements: Vec<BoundStmt> = section
+                        .statements
+                        .iter()
+                        .map(|statement| self.bind_statement(statement))
+                        .collect();
+                    if !statements.is_empty() && statements.iter().all(is_straight_line) {
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::SwitchFallThrough,
+                            section_anchor(section, switch_span),
+                        ));
+                    }
+                    bound_sections.push(BoundSwitchSection { labels, statements });
+                }
                 self.exit_scope();
                 BoundStmtKind::Switch {
                     expression,
-                    sections,
+                    sections: bound_sections,
                 }
             }
             StmtKind::Try {
@@ -326,13 +369,29 @@ impl Binder {
     fn bind_switch_label(&mut self, label: &SwitchLabel) -> BoundSwitchLabel {
         match label {
             SwitchLabel::Default => BoundSwitchLabel::Default,
-            SwitchLabel::Case(expr) => match case_constant(expr) {
-                Some(value) => BoundSwitchLabel::Case(value),
-                None => {
-                    self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, expr.span));
-                    BoundSwitchLabel::Case(0)
+            SwitchLabel::Case(expr) => {
+                match case_constant(expr).or_else(|| self.enum_case_value(expr)) {
+                    Some(value) => BoundSwitchLabel::Case(value),
+                    None => {
+                        self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, expr.span));
+                        BoundSwitchLabel::Case(0)
+                    }
                 }
-            },
+            }
+        }
+    }
+
+    /// The underlying value of a case label that names an enum member (or any
+    /// constant field), by binding it and reading the field's constant. `None` when
+    /// the expression is not a constant member access.
+    fn enum_case_value(&mut self, expr: &Expr) -> Option<i64> {
+        let bound = self.bind_expression(expr);
+        self.record_case_label_uses(&bound);
+        match &bound.kind {
+            BoundExprKind::FieldAccess {
+                field: Some(field), ..
+            } => field.constant,
+            _ => None,
         }
     }
 
@@ -419,6 +478,21 @@ impl Binder {
         let declared = self.resolve_named_type(&bind_type(ty), ty.span);
         let mut bound = Vec::with_capacity(declarators.len());
         for declarator in declarators {
+            if self.local_in_current_scope(&declarator.name) {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::DuplicateLocal {
+                        name: declarator.name.clone(),
+                    },
+                    declarator.span,
+                ));
+            } else if self.local_in_enclosing_scope(&declarator.name) {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::LocalShadowsEnclosing {
+                        name: declarator.name.clone(),
+                    },
+                    declarator.span,
+                ));
+            }
             let initializer = declarator.initializer.as_ref().map(|expr| {
                 let value = self.bind_expression(expr);
                 self.check_convertible(&value.ty, &declared, declarator.span);
@@ -453,13 +527,7 @@ impl Binder {
             return;
         }
         if !self.converts(source, target) {
-            self.report(Diagnostic::new(
-                DiagnosticKind::NoImplicitConversion {
-                    from: source.to_string().into(),
-                    to: target.to_string().into(),
-                },
-                span,
-            ));
+            self.report_no_implicit_conversion(source, target, span);
         }
     }
 }
@@ -476,6 +544,53 @@ fn case_constant(expr: &Expr) -> Option<i64> {
             operand,
         } => case_constant(operand).map(|value| -value),
         _ => None,
+    }
+}
+
+/// A span to anchor a section-level diagnostic on: its first `case` constant, else
+/// its first statement, else the switch's governing expression.
+fn section_anchor(section: &SwitchSection, fallback: Span) -> Span {
+    section
+        .labels
+        .iter()
+        .find_map(|label| match label {
+            SwitchLabel::Case(expr) => Some(expr.span),
+            SwitchLabel::Default => None,
+        })
+        .or_else(|| section.statements.first().map(|statement| statement.span))
+        .unwrap_or(fallback)
+}
+
+/// Whether a bound expression is one C# allows to stand alone as a statement
+/// (15.6): assignment, invocation, object/array creation, or pre/post
+/// increment/decrement. `checked`/`unchecked` wrappers and a binding error are
+/// admitted conservatively, so an odd-but-legal form is a gap, not a false CS0201.
+fn is_statement_expression(kind: &BoundExprKind) -> bool {
+    matches!(
+        kind,
+        BoundExprKind::Assignment { .. }
+            | BoundExprKind::Call { .. }
+            | BoundExprKind::ObjectCreation { .. }
+            | BoundExprKind::ArrayCreation { .. }
+            | BoundExprKind::Postfix { .. }
+            | BoundExprKind::Unary {
+                operator: UnaryOperator::PreIncrement | UnaryOperator::PreDecrement,
+                ..
+            }
+            | BoundExprKind::Checked(_)
+            | BoundExprKind::Unchecked(_)
+            | BoundExprKind::Error
+    )
+}
+
+/// Whether a statement passes control straight through to the next (no jump, no
+/// branching). A section built only of these reaches its endpoint, so it falls
+/// through (CS0163); anything else is left uncertain to avoid a false positive.
+fn is_straight_line(stmt: &BoundStmt) -> bool {
+    match &stmt.kind {
+        BoundStmtKind::Local { .. } | BoundStmtKind::Expression(_) | BoundStmtKind::Empty => true,
+        BoundStmtKind::Block(statements) => statements.iter().all(is_straight_line),
+        _ => false,
     }
 }
 

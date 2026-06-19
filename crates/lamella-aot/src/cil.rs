@@ -5,7 +5,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, OperandKind};
-use lamella_ir::{BasicBlock, BinOp, BlockId, CmpOp, Function, Inst, MirType, Terminator, ValueId};
+use lamella_ir::{
+    BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId,
+};
 
 /// Why a method body could not be lowered to MIR.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,7 +312,11 @@ fn binary(
 ) -> Result<(), CilError> {
     let rhs = stack.pop().ok_or(CilError::StackUnderflow)?;
     let lhs = stack.pop().ok_or(CilError::StackUnderflow)?;
-    let result = new_value(value_types, MirType::I32);
+    let ty = value_types
+        .get(lhs.0 as usize)
+        .copied()
+        .unwrap_or(MirType::I32);
+    let result = new_value(value_types, ty);
     insts.push((result, Inst::Binary { op, lhs, rhs }));
     stack.push(result);
     Ok(())
@@ -327,6 +333,58 @@ fn compare(
     let lhs = stack.pop().ok_or(CilError::StackUnderflow)?;
     let result = new_value(value_types, MirType::I32);
     insts.push((result, Inst::Compare { op, lhs, rhs }));
+    stack.push(result);
+    Ok(())
+}
+
+/// Pops one operand and pushes its sub-word width conversion (the CLI's `conv.i1`/
+/// `conv.u1`/`conv.i2`/`conv.u2`); the result is `int32`.
+fn convert(
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    kind: ConvKind,
+) -> Result<(), CilError> {
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let result = new_value(value_types, MirType::I32);
+    insts.push((result, Inst::Convert { value, kind }));
+    stack.push(result);
+    Ok(())
+}
+
+/// Widens the top of stack to `int64` (sign- or zero-extended); a no-op if it is already
+/// `int64` (the CLI's `conv.i8`/`conv.u8`).
+fn widen(
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    signed: bool,
+) -> Result<(), CilError> {
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    if value_types.get(value.0 as usize) == Some(&MirType::I64) {
+        stack.push(value);
+        return Ok(());
+    }
+    let result = new_value(value_types, MirType::I64);
+    insts.push((result, Inst::Widen { value, signed }));
+    stack.push(result);
+    Ok(())
+}
+
+/// Narrows the top of stack to `int32`: truncates an `int64`, or a no-op on a 32-bit value
+/// (the CLI's `conv.i4`/`conv.u4`).
+fn narrow_to_i32(
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<(), CilError> {
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    if value_types.get(value.0 as usize) != Some(&MirType::I64) {
+        stack.push(value);
+        return Ok(());
+    }
+    let result = new_value(value_types, MirType::I32);
+    insts.push((result, Inst::Truncate { value }));
     stack.push(result);
     Ok(())
 }
@@ -398,6 +456,20 @@ fn apply_value_op(
             };
             push_const(value_types, stack, insts, i64::from(*v));
         }
+        Opcode::LdcI8 => {
+            let Operand::Int64(v) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            let result = new_value(value_types, MirType::I64);
+            insts.push((
+                result,
+                Inst::ConstInt {
+                    ty: MirType::I64,
+                    value: *v,
+                },
+            ));
+            stack.push(result);
+        }
         Opcode::Add => binary(value_types, stack, insts, BinOp::Add)?,
         Opcode::Sub => binary(value_types, stack, insts, BinOp::Sub)?,
         Opcode::Mul => binary(value_types, stack, insts, BinOp::Mul)?,
@@ -453,7 +525,13 @@ fn apply_value_op(
             ));
             stack.push(result);
         }
-        Opcode::ConvI4 | Opcode::ConvU4 => {}
+        Opcode::ConvI1 => convert(value_types, stack, insts, ConvKind::SignExtend8)?,
+        Opcode::ConvU1 => convert(value_types, stack, insts, ConvKind::ZeroExtend8)?,
+        Opcode::ConvI2 => convert(value_types, stack, insts, ConvKind::SignExtend16)?,
+        Opcode::ConvU2 => convert(value_types, stack, insts, ConvKind::ZeroExtend16)?,
+        Opcode::ConvI8 => widen(value_types, stack, insts, true)?,
+        Opcode::ConvU8 => widen(value_types, stack, insts, false)?,
+        Opcode::ConvI4 | Opcode::ConvU4 => narrow_to_i32(value_types, stack, insts)?,
         Opcode::Pop => {
             stack.pop().ok_or(CilError::StackUnderflow)?;
         }
@@ -494,7 +572,13 @@ fn apply_value_op(
             match info.target {
                 CallTarget::Internal(callee) => {
                     let result = new_value(value_types, MirType::I32);
-                    insts.push((result, Inst::Call { callee, args: call_args }));
+                    insts.push((
+                        result,
+                        Inst::Call {
+                            callee,
+                            args: call_args,
+                        },
+                    ));
                     if info.has_result {
                         stack.push(result);
                     }
@@ -511,7 +595,12 @@ fn apply_value_op(
                     text.push(b'\n');
                     text.push(0);
                     let result = new_value(value_types, MirType::I32);
-                    insts.push((result, Inst::SemihostWrite { text: text.into_boxed_slice() }));
+                    insts.push((
+                        result,
+                        Inst::SemihostWrite {
+                            text: text.into_boxed_slice(),
+                        },
+                    ));
                 }
             }
         }

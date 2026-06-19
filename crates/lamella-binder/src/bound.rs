@@ -42,6 +42,9 @@ pub struct FieldReference {
     pub is_static: bool,
     /// The field's accessibility.
     pub accessibility: Accessibility,
+    /// The compile-time constant value, for an enum member (its underlying value),
+    /// so emission folds the access to a constant load. `None` for an ordinary field.
+    pub constant: Option<i64>,
 }
 
 /// The method an invocation resolved to, recorded so emission can name it with a
@@ -236,6 +239,11 @@ pub struct Binder {
     current_type: Option<TypeSymbol>,
     current_method: Option<MethodContext>,
     imported_namespaces: Vec<Box<str>>,
+    /// Locals referenced in `switch` case-label expressions of the method being
+    /// bound -- they are folded out of the bound tree, so the unused-local check
+    /// (`CS0168`/`CS0219`) is seeded with them to avoid a false warning. Reset per
+    /// method.
+    case_label_uses: alloc::collections::BTreeSet<Box<str>>,
 }
 
 impl Binder {
@@ -270,6 +278,13 @@ impl Binder {
         self.diagnostics.push(diagnostic);
     }
 
+    /// Records the locals a `switch` case-label expression references, so the
+    /// unused-local check (`CS0168`/`CS0219`) is not misled by a label folded out of
+    /// the bound tree.
+    pub(crate) fn record_case_label_uses(&mut self, expr: &BoundExpr) {
+        crate::flow::collect_uses(expr, &mut self.case_label_uses);
+    }
+
     /// Resolves a type against the reference world, reporting `CS0246` if unknown.
     pub(crate) fn resolve_named_type(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
         resolve_type(&self.world, ty, &mut self.diagnostics, span)
@@ -279,6 +294,30 @@ impl Binder {
     /// that walk the model's inheritance graph (13.1).
     pub(crate) fn converts(&self, from: &TypeSymbol, to: &TypeSymbol) -> bool {
         converts(&self.model, from, to)
+    }
+
+    /// Reports a failed implicit conversion at `span`: `CS0266` when an explicit
+    /// conversion (a cast) exists, otherwise `CS0029`. Use this at every assignment
+    /// context (initializer, assignment, return, field initializer); a context with
+    /// no cast escape (a non-`bool` condition) reports `CS0029` directly.
+    pub(crate) fn report_no_implicit_conversion(
+        &mut self,
+        from: &TypeSymbol,
+        to: &TypeSymbol,
+        span: Span,
+    ) {
+        let kind = if can_cast(&self.model, from, to) {
+            DiagnosticKind::ExplicitConversionExists {
+                from: from.to_string().into(),
+                to: to.to_string().into(),
+            }
+        } else {
+            DiagnosticKind::NoImplicitConversion {
+                from: from.to_string().into(),
+                to: to.to_string().into(),
+            }
+        };
+        self.report(Diagnostic::new(kind, span));
     }
 
     /// Wraps `expr` in the implicit conversion to `target` so emission widens,
@@ -428,6 +467,7 @@ impl Binder {
             return_type,
         });
         self.enter_scope();
+        self.case_label_uses.clear();
         for (parameter, ty) in parameters {
             self.declare_local(parameter, ty.clone());
         }
@@ -450,6 +490,12 @@ impl Binder {
                 &bound,
                 &parameter_names,
             ));
+        self.diagnostics.extend(crate::flow::check_unused_locals(
+            &bound,
+            &self.case_label_uses,
+        ));
+        self.diagnostics
+            .extend(crate::flow::check_unreachable(&bound));
         self.current_method = None;
         self.current_type = None;
         bound
@@ -467,13 +513,7 @@ impl Binder {
         self.enter_scope();
         let value = self.bind_expression(initializer);
         if !value.ty.is_error() && !field_type.is_error() && !self.converts(&value.ty, field_type) {
-            self.diagnostics.push(Diagnostic::new(
-                DiagnosticKind::NoImplicitConversion {
-                    from: value.ty.to_string().into(),
-                    to: field_type.to_string().into(),
-                },
-                initializer.span,
-            ));
+            self.report_no_implicit_conversion(&value.ty, field_type, initializer.span);
         }
         self.exit_scope();
         self.current_type = None;
@@ -506,13 +546,7 @@ impl Binder {
                 Some(expr)
                     if !expr.ty.is_error() && !self.converts(&expr.ty, &method.return_type) =>
                 {
-                    self.diagnostics.push(Diagnostic::new(
-                        DiagnosticKind::NoImplicitConversion {
-                            from: expr.ty.to_string().into(),
-                            to: method.return_type.to_string().into(),
-                        },
-                        span,
-                    ));
+                    self.report_no_implicit_conversion(&expr.ty, &method.return_type, span);
                 }
                 _ => {}
             }
@@ -539,6 +573,23 @@ impl Binder {
     /// Looks a name up through the scope stack, innermost first.
     fn lookup_local(&self, name: &str) -> Option<&TypeSymbol> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    /// Whether a local of this name is already declared in the innermost scope: a
+    /// redeclaration (CS0128).
+    pub(crate) fn local_in_current_scope(&self, name: &str) -> bool {
+        self.scopes
+            .last()
+            .is_some_and(|scope| scope.contains_key(name))
+    }
+
+    /// Whether a local of this name is declared in an enclosing (not innermost)
+    /// scope, which a new local would shadow (CS0136).
+    pub(crate) fn local_in_enclosing_scope(&self, name: &str) -> bool {
+        let innermost = self.scopes.len().saturating_sub(1);
+        self.scopes[..innermost]
+            .iter()
+            .any(|scope| scope.contains_key(name))
     }
 
     /// Binds an expression (14).
@@ -690,6 +741,8 @@ impl Binder {
         let right = self.bind_expression(right_expr);
         let ty = if left.ty.is_error() || right.ty.is_error() {
             TypeSymbol::Error
+        } else if let Some(result) = self.enum_binary_result(operator, &left.ty, &right.ty) {
+            result
         } else if let Some(result) = binary_result_type(operator, &left.ty, &right.ty) {
             result
         } else {
@@ -713,6 +766,38 @@ impl Binder {
         }
     }
 
+    /// Whether `ty` is an enum type declared in the model.
+    fn is_enum_type(&self, ty: &TypeSymbol) -> bool {
+        self.type_info_of(ty)
+            .is_some_and(|info| info.kind == TypeKind::Enum)
+    }
+
+    /// The result of a binary operator on enum operands of the same type (14.7):
+    /// the bitwise operators yield the enum; the relational operators yield `bool`.
+    /// `==`/`!=` fall through to the general path. `None` if it does not apply.
+    fn is_enum_type_pair(&self, left: &TypeSymbol, right: &TypeSymbol) -> bool {
+        left == right && self.is_enum_type(left)
+    }
+
+    fn enum_binary_result(
+        &self,
+        operator: BinaryOperator,
+        left: &TypeSymbol,
+        right: &TypeSymbol,
+    ) -> Option<TypeSymbol> {
+        use BinaryOperator as Op;
+        if !self.is_enum_type_pair(left, right) {
+            return None;
+        }
+        match operator {
+            Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor => Some(left.clone()),
+            Op::LessThan | Op::GreaterThan | Op::LessThanOrEqual | Op::GreaterThanOrEqual => {
+                Some(TypeSymbol::Special(SpecialType::Boolean))
+            }
+            _ => None,
+        }
+    }
+
     fn bind_unary(
         &mut self,
         operator: UnaryOperator,
@@ -722,6 +807,8 @@ impl Binder {
         let operand = self.bind_expression(operand_expr);
         let ty = if operand.ty.is_error() {
             TypeSymbol::Error
+        } else if operator == UnaryOperator::Complement && self.is_enum_type(&operand.ty) {
+            operand.ty.clone()
         } else if let Some(result) = unary_result_type(operator, &operand.ty) {
             result
         } else {
@@ -862,13 +949,7 @@ impl Binder {
         match compound_binary_operator(operator) {
             None => {
                 if !self.converts(value, target) {
-                    self.diagnostics.push(Diagnostic::new(
-                        DiagnosticKind::NoImplicitConversion {
-                            from: value.to_string().into(),
-                            to: target.to_string().into(),
-                        },
-                        span,
-                    ));
+                    self.report_no_implicit_conversion(value, target, span);
                 }
             }
             Some(binary) => {
@@ -1253,6 +1334,7 @@ impl Binder {
                     ty: field.ty.clone(),
                     is_static: field.is_static,
                     accessibility: field.accessibility,
+                    constant: field.constant,
                 });
             }
             if let Some(property) = info.find_property(name) {
@@ -2114,6 +2196,7 @@ mod tests {
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
             accessibility: crate::symbols::Accessibility::Public,
+            constant: None,
         });
         widget.methods.push(MethodSymbol {
             name: "Area".into(),
@@ -2197,6 +2280,7 @@ mod tests {
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
             accessibility: crate::symbols::Accessibility::Public,
+            constant: None,
         });
         widget.methods.push(MethodSymbol {
             name: "Area".into(),
@@ -2437,7 +2521,7 @@ mod tests {
             &TypeSymbol::Special(SpecialType::Object)
         ));
         bound_in_scope(&mut binder, "d = a");
-        assert!(binder.diagnostics().iter().any(|d| d.code() == 29));
+        assert!(binder.diagnostics().iter().any(|d| d.code() == 266));
     }
 
     #[test]
@@ -2481,6 +2565,9 @@ mod tests {
             binder
                 .into_diagnostics()
                 .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+                })
                 .map(Diagnostic::code)
                 .collect::<Vec<_>>()
         };
@@ -2504,7 +2591,9 @@ mod tests {
         let mut binder = Binder::new();
         let body = parse_statement("{ int y = p; }").statement;
         binder.bind_method(None, "M", void, &[("p".into(), int)], &body);
-        assert!(binder.diagnostics().is_empty());
+        assert!(!binder.diagnostics().iter().any(|diagnostic| {
+            diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+        }));
     }
 
     #[test]
@@ -2520,6 +2609,9 @@ mod tests {
             binder
                 .into_diagnostics()
                 .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+                })
                 .map(Diagnostic::code)
                 .collect::<Vec<_>>()
         };
@@ -2690,6 +2782,183 @@ mod tests {
                 "class C { static int Run() { int x = 1; \
                  switch (x) { case 1: return 1; default: return 0; } } }"
             ),
+            []
+        );
+    }
+
+    #[test]
+    fn switch_duplicate_label_is_cs0152_and_fall_through_is_cs0163() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes(
+                "class C { static int Run(int x) { \
+                 switch (x) { case 1: return 1; case 1: return 2; default: return 0; } } }"
+            ),
+            [152]
+        );
+        assert_eq!(
+            codes(
+                "class C { static int Run(int x) { int y = 0; \
+                 switch (x) { case 1: y = 1; default: y = 2; break; } return y; } }"
+            ),
+            [163]
+        );
+        assert_eq!(
+            codes(
+                "class C { static int Run(int x) { int y = 0; \
+                 switch (x) { case 1: y = 1; break; default: break; } return y; } }"
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn duplicate_local_is_cs0128_and_shadowing_is_cs0136() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes("class C { static int Run() { int x = 1; int x = 2; return x; } }"),
+            [128]
+        );
+        assert_eq!(
+            codes("class C { static int Run() { int x = 1; { int x = 2; return x; } } }"),
+            [136]
+        );
+        assert_eq!(
+            codes("class C { static int Run() { int x = 1; { int y = 2; return x + y; } } }"),
+            []
+        );
+    }
+
+    #[test]
+    fn non_statement_expression_is_cs0201() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes("class C { static void Run() { int x = 1; x + 1; } }"),
+            [201]
+        );
+        assert_eq!(
+            codes(
+                "class C { static int Get() { return 1; } \
+                 static void Run() { int x = 0; x = x + 1; Get(); } }"
+            ),
+            []
+        );
+    }
+
+    #[test]
+    fn narrowing_is_cs0266_but_unrelated_types_are_cs0029() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes("class C { static int Run() { int x = 3.14; return x; } }"),
+            [266]
+        );
+        assert_eq!(
+            codes("class C { static int Run() { int x = \"s\"; return x; } }"),
+            [29]
+        );
+    }
+
+    #[test]
+    fn unused_locals_warn_cs0219_and_cs0168() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes("class C { static int Run() { int spare = 5; return 0; } }"),
+            [219]
+        );
+        assert_eq!(
+            codes("class C { static int Run() { int spare; return 0; } }"),
+            [168]
+        );
+        assert_eq!(
+            codes("class C { static int Run() { int x = 5; return x; } }"),
+            []
+        );
+        assert_eq!(
+            codes("class C { static int Run() { Bogus b = null; return 0; } }"),
+            [246]
+        );
+    }
+
+    #[test]
+    fn unreachable_code_is_cs0162() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes("class C { static int M() { return 1; int x = 5; return x; } }"),
+            [162]
+        );
+        assert_eq!(
+            codes("class C { static int M() { while (true) { } int x = 5; return x; } }"),
+            [162]
+        );
+        assert_eq!(
+            codes(
+                "class C { static int M(int p) { \
+                 if (p > 0) return 1; else return 2; int x = 5; return x; } }"
+            ),
+            [162]
+        );
+        assert_eq!(
+            codes("class C { static int M() { while (true) { break; } return 42; } }"),
             []
         );
     }

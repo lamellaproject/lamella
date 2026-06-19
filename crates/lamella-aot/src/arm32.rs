@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use lamella_asm_arm32::{AssembleError, Cond, Encoder, Label, Reg};
-use lamella_ir::{BinOp, BlockId, CmpOp, Function, Inst, Terminator, ValueId};
+use lamella_ir::{BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId};
 
 use crate::target::TargetLowering;
 
@@ -57,9 +57,15 @@ fn materialize_compare(
     op: CmpOp,
 ) -> Result<(), AssembleError> {
     enc.cmp_reg(lhs, rhs)?;
+    materialize_from_flags(enc, dest, cmpop_to_cond(op))
+}
+
+/// Sets `dest` to 1 if the current condition flags satisfy `cond`, else 0 -- a branchful
+/// select, since the M0 has no conditional-set. The caller has already set the flags.
+fn materialize_from_flags(enc: &mut Encoder, dest: Reg, cond: Cond) -> Result<(), AssembleError> {
     let one = enc.new_label();
     let done = enc.new_label();
-    enc.b_cond(cmpop_to_cond(op), one);
+    enc.b_cond(cond, one);
     enc.movs_imm(dest, 0)?;
     enc.b(done);
     enc.bind_label(one);
@@ -144,6 +150,16 @@ fn lower_inst(
             enc.ldr_imm(assign(result), assign(*address), 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::Convert { value, kind } => {
+            extend_for(enc, assign(result), assign(*value), *kind)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::Widen { .. }
+        | Inst::Truncate { .. }
+        | Inst::InitStruct
+        | Inst::FieldLoad { .. }
+        | Inst::FieldStore { .. }
+        | Inst::CopyStruct { .. } => return Err(LowerError::CallUnsupported),
         Inst::Call { .. } => return Err(LowerError::CallUnsupported),
         Inst::SemihostWrite { .. } => return Err(LowerError::CallUnsupported),
     }
@@ -192,6 +208,36 @@ fn shift(
     }
 }
 
+/// Emits the sign/zero-extend that realizes a [`ConvKind`] (`d = ext(m)`).
+fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(), AssembleError> {
+    match kind {
+        ConvKind::SignExtend8 => enc.sxtb(rd, rm),
+        ConvKind::ZeroExtend8 => enc.uxtb(rd, rm),
+        ConvKind::SignExtend16 => enc.sxth(rd, rm),
+        ConvKind::ZeroExtend16 => enc.uxth(rd, rm),
+    }
+}
+
+/// Loads a 32-bit constant into `reg` -- inline if it fits a `MOVS #imm8`, else from the
+/// literal pool.
+fn load_const_word(
+    enc: &mut Encoder,
+    pool: &mut Vec<(Label, u32)>,
+    reg: Reg,
+    value: u32,
+) -> Result<(), LowerError> {
+    if let Ok(imm) = u8::try_from(value) {
+        enc.movs_imm(reg, imm)
+            .map_err(|_| LowerError::TooManyValues)?;
+    } else {
+        let entry = enc.new_label();
+        enc.ldr_literal(reg, entry)
+            .map_err(|_| LowerError::TooManyValues)?;
+        pool.push((entry, value));
+    }
+    Ok(())
+}
+
 /// Lowers a straight-line integer [`Function`] whose value count exceeds the
 /// eight registers, by giving each value a stack slot at `[sp, #value*4]` and
 /// shuttling operands through scratch registers r0 and r1. The frame is bounded
@@ -204,20 +250,66 @@ fn lower_spilled_inst(
     enc: &mut Encoder,
     pool: &mut Vec<(Label, u32)>,
     strings: &mut Vec<(Label, Box<[u8]>)>,
+    value_types: &[MirType],
     slot: &impl Fn(ValueId) -> u16,
     inst: &Inst,
     func_labels: &[Label],
 ) -> Result<(), LowerError> {
     match inst {
+        Inst::ConstInt {
+            ty: MirType::I64,
+            value,
+        } => {
+            load_const_word(enc, pool, Reg::R0, *value as u32)?;
+            load_const_word(enc, pool, Reg::R1, (*value >> 32) as u32)?;
+        }
         Inst::ConstInt { value, .. } => {
-            if let Ok(imm) = u8::try_from(*value) {
-                enc.movs_imm(Reg::R0, imm)
-                    .map_err(|_| LowerError::TooManyValues)?;
-            } else {
-                let entry = enc.new_label();
-                enc.ldr_literal(Reg::R0, entry)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                pool.push((entry, *value as u32));
+            load_const_word(enc, pool, Reg::R0, *value as u32)?;
+        }
+        Inst::Binary { op, lhs, rhs } if value_types.get(lhs.0 as usize) == Some(&MirType::I64) => {
+            let (a, b) = (slot(*lhs), slot(*rhs));
+            enc.ldr_sp(Reg::R0, a)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, a + 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R2, b)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R3, b + 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            match op {
+                BinOp::Add => {
+                    enc.adds(Reg::R0, Reg::R0, Reg::R2)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.adcs(Reg::R1, Reg::R3)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                BinOp::Sub => {
+                    enc.subs(Reg::R0, Reg::R0, Reg::R2)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.sbcs(Reg::R1, Reg::R3)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                BinOp::And => {
+                    enc.ands(Reg::R0, Reg::R2)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.ands(Reg::R1, Reg::R3)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                BinOp::Or => {
+                    enc.orrs(Reg::R0, Reg::R2)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.orrs(Reg::R1, Reg::R3)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                BinOp::Xor => {
+                    enc.eors(Reg::R0, Reg::R2)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.eors(Reg::R1, Reg::R3)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                BinOp::Mul | BinOp::Shl | BinOp::ShrSigned | BinOp::ShrUnsigned => {
+                    return Err(LowerError::TooManyValues);
+                }
             }
         }
         Inst::Binary { op, lhs, rhs } => {
@@ -237,6 +329,57 @@ fn lower_spilled_inst(
                 BinOp::ShrUnsigned => enc.lsrs_reg(Reg::R0, Reg::R1),
             };
             emitted.map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::Compare { op, lhs, rhs }
+            if value_types.get(lhs.0 as usize) == Some(&MirType::I64) =>
+        {
+            if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                let (a, b) = (slot(*lhs), slot(*rhs));
+                enc.ldr_sp(Reg::R0, a)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R1, a + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R2, b)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R3, b + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.eors(Reg::R0, Reg::R2)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.eors(Reg::R1, Reg::R3)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.orrs(Reg::R0, Reg::R1)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                materialize_from_flags(enc, Reg::R0, cmpop_to_cond(*op))
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                let (swap, cond) = match op {
+                    CmpOp::SignedLt => (false, Cond::LessThan),
+                    CmpOp::SignedGe => (false, Cond::GreaterOrEqual),
+                    CmpOp::SignedGt => (true, Cond::LessThan),
+                    CmpOp::SignedLe => (true, Cond::GreaterOrEqual),
+                    CmpOp::UnsignedLt => (false, Cond::CarryClear),
+                    CmpOp::UnsignedGe => (false, Cond::CarrySet),
+                    CmpOp::UnsignedGt => (true, Cond::CarryClear),
+                    CmpOp::UnsignedLe => (true, Cond::CarrySet),
+                    CmpOp::Eq | CmpOp::Ne => (false, Cond::Eq),
+                };
+                let (min, sub) = if swap { (*rhs, *lhs) } else { (*lhs, *rhs) };
+                let (m, s) = (slot(min), slot(sub));
+                enc.ldr_sp(Reg::R0, m)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R1, m + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R2, s)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R3, s + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.subs(Reg::R0, Reg::R0, Reg::R2)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.sbcs(Reg::R1, Reg::R3)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                materialize_from_flags(enc, Reg::R0, cond)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
         }
         Inst::Compare { op, lhs, rhs } => {
             enc.ldr_sp(Reg::R0, slot(*lhs))
@@ -274,6 +417,41 @@ fn lower_spilled_inst(
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::FieldLoad { base, offset } => {
+            enc.ldr_sp(Reg::R0, slot(*base) + *offset as u16)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::FieldStore {
+            base,
+            offset,
+            value,
+        } => {
+            enc.ldr_sp(Reg::R0, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.str_sp(Reg::R0, slot(*base) + *offset as u16)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::InitStruct | Inst::CopyStruct { .. } => {}
+        Inst::Convert { value, kind } => {
+            enc.ldr_sp(Reg::R0, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+            extend_for(enc, Reg::R0, Reg::R0, *kind).map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::Widen { value, signed } => {
+            enc.ldr_sp(Reg::R0, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+            if *signed {
+                enc.asrs_imm(Reg::R1, Reg::R0, 31)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                enc.movs_imm(Reg::R1, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+        }
+        Inst::Truncate { value } => {
+            enc.ldr_sp(Reg::R0, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
         Inst::SemihostWrite { text } => {
             let entry = enc.new_label();
             strings.push((entry, text.clone()));
@@ -304,12 +482,18 @@ fn lower_spilled_into(
         .iter()
         .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
     let lr_bytes = if has_calls { 4 } else { 0 };
-    let frame = ((func.value_types.len() * 4 + lr_bytes + 7) & !7usize) - lr_bytes;
+    let mut offsets: Vec<u16> = Vec::with_capacity(func.value_types.len());
+    let mut used = 0u16;
+    for ty in &func.value_types {
+        offsets.push(used);
+        used += ty.stack_slot_bytes() as u16;
+    }
+    let frame = ((used as usize + lr_bytes + 7) & !7usize) - lr_bytes;
     if frame > 508 {
         return Err(LowerError::TooManyValues);
     }
     let frame = frame as u16;
-    let slot = |v: ValueId| (v.0 as u16) * 4;
+    let slot = |v: ValueId| offsets[v.0 as usize];
 
     let mut pool: Vec<(Label, u32)> = Vec::new();
     let mut strings: Vec<(Label, Box<[u8]>)> = Vec::new();
@@ -343,9 +527,46 @@ fn lower_spilled_into(
             if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
                 line_table.push((enc.position(), cil));
             }
-            lower_spilled_inst(enc, &mut pool, &mut strings, &slot, inst, func_labels)?;
+            if matches!(inst, Inst::InitStruct) {
+                let bytes = func
+                    .value_type(*result)
+                    .map_or(0, MirType::stack_slot_bytes);
+                enc.movs_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                for w in 0..(bytes / 4) {
+                    enc.str_sp(Reg::R0, slot(*result) + (w as u16) * 4)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                continue;
+            }
+            if let Inst::CopyStruct { src } = inst {
+                let bytes = func
+                    .value_type(*result)
+                    .map_or(0, MirType::stack_slot_bytes);
+                for w in 0..(bytes / 4) {
+                    let off = (w as u16) * 4;
+                    enc.ldr_sp(Reg::R0, slot(*src) + off)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.str_sp(Reg::R0, slot(*result) + off)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                continue;
+            }
+            lower_spilled_inst(
+                enc,
+                &mut pool,
+                &mut strings,
+                &func.value_types,
+                &slot,
+                inst,
+                func_labels,
+            )?;
             enc.str_sp(Reg::R0, slot(*result))
                 .map_err(|_| LowerError::TooManyValues)?;
+            if func.value_type(*result) == Some(MirType::I64) {
+                enc.str_sp(Reg::R1, slot(*result) + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
         }
         if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
             line_table.push((enc.position(), cil));
@@ -355,6 +576,10 @@ fn lower_spilled_into(
                 if let Some(v) = value {
                     enc.ldr_sp(Reg::R0, slot(*v))
                         .map_err(|_| LowerError::TooManyValues)?;
+                    if func.value_type(*v) == Some(MirType::I64) {
+                        enc.ldr_sp(Reg::R1, slot(*v) + 4)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
                 }
                 enc.add_sp(frame).map_err(|_| LowerError::TooManyValues)?;
                 if has_calls {
@@ -443,8 +668,19 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     if lamella_ir::verify(func).is_err() {
         return Err(LowerError::NotWellFormed);
     }
-    if func.value_types.iter().any(|ty| !ty.is_integer()) {
+    if func
+        .value_types
+        .iter()
+        .any(|ty| ty.is_float() || ty.is_gc_reference())
+    {
         return Err(LowerError::NonIntegerValue);
+    }
+    if func
+        .value_types
+        .iter()
+        .any(|ty| matches!(ty, MirType::I64 | MirType::ValueType { .. }))
+    {
+        return Ok(Assignment::Spilled);
     }
     if func.blocks.iter().any(|b| {
         b.insts
@@ -826,6 +1062,237 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         let bytes = lower(&func).unwrap();
         assert!(bytes.windows(2).any(|w| w[1] == 0x60));
+    }
+
+    #[test]
+    fn lowers_an_i64_add() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::I64, MirType::I64, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 5,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 3,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(
+            bytes.windows(2).any(|w| w == [0x59, 0x41]),
+            "ADCS (carry add) present"
+        );
+    }
+
+    #[test]
+    fn lowers_an_i64_compare() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I64, MirType::I64, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 5,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 3,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Compare {
+                            op: CmpOp::SignedLt,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(
+            bytes.windows(2).any(|w| w == [0x99, 0x41]),
+            "SBCS (carry subtract) present"
+        );
+    }
+
+    #[test]
+    fn lowers_an_i64_widen() {
+        let func = Function {
+            params: vec![MirType::I32],
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::I32, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::Widen {
+                        value: ValueId(0),
+                        signed: true,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(
+            bytes.windows(2).any(|w| w == [0xC1, 0x17]),
+            "ASRS sign-extend present"
+        );
+    }
+
+    #[test]
+    fn lowers_a_blittable_struct() {
+        let point = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 8,
+        };
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![point, MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::InitStruct),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 7,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::FieldStore {
+                            base: ValueId(0),
+                            offset: 0,
+                            value: ValueId(1),
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::FieldLoad {
+                            base: ValueId(0),
+                            offset: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(3)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(bytes.windows(2).any(|w| w == [0x00, 0x20]), "initobj zero");
+    }
+
+    #[test]
+    fn lowers_a_struct_copy() {
+        let point = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 8,
+        };
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![point, MirType::I32, MirType::I32, point, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::InitStruct),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 9,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::FieldStore {
+                            base: ValueId(0),
+                            offset: 0,
+                            value: ValueId(1),
+                        },
+                    ),
+                    (ValueId(3), Inst::CopyStruct { src: ValueId(0) }),
+                    (
+                        ValueId(4),
+                        Inst::FieldLoad {
+                            base: ValueId(3),
+                            offset: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(4)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(lower(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_a_sub_word_conversion() {
+        let func = Function {
+            params: vec![MirType::I32],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::Convert {
+                        value: ValueId(0),
+                        kind: ConvKind::SignExtend8,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(bytes.windows(2).any(|w| w[1] == 0xB2));
     }
 
     #[test]

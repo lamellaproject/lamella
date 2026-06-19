@@ -11,6 +11,9 @@ description = "Lamella's ahead-of-time backend driver: lowers the middle IR to t
 lamella-ir = { path = "../lamella-ir" }
 lamella-cil = { path = "../lamella-cil" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32", optional = true }
+# The AOT compiler reads an assembly's metadata to resolve call/ldstr tokens (the
+# MetadataResolver); the core IR->native lowering itself stays metadata-free.
+lamella-metadata = { path = "../lamella-metadata" }
 
 [features]
 default = ["arm32"]
@@ -18,9 +21,6 @@ default = ["arm32"]
 # the code generators it needs -- an ARM32 device never builds the RISC-V or WASM
 # paths, and vice versa.
 arm32 = ["dep:lamella-asm-arm32"]
-
-[dev-dependencies]
-lamella-metadata = { path = "../lamella-metadata" }
 
 [lints]
 workspace = true

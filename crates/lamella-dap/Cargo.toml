@@ -22,12 +22,20 @@ lamella-ves = { path = "../lamella-ves", optional = true }
 lamella-cil = { path = "../lamella-cil", optional = true }
 lamella-load = { path = "../lamella-load", optional = true }
 lamella-metadata = { path = "../lamella-metadata", optional = true }
+# Source mapping rebuilds method tokens to resolve a PDB rid to the interpreter's MethodId.
+lamella-token = { path = "../lamella-token", optional = true }
 
 [features]
 default = ["interpreter"]
 # The interpreter backend (InterpreterBackend) + the `lamella-dap` CIL server binary.
 # Off => a trait-only adapter + serve layer a device backend plugs into; no interpreter.
-interpreter = ["dep:lamella-ves", "dep:lamella-cil", "dep:lamella-load", "dep:lamella-metadata"]
+interpreter = [
+    "dep:lamella-ves",
+    "dep:lamella-cil",
+    "dep:lamella-load",
+    "dep:lamella-metadata",
+    "dep:lamella-token",
+]
 
 # The CIL server binary needs the interpreter; a device server is a separate binary.
 [[bin]]
@@ -35,9 +43,9 @@ name = "lamella-dap"
 path = "src/main.rs"
 required-features = ["interpreter"]
 
-# The adapter/serve tests build hand-written interpreter programs (interpreter-gated).
 [dev-dependencies]
-lamella-token = { path = "../lamella-token" }
+# The source-mapping integration test compiles a fixture (with a Portable PDB) in-memory.
+lamella-assemble = { path = "../lamella-assemble" }
 
 [lints]
 workspace = true

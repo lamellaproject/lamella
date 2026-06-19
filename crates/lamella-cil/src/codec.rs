@@ -371,6 +371,16 @@ fn layout(instructions: &[Instruction]) -> Result<Vec<u32>, EncodeError> {
     Ok(offsets)
 }
 
+/// The byte offset of each instruction in `code`, in order, plus a final entry for the
+/// total body length -- `offsets[i]` is instruction `i`'s offset and `offsets[len]` is
+/// the body size. These are the offsets a Portable PDB's sequence points use, recomputed
+/// from decoded instructions so a debugger can map an instruction index to and from a CIL
+/// byte offset. `None` if an instruction is malformed (its opcode and operand disagree).
+#[must_use]
+pub fn instruction_offsets(code: &[Instruction]) -> Option<Vec<u32>> {
+    layout(code).ok()
+}
+
 fn instruction_size(instruction: &Instruction) -> Result<u32, EncodeError> {
     if !instruction.is_consistent() {
         return Err(EncodeError::OperandMismatch {

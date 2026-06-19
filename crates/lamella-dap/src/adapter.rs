@@ -36,6 +36,16 @@ impl Debugger {
         Debugger::with_backend(Box::new(InterpreterBackend::new(module, entry)))
     }
 
+    /// Creates a debugger over the interpreter with source mapping from a standalone
+    /// Portable PDB (`pdb_bytes`): source breakpoints and source-located stack frames.
+    #[cfg(feature = "interpreter")]
+    #[must_use]
+    pub fn with_source(module: Module, entry: u32, pdb_bytes: Vec<u8>) -> Debugger {
+        Debugger::with_backend(Box::new(InterpreterBackend::with_pdb(
+            module, entry, pdb_bytes,
+        )))
+    }
+
     /// Creates a debugger over any [`DebugBackend`] -- the interpreter, or an on-device
     /// target. This is the seam an on-device adapter constructs.
     #[must_use]
@@ -135,7 +145,7 @@ impl Debugger {
                 }
                 (true, None)
             }
-            "setBreakpoints" => (true, Some(unverified_breakpoints(request))),
+            "setBreakpoints" => (true, Some(self.set_source_breakpoints(request))),
             "setInstructionBreakpoints" => (true, Some(self.set_instruction_breakpoints(request))),
             "disassemble" => (true, Some(self.disassemble(request))),
             "disconnect" => (true, None),
@@ -186,6 +196,48 @@ impl Debugger {
                     results.push(
                         json!({ "verified": true, "instructionReference": address.to_string() }),
                     );
+                }
+                None => results.push(json!({ "verified": false })),
+            }
+        }
+        self.backend.set_breakpoints(&addresses);
+        json!({ "breakpoints": results })
+    }
+
+    /// Replaces the source breakpoints. Each is a `line` in the request's `source`,
+    /// resolved to a code address by the backend's source mapping; a line with no code
+    /// resolves to nothing and is reported unverified.
+    fn set_source_breakpoints(&mut self, request: &Request) -> Json {
+        let arguments = request.arguments.as_ref();
+        let document = arguments
+            .and_then(|args| args.get("source"))
+            .and_then(|source| source.get("path"))
+            .and_then(Json::as_str)
+            .unwrap_or_default();
+        let specs = arguments
+            .and_then(|args| args.get("breakpoints"))
+            .and_then(Json::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut addresses = Vec::new();
+        let mut results = Vec::new();
+        for spec in &specs {
+            let requested = spec.get("line").and_then(Json::as_u64);
+            let address = requested
+                .and_then(|line| u32::try_from(line).ok())
+                .and_then(|line| self.backend.resolve_source_breakpoint(document, line));
+            match address {
+                Some(address) => {
+                    addresses.push(address);
+                    let line = self
+                        .backend
+                        .source_location(address)
+                        .map_or(requested.unwrap_or(0), |location| u64::from(location.line));
+                    results.push(json!({
+                        "verified": true,
+                        "line": line,
+                        "instructionReference": address.to_string(),
+                    }));
                 }
                 None => results.push(json!({ "verified": false })),
             }
@@ -265,13 +317,20 @@ impl Debugger {
         let frames = self.backend.stack();
         let mut out = Vec::with_capacity(frames.len());
         for (index, frame) in frames.iter().enumerate().rev() {
-            out.push(json!({
+            let source = self.backend.source_location(frame.address);
+            let mut entry = json!({
                 "id": index,
                 "name": frame.name,
-                "line": frame.line,
-                "column": 1,
+                "line": source.as_ref().map_or(frame.line, |location| location.line),
+                "column": source.as_ref().map_or(1, |location| location.column),
                 "instructionPointerReference": frame.address.to_string(),
-            }));
+            });
+            if let Some(location) = &source {
+                entry["source"] = json!({ "path": location.file.clone() });
+                entry["endLine"] = json!(location.end_line);
+                entry["endColumn"] = json!(location.end_column);
+            }
+            out.push(entry);
         }
         let total = out.len();
         json!({ "stackFrames": out, "totalFrames": total })
@@ -381,19 +440,6 @@ fn capabilities() -> Json {
         "supportsInstructionBreakpoints": true,
         "supportsDisassembleRequest": true,
     })
-}
-
-fn unverified_breakpoints(request: &Request) -> Json {
-    let count = request
-        .arguments
-        .as_ref()
-        .and_then(|args| args.get("breakpoints"))
-        .and_then(Json::as_array)
-        .map_or(0, Vec::len);
-    let breakpoints: Vec<Json> = (0..count)
-        .map(|_| json!({ "verified": false, "message": "source breakpoints await CIL-to-source mapping" }))
-        .collect();
-    json!({ "breakpoints": breakpoints })
 }
 
 fn arg_u32(request: &Request, field: &str) -> u32 {

@@ -2,7 +2,7 @@
 
 use lamella_dap::{Debugger, serve};
 use lamella_metadata::Assembly;
-use std::{env, fs, io, process};
+use std::{env, fs, io, path::Path, process};
 
 fn main() {
     let Some(path) = env::args().nth(1) else {
@@ -22,7 +22,11 @@ fn main() {
         process::exit(1);
     });
 
-    let mut debugger = Debugger::new(program.module, program.entry);
+    let pdb_path = Path::new(&path).with_extension("pdb");
+    let mut debugger = match fs::read(&pdb_path) {
+        Ok(pdb) => Debugger::with_source(program.module, program.entry, pdb),
+        Err(_) => Debugger::new(program.module, program.entry),
+    };
     let stdin = io::stdin();
     let stdout = io::stdout();
     if let Err(error) = serve(&mut debugger, &mut stdin.lock(), &mut stdout.lock()) {

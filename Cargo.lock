@@ -65,6 +65,7 @@ dependencies = [
 name = "lamella-dap"
 version = "0.0.0"
 dependencies = [
+ "lamella-assemble",
  "lamella-cil",
  "lamella-debug-backend",
  "lamella-load",
@@ -83,9 +84,11 @@ version = "0.0.0"
 name = "lamella-debug-device"
 version = "0.0.0"
 dependencies = [
+ "lamella-aot",
  "lamella-cmsis-dap",
  "lamella-dap",
  "lamella-debug-backend",
+ "lamella-metadata",
  "lamella-usbhid",
 ]
 

@@ -28,9 +28,15 @@ pub enum MirType {
     /// A managed pointer (`&`): a possibly-interior pointer into managed memory,
     /// also reported to the collector and kept distinct from an unmanaged pointer.
     ManagedPtr,
-    /// A value-type instance, carried by its layout [`TypeHandle`]. Its size and
-    /// field layout (including which fields hold `O`/`&`) come from metadata.
-    ValueType(TypeHandle),
+    /// A value-type instance: a `size`-byte struct laid out inline, identified by its
+    /// layout [`TypeHandle`]. The size is carried for stack-slot allocation; field
+    /// offsets and which fields hold `O`/`&` come from the handle's metadata layout.
+    ValueType {
+        /// The value type's layout handle: its identity for field offsets and GC map.
+        handle: TypeHandle,
+        /// The instance's size in bytes, for stack-slot allocation.
+        size: u32,
+    },
 }
 
 impl MirType {
@@ -55,6 +61,17 @@ impl MirType {
     pub fn is_float(self) -> bool {
         matches!(self, MirType::F32 | MirType::F64)
     }
+
+    /// The bytes a value of this type occupies in a stack slot: 8 for the 64-bit scalars,
+    /// the size rounded up to a word for a value type, 4 for everything else.
+    #[must_use]
+    pub fn stack_slot_bytes(self) -> u32 {
+        match self {
+            MirType::I64 | MirType::F64 => 8,
+            MirType::ValueType { size, .. } => size.next_multiple_of(4),
+            _ => 4,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -67,7 +84,13 @@ mod tests {
         assert!(MirType::ManagedPtr.is_gc_reference());
         assert!(!MirType::I32.is_gc_reference());
         assert!(!MirType::F64.is_gc_reference());
-        assert!(!MirType::ValueType(TypeHandle(1)).is_gc_reference());
+        assert!(
+            !MirType::ValueType {
+                handle: TypeHandle(1),
+                size: 8
+            }
+            .is_gc_reference()
+        );
     }
 
     #[test]

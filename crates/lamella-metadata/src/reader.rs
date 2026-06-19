@@ -2,11 +2,15 @@
 
 use crate::constant::{ConstantValue, decode_constant};
 use crate::flags;
+use alloc::vec::Vec;
+
 use crate::heaps::StringsHeap;
 use crate::image::{MetadataError, MetadataImage};
 use crate::pe::PeImage;
 use crate::rows::Tables;
-use crate::signature::{MethodSig, SigType, calling, parse_field, parse_method};
+use crate::signature::{
+    MethodSig, SigType, calling, parse_field, parse_local_var_sig, parse_method,
+};
 use crate::tables::{TableError, TablesHeader, table};
 use lamella_cil::{MethodBodyImage, read_method_body};
 use lamella_token::Token;
@@ -624,6 +628,13 @@ impl<'a> Method<'a> {
         self.assembly.strings().get(row.raw(3)).ok()
     }
 
+    /// The method's `MethodDef` row index (its metadata rid) -- the key a Portable PDB
+    /// uses for sequence points and local-variable names.
+    #[must_use]
+    pub fn rid(&self) -> u32 {
+        self.index
+    }
+
     /// The method attribute flags (II.23.1.10).
     #[must_use]
     pub fn flags(&self) -> u32 {
@@ -663,6 +674,24 @@ impl<'a> Method<'a> {
         }
         let offset = PeImage::parse(file).ok()?.rva_to_offset(rva).ok()?;
         read_method_body(file.get(offset..)?).ok()
+    }
+
+    /// The method's local-variable types, resolving the body's local-variable
+    /// signature (a `StandAloneSig`, II.23.2.6). The index in the returned vector is
+    /// the local's slot number. Empty when the method declares no locals (or has no
+    /// body). This is what an interpreter or AOT lowering needs to type its locals,
+    /// and what `lamella-dap` needs to show them.
+    #[must_use]
+    pub fn local_variables(&self) -> Vec<SigType> {
+        let Some(token) = self.body().and_then(|body| body.local_var_sig) else {
+            return Vec::new();
+        };
+        self.assembly
+            .tables
+            .row(table::STAND_ALONE_SIG, token.row())
+            .and_then(|row| self.assembly.image.blob().get(row.raw(0)).ok())
+            .and_then(|blob| parse_local_var_sig(blob).ok())
+            .unwrap_or_default()
     }
 
     /// Whether the method is static.

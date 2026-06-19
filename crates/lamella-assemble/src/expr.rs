@@ -58,6 +58,10 @@ pub fn emit_expression(
             emit_expression(operand, frame, tokens, out)?;
             emit_conversion(*conversion, &expr.ty, out)
         }
+        BoundExprKind::Cast { operand } => {
+            emit_expression(operand, frame, tokens, out)?;
+            emit_cast(&operand.ty, &expr.ty, tokens, out)
+        }
         BoundExprKind::Call {
             callee,
             arguments,
@@ -338,6 +342,10 @@ fn emit_field_load(
             "a field access that did not resolve",
         ));
     };
+    if let Some(value) = field.constant {
+        out.push(load_i4(value as i32));
+        return Ok(());
+    }
     let token = tokens
         .field(&field.declaring_type, &field.name)
         .ok_or(EmitError::Unsupported("field outside this module"))?;
@@ -443,6 +451,31 @@ fn accessor_name(prefix: &str, property: &str) -> String {
     let mut name = String::from(prefix);
     name.push_str(property);
     name
+}
+
+/// Emits the instruction (if any) for an explicit cast from `from` to `to`. An
+/// identity cast is a no-op; a cast to an enum or a numeric/char type is the
+/// corresponding `conv.*` (an enum's operand is already its underlying integer, so
+/// `conv.i4` is the v1 underlying conversion). A reference downcast (`castclass`)
+/// and unboxing arrive with the reference-type work.
+fn emit_cast(
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if from == to {
+        return Ok(());
+    }
+    if tokens.is_enum(to) {
+        out.push(Instruction::simple(Opcode::ConvI4));
+        return Ok(());
+    }
+    if matches!(to, TypeSymbol::Special(_)) {
+        out.push(Instruction::simple(numeric_conversion(to)?));
+        return Ok(());
+    }
+    Err(EmitError::Unsupported("this cast is not lowered yet"))
 }
 
 /// Emits the instruction (if any) for a conversion whose target is `target`.

@@ -11,6 +11,6 @@ pub mod types;
 pub mod verify;
 
 pub use function::{BasicBlock, BlockId, Function, Terminator, ValueId};
-pub use inst::{BinOp, CmpOp, Inst};
+pub use inst::{BinOp, CmpOp, ConvKind, Inst};
 pub use types::{MirType, TypeHandle};
 pub use verify::{VerifyError, verify};

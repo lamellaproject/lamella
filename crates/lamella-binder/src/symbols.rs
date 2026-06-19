@@ -49,6 +49,9 @@ pub struct FieldSymbol {
     pub is_static: bool,
     /// The field's accessibility.
     pub accessibility: Accessibility,
+    /// The compile-time constant value for an enum member (its underlying value);
+    /// `None` for an ordinary field.
+    pub constant: Option<i64>,
 }
 
 /// A property of a type (17.6), reduced to its name and type.
@@ -262,6 +265,7 @@ mod tests {
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
             accessibility: Accessibility::Public,
+            constant: None,
         });
         info.methods.push(MethodSymbol {
             name: "Area".into(),

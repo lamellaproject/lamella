@@ -52,6 +52,24 @@ pub trait DebugBackend {
     /// compiler's sequence points map it to source).
     fn stack(&self) -> Vec<Frame>;
 
+    /// Resolves a source breakpoint -- `line` in `document` -- to an opaque code address
+    /// (the same space as `stack` / `set_breakpoints`), or `None` if the backend has no
+    /// source mapping or the line carries no code. Interpreter: via the Portable PDB;
+    /// device: via the AOT debug-info. The adapter calls this for source `setBreakpoints`.
+    fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
+        let _ = (document, line);
+        None
+    }
+
+    /// The source location a code `address` (from `stack`) maps to, or `None` without a
+    /// source mapping -- the inverse of [`DebugBackend::resolve_source_breakpoint`]. The
+    /// adapter puts it on a `stackTrace` frame so the editor shows source, not the CIL
+    /// index.
+    fn source_location(&self, address: u64) -> Option<SourceLocation> {
+        let _ = address;
+        None
+    }
+
     /// The variables in one scope of frame `index`. Interpreter: the frame's
     /// arguments / locals / evaluation-stack slots. Device: locals/arguments recovered
     /// from the AOT debug-info (register or stack-slot homes), read via memory/regs.
@@ -105,6 +123,22 @@ pub struct Frame {
     pub name: String,
     /// The 1-based line shown in the editor (the CIL index until source mapping).
     pub line: u32,
+}
+
+/// A source position a backend maps a code address to: the file and a 1-based
+/// line/column range. The adapter places it on a `stackTrace` frame; a backend with no
+/// source info returns `None` instead.
+pub struct SourceLocation {
+    /// The source file path.
+    pub file: String,
+    /// 1-based start line.
+    pub line: u32,
+    /// 1-based start column.
+    pub column: u32,
+    /// 1-based end line.
+    pub end_line: u32,
+    /// 1-based end column.
+    pub end_column: u32,
 }
 
 /// A variable scope of a frame.

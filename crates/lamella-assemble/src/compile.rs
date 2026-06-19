@@ -24,7 +24,7 @@ use lamella_syntax::ast::{
     CompilationUnit, Literal, Member, Modifier, NamespaceMember, Parameter, QualifiedName,
     TypeDecl, UsingDirective, UsingKind, VariableDeclarator,
 };
-use lamella_syntax::diagnostic::Diagnostic as SyntaxDiagnostic;
+use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
 use lamella_syntax::parser::parse_compilation_unit;
 use lamella_syntax::span::Span;
 use lamella_token::Token;
@@ -47,6 +47,8 @@ const IL_MANAGED: u16 = 0x0000;
 pub struct Diagnostic {
     /// The C# compiler code (`CSxxxx`).
     pub code: u16,
+    /// Whether it stops compilation (an error) or not (a warning).
+    pub severity: Severity,
     /// The rendered message.
     pub message: String,
     /// The source location.
@@ -57,6 +59,7 @@ impl Diagnostic {
     fn from_syntax(diagnostic: &SyntaxDiagnostic) -> Diagnostic {
         Diagnostic {
             code: diagnostic.code(),
+            severity: diagnostic.severity(),
             message: format!("{}", diagnostic.kind),
             span: diagnostic.span,
         }
@@ -65,9 +68,16 @@ impl Diagnostic {
     fn from_binder(diagnostic: &BinderDiagnostic) -> Diagnostic {
         Diagnostic {
             code: diagnostic.code(),
+            severity: diagnostic.severity(),
             message: format!("{}", diagnostic.kind),
             span: diagnostic.span,
         }
+    }
+
+    /// Whether this diagnostic is an error (and so blocks emission).
+    #[must_use]
+    pub fn is_error(&self) -> bool {
+        matches!(self.severity, Severity::Error)
     }
 }
 
@@ -140,20 +150,27 @@ pub fn compile_source(
     emit_debug: bool,
 ) -> Compilation {
     let parsed = parse_compilation_unit(source);
-    if !parsed.diagnostics.is_empty() {
+    let parse_diagnostics: Vec<Diagnostic> = parsed
+        .diagnostics
+        .iter()
+        .map(Diagnostic::from_syntax)
+        .collect();
+    if parse_diagnostics.iter().any(Diagnostic::is_error) {
         return Compilation {
-            diagnostics: parsed
-                .diagnostics
-                .iter()
-                .map(Diagnostic::from_syntax)
-                .collect(),
+            diagnostics: parse_diagnostics,
             image: None,
             pdb: None,
             emit_error: None,
         };
     }
     let debug = emit_debug.then_some((source, source_path));
-    compile(&parsed.unit, module_name, assembly_name, references, debug)
+    let mut compiled = compile(&parsed.unit, module_name, assembly_name, references, debug);
+    if !parse_diagnostics.is_empty() {
+        let mut diagnostics = parse_diagnostics;
+        diagnostics.append(&mut compiled.diagnostics);
+        compiled.diagnostics = diagnostics;
+    }
+    compiled
 }
 
 fn compile(
@@ -167,7 +184,7 @@ fn compile(
         .iter()
         .map(Diagnostic::from_binder)
         .collect();
-    if !diagnostics.is_empty() {
+    if diagnostics.iter().any(Diagnostic::is_error) {
         return Compilation {
             diagnostics,
             image: None,
@@ -965,6 +982,7 @@ fn emit_default_constructor(image: &mut ImageBuilder) -> Result<(), crate::EmitE
 fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitError> {
     let special = match ty {
         TypeSymbol::Special(special) => special,
+        TypeSymbol::Named(_) if tokens.is_enum(ty) => return Ok(TypeSig::Int32),
         TypeSymbol::Named(_) => {
             return tokens
                 .type_token(ty)
@@ -1121,7 +1139,10 @@ fn collect_tokens(
                     &inner,
                 );
             }
-            NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
+            NamespaceMember::Enum(declaration) => {
+                tokens.insert_enum(&named_symbol(namespace, &declaration.name));
+            }
+            NamespaceMember::Delegate(_) => {}
         }
     }
 }
@@ -1361,6 +1382,99 @@ mod tests {
     }
 
     #[test]
+    fn local_variables_round_trip_through_the_reader() {
+        use lamella_metadata::{Assembly, SigType};
+        let unit = parse_compilation_unit(
+            "class P { static int Run() { int a = 1; double b = 2.0; long c = 3; return a; } }",
+        )
+        .unit;
+        let image = compile_unit(&unit, "lv.dll", "lv")
+            .image
+            .expect("the method emits");
+        let assembly = Assembly::read(&image).expect("the image reads back");
+        let run = assembly
+            .find_type("", "P")
+            .expect("type P is present")
+            .methods()
+            .find(|method| method.name() == Some("Run"))
+            .expect("Run is present");
+        assert_eq!(
+            run.local_variables(),
+            [SigType::I4, SigType::R8, SigType::I8]
+        );
+    }
+
+    #[test]
+    fn a_warning_does_not_block_emission() {
+        let result = compile_source(
+            "#warning carry on\nclass Program { static int Main() { return 0; } }",
+            "w.cs",
+            "w.dll",
+            "w",
+            &[],
+            false,
+        );
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(!result.diagnostics[0].is_error());
+    }
+
+    #[test]
+    fn compiles_numeric_and_enum_casts() {
+        let unit = parse_compilation_unit(
+            "enum E { A, B, C } \
+             class P { static int Main() { double d = 42.9; E c = E.C; return (int)d + (int)c; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "k.dll", "k");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_enum_typed_local_param_and_return() {
+        let unit = parse_compilation_unit(
+            "enum Color { Red, Green, Blue } \
+             class P { \
+                static Color Pick() { return Color.Blue; } \
+                static int Rank(Color c) { if (c == Color.Blue) { return 42; } return 0; } \
+                static int Main() { Color c = Pick(); return Rank(c); } \
+             }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "c.dll", "c");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_enum_bitwise_and_case_labels() {
+        let unit = parse_compilation_unit(
+            "enum Perm { None = 0, Read = 1, Write = 2 } \
+             class P { static int Main() { \
+                Perm p = Perm.Read | Perm.Write; \
+                switch (p & Perm.Write) { case Perm.Write: return 42; default: return 0; } \
+             } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "f.dll", "f");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_enum_members_and_comparison() {
+        let unit = parse_compilation_unit(
+            "enum E { A, B = 5, C } \
+             class Program { static int Main() { if (E.C == E.B) { return 0; } return 42; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "e.dll", "e");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
     fn compiles_foreach_over_an_array() {
         let unit = parse_compilation_unit(
             "class Program { \
@@ -1404,7 +1518,7 @@ mod tests {
             "class Program { \
                 static int Main() { \
                     double d = 42.0; float f = 1.5f; \
-                    if (d > 41.5) { return 42; } \
+                    if (d > 41.5 && f > 1.0f) { return 42; } \
                     return 0; \
                 } \
              }",

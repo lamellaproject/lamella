@@ -3,8 +3,17 @@
 //! interface an on-device target uses.
 
 use lamella_cil::{Instruction, Operand};
-use lamella_debug_backend::{DebugBackend, Disassembled, Frame, Register, Scope, Stop, Variable};
+use lamella_debug_backend::{
+    DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
+};
+use lamella_metadata::PortablePdb;
+use lamella_token::Token;
 use lamella_ves::{Method, MethodId, Module, Session, Status, Value, Vm};
+use std::collections::BTreeMap;
+
+/// The `MethodDef` metadata table tag, for rebuilding a method token to map a PDB
+/// `method_rid` to the interpreter's `MethodId`.
+const METHOD_DEF: u8 = 0x06;
 
 /// A [`DebugBackend`] over the interpreter: it owns the module being debugged, the
 /// runtime context, and the running `Session` once launched.
@@ -18,6 +27,11 @@ pub struct InterpreterBackend {
     breakpoints: Vec<(u32, u32)>,
     /// UTF-16 code units of console output already drained by [`Self::take_output`].
     output_sent: usize,
+    /// The standalone Portable PDB bytes, when source mapping is available.
+    pdb: Option<Vec<u8>>,
+    /// `MethodId` -> `MethodDef` rid: the reverse of the module's token binding, so a
+    /// stack frame's method maps back to its PDB row for `source_location`.
+    method_rid: BTreeMap<MethodId, u32>,
 }
 
 impl InterpreterBackend {
@@ -31,6 +45,33 @@ impl InterpreterBackend {
             session: None,
             breakpoints: Vec::new(),
             output_sent: 0,
+            pdb: None,
+            method_rid: BTreeMap::new(),
+        }
+    }
+
+    /// Creates a backend with source mapping from a standalone Portable PDB
+    /// (`pdb_bytes`), building the `MethodId` -> `method_rid` reverse map from the
+    /// module's token binding so frames and breakpoints map to and from source.
+    #[must_use]
+    pub fn with_pdb(module: Module, entry: u32, pdb_bytes: Vec<u8>) -> InterpreterBackend {
+        let mut method_rid = BTreeMap::new();
+        if let Ok(pdb) = PortablePdb::read(&pdb_bytes) {
+            for rid in 1..=pdb.method_count() {
+                if let Some(id) = module.resolve(Token::new(METHOD_DEF, rid)) {
+                    method_rid.insert(id, rid);
+                }
+            }
+        }
+        InterpreterBackend {
+            module,
+            entry,
+            vm: Vm::new(),
+            session: None,
+            breakpoints: Vec::new(),
+            output_sent: 0,
+            pdb: Some(pdb_bytes),
+            method_rid,
         }
     }
 
@@ -54,6 +95,40 @@ impl InterpreterBackend {
             Method::Managed { body, .. } => Some(&body.code[..]),
             Method::Intrinsic { .. } => None,
         }
+    }
+
+    /// The CIL byte offset of each instruction in `method` (index -> offset), recomputed
+    /// from the decoded body to align with the Portable PDB's sequence points.
+    fn offsets(&self, method: MethodId) -> Option<Vec<u32>> {
+        lamella_cil::instruction_offsets(self.method_code(method)?)
+    }
+
+    /// The CIL byte offset of `method`'s instruction `index`.
+    fn index_to_il_offset(&self, method: MethodId, index: u32) -> Option<u32> {
+        self.offsets(method)?.get(index as usize).copied()
+    }
+
+    /// The instruction index at CIL byte offset `il_offset` in `method`: the boundary the
+    /// offset names, else the last instruction at or before it.
+    fn il_offset_to_index(&self, method: MethodId, il_offset: u32) -> Option<u32> {
+        let offsets = self.offsets(method)?;
+        let slice = offsets.get(..offsets.len().saturating_sub(1))?;
+        let index = slice
+            .iter()
+            .position(|&offset| offset == il_offset)
+            .or_else(|| slice.iter().rposition(|&offset| offset <= il_offset))?;
+        u32::try_from(index).ok()
+    }
+
+    /// Source names for `method`'s locals by slot, from the PDB, when available.
+    fn local_names(&self, method: MethodId) -> Option<BTreeMap<u16, String>> {
+        let pdb = PortablePdb::read(self.pdb.as_ref()?).ok()?;
+        let method_rid = *self.method_rid.get(&method)?;
+        let mut names = BTreeMap::new();
+        for variable in pdb.local_variables(method_rid) {
+            names.insert(variable.index, String::from(variable.name));
+        }
+        Some(names)
     }
 }
 
@@ -137,6 +212,29 @@ impl DebugBackend for InterpreterBackend {
             .collect()
     }
 
+    fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
+        let pdb = PortablePdb::read(self.pdb.as_ref()?).ok()?;
+        let (method_rid, il_offset) = pdb.resolve_breakpoint(document, line)?;
+        let method = self.module.resolve(Token::new(METHOD_DEF, method_rid))?;
+        let index = self.il_offset_to_index(method, il_offset)?;
+        Some(encode_address(method, index))
+    }
+
+    fn source_location(&self, address: u64) -> Option<SourceLocation> {
+        let (method, index) = decode_address(address);
+        let method_rid = *self.method_rid.get(&method)?;
+        let il_offset = self.index_to_il_offset(method, index)?;
+        let pdb = PortablePdb::read(self.pdb.as_ref()?).ok()?;
+        let point = pdb.source_location(method_rid, il_offset)?;
+        Some(SourceLocation {
+            file: pdb.method_document(method_rid)?,
+            line: point.start_line,
+            column: point.start_column,
+            end_line: point.end_line,
+            end_column: point.end_column,
+        })
+    }
+
     fn variables(&self, frame_index: usize, scope: Scope) -> Vec<Variable> {
         let Some(session) = self.session.as_ref() else {
             return Vec::new();
@@ -144,18 +242,27 @@ impl DebugBackend for InterpreterBackend {
         let Some(frame) = session.frame(frame_index) else {
             return Vec::new();
         };
+        let method = frame.method;
         let (prefix, values) = match scope {
             Scope::Arguments => ("arg", frame.args),
             Scope::Locals => ("local", frame.locals),
             Scope::Stack => ("stack", frame.stack),
         };
+        let names = matches!(scope, Scope::Locals)
+            .then(|| self.local_names(method))
+            .flatten();
         values
             .iter()
             .enumerate()
             .map(|(index, value)| {
                 let (text, kind) = format_value(&self.vm, value.clone());
+                let name = names
+                    .as_ref()
+                    .and_then(|names| names.get(&(index as u16)))
+                    .cloned()
+                    .unwrap_or_else(|| format!("{prefix}{index}"));
                 Variable {
-                    name: format!("{prefix}{index}"),
+                    name,
                     value: text,
                     kind,
                 }

@@ -580,6 +580,21 @@ impl Encoder {
         self.dp_reg(0b0100, rdn, rm)
     }
 
+    /// `ASRS Rd, Rm, #imm5` -- arithmetic shift right by 1-31 (used to spread the sign
+    /// bit across the high word of an `int64`). 16-bit T1 (A6.7.9).
+    pub fn asrs_imm(&mut self, rd: Reg, rm: Reg, imm5: u8) -> Result<(), AssembleError> {
+        if !rd.is_low() || !rm.is_low() || imm5 == 0 || imm5 > 31 {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(
+            0x1000
+                | (u16::from(imm5) << 6)
+                | (u16::from(rm.number()) << 3)
+                | u16::from(rd.number()),
+        );
+        Ok(())
+    }
+
     /// `ADCS Rdn, Rm` -- add with carry, setting flags (opcode 0101).
     pub fn adcs(&mut self, rdn: Reg, rm: Reg) -> Result<(), AssembleError> {
         self.dp_reg(0b0101, rdn, rm)

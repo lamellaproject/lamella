@@ -1,6 +1,6 @@
 //! Resolving called methods and accessed fields to their metadata tokens.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -43,6 +43,9 @@ pub struct Tokens {
     methods: BTreeMap<String, Token>,
     fields: BTreeMap<String, Token>,
     strings: BTreeMap<Vec<u16>, Token>,
+    /// The enum types declared in this module, by key. Their signatures lower to the
+    /// underlying integer type (v1: `int32`), so they need no `TypeDef` token.
+    enums: BTreeSet<String>,
 }
 
 impl Tokens {
@@ -61,6 +64,17 @@ impl Tokens {
     #[must_use]
     pub fn type_token(&self, ty: &TypeSymbol) -> Option<Token> {
         self.types.get(&type_key(ty)).copied()
+    }
+
+    /// Records that this type is an enum (its signatures lower to the underlying type).
+    pub fn insert_enum(&mut self, ty: &TypeSymbol) {
+        self.enums.insert(type_key(ty));
+    }
+
+    /// Whether this type is an enum declared in the module.
+    #[must_use]
+    pub fn is_enum(&self, ty: &TypeSymbol) -> bool {
+        self.enums.contains(&type_key(ty))
     }
 
     /// Records `token` as the method named by this identity.

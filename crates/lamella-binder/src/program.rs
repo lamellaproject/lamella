@@ -3,7 +3,7 @@
 use crate::bind::bind_type;
 use crate::bound::Binder;
 use crate::declaration::collect_into;
-use crate::diagnostic::Diagnostic;
+use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::reference::load_assembly;
 use crate::special::SpecialType;
 use crate::symbols::Model;
@@ -78,6 +78,22 @@ fn bind_namespace_body(
 
 fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     let enclosing = named_symbol(namespace, &declaration.name);
+    let mut seen_fields: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
+    for member in &declaration.members {
+        if let Member::Field { declarators, .. } = member {
+            for declarator in declarators {
+                if !seen_fields.insert(&declarator.name) {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::DuplicateMember {
+                            type_name: declaration.name.clone(),
+                            member: declarator.name.clone(),
+                        },
+                        declarator.span,
+                    ));
+                }
+            }
+        }
+    }
     for member in &declaration.members {
         match member {
             Member::Method {
@@ -233,11 +249,17 @@ mod tests {
         let codes = sorted_codes(
             "class Box { \
                 int Bad { get { return \"s\"; } } \
-                int Sink { set { int v = value; } } \
+                int Sink { set { if (value > 0) { } } } \
                 int Oops { set { return 1; } } \
              }",
         );
         assert_eq!(codes, [29, 127]);
+    }
+
+    #[test]
+    fn duplicate_field_name_is_cs0102() {
+        assert_eq!(sorted_codes("class C { int x; int x; }"), [102]);
+        assert_eq!(sorted_codes("class C { int x; int y; }"), []);
     }
 
     #[test]

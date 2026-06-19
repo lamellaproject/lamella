@@ -70,6 +70,367 @@ enum Flow {
     Exits,
 }
 
+/// Reports `CS0168`/`CS0219` for a local whose name never appears anywhere in the
+/// body. Counting *every* occurrence -- even an assignment target -- as a use makes
+/// this a safe subset of csc (it under-reports rather than risk a false warning): it
+/// fires only when a declared local is truly never referenced again. `CS0219` when
+/// the local has an initializer (its assigned value is unused), `CS0168` otherwise.
+#[must_use]
+pub fn check_unused_locals(body: &BoundStmt, also_used: &BTreeSet<Box<str>>) -> Vec<Diagnostic> {
+    let mut used: BTreeSet<Box<str>> = also_used.clone();
+    let mut declared: Vec<(Box<str>, Span, bool)> = Vec::new();
+    collect_locals(body, &mut used, &mut declared);
+    declared
+        .into_iter()
+        .filter(|(name, _, _)| !used.contains(name))
+        .map(|(name, span, has_initializer)| {
+            let kind = if has_initializer {
+                DiagnosticKind::UnusedLocalValue { name }
+            } else {
+                DiagnosticKind::UnusedLocal { name }
+            };
+            Diagnostic::new(kind, span)
+        })
+        .collect()
+}
+
+/// Records every declared local (with its span and whether it has an initializer)
+/// and gathers every local name that appears anywhere in `stmt`.
+fn collect_locals(
+    stmt: &BoundStmt,
+    used: &mut BTreeSet<Box<str>>,
+    declared: &mut Vec<(Box<str>, Span, bool)>,
+) {
+    match &stmt.kind {
+        BoundStmtKind::Local { ty, declarators } => {
+            let report = !ty.is_error();
+            for declarator in declarators {
+                if report {
+                    declared.push((
+                        declarator.name.clone(),
+                        stmt.span,
+                        declarator.initializer.is_some(),
+                    ));
+                }
+                if let Some(initializer) = &declarator.initializer {
+                    collect_uses(initializer, used);
+                }
+            }
+        }
+        BoundStmtKind::Empty
+        | BoundStmtKind::Error
+        | BoundStmtKind::Break
+        | BoundStmtKind::Continue
+        | BoundStmtKind::Goto => {}
+        BoundStmtKind::Block(statements) => {
+            for statement in statements {
+                collect_locals(statement, used, declared);
+            }
+        }
+        BoundStmtKind::Expression(expr) => collect_uses(expr, used),
+        BoundStmtKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_uses(condition, used);
+            collect_locals(then_branch, used, declared);
+            if let Some(else_branch) = else_branch {
+                collect_locals(else_branch, used, declared);
+            }
+        }
+        BoundStmtKind::While { condition, body } | BoundStmtKind::DoWhile { condition, body } => {
+            collect_uses(condition, used);
+            collect_locals(body, used, declared);
+        }
+        BoundStmtKind::For {
+            initializer,
+            condition,
+            iterators,
+            body,
+        } => {
+            for statement in initializer {
+                collect_locals(statement, used, declared);
+            }
+            if let Some(condition) = condition {
+                collect_uses(condition, used);
+            }
+            for iterator in iterators {
+                collect_uses(iterator, used);
+            }
+            collect_locals(body, used, declared);
+        }
+        BoundStmtKind::ForEach {
+            collection, body, ..
+        } => {
+            collect_uses(collection, used);
+            collect_locals(body, used, declared);
+        }
+        BoundStmtKind::Return(value) | BoundStmtKind::Throw(value) => {
+            if let Some(value) = value {
+                collect_uses(value, used);
+            }
+        }
+        BoundStmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            collect_locals(body, used, declared);
+            for catch in catches {
+                collect_locals(&catch.body, used, declared);
+            }
+            if let Some(finally) = finally {
+                collect_locals(finally, used, declared);
+            }
+        }
+        BoundStmtKind::Switch {
+            expression,
+            sections,
+        } => {
+            collect_uses(expression, used);
+            for section in sections {
+                for statement in &section.statements {
+                    collect_locals(statement, used, declared);
+                }
+            }
+        }
+        BoundStmtKind::Lock { expression, body } => {
+            collect_uses(expression, used);
+            collect_locals(body, used, declared);
+        }
+        BoundStmtKind::Using { resource, body } => {
+            for statement in resource {
+                collect_locals(statement, used, declared);
+            }
+            collect_locals(body, used, declared);
+        }
+        BoundStmtKind::Checked(inner)
+        | BoundStmtKind::Unchecked(inner)
+        | BoundStmtKind::Labeled { body: inner, .. } => collect_locals(inner, used, declared),
+    }
+}
+
+/// Gathers every local name that appears anywhere in `expr` (an assignment target is
+/// counted too, which only makes the unused check more conservative). Also used by
+/// the binder to record locals referenced in `switch` case-label expressions.
+pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
+    match &expr.kind {
+        BoundExprKind::Local(name) => {
+            used.insert(name.clone());
+        }
+        BoundExprKind::Literal(_)
+        | BoundExprKind::This
+        | BoundExprKind::Base
+        | BoundExprKind::TypeReference(_)
+        | BoundExprKind::NamespaceReference(_)
+        | BoundExprKind::TypeOf
+        | BoundExprKind::Error => {}
+        BoundExprKind::FieldAccess { receiver, .. }
+        | BoundExprKind::PropertyAccess { receiver, .. }
+        | BoundExprKind::MethodGroup { receiver, .. } => collect_uses(receiver, used),
+        BoundExprKind::Call {
+            callee, arguments, ..
+        } => {
+            collect_uses(callee, used);
+            for argument in arguments {
+                collect_uses(argument, used);
+            }
+        }
+        BoundExprKind::ElementAccess { receiver, indices } => {
+            collect_uses(receiver, used);
+            for index in indices {
+                collect_uses(index, used);
+            }
+        }
+        BoundExprKind::ArrayCreation { lengths } => {
+            for length in lengths {
+                collect_uses(length, used);
+            }
+        }
+        BoundExprKind::ObjectCreation { arguments, .. } => {
+            for argument in arguments {
+                collect_uses(argument, used);
+            }
+        }
+        BoundExprKind::Binary { left, right, .. } => {
+            collect_uses(left, used);
+            collect_uses(right, used);
+        }
+        BoundExprKind::Unary { operand, .. } | BoundExprKind::Postfix { operand, .. } => {
+            collect_uses(operand, used);
+        }
+        BoundExprKind::Cast { operand }
+        | BoundExprKind::TypeTest { operand, .. }
+        | BoundExprKind::Conversion { operand, .. } => collect_uses(operand, used),
+        BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
+            collect_uses(inner, used);
+        }
+        BoundExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            collect_uses(condition, used);
+            collect_uses(when_true, used);
+            collect_uses(when_false, used);
+        }
+        BoundExprKind::Assignment { target, value, .. } => {
+            collect_uses(target, used);
+            collect_uses(value, used);
+        }
+    }
+}
+
+/// Reports `CS0162` for the first statement in each block whose start point cannot be
+/// reached (8.1). This is deliberately conservative: a statement is flagged only when
+/// control *definitely* cannot reach it -- after a `return`/`throw`/`break`/
+/// `continue`/`goto`, after a constant-true loop with no `break` that targets it, or
+/// after an `if` all of whose branches leave. Constant `if` conditions, `switch`
+/// ends, and `try` ends are treated as reachable, so the analysis under-reports
+/// rather than risk flagging reachable code.
+#[must_use]
+pub fn check_unreachable(body: &BoundStmt) -> Vec<Diagnostic> {
+    let mut check = Unreachable {
+        diagnostics: Vec::new(),
+    };
+    check.statement(body);
+    check.diagnostics
+}
+
+struct Unreachable {
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl Unreachable {
+    /// Processes a statement list, flagging only the first unreachable statement (as
+    /// csc does). Returns whether control can reach the end of the list.
+    fn block(&mut self, statements: &[BoundStmt]) -> bool {
+        let mut reachable = true;
+        for statement in statements {
+            if !reachable {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::UnreachableCode,
+                    statement.span,
+                ));
+                return false;
+            }
+            reachable = self.statement(statement);
+        }
+        reachable
+    }
+
+    /// Whether control can reach the end point of `stmt`, given its start is reached.
+    fn statement(&mut self, stmt: &BoundStmt) -> bool {
+        use BoundStmtKind as Kind;
+        match &stmt.kind {
+            Kind::Return(_) | Kind::Throw(_) | Kind::Break | Kind::Continue | Kind::Goto => false,
+            Kind::Expression(_) | Kind::Local { .. } | Kind::Empty | Kind::Error => true,
+            Kind::Block(statements) => self.block(statements),
+            Kind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                let then_reaches = self.statement(then_branch);
+                let else_reaches = match else_branch {
+                    Some(else_branch) => self.statement(else_branch),
+                    None => true,
+                };
+                then_reaches || else_reaches
+            }
+            Kind::While { condition, body } => {
+                self.statement(body);
+                !is_const_true(condition) || loop_breaks(body)
+            }
+            Kind::For {
+                condition, body, ..
+            } => {
+                self.statement(body);
+                let endless = condition.as_ref().is_none_or(is_const_true);
+                !endless || loop_breaks(body)
+            }
+            Kind::ForEach { body, .. } | Kind::DoWhile { body, .. } => {
+                self.statement(body);
+                true
+            }
+            Kind::Switch { sections, .. } => {
+                for section in sections {
+                    self.block(&section.statements);
+                }
+                true
+            }
+            Kind::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                self.statement(body);
+                for catch in catches {
+                    self.statement(&catch.body);
+                }
+                if let Some(finally) = finally {
+                    self.statement(finally);
+                }
+                true
+            }
+            Kind::Lock { body, .. } | Kind::Using { body, .. } => self.statement(body),
+            Kind::Checked(inner) | Kind::Unchecked(inner) | Kind::Labeled { body: inner, .. } => {
+                self.statement(inner)
+            }
+        }
+    }
+}
+
+/// Whether `stmt` contains a `break` that targets the immediately enclosing loop --
+/// that is, one not captured by a nested loop or `switch`. Over-approximates (treats
+/// anything it is unsure about as not-a-break by structure, but never misses a break
+/// reachable through `if`/`try`/`block`), so an endless loop is only declared endless
+/// when it truly has no escaping `break`.
+fn loop_breaks(stmt: &BoundStmt) -> bool {
+    use BoundStmtKind as Kind;
+    match &stmt.kind {
+        Kind::Break => true,
+        Kind::While { .. }
+        | Kind::DoWhile { .. }
+        | Kind::For { .. }
+        | Kind::ForEach { .. }
+        | Kind::Switch { .. } => false,
+        Kind::Block(statements) => statements.iter().any(loop_breaks),
+        Kind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            loop_breaks(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| loop_breaks(branch))
+        }
+        Kind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            loop_breaks(body)
+                || catches.iter().any(|catch| loop_breaks(&catch.body))
+                || finally.as_ref().is_some_and(|finally| loop_breaks(finally))
+        }
+        Kind::Lock { body, .. } | Kind::Using { body, .. } => loop_breaks(body),
+        Kind::Checked(inner) | Kind::Unchecked(inner) | Kind::Labeled { body: inner, .. } => {
+            loop_breaks(inner)
+        }
+        Kind::Return(_)
+        | Kind::Throw(_)
+        | Kind::Continue
+        | Kind::Goto
+        | Kind::Expression(_)
+        | Kind::Local { .. }
+        | Kind::Empty
+        | Kind::Error => false,
+    }
+}
+
 /// Reports `CS0165` for every read of a local that is not definitely assigned on
 /// all paths to it (clause 12, Annex A). `parameters` start definitely assigned.
 #[must_use]

@@ -155,6 +155,36 @@ fn check_inst(
         Inst::Load { address } => {
             use_value(func, defined, *address, errors);
         }
+        Inst::Convert { value, .. } => {
+            use_value(func, defined, *value, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::I32, r, errors);
+            }
+        }
+        Inst::Widen { value, .. } => {
+            use_value(func, defined, *value, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::I64, r, errors);
+            }
+        }
+        Inst::Truncate { value } => {
+            use_value(func, defined, *value, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::I32, r, errors);
+            }
+        }
+        Inst::InitStruct => {
+        }
+        Inst::FieldLoad { base, .. } => {
+            use_value(func, defined, *base, errors);
+        }
+        Inst::FieldStore { base, value, .. } => {
+            use_value(func, defined, *base, errors);
+            use_value(func, defined, *value, errors);
+        }
+        Inst::CopyStruct { src } => {
+            use_value(func, defined, *src, errors);
+        }
         Inst::SemihostWrite { .. } => {
         }
     }

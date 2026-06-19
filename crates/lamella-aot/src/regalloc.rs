@@ -167,6 +167,26 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::Load { address } => {
                     mark(&mut lo, &mut hi, &mut defined, *address, ip);
                 }
+                Inst::Convert { value, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
+                Inst::Widen { value, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
+                Inst::Truncate { value } => {
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
+                Inst::InitStruct => {}
+                Inst::FieldLoad { base, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *base, ip);
+                }
+                Inst::FieldStore { base, value, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *base, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
+                Inst::CopyStruct { src } => {
+                    mark(&mut lo, &mut hi, &mut defined, *src, ip);
+                }
                 Inst::SemihostWrite { .. } => {}
                 Inst::ConstInt { .. } => {}
             }
@@ -345,6 +365,16 @@ fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*value);
         }
         Inst::Load { address } => f(*address),
+        Inst::Convert { value, .. } => f(*value),
+        Inst::Widen { value, .. } => f(*value),
+        Inst::Truncate { value } => f(*value),
+        Inst::InitStruct => {}
+        Inst::FieldLoad { base, .. } => f(*base),
+        Inst::FieldStore { base, value, .. } => {
+            f(*base);
+            f(*value);
+        }
+        Inst::CopyStruct { src } => f(*src),
         Inst::SemihostWrite { .. } => {}
     }
 }

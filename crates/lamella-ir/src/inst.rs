@@ -57,6 +57,21 @@ pub enum CmpOp {
     UnsignedGe,
 }
 
+/// A width conversion: narrowing an `int32` to a smaller integer and re-extending it to
+/// the stack's 32-bit width, signed or unsigned -- the CLI's `conv.i1`/`conv.u1`/
+/// `conv.i2`/`conv.u2`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConvKind {
+    /// Sign-extend the low 8 bits (`conv.i1`).
+    SignExtend8,
+    /// Zero-extend the low 8 bits (`conv.u1`).
+    ZeroExtend8,
+    /// Sign-extend the low 16 bits (`conv.i2`).
+    SignExtend16,
+    /// Zero-extend the low 16 bits (`conv.u2`).
+    ZeroExtend16,
+}
+
 /// One MIR instruction: an operation defining a single typed result value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inst {
@@ -85,6 +100,28 @@ pub enum Inst {
         /// The right operand.
         rhs: ValueId,
     },
+    /// Converts `value` to a narrower integer width and back to `int32`, signed or
+    /// unsigned per `kind` -- the CLI's sub-word `conv.*`. The result is `int32`.
+    Convert {
+        /// The value to convert.
+        value: ValueId,
+        /// The width and signedness of the conversion.
+        kind: ConvKind,
+    },
+    /// Widens a 32-bit integer to `int64`, sign- or zero-extended per `signed` (the CLI's
+    /// `conv.i8`/`conv.u8` from an `int32`). The result is `int64`.
+    Widen {
+        /// The 32-bit value to widen.
+        value: ValueId,
+        /// Sign-extend (`conv.i8`) when true, zero-extend (`conv.u8`) when false.
+        signed: bool,
+    },
+    /// Truncates an `int64` to its low 32 bits (the CLI's `conv.i4`/`conv.u4` from an
+    /// `int64`). The result is `int32`.
+    Truncate {
+        /// The 64-bit value to truncate.
+        value: ValueId,
+    },
     /// A direct call to another function of the program (named by index), passing
     /// `args` and producing the callee's return value.
     Call {
@@ -107,6 +144,34 @@ pub enum Inst {
     Load {
         /// The value holding the source address.
         address: ValueId,
+    },
+    /// Zero-initializes the value-type instance this defines -- the CLI's `initobj`. The
+    /// result is the zeroed value type; its size comes from the result's [`MirType`].
+    InitStruct,
+    /// Loads the scalar field at byte `offset` of the value-type `base` -- the CLI's
+    /// `ldfld` on a local struct. The result is the field's value.
+    FieldLoad {
+        /// The value-type instance being read.
+        base: ValueId,
+        /// The field's byte offset within the value type.
+        offset: u32,
+    },
+    /// Stores `value` into the value-type `base` at byte `offset` -- the CLI's `stfld`.
+    /// A side effect; the instruction's result is a placeholder callers ignore.
+    FieldStore {
+        /// The value-type instance being written.
+        base: ValueId,
+        /// The field's byte offset within the value type.
+        offset: u32,
+        /// The scalar value to store (its width comes from its type).
+        value: ValueId,
+    },
+    /// Copies the value-type `src` to the instance this defines -- the CLI's `ldobj`/`stobj`
+    /// value copy (struct assignment, pass-by-value). The result is the copy; its size comes
+    /// from the result's [`MirType`].
+    CopyStruct {
+        /// The value-type instance to copy from.
+        src: ValueId,
     },
     /// Writes a NUL-terminated string to the host via an ARM semihosting `SYS_WRITE0`
     /// request -- the `Debug.WriteLine` / console-output primitive. A side effect; the

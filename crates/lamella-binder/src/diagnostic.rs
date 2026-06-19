@@ -27,10 +27,10 @@ impl Diagnostic {
         self.kind.code()
     }
 
-    /// The severity (every binder diagnostic is an error so far).
+    /// The severity, from the diagnostic's kind.
     #[must_use]
     pub fn severity(&self) -> Severity {
-        Severity::Error
+        self.kind.severity()
     }
 }
 
@@ -115,6 +115,54 @@ pub enum DiagnosticKind {
     },
     /// `CS0150`: a constant value was expected (e.g. a non-constant `case` label).
     ConstantExpected,
+    /// `CS0152`: a `switch` has two labels with the same value (or two `default`s).
+    DuplicateCaseLabel {
+        /// The duplicated label, rendered as `case 5` or `default`.
+        label: Box<str>,
+    },
+    /// `CS0163`: control can fall off the end of a non-empty `switch` section into
+    /// the next (C# forbids implicit fall-through).
+    SwitchFallThrough,
+    /// `CS0128`: a local variable of this name is already declared in this scope.
+    DuplicateLocal {
+        /// The redeclared name.
+        name: Box<str>,
+    },
+    /// `CS0136`: a local would shadow one already in an enclosing scope, which C#
+    /// forbids.
+    LocalShadowsEnclosing {
+        /// The shadowing name.
+        name: Box<str>,
+    },
+    /// `CS0201`: an expression that is not assignment, call, increment, decrement,
+    /// or object creation was used as a statement.
+    IllegalStatementExpression,
+    /// `CS0102`: the type already contains a definition for this member name.
+    DuplicateMember {
+        /// The type that declares it twice.
+        type_name: Box<str>,
+        /// The duplicated member name.
+        member: Box<str>,
+    },
+    /// `CS0266`: no implicit conversion exists, but an explicit one (a cast) does.
+    ExplicitConversionExists {
+        /// The source type.
+        from: Box<str>,
+        /// The target type.
+        to: Box<str>,
+    },
+    /// `CS0168` (warning): a local is declared but never used.
+    UnusedLocal {
+        /// The local's name.
+        name: Box<str>,
+    },
+    /// `CS0219` (warning): a local is assigned but its value is never used.
+    UnusedLocalValue {
+        /// The local's name.
+        name: Box<str>,
+    },
+    /// `CS0162` (warning): a statement can never be reached.
+    UnreachableCode,
     /// `CS0120`: an instance member was named through a type, with no object.
     ObjectReferenceRequired {
         /// The qualified member name.
@@ -200,6 +248,16 @@ impl DiagnosticKind {
             DiagnosticKind::AmbiguousCall { .. } => 121,
             DiagnosticKind::Inaccessible { .. } => 122,
             DiagnosticKind::ConstantExpected => 150,
+            DiagnosticKind::DuplicateCaseLabel { .. } => 152,
+            DiagnosticKind::SwitchFallThrough => 163,
+            DiagnosticKind::DuplicateLocal { .. } => 128,
+            DiagnosticKind::LocalShadowsEnclosing { .. } => 136,
+            DiagnosticKind::IllegalStatementExpression => 201,
+            DiagnosticKind::DuplicateMember { .. } => 102,
+            DiagnosticKind::ExplicitConversionExists { .. } => 266,
+            DiagnosticKind::UnusedLocal { .. } => 168,
+            DiagnosticKind::UnusedLocalValue { .. } => 219,
+            DiagnosticKind::UnreachableCode => 162,
             DiagnosticKind::ObjectReferenceRequired { .. } => 120,
             DiagnosticKind::StaticMemberViaInstance { .. } => 176,
             DiagnosticKind::CannotIndex { .. } => 21,
@@ -211,6 +269,19 @@ impl DiagnosticKind {
             DiagnosticKind::UseOfUnassignedLocal { .. } => 165,
             DiagnosticKind::NamespaceMemberNotFound { .. } => 234,
             DiagnosticKind::AmbiguousReference { .. } => 104,
+        }
+    }
+
+    /// Whether this diagnostic stops compilation. Most semantic diagnostics are
+    /// errors; the unused-local diagnostics are warnings (CS0162 unreachable will
+    /// join them once the reachability pass is break-aware).
+    #[must_use]
+    pub fn severity(&self) -> Severity {
+        match self {
+            DiagnosticKind::UnusedLocal { .. }
+            | DiagnosticKind::UnusedLocalValue { .. }
+            | DiagnosticKind::UnreachableCode => Severity::Warning,
+            _ => Severity::Error,
         }
     }
 }
@@ -267,6 +338,50 @@ impl fmt::Display for DiagnosticKind {
                 write!(f, "'{member}' is inaccessible due to its protection level")
             }
             DiagnosticKind::ConstantExpected => write!(f, "A constant value is expected"),
+            DiagnosticKind::DuplicateCaseLabel { label } => write!(
+                f,
+                "The label '{label}:' already occurs in this switch statement"
+            ),
+            DiagnosticKind::SwitchFallThrough => {
+                write!(
+                    f,
+                    "Control cannot fall through from one case label to another"
+                )
+            }
+            DiagnosticKind::DuplicateLocal { name } => write!(
+                f,
+                "A local variable named '{name}' is already defined in this scope"
+            ),
+            DiagnosticKind::LocalShadowsEnclosing { name } => write!(
+                f,
+                "A local variable named '{name}' cannot be declared in this scope \
+                 because it would give a different meaning to '{name}', which is \
+                 already used in a 'parent or current' scope to denote something else"
+            ),
+            DiagnosticKind::IllegalStatementExpression => write!(
+                f,
+                "Only assignment, call, increment, decrement, and new object \
+                 expressions can be used as a statement"
+            ),
+            DiagnosticKind::DuplicateMember { type_name, member } => write!(
+                f,
+                "The type '{type_name}' already contains a definition for '{member}'"
+            ),
+            DiagnosticKind::ExplicitConversionExists { from, to } => write!(
+                f,
+                "Cannot implicitly convert type '{from}' to '{to}'. \
+                 An explicit conversion exists (are you missing a cast?)"
+            ),
+            DiagnosticKind::UnusedLocal { name } => {
+                write!(f, "The variable '{name}' is declared but never used")
+            }
+            DiagnosticKind::UnusedLocalValue { name } => {
+                write!(
+                    f,
+                    "The variable '{name}' is assigned but its value is never used"
+                )
+            }
+            DiagnosticKind::UnreachableCode => write!(f, "Unreachable code detected"),
             DiagnosticKind::ObjectReferenceRequired { member } => write!(
                 f,
                 "An object reference is required for the non-static member '{member}'"

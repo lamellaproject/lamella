@@ -114,8 +114,13 @@ fn compile(options: &Options) -> Result<bool, String> {
     let lines = LineMap::new(&text);
     for diagnostic in &result.diagnostics {
         let (line, column) = lines.position(&text, diagnostic.span.start);
+        let severity = if diagnostic.is_error() {
+            "error"
+        } else {
+            "warning"
+        };
         println!(
-            "{}({line},{column}): error CS{:04}: {}",
+            "{}({line},{column}): {severity} CS{:04}: {}",
             options.source, diagnostic.code, diagnostic.message
         );
     }
@@ -132,7 +137,11 @@ fn compile(options: &Options) -> Result<bool, String> {
             Ok(true)
         }
         None => {
-            if result.diagnostics.is_empty() {
+            if !result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.is_error())
+            {
                 if let Some(error) = result.emit_error {
                     println!("{}: error: not lowered yet: {error:?}", options.source);
                 }

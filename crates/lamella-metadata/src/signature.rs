@@ -15,6 +15,8 @@ pub mod calling {
     pub const EXPLICIT_THIS: u8 = 0x40;
     /// The vararg-sentinel element type, separating fixed from vararg parameters.
     pub const SENTINEL: u8 = 0x41;
+    /// The leading byte of a local-variable signature (II.23.2.6).
+    pub const LOCAL_SIG: u8 = 0x07;
 }
 
 /// The element-type bytes a signature begins with (II.23.1.16).
@@ -73,6 +75,8 @@ pub mod element {
     pub const CMOD_REQD: u8 = 0x1F;
     /// An optional custom modifier; followed by a `TypeDefOrRef` token.
     pub const CMOD_OPT: u8 = 0x20;
+    /// A pinned local-variable constraint, preceding the local's type (II.23.2.6).
+    pub const PINNED: u8 = 0x45;
 }
 
 /// An error decoding a signature.
@@ -270,6 +274,26 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
     })
 }
 
+/// Decodes a local-variable signature blob (II.23.2.6): the LOCAL_SIG byte, the
+/// count, then each local's type. A `pinned` constraint before a local is skipped;
+/// a by-ref local decodes through [`read_type`]'s `BYREF` handling.
+pub fn parse_local_var_sig(blob: &[u8]) -> Result<Vec<SigType>, SigError> {
+    let mut reader = Reader::new(blob);
+    let convention = reader.read_u8()?;
+    if convention != calling::LOCAL_SIG {
+        return Err(SigError::BadCallingConvention(convention));
+    }
+    let count = reader.read_compressed_u32()?;
+    let mut locals = Vec::with_capacity(count as usize);
+    while (locals.len() as u32) < count {
+        while reader.peek_u8()? == element::PINNED {
+            reader.read_u8()?;
+        }
+        locals.push(read_type(&mut reader)?);
+    }
+    Ok(locals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,6 +305,45 @@ mod tests {
         assert_eq!(parse_type(&[element::STRING]), Ok(SigType::String));
         assert_eq!(parse_type(&[element::OBJECT]), Ok(SigType::Object));
         assert_eq!(parse_type(&[element::BOOLEAN]), Ok(SigType::Boolean));
+    }
+
+    #[test]
+    fn local_var_sig_decodes_each_local() {
+        let blob = [
+            calling::LOCAL_SIG,
+            0x03,
+            element::I4,
+            element::R8,
+            element::STRING,
+        ];
+        assert_eq!(
+            parse_local_var_sig(&blob),
+            Ok(alloc::vec![SigType::I4, SigType::R8, SigType::String])
+        );
+    }
+
+    #[test]
+    fn local_var_sig_skips_pinned_and_reads_byref() {
+        let blob = [
+            calling::LOCAL_SIG,
+            0x02,
+            element::PINNED,
+            element::I4,
+            element::BYREF,
+            element::R8,
+        ];
+        assert_eq!(
+            parse_local_var_sig(&blob),
+            Ok(alloc::vec![
+                SigType::I4,
+                SigType::ByRef(alloc::boxed::Box::new(SigType::R8))
+            ])
+        );
+    }
+
+    #[test]
+    fn local_var_sig_rejects_a_wrong_convention() {
+        assert!(parse_local_var_sig(&[calling::FIELD, element::I4]).is_err());
     }
 
     #[test]

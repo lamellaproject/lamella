@@ -55,10 +55,31 @@ pub enum Object {
     },
 }
 
-/// The managed heap: an append-only arena of [`Object`]s.
-#[derive(Debug, Default)]
+/// The initial collection threshold (object count) before the live set is known; it
+/// adapts upward to ~2x the survivors after each collection, so the working set settles.
+#[cfg(feature = "gc")]
+const INITIAL_GC_THRESHOLD: usize = 64;
+
+/// The managed heap: an arena of [`Object`]s. With the `gc` feature, the collector
+/// compacts it; without it, an append-only arena that leaks (the no-GC profile).
+#[derive(Debug)]
+#[cfg_attr(not(feature = "gc"), derive(Default))]
 pub struct Heap {
     objects: Vec<Object>,
+    /// The object count at which the next collection triggers (see
+    /// [`Heap::should_collect`]); adapts after each collection.
+    #[cfg(feature = "gc")]
+    gc_threshold: usize,
+}
+
+#[cfg(feature = "gc")]
+impl Default for Heap {
+    fn default() -> Heap {
+        Heap {
+            objects: Vec::new(),
+            gc_threshold: INITIAL_GC_THRESHOLD,
+        }
+    }
 }
 
 impl Heap {
@@ -68,8 +89,9 @@ impl Heap {
         Heap::default()
     }
 
-    /// Allocates `object` and returns a reference to it. The object is never
-    /// freed yet (the MVP leaks).
+    /// Allocates `object` and returns a reference to it. With the `gc` feature an
+    /// object unreachable from the roots is later reclaimed by [`Heap::collect`];
+    /// without it the arena only grows.
     pub fn alloc(&mut self, object: Object) -> ObjectRef {
         let index = self.objects.len() as u32;
         self.objects.push(object);
@@ -237,6 +259,13 @@ impl Heap {
         self.objects.len()
     }
 
+    /// Whether the live arena has reached the collection threshold -- the trigger the
+    /// interpreter checks at each instruction boundary to decide whether to collect.
+    #[must_use]
+    pub fn should_collect(&self) -> bool {
+        self.objects.len() >= self.gc_threshold
+    }
+
     /// Reclaims every object unreachable from the roots and compacts the survivors.
     pub fn collect<R>(&mut self, mut enumerate_roots: R)
     where
@@ -281,6 +310,11 @@ impl Heap {
             }
         }
         enumerate_roots(&mut |value| remap_value(value, &remap));
+        self.gc_threshold = self
+            .objects
+            .len()
+            .saturating_mul(2)
+            .max(INITIAL_GC_THRESHOLD);
     }
 }
 

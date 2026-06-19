@@ -290,6 +290,24 @@ impl<T: Transport> Dap<T> {
         self.write_word(FP_COMP0, 0)
     }
 
+    /// Replaces every hardware breakpoint with `addresses`, one per comparator (the
+    /// Cortex-M0 BPU has four). Enables the FPB; comparators past `addresses` are cleared,
+    /// and any address beyond the fourth is dropped.
+    pub fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), DapError> {
+        self.write_word(FP_CTRL, 0b11)?;
+        for i in 0..4u32 {
+            let comp = match addresses.get(i as usize) {
+                Some(&address) => {
+                    let bp_match = if address & 0x2 != 0 { 0b10 } else { 0b01 };
+                    (bp_match << 30) | (address & 0x1fff_fffc) | 1
+                }
+                None => 0,
+            };
+            self.write_word(FP_COMP0 + i * 4, comp)?;
+        }
+        Ok(())
+    }
+
     fn read_dp(&mut self, reg: u8) -> Result<u32, DapError> {
         self.transfer_read(proto::dp_read(reg))
     }
@@ -537,5 +555,17 @@ mod tests {
         assert_eq!(&dap.transport.sent[1][4..8], &0b11u32.to_le_bytes());
         let expected = (0b01u32 << 30) | (0x30 & 0x1fff_fffc) | 1;
         assert_eq!(&dap.transport.sent[3][4..8], &expected.to_le_bytes());
+    }
+
+    #[test]
+    fn set_breakpoints_programs_four_comparators() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut dap = Dap::new(Mock::new(vec![ack; 10]));
+        dap.set_breakpoints(&[0x0000_0030, 0x0000_0050]).unwrap();
+        let comp0 = (0b01u32 << 30) | (0x30 & 0x1fff_fffc) | 1;
+        let comp1 = (0b01u32 << 30) | (0x50 & 0x1fff_fffc) | 1;
+        assert_eq!(&dap.transport.sent[3][4..8], &comp0.to_le_bytes());
+        assert_eq!(&dap.transport.sent[5][4..8], &comp1.to_le_bytes());
+        assert_eq!(&dap.transport.sent[9][4..8], &0u32.to_le_bytes());
     }
 }

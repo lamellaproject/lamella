@@ -445,6 +445,10 @@ impl Session {
     /// call stack: a return pops (handing the result back, or finishing); a call
     /// pushes a managed frame or invokes an intrinsic.
     fn advance(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
+        #[cfg(feature = "gc")]
+        if vm.heap().should_collect() {
+            self.collect_garbage(vm);
+        }
         let Session { frames, result, .. } = self;
         let current = match frames.len() {
             0 => return Ok(Status::Done(None)),
@@ -798,11 +802,13 @@ fn method_handlers(module: &Module, id: MethodId) -> Result<&[EhClause], Trap> {
     }
 }
 
-/// A reserved type id for runtime-fault exception objects (divide-by-zero, etc.). No
-/// loaded type has this id, so `catch (SomeUserType)` will not match a fault, while
-/// `catch (Exception)` / a catch-all (unresolvable catch types) will.
-#[cfg(feature = "exceptions")]
-const FAULT_TYPE_ID: u32 = u32::MAX;
+/// A reserved type id for objects whose type is external to this module: a runtime-fault
+/// exception (divide-by-zero, etc.) or a `new` of an external BCL type whose constructor
+/// is an intrinsic (e.g. `System.Exception`). No loaded type has this id, so it has no
+/// field layout or vtable, `sig_dispatch` finds nothing for it (callvirt falls back to the
+/// bound intrinsic), and `catch (SomeUserType)` will not match it while `catch (Exception)`
+/// / a catch-all (unresolvable catch types) will.
+const EXTERNAL_TYPE_ID: u32 = u32::MAX;
 
 /// Converts a catchable runtime fault into a thrown exception object (carrying a
 /// default message), or returns `None` for traps that should still abort execution
@@ -816,7 +822,7 @@ fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
         Trap::InvalidCast => "Unable to cast object to the target type.",
         _ => return None,
     };
-    let exception = vm.heap_mut().alloc_instance(FAULT_TYPE_ID, Vec::new());
+    let exception = vm.heap_mut().alloc_instance(EXTERNAL_TYPE_ID, Vec::new());
     let chars: Vec<u16> = text.bytes().map(u16::from).collect();
     let message = vm.heap_mut().alloc_string(&chars);
     vm.set_exception_message(exception, message);
@@ -1250,11 +1256,17 @@ fn step(
                 return Ok(Flow::Next);
             }
             let ctor = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
-            let type_id = module.method_type(ctor).ok_or(Trap::NoSuchMethod(ctor))?;
-            let defaults = module
-                .type_field_defaults(type_id)
-                .ok_or(Trap::NoSuchMethod(ctor))?
-                .to_vec();
+            let is_intrinsic = matches!(module.method(ctor), Some(Method::Intrinsic { .. }));
+            let (type_id, defaults) = if is_intrinsic {
+                (EXTERNAL_TYPE_ID, Vec::new())
+            } else {
+                let type_id = module.method_type(ctor).ok_or(Trap::NoSuchMethod(ctor))?;
+                let defaults = module
+                    .type_field_defaults(type_id)
+                    .ok_or(Trap::NoSuchMethod(ctor))?
+                    .to_vec();
+                (type_id, defaults)
+            };
             let param_count = module
                 .method(ctor)
                 .ok_or(Trap::NoSuchMethod(ctor))?
@@ -2060,6 +2072,96 @@ fn bounded_index(index: i32, len: usize) -> Result<usize, Trap> {
         .ok()
         .filter(|&index| index < len)
         .ok_or(Trap::IndexOutOfRange(index))
+}
+
+/// Garbage-collection integration: enumerating the interpreter's roots for the heap's
+/// mark-compact collector (the `gc` feature).
+#[cfg(feature = "gc")]
+impl Session {
+    /// Reclaims unreachable objects and compacts the heap, relocating every live
+    /// reference. Enumerates all roots -- each frame's eval stack, locals, arguments, and
+    /// continuation state (`new_object`, `current_exception`, a pending `finally` chain's
+    /// exception, an in-flight multicast), the entry's result, the statics, and the
+    /// exception-message table. Called at an instruction boundary, where the frame state
+    /// is consistent, so anything still live is reachable from these roots.
+    fn collect_garbage(&mut self, vm: &mut Vm) {
+        let mut messages: Vec<Value> = Vec::with_capacity(vm.exception_messages.len() * 2);
+        for (&exception, &message) in &vm.exception_messages {
+            messages.push(Value::Object(exception));
+            messages.push(Value::Object(message));
+        }
+
+        let Vm { heap, statics, .. } = vm;
+        let frames = &mut self.frames;
+        let result = &mut self.result;
+        heap.collect(|visit| {
+            for frame in frames.iter_mut() {
+                for value in frame.stack.iter_mut() {
+                    visit(value);
+                }
+                for value in frame.locals.iter_mut() {
+                    visit(value);
+                }
+                for value in frame.args.iter_mut() {
+                    visit(value);
+                }
+                visit_optional_ref(&mut frame.new_object, visit);
+                visit_optional_ref(&mut frame.current_exception, visit);
+                if let Some(pending) = &mut frame.pending {
+                    match &mut pending.then {
+                        AfterFinally::Catch { exception, .. } | AfterFinally::Unwind(exception) => {
+                            visit_ref(exception, visit);
+                        }
+                        AfterFinally::Goto(_) => {}
+                    }
+                }
+                if let Some((invocations, params)) = &mut frame.multicast {
+                    for (target, _) in invocations.iter_mut() {
+                        visit(target);
+                    }
+                    for value in params.iter_mut() {
+                        visit(value);
+                    }
+                }
+            }
+            if let Some(Some(value)) = result.as_mut() {
+                visit(value);
+            }
+            for value in statics.iter_mut() {
+                visit(value);
+            }
+            for value in messages.iter_mut() {
+                visit(value);
+            }
+        });
+
+        vm.exception_messages = messages
+            .chunks_exact(2)
+            .filter_map(|pair| match (&pair[0], &pair[1]) {
+                (Value::Object(key), Value::Object(value)) => Some((*key, *value)),
+                _ => None,
+            })
+            .collect();
+    }
+}
+
+/// Relocates an optional heap-reference root through the collector's value visitor.
+#[cfg(feature = "gc")]
+fn visit_optional_ref(slot: &mut Option<ObjectRef>, visit: &mut dyn FnMut(&mut Value)) {
+    if let Some(reference) = slot {
+        visit_ref(reference, visit);
+    }
+}
+
+/// Relocates a bare heap-reference root by mirroring it through a temporary `Value`; the
+/// visitor marks it, and on the relocation pass rewrites the contained `ObjectRef`.
+#[cfg(feature = "gc")]
+fn visit_ref(reference: &mut ObjectRef, visit: &mut dyn FnMut(&mut Value)) {
+    let mut wrapped = Value::Object(*reference);
+    visit(&mut wrapped);
+    if let Value::Object(new) = wrapped {
+        *reference = new;
+    }
 }
 
 #[cfg(test)]

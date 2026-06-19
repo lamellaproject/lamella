@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod cil;
+pub mod resolver;
 pub mod target;
 
 mod regalloc;

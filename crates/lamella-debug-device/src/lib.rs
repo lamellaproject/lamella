@@ -6,57 +6,92 @@
 use core::cell::RefCell;
 
 use lamella_cmsis_dap::{Dap, Transport};
-use lamella_debug_backend::{DebugBackend, Disassembled, Frame, Register, Scope, Stop, Variable};
+use lamella_debug_backend::{
+    DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
+};
 
 /// Drives a Cortex-M target over a CMSIS-DAP probe as a [`DebugBackend`]. The trait's
 /// inspection methods take `&self` (suited to the interpreter's in-memory state), so the
 /// probe sits behind a `RefCell` for the I/O those methods must perform.
 pub struct DeviceBackend<T: Transport> {
     dap: RefCell<Dap<T>>,
-    /// `(native offset, CIL index)` for the loaded method, ascending by offset.
+    /// `(native offset, source line)` for the loaded method, ascending by offset.
     lines: Vec<(u32, u32)>,
     /// The loaded method's flash base, subtracted from a PC to index `lines`.
     base: u32,
     /// The method's display name.
     name: String,
+    /// The source file the method came from (for source locations), empty if unknown.
+    file: String,
+    /// Semihosting output captured from the target, drained by `take_output`.
+    output: String,
 }
 
 impl<T: Transport> DeviceBackend<T> {
-    /// Wraps a probe with the loaded method's line table (native offset -> CIL index),
-    /// its flash `base`, and a display `name`.
-    pub fn new(dap: Dap<T>, lines: Vec<(u32, u32)>, base: u32, name: String) -> Self {
+    /// Wraps a probe with the loaded method's line table (native offset -> source line),
+    /// its flash `base`, a display `name`, and the source `file` it came from.
+    pub fn new(dap: Dap<T>, lines: Vec<(u32, u32)>, base: u32, name: String, file: String) -> Self {
         DeviceBackend {
             dap: RefCell::new(dap),
             lines,
             base,
             name,
+            file,
+            output: String::new(),
         }
     }
 
-    /// The CIL byte offset whose native code contains `offset` (the last entry at or
-    /// before it).
-    fn cil_offset_at(&self, offset: u32) -> u32 {
+    /// The 1-based source line whose native code contains `offset` (the last entry at or
+    /// before it), or 0 if unknown.
+    fn source_line_at(&self, offset: u32) -> u32 {
         self.lines
             .iter()
             .rev()
             .find(|&&(start, _)| start <= offset)
-            .map_or(0, |&(_, cil)| cil)
+            .map_or(0, |&(_, line)| line)
     }
 
-    /// Resumes and polls until the core halts, mapping the outcome to a [`Stop`].
-    fn run_until_halt(&mut self) -> Stop {
-        let dap = self.dap.get_mut();
-        if dap.resume().is_err() {
-            return Stop::Fault("resume failed".into());
-        }
-        for _ in 0..100_000 {
-            match dap.is_halted() {
-                Ok(true) => return Stop::Breakpoint,
-                Ok(false) => {}
-                Err(_) => return Stop::Fault("could not read halt status".into()),
+    /// Services a halt: if the core stopped at a semihosting `BKPT 0xAB`, captures a
+    /// `SYS_WRITE0` string into the output buffer, steps past it, resumes, and reports
+    /// `Some(true)` (keep running); a non-semihosting halt is `Some(false)` (a real
+    /// stop); a probe error is `None`.
+    fn service_semihosting(&mut self) -> Option<bool> {
+        let string_bytes = {
+            let dap = self.dap.get_mut();
+            let pc = dap.read_core_reg(15).ok()?;
+            let word = dap.read_word(pc & !3).ok()?;
+            let halfword = if pc & 2 != 0 {
+                (word >> 16) as u16
+            } else {
+                word as u16
+            };
+            if halfword != 0xBEAB {
+                return Some(false);
             }
+            let bytes = if dap.read_core_reg(0).ok()? == 0x04 {
+                let mut addr = dap.read_core_reg(1).ok()?;
+                let mut collected = Vec::new();
+                while collected.len() < 4096 {
+                    let w = dap.read_word(addr & !3).ok()?;
+                    let byte = (w >> ((addr & 3) * 8)) as u8;
+                    if byte == 0 {
+                        break;
+                    }
+                    collected.push(byte);
+                    addr = addr.wrapping_add(1);
+                }
+                Some(collected)
+            } else {
+                None
+            };
+            dap.write_core_reg(15, pc.wrapping_add(2)).ok()?;
+            dap.resume().ok()?;
+            bytes
+        };
+        if let Some(bytes) = string_bytes {
+            self.output.push_str(&String::from_utf8_lossy(&bytes));
         }
-        Stop::Fault("target did not halt".into())
+        Some(true)
     }
 }
 
@@ -70,7 +105,22 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn resume(&mut self) -> Stop {
-        self.run_until_halt()
+        match self.dap.get_mut().resume() {
+            Ok(()) => Stop::Running,
+            Err(_) => Stop::Fault("resume failed".into()),
+        }
+    }
+
+    fn poll(&mut self) -> Stop {
+        match self.dap.get_mut().is_halted() {
+            Ok(false) => Stop::Running,
+            Ok(true) => match self.service_semihosting() {
+                Some(true) => Stop::Running,
+                Some(false) => Stop::Breakpoint,
+                None => Stop::Fault("semihosting service failed".into()),
+            },
+            Err(_) => Stop::Fault("could not read halt status".into()),
+        }
     }
 
     fn step(&mut self) -> Stop {
@@ -85,25 +135,42 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn set_breakpoints(&mut self, addresses: &[u64]) {
-        let dap = self.dap.get_mut();
-        match addresses.first() {
-            Some(&addr) => {
-                let _ = dap.set_breakpoint(addr as u32);
-            }
-            None => {
-                let _ = dap.clear_breakpoint();
-            }
-        }
+        let words: Vec<u32> = addresses.iter().map(|&a| a as u32).collect();
+        let _ = self.dap.get_mut().set_breakpoints(&words);
     }
 
     fn stack(&self) -> Vec<Frame> {
         let pc = self.dap.borrow_mut().read_core_reg(15).unwrap_or(0);
-        let cil = self.cil_offset_at(pc.saturating_sub(self.base));
+        let line = self.source_line_at(pc.saturating_sub(self.base));
         vec![Frame {
             address: u64::from(pc),
             name: self.name.clone(),
-            line: cil + 1,
+            line,
         }]
+    }
+
+    fn resolve_source_breakpoint(&self, _document: &str, line: u32) -> Option<u64> {
+        self.lines
+            .iter()
+            .find(|&&(_, src)| src == line)
+            .map(|&(native, _)| u64::from(self.base + native))
+    }
+
+    fn source_location(&self, address: u64) -> Option<SourceLocation> {
+        if self.file.is_empty() {
+            return None;
+        }
+        let line = self.source_line_at((address as u32).saturating_sub(self.base));
+        if line == 0 {
+            return None;
+        }
+        Some(SourceLocation {
+            file: self.file.clone(),
+            line,
+            column: 1,
+            end_line: line,
+            end_column: 1,
+        })
     }
 
     fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
@@ -169,6 +236,10 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn take_output(&mut self) -> Option<String> {
-        None
+        if self.output.is_empty() {
+            None
+        } else {
+            Some(core::mem::take(&mut self.output))
+        }
     }
 }

@@ -14,6 +14,10 @@ workspace = true
 lamella-debug-backend = { path = "../lamella-debug-backend" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 
-# The device DAP server binary links the adapter + wire protocol WITHOUT the interpreter.
+# The device DAP server binary links the adapter + wire protocol WITHOUT the interpreter,
+# and lowers the deployed program (lamella-aot) + reads its Portable PDB (lamella-metadata)
+# to compose the native -> source-line mapping at launch.
 lamella-dap = { path = "../lamella-dap", default-features = false }
 lamella-usbhid = { path = "../lamella-usbhid" }
+lamella-aot = { path = "../lamella-aot" }
+lamella-metadata = { path = "../lamella-metadata" }
