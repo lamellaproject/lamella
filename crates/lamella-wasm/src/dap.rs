@@ -17,14 +17,17 @@ thread_local! {
 
 /// Loads a program and starts a debug session, returning a 1-based handle, or 0 on
 /// a load failure.
-fn create(bytes: &[u8]) -> u32 {
+fn create(bytes: &[u8], pdb: Option<Vec<u8>>) -> u32 {
     let Ok(assembly) = Assembly::read(bytes) else {
         return 0;
     };
     let Ok(program) = load(&assembly) else {
         return 0;
     };
-    let debugger = Debugger::new(program.module, program.entry);
+    let debugger = match pdb {
+        Some(pdb_bytes) => Debugger::with_source(program.module, program.entry, pdb_bytes),
+        None => Debugger::new(program.module, program.entry),
+    };
     SESSIONS.with(|sessions| {
         let mut sessions = sessions.borrow_mut();
         sessions.push(Some(debugger));
@@ -68,7 +71,26 @@ fn dispose(handle: u32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn lamella_dap_create(ptr: *const u8, len: usize) -> u32 {
     let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
-    create(bytes)
+    create(bytes, None)
+}
+
+/// Starts a source-mapped debug session for the assembly at `prog_ptr..prog_ptr + prog_len`
+/// with its Portable PDB at `pdb_ptr..pdb_ptr + pdb_len`; returns a 1-based handle, or 0 on
+/// failure. The PDB lights up source breakpoints, source-located frames, and named locals --
+/// the browser has no filesystem for a `.pdb` sidecar, so it passes the bytes in memory.
+///
+/// # Safety
+/// Both pointer/length pairs must be buffers the host filled via prior `lamella_alloc` calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_dap_create_with_pdb(
+    prog_ptr: *const u8,
+    prog_len: usize,
+    pdb_ptr: *const u8,
+    pdb_len: usize,
+) -> u32 {
+    let bytes = unsafe { core::slice::from_raw_parts(prog_ptr, prog_len) };
+    let pdb_bytes = unsafe { core::slice::from_raw_parts(pdb_ptr, pdb_len) };
+    create(bytes, Some(pdb_bytes.to_vec()))
 }
 
 /// Dispatches a DAP request (JSON at `ptr..ptr + len`) to session `handle`,
@@ -94,9 +116,10 @@ pub extern "C" fn lamella_dap_dispose(handle: u32) {
 #[cfg(feature = "selftest")]
 #[unsafe(no_mangle)]
 pub extern "C" fn lamella_dap_selftest() -> i32 {
-    let handle = create(include_bytes!(
-        "../../lamella-load/tests/fixtures/hello.dll"
-    ));
+    let handle = create(
+        include_bytes!("../../lamella-load/tests/fixtures/hello.dll"),
+        None,
+    );
     if handle == 0 {
         return 0;
     }
@@ -136,7 +159,7 @@ mod tests {
             eprintln!("hello.dll absent; skipping");
             return;
         };
-        let handle = create(&bytes);
+        let handle = create(&bytes, None);
         assert_ne!(handle, 0);
 
         let init = reply_text(
@@ -157,5 +180,26 @@ mod tests {
         dispose(handle);
         let after = request(handle, br#"{"type":"request","seq":4,"command":"threads"}"#);
         assert_eq!(after, b"[]");
+    }
+
+    #[test]
+    fn create_with_pdb_starts_a_runnable_session() {
+        let Some(bytes) = fixture("hello.dll") else {
+            eprintln!("hello.dll absent; skipping");
+            return;
+        };
+        let handle = create(&bytes, Some(Vec::new()));
+        assert_ne!(handle, 0);
+        reply_text(
+            handle,
+            br#"{"type":"request","seq":1,"command":"initialize"}"#,
+        );
+        reply_text(handle, br#"{"type":"request","seq":2,"command":"launch"}"#);
+        let ran = reply_text(
+            handle,
+            br#"{"type":"request","seq":3,"command":"continue"}"#,
+        );
+        assert!(ran.contains("Hello, World!"), "reply was {ran}");
+        dispose(handle);
     }
 }

@@ -46,6 +46,10 @@ pub struct Tokens {
     /// The enum types declared in this module, by key. Their signatures lower to the
     /// underlying integer type (v1: `int32`), so they need no `TypeDef` token.
     enums: BTreeSet<String>,
+    /// The struct (value) types declared in this module, by key. Their signatures are
+    /// `ValueType` of the type's token, and a value-type local is addressed via
+    /// `ldloca` for field access.
+    structs: BTreeSet<String>,
 }
 
 impl Tokens {
@@ -75,6 +79,17 @@ impl Tokens {
     #[must_use]
     pub fn is_enum(&self, ty: &TypeSymbol) -> bool {
         self.enums.contains(&type_key(ty))
+    }
+
+    /// Records that this type is a struct (a value type with `ValueType` signatures).
+    pub fn insert_struct(&mut self, ty: &TypeSymbol) {
+        self.structs.insert(type_key(ty));
+    }
+
+    /// Whether this type is a struct (value type) declared in the module.
+    #[must_use]
+    pub fn is_struct(&self, ty: &TypeSymbol) -> bool {
+        self.structs.contains(&type_key(ty))
     }
 
     /// Records `token` as the method named by this identity.

@@ -1,5 +1,7 @@
 //! A tree-of-frames CIL interpreter over a hand-built method body.
 
+#[cfg(feature = "bcl")]
+use crate::module::IntrinsicFn;
 use crate::module::{Method, MethodId, Module};
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
@@ -32,6 +34,13 @@ pub struct Vm {
     /// `Exception.Message` works without modeling mscorlib's field layout (and so the
     /// message-stripping knob has one place to act). Keyed by the exception object.
     exception_messages: BTreeMap<ObjectRef, ObjectRef>,
+    /// Whether a finalizer is currently running: the collector is paused (a GC triggered
+    /// from within a finalizer is a no-op) so the in-flight f-reachable list stays valid.
+    #[cfg(feature = "finalizers")]
+    finalizing: bool,
+    /// Set by `GC.Collect`: the next safepoint collects regardless of the heap threshold.
+    #[cfg(feature = "gc")]
+    force_collect: bool,
 }
 
 impl Vm {
@@ -39,6 +48,18 @@ impl Vm {
     #[must_use]
     pub fn new() -> Vm {
         Vm::default()
+    }
+
+    /// Requests a collection at the next safepoint (`GC.Collect`).
+    #[cfg(feature = "gc")]
+    pub fn request_collect(&mut self) {
+        self.force_collect = true;
+    }
+
+    /// Takes and clears any pending forced-collection request.
+    #[cfg(feature = "gc")]
+    pub fn take_force_collect(&mut self) -> bool {
+        core::mem::take(&mut self.force_collect)
     }
 
     /// The managed heap.
@@ -132,6 +153,9 @@ struct Frame {
     /// A multicast-delegate invocation in progress: the remaining `(target, method)`
     /// invocations and the shared arguments, so each is called as the previous returns.
     multicast: Option<Multicast>,
+    /// A `constrained.` prefix awaiting the next `callvirt`: the type to resolve the call
+    /// against (the receiver stays a managed pointer to the value type).
+    pending_constraint: Option<Token>,
 }
 
 /// What executing one instruction decided.
@@ -205,6 +229,13 @@ enum Flow {
         /// The value to store.
         value: Value,
     },
+    /// `cpobj`: copy the value-type instance at `src` to `dest` (both managed pointers).
+    CopyObj {
+        /// The destination location to write.
+        dest: Location,
+        /// The source location to read.
+        src: Location,
+    },
     /// A multicast delegate's `Invoke`: call each `(target, method)` in turn (each with
     /// `params`); the delegate's result is the last one's.
     InvokeMulticast {
@@ -266,6 +297,7 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
             Flow::InitObj { .. } => return Err(Trap::Unsupported(Opcode::Initobj)),
             Flow::LoadObj { .. } => return Err(Trap::Unsupported(Opcode::Ldobj)),
             Flow::StoreObj { .. } => return Err(Trap::Unsupported(Opcode::Stobj)),
+            Flow::CopyObj { .. } => return Err(Trap::Unsupported(Opcode::Cpobj)),
             Flow::InvokeMulticast { .. } => return Err(Trap::Unsupported(Opcode::Callvirt)),
         }
     }
@@ -446,8 +478,11 @@ impl Session {
     /// pushes a managed frame or invokes an intrinsic.
     fn advance(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
         #[cfg(feature = "gc")]
-        if vm.heap().should_collect() {
-            self.collect_garbage(vm);
+        {
+            let forced = vm.take_force_collect();
+            if forced || vm.heap().should_collect() {
+                self.collect_garbage(module, vm);
+            }
         }
         let Session { frames, result, .. } = self;
         let current = match frames.len() {
@@ -513,14 +548,25 @@ impl Session {
                 Some(Method::Intrinsic { func, .. }) => {
                     let func = *func;
                     let args = deref_byref_args(frames, vm, args);
-                    if let Some(value) = func(vm, &args)? {
-                        frames
-                            .last_mut()
-                            .ok_or(Trap::CallStackOverflow)?
-                            .stack
-                            .push(value);
+                    match func(vm, module, &args) {
+                        Ok(result) => {
+                            if let Some(value) = result {
+                                frames
+                                    .last_mut()
+                                    .ok_or(Trap::CallStackOverflow)?
+                                    .stack
+                                    .push(value);
+                            }
+                            Ok(Status::Running)
+                        }
+                        #[cfg(feature = "exceptions")]
+                        Err(trap) => match catchable_fault(&trap, vm) {
+                            Some(exception) => raise(frames, module, vm, exception),
+                            None => Err(trap),
+                        },
+                        #[cfg(not(feature = "exceptions"))]
+                        Err(trap) => Err(trap),
                     }
-                    Ok(Status::Running)
                 }
                 None => Err(Trap::NoSuchMethod(method)),
             },
@@ -542,7 +588,7 @@ impl Session {
                     let mut full_args = Vec::with_capacity(args.len() + 1);
                     full_args.push(Value::Object(object));
                     full_args.extend(args);
-                    func(vm, &full_args)?;
+                    func(vm, module, &full_args)?;
                     frames
                         .last_mut()
                         .ok_or(Trap::CallStackOverflow)?
@@ -629,6 +675,11 @@ impl Session {
             }
             Flow::StoreObj { location, value } => {
                 write_location_value(frames, vm, location, value)?;
+                Ok(Status::Running)
+            }
+            Flow::CopyObj { dest, src } => {
+                let value = read_byref(frames, vm, src);
+                write_location_value(frames, vm, dest, value)?;
                 Ok(Status::Running)
             }
             Flow::InvokeMulticast {
@@ -735,6 +786,36 @@ fn read_byref(frames: &[Frame], vm: &Vm, location: Location) -> Value {
     read_location_value(frames, vm, location).unwrap_or(Value::Null)
 }
 
+/// The underlying integer of an enum value at a managed pointer this frame can reach (a
+/// local/argument of this frame, or a heap field/element/static) -- for Enum.ToString.
+#[cfg(feature = "bcl")]
+fn read_enum_value(frame: &Frame, frame_index: usize, vm: &Vm, location: Location) -> Option<i64> {
+    let value = match location {
+        Location::Local { frame: f, slot } if f == frame_index => frame.locals.get(slot).cloned(),
+        Location::Arg { frame: f, slot } if f == frame_index => frame.args.get(slot).cloned(),
+        Location::Field { object, slot } => vm.heap().instance_field(object, slot),
+        Location::Element { array, index } => vm.heap().array_get(array, index),
+        Location::Static { slot } => vm.static_field(slot),
+        _ => None,
+    }?;
+    match value {
+        Value::Int32(n) => Some(i64::from(n)),
+        Value::Int64(n) => Some(n),
+        _ => None,
+    }
+}
+
+/// Whether `method` is the `Object.ToString` intrinsic, so a `constrained.` Enum.ToString
+/// can be rendered as the constant name rather than the boxed value's text.
+#[cfg(feature = "bcl")]
+fn is_object_to_string(module: &Module, method: MethodId) -> bool {
+    if let Some(Method::Intrinsic { func, .. }) = module.method(method) {
+        core::ptr::fn_addr_eq(*func, crate::intrinsics::object_to_string as IntrinsicFn)
+    } else {
+        false
+    }
+}
+
 /// Stores `value` at `slot`, growing `slots` with `Null` placeholders to reach it.
 fn set_slot(slots: &mut Vec<Value>, slot: usize, value: Value) {
     while slots.len() <= slot {
@@ -820,6 +901,7 @@ fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
         Trap::NullReference => "Object reference not set to an instance of an object.",
         Trap::IndexOutOfRange(_) => "Index was outside the bounds of the array.",
         Trap::InvalidCast => "Unable to cast object to the target type.",
+        Trap::InvalidArgument => "Requested value was not found.",
         _ => return None,
     };
     let exception = vm.heap_mut().alloc_instance(EXTERNAL_TYPE_ID, Vec::new());
@@ -1217,14 +1299,35 @@ fn step(
                 }
             };
             let args = frame.take_args(arg_count)?;
-            let this = object_ref(
-                args.first().ok_or(Trap::StackUnderflow)?.clone(),
-                Opcode::Callvirt,
-            )?;
-            let runtime_type = vm.heap().type_of(this);
             let sig_key = target_info.map(|(key, _)| key);
+            let constraint = frame.pending_constraint.take();
+            let runtime_type = match constraint {
+                Some(constraint) => module.type_id_of(constraint),
+                None => {
+                    let this = object_ref(
+                        args.first().ok_or(Trap::StackUnderflow)?.clone(),
+                        Opcode::Callvirt,
+                    )?;
+                    vm.heap().type_of(this)
+                }
+            };
             let method = resolve_callvirt(module, static_method, sig_key, runtime_type)
                 .ok_or(Trap::UnresolvedCall(token))?;
+            #[cfg(feature = "bcl")]
+            if let Some(constraint) = constraint {
+                if is_object_to_string(module, method) {
+                    if let Some(&Value::ByRef(location)) = args.first() {
+                        if let Some(value) = read_enum_value(frame, frame_index, vm, location) {
+                            if let Some(name) = module.enum_value_name(constraint.0, value) {
+                                let chars: Vec<u16> = name.encode_utf16().collect();
+                                let string = vm.heap_mut().alloc_string(&chars);
+                                frame.stack.push(Value::Object(string));
+                                return Ok(Flow::Next);
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(Flow::Call { method, args });
         }
 
@@ -1274,6 +1377,10 @@ fn step(
                 .saturating_sub(1);
             let args = frame.take_args(param_count)?;
             let object = vm.heap_mut().alloc_instance(type_id, defaults);
+            #[cfg(feature = "finalizers")]
+            if module.finalizer_of(type_id).is_some() {
+                vm.heap_mut().register_finalizer(object);
+            }
             return Ok(Flow::NewObj { ctor, object, args });
         }
 
@@ -1395,6 +1502,26 @@ fn step(
                 Value::Null => return Err(Trap::NullReference),
                 _ => return Err(Trap::TypeMismatch(Opcode::Stobj)),
             }
+        }
+        Opcode::Cpobj => {
+            let src = match frame.pop()? {
+                Value::ByRef(location) => location,
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::Cpobj)),
+            };
+            match frame.pop()? {
+                Value::ByRef(dest) => return Ok(Flow::CopyObj { dest, src }),
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::Cpobj)),
+            }
+        }
+        Opcode::Constrained => {
+            frame.pending_constraint = Some(token_operand(instruction)?);
+        }
+        Opcode::Readonly => {}
+        Opcode::Ldtoken => {
+            let token = token_operand(instruction)?;
+            frame.stack.push(Value::NativeInt(i64::from(token.0)));
         }
 
         Opcode::Ldsfld => {
@@ -1541,6 +1668,7 @@ impl Frame {
             current_exception: None,
             pending: None,
             multicast: None,
+            pending_constraint: None,
         }
     }
 
@@ -2084,7 +2212,13 @@ impl Session {
     /// exception, an in-flight multicast), the entry's result, the statics, and the
     /// exception-message table. Called at an instruction boundary, where the frame state
     /// is consistent, so anything still live is reachable from these roots.
-    fn collect_garbage(&mut self, vm: &mut Vm) {
+    fn collect_garbage(&mut self, module: &Module, vm: &mut Vm) {
+        #[cfg(feature = "finalizers")]
+        if vm.finalizing {
+            return;
+        }
+        #[cfg(not(feature = "finalizers"))]
+        let _ = module;
         let mut messages: Vec<Value> = Vec::with_capacity(vm.exception_messages.len() * 2);
         for (&exception, &message) in &vm.exception_messages {
             messages.push(Value::Object(exception));
@@ -2094,7 +2228,7 @@ impl Session {
         let Vm { heap, statics, .. } = vm;
         let frames = &mut self.frames;
         let result = &mut self.result;
-        heap.collect(|visit| {
+        let finalizable = heap.collect(|visit| {
             for frame in frames.iter_mut() {
                 for value in frame.stack.iter_mut() {
                     visit(value);
@@ -2142,6 +2276,27 @@ impl Session {
                 _ => None,
             })
             .collect();
+
+        #[cfg(not(feature = "finalizers"))]
+        let _ = finalizable;
+        #[cfg(feature = "finalizers")]
+        if !finalizable.is_empty() {
+            vm.finalizing = true;
+            for object in finalizable {
+                let Some(type_id) = vm.heap().type_of(object) else {
+                    continue;
+                };
+                let Some(finalize) = module.finalizer_of(type_id) else {
+                    continue;
+                };
+                if let Ok(mut session) =
+                    Session::new(module, finalize, alloc::vec![Value::Object(object)])
+                {
+                    let _ = session.run(module, vm);
+                }
+            }
+            vm.finalizing = false;
+        }
     }
 }
 

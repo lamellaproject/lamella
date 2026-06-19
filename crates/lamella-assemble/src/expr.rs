@@ -41,7 +41,21 @@ pub fn emit_expression(
             _ => {
                 emit_expression(left, frame, tokens, out)?;
                 emit_expression(right, frame, tokens, out)?;
-                emit_binary(*operator, out)
+                let is_string =
+                    |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(SpecialType::String));
+                if matches!(operator, BinaryOperator::Add)
+                    && is_string(&left.ty)
+                    && is_string(&right.ty)
+                {
+                    let string = TypeSymbol::Special(SpecialType::String);
+                    let token = tokens
+                        .method(&string, "Concat", &[string.clone(), string.clone()])
+                        .ok_or(EmitError::Unsupported("String.Concat was not minted"))?;
+                    out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+                    Ok(())
+                } else {
+                    emit_binary(*operator, out)
+                }
             }
         },
         BoundExprKind::Unary { operator, operand } => {
@@ -56,7 +70,17 @@ pub fn emit_expression(
             conversion,
         } => {
             emit_expression(operand, frame, tokens, out)?;
-            emit_conversion(*conversion, &expr.ty, out)
+            if matches!(conversion, ConversionKind::Boxing) {
+                let token = tokens
+                    .type_token(&operand.ty)
+                    .ok_or(EmitError::Unsupported(
+                        "boxing a value type with no metadata token",
+                    ))?;
+                out.push(Instruction::new(Opcode::Box, Operand::Token(token)));
+                Ok(())
+            } else {
+                emit_conversion(*conversion, &expr.ty, out)
+            }
         }
         BoundExprKind::Cast { operand } => {
             emit_expression(operand, frame, tokens, out)?;
@@ -303,10 +327,19 @@ fn emit_call(
     let Some(method) = method else {
         return Err(EmitError::Unsupported("a call that did not resolve"));
     };
+    let on_value_type = tokens.is_struct(&method.declaring_type);
+    let is_base_call = matches!(
+        &callee.kind,
+        BoundExprKind::MethodGroup { receiver, .. } if matches!(receiver.kind, BoundExprKind::Base)
+    );
     if !method.is_static {
         match &callee.kind {
             BoundExprKind::MethodGroup { receiver, .. } => {
-                emit_expression(receiver, frame, tokens, out)?;
+                if on_value_type {
+                    emit_value_type_receiver(receiver, frame, tokens, out)?;
+                } else {
+                    emit_expression(receiver, frame, tokens, out)?;
+                }
             }
             _ => return Err(EmitError::Unsupported("an instance call with no receiver")),
         }
@@ -319,7 +352,7 @@ fn emit_call(
         .ok_or(EmitError::Unsupported(
             "call to a method outside this module",
         ))?;
-    let opcode = if method.is_static {
+    let opcode = if method.is_static || on_value_type || is_base_call {
         Opcode::Call
     } else {
         Opcode::Callvirt
@@ -352,7 +385,7 @@ fn emit_field_load(
     if field.is_static {
         out.push(Instruction::new(Opcode::Ldsfld, Operand::Token(token)));
     } else {
-        emit_expression(receiver, frame, tokens, out)?;
+        emit_field_receiver(field, receiver, frame, tokens, out)?;
         out.push(Instruction::new(Opcode::Ldfld, Operand::Token(token)));
     }
     Ok(())
@@ -378,7 +411,7 @@ pub(crate) fn emit_field_store(
         emit_expression(value, frame, tokens, out)?;
         out.push(Instruction::new(Opcode::Stsfld, Operand::Token(token)));
     } else {
-        emit_expression(receiver, frame, tokens, out)?;
+        emit_field_receiver(field, receiver, frame, tokens, out)?;
         emit_expression(value, frame, tokens, out)?;
         out.push(Instruction::new(Opcode::Stfld, Operand::Token(token)));
     }
@@ -467,6 +500,13 @@ fn emit_cast(
     if from == to {
         return Ok(());
     }
+    if matches!(from, TypeSymbol::Special(SpecialType::Object)) && is_value_type(to, tokens) {
+        let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
+            "unboxing to a value type with no metadata token",
+        ))?;
+        out.push(Instruction::new(Opcode::UnboxAny, Operand::Token(token)));
+        return Ok(());
+    }
     if tokens.is_enum(to) {
         out.push(Instruction::simple(Opcode::ConvI4));
         return Ok(());
@@ -476,6 +516,19 @@ fn emit_cast(
         return Ok(());
     }
     Err(EmitError::Unsupported("this cast is not lowered yet"))
+}
+
+/// Whether `ty` is a value type that boxes/unboxes by token: a numeric/`bool`/`char`
+/// primitive or a module struct (an enum is erased to its underlying integer, so it
+/// is excluded here).
+pub(crate) fn is_value_type(ty: &TypeSymbol, tokens: &Tokens) -> bool {
+    match ty {
+        TypeSymbol::Special(special) => !matches!(
+            special,
+            SpecialType::Object | SpecialType::String | SpecialType::Void
+        ),
+        _ => tokens.is_struct(ty),
+    }
 }
 
 /// Emits the instruction (if any) for a conversion whose target is `target`.
@@ -518,6 +571,80 @@ fn numeric_conversion(target: &TypeSymbol) -> Result<Opcode, EmitError> {
             ));
         }
     })
+}
+
+/// Emits the address of a local or parameter (`ldloca`/`ldarga`), for accessing a
+/// field of a value type in place.
+fn emit_local_address(
+    name: &str,
+    frame: &Frame,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    match frame.slot(name) {
+        Some(Slot::Argument(slot)) => {
+            out.push(Instruction::new(Opcode::Ldarga, Operand::Variable(slot)));
+        }
+        Some(Slot::Local(slot)) => {
+            out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+        }
+        None => {
+            return Err(EmitError::Unsupported(
+                "address of a name with no frame slot",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Emits a field-access receiver. A field of a value type (a struct) held in a local
+/// or parameter is reached through its address (`ldloca`/`ldarga`), so a read avoids a
+/// copy and a write stores back in place; every other receiver is emitted as a value.
+fn emit_field_receiver(
+    field: &FieldReference,
+    receiver: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if tokens.is_struct(&field.declaring_type) {
+        return emit_value_type_receiver(receiver, frame, tokens, out);
+    }
+    emit_expression(receiver, frame, tokens, out)
+}
+
+/// Emits the receiver of a value-type member (a field or method) as an address: a
+/// local or parameter is taken by `ldloca`/`ldarga`; a nested value-type field is the
+/// address of its container then `ldflda`, so a write stores in place; `this`/`base`
+/// is already a managed pointer (`ldarg.0`), so it is emitted as a value.
+fn emit_value_type_receiver(
+    receiver: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    match &receiver.kind {
+        BoundExprKind::Local(name) => emit_local_address(name, frame, out),
+        BoundExprKind::FieldAccess {
+            receiver: container,
+            field: Some(field),
+            ..
+        } => {
+            if tokens.is_struct(&container.ty) {
+                emit_value_type_receiver(container, frame, tokens, out)?;
+            } else {
+                emit_expression(container, frame, tokens, out)?;
+            }
+            let token =
+                tokens
+                    .field(&field.declaring_type, &field.name)
+                    .ok_or(EmitError::Unsupported(
+                        "address of a field outside this module",
+                    ))?;
+            out.push(Instruction::new(Opcode::Ldflda, Operand::Token(token)));
+            Ok(())
+        }
+        _ => emit_expression(receiver, frame, tokens, out),
+    }
 }
 
 pub(crate) fn emit_local(

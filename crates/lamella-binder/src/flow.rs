@@ -3,6 +3,8 @@
 use crate::bound::{BoundExpr, BoundExprKind};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::statement::{BoundStmt, BoundStmtKind, BoundSwitchLabel};
+use crate::symbols::{Model, TypeKind};
+use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
@@ -433,21 +435,36 @@ fn loop_breaks(stmt: &BoundStmt) -> bool {
 
 /// Reports `CS0165` for every read of a local that is not definitely assigned on
 /// all paths to it (clause 12, Annex A). `parameters` start definitely assigned.
+/// `model` distinguishes a struct (whose field assignment assigns the local) from a
+/// reference type (whose field assignment reads the local).
 #[must_use]
-pub fn check_definite_assignment(body: &BoundStmt, parameters: &[Box<str>]) -> Vec<Diagnostic> {
+pub fn check_definite_assignment(
+    body: &BoundStmt,
+    parameters: &[Box<str>],
+    model: &Model,
+) -> Vec<Diagnostic> {
     let mut analyzer = Analyzer {
         diagnostics: Vec::new(),
+        model,
     };
     let assigned: Assigned = parameters.iter().cloned().collect();
     analyzer.statement(body, assigned);
     analyzer.diagnostics
 }
 
-struct Analyzer {
+struct Analyzer<'a> {
     diagnostics: Vec<Diagnostic>,
+    model: &'a Model,
 }
 
-impl Analyzer {
+impl Analyzer<'_> {
+    /// Whether `ty` is a struct, whose fields are assigned in place (12.x).
+    fn is_struct(&self, ty: &TypeSymbol) -> bool {
+        self.model
+            .get_by_symbol(ty)
+            .is_some_and(|info| info.kind == TypeKind::Struct)
+    }
+
     fn statement(&mut self, stmt: &BoundStmt, assigned: Assigned) -> Flow {
         let span = stmt.span;
         match &stmt.kind {
@@ -731,6 +748,12 @@ impl Analyzer {
                 BoundExprKind::Local(name) => {
                     assigned.insert(name.clone());
                 }
+                BoundExprKind::FieldAccess { receiver, .. } => match &receiver.kind {
+                    BoundExprKind::Local(name) if self.is_struct(&receiver.ty) => {
+                        assigned.insert(name.clone());
+                    }
+                    _ => self.expression(target, assigned, span),
+                },
                 _ => self.expression(target, assigned, span),
             }
         } else {

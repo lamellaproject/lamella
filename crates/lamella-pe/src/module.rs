@@ -359,6 +359,44 @@ impl ImageBuilder {
         Token::new(table::METHOD_DEF, row)
     }
 
+    /// Adds an abstract `MethodDef` (RVA 0, no body) -- an interface method or an
+    /// abstract class method. `flags` carries Abstract | Virtual.
+    pub fn add_abstract_method(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {
+        let name = self.strings.intern(name);
+        let signature = self.blobs.intern(signature);
+        let first_param = self.tables.row_count(table::PARAM) + 1;
+        let row = self.tables.add_row(
+            table::METHOD_DEF,
+            alloc::vec![
+                Column::U32(0),
+                Column::U16(0),
+                Column::U16(flags),
+                Column::StringRef(name),
+                Column::BlobRef(signature),
+                Column::Index(table::PARAM, first_param),
+            ],
+        );
+        self.method_debug.push(MethodDebug {
+            sequence_points: Vec::new(),
+            local_signature: 0,
+            locals: Vec::new(),
+            scope_length: 0,
+        });
+        Token::new(table::METHOD_DEF, row)
+    }
+
+    /// Records that `class` (a `TypeDef`) implements `interface` (a `TypeDef`/`TypeRef`)
+    /// via an `InterfaceImpl` row (II.22.23).
+    pub fn add_interface_impl(&mut self, class: Token, interface: Token) {
+        self.tables.add_row(
+            table::INTERFACE_IMPL,
+            alloc::vec![
+                Column::Index(table::TYPE_DEF, class.row()),
+                Column::Coded(CodedIndex::TypeDefOrRef, interface),
+            ],
+        );
+    }
+
     /// Records a method's debug info (sequence points, local names) for the PDB.
     pub fn set_method_debug(&mut self, method: Token, debug: MethodDebug) {
         let index = method.row() as usize - 1;

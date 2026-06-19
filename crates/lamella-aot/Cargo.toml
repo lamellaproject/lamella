@@ -15,6 +15,10 @@ lamella-asm-arm32 = { path = "../lamella-asm-arm32", optional = true }
 # MetadataResolver); the core IR->native lowering itself stays metadata-free.
 lamella-metadata = { path = "../lamella-metadata" }
 
+[dev-dependencies]
+# Tests construct metadata tokens directly (e.g. a mock field-offset resolver).
+lamella-token = { path = "../lamella-token" }
+
 [features]
 default = ["arm32"]
 # Each target backend is independently selectable, so a deployment compiles only

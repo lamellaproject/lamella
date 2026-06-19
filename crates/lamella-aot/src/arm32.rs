@@ -238,6 +238,35 @@ fn load_const_word(
     Ok(())
 }
 
+/// Loads call arguments into the AAPCS registers starting at `start_reg`: each takes one
+/// register per word, a doubleword (i64/F64) is even-aligned, and overflow past r3 is a
+/// [`LowerError::CallUnsupported`].
+fn load_call_args(
+    enc: &mut Encoder,
+    value_types: &[MirType],
+    slot: &impl Fn(ValueId) -> u16,
+    args: &[ValueId],
+    start_reg: u8,
+) -> Result<(), LowerError> {
+    let mut reg = start_reg;
+    for &a in args {
+        let ty = value_types.get(a.0 as usize).copied();
+        let words = ty.map_or(1, |t| (t.stack_slot_bytes() / 4).max(1));
+        if matches!(ty, Some(MirType::I64 | MirType::F64)) && reg % 2 == 1 {
+            reg += 1;
+        }
+        for w in 0..words {
+            let r = Reg::new(reg)
+                .filter(|_| reg < 4)
+                .ok_or(LowerError::CallUnsupported)?;
+            enc.ldr_sp(r, slot(a) + (w as u16) * 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            reg += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Lowers a straight-line integer [`Function`] whose value count exceeds the
 /// eight registers, by giving each value a stack slot at `[sp, #value*4]` and
 /// shuttling operands through scratch registers r0 and r1. The frame is bounded
@@ -390,14 +419,7 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::Call { callee, args } => {
-            if args.len() > 4 {
-                return Err(LowerError::CallUnsupported);
-            }
-            for (i, a) in args.iter().enumerate() {
-                let r = Reg::new(i as u8).ok_or(LowerError::TooManyValues)?;
-                enc.ldr_sp(r, slot(*a))
-                    .map_err(|_| LowerError::TooManyValues)?;
-            }
+            load_call_args(enc, value_types, slot, args, 0)?;
             let target = *func_labels
                 .get(*callee as usize)
                 .ok_or(LowerError::CallUnsupported)?;
@@ -488,6 +510,11 @@ fn lower_spilled_into(
         offsets.push(used);
         used += ty.stack_slot_bytes() as u16;
     }
+    let returns_big_struct = matches!(func.ret, Some(MirType::ValueType { size, .. }) if size > 4);
+    let result_ptr_off = used;
+    if returns_big_struct {
+        used += 4;
+    }
     let frame = ((used as usize + lr_bytes + 7) & !7usize) - lr_bytes;
     if frame > 508 {
         return Err(LowerError::TooManyValues);
@@ -506,12 +533,26 @@ fn lower_spilled_into(
         .blocks
         .get(func.entry.index())
         .ok_or(LowerError::ControlFlowUnsupported)?;
-    for (i, &param) in entry_block.params.iter().enumerate() {
-        let arg = Reg::new(i as u8)
-            .filter(|_| i < 4)
-            .ok_or(LowerError::TooManyValues)?;
-        enc.str_sp(arg, slot(param))
+    let mut reg = 0u8;
+    if returns_big_struct {
+        enc.str_sp(Reg::R0, result_ptr_off)
             .map_err(|_| LowerError::TooManyValues)?;
+        reg = 1;
+    }
+    for &param in &entry_block.params {
+        let ty = func.value_type(param);
+        let words = ty.map_or(1, |t| (t.stack_slot_bytes() / 4).max(1));
+        if matches!(ty, Some(MirType::I64 | MirType::F64)) && reg % 2 == 1 {
+            reg += 1;
+        }
+        for w in 0..words {
+            let r = Reg::new(reg)
+                .filter(|_| reg < 4)
+                .ok_or(LowerError::TooManyValues)?;
+            enc.str_sp(r, slot(param) + (w as u16) * 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            reg += 1;
+        }
     }
 
     let block_labels: Vec<Label> = (0..func.blocks.len()).map(|_| enc.new_label()).collect();
@@ -552,6 +593,19 @@ fn lower_spilled_into(
                 }
                 continue;
             }
+            if let Inst::Call { callee, args } = inst {
+                if matches!(func.value_type(*result), Some(MirType::ValueType { size, .. }) if size > 4)
+                {
+                    enc.add_sp_imm(Reg::R0, slot(*result))
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    load_call_args(enc, &func.value_types, &slot, args, 1)?;
+                    let target = *func_labels
+                        .get(*callee as usize)
+                        .ok_or(LowerError::CallUnsupported)?;
+                    enc.bl(target);
+                    continue;
+                }
+            }
             lower_spilled_inst(
                 enc,
                 &mut pool,
@@ -573,7 +627,22 @@ fn lower_spilled_into(
         }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
-                if let Some(v) = value {
+                if returns_big_struct {
+                    if let Some(v) = value {
+                        let size = func.value_type(*v).map_or(0, MirType::stack_slot_bytes);
+                        enc.ldr_sp(Reg::R1, result_ptr_off)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        for w in 0..(size / 4) {
+                            let off = (w as u16) * 4;
+                            enc.ldr_sp(Reg::R0, slot(*v) + off)
+                                .map_err(|_| LowerError::TooManyValues)?;
+                            enc.str_imm(Reg::R0, Reg::R1, off)
+                                .map_err(|_| LowerError::TooManyValues)?;
+                        }
+                        enc.ldr_sp(Reg::R0, result_ptr_off)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
+                } else if let Some(v) = value {
                     enc.ldr_sp(Reg::R0, slot(*v))
                         .map_err(|_| LowerError::TooManyValues)?;
                     if func.value_type(*v) == Some(MirType::I64) {
@@ -1269,6 +1338,125 @@ mod tests {
         };
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(lower(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_a_struct_argument() {
+        let point = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 8,
+        };
+        let func = Function {
+            params: vec![point],
+            ret: Some(MirType::I32),
+            value_types: vec![point, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::FieldLoad {
+                        base: ValueId(0),
+                        offset: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(lower(&func).is_ok());
+    }
+
+    #[test]
+    fn passes_a_struct_argument_across_a_call() {
+        let point = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 8,
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![point, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::InitStruct),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: vec![ValueId(0)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let sum = Function {
+            params: vec![point],
+            ret: Some(MirType::I32),
+            value_types: vec![point, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::FieldLoad {
+                        base: ValueId(0),
+                        offset: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(lower_module(&[main, sum]).is_ok());
+    }
+
+    #[test]
+    fn returns_a_struct_by_value() {
+        let point = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 8,
+        };
+        let make = Function {
+            params: Vec::new(),
+            ret: Some(point),
+            value_types: vec![point],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(0), Inst::InitStruct)],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![point, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::FieldLoad {
+                            base: ValueId(0),
+                            offset: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(lower_module(&[main, make]).is_ok());
     }
 
     #[test]

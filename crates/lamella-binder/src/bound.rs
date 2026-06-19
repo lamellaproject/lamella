@@ -273,6 +273,12 @@ impl Binder {
         }
     }
 
+    /// The binder's type model, for the assembling step (base classes, member kinds).
+    #[must_use]
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
     /// Records a diagnostic.
     pub(crate) fn report(&mut self, diagnostic: Diagnostic) {
         self.diagnostics.push(diagnostic);
@@ -485,11 +491,9 @@ impl Binder {
             .iter()
             .map(|(parameter, _)| parameter.clone())
             .collect();
-        self.diagnostics
-            .extend(crate::flow::check_definite_assignment(
-                &bound,
-                &parameter_names,
-            ));
+        let unassigned =
+            crate::flow::check_definite_assignment(&bound, &parameter_names, &self.model);
+        self.diagnostics.extend(unassigned);
         self.diagnostics.extend(crate::flow::check_unused_locals(
             &bound,
             &self.case_label_uses,
@@ -1064,12 +1068,19 @@ impl Binder {
                     .map(|argument| argument.ty.clone())
                     .collect();
                 self.resolve_call(&name, &receiver_ty, &candidates, &argument_types, span)
-                    .map(|method| MethodReference {
-                        declaring_type: receiver_ty,
-                        name: method.name,
-                        parameters: method.parameters,
-                        return_type: method.return_type,
-                        is_static: method.is_static,
+                    .map(|method| {
+                        let declaring_type = self.declaring_type_in_chain(
+                            &receiver_ty,
+                            &method.name,
+                            &method.parameters,
+                        );
+                        MethodReference {
+                            declaring_type,
+                            name: method.name,
+                            parameters: method.parameters,
+                            return_type: method.return_type,
+                            is_static: method.is_static,
+                        }
                     })
             }
             _ => None,
@@ -1370,6 +1381,29 @@ impl Binder {
         methods
     }
 
+    /// The type a resolved method reference should name: the most-derived type from
+    /// `ty` up its base chain that declares the method `name(parameters)`. An override
+    /// names the deriving type; a method only inherited names the base that declares
+    /// it (so the emitted token resolves there, not on the receiver's type).
+    fn declaring_type_in_chain(
+        &self,
+        ty: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) -> TypeSymbol {
+        let mut current = self.type_info_of(ty);
+        while let Some(info) = current {
+            if info
+                .methods_named(name)
+                .any(|method| method.parameters.as_slice() == parameters)
+            {
+                return type_symbol_in(&info.namespace, &info.name);
+            }
+            current = info.base.as_ref().and_then(|base| self.type_info_of(base));
+        }
+        ty.clone()
+    }
+
     /// Binds a simple name (14.5.2). For now a name resolves only to a local
     /// variable or parameter; anything else is `CS0103` (field, type, and
     /// namespace lookup arrive with the declaration model).
@@ -1517,6 +1551,12 @@ fn binary_result_type(
     let left_special = as_special(left);
     let right_special = as_special(right);
     match operator {
+        Op::Add
+            if left_special == Some(SpecialType::String)
+                && right_special == Some(SpecialType::String) =>
+        {
+            Some(TypeSymbol::Special(SpecialType::String))
+        }
         Op::Multiply | Op::Divide | Op::Modulo | Op::Add | Op::Subtract => {
             binary_numeric_promotion(left_special?, right_special?).map(TypeSymbol::Special)
         }

@@ -13,6 +13,7 @@ use lamella_binder::{
 use lamella_cil::{EhClause, EhKind, Instruction, InstructionRange, Opcode, Operand};
 use lamella_syntax::ast::{AssignmentOperator, PostfixOperator, UnaryOperator};
 use lamella_syntax::span::Span;
+use lamella_token::Token;
 
 /// A statement's first instruction index paired with its source span -- the raw
 /// material the debug-info writer turns into a source-line mapping.
@@ -114,7 +115,11 @@ fn stack_effect(opcode: Opcode) -> i32 {
         | Opcode::LdcR8
         | Opcode::Ldnull
         | Opcode::Ldarg
+        | Opcode::Ldarga
+        | Opcode::LdargaS
         | Opcode::Ldloc
+        | Opcode::Ldloca
+        | Opcode::LdlocaS
         | Opcode::Ldsfld
         | Opcode::Newobj
         | Opcode::Call
@@ -156,6 +161,7 @@ pub fn emit_method(
         &Tokens::new(),
         body,
         &TypeSymbol::Special(SpecialType::Void),
+        None,
     )?
     .0)
 }
@@ -170,9 +176,10 @@ pub fn emit_body(
     tokens: &Tokens,
     arg_base: u16,
     return_type: &TypeSymbol,
+    base_ctor: Option<Token>,
 ) -> Result<EmittedBody, EmitError> {
     let mut frame = Frame::build(parameters, body, arg_base);
-    let lowered = lower(&mut frame, tokens, body, return_type)?;
+    let lowered = lower(&mut frame, tokens, body, return_type, base_ctor)?;
     Ok(EmittedBody {
         code: lowered.0,
         local_types: frame.local_types().to_vec(),
@@ -191,6 +198,7 @@ fn lower(
     tokens: &Tokens,
     body: &BoundStmt,
     return_type: &TypeSymbol,
+    base_ctor: Option<Token>,
 ) -> Result<Lowered, EmitError> {
     let mut labels = Labels::default();
     if contains_try(body) {
@@ -204,6 +212,10 @@ fn lower(
     }
 
     let mut out = Vec::new();
+    if let Some(base_ctor) = base_ctor {
+        out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
+        out.push(Instruction::new(Opcode::Call, Operand::Token(base_ctor)));
+    }
     emit_statement(body, frame, tokens, &mut labels, &mut out)?;
 
     if let Some(Epilogue { label, return_slot }) = labels.epilogue {
@@ -269,8 +281,32 @@ fn emit_statement(
         BoundStmtKind::Local { declarators, .. } => {
             for declarator in declarators {
                 if let Some(initializer) = &declarator.initializer {
-                    emit_expression(initializer, frame, tokens, out)?;
-                    store_to(frame, &declarator.name, out)?;
+                    let value_type_new = matches!(
+                        &initializer.kind,
+                        BoundExprKind::ObjectCreation { arguments, .. } if arguments.is_empty()
+                    ) && tokens.is_struct(&initializer.ty);
+                    if value_type_new {
+                        let token =
+                            tokens
+                                .type_token(&initializer.ty)
+                                .ok_or(EmitError::Unsupported(
+                                    "struct type has no token for initobj",
+                                ))?;
+                        match frame.slot(&declarator.name) {
+                            Some(Slot::Local(slot)) => {
+                                out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+                                out.push(Instruction::new(Opcode::Initobj, Operand::Token(token)));
+                            }
+                            _ => {
+                                return Err(EmitError::Unsupported(
+                                    "initobj target is not a local",
+                                ));
+                            }
+                        }
+                    } else {
+                        emit_expression(initializer, frame, tokens, out)?;
+                        store_to(frame, &declarator.name, out)?;
+                    }
                 }
             }
         }
@@ -811,7 +847,8 @@ mod tests {
     fn emission_records_a_sequence_point_per_statement() {
         let body = parse_statement("{ int x = 1; return x; }").statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &body);
-        let emitted = emit_body(&[], &bound, &Tokens::new(), 0, &int()).expect("should lower");
+        let emitted =
+            emit_body(&[], &bound, &Tokens::new(), 0, &int(), None).expect("should lower");
 
         let offsets: Vec<u32> = emitted
             .sequence_points

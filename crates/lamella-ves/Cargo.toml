@@ -12,7 +12,7 @@ lamella-cil = { path = "../lamella-cil" }
 lamella-token = { path = "../lamella-token" }
 
 [features]
-default = ["bcl", "exceptions", "gc"]
+default = ["bcl", "exceptions", "gc", "finalizers"]
 # The BCL intrinsics (System.Console / System.String / Object..ctor). Off => the
 # minimal interpreter core (arithmetic, control flow, the object model) with no BCL
 # surface -- the smallest build for a constrained target. The runtime side of a
@@ -26,6 +26,11 @@ exceptions = []
 # the bump arena with no collector, root machinery compiled out -- the no-GC driver /
 # tiny-target profile. A capability-profile knob.
 gc = []
+# Object finalization: destructors / Finalize via an f-reachable queue run at a GC
+# safepoint, plus GC.SuppressFinalize / ReRegisterForFinalize and resurrection. Requires
+# `gc` (only a collector detects unreachability). Off => no finalization machinery, the
+# embedded default. A capability-profile knob.
+finalizers = ["gc"]
 
 [lints]
 workspace = true

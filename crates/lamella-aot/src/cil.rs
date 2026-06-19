@@ -68,6 +68,18 @@ pub trait CallResolver {
     fn user_string(&self, _operand: &Operand) -> Option<Box<[u8]>> {
         None
     }
+
+    /// The byte offset of a field (an `ldfld`/`stfld` operand token) within its declaring
+    /// value type's layout. Defaults to `None`.
+    fn field_offset(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
+    /// The size in bytes of a value type (an `initobj` type-operand token), from its layout.
+    /// Defaults to `None`.
+    fn value_type_size(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
 }
 
 /// A [`CallResolver`] for call-free bodies: every resolution fails. The default for the
@@ -86,6 +98,8 @@ impl CallResolver for NoCalls {
 fn lower_with_source(
     body: &MethodBodyImage,
     resolver: &dyn CallResolver,
+    arg_types: &[MirType],
+    local_types: &[MirType],
 ) -> Result<(Function, CilSourceMap), CilError> {
     let code = &body.code;
     let mut byte_offsets: Vec<u32> = Vec::with_capacity(code.len());
@@ -116,7 +130,12 @@ fn lower_with_source(
     let mut value_types: Vec<MirType> = Vec::new();
     let mut strings: Vec<(ValueId, Box<[u8]>)> = Vec::new();
     let args: Vec<ValueId> = (0..arg_count)
-        .map(|_| new_value(&mut value_types, MirType::I32))
+        .map(|i| {
+            new_value(
+                &mut value_types,
+                arg_types.get(i).copied().unwrap_or(MirType::I32),
+            )
+        })
         .collect();
 
     let mut block_params: Vec<Vec<ValueId>> = Vec::with_capacity(blocks.len());
@@ -125,7 +144,10 @@ fn lower_with_source(
             args.clone()
         } else if is_merge(b) {
             (0..local_count)
-                .map(|_| new_value(&mut value_types, MirType::I32))
+                .map(|i| {
+                    let ty = local_types.get(i).copied().unwrap_or(MirType::I32);
+                    new_value(&mut value_types, ty)
+                })
                 .collect()
         } else {
             Vec::new()
@@ -158,6 +180,7 @@ fn lower_with_source(
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
         let mut il_index: Vec<u32> = Vec::new();
         let mut terminator: Option<Terminator> = None;
+        let mut last_local_addr: Option<usize> = None;
 
         for i in start..end {
             let inst = &code[i];
@@ -187,6 +210,7 @@ fn lower_with_source(
                     &mut insts,
                     &mut strings,
                     resolver,
+                    &mut last_local_addr,
                 )?;
             }
             for _ in before..insts.len() {
@@ -239,7 +263,9 @@ fn lower_with_source(
     });
 
     let function = Function {
-        params: (0..arg_count).map(|_| MirType::I32).collect(),
+        params: (0..arg_count)
+            .map(|i| arg_types.get(i).copied().unwrap_or(MirType::I32))
+            .collect(),
         ret,
         value_types,
         entry: BlockId(0),
@@ -258,13 +284,13 @@ pub struct CilSourceMap(pub Vec<Vec<u32>>);
 /// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`]. See
 /// [`lower_method_debug`] for the accompanying [`CilSourceMap`].
 pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
-    lower_with_source(body, &NoCalls).map(|(function, _)| function)
+    lower_with_source(body, &NoCalls, &[], &[]).map(|(function, _)| function)
 }
 
 /// Lowers a method body, also returning the [`CilSourceMap`] tying each MIR
 /// instruction back to the CIL instruction it came from.
 pub fn lower_method_debug(body: &MethodBodyImage) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body, &NoCalls)
+    lower_with_source(body, &NoCalls, &[], &[])
 }
 
 /// Lowers a method body that makes calls, using `resolver` to map each `call`'s token to
@@ -274,7 +300,20 @@ pub fn lower_method_debug_with(
     body: &MethodBodyImage,
     resolver: &dyn CallResolver,
 ) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body, resolver)
+    lower_with_source(body, resolver, &[], &[])
+}
+
+/// Lowers a method body with explicit parameter and local types (mapped from the method's
+/// signature and local-variable signature), so `int64`, value-type, and other non-`int32`
+/// slots type correctly instead of defaulting to `int32`. A slot with no supplied type
+/// defaults to `int32`.
+pub fn lower_method_typed(
+    body: &MethodBodyImage,
+    resolver: &dyn CallResolver,
+    arg_types: &[MirType],
+    local_types: &[MirType],
+) -> Result<(Function, CilSourceMap), CilError> {
+    lower_with_source(body, resolver, arg_types, local_types)
 }
 
 /// Defines a fresh MIR value of `ty` and returns its id.
@@ -401,6 +440,7 @@ fn apply_value_op(
     insts: &mut Vec<(ValueId, Inst)>,
     strings: &mut Vec<(ValueId, Box<[u8]>)>,
     resolver: &dyn CallResolver,
+    last_local_addr: &mut Option<usize>,
 ) -> Result<(), CilError> {
     match inst.opcode {
         Opcode::Nop => {}
@@ -604,6 +644,54 @@ fn apply_value_op(
                 }
             }
         }
+        Opcode::LdlocaS | Opcode::Ldloca => {
+            let Operand::Variable(n) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            *last_local_addr = Some(*n as usize);
+        }
+        Opcode::Initobj => {
+            let n = last_local_addr.take().ok_or(CilError::BadOperand)?;
+            let size = resolver
+                .value_type_size(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let zeroed = new_value(
+                value_types,
+                MirType::ValueType {
+                    handle: lamella_ir::TypeHandle(0),
+                    size,
+                },
+            );
+            insts.push((zeroed, Inst::InitStruct));
+            *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(zeroed);
+        }
+        Opcode::Ldfld => {
+            let n = last_local_addr.take().ok_or(CilError::BadOperand)?;
+            let base = locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?;
+            let offset = resolver
+                .field_offset(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let result = new_value(value_types, MirType::I32);
+            insts.push((result, Inst::FieldLoad { base, offset }));
+            stack.push(result);
+        }
+        Opcode::Stfld => {
+            let n = last_local_addr.take().ok_or(CilError::BadOperand)?;
+            let base = locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?;
+            let offset = resolver
+                .field_offset(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::FieldStore {
+                    base,
+                    offset,
+                    value,
+                },
+            ));
+        }
         other => return Err(CilError::Unsupported(other)),
     }
     Ok(())
@@ -753,7 +841,12 @@ fn scan_slots(code: &[Instruction]) -> (usize, usize) {
             Opcode::Ldloc1 | Opcode::Stloc1 => locals = locals.max(2),
             Opcode::Ldloc2 | Opcode::Stloc2 => locals = locals.max(3),
             Opcode::Ldloc3 | Opcode::Stloc3 => locals = locals.max(4),
-            Opcode::LdlocS | Opcode::Ldloc | Opcode::StlocS | Opcode::Stloc => {
+            Opcode::LdlocS
+            | Opcode::Ldloc
+            | Opcode::StlocS
+            | Opcode::Stloc
+            | Opcode::LdlocaS
+            | Opcode::Ldloca => {
                 if let Operand::Variable(n) = &instruction.operand {
                     locals = locals.max(*n as usize + 1);
                 }
@@ -820,6 +913,65 @@ mod control_flow {
 
     use alloc::collections::BTreeSet;
     use lamella_cil::{Instruction, Opcode, Operand};
+
+    #[test]
+    fn lowers_struct_field_access() {
+        use super::*;
+        use lamella_token::Token;
+        struct Fields;
+        impl CallResolver for Fields {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn field_offset(&self, op: &Operand) -> Option<u32> {
+                match op {
+                    Operand::Token(t) if (t.0 & 0x00FF_FFFF) == 1 => Some(0),
+                    Operand::Token(t) if (t.0 & 0x00FF_FFFF) == 2 => Some(4),
+                    _ => None,
+                }
+            }
+            fn value_type_size(&self, _: &Operand) -> Option<u32> {
+                Some(8)
+            }
+        }
+        let field = |row| Operand::Token(Token::new(0x04, row));
+        let ty = Operand::Token(Token::new(0x02, 1));
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Initobj, ty),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::new(Opcode::Stfld, field(1)),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::new(Opcode::Stfld, field(2)),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldfld, field(1)),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldfld, field(2)),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::LdcI48),
+                Instruction::simple(Opcode::Ceq),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let point = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 8,
+        };
+        let (func, _) = lower_method_typed(&body, &Fields, &[], &[point]).unwrap();
+        let insts: Vec<_> = func.blocks[0].insts.iter().map(|(_, i)| i).collect();
+        assert!(insts.iter().any(|i| matches!(i, Inst::InitStruct)));
+        assert!(insts.iter().any(|i| matches!(i, Inst::FieldStore { .. })));
+        assert!(insts.iter().any(|i| matches!(i, Inst::FieldLoad { .. })));
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
 
     /// Whether an opcode is a branch and, if so, whether it also falls through.
     #[derive(Clone, Copy)]

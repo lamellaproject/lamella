@@ -11,17 +11,19 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use lamella_cil::{Opcode, Operand};
-use lamella_metadata::{Assembly, Method, MethodSig, SigType};
+use lamella_metadata::{Assembly, ConstantValue, Method, MethodSig, SigType};
 use lamella_token::Token;
 use lamella_ves::intrinsics::{
     boolean_to_string, char_to_string, console_write, console_write_bool, console_write_char,
     console_write_double, console_write_int32, console_write_int64, console_write_line,
     console_write_line_bool, console_write_line_char, console_write_line_double,
     console_write_line_empty, console_write_line_int32, console_write_line_int64,
-    console_write_line_object, delegate_combine, delegate_remove, double_to_string, exception_ctor,
-    exception_get_message, int32_to_string, int64_to_string, object_ctor, object_to_string,
+    console_write_line_object, delegate_combine, delegate_remove, double_to_string,
+    enum_is_defined, enum_parse, exception_ctor, exception_get_message, gc_collect,
+    int32_to_string, int64_to_string, object_ctor, object_to_string, reregister_finalize,
     string_concat, string_concat3, string_equals, string_get_chars, string_get_length,
     string_is_null_or_empty, string_not_equals, string_substring, string_substring_len,
+    suppress_finalize, type_from_handle, wait_for_pending_finalizers,
 };
 use lamella_ves::{IntrinsicFn, MethodId, Module, Value};
 
@@ -89,7 +91,10 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
     let mut own_fields: Vec<Vec<(Token, Value)>> = Vec::new();
     let mut method_row: u32 = 0;
     let mut field_row: u32 = 0;
+    let mut type_row: u32 = 0;
     for type_def in assembly.type_defs() {
+        type_row += 1;
+        let is_enum = is_enum_type(assembly, type_def.extends());
         let mut own = Vec::new();
         for field in type_def.fields() {
             field_row += 1;
@@ -97,6 +102,16 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
             if field.is_static() {
                 if !field.is_literal() {
                     module.bind_static_field(token, default_field_value(field.signature()));
+                } else if is_enum {
+                    if let (Some(name), Some(constant)) = (field.name(), field.constant()) {
+                        let type_token = Token::new(TYPE_DEF, type_row).0;
+                        if matches!(constant, ConstantValue::I8(_) | ConstantValue::U8(_)) {
+                            module.set_enum_wide(type_token);
+                        }
+                        if let Some(value) = constant_as_i64(constant) {
+                            module.set_enum_constant(type_token, value, name.into());
+                        }
+                    }
                 }
                 continue;
             }
@@ -159,6 +174,9 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
             if name == ".cctor" {
                 module.add_static_ctor(id);
             }
+            if name == "Finalize" && arg_count(&method) == 1 {
+                module.set_finalizer(type_id, id);
+            }
             if method.flags() & METHOD_VIRTUAL != 0 {
                 virtuals.push(VirtualMethod {
                     id,
@@ -201,7 +219,7 @@ fn bind_strings(assembly: &Assembly, module: &mut Module, tokens: &BTreeSet<Toke
 /// `System.Console.WriteLine`; an unrecognized call is left unbound and only traps
 /// if actually executed.
 fn bind_bcl_calls(assembly: &Assembly, module: &mut Module, tokens: &BTreeSet<Token>) {
-    let mut bound: BTreeMap<usize, MethodId> = BTreeMap::new();
+    let mut bound: BTreeMap<(usize, u16), MethodId> = BTreeMap::new();
     for token in tokens {
         let Some(member) = assembly.member_ref(token.row()) else {
             continue;
@@ -232,11 +250,11 @@ fn bind_bcl_calls(assembly: &Assembly, module: &mut Module, tokens: &BTreeSet<To
             .as_ref()
             .map_or(0, |sig| sig.parameters.len() + usize::from(sig.has_this));
         let arg_count = u16::try_from(arg_count).unwrap_or(u16::MAX);
-        let id = match bound.get(&(function as usize)) {
+        let id = match bound.get(&(function as usize, arg_count)) {
             Some(&id) => id,
             None => {
                 let id = module.add_intrinsic(function, arg_count);
-                bound.insert(function as usize, id);
+                bound.insert((function as usize, arg_count), id);
                 id
             }
         };
@@ -267,8 +285,16 @@ fn bcl_intrinsic(
         ("String", "IsNullOrEmpty") => string_is_null_or_empty_overload(signature),
         ("String", "Substring") => string_substring_overload(signature),
         ("Object", ".ctor") => object_ctor_overload(signature),
+        ("Object", "Finalize") => Some(object_ctor),
         ("Exception", ".ctor") => Some(exception_ctor),
         ("Exception", "get_Message") => Some(exception_get_message),
+        ("GC", "SuppressFinalize") => Some(suppress_finalize),
+        ("GC", "ReRegisterForFinalize") => Some(reregister_finalize),
+        ("GC", "Collect") => Some(gc_collect),
+        ("GC", "WaitForPendingFinalizers") => Some(wait_for_pending_finalizers),
+        ("Type", "GetTypeFromHandle") => Some(type_from_handle),
+        ("Enum", "Parse") => Some(enum_parse),
+        ("Enum", "IsDefined") => Some(enum_is_defined),
         ("Int32", "ToString") => to_string_overload(int32_to_string, signature),
         ("Boolean", "ToString") => to_string_overload(boolean_to_string, signature),
         ("Char", "ToString") => to_string_overload(char_to_string, signature),
@@ -414,6 +440,34 @@ fn is_delegate_type(assembly: &Assembly, extends: Token) -> bool {
         .type_ref(extends.row())
         .and_then(|type_ref| type_ref.name())
         .is_some_and(|name| matches!(name.name, "MulticastDelegate" | "Delegate"))
+}
+
+/// Whether a type extends `System.Enum` -- i.e. is an enum, whose literal constants the
+/// loader records (by value) so `Enum.ToString` can name them.
+fn is_enum_type(assembly: &Assembly, extends: Token) -> bool {
+    if extends.table() != TYPE_REF {
+        return false;
+    }
+    assembly
+        .type_ref(extends.row())
+        .and_then(|type_ref| type_ref.name())
+        .is_some_and(|name| name.name == "Enum")
+}
+
+/// An integer constant's value as `i64` (an enum's underlying type is an integer kind).
+fn constant_as_i64(value: ConstantValue) -> Option<i64> {
+    match value {
+        ConstantValue::Char(c) => Some(i64::from(c)),
+        ConstantValue::I1(n) => Some(i64::from(n)),
+        ConstantValue::U1(n) => Some(i64::from(n)),
+        ConstantValue::I2(n) => Some(i64::from(n)),
+        ConstantValue::U2(n) => Some(i64::from(n)),
+        ConstantValue::I4(n) => Some(i64::from(n)),
+        ConstantValue::U4(n) => Some(i64::from(n)),
+        ConstantValue::I8(n) => Some(n),
+        ConstantValue::U8(n) => i64::try_from(n).ok(),
+        _ => None,
+    }
 }
 
 /// A signature key (method name + parameter types) for interface / abstract dispatch.

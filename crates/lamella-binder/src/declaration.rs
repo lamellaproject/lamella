@@ -98,6 +98,14 @@ fn enum_member_value(expr: &Expr) -> Option<i64> {
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     let mut info = TypeInfo::new(namespace, &declaration.name, map_kind(declaration.kind));
     info.bases = declaration.bases.iter().map(bind_type).collect();
+    let is_interface = matches!(declaration.kind, SyntaxTypeKind::Interface);
+    let access = |modifiers: &[Modifier]| {
+        if is_interface {
+            Accessibility::Public
+        } else {
+            accessibility_of(modifiers)
+        }
+    };
     for member in &declaration.members {
         match member {
             Member::Field {
@@ -108,7 +116,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             } => {
                 let field_ty = bind_type(ty);
                 let is_static = is_static(modifiers);
-                let accessibility = accessibility_of(modifiers);
+                let accessibility = access(modifiers);
                 for declarator in declarators {
                     info.fields.push(FieldSymbol {
                         name: declarator.name.clone(),
@@ -130,7 +138,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
                 is_static: is_static(modifiers),
-                accessibility: accessibility_of(modifiers),
+                accessibility: access(modifiers),
             }),
             Member::Property {
                 modifiers,
@@ -141,7 +149,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 name: name.clone(),
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
-                accessibility: accessibility_of(modifiers),
+                accessibility: access(modifiers),
             }),
             Member::Constructor {
                 modifiers,
@@ -151,8 +159,11 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             _ => {}
         }
     }
-    if matches!(info.kind, TypeKind::Class | TypeKind::Struct) && info.constructors.is_empty() {
-        info.constructors.push(constructor(&[]));
+    let has_parameterless = info.constructors.iter().any(|c| c.parameters.is_empty());
+    match info.kind {
+        TypeKind::Struct if !has_parameterless => info.constructors.push(constructor(&[])),
+        TypeKind::Class if info.constructors.is_empty() => info.constructors.push(constructor(&[])),
+        _ => {}
     }
     info
 }

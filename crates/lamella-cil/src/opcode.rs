@@ -375,11 +375,13 @@ opcodes! {
         Volatile = 0xFE13, "volatile.", None;
         Tail = 0xFE14, "tail.", None;
         Initobj = 0xFE15, "initobj", Token;
+        Constrained = 0xFE16, "constrained.", Token;
         Cpblk = 0xFE17, "cpblk", None;
         Initblk = 0xFE18, "initblk", None;
         Rethrow = 0xFE1A, "rethrow", None;
         Sizeof = 0xFE1C, "sizeof", Token;
         Refanytype = 0xFE1D, "refanytype", None;
+        Readonly = 0xFE1E, "readonly.", None;
     }
 }
 
@@ -419,8 +421,8 @@ mod tests {
     use alloc::collections::BTreeSet;
 
     #[test]
-    fn there_are_214_opcodes() {
-        assert_eq!(Opcode::all().len(), 214);
+    fn there_are_216_opcodes() {
+        assert_eq!(Opcode::all().len(), 216);
     }
 
     #[test]
@@ -465,7 +467,7 @@ mod tests {
             .iter()
             .filter(|op| matches!(op.encoding(), Encoding::Extended(_)))
             .count();
-        assert_eq!(two_byte, 25);
+        assert_eq!(two_byte, 27);
         assert_eq!(Opcode::all().len() - two_byte, 189);
     }
 

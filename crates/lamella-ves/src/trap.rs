@@ -34,6 +34,9 @@ pub enum Trap {
     /// A `castclass` to a type the object is not an instance of (the
     /// `InvalidCastException` site, until exceptions exist).
     InvalidCast,
+    /// An argument was invalid (the `ArgumentException` site) -- e.g. `Enum.Parse` of a
+    /// name that names no constant of the enum.
+    InvalidArgument,
     /// A field token (`ldfld`/`stfld`) resolved to no field slot in the module.
     UnresolvedField(Token),
     /// Integer division or remainder by zero (`div`, `rem`, and unsigned forms).
@@ -68,6 +71,7 @@ impl fmt::Display for Trap {
             Trap::IndexOutOfRange(index) => write!(f, "index {index} out of range"),
             Trap::NullReference => f.write_str("dereferenced a null reference"),
             Trap::InvalidCast => f.write_str("invalid cast"),
+            Trap::InvalidArgument => f.write_str("invalid argument"),
             Trap::UnresolvedField(token) => {
                 write!(f, "field token 0x{:08X} resolved to no field", token.0)
             }

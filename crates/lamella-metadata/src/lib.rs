@@ -11,6 +11,7 @@ pub mod constant;
 pub mod flags;
 pub mod heaps;
 pub mod image;
+pub mod layout;
 pub mod pdb;
 pub mod pe;
 pub mod reader;
@@ -26,6 +27,7 @@ pub use heaps::{
     read_compressed_u32,
 };
 pub use image::{MetadataError, MetadataImage};
+pub use layout::{LayoutError, TargetLayout, TypeLayout, layout_value_type};
 pub use pdb::{LocalVariable, PortablePdb, SequencePoint};
 pub use pe::{PeError, PeImage};
 pub use reader::{

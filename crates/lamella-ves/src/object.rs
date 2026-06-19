@@ -70,6 +70,12 @@ pub struct Heap {
     /// [`Heap::should_collect`]); adapts after each collection.
     #[cfg(feature = "gc")]
     gc_threshold: usize,
+    /// Parallel to `objects`: whether each object is registered for finalization (its
+    /// type has a `Finalize` and it has not been finalized or suppressed). The collector
+    /// promotes an unreachable registered object to the f-reachable set instead of
+    /// reclaiming it.
+    #[cfg(feature = "finalizers")]
+    finalize_registered: Vec<bool>,
 }
 
 #[cfg(feature = "gc")]
@@ -78,6 +84,8 @@ impl Default for Heap {
         Heap {
             objects: Vec::new(),
             gc_threshold: INITIAL_GC_THRESHOLD,
+            #[cfg(feature = "finalizers")]
+            finalize_registered: Vec::new(),
         }
     }
 }
@@ -95,6 +103,8 @@ impl Heap {
     pub fn alloc(&mut self, object: Object) -> ObjectRef {
         let index = self.objects.len() as u32;
         self.objects.push(object);
+        #[cfg(feature = "finalizers")]
+        self.finalize_registered.push(false);
         ObjectRef(index)
     }
 
@@ -266,34 +276,61 @@ impl Heap {
         self.objects.len() >= self.gc_threshold
     }
 
-    /// Reclaims every object unreachable from the roots and compacts the survivors.
-    pub fn collect<R>(&mut self, mut enumerate_roots: R)
+    /// Registers `reference` for finalization -- its type declares a `Finalize`, so the
+    /// collector runs that finalizer when the object becomes unreachable. Also serves
+    /// `ReRegisterForFinalize` (re-arming a suppressed or already-finalized object).
+    #[cfg(feature = "finalizers")]
+    pub fn register_finalizer(&mut self, reference: ObjectRef) {
+        if let Some(slot) = self.finalize_registered.get_mut(reference.0 as usize) {
+            *slot = true;
+        }
+    }
+
+    /// Cancels finalization for `reference` (`GC.SuppressFinalize`).
+    #[cfg(feature = "finalizers")]
+    pub fn suppress_finalizer(&mut self, reference: ObjectRef) {
+        if let Some(slot) = self.finalize_registered.get_mut(reference.0 as usize) {
+            *slot = false;
+        }
+    }
+
+    /// Reclaims every object unreachable from the roots and compacts the survivors,
+    /// returning the objects promoted for finalization (the f-reachable set) at their new
+    /// positions -- always empty without the `finalizers` feature.
+    pub fn collect<R>(&mut self, mut enumerate_roots: R) -> Vec<ObjectRef>
     where
         R: FnMut(&mut dyn FnMut(&mut Value)),
     {
         let count = self.objects.len();
         let mut live = alloc::vec![false; count];
         let mut work: Vec<usize> = Vec::new();
-        let mark = |index: usize, live: &mut [bool], work: &mut Vec<usize>| {
-            if index < count && !live[index] {
-                live[index] = true;
-                work.push(index);
-            }
-        };
         enumerate_roots(&mut |value| {
             collect_refs(value, &mut |reference| {
-                mark(reference.0 as usize, &mut live, &mut work);
+                let index = reference.0 as usize;
+                if index < count && !live[index] {
+                    live[index] = true;
+                    work.push(index);
+                }
             });
         });
-        while let Some(index) = work.pop() {
-            let mut children: Vec<usize> = Vec::new();
-            object_refs(&self.objects[index], &mut |reference| {
-                children.push(reference.0 as usize);
-            });
-            for child in children {
-                mark(child, &mut live, &mut work);
+        trace(&self.objects, &mut live, &mut work);
+
+        #[cfg(feature = "finalizers")]
+        let finalizable: Vec<usize> = {
+            let mut promoted = Vec::new();
+            #[allow(clippy::needless_range_loop)]
+            for index in 0..count {
+                if !live[index] && self.finalize_registered[index] {
+                    live[index] = true;
+                    self.finalize_registered[index] = false;
+                    work.push(index);
+                    promoted.push(index);
+                }
             }
-        }
+            trace(&self.objects, &mut live, &mut work);
+            promoted
+        };
+
         let mut remap: Vec<Option<u32>> = alloc::vec![None; count];
         let mut next = 0u32;
         for (slot, &alive) in remap.iter_mut().zip(live.iter()) {
@@ -303,10 +340,14 @@ impl Heap {
             }
         }
         let old = core::mem::take(&mut self.objects);
+        #[cfg(feature = "finalizers")]
+        let old_registered = core::mem::take(&mut self.finalize_registered);
         for (index, mut object) in old.into_iter().enumerate() {
             if live[index] {
                 remap_object(&mut object, &remap);
                 self.objects.push(object);
+                #[cfg(feature = "finalizers")]
+                self.finalize_registered.push(old_registered[index]);
             }
         }
         enumerate_roots(&mut |value| remap_value(value, &remap));
@@ -315,6 +356,34 @@ impl Heap {
             .len()
             .saturating_mul(2)
             .max(INITIAL_GC_THRESHOLD);
+
+        #[cfg(feature = "finalizers")]
+        let result = finalizable
+            .iter()
+            .filter_map(|&index| remap[index].map(ObjectRef))
+            .collect();
+        #[cfg(not(feature = "finalizers"))]
+        let result = Vec::new();
+        result
+    }
+}
+
+/// Drains the mark worklist: traces every reference out of each marked object, marking
+/// and enqueuing newly reached objects. Shared by the root mark and the finalizer-promotion
+/// re-trace.
+#[cfg(feature = "gc")]
+fn trace(objects: &[Object], live: &mut [bool], work: &mut Vec<usize>) {
+    while let Some(index) = work.pop() {
+        let mut children: Vec<usize> = Vec::new();
+        object_refs(&objects[index], &mut |reference| {
+            children.push(reference.0 as usize);
+        });
+        for child in children {
+            if child < live.len() && !live[child] {
+                live[child] = true;
+                work.push(child);
+            }
+        }
     }
 }
 

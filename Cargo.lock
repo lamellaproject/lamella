@@ -20,6 +20,7 @@ dependencies = [
  "lamella-cil",
  "lamella-ir",
  "lamella-metadata",
+ "lamella-token",
 ]
 
 [[package]]

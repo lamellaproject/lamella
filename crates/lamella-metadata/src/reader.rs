@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 
 use crate::heaps::StringsHeap;
 use crate::image::{MetadataError, MetadataImage};
+use crate::layout::{LayoutError, TargetLayout, TypeLayout, layout_value_type};
 use crate::pe::PeImage;
 use crate::rows::Tables;
 use crate::signature::{
@@ -268,6 +269,61 @@ impl<'a> Assembly<'a> {
         }
     }
 
+    /// The layout of a value type (a struct or enum) named by a `TypeDef` token: its
+    /// instance fields, in declaration order, placed per `target`, with the
+    /// reference-offset map. Recurses into nested value-type fields. This is the one
+    /// shared layout the backend (stack slots + GC stack maps) and the runtime (the
+    /// flat heap + boxing) consume, so neither re-derives it. A field whose type is a
+    /// value type in another assembly (a `TypeRef`) cannot be resolved here and is a
+    /// `LayoutError::UnresolvedValueType`.
+    pub fn value_type_layout(
+        &self,
+        token: Token,
+        target: &TargetLayout,
+    ) -> Result<TypeLayout, LayoutError> {
+        if token.table() != table::TYPE_DEF {
+            return Err(LayoutError::UnresolvedValueType(token));
+        }
+        let fields: Vec<SigType> = match self.type_def(token.row()) {
+            Some(type_def) => type_def
+                .fields()
+                .filter(|field| !field.is_static())
+                .filter_map(|field| field.signature())
+                .collect(),
+            None => return Err(LayoutError::UnresolvedValueType(token)),
+        };
+        layout_value_type(&fields, target, &|nested| {
+            self.value_type_layout(nested, target).ok()
+        })
+    }
+
+    /// The byte offset of an instance field within its declaring type, by the field's
+    /// token -- the seam from a `Field` token to a layout offset. Finds the type that
+    /// declares the field, lays it out, and returns the offset of that field's slot
+    /// (in declaration order among the instance fields). `None` if the token names no
+    /// instance field of a layable type. The offset is from the type's field block;
+    /// a reference type's object header, if any, is the runtime's to add.
+    #[must_use]
+    pub fn field_offset(&self, field: Token, target: &TargetLayout) -> Option<u32> {
+        if field.table() != table::FIELD {
+            return None;
+        }
+        for type_def in self.type_defs() {
+            let mut index = 0usize;
+            for candidate in type_def.fields() {
+                if candidate.is_static() {
+                    continue;
+                }
+                if candidate.token() == field {
+                    let layout = self.value_type_layout(type_def.token(), target).ok()?;
+                    return layout.field_offsets.get(index).copied();
+                }
+                index += 1;
+            }
+        }
+        None
+    }
+
     /// The `TypeDef` that owns the method at `method_index`, found by the method
     /// ranges the `TypeDef.MethodList` column delimits.
     fn method_owner(&self, method_index: u32) -> Option<TypeDef<'a>> {
@@ -385,6 +441,12 @@ impl<'a> TypeDef<'a> {
     #[must_use]
     pub fn name(&self) -> Option<TypeName<'a>> {
         self.assembly.type_name(self.index)
+    }
+
+    /// This type's `TypeDef` token (e.g. to pass to [`Assembly::value_type_layout`]).
+    #[must_use]
+    pub fn token(&self) -> Token {
+        Token::new(table::TYPE_DEF, self.index)
     }
 
     /// The type attribute flags (II.23.1.15).
@@ -598,6 +660,12 @@ impl<'a> Field<'a> {
     #[must_use]
     pub fn is_static(&self) -> bool {
         flags::field_is_static(self.flags())
+    }
+
+    /// This field's `Field` token.
+    #[must_use]
+    pub fn token(&self) -> Token {
+        Token::new(table::FIELD, self.index)
     }
 
     /// Whether the field is a `const` literal.

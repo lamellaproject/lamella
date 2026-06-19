@@ -1,6 +1,7 @@
 //! Compiling a bound program to a managed PE: the bridge over the whole back end.
 
 use crate::debug::LineMap;
+use crate::expr::is_value_type;
 use crate::method::{EmittedBody, emit_body, max_stack};
 use crate::tokens::Tokens;
 use alloc::boxed::Box;
@@ -8,9 +9,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_binder::{
-    Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, Diagnostic as BinderDiagnostic,
-    Model, SpecialType, TypeSymbol, bind_compilation_unit_with_references, bind_type, collect_into,
-    load_assembly,
+    Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, ConversionKind,
+    Diagnostic as BinderDiagnostic, Model, SpecialType, TypeSymbol,
+    bind_compilation_unit_with_references, bind_type, collect_into, load_assembly,
 };
 use lamella_cil::{
     Instruction, MethodBodyImage, Opcode, Operand, encode_with_offsets, write_method_body,
@@ -22,7 +23,7 @@ use lamella_pe::{
 };
 use lamella_syntax::ast::{
     CompilationUnit, Literal, Member, Modifier, NamespaceMember, Parameter, QualifiedName,
-    TypeDecl, UsingDirective, UsingKind, VariableDeclarator,
+    TypeDecl, TypeKind, UsingDirective, UsingKind, VariableDeclarator,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
 use lamella_syntax::parser::parse_compilation_unit;
@@ -33,8 +34,17 @@ const TYPE_DEF: u8 = 0x02;
 const FIELD: u8 = 0x04;
 const METHOD_DEF: u8 = 0x06;
 const PUBLIC_CLASS: u32 = 0x0000_0001;
+const PUBLIC_STRUCT: u32 = 0x0000_0001 | 0x0000_0008 | 0x0000_0100;
 const METHOD_PUBLIC: u16 = 0x0006;
 const METHOD_STATIC: u16 = 0x0010;
+const METHOD_VIRTUAL: u16 = 0x0040;
+const METHOD_HIDEBYSIG: u16 = 0x0080;
+const METHOD_NEWSLOT: u16 = 0x0100;
+const METHOD_FINAL: u16 = 0x0020;
+const METHOD_ABSTRACT: u16 = 0x0400;
+const INTERFACE_FLAGS: u32 = 0x0000_0001 | 0x0000_0020 | 0x0000_0080;
+const IFACE_METHOD_FLAGS: u16 =
+    METHOD_PUBLIC | METHOD_VIRTUAL | METHOD_ABSTRACT | METHOD_NEWSLOT | METHOD_HIDEBYSIG;
 const FIELD_PUBLIC: u16 = 0x0006;
 const FIELD_STATIC: u16 = 0x0010;
 const CTOR_FLAGS: u16 = 0x0006 | 0x0800 | 0x1000;
@@ -326,6 +336,39 @@ fn emit_namespace(
     Ok(())
 }
 
+/// Emits an interface as a `TypeDef` with no base, no constructor, and abstract
+/// methods (II.22.37 semantics). Implementing classes get an `InterfaceImpl` row.
+fn emit_interface(
+    image: &mut ImageBuilder,
+    tokens: &Tokens,
+    namespace: &str,
+    declaration: &TypeDecl,
+) -> Result<(), crate::EmitError> {
+    let nil = Token::new(TYPE_DEF, 0);
+    image.add_type(namespace, &declaration.name, nil, INTERFACE_FLAGS);
+    for member in &declaration.members {
+        if let Member::Method {
+            return_type,
+            name,
+            parameters,
+            ..
+        } = member
+        {
+            let parameter_sigs: Vec<TypeSig> = parameters
+                .iter()
+                .map(|parameter| type_sig(tokens, &bind_type(&parameter.ty)))
+                .collect::<Result<_, _>>()?;
+            let signature = method_signature(
+                true,
+                &parameter_sigs,
+                &type_sig(tokens, &bind_type(return_type))?,
+            );
+            image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_type(
     image: &mut ImageBuilder,
@@ -337,8 +380,50 @@ fn emit_type(
     declaration: &TypeDecl,
     debug: Option<&DebugContext>,
 ) -> Result<(), crate::EmitError> {
-    let type_token = image.add_type(namespace, &declaration.name, object, PUBLIC_CLASS);
+    let is_struct = declaration.kind == TypeKind::Struct;
     let enclosing = named_symbol(namespace, &declaration.name);
+    if matches!(declaration.kind, TypeKind::Interface) {
+        return emit_interface(image, tokens, namespace, declaration);
+    }
+    let base_class = if is_struct {
+        None
+    } else {
+        binder
+            .model()
+            .get_by_symbol(&enclosing)
+            .and_then(|info| info.base.clone())
+    };
+    let (base, flags) = if is_struct {
+        (image.type_ref("System", "ValueType"), PUBLIC_STRUCT)
+    } else {
+        let base_token = base_class
+            .as_ref()
+            .and_then(|symbol| tokens.type_token(symbol))
+            .unwrap_or(object);
+        (base_token, PUBLIC_CLASS)
+    };
+    let type_token = image.add_type(namespace, &declaration.name, base, flags);
+    let interface_tokens: Vec<Token> = {
+        let model = binder.model();
+        model
+            .get_by_symbol(&enclosing)
+            .map(|info| {
+                info.bases
+                    .iter()
+                    .filter(|base| {
+                        model
+                            .get_by_symbol(base)
+                            .is_some_and(|b| b.kind == lamella_binder::TypeKind::Interface)
+                    })
+                    .filter_map(|base| tokens.type_token(base))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let implements_interface = !interface_tokens.is_empty();
+    for interface in interface_tokens {
+        image.add_interface_impl(type_token, interface);
+    }
     for member in &declaration.members {
         if let Member::Field {
             modifiers,
@@ -350,34 +435,61 @@ fn emit_type(
             emit_field(image, tokens, modifiers, ty, declarators)?;
         }
     }
-    if !declares_constructor(declaration) {
-        emit_default_constructor(image)?;
+    if !is_struct && !declares_constructor(declaration) {
+        let base_ctor = base_class
+            .as_ref()
+            .and_then(|symbol| tokens.method(symbol, ".ctor", &[]))
+            .unwrap_or_else(|| image.object_ctor());
+        emit_default_constructor(image, base_ctor)?;
     }
     for member in &declaration.members {
-        if let Member::Method {
-            modifiers,
-            return_type,
-            name,
-            parameters,
-            body: Some(body),
-            ..
-        } = member
-        {
-            let token = emit_one_method(
-                image,
-                binder,
-                &enclosing,
-                tokens,
+        match member {
+            Member::Method {
                 modifiers,
-                name,
                 return_type,
+                name,
                 parameters,
-                body,
-                debug,
-            )?;
-            if entry_point.is_none() && &**name == "Main" && modifiers.contains(&Modifier::Static) {
-                *entry_point = Some(token);
+                body: Some(body),
+                ..
+            } => {
+                let token = emit_one_method(
+                    image,
+                    binder,
+                    &enclosing,
+                    tokens,
+                    modifiers,
+                    name,
+                    return_type,
+                    parameters,
+                    body,
+                    implements_interface,
+                    debug,
+                )?;
+                if entry_point.is_none()
+                    && &**name == "Main"
+                    && modifiers.contains(&Modifier::Static)
+                {
+                    *entry_point = Some(token);
+                }
             }
+            Member::Constructor {
+                parameters, body, ..
+            } => {
+                let base_ctor = if is_struct {
+                    None
+                } else {
+                    Some(
+                        base_class
+                            .as_ref()
+                            .and_then(|symbol| tokens.method(symbol, ".ctor", &[]))
+                            .unwrap_or_else(|| image.object_ctor()),
+                    )
+                };
+                emit_constructor(
+                    image, binder, &enclosing, tokens, parameters, body, base_ctor, debug,
+                )?;
+            }
+            _ => {}
         }
     }
     let mut first_property = None;
@@ -423,6 +535,7 @@ fn emit_one_method(
     return_type: &lamella_syntax::ast::TypeRef,
     parameters: &[Parameter],
     body: &lamella_syntax::ast::Stmt,
+    interface_impl: bool,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let return_symbol = bind_type(return_type);
@@ -431,7 +544,20 @@ fn emit_one_method(
         .map(|parameter| (parameter.name.clone(), bind_type(&parameter.ty)))
         .collect();
     let is_static = modifiers.contains(&Modifier::Static);
-    let flags = METHOD_PUBLIC | if is_static { METHOD_STATIC } else { 0 };
+    let is_virtual = modifiers.contains(&Modifier::Virtual);
+    let is_override = modifiers.contains(&Modifier::Override);
+    let mut flags = METHOD_PUBLIC;
+    if is_static {
+        flags |= METHOD_STATIC;
+    }
+    if is_virtual || is_override {
+        flags |= METHOD_VIRTUAL | METHOD_HIDEBYSIG;
+        if is_virtual {
+            flags |= METHOD_NEWSLOT;
+        }
+    } else if interface_impl && !is_static {
+        flags |= METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_HIDEBYSIG;
+    }
     emit_method_body(
         image,
         binder,
@@ -443,6 +569,42 @@ fn emit_one_method(
         body,
         is_static,
         flags,
+        None,
+        debug,
+    )
+}
+
+/// Emits an explicit constructor as an instance `.ctor`. A class constructor chains to
+/// `base_ctor` first (`ldarg.0; call base..ctor`); a struct (`base_ctor` is `None`)
+/// has no base constructor and just initializes its fields through `this`. `new T(args)`
+/// lowers to `newobj` of the token this records.
+#[allow(clippy::too_many_arguments)]
+fn emit_constructor(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
+    tokens: &mut Tokens,
+    parameters: &[Parameter],
+    body: &lamella_syntax::ast::Stmt,
+    base_ctor: Option<Token>,
+    debug: Option<&DebugContext>,
+) -> Result<Token, crate::EmitError> {
+    let params: Vec<(Box<str>, TypeSymbol)> = parameters
+        .iter()
+        .map(|parameter| (parameter.name.clone(), bind_type(&parameter.ty)))
+        .collect();
+    emit_method_body(
+        image,
+        binder,
+        tokens,
+        enclosing,
+        ".ctor",
+        &TypeSymbol::Special(SpecialType::Void),
+        &params,
+        body,
+        false,
+        CTOR_FLAGS,
+        base_ctor,
         debug,
     )
 }
@@ -462,6 +624,7 @@ fn emit_method_body(
     body: &lamella_syntax::ast::Stmt,
     is_static: bool,
     flags: u16,
+    base_ctor: Option<Token>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let bound = binder.bind_method(
@@ -482,7 +645,14 @@ fn emit_method_body(
         local_names,
         sequence_points,
         handlers,
-    } = emit_body(&parameter_names, &bound, tokens, arg_base, return_symbol)?;
+    } = emit_body(
+        &parameter_names,
+        &bound,
+        tokens,
+        arg_base,
+        return_symbol,
+        base_ctor,
+    )?;
     let local_var_sig = if local_types.is_empty() {
         None
     } else {
@@ -615,6 +785,7 @@ fn emit_property(
             body,
             is_static,
             flags,
+            None,
             debug,
         )?;
         image.add_method_semantics(SEMANTICS_GETTER, getter, property);
@@ -631,6 +802,7 @@ fn emit_property(
             body,
             is_static,
             flags,
+            None,
             debug,
         )?;
         image.add_method_semantics(SEMANTICS_SETTER, setter, property);
@@ -767,14 +939,40 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             let token = image.user_string(text);
             tokens.insert_string(text, token);
         }
-        BoundExprKind::Binary { left, right, .. } => {
+        BoundExprKind::Binary {
+            left,
+            right,
+            operator,
+        } => {
             mint_in_expr(left, image, tokens);
             mint_in_expr(right, image, tokens);
+            if matches!(operator, lamella_syntax::ast::BinaryOperator::Add)
+                && is_string(&left.ty)
+                && is_string(&right.ty)
+            {
+                mint_member_ref(&string_concat_reference(), image, tokens);
+            }
         }
-        BoundExprKind::Unary { operand, .. }
-        | BoundExprKind::Postfix { operand, .. }
-        | BoundExprKind::Cast { operand }
-        | BoundExprKind::Conversion { operand, .. } => mint_in_expr(operand, image, tokens),
+        BoundExprKind::Unary { operand, .. } | BoundExprKind::Postfix { operand, .. } => {
+            mint_in_expr(operand, image, tokens);
+        }
+        BoundExprKind::Conversion {
+            operand,
+            conversion,
+        } => {
+            mint_in_expr(operand, image, tokens);
+            if matches!(conversion, ConversionKind::Boxing) {
+                mint_value_type_token(&operand.ty, image, tokens);
+            }
+        }
+        BoundExprKind::Cast { operand } => {
+            mint_in_expr(operand, image, tokens);
+            if matches!(operand.ty, TypeSymbol::Special(SpecialType::Object))
+                && is_value_type(&expr.ty, tokens)
+            {
+                mint_value_type_token(&expr.ty, image, tokens);
+            }
+        }
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
             mint_in_expr(inner, image, tokens);
         }
@@ -855,6 +1053,23 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
 /// Mints a `MemberRef` for an external (BCL) method `method`: a `TypeRef` to its
 /// declaring type, then a `MemberRef` with its encoded signature, recorded in the
 /// token table. Skipped (left for emission to report) if a type cannot be encoded.
+/// Whether `ty` is `string`.
+fn is_string(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Special(SpecialType::String))
+}
+
+/// The reference `string + string` lowers to: `System.String::Concat(string, string)`.
+fn string_concat_reference() -> lamella_binder::MethodReference {
+    let string = TypeSymbol::Special(SpecialType::String);
+    lamella_binder::MethodReference {
+        declaring_type: string.clone(),
+        name: "Concat".into(),
+        parameters: alloc::vec![string.clone(), string.clone()],
+        return_type: string,
+        is_static: true,
+    }
+}
+
 fn mint_member_ref(
     method: &lamella_binder::MethodReference,
     image: &mut ImageBuilder,
@@ -931,9 +1146,28 @@ fn system_type_name(special: SpecialType) -> Option<(&'static str, &'static str)
     })
 }
 
+/// Mints the metadata token a `box`/`unbox.any` names for the value type `ty`. A
+/// module struct already has its `TypeDef` token (nothing to do); a primitive needs a
+/// `System.*` `TypeRef`.
+fn mint_value_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut Tokens) {
+    if tokens.type_token(ty).is_some() {
+        return;
+    }
+    if let TypeSymbol::Special(special) = ty {
+        if let Some((namespace, name)) = system_type_name(*special) {
+            let token = image.type_ref(namespace, name);
+            tokens.insert_type(ty, token);
+        }
+    }
+}
+
 /// Splits a named type into `(namespace, name)`, e.g. `System.Console` -> `("System",
 /// "Console")`. Returns `None` for a non-named type.
 fn split_type_name(ty: &TypeSymbol) -> Option<(String, String)> {
+    if let TypeSymbol::Special(special) = ty {
+        let (namespace, name) = system_type_name(*special)?;
+        return Some((String::from(namespace), String::from(name)));
+    }
     let TypeSymbol::Named(parts) = ty else {
         return None;
     };
@@ -956,11 +1190,13 @@ fn declares_constructor(declaration: &TypeDecl) -> bool {
 
 /// Emits the implicit default constructor: `this`, a call to the base `Object`
 /// constructor, and `ret`. (Field initializers are not run yet.)
-fn emit_default_constructor(image: &mut ImageBuilder) -> Result<(), crate::EmitError> {
-    let object_ctor = image.object_ctor();
+fn emit_default_constructor(
+    image: &mut ImageBuilder,
+    base_ctor: Token,
+) -> Result<(), crate::EmitError> {
     let code = [
         Instruction::new(Opcode::Ldarg, Operand::Variable(0)),
-        Instruction::new(Opcode::Call, Operand::Token(object_ctor)),
+        Instruction::new(Opcode::Call, Operand::Token(base_ctor)),
         Instruction::simple(Opcode::Ret),
     ];
     let body = MethodBodyImage {
@@ -983,6 +1219,11 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
     let special = match ty {
         TypeSymbol::Special(special) => special,
         TypeSymbol::Named(_) if tokens.is_enum(ty) => return Ok(TypeSig::Int32),
+        TypeSymbol::Named(_) if tokens.is_struct(ty) => {
+            return tokens.type_token(ty).map(TypeSig::ValueType).ok_or(
+                crate::EmitError::Unsupported("a struct type outside this module in a signature"),
+            );
+        }
         TypeSymbol::Named(_) => {
             return tokens
                 .type_token(ty)
@@ -1057,6 +1298,11 @@ fn collect_tokens(
                 let declaring = named_symbol(namespace, &declaration.name);
                 *next_type += 1;
                 tokens.insert_type(&declaring, Token::new(TYPE_DEF, *next_type));
+                let is_struct = declaration.kind == TypeKind::Struct;
+                let is_interface = declaration.kind == TypeKind::Interface;
+                if is_struct {
+                    tokens.insert_struct(&declaring);
+                }
                 for member in &declaration.members {
                     if let Member::Field { declarators, .. } = member {
                         for declarator in declarators {
@@ -1069,7 +1315,7 @@ fn collect_tokens(
                         }
                     }
                 }
-                if !declares_constructor(declaration) {
+                if !is_struct && !is_interface && !declares_constructor(declaration) {
                     *next_method += 1;
                     tokens.insert_method(
                         &declaring,
@@ -1079,22 +1325,35 @@ fn collect_tokens(
                     );
                 }
                 for member in &declaration.members {
-                    if let Member::Method {
-                        name,
-                        parameters,
-                        body: Some(_),
-                        ..
-                    } = member
-                    {
-                        *next_method += 1;
-                        let params: Vec<TypeSymbol> =
-                            parameters.iter().map(|p| bind_type(&p.ty)).collect();
-                        tokens.insert_method(
-                            &declaring,
+                    match member {
+                        Member::Method {
                             name,
-                            &params,
-                            Token::new(METHOD_DEF, *next_method),
-                        );
+                            parameters,
+                            body,
+                            ..
+                        } if body.is_some() || is_interface => {
+                            *next_method += 1;
+                            let params: Vec<TypeSymbol> =
+                                parameters.iter().map(|p| bind_type(&p.ty)).collect();
+                            tokens.insert_method(
+                                &declaring,
+                                name,
+                                &params,
+                                Token::new(METHOD_DEF, *next_method),
+                            );
+                        }
+                        Member::Constructor { parameters, .. } => {
+                            *next_method += 1;
+                            let params: Vec<TypeSymbol> =
+                                parameters.iter().map(|p| bind_type(&p.ty)).collect();
+                            tokens.insert_method(
+                                &declaring,
+                                ".ctor",
+                                &params,
+                                Token::new(METHOD_DEF, *next_method),
+                            );
+                        }
+                        _ => {}
                     }
                 }
                 for member in &declaration.members {
@@ -1445,6 +1704,195 @@ mod tests {
         let result = compile_unit(&unit, "c.dll", "c");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_interface_dispatch() {
+        let unit = parse_compilation_unit(
+            "interface IAnimal { int Legs(); } \
+             class Dog : IAnimal { public int Legs() { return 4; } } \
+             class Spider : IAnimal { public int Legs() { return 8; } } \
+             class P { static int Count(IAnimal a) { return a.Legs(); } \
+                static int Main() { return Count(new Dog()) * 10 + Count(new Spider()) - 6; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "i.dll", "i");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_virtual_dispatch_and_inheritance() {
+        let unit = parse_compilation_unit(
+            "class A { public int X; public virtual int F() { return 1; } } \
+             class B : A { public override int F() { return base.F() + 40; } \
+                public int G() { return X; } } \
+             class P { static int Main() { \
+                B b = new B(); b.X = 1; A a = b; return a.F() + b.G(); } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "v.dll", "v");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_blittable_struct() {
+        let unit = parse_compilation_unit(
+            "struct Point { public int X; public int Y; } \
+             class P { static int Main() { \
+                Point p = new Point(); p.X = 40; p.Y = 2; \
+                Point q = p; q.X = 100; \
+                return p.X + p.Y; \
+             } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "s.dll", "s");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_struct_method_and_field_return() {
+        let unit = parse_compilation_unit(
+            "struct Point { public int X; public int Y; public int Sum() { return X + Y; } } \
+             class P { static int Main() { \
+                Point p = new Point(); p.X = 13; p.Y = 8; \
+                return p.Sum() + p.X + p.Y; \
+             } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "m.dll", "m");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_nested_struct_field_access() {
+        let unit = parse_compilation_unit(
+            "struct Inner { public int V; } struct Outer { public Inner I; public int N; } \
+             class P { static int Main() { \
+                Outer o = new Outer(); o.I.V = 40; o.N = 2; return o.I.V + o.N; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "n.dll", "n");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_explicit_struct_constructor() {
+        let unit = parse_compilation_unit(
+            "struct Point { public int X; public int Y; \
+                public Point(int x, int y) { X = x; Y = y; } } \
+             class P { static int Main() { \
+                Point p = new Point(40, 2); Point q = new Point(); \
+                return p.X + p.Y + q.X; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "c.dll", "c");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_class_constructor_and_base_chain() {
+        for src in [
+            "class Foo { public int V; public Foo(int v) { V = v; } } \
+             class P { static int Main() { Foo f = new Foo(42); return f.V; } }",
+            "class A { public int X; } \
+             class B : A { public int Y; public B(int x, int y) { X = x; Y = y; } } \
+             class P { static int Main() { B b = new B(40, 2); return b.X + b.Y; } }",
+        ] {
+            let unit = parse_compilation_unit(src).unit;
+            let result = compile_unit(&unit, "c.dll", "c");
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            assert!(result.image.is_some(), "{:?}", result.emit_error);
+        }
+    }
+
+    #[test]
+    fn compiles_string_concatenation() {
+        let unit = parse_compilation_unit(
+            "class P { static string J(string a, string b) { return a + b; } \
+             static int Main() { J(\"x\", \"y\"); return 0; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "s.dll", "s");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+    }
+
+    #[test]
+    fn compiles_boxing_and_unboxing() {
+        for src in [
+            "class P { static int Main() { int n = 42; object o = n; return (int)o; } }",
+            "struct Pt { public int X; public int Y; } \
+             class P { static int Main() { Pt p = new Pt(); p.X = 40; p.Y = 2; \
+                object o = p; Pt q = (Pt)o; return q.X + q.Y; } }",
+        ] {
+            let unit = parse_compilation_unit(src).unit;
+            let result = compile_unit(&unit, "b.dll", "b");
+            assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+            assert!(result.image.is_some(), "{:?}", result.emit_error);
+        }
+    }
+
+    #[test]
+    fn struct_layout_round_trips_through_the_reader() {
+        use lamella_metadata::{Assembly, TargetLayout};
+        let unit = parse_compilation_unit(
+            "struct Point { public int X; public int Y; } \
+             class P { static int Main() { Point p = new Point(); return p.X + p.Y; } }",
+        )
+        .unit;
+        let image = compile_unit(&unit, "s.dll", "s").image.expect("emits");
+        let assembly = Assembly::read(&image).expect("reads back");
+        let point = assembly.find_type("", "Point").expect("Point type");
+        let layout = assembly
+            .value_type_layout(point.token(), &TargetLayout::ilp32())
+            .expect("lays out");
+        assert_eq!(layout.field_offsets, [0, 4]);
+        assert_eq!(layout.size, 8);
+        assert_eq!(layout.alignment, 4);
+        assert!(layout.reference_offsets.is_empty());
+    }
+
+    #[test]
+    fn field_offset_resolves_a_field_token_to_its_layout_offset() {
+        use lamella_metadata::{Assembly, TargetLayout};
+        let unit = parse_compilation_unit(
+            "struct Holder { public string Tag; public int N; } \
+             class P { static int Main() { Holder h = new Holder(); h.N = 1; return h.N; } }",
+        )
+        .unit;
+        let image = compile_unit(&unit, "f.dll", "f").image.expect("emits");
+        let asm = Assembly::read(&image).expect("reads back");
+        let holder = asm.find_type("", "Holder").expect("Holder type");
+        let tag = holder.fields().find(|f| f.name() == Some("Tag")).unwrap();
+        let n = holder.fields().find(|f| f.name() == Some("N")).unwrap();
+        let target = TargetLayout::ilp32();
+        assert_eq!(asm.field_offset(tag.token(), &target), Some(0));
+        assert_eq!(asm.field_offset(n.token(), &target), Some(4));
+    }
+
+    #[test]
+    fn reference_struct_layout_reports_the_gc_map() {
+        use lamella_metadata::{Assembly, TargetLayout};
+        let unit = parse_compilation_unit(
+            "struct Holder { public string Tag; public int N; } \
+             class P { static int Main() { Holder h = new Holder(); h.N = 1; return h.N; } }",
+        )
+        .unit;
+        let image = compile_unit(&unit, "h.dll", "h").image.expect("emits");
+        let assembly = Assembly::read(&image).expect("reads back");
+        let holder = assembly.find_type("", "Holder").expect("Holder type");
+        let layout = assembly
+            .value_type_layout(holder.token(), &TargetLayout::ilp32())
+            .expect("lays out");
+        assert_eq!(layout.field_offsets, [0, 4]);
+        assert_eq!(layout.size, 8);
+        assert_eq!(layout.reference_offsets, [0]);
     }
 
     #[test]

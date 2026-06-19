@@ -41,7 +41,7 @@ struct TypeInfo {
 /// context [`Vm`] (heap, console, ...) and the call arguments in declaration
 /// order, and returns the method's result (`None` for `void`) or a [`Trap`]. It is
 /// documented as a shared seam in `docs/COORDINATION.md`.
-pub type IntrinsicFn = fn(&mut Vm, &[Value]) -> Result<Option<Value>, Trap>;
+pub type IntrinsicFn = fn(&mut Vm, &Module, &[Value]) -> Result<Option<Value>, Trap>;
 
 /// A callable method: either managed CIL the interpreter executes, or a native
 /// intrinsic it invokes directly.
@@ -112,6 +112,17 @@ pub struct Module {
     /// A delegate type's `Invoke` token mapped to its parameter count, so `callvirt` on
     /// it calls the delegate's bound method with the bound target.
     delegate_invokes: BTreeMap<u32, u16>,
+    /// A value/reference type's `Finalize` method (a destructor), if it declares one --
+    /// the finalizer the collector runs when an instance becomes unreachable. Kept
+    /// unconditionally (it is tiny); the finalization machinery that consumes it is
+    /// behind the `finalizers` feature.
+    finalizers: BTreeMap<TypeId, MethodId>,
+    /// Each enum type's constants (keyed by its `TypeDef` token): the underlying integer
+    /// value mapped to the constant name, so `Enum.ToString` can render the name.
+    enum_constants: BTreeMap<u32, BTreeMap<i64, String>>,
+    /// Tokens of enum types whose underlying type is 64-bit (long / ulong), so `Enum.Parse`
+    /// boxes their values as int64 to match the declared type.
+    enum_wide: BTreeSet<u32>,
 }
 
 impl Module {
@@ -292,6 +303,63 @@ impl Module {
     /// Records a static constructor (`.cctor`) to run before the entry point.
     pub fn add_static_ctor(&mut self, method: MethodId) {
         self.static_ctors.push(method);
+    }
+
+    /// Records `type_id`'s `Finalize` method (its destructor), so allocating an instance
+    /// registers it for finalization and the collector can run it on reclamation.
+    pub fn set_finalizer(&mut self, type_id: TypeId, method: MethodId) {
+        self.finalizers.insert(type_id, method);
+    }
+
+    /// The `Finalize` method `type_id` declares, if any.
+    #[must_use]
+    pub fn finalizer_of(&self, type_id: TypeId) -> Option<MethodId> {
+        self.finalizers.get(&type_id).copied()
+    }
+
+    /// Records that the enum type `token` has a constant `name` with underlying `value`.
+    pub fn set_enum_constant(&mut self, token: u32, value: i64, name: String) {
+        self.enum_constants
+            .entry(token)
+            .or_default()
+            .insert(value, name);
+    }
+
+    /// The name of the constant with underlying `value` in the enum type `token`, if any.
+    #[must_use]
+    pub fn enum_value_name(&self, token: u32, value: i64) -> Option<&str> {
+        self.enum_constants
+            .get(&token)
+            .and_then(|constants| constants.get(&value))
+            .map(String::as_str)
+    }
+
+    /// The underlying value of the constant named `name` in the enum type `token`, if any
+    /// -- the reverse of [`Self::enum_value_name`], for `Enum.Parse`.
+    #[must_use]
+    pub fn enum_value_by_name(&self, token: u32, name: &str, ignore_case: bool) -> Option<i64> {
+        self.enum_constants
+            .get(&token)?
+            .iter()
+            .find_map(|(value, constant)| {
+                let matched = if ignore_case {
+                    constant.eq_ignore_ascii_case(name)
+                } else {
+                    constant == name
+                };
+                matched.then_some(*value)
+            })
+    }
+
+    /// Records that the enum type `token` has a 64-bit underlying type (long / ulong).
+    pub fn set_enum_wide(&mut self, token: u32) {
+        self.enum_wide.insert(token);
+    }
+
+    /// Whether the enum type `token` has a 64-bit underlying type.
+    #[must_use]
+    pub fn enum_is_wide(&self, token: u32) -> bool {
+        self.enum_wide.contains(&token)
     }
 
     /// The static constructors, in the order to run them.
