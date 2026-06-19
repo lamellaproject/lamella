@@ -1,0 +1,15 @@
+[package]
+name = "lamella-pe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Managed PE and ECMA-335 metadata writer for the Lamella C# compiler."
+
+[dependencies]
+lamella-metadata = { path = "../lamella-metadata" }
+lamella-token = { path = "../lamella-token" }
+
+[lints]
+workspace = true

@@ -100,11 +100,20 @@ impl CodedIndex {
     /// The column width in bytes (2 or 4) given the table row counts.
     #[must_use]
     pub fn size(self, header: &TablesHeader) -> usize {
+        self.width(|table| header.row_count(table))
+    }
+
+    /// The column width in bytes (2 or 4) given a `row_count` lookup over the
+    /// tables this index selects. The write-side counterpart of [`size`], which a
+    /// metadata writer uses before any [`TablesHeader`] exists.
+    ///
+    /// [`size`]: CodedIndex::size
+    pub fn width(self, row_count: impl Fn(u8) -> u32) -> usize {
         let max_rows = self
             .variants()
             .iter()
             .filter(|&&t| t != NONE)
-            .map(|&t| header.row_count(t))
+            .map(|&t| row_count(t))
             .max()
             .unwrap_or(0);
         let room = 1u64 << (16 - self.tag_bits());
@@ -121,6 +130,22 @@ impl CodedIndex {
         match self.variants().get(tag) {
             Some(&t) if t != NONE => Token::new(t, row),
             _ => Token::new(0, 0),
+        }
+    }
+
+    /// Encodes a [`Token`] as a raw coded-index value: the row shifted past the tag
+    /// bits, with the tag naming the token's table. The write-side mirror of
+    /// [`CodedIndex::decode`]. A token whose table this index does not select
+    /// encodes as 0 (the nil coded index).
+    #[must_use]
+    pub fn encode(self, token: Token) -> u32 {
+        match self
+            .variants()
+            .iter()
+            .position(|&t| t != NONE && t == token.table())
+        {
+            Some(tag) => (token.row() << self.tag_bits()) | tag as u32,
+            None => 0,
         }
     }
 }
@@ -147,6 +172,23 @@ mod tests {
             }
         }
         stream
+    }
+
+    #[test]
+    fn encode_is_the_inverse_of_decode() {
+        let index = CodedIndex::TypeDefOrRef;
+        assert_eq!(index.encode(Token::new(table::TYPE_DEF, 1)), 1 << 2);
+        assert_eq!(index.encode(Token::new(table::TYPE_REF, 1)), (1 << 2) | 1);
+        assert_eq!(index.encode(Token::new(table::TYPE_SPEC, 3)), (3 << 2) | 2);
+        for &(table, row) in &[
+            (table::TYPE_DEF, 7),
+            (table::TYPE_REF, 2),
+            (table::TYPE_SPEC, 5),
+        ] {
+            let token = Token::new(table, row);
+            assert_eq!(index.decode(index.encode(token)), token);
+        }
+        assert_eq!(index.encode(Token::new(table::METHOD_DEF, 1)), 0);
     }
 
     #[test]

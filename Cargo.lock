@@ -23,6 +23,18 @@ name = "lamella-asm-arm32"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-assemble"
+version = "0.0.0"
+dependencies = [
+ "lamella-binder",
+ "lamella-cil",
+ "lamella-metadata",
+ "lamella-pe",
+ "lamella-syntax",
+ "lamella-token",
+]
+
+[[package]]
 name = "lamella-binder"
 version = "0.0.0"
 dependencies = [
@@ -74,6 +86,14 @@ name = "lamella-metadata"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-token",
+]
+
+[[package]]
+name = "lamella-pe"
+version = "0.0.0"
+dependencies = [
+ "lamella-metadata",
  "lamella-token",
 ]
 

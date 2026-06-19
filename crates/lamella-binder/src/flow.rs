@@ -269,7 +269,9 @@ impl Analyzer {
             | BoundExprKind::MethodGroup { receiver, .. } => {
                 self.expression(receiver, assigned, span);
             }
-            BoundExprKind::Call { callee, arguments } => {
+            BoundExprKind::Call {
+                callee, arguments, ..
+            } => {
                 self.expression(callee, assigned, span);
                 for argument in arguments {
                     self.expression(argument, assigned, span);
@@ -312,7 +314,9 @@ impl Analyzer {
                     assigned.insert(name.clone());
                 }
             }
-            BoundExprKind::Cast { operand } | BoundExprKind::TypeTest { operand, .. } => {
+            BoundExprKind::Cast { operand }
+            | BoundExprKind::TypeTest { operand, .. }
+            | BoundExprKind::Conversion { operand, .. } => {
                 self.expression(operand, assigned, span);
             }
             BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {

@@ -148,6 +148,10 @@ fn check_inst(
                 use_value(func, defined, arg, errors);
             }
         }
+        Inst::Store { address, value } => {
+            use_value(func, defined, *address, errors);
+            use_value(func, defined, *value, errors);
+        }
     }
 }
 

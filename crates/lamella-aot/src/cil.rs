@@ -337,6 +337,13 @@ fn apply_value_op(
             let top = *stack.last().ok_or(CilError::StackUnderflow)?;
             stack.push(top);
         }
+        Opcode::ConvI | Opcode::ConvU => {}
+        Opcode::StindI4 => {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::I32);
+            insts.push((result, Inst::Store { address, value }));
+        }
         other => return Err(CilError::Unsupported(other)),
     }
     Ok(())

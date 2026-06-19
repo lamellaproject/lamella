@@ -201,6 +201,7 @@ impl Binder {
             StmtKind::Return(value) => {
                 let value = value.as_ref().map(|expr| self.bind_expression(expr));
                 self.check_return(value.as_ref(), stmt.span);
+                let value = value.map(|v| self.convert_to_return_type(v));
                 BoundStmtKind::Return(value)
             }
             StmtKind::DoWhile { body, condition } => {
@@ -378,13 +379,11 @@ impl Binder {
         let declared = self.resolve_named_type(&bind_type(ty), ty.span);
         let mut bound = Vec::with_capacity(declarators.len());
         for declarator in declarators {
-            let initializer = declarator
-                .initializer
-                .as_ref()
-                .map(|expr| self.bind_expression(expr));
-            if let Some(initializer) = &initializer {
-                self.check_convertible(&initializer.ty, &declared, declarator.span);
-            }
+            let initializer = declarator.initializer.as_ref().map(|expr| {
+                let value = self.bind_expression(expr);
+                self.check_convertible(&value.ty, &declared, declarator.span);
+                self.convert(value, &declared)
+            });
             self.declare_local(&declarator.name, declared.clone());
             bound.push(BoundDeclarator {
                 name: declarator.name.clone(),
@@ -448,6 +447,36 @@ mod tests {
         assert_eq!(codes("long n = 1;"), []);
         assert_eq!(codes("while (true) ;"), []);
         assert_eq!(codes("{ int x = 1; int y = x + 2; }"), []);
+    }
+
+    #[test]
+    fn a_widening_initializer_gets_a_conversion_node() {
+        use crate::bound::{BoundExprKind, ConversionKind};
+
+        let mut binder = Binder::new();
+        binder.enter_scope();
+        let stmt = binder.bind_statement(&parse_statement("long x = 1;").statement);
+        let BoundStmtKind::Local { declarators, .. } = &stmt.kind else {
+            panic!("expected a local declaration");
+        };
+        let init = declarators[0].initializer.as_ref().expect("initializer");
+        assert_eq!(init.ty, TypeSymbol::Special(SpecialType::Int64));
+        assert!(matches!(
+            init.kind,
+            BoundExprKind::Conversion {
+                conversion: ConversionKind::ImplicitNumeric,
+                ..
+            }
+        ));
+
+        let mut binder = Binder::new();
+        binder.enter_scope();
+        let stmt = binder.bind_statement(&parse_statement("int y = 1;").statement);
+        let BoundStmtKind::Local { declarators, .. } = &stmt.kind else {
+            panic!("expected a local declaration");
+        };
+        let init = declarators[0].initializer.as_ref().expect("initializer");
+        assert!(matches!(init.kind, BoundExprKind::Literal(_)));
     }
 
     #[test]

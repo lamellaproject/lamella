@@ -135,6 +135,10 @@ fn lower_inst(
             materialize_compare(enc, assign(result), assign(*lhs), assign(*rhs), *op)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::Store { address, value } => {
+            enc.str_imm(assign(*value), assign(*address), 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
         Inst::Call { .. } => return Err(LowerError::CallUnsupported),
     }
     Ok(())
@@ -248,6 +252,14 @@ fn lower_spilled_inst(
                 .get(*callee as usize)
                 .ok_or(LowerError::CallUnsupported)?;
             enc.bl(target);
+        }
+        Inst::Store { address, value } => {
+            enc.ldr_sp(Reg::R0, slot(*address))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.str_imm(Reg::R1, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
         }
     }
     Ok(())
@@ -677,6 +689,46 @@ mod tests {
             }],
         };
         assert_eq!(lower(&func).unwrap(), vec![0x2A, 0x20, 0x70, 0x47]);
+    }
+
+    #[test]
+    fn lowers_an_mmio_store() {
+        let func = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0x5000_0508,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0x2000,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Store {
+                            address: ValueId(0),
+                            value: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(bytes.windows(2).any(|w| w[1] == 0x60));
     }
 
     #[test]

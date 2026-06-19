@@ -20,7 +20,9 @@ pub mod symbols;
 pub mod types;
 
 pub use bind::bind_type;
-pub use bound::{Binder, BoundExpr, BoundExprKind, bind_expression};
+pub use bound::{
+    Binder, BoundExpr, BoundExprKind, ConversionKind, MethodReference, bind_expression,
+};
 pub use conversion::has_implicit_conversion;
 pub use declaration::{collect_model, collect_types};
 pub use diagnostic::{Diagnostic, DiagnosticKind};

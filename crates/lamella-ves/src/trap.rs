@@ -28,6 +28,14 @@ pub enum Trap {
     BranchOutOfRange(u32),
     /// A string or array index was outside its bounds.
     IndexOutOfRange(i32),
+    /// A field access, method call, or unbox dereferenced the null reference (the
+    /// `NullReferenceException` site, until exceptions exist).
+    NullReference,
+    /// A `castclass` to a type the object is not an instance of (the
+    /// `InvalidCastException` site, until exceptions exist).
+    InvalidCast,
+    /// A field token (`ldfld`/`stfld`) resolved to no field slot in the module.
+    UnresolvedField(Token),
     /// Integer division or remainder by zero (`div`, `rem`, and unsigned forms).
     DivideByZero,
     /// A `call` token resolved to no method in the module.
@@ -56,6 +64,11 @@ impl fmt::Display for Trap {
             Trap::ArgumentOutOfRange(slot) => write!(f, "argument {slot} out of range"),
             Trap::BranchOutOfRange(target) => write!(f, "branch target {target} out of range"),
             Trap::IndexOutOfRange(index) => write!(f, "index {index} out of range"),
+            Trap::NullReference => f.write_str("dereferenced a null reference"),
+            Trap::InvalidCast => f.write_str("invalid cast"),
+            Trap::UnresolvedField(token) => {
+                write!(f, "field token 0x{:08X} resolved to no field", token.0)
+            }
             Trap::DivideByZero => f.write_str("integer divide by zero"),
             Trap::UnresolvedCall(token) => {
                 write!(f, "call token 0x{:08X} resolved to no method", token.0)

@@ -6,7 +6,7 @@ use crate::conversion::{can_cast, converts};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::resolve::{TypeTable, resolve_type};
 use crate::special::SpecialType;
-use crate::symbols::{MethodSymbol, Model, TypeInfo};
+use crate::symbols::{MethodSymbol, Model, TypeInfo, TypeKind};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -26,6 +26,33 @@ pub struct BoundExpr {
     pub kind: BoundExprKind,
     /// The expression's type (`TypeSymbol::Error` when binding failed).
     pub ty: TypeSymbol,
+}
+
+/// The method an invocation resolved to, recorded so emission can name it with a
+/// metadata token and choose `call` versus `callvirt`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodReference {
+    /// The type through which the method is named.
+    pub declaring_type: TypeSymbol,
+    /// The method name.
+    pub name: Box<str>,
+    /// The parameter types, in order.
+    pub parameters: Vec<TypeSymbol>,
+    /// The return type.
+    pub return_type: TypeSymbol,
+    /// Whether the method is `static`.
+    pub is_static: bool,
+}
+
+/// What an inserted [`BoundExprKind::Conversion`] does at emit time (13.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversionKind {
+    /// A widening numeric conversion: emit `conv.*` to the target type.
+    ImplicitNumeric,
+    /// A value type to `object`: emit `box`.
+    Boxing,
+    /// A reference upcast (derived to base or interface): a no-op in CIL.
+    ImplicitReference,
 }
 
 /// The kind of a [`BoundExpr`]. Grows as the binder learns more expression forms.
@@ -76,6 +103,8 @@ pub enum BoundExprKind {
         callee: Box<BoundExpr>,
         /// The bound arguments, in order.
         arguments: Vec<BoundExpr>,
+        /// The method overload resolution chose, when it succeeded.
+        method: Option<MethodReference>,
     },
     /// An element access `receiver[indices]` (14.5.6); its type is the array's
     /// element type.
@@ -122,6 +151,15 @@ pub enum BoundExprKind {
     Cast {
         /// The operand being cast.
         operand: Box<BoundExpr>,
+    },
+    /// An implicit conversion the binder inserts so emission knows to widen a
+    /// numeric, box a value type, or treat a reference upcast as a no-op (13.1).
+    /// The expression's type is the conversion's target.
+    Conversion {
+        /// The value being converted.
+        operand: Box<BoundExpr>,
+        /// What kind of conversion to perform.
+        conversion: ConversionKind,
     },
     /// An `is`/`as` type test (14.9.9, 14.9.10); the tested type is the result
     /// type for `as` and `bool` for `is`.
@@ -221,6 +259,64 @@ impl Binder {
     /// that walk the model's inheritance graph (13.1).
     pub(crate) fn converts(&self, from: &TypeSymbol, to: &TypeSymbol) -> bool {
         converts(&self.model, from, to)
+    }
+
+    /// Wraps `expr` in the implicit conversion to `target` so emission widens,
+    /// boxes, or upcasts as needed (13.1). Returns `expr` unchanged when the types
+    /// match or no implicit conversion applies (the site reports any error).
+    pub(crate) fn convert(&self, expr: BoundExpr, target: &TypeSymbol) -> BoundExpr {
+        if expr.ty == *target
+            || expr.ty.is_error()
+            || target.is_error()
+            || !self.converts(&expr.ty, target)
+        {
+            return expr;
+        }
+        let conversion = self.conversion_kind(&expr.ty, target);
+        BoundExpr {
+            kind: BoundExprKind::Conversion {
+                operand: Box::new(expr),
+                conversion,
+            },
+            ty: target.clone(),
+        }
+    }
+
+    /// Converts `value` to the enclosing method's return type, for a `return`.
+    pub(crate) fn convert_to_return_type(&self, value: BoundExpr) -> BoundExpr {
+        match &self.current_method {
+            Some(method) => {
+                let target = method.return_type.clone();
+                self.convert(value, &target)
+            }
+            None => value,
+        }
+    }
+
+    fn conversion_kind(&self, from: &TypeSymbol, to: &TypeSymbol) -> ConversionKind {
+        if as_special(from).is_some_and(SpecialType::is_numeric)
+            && as_special(to).is_some_and(SpecialType::is_numeric)
+        {
+            ConversionKind::ImplicitNumeric
+        } else if matches!(to, TypeSymbol::Special(SpecialType::Object)) && self.is_value_type(from)
+        {
+            ConversionKind::Boxing
+        } else {
+            ConversionKind::ImplicitReference
+        }
+    }
+
+    /// Whether a type is a value type (boxed when converted to `object`).
+    fn is_value_type(&self, ty: &TypeSymbol) -> bool {
+        match ty {
+            TypeSymbol::Special(SpecialType::Object | SpecialType::String) => false,
+            TypeSymbol::Special(_) => true,
+            TypeSymbol::Named(_) => matches!(
+                self.type_info_of(ty).map(|info| info.kind),
+                Some(TypeKind::Struct | TypeKind::Enum)
+            ),
+            TypeSymbol::Array { .. } | TypeSymbol::Error => false,
+        }
     }
 
     /// The diagnostics gathered so far.
@@ -715,12 +811,15 @@ impl Binder {
     ) -> BoundExpr {
         let target_span = target_expr.span;
         let target = self.bind_expression(target_expr);
-        let value = self.bind_expression(value_expr);
+        let mut value = self.bind_expression(value_expr);
         if !target.ty.is_error() && !is_lvalue(&target) {
             self.diagnostics
                 .push(Diagnostic::new(DiagnosticKind::NotAssignable, target_span));
         } else if !target.ty.is_error() && !value.ty.is_error() {
             self.check_assignment(operator, &target.ty, &value.ty, span);
+            if matches!(operator, AssignmentOperator::Assign) {
+                value = self.convert(value, &target.ty);
+            }
         }
         let ty = target.ty.clone();
         BoundExpr {
@@ -829,7 +928,7 @@ impl Binder {
             }
             _ => None,
         };
-        let ty = match group {
+        let resolved = match group {
             Some((receiver_ty, name))
                 if !arguments.iter().any(|argument| argument.ty.is_error()) =>
             {
@@ -839,29 +938,40 @@ impl Binder {
                     .map(|argument| argument.ty.clone())
                     .collect();
                 self.resolve_call(&name, &candidates, &argument_types, span)
+                    .map(|method| MethodReference {
+                        declaring_type: receiver_ty,
+                        name: method.name,
+                        parameters: method.parameters,
+                        return_type: method.return_type,
+                        is_static: method.is_static,
+                    })
             }
-            _ => TypeSymbol::Error,
+            _ => None,
         };
+        let ty = resolved
+            .as_ref()
+            .map_or(TypeSymbol::Error, |method| method.return_type.clone());
         BoundExpr {
             kind: BoundExprKind::Call {
                 callee: Box::new(callee),
                 arguments,
+                method: resolved,
             },
             ty,
         }
     }
 
     /// Resolves a call to a method group by overload resolution (14.4.2),
-    /// reporting the appropriate diagnostic and returning the result type.
+    /// reporting the appropriate diagnostic and returning the chosen method.
     fn resolve_call(
         &mut self,
         name: &str,
         candidates: &[MethodSymbol],
         argument_types: &[TypeSymbol],
         span: Span,
-    ) -> TypeSymbol {
+    ) -> Option<MethodSymbol> {
         match resolve_overload(&self.model, candidates, argument_types) {
-            OverloadResult::Resolved(return_type) => return_type,
+            OverloadResult::Resolved(method) => Some(method),
             OverloadResult::Ambiguous => {
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::AmbiguousCall {
@@ -869,7 +979,7 @@ impl Binder {
                     },
                     span,
                 ));
-                TypeSymbol::Error
+                None
             }
             OverloadResult::WrongArgumentCount => {
                 self.diagnostics.push(Diagnostic::new(
@@ -879,7 +989,7 @@ impl Binder {
                     },
                     span,
                 ));
-                TypeSymbol::Error
+                None
             }
             OverloadResult::BadArgument { index, from, to } => {
                 self.diagnostics.push(Diagnostic::new(
@@ -890,7 +1000,7 @@ impl Binder {
                     },
                     span,
                 ));
-                TypeSymbol::Error
+                None
             }
         }
     }
@@ -1266,8 +1376,8 @@ fn error_expr() -> BoundExpr {
 
 /// The outcome of overload resolution over a method group (14.4.2).
 enum OverloadResult {
-    /// A unique best overload, with its return type.
-    Resolved(TypeSymbol),
+    /// A unique best overload.
+    Resolved(MethodSymbol),
     /// Two or more applicable overloads with no unique best.
     Ambiguous,
     /// No overload accepts this number of arguments.
@@ -1296,7 +1406,7 @@ fn resolve_overload(
         .filter(|candidate| is_applicable(model, candidate, arguments))
         .collect();
     if let Some(best) = best_candidate(model, &applicable, arguments) {
-        return OverloadResult::Resolved(best.return_type.clone());
+        return OverloadResult::Resolved(best.clone());
     }
     if !applicable.is_empty() {
         return OverloadResult::Ambiguous;
@@ -2304,6 +2414,41 @@ mod tests {
         assert_eq!(call_codes("c.Take(1, 2)"), [1501]);
         assert_eq!(call_codes("c.Take(\"x\")"), [1503]);
         assert_eq!(call_codes("c.G(1, 1)"), [121]);
+    }
+
+    #[test]
+    fn a_call_records_its_resolved_method() {
+        use crate::symbols::{MethodSymbol, TypeInfo, TypeKind};
+
+        let int = TypeSymbol::Special(SpecialType::Int32);
+        let mut calc = TypeInfo::new("", "Calc", TypeKind::Class);
+        calc.methods.push(MethodSymbol {
+            name: "F".into(),
+            return_type: int.clone(),
+            parameters: alloc::vec![int.clone()],
+            is_static: false,
+        });
+        let mut model = Model::new();
+        model.insert(calc);
+
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        let calc_type = TypeSymbol::Named(["Calc".into()].into());
+        binder.declare_local("c", calc_type.clone());
+        let call = binder.bind_expression(&parse_expression("c.F(1)").expr);
+
+        let BoundExprKind::Call {
+            method: Some(method),
+            ..
+        } = call.kind
+        else {
+            panic!("the call should record its resolved method");
+        };
+        assert_eq!(&*method.name, "F");
+        assert_eq!(method.parameters, alloc::vec![int.clone()]);
+        assert_eq!(method.return_type, int);
+        assert!(!method.is_static);
+        assert_eq!(method.declaring_type, calc_type);
     }
 
     #[test]

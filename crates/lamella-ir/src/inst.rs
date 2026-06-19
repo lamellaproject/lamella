@@ -92,4 +92,13 @@ pub enum Inst {
         /// The argument values, in order (placed in the ABI's argument registers).
         args: Vec<ValueId>,
     },
+    /// Stores `value` to the 32-bit memory address held in `address` -- the
+    /// memory-mapped-I/O write primitive. The write is a side effect; the
+    /// instruction's own result value is a placeholder that callers ignore.
+    Store {
+        /// The value holding the destination address.
+        address: ValueId,
+        /// The value to write there.
+        value: ValueId,
+    },
 }

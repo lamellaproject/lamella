@@ -6,6 +6,7 @@
 extern crate alloc;
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -16,15 +17,20 @@ use lamella_ves::intrinsics::{
     console_write, console_write_bool, console_write_char, console_write_double,
     console_write_int32, console_write_int64, console_write_line, console_write_line_bool,
     console_write_line_char, console_write_line_double, console_write_line_empty,
-    console_write_line_int32, console_write_line_int64, string_concat, string_concat3,
+    console_write_line_int32, console_write_line_int64, object_ctor, string_concat, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty, string_not_equals,
     string_substring, string_substring_len,
 };
-use lamella_ves::{IntrinsicFn, MethodId, Module};
+use lamella_ves::{IntrinsicFn, MethodId, Module, Value};
 
 const TYPE_REF: u8 = 0x01;
+const TYPE_DEF: u8 = 0x02;
+const FIELD: u8 = 0x04;
 const METHOD_DEF: u8 = 0x06;
 const MEMBER_REF: u8 = 0x0A;
+
+const METHOD_VIRTUAL: u32 = 0x0040;
+const METHOD_NEWSLOT: u32 = 0x0100;
 
 /// A loaded program: the runnable module and the entry-point method to start at.
 pub struct Program {
@@ -73,11 +79,33 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
     let mut entry = None;
     let mut string_tokens = BTreeSet::new();
     let mut bcl_call_tokens = BTreeSet::new();
-    let mut row: u32 = 0;
+    let mut newarr_tokens = BTreeSet::new();
+    let mut type_extends: Vec<Token> = Vec::new();
+    let mut type_virtuals: Vec<Vec<VirtualMethod>> = Vec::new();
+    let mut own_fields: Vec<Vec<(Token, Value)>> = Vec::new();
+    let mut method_row: u32 = 0;
+    let mut field_row: u32 = 0;
     for type_def in assembly.type_defs() {
+        let mut own = Vec::new();
+        for field in type_def.fields() {
+            field_row += 1;
+            let token = Token::new(FIELD, field_row);
+            if field.is_static() {
+                if !field.is_literal() {
+                    module.bind_static_field(token, default_field_value(field.signature()));
+                }
+                continue;
+            }
+            own.push((token, default_field_value(field.signature())));
+        }
+        let type_id = module.add_type(Vec::new());
+        own_fields.push(own);
+        type_extends.push(type_def.extends());
+
+        let mut virtuals = Vec::new();
         for method in type_def.methods() {
-            row += 1;
-            let token = Token::new(METHOD_DEF, row);
+            method_row += 1;
+            let token = Token::new(METHOD_DEF, method_row);
             let Some(body) = method.body() else {
                 continue;
             };
@@ -87,8 +115,13 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
                         Opcode::Ldstr => {
                             string_tokens.insert(*operand);
                         }
-                        Opcode::Call | Opcode::Callvirt if operand.table() == MEMBER_REF => {
+                        Opcode::Call | Opcode::Callvirt | Opcode::Newobj
+                            if operand.table() == MEMBER_REF =>
+                        {
                             bcl_call_tokens.insert(*operand);
+                        }
+                        Opcode::Newarr => {
+                            newarr_tokens.insert(*operand);
                         }
                         _ => {}
                     }
@@ -96,15 +129,35 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
             }
             let id = module.add_method(body, arg_count(&method));
             module.bind_token(token, id);
+            module.set_method_type(id, type_id);
+            if method.name() == Some(".cctor") {
+                module.add_static_ctor(id);
+            }
+            if method.flags() & METHOD_VIRTUAL != 0 {
+                virtuals.push(VirtualMethod {
+                    id,
+                    name: method.name().unwrap_or("").into(),
+                    params: method
+                        .signature()
+                        .map(|sig| sig.parameters)
+                        .unwrap_or_default(),
+                    newslot: method.flags() & METHOD_NEWSLOT != 0,
+                });
+            }
             if token.0 == entry_token {
                 entry = Some(id);
             }
         }
+        type_virtuals.push(virtuals);
     }
 
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     bind_strings(assembly, &mut module, &string_tokens);
     bind_bcl_calls(assembly, &mut module, &bcl_call_tokens);
+    bind_array_defaults(assembly, &mut module, &newarr_tokens);
+    build_field_layouts(&mut module, &type_extends, &own_fields);
+    build_vtables(&mut module, &type_extends, &type_virtuals);
+    bind_types(&mut module, &type_extends);
     Ok(Program { module, entry })
 }
 
@@ -188,7 +241,214 @@ fn bcl_intrinsic(
         ("String", "op_Inequality") => string_not_equals_overload(signature),
         ("String", "IsNullOrEmpty") => string_is_null_or_empty_overload(signature),
         ("String", "Substring") => string_substring_overload(signature),
+        ("Object", ".ctor") => object_ctor_overload(signature),
         _ => None,
+    }
+}
+
+/// `System.Object..ctor()` -- the base constructor every constructor chains to; a
+/// no-op intrinsic (it takes only `this`).
+fn object_ctor_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [] => Some(object_ctor),
+        _ => None,
+    }
+}
+
+/// The zero value a freshly allocated instance field of this signature holds
+/// (ECMA-335 III.4.21 zero-initializes instances): the numeric zero of its width,
+/// or null for a reference.
+fn default_field_value(signature: Option<SigType>) -> Value {
+    match signature {
+        Some(SigType::I8 | SigType::U8) => Value::Int64(0),
+        Some(SigType::R4 | SigType::R8) => Value::Float(0.0),
+        Some(
+            SigType::Boolean
+            | SigType::Char
+            | SigType::I1
+            | SigType::U1
+            | SigType::I2
+            | SigType::U2
+            | SigType::I4
+            | SigType::U4,
+        ) => Value::Int32(0),
+        _ => Value::Null,
+    }
+}
+
+/// Binds each `newarr` element-type token to its elements' zero value.
+fn bind_array_defaults(assembly: &Assembly, module: &mut Module, tokens: &BTreeSet<Token>) {
+    for token in tokens {
+        module.bind_array_default(*token, array_element_default(assembly, *token));
+    }
+}
+
+/// The zero value an array's elements take (ECMA-335 III.4.20): the numeric zero of a
+/// primitive element, or null for a reference element. The `newarr` operand names the
+/// element type; only a `TypeRef` to a `System` primitive is non-null -- a user
+/// `TypeDef`, a `TypeSpec` (array/generic), and unrecognized names are references.
+fn array_element_default(assembly: &Assembly, element_type: Token) -> Value {
+    if element_type.table() != TYPE_REF {
+        return Value::Null;
+    }
+    let Some(name) = assembly
+        .type_ref(element_type.row())
+        .and_then(|type_ref| type_ref.name())
+    else {
+        return Value::Null;
+    };
+    if name.namespace != "System" {
+        return Value::Null;
+    }
+    match name.name {
+        "Int32" | "UInt32" | "Int16" | "UInt16" | "SByte" | "Byte" | "Boolean" | "Char" => {
+            Value::Int32(0)
+        }
+        "Int64" | "UInt64" => Value::Int64(0),
+        "Single" | "Double" => Value::Float(0.0),
+        "IntPtr" | "UIntPtr" => Value::NativeInt(0),
+        _ => Value::Null,
+    }
+}
+
+/// Computes each type's full instance-field layout (base fields first, then own) and
+/// binds each own field token to its cumulative slot, so a derived instance carries
+/// its inherited fields at the same slots its base uses.
+fn build_field_layouts(module: &mut Module, extends: &[Token], own_fields: &[Vec<(Token, Value)>]) {
+    let mut memo: Vec<Option<Vec<Value>>> = alloc::vec![None; extends.len()];
+    for type_id in 0..extends.len() {
+        let full = field_layout(type_id, extends, own_fields, &mut memo);
+        let base_count = full.len() - own_fields[type_id].len();
+        for (index, (token, _)) in own_fields[type_id].iter().enumerate() {
+            module.bind_field(*token, (base_count + index) as u32);
+        }
+        module.set_type_field_defaults(type_id as u32, full);
+    }
+}
+
+/// The memoized full field layout (zero values) of `type_id`: its base's layout
+/// followed by its own instance fields.
+fn field_layout(
+    type_id: usize,
+    extends: &[Token],
+    own_fields: &[Vec<(Token, Value)>],
+    memo: &mut [Option<Vec<Value>>],
+) -> Vec<Value> {
+    if let Some(layout) = &memo[type_id] {
+        return layout.clone();
+    }
+    let mut layout = match base_type_id(extends[type_id], extends.len()) {
+        Some(base) => field_layout(base, extends, own_fields, memo),
+        None => Vec::new(),
+    };
+    layout.extend(own_fields[type_id].iter().map(|(_, default)| *default));
+    memo[type_id] = Some(layout.clone());
+    layout
+}
+
+/// A virtual method declared by a type, for vtable construction.
+struct VirtualMethod {
+    id: MethodId,
+    name: String,
+    params: Vec<SigType>,
+    newslot: bool,
+}
+
+/// One slot of a vtable under construction: the virtual method's identity (name +
+/// parameter types, to match an override to the slot it overrides) and the current
+/// most-derived implementation.
+#[derive(Clone)]
+struct VtableSlot {
+    name: String,
+    params: Vec<SigType>,
+    method: MethodId,
+}
+
+/// Builds each type's virtual method table and records each virtual method's slot,
+/// following single inheritance (II.12.2): a type's table extends its base's, a
+/// `newslot` method appends a slot, and an override (matched by name + parameter
+/// types) replaces the inherited slot. Abstract methods (no body, hence no id) are
+/// not modeled, so dispatch through an abstract base declaration is unsupported.
+fn build_vtables(module: &mut Module, extends: &[Token], virtuals: &[Vec<VirtualMethod>]) {
+    let mut memo: Vec<Option<Vec<VtableSlot>>> = alloc::vec![None; extends.len()];
+    let mut method_slots: BTreeMap<MethodId, u32> = BTreeMap::new();
+    for type_id in 0..extends.len() {
+        let table = compute_vtable(type_id, extends, virtuals, &mut memo, &mut method_slots);
+        if !table.is_empty() {
+            module.set_vtable(
+                type_id as u32,
+                table.iter().map(|slot| slot.method).collect(),
+            );
+        }
+    }
+    for (method, slot) in method_slots {
+        module.bind_method_slot(method, slot);
+    }
+}
+
+/// The memoized vtable of `type_id`, recursing into the base type so a derived table
+/// extends its base's. Records each of this type's own virtual methods' slots.
+fn compute_vtable(
+    type_id: usize,
+    extends: &[Token],
+    virtuals: &[Vec<VirtualMethod>],
+    memo: &mut [Option<Vec<VtableSlot>>],
+    method_slots: &mut BTreeMap<MethodId, u32>,
+) -> Vec<VtableSlot> {
+    if let Some(table) = &memo[type_id] {
+        return table.clone();
+    }
+    let mut table = match base_type_id(extends[type_id], extends.len()) {
+        Some(base) => compute_vtable(base, extends, virtuals, memo, method_slots),
+        None => Vec::new(),
+    };
+    for method in &virtuals[type_id] {
+        let overridden = (!method.newslot)
+            .then(|| {
+                table
+                    .iter()
+                    .position(|slot| slot.name == method.name && slot.params == method.params)
+            })
+            .flatten();
+        let slot = match overridden {
+            Some(slot) => {
+                table[slot].method = method.id;
+                slot as u32
+            }
+            None => {
+                table.push(VtableSlot {
+                    name: method.name.clone(),
+                    params: method.params.clone(),
+                    method: method.id,
+                });
+                (table.len() - 1) as u32
+            }
+        };
+        method_slots.insert(method.id, slot);
+    }
+    memo[type_id] = Some(table.clone());
+    table
+}
+
+/// The base type's id from an `extends` token: a same-assembly `TypeDef` in range
+/// (its 1-based row is the type id + 1), or `None` for `System.Object` / an external
+/// base (a `TypeRef`) or a nil token.
+fn base_type_id(extends: Token, count: usize) -> Option<usize> {
+    if extends.table() != TYPE_DEF {
+        return None;
+    }
+    let index = (extends.row() as usize).checked_sub(1)?;
+    (index < count).then_some(index)
+}
+
+/// Binds each type's `TypeDef` token to its id and records its base, so `castclass`
+/// and `isinst` can resolve a target type and test the subtype relation at run time.
+fn bind_types(module: &mut Module, extends: &[Token]) {
+    for type_id in 0..extends.len() {
+        let token = Token::new(TYPE_DEF, (type_id + 1) as u32);
+        module.bind_type_token(token, type_id as u32);
+        let base = base_type_id(extends[type_id], extends.len()).map(|base| base as u32);
+        module.set_type_base(type_id as u32, base);
     }
 }
 

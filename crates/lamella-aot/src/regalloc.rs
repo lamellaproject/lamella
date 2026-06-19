@@ -160,6 +160,10 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
                 }
+                Inst::Store { address, value } => {
+                    mark(&mut lo, &mut hi, &mut defined, *address, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
                 Inst::ConstInt { .. } => {}
             }
             mark(&mut lo, &mut hi, &mut defined, *result, ip);
@@ -332,6 +336,10 @@ fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*rhs);
         }
         Inst::Call { args, .. } => args.iter().for_each(|a| f(*a)),
+        Inst::Store { address, value } => {
+            f(*address);
+            f(*value);
+        }
     }
 }
 

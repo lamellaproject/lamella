@@ -385,6 +385,15 @@ pub fn string_concat3(vm: &mut Vm, args: &[Value]) -> Result<Option<Value>, Trap
     Ok(Some(Value::Object(reference)))
 }
 
+/// `System.Object..ctor()`: the base constructor every constructor chains to. With
+/// no object header to initialize here, it is a no-op (it still receives `this`).
+///
+/// # Errors
+/// Never errors.
+pub fn object_ctor(_vm: &mut Vm, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
