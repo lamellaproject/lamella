@@ -14,16 +14,23 @@ use lamella_cil::{Opcode, Operand};
 use lamella_metadata::{Assembly, ConstantValue, Method, MethodSig, SigType};
 use lamella_token::Token;
 use lamella_ves::intrinsics::{
-    boolean_to_string, char_to_string, console_write, console_write_bool, console_write_char,
-    console_write_double, console_write_int32, console_write_int64, console_write_line,
-    console_write_line_bool, console_write_line_char, console_write_line_double,
-    console_write_line_empty, console_write_line_int32, console_write_line_int64,
-    console_write_line_object, delegate_combine, delegate_remove, double_to_string,
-    enum_is_defined, enum_parse, exception_ctor, exception_get_message, gc_collect,
-    int32_to_string, int64_to_string, md_array_get, md_array_get_length, md_array_length,
-    md_array_set, object_ctor, object_to_string, reregister_finalize, string_concat,
-    string_concat3, string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
-    string_not_equals, string_substring, string_substring_len, suppress_finalize, type_from_handle,
+    boolean_parse, boolean_to_string, char_is_digit, char_is_letter, char_is_letter_or_digit,
+    char_is_lower, char_is_upper, char_is_white_space, char_to_lower, char_to_string,
+    char_to_upper, console_write, console_write_bool, console_write_char, console_write_double,
+    console_write_int32, console_write_int64, console_write_line, console_write_line_bool,
+    console_write_line_char, console_write_line_double, console_write_line_empty,
+    console_write_line_int32, console_write_line_int64, console_write_line_object,
+    delegate_combine, delegate_remove, double_to_string, enum_is_defined, enum_parse,
+    exception_ctor, exception_get_message, gc_collect, int32_parse, int32_to_string, int64_parse,
+    int64_to_string, math_abs_int32, math_abs_int64, math_max_int32, math_max_int64,
+    math_min_int32, math_min_int64, math_sign_int32, math_sign_int64, md_array_get,
+    md_array_get_length, md_array_length, md_array_set, object_ctor, object_to_string,
+    reregister_finalize, string_concat, string_concat3, string_contains, string_ends_with,
+    string_equals, string_get_chars, string_get_length, string_index_of_char,
+    string_index_of_string, string_insert, string_is_null_or_empty, string_last_index_of_char,
+    string_not_equals, string_pad_left, string_pad_right, string_remove, string_replace_char,
+    string_replace_string, string_starts_with, string_substring, string_substring_len,
+    string_to_lower, string_to_upper, string_trim, suppress_finalize, type_from_handle,
     wait_for_pending_finalizers,
 };
 use lamella_ves::{IntrinsicFn, MethodId, Module, Value};
@@ -173,6 +180,28 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
             let id = module.add_method(body, arg_count(&method));
             module.bind_token(token, id);
             module.set_method_type(id, type_id);
+            let qualified = match type_def.name() {
+                Some(declaring) if !declaring.namespace.is_empty() => {
+                    alloc::format!("{}.{}.{}", declaring.namespace, declaring.name, name)
+                }
+                Some(declaring) => alloc::format!("{}.{}", declaring.name, name),
+                None => name.clone(),
+            };
+            let mut arg_names = Vec::new();
+            if !method.is_static() {
+                arg_names.push(String::from("this"));
+            }
+            let mut declared = alloc::vec![String::new(); params.len()];
+            for param in method.params() {
+                if let Ok(slot) = usize::try_from(param.sequence().wrapping_sub(1)) {
+                    if let (Some(entry), Some(param_name)) = (declared.get_mut(slot), param.name())
+                    {
+                        *entry = String::from(param_name);
+                    }
+                }
+            }
+            arg_names.extend(declared);
+            module.set_method_debug(id, qualified, arg_names);
             if name == ".cctor" {
                 module.add_static_ctor(id);
             }
@@ -301,6 +330,19 @@ fn bcl_intrinsic(
         ("String", "op_Inequality") => string_not_equals_overload(signature),
         ("String", "IsNullOrEmpty") => string_is_null_or_empty_overload(signature),
         ("String", "Substring") => string_substring_overload(signature),
+        ("String", "IndexOf") => string_index_of_overload(signature),
+        ("String", "LastIndexOf") => string_last_index_of_overload(signature),
+        ("String", "StartsWith") => string_one_string_predicate(string_starts_with, signature),
+        ("String", "EndsWith") => string_one_string_predicate(string_ends_with, signature),
+        ("String", "Contains") => string_one_string_predicate(string_contains, signature),
+        ("String", "ToUpper") => string_no_arg_transform(string_to_upper, signature),
+        ("String", "ToLower") => string_no_arg_transform(string_to_lower, signature),
+        ("String", "Trim") => string_no_arg_transform(string_trim, signature),
+        ("String", "Replace") => string_replace_overload(signature),
+        ("String", "PadLeft") => string_pad_overload(string_pad_left, signature),
+        ("String", "PadRight") => string_pad_overload(string_pad_right, signature),
+        ("String", "Insert") => string_insert_overload(signature),
+        ("String", "Remove") => string_remove_overload(signature),
         ("Object", ".ctor") => object_ctor_overload(signature),
         ("Object", "Finalize") => Some(object_ctor),
         ("Exception", ".ctor") => Some(exception_ctor),
@@ -322,6 +364,21 @@ fn bcl_intrinsic(
         ("Object", "ToString") => to_string_overload(object_to_string, signature),
         ("Delegate", "Combine") => Some(delegate_combine),
         ("Delegate", "Remove") => Some(delegate_remove),
+        ("Math", "Abs") => math_abs_overload(signature),
+        ("Math", "Max") => math_binary_overload(math_max_int32, math_max_int64, signature),
+        ("Math", "Min") => math_binary_overload(math_min_int32, math_min_int64, signature),
+        ("Math", "Sign") => math_sign_overload(signature),
+        ("Char", "IsDigit") => char_one_arg_overload(char_is_digit, signature),
+        ("Char", "IsLetter") => char_one_arg_overload(char_is_letter, signature),
+        ("Char", "IsLetterOrDigit") => char_one_arg_overload(char_is_letter_or_digit, signature),
+        ("Char", "IsWhiteSpace") => char_one_arg_overload(char_is_white_space, signature),
+        ("Char", "IsUpper") => char_one_arg_overload(char_is_upper, signature),
+        ("Char", "IsLower") => char_one_arg_overload(char_is_lower, signature),
+        ("Char", "ToUpper") => char_one_arg_overload(char_to_upper, signature),
+        ("Char", "ToLower") => char_one_arg_overload(char_to_lower, signature),
+        ("Int32", "Parse") => one_string_overload(int32_parse, signature),
+        ("Int64", "Parse") => one_string_overload(int64_parse, signature),
+        ("Boolean", "Parse") => one_string_overload(boolean_parse, signature),
         _ => None,
     }
 }
@@ -760,6 +817,136 @@ fn string_substring_overload(signature: Option<&MethodSig>) -> Option<IntrinsicF
 fn string_get_chars_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
     match parameters_of(signature) {
         [SigType::I4] => Some(string_get_chars),
+        _ => None,
+    }
+}
+
+/// `String.IndexOf(char)` / `IndexOf(string)` -- the ordinal-search overloads.
+fn string_index_of_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::Char] => Some(string_index_of_char),
+        [SigType::String] => Some(string_index_of_string),
+        _ => None,
+    }
+}
+
+/// `String.LastIndexOf(char)`.
+fn string_last_index_of_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::Char] => Some(string_last_index_of_char),
+        _ => None,
+    }
+}
+
+/// A one-string-argument predicate (`StartsWith` / `EndsWith` / `Contains`), ordinal.
+fn string_one_string_predicate(
+    intrinsic: IntrinsicFn,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::String] => Some(intrinsic),
+        _ => None,
+    }
+}
+
+/// A parameterless string-returning transform (`ToUpper` / `ToLower` / `Trim`); the
+/// culture/char-set overloads are not modeled.
+fn string_no_arg_transform(
+    intrinsic: IntrinsicFn,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [] => Some(intrinsic),
+        _ => None,
+    }
+}
+
+/// `String.Replace(char, char)` / `Replace(string, string)`.
+fn string_replace_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::Char, SigType::Char] => Some(string_replace_char),
+        [SigType::String, SigType::String] => Some(string_replace_string),
+        _ => None,
+    }
+}
+
+/// `Math.Abs(int)` / `Abs(long)` -- the integer overloads (float/double need libm).
+fn math_abs_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::I4] => Some(math_abs_int32),
+        [SigType::I8] => Some(math_abs_int64),
+        _ => None,
+    }
+}
+
+/// A binary `Math` overload (`Max` / `Min`) over two ints or two longs.
+fn math_binary_overload(
+    int32: IntrinsicFn,
+    int64: IntrinsicFn,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::I4, SigType::I4] => Some(int32),
+        [SigType::I8, SigType::I8] => Some(int64),
+        _ => None,
+    }
+}
+
+/// `Math.Sign(int)` / `Sign(long)` -- both return an `int`.
+fn math_sign_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::I4] => Some(math_sign_int32),
+        [SigType::I8] => Some(math_sign_int64),
+        _ => None,
+    }
+}
+
+/// A one-`char` `System.Char` method (classification or ASCII casing).
+fn char_one_arg_overload(
+    intrinsic: IntrinsicFn,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::Char] => Some(intrinsic),
+        _ => None,
+    }
+}
+
+/// A single-`string`-argument static method (`Int32.Parse`, `Boolean.Parse`, ...). The
+/// format-provider / number-styles overloads are not modeled.
+fn one_string_overload(
+    intrinsic: IntrinsicFn,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::String] => Some(intrinsic),
+        _ => None,
+    }
+}
+
+/// `String.PadLeft(int)` / `PadLeft(int, char)` (and the `PadRight` pair).
+fn string_pad_overload(
+    intrinsic: IntrinsicFn,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::I4] | [SigType::I4, SigType::Char] => Some(intrinsic),
+        _ => None,
+    }
+}
+
+/// `String.Insert(int, string)`.
+fn string_insert_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::I4, SigType::String] => Some(string_insert),
+        _ => None,
+    }
+}
+
+/// `String.Remove(int)` / `Remove(int, int)`.
+fn string_remove_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::I4] | [SigType::I4, SigType::I4] => Some(string_remove),
         _ => None,
     }
 }

@@ -70,6 +70,23 @@ pub trait DebugBackend {
         None
     }
 
+    /// Whether the backend has source-level debug info loaded (the interpreter's Portable
+    /// PDB, or a device's AOT debug-info). When true, the adapter steps at *source*
+    /// granularity -- `next` / `stepIn` / `stepOut` advance to the next sequence point (a
+    /// source statement) rather than one instruction at a time. The default keeps the
+    /// instruction-level stepping a backend without source info offers.
+    fn has_source(&self) -> bool {
+        false
+    }
+
+    /// Whether execution is parked at a source-statement boundary right now -- a
+    /// (non-hidden) sequence point in the innermost frame. The adapter single-steps until
+    /// this holds (at the call depth the step implies) so a source-level step lands on a
+    /// statement, never mid-statement. Consulted only when [`DebugBackend::has_source`].
+    fn at_source_boundary(&self) -> bool {
+        false
+    }
+
     /// The variables in one scope of frame `index`. Interpreter: the frame's
     /// arguments / locals / evaluation-stack slots. Device: locals/arguments recovered
     /// from the AOT debug-info (register or stack-slot homes), read via memory/regs.

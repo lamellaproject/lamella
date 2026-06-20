@@ -132,6 +132,21 @@ impl SpecialType {
                 | SpecialType::Decimal
         )
     }
+
+    /// Whether the type is an unsigned integral type (4.1.5): `byte`, `ushort`,
+    /// `uint`, `ulong`, and `char` (16-bit unsigned). These select the `.un` CIL
+    /// forms for division, remainder, right shift, and the relational operators.
+    #[must_use]
+    pub fn is_unsigned(self) -> bool {
+        matches!(
+            self,
+            SpecialType::Byte
+                | SpecialType::UInt16
+                | SpecialType::UInt32
+                | SpecialType::UInt64
+                | SpecialType::Char
+        )
+    }
 }
 
 #[cfg(test)]

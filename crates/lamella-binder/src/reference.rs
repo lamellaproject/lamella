@@ -1,7 +1,9 @@
 //! Loading a reference assembly's types into the binder's [`Model`].
 
 use crate::special::SpecialType;
-use crate::symbols::{Accessibility, FieldSymbol, MethodSymbol, Model, TypeInfo, TypeKind};
+use crate::symbols::{
+    Accessibility, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind,
+};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -68,6 +70,26 @@ fn type_info(assembly: &Assembly, type_def: &lamella_metadata::TypeDef) -> Optio
             is_static: !signature.has_this,
             accessibility: Accessibility::Public,
         };
+        let property = method_name
+            .strip_prefix("get_")
+            .filter(|_| signature.parameters.is_empty())
+            .map(|name| (name, symbol.return_type.clone()))
+            .or_else(|| {
+                method_name
+                    .strip_prefix("set_")
+                    .filter(|_| symbol.parameters.len() == 1)
+                    .map(|name| (name, symbol.parameters[0].clone()))
+            });
+        if let Some((property_name, ty)) = property {
+            if info.find_property(property_name).is_none() {
+                info.properties.push(PropertySymbol {
+                    name: property_name.into(),
+                    ty,
+                    is_static: symbol.is_static,
+                    accessibility: Accessibility::Public,
+                });
+            }
+        }
         if method_name == ".ctor" {
             info.constructors.push(symbol);
         } else {

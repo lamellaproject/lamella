@@ -9,7 +9,7 @@ use lamella_debug_backend::{
 use lamella_metadata::PortablePdb;
 use lamella_token::Token;
 use lamella_ves::{Method, MethodId, Module, Session, Status, Value, Vm};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The `MethodDef` metadata table tag, for rebuilding a method token to map a PDB
 /// `method_rid` to the interpreter's `MethodId`.
@@ -32,6 +32,13 @@ pub struct InterpreterBackend {
     /// `MethodId` -> `MethodDef` rid: the reverse of the module's token binding, so a
     /// stack frame's method maps back to its PDB row for `source_location`.
     method_rid: BTreeMap<MethodId, u32>,
+    /// Per method, the CIL byte offsets carrying a (non-hidden) sequence point: the
+    /// statement boundaries a source-level step may land on. Empty without a PDB.
+    seq_boundaries: BTreeMap<MethodId, BTreeSet<u32>>,
+    /// True when execution is parked on a breakpoint already reported to the client, so
+    /// the next `resume` steps off it before running on. False at launch -- so a
+    /// breakpoint on the entry instruction fires rather than being stepped over.
+    at_reported_breakpoint: bool,
 }
 
 impl InterpreterBackend {
@@ -47,6 +54,8 @@ impl InterpreterBackend {
             output_sent: 0,
             pdb: None,
             method_rid: BTreeMap::new(),
+            seq_boundaries: BTreeMap::new(),
+            at_reported_breakpoint: false,
         }
     }
 
@@ -56,10 +65,20 @@ impl InterpreterBackend {
     #[must_use]
     pub fn with_pdb(module: Module, entry: u32, pdb_bytes: Vec<u8>) -> InterpreterBackend {
         let mut method_rid = BTreeMap::new();
+        let mut seq_boundaries = BTreeMap::new();
         if let Ok(pdb) = PortablePdb::read(&pdb_bytes) {
             for rid in 1..=pdb.method_count() {
                 if let Some(id) = module.resolve(Token::new(METHOD_DEF, rid)) {
                     method_rid.insert(id, rid);
+                    let offsets: BTreeSet<u32> = pdb
+                        .sequence_points(rid)
+                        .iter()
+                        .filter(|point| !point.is_hidden)
+                        .map(|point| point.il_offset)
+                        .collect();
+                    if !offsets.is_empty() {
+                        seq_boundaries.insert(id, offsets);
+                    }
                 }
             }
         }
@@ -72,6 +91,8 @@ impl InterpreterBackend {
             output_sent: 0,
             pdb: Some(pdb_bytes),
             method_rid,
+            seq_boundaries,
+            at_reported_breakpoint: false,
         }
     }
 
@@ -137,6 +158,7 @@ impl DebugBackend for InterpreterBackend {
         match Session::new(&self.module, self.entry, Vec::new()) {
             Ok(session) => {
                 self.session = Some(session);
+                self.at_reported_breakpoint = false;
                 self.apply_breakpoints();
                 true
             }
@@ -149,12 +171,14 @@ impl DebugBackend for InterpreterBackend {
             session,
             vm,
             module,
+            at_reported_breakpoint,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
             return Stop::Done;
         };
-        if session.is_at_breakpoint() {
+        if *at_reported_breakpoint && session.is_at_breakpoint() {
+            *at_reported_breakpoint = false;
             match session.step(module, vm) {
                 Ok(Status::Done(_)) => return Stop::Done,
                 Ok(_) => {}
@@ -162,7 +186,10 @@ impl DebugBackend for InterpreterBackend {
             }
         }
         match session.resume(module, vm) {
-            Ok(Status::Paused | Status::Running) => Stop::Breakpoint,
+            Ok(Status::Paused | Status::Running) => {
+                *at_reported_breakpoint = true;
+                Stop::Breakpoint
+            }
             Ok(Status::Done(_)) => Stop::Done,
             Err(trap) => Stop::Fault(format!("{trap}")),
         }
@@ -173,11 +200,13 @@ impl DebugBackend for InterpreterBackend {
             session,
             vm,
             module,
+            at_reported_breakpoint,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
             return Stop::Done;
         };
+        *at_reported_breakpoint = false;
         match session.step(module, vm) {
             Ok(Status::Done(_)) => Stop::Done,
             Ok(Status::Running | Status::Paused) => Stop::Step,
@@ -205,7 +234,11 @@ impl DebugBackend for InterpreterBackend {
             .filter_map(|index| {
                 session.frame(index).map(|frame| Frame {
                     address: encode_address(frame.method, frame.ip),
-                    name: alloc_method_name(frame.method, frame.ip),
+                    name: self
+                        .module
+                        .method_name(frame.method)
+                        .map(String::from)
+                        .unwrap_or_else(|| alloc_method_name(frame.method, frame.ip)),
                     line: frame.ip + 1,
                 })
             })
@@ -235,6 +268,28 @@ impl DebugBackend for InterpreterBackend {
         })
     }
 
+    fn has_source(&self) -> bool {
+        self.pdb.is_some()
+    }
+
+    fn at_source_boundary(&self) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return false;
+        };
+        let Some(frame) = session
+            .depth()
+            .checked_sub(1)
+            .and_then(|innermost| session.frame(innermost))
+        else {
+            return false;
+        };
+        let Some(boundaries) = self.seq_boundaries.get(&frame.method) else {
+            return false;
+        };
+        self.index_to_il_offset(frame.method, frame.ip)
+            .is_some_and(|il_offset| boundaries.contains(&il_offset))
+    }
+
     fn variables(&self, frame_index: usize, scope: Scope) -> Vec<Variable> {
         let Some(session) = self.session.as_ref() else {
             return Vec::new();
@@ -251,6 +306,7 @@ impl DebugBackend for InterpreterBackend {
         let names = matches!(scope, Scope::Locals)
             .then(|| self.local_names(method))
             .flatten();
+        let arguments = matches!(scope, Scope::Arguments);
         values
             .iter()
             .enumerate()
@@ -260,6 +316,11 @@ impl DebugBackend for InterpreterBackend {
                     .as_ref()
                     .and_then(|names| names.get(&(index as u16)))
                     .cloned()
+                    .or_else(|| {
+                        arguments
+                            .then(|| self.module.arg_name(method, index).map(String::from))
+                            .flatten()
+                    })
                     .unwrap_or_else(|| format!("{prefix}{index}"));
                 Variable {
                     name,

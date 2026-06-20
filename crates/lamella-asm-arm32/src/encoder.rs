@@ -307,6 +307,23 @@ impl Encoder {
         Ok(())
     }
 
+    /// `LSRS Rd, Rm, #imm5` -- logical (zero-filling) shift right by an immediate. 16-bit
+    /// encoding T1 (ARMv6-M ARM, LSR (immediate)): `0000 1 imm5 Rm Rd`, i.e. `LSLS` with bit
+    /// 11 set. Low registers; `imm5` in 1..=31 (the ARM encoding reads 0 as a shift of 32,
+    /// which this lowering never emits).
+    pub fn lsrs_imm(&mut self, rd: Reg, rm: Reg, imm5: u8) -> Result<(), AssembleError> {
+        if !(rd.is_low() && rm.is_low()) || imm5 > 31 {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(
+            0x0800
+                | (u16::from(imm5) << 6)
+                | (u16::from(rm.number()) << 3)
+                | u16::from(rd.number()),
+        );
+        Ok(())
+    }
+
     /// `LDR Rt, [Rn, #imm]` -- load a word from `Rn + imm`. 16-bit encoding T1
     /// (A6.7.26); low registers, `imm` a multiple of 4 in 0..=124.
     pub fn ldr_imm(&mut self, rt: Reg, rn: Reg, imm: u16) -> Result<(), AssembleError> {
@@ -980,6 +997,14 @@ mod tests {
         assert_eq!(
             one(|e| e.lsls_imm(Reg::R0, Reg::R1, 3).unwrap()),
             [0xC8, 0x00]
+        );
+    }
+
+    #[test]
+    fn lsrs_immediate() {
+        assert_eq!(
+            one(|e| e.lsrs_imm(Reg::R0, Reg::R1, 3).unwrap()),
+            [0xC8, 0x08]
         );
     }
 

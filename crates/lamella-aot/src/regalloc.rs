@@ -191,6 +191,9 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *src, ip);
                 }
                 Inst::SemihostWrite { .. } => {}
+                Inst::WriteInt { value } => {
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
                 Inst::ConstInt { .. } => {}
             }
             mark(&mut lo, &mut hi, &mut defined, *result, ip);
@@ -380,6 +383,7 @@ fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::FieldAddr { base, .. } => f(*base),
         Inst::CopyStruct { src } => f(*src),
         Inst::SemihostWrite { .. } => {}
+        Inst::WriteInt { value } => f(*value),
     }
 }
 

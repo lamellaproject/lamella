@@ -190,6 +190,9 @@ fn check_inst(
         }
         Inst::SemihostWrite { .. } => {
         }
+        Inst::WriteInt { value } => {
+            use_value(func, defined, *value, errors);
+        }
     }
 }
 

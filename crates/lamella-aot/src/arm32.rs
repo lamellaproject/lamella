@@ -162,7 +162,9 @@ fn lower_inst(
         | Inst::FieldAddr { .. }
         | Inst::CopyStruct { .. } => return Err(LowerError::CallUnsupported),
         Inst::Call { .. } => return Err(LowerError::CallUnsupported),
-        Inst::SemihostWrite { .. } => return Err(LowerError::CallUnsupported),
+        Inst::SemihostWrite { .. } | Inst::WriteInt { .. } => {
+            return Err(LowerError::CallUnsupported);
+        }
     }
     Ok(())
 }
@@ -502,7 +504,73 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.bkpt(0xAB);
         }
+        Inst::WriteInt { value } => {
+            enc.ldr_sp(Reg::R0, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_write_int(enc)?;
+        }
     }
+    Ok(())
+}
+
+/// Emits the `Console.WriteLine(int)` routine: format the signed int already in `r0` as
+/// decimal with a trailing newline into a 16-byte stack buffer, then `SYS_WRITE0` it.
+/// Cortex-M0 (ARMv6-M) has no divide, so each digit comes from a shift-only unsigned
+/// divide-by-10 (Hacker's Delight). Saves/restores r4-r7; r0-r3 are scratch on this path.
+fn emit_write_int(enc: &mut Encoder) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    enc.push_registers(0b1111_0000, false);
+    enc.sub_sp(16).map_err(oops)?;
+    enc.add_sp_imm(Reg::R6, 0).map_err(oops)?;
+    enc.asrs_imm(Reg::R4, Reg::R0, 31).map_err(oops)?;
+    enc.eors(Reg::R0, Reg::R4).map_err(oops)?;
+    enc.subs(Reg::R0, Reg::R0, Reg::R4).map_err(oops)?;
+    enc.movs_imm(Reg::R5, 15).map_err(oops)?;
+    enc.movs_imm(Reg::R2, 0).map_err(oops)?;
+    enc.strb_reg(Reg::R2, Reg::R6, Reg::R5).map_err(oops)?;
+    enc.subs_imm8(Reg::R5, 1).map_err(oops)?;
+    enc.movs_imm(Reg::R2, b'\n').map_err(oops)?;
+    enc.strb_reg(Reg::R2, Reg::R6, Reg::R5).map_err(oops)?;
+    let loop_top = enc.new_label();
+    let skip_corr = enc.new_label();
+    enc.bind_label(loop_top);
+    enc.lsrs_imm(Reg::R1, Reg::R0, 1).map_err(oops)?;
+    enc.lsrs_imm(Reg::R3, Reg::R0, 2).map_err(oops)?;
+    enc.adds(Reg::R1, Reg::R1, Reg::R3).map_err(oops)?;
+    enc.lsrs_imm(Reg::R3, Reg::R1, 4).map_err(oops)?;
+    enc.adds(Reg::R1, Reg::R1, Reg::R3).map_err(oops)?;
+    enc.lsrs_imm(Reg::R3, Reg::R1, 8).map_err(oops)?;
+    enc.adds(Reg::R1, Reg::R1, Reg::R3).map_err(oops)?;
+    enc.lsrs_imm(Reg::R3, Reg::R1, 16).map_err(oops)?;
+    enc.adds(Reg::R1, Reg::R1, Reg::R3).map_err(oops)?;
+    enc.lsrs_imm(Reg::R1, Reg::R1, 3).map_err(oops)?;
+    enc.lsls_imm(Reg::R3, Reg::R1, 3).map_err(oops)?;
+    enc.lsls_imm(Reg::R2, Reg::R1, 1).map_err(oops)?;
+    enc.adds(Reg::R3, Reg::R3, Reg::R2).map_err(oops)?;
+    enc.subs(Reg::R2, Reg::R0, Reg::R3).map_err(oops)?;
+    enc.cmp_imm(Reg::R2, 10).map_err(oops)?;
+    enc.b_cond(Cond::CarryClear, skip_corr);
+    enc.adds_imm8(Reg::R1, 1).map_err(oops)?;
+    enc.subs_imm8(Reg::R2, 10).map_err(oops)?;
+    enc.bind_label(skip_corr);
+    enc.adds_imm8(Reg::R2, b'0').map_err(oops)?;
+    enc.subs_imm8(Reg::R5, 1).map_err(oops)?;
+    enc.strb_reg(Reg::R2, Reg::R6, Reg::R5).map_err(oops)?;
+    enc.movs_reg(Reg::R0, Reg::R1).map_err(oops)?;
+    enc.cmp_imm(Reg::R0, 0).map_err(oops)?;
+    enc.b_cond(Cond::Ne, loop_top);
+    let skip_sign = enc.new_label();
+    enc.cmp_imm(Reg::R4, 0).map_err(oops)?;
+    enc.b_cond(Cond::Eq, skip_sign);
+    enc.subs_imm8(Reg::R5, 1).map_err(oops)?;
+    enc.movs_imm(Reg::R2, b'-').map_err(oops)?;
+    enc.strb_reg(Reg::R2, Reg::R6, Reg::R5).map_err(oops)?;
+    enc.bind_label(skip_sign);
+    enc.adds(Reg::R1, Reg::R6, Reg::R5).map_err(oops)?;
+    enc.movs_imm(Reg::R0, 4).map_err(oops)?;
+    enc.bkpt(0xAB);
+    enc.add_sp(16).map_err(oops)?;
+    enc.pop_registers(0b1111_0000, false);
     Ok(())
 }
 
@@ -774,7 +842,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     if func.blocks.iter().any(|b| {
         b.insts
             .iter()
-            .any(|(_, i)| matches!(i, Inst::SemihostWrite { .. }))
+            .any(|(_, i)| matches!(i, Inst::SemihostWrite { .. } | Inst::WriteInt { .. }))
     }) {
         return Ok(Assignment::Spilled);
     }

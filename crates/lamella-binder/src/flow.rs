@@ -267,7 +267,7 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
         BoundExprKind::Unary { operand, .. } | BoundExprKind::Postfix { operand, .. } => {
             collect_uses(operand, used);
         }
-        BoundExprKind::Cast { operand }
+        BoundExprKind::Cast { operand, .. }
         | BoundExprKind::TypeTest { operand, .. }
         | BoundExprKind::Conversion { operand, .. } => collect_uses(operand, used),
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
@@ -719,7 +719,7 @@ impl Analyzer<'_> {
                     assigned.insert(name.clone());
                 }
             }
-            BoundExprKind::Cast { operand }
+            BoundExprKind::Cast { operand, .. }
             | BoundExprKind::TypeTest { operand, .. }
             | BoundExprKind::Conversion { operand, .. } => {
                 self.expression(operand, assigned, span);

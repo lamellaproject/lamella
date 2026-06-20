@@ -33,6 +33,7 @@ pub fn emit_expression(
             operator,
             left,
             right,
+            checked,
         } => match operator {
             BinaryOperator::LogicalAnd => {
                 emit_short_circuit(left, right, false, frame, tokens, out)
@@ -54,7 +55,7 @@ pub fn emit_expression(
                     out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
                     Ok(())
                 } else {
-                    emit_binary(*operator, out)
+                    emit_binary(*operator, &left.ty, *checked, out)
                 }
             }
         },
@@ -82,9 +83,9 @@ pub fn emit_expression(
                 emit_conversion(*conversion, &expr.ty, out)
             }
         }
-        BoundExprKind::Cast { operand } => {
+        BoundExprKind::Cast { operand, checked } => {
             emit_expression(operand, frame, tokens, out)?;
-            emit_cast(&operand.ty, &expr.ty, tokens, out)
+            emit_cast(&operand.ty, &expr.ty, *checked, tokens, out)
         }
         BoundExprKind::Call {
             callee,
@@ -223,6 +224,17 @@ fn emit_element_load(
     }
     emit_expression(receiver, frame, tokens, out)?;
     emit_expression(&indices[0], frame, tokens, out)?;
+    if matches!(receiver.ty, TypeSymbol::Special(SpecialType::String)) {
+        let token = tokens
+            .method(
+                &receiver.ty,
+                "get_Chars",
+                &[TypeSymbol::Special(SpecialType::Int32)],
+            )
+            .ok_or(EmitError::Unsupported("String::get_Chars was not minted"))?;
+        out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
+        return Ok(());
+    }
     out.push(Instruction::simple(ldelem_opcode(element_ty)?));
     Ok(())
 }
@@ -420,7 +432,7 @@ fn emit_field_load(
         ));
     };
     if let Some(value) = field.constant {
-        out.push(load_i4(value as i32));
+        out.push(const_load(value, &field.ty));
         return Ok(());
     }
     let token = tokens
@@ -538,6 +550,7 @@ fn accessor_name(prefix: &str, property: &str) -> String {
 fn emit_cast(
     from: &TypeSymbol,
     to: &TypeSymbol,
+    checked: bool,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
@@ -555,8 +568,13 @@ fn emit_cast(
         out.push(Instruction::simple(Opcode::ConvI4));
         return Ok(());
     }
-    if matches!(to, TypeSymbol::Special(_)) {
-        out.push(Instruction::simple(numeric_conversion(to)?));
+    if let TypeSymbol::Special(target) = to {
+        let unsigned_source = matches!(from, TypeSymbol::Special(source) if source.is_unsigned());
+        let opcode = match (checked, checked_overflow_conversion(*target, unsigned_source)) {
+            (true, Some(ovf)) => ovf,
+            _ => numeric_conversion(to)?,
+        };
+        out.push(Instruction::simple(opcode));
         return Ok(());
     }
     Err(EmitError::Unsupported("this cast is not lowered yet"))
@@ -760,25 +778,35 @@ fn emit_literal(
     Ok(())
 }
 
-fn emit_binary(operator: BinaryOperator, out: &mut Vec<Instruction>) -> Result<(), EmitError> {
+fn emit_binary(
+    operator: BinaryOperator,
+    operand_ty: &TypeSymbol,
+    checked: bool,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
     use BinaryOperator as Op;
+    let unsigned = matches!(operand_ty, TypeSymbol::Special(special) if special.is_unsigned());
     let opcode = match operator {
-        Op::Add => Opcode::Add,
-        Op::Subtract => Opcode::Sub,
-        Op::Multiply => Opcode::Mul,
-        Op::Divide => Opcode::Div,
-        Op::Modulo => Opcode::Rem,
+        Op::Add => checked_or(checked, unsigned, Opcode::AddOvfUn, Opcode::AddOvf, Opcode::Add),
+        Op::Subtract => checked_or(checked, unsigned, Opcode::SubOvfUn, Opcode::SubOvf, Opcode::Sub),
+        Op::Multiply => checked_or(checked, unsigned, Opcode::MulOvfUn, Opcode::MulOvf, Opcode::Mul),
+        Op::Divide => unsigned_or(unsigned, Opcode::DivUn, Opcode::Div),
+        Op::Modulo => unsigned_or(unsigned, Opcode::RemUn, Opcode::Rem),
         Op::BitwiseAnd => Opcode::And,
         Op::BitwiseOr => Opcode::Or,
         Op::BitwiseXor => Opcode::Xor,
         Op::LeftShift => Opcode::Shl,
-        Op::RightShift => Opcode::Shr,
+        Op::RightShift => unsigned_or(unsigned, Opcode::ShrUn, Opcode::Shr),
         Op::Equal => Opcode::Ceq,
-        Op::GreaterThan => Opcode::Cgt,
-        Op::LessThan => Opcode::Clt,
+        Op::GreaterThan => unsigned_or(unsigned, Opcode::CgtUn, Opcode::Cgt),
+        Op::LessThan => unsigned_or(unsigned, Opcode::CltUn, Opcode::Clt),
         Op::NotEqual => return emit_negated(Opcode::Ceq, out),
-        Op::LessThanOrEqual => return emit_negated(Opcode::Cgt, out),
-        Op::GreaterThanOrEqual => return emit_negated(Opcode::Clt, out),
+        Op::LessThanOrEqual => {
+            return emit_negated(unsigned_or(unsigned, Opcode::CgtUn, Opcode::Cgt), out);
+        }
+        Op::GreaterThanOrEqual => {
+            return emit_negated(unsigned_or(unsigned, Opcode::CltUn, Opcode::Clt), out);
+        }
         Op::LogicalAnd | Op::LogicalOr => {
             return Err(EmitError::Unsupported(
                 "short-circuit && / || (needs branches)",
@@ -787,6 +815,47 @@ fn emit_binary(operator: BinaryOperator, out: &mut Vec<Instruction>) -> Result<(
     };
     out.push(Instruction::simple(opcode));
     Ok(())
+}
+
+/// Picks the unsigned opcode when the operands are unsigned, else the signed one.
+fn unsigned_or(unsigned: bool, when_unsigned: Opcode, when_signed: Opcode) -> Opcode {
+    if unsigned { when_unsigned } else { when_signed }
+}
+
+/// Picks the overflow-throwing opcode in a `checked` context (its `.un` variant for
+/// unsigned operands), else the plain form.
+fn checked_or(checked: bool, unsigned: bool, ovf_un: Opcode, ovf: Opcode, plain: Opcode) -> Opcode {
+    if checked {
+        if unsigned { ovf_un } else { ovf }
+    } else {
+        plain
+    }
+}
+
+/// The `conv.ovf.*` opcode for a checked conversion to integral `target` (the `.un`
+/// form for an unsigned source). `None` for a non-integral target (float/decimal),
+/// which cannot overflow and uses the plain `conv.*`.
+fn checked_overflow_conversion(target: SpecialType, unsigned_source: bool) -> Option<Opcode> {
+    use SpecialType as S;
+    Some(match (target, unsigned_source) {
+        (S::SByte, false) => Opcode::ConvOvfI1,
+        (S::SByte, true) => Opcode::ConvOvfI1Un,
+        (S::Byte, false) => Opcode::ConvOvfU1,
+        (S::Byte, true) => Opcode::ConvOvfU1Un,
+        (S::Int16, false) => Opcode::ConvOvfI2,
+        (S::Int16, true) => Opcode::ConvOvfI2Un,
+        (S::UInt16 | S::Char, false) => Opcode::ConvOvfU2,
+        (S::UInt16 | S::Char, true) => Opcode::ConvOvfU2Un,
+        (S::Int32, false) => Opcode::ConvOvfI4,
+        (S::Int32, true) => Opcode::ConvOvfI4Un,
+        (S::UInt32, false) => Opcode::ConvOvfU4,
+        (S::UInt32, true) => Opcode::ConvOvfU4Un,
+        (S::Int64, false) => Opcode::ConvOvfI8,
+        (S::Int64, true) => Opcode::ConvOvfI8Un,
+        (S::UInt64, false) => Opcode::ConvOvfU8,
+        (S::UInt64, true) => Opcode::ConvOvfU8Un,
+        _ => return None,
+    })
 }
 
 fn emit_unary(operator: UnaryOperator, out: &mut Vec<Instruction>) -> Result<(), EmitError> {
@@ -819,6 +888,19 @@ fn load_i4(value: i32) -> Instruction {
     Instruction::new(Opcode::LdcI4, Operand::Int32(value))
 }
 
+/// Loads a folded integer constant: `ldc.i8` for the 64-bit integral types,
+/// otherwise `ldc.i4` (the value's low 32 bits, two's-complement).
+fn const_load(value: i64, ty: &TypeSymbol) -> Instruction {
+    if matches!(
+        ty,
+        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
+    ) {
+        Instruction::new(Opcode::LdcI8, Operand::Int64(value))
+    } else {
+        load_i4(value as i32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,6 +919,16 @@ mod tests {
     }
     fn op(opcode: Opcode) -> Instruction {
         Instruction::simple(opcode)
+    }
+
+    #[test]
+    fn checked_context_uses_overflow_opcodes() {
+        assert_eq!(emit("checked(1 + 2)"), [i4(1), i4(2), op(Opcode::AddOvf)]);
+        assert_eq!(emit("checked(5 * 6)"), [i4(5), i4(6), op(Opcode::MulOvf)]);
+        assert_eq!(*emit("checked((int)5L)").last().unwrap(), op(Opcode::ConvOvfI4));
+        assert_eq!(emit("unchecked(1 + 2)"), [i4(1), i4(2), op(Opcode::Add)]);
+        assert_eq!(emit("1 + 2"), [i4(1), i4(2), op(Opcode::Add)]);
+        assert_eq!(*emit("(int)5L").last().unwrap(), op(Opcode::ConvI4));
     }
 
     #[test]

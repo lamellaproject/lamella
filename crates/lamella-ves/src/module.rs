@@ -126,6 +126,18 @@ pub struct Module {
     /// `newobj` tokens that construct a multi-dimensional array (an array TypeSpec's
     /// `.ctor`), mapped to the array's rank -- newobj allocates from that many lengths.
     md_array_ctors: BTreeMap<u32, u16>,
+    /// Debug names keyed by method id: the qualified method name and the argument names
+    /// in CIL slot order (`this` first for an instance method). Empty unless a loader
+    /// records them; the debugger surfaces them on frames and in the arguments view.
+    method_debug: BTreeMap<MethodId, MethodDebug>,
+}
+
+/// Debug display names for one method: its qualified name and its argument names in CIL
+/// slot order (`this` first for an instance method), recorded by a loader for the debugger.
+#[derive(Clone)]
+struct MethodDebug {
+    name: String,
+    args: Vec<String>,
 }
 
 impl Module {
@@ -179,6 +191,30 @@ impl Module {
     #[must_use]
     pub fn method(&self, id: MethodId) -> Option<&Method> {
         self.methods.get(id as usize)
+    }
+
+    /// Records debug names for method `id`: its qualified name (e.g. `Program.Fact`) and
+    /// its argument names in CIL slot order (`this` first for an instance method). The
+    /// debugger surfaces these on stack frames and in the arguments view.
+    pub fn set_method_debug(&mut self, id: MethodId, name: String, args: Vec<String>) {
+        self.method_debug.insert(id, MethodDebug { name, args });
+    }
+
+    /// The qualified display name recorded for method `id`, if any.
+    #[must_use]
+    pub fn method_name(&self, id: MethodId) -> Option<&str> {
+        self.method_debug.get(&id).map(|debug| debug.name.as_str())
+    }
+
+    /// The name recorded for argument slot `index` of method `id`, if present and
+    /// non-empty (`this` is slot 0 of an instance method).
+    #[must_use]
+    pub fn arg_name(&self, id: MethodId, index: usize) -> Option<&str> {
+        self.method_debug
+            .get(&id)
+            .and_then(|debug| debug.args.get(index))
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
     }
 
     /// Adds a declared reference type with the zero values of its instance fields
@@ -469,5 +505,27 @@ impl Module {
     #[must_use]
     pub fn delegate_invoke(&self, token: Token) -> Option<u16> {
         self.delegate_invokes.get(&token.0).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_debug_names_round_trip() {
+        let mut module = Module::new();
+        module.set_method_debug(
+            0,
+            String::from("Program.Twice"),
+            Vec::from([String::from("this"), String::new(), String::from("count")]),
+        );
+        assert_eq!(module.method_name(0), Some("Program.Twice"));
+        assert_eq!(module.arg_name(0, 0), Some("this"));
+        assert_eq!(module.arg_name(0, 1), None);
+        assert_eq!(module.arg_name(0, 2), Some("count"));
+        assert_eq!(module.arg_name(0, 3), None);
+        assert_eq!(module.method_name(1), None);
+        assert_eq!(module.arg_name(1, 0), None);
     }
 }

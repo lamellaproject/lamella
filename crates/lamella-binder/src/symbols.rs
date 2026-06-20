@@ -174,8 +174,8 @@ impl Model {
             .get(&(String::from(namespace), String::from(name)))
     }
 
-    /// The type a named [`TypeSymbol`] refers to, if present (`None` for special
-    /// and array types).
+    /// The type a [`TypeSymbol`] refers to, if present. A predefined type resolves
+    /// to its `System.<Name>` reference type; array and error types have none.
     #[must_use]
     pub fn get_by_symbol(&self, ty: &TypeSymbol) -> Option<&TypeInfo> {
         match ty {
@@ -183,7 +183,11 @@ impl Model {
                 let (namespace, name) = split_named(parts);
                 self.get(&namespace, name)
             }
-            _ => None,
+            TypeSymbol::Special(special) => {
+                let (namespace, name) = special.full_name();
+                self.get(namespace, name)
+            }
+            TypeSymbol::Array { .. } | TypeSymbol::Error => None,
         }
     }
 

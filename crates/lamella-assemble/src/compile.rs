@@ -976,6 +976,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             left,
             right,
             operator,
+            ..
         } => {
             mint_in_expr(left, image, tokens);
             mint_in_expr(right, image, tokens);
@@ -998,7 +999,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 mint_value_type_token(&operand.ty, image, tokens);
             }
         }
-        BoundExprKind::Cast { operand } => {
+        BoundExprKind::Cast { operand, .. } => {
             mint_in_expr(operand, image, tokens);
             if matches!(operand.ty, TypeSymbol::Special(SpecialType::Object))
                 && is_value_type(&expr.ty, tokens)
@@ -1050,8 +1051,23 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             }
         }
         BoundExprKind::FieldAccess { receiver, .. }
-        | BoundExprKind::PropertyAccess { receiver, .. }
         | BoundExprKind::MethodGroup { receiver, .. } => mint_in_expr(receiver, image, tokens),
+        BoundExprKind::PropertyAccess { receiver, name } => {
+            mint_in_expr(receiver, image, tokens);
+            let getter = lamella_binder::MethodReference {
+                declaring_type: receiver.ty.clone(),
+                name: accessor_name("get_", name).into(),
+                parameters: Vec::new(),
+                return_type: expr.ty.clone(),
+                is_static: matches!(receiver.kind, BoundExprKind::TypeReference(_)),
+            };
+            if tokens
+                .method(&getter.declaring_type, &getter.name, &getter.parameters)
+                .is_none()
+            {
+                mint_member_ref(&getter, image, tokens);
+            }
+        }
         BoundExprKind::ArrayCreation { lengths } => {
             for length in lengths {
                 mint_in_expr(length, image, tokens);
@@ -1064,6 +1080,21 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             mint_in_expr(receiver, image, tokens);
             for index in indices {
                 mint_in_expr(index, image, tokens);
+            }
+            if matches!(receiver.ty, TypeSymbol::Special(SpecialType::String)) {
+                let getter = lamella_binder::MethodReference {
+                    declaring_type: TypeSymbol::Special(SpecialType::String),
+                    name: "get_Chars".into(),
+                    parameters: alloc::vec![TypeSymbol::Special(SpecialType::Int32)],
+                    return_type: TypeSymbol::Special(SpecialType::Char),
+                    is_static: false,
+                };
+                if tokens
+                    .method(&getter.declaring_type, &getter.name, &getter.parameters)
+                    .is_none()
+                {
+                    mint_member_ref(&getter, image, tokens);
+                }
             }
         }
         BoundExprKind::Assignment { target, value, .. } => {

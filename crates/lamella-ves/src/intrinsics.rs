@@ -463,6 +463,729 @@ pub fn string_concat3(
     Ok(Some(Value::Object(reference)))
 }
 
+/// `-1` for no match, else the index as an `int32` -- the .NET convention for the
+/// `IndexOf` family.
+fn match_index(index: Option<usize>) -> Value {
+    Value::Int32(
+        index
+            .and_then(|index| i32::try_from(index).ok())
+            .unwrap_or(-1),
+    )
+}
+
+/// The index of the first ordinal occurrence of `needle` in `haystack`. The empty
+/// needle matches at 0, as .NET's ordinal search does.
+fn find_subsequence(haystack: &[u16], needle: &[u16]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// ASCII upper-casing of one UTF-16 code unit (`a..z` -> `A..Z`); others are unchanged.
+/// Full Unicode/culture casing is a later refinement.
+fn ascii_upper(unit: u16) -> u16 {
+    if (b'a' as u16..=b'z' as u16).contains(&unit) {
+        unit - 32
+    } else {
+        unit
+    }
+}
+
+/// ASCII lower-casing of one UTF-16 code unit (`A..Z` -> `a..z`); others are unchanged.
+fn ascii_lower(unit: u16) -> u16 {
+    if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+        unit + 32
+    } else {
+        unit
+    }
+}
+
+/// Whether a UTF-16 code unit is one of the ASCII whitespace characters `Trim` removes
+/// (space, tab, LF, VT, FF, CR). Unicode whitespace is a later refinement.
+fn is_ascii_space(unit: u16) -> bool {
+    matches!(unit, 0x20 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)
+}
+
+/// `System.String.IndexOf(char)`: the index of the first occurrence of a code unit, or
+/// `-1`. The string is `this`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a string or the argument not a char.
+pub fn string_index_of_char(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(target)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let target = target as u16;
+    Ok(Some(match_index(chars.iter().position(|&c| c == target))))
+}
+
+/// `System.String.IndexOf(string)`: the index of the first ordinal occurrence of a
+/// substring, or `-1`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if a receiver/argument is a non-string value.
+pub fn string_index_of_string(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let needle = string_arg_chars(vm, args.get(1))?;
+    Ok(Some(match_index(find_subsequence(&chars, &needle))))
+}
+
+/// `System.String.LastIndexOf(char)`: the index of the last occurrence, or `-1`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a string or the argument not a char.
+pub fn string_last_index_of_char(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(target)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let target = target as u16;
+    Ok(Some(match_index(chars.iter().rposition(|&c| c == target))))
+}
+
+/// `System.String.StartsWith(string)` (ordinal): does the string begin with `value`?
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if a receiver/argument is a non-string value.
+pub fn string_starts_with(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let value = string_arg_chars(vm, args.get(1))?;
+    Ok(Some(Value::Int32(i32::from(chars.starts_with(&value)))))
+}
+
+/// `System.String.EndsWith(string)` (ordinal): does the string end with `value`?
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if a receiver/argument is a non-string value.
+pub fn string_ends_with(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let value = string_arg_chars(vm, args.get(1))?;
+    Ok(Some(Value::Int32(i32::from(chars.ends_with(&value)))))
+}
+
+/// `System.String.Contains(string)` (ordinal): does the string contain `value`?
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if a receiver/argument is a non-string value.
+pub fn string_contains(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let value = string_arg_chars(vm, args.get(1))?;
+    Ok(Some(Value::Int32(i32::from(
+        find_subsequence(&chars, &value).is_some(),
+    ))))
+}
+
+/// `System.String.ToUpper()`: an ASCII upper-cased copy.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a string.
+pub fn string_to_upper(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let upper: Vec<u16> = string_arg_chars(vm, args.first())?
+        .iter()
+        .map(|&unit| ascii_upper(unit))
+        .collect();
+    let reference = vm.heap_mut().alloc_string(&upper);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.ToLower()`: an ASCII lower-cased copy.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a string.
+pub fn string_to_lower(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let lower: Vec<u16> = string_arg_chars(vm, args.first())?
+        .iter()
+        .map(|&unit| ascii_lower(unit))
+        .collect();
+    let reference = vm.heap_mut().alloc_string(&lower);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.Trim()`: a copy with leading and trailing ASCII whitespace removed.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a string.
+pub fn string_trim(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let trimmed: &[u16] = match chars.iter().position(|&c| !is_ascii_space(c)) {
+        Some(start) => {
+            let end = chars
+                .iter()
+                .rposition(|&c| !is_ascii_space(c))
+                .unwrap_or(start);
+            &chars[start..=end]
+        }
+        None => &[],
+    };
+    let reference = vm.heap_mut().alloc_string(trimmed);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.Replace(char, char)`: every `from` replaced by `to`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for bad argument types.
+pub fn string_replace_char(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(from)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(to)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (from, to) = (from as u16, to as u16);
+    let replaced: Vec<u16> = chars
+        .iter()
+        .map(|&unit| if unit == from { to } else { unit })
+        .collect();
+    let reference = vm.heap_mut().alloc_string(&replaced);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.Replace(string, string)`: every non-overlapping ordinal occurrence of
+/// `old` replaced by `new`. An empty `old` leaves the string unchanged (.NET throws
+/// `ArgumentException`; the interpreter returns the original rather than trapping).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if a receiver/argument is a non-string value.
+pub fn string_replace_string(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let old = string_arg_chars(vm, args.get(1))?;
+    let new = string_arg_chars(vm, args.get(2))?;
+    let replaced = if old.is_empty() {
+        chars
+    } else {
+        let mut out = Vec::with_capacity(chars.len());
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index..].starts_with(&old) {
+                out.extend_from_slice(&new);
+                index += old.len();
+            } else {
+                out.push(chars[index]);
+                index += 1;
+            }
+        }
+        out
+    };
+    let reference = vm.heap_mut().alloc_string(&replaced);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// The single `int32` argument of a numeric intrinsic.
+fn arg_int32(args: &[Value]) -> Result<i32, Trap> {
+    match args.first() {
+        Some(&Value::Int32(value)) => Ok(value),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// The single `int64` argument of a numeric intrinsic.
+fn arg_int64(args: &[Value]) -> Result<i64, Trap> {
+    match args.first() {
+        Some(&Value::Int64(value)) => Ok(value),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// The two `int32` arguments of a binary numeric intrinsic.
+fn two_int32(args: &[Value]) -> Result<(i32, i32), Trap> {
+    match (args.first(), args.get(1)) {
+        (Some(&Value::Int32(left)), Some(&Value::Int32(right))) => Ok((left, right)),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// The two `int64` arguments of a binary numeric intrinsic.
+fn two_int64(args: &[Value]) -> Result<(i64, i64), Trap> {
+    match (args.first(), args.get(1)) {
+        (Some(&Value::Int64(left)), Some(&Value::Int64(right))) => Ok((left, right)),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// `System.Math.Abs(int)`: the absolute value; throws `OverflowException` for
+/// `int.MinValue`, whose magnitude is unrepresentable (matching .NET).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-int argument; [`Trap::Overflow`] for `int.MinValue`.
+pub fn math_abs_int32(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    arg_int32(args)?
+        .checked_abs()
+        .map(|abs| Some(Value::Int32(abs)))
+        .ok_or(Trap::Overflow)
+}
+
+/// `System.Math.Abs(long)`: the absolute value; `OverflowException` for `long.MinValue`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-long argument; [`Trap::Overflow`] for `long.MinValue`.
+pub fn math_abs_int64(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    arg_int64(args)?
+        .checked_abs()
+        .map(|abs| Some(Value::Int64(abs)))
+        .ok_or(Trap::Overflow)
+}
+
+/// `System.Math.Max(int, int)`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-int arguments.
+pub fn math_max_int32(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (left, right) = two_int32(args)?;
+    Ok(Some(Value::Int32(left.max(right))))
+}
+
+/// `System.Math.Min(int, int)`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-int arguments.
+pub fn math_min_int32(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (left, right) = two_int32(args)?;
+    Ok(Some(Value::Int32(left.min(right))))
+}
+
+/// `System.Math.Max(long, long)`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-long arguments.
+pub fn math_max_int64(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (left, right) = two_int64(args)?;
+    Ok(Some(Value::Int64(left.max(right))))
+}
+
+/// `System.Math.Min(long, long)`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-long arguments.
+pub fn math_min_int64(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (left, right) = two_int64(args)?;
+    Ok(Some(Value::Int64(left.min(right))))
+}
+
+/// `System.Math.Sign(int)`: -1, 0, or 1.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-int argument.
+pub fn math_sign_int32(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(arg_int32(args)?.signum())))
+}
+
+/// `System.Math.Sign(long)`: -1, 0, or 1 (returned as an `int`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-long argument.
+pub fn math_sign_int64(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(arg_int64(args)?.signum() as i32)))
+}
+
+/// Whether a UTF-16 code unit is an ASCII decimal digit (`0..9`).
+fn is_ascii_digit_unit(unit: u16) -> bool {
+    (b'0' as u16..=b'9' as u16).contains(&unit)
+}
+
+/// Whether a UTF-16 code unit is an ASCII letter (`A..Z` or `a..z`).
+fn is_ascii_letter_unit(unit: u16) -> bool {
+    (b'A' as u16..=b'Z' as u16).contains(&unit) || (b'a' as u16..=b'z' as u16).contains(&unit)
+}
+
+/// The `char` argument of a `System.Char` intrinsic, as its UTF-16 code unit (a `char`
+/// is an `int32` on the stack).
+fn arg_char(args: &[Value]) -> Result<u16, Trap> {
+    Ok(arg_int32(args)? as u16)
+}
+
+/// `System.Char.IsDigit(char)` (ASCII classification).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-char argument.
+pub fn char_is_digit(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(is_ascii_digit_unit(
+        arg_char(args)?,
+    )))))
+}
+
+/// `System.Char.IsLetter(char)` (ASCII classification).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-char argument.
+pub fn char_is_letter(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(is_ascii_letter_unit(
+        arg_char(args)?,
+    )))))
+}
+
+/// `System.Char.IsLetterOrDigit(char)` (ASCII classification).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-char argument.
+pub fn char_is_letter_or_digit(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let unit = arg_char(args)?;
+    Ok(Some(Value::Int32(i32::from(
+        is_ascii_letter_unit(unit) || is_ascii_digit_unit(unit),
+    ))))
+}
+
+/// `System.Char.IsWhiteSpace(char)` (ASCII whitespace).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-char argument.
+pub fn char_is_white_space(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(is_ascii_space(arg_char(
+        args,
+    )?)))))
+}
+
+/// `System.Char.IsUpper(char)` (ASCII).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-char argument.
+pub fn char_is_upper(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let unit = arg_char(args)?;
+    Ok(Some(Value::Int32(i32::from(
+        (b'A' as u16..=b'Z' as u16).contains(&unit),
+    ))))
+}
+
+/// `System.Char.IsLower(char)` (ASCII).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-char argument.
+pub fn char_is_lower(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let unit = arg_char(args)?;
+    Ok(Some(Value::Int32(i32::from(
+        (b'a' as u16..=b'z' as u16).contains(&unit),
+    ))))
+}
+
+/// `System.Char.ToUpper(char)`: the ASCII upper-case of a code unit (as a `char`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-char argument.
+pub fn char_to_upper(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(ascii_upper(arg_char(args)?)))))
+}
+
+/// `System.Char.ToLower(char)`: the ASCII lower-case of a code unit (as a `char`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-char argument.
+pub fn char_to_lower(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(ascii_lower(arg_char(args)?)))))
+}
+
+/// The `chars` slice with leading and trailing ASCII whitespace removed.
+fn trim_ascii(chars: &[u16]) -> &[u16] {
+    match chars.iter().position(|&unit| !is_ascii_space(unit)) {
+        Some(start) => {
+            let end = chars
+                .iter()
+                .rposition(|&unit| !is_ascii_space(unit))
+                .unwrap_or(start);
+            &chars[start..=end]
+        }
+        None => &[],
+    }
+}
+
+/// Parses a base-10 integer from UTF-16 chars (an `i128` accumulator): optional ASCII
+/// whitespace, an optional `+`/`-` sign, then ASCII digits. `None` for malformed input
+/// or magnitude overflow of the accumulator.
+fn parse_decimal(chars: &[u16]) -> Option<i128> {
+    let body = trim_ascii(chars);
+    let (negative, digits) = match body.first() {
+        Some(&unit) if unit == b'-' as u16 => (true, &body[1..]),
+        Some(&unit) if unit == b'+' as u16 => (false, &body[1..]),
+        _ => (false, body),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: i128 = 0;
+    for &unit in digits {
+        if !is_ascii_digit_unit(unit) {
+            return None;
+        }
+        value = value
+            .checked_mul(10)?
+            .checked_add(i128::from(unit - b'0' as u16))?;
+    }
+    Some(if negative { -value } else { value })
+}
+
+/// `System.Int32.Parse(string)`: a base-10 parse.
+///
+/// # Errors
+/// [`Trap::InvalidArgument`] (the FormatException site) for malformed input;
+/// [`Trap::Overflow`] if the value does not fit an `int32`; [`Trap::TypeMismatch`] for a
+/// non-string argument.
+pub fn int32_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let value = parse_decimal(&chars).ok_or(Trap::InvalidArgument)?;
+    i32::try_from(value)
+        .map(|value| Some(Value::Int32(value)))
+        .map_err(|_| Trap::Overflow)
+}
+
+/// `System.Int64.Parse(string)`: a base-10 parse.
+///
+/// # Errors
+/// [`Trap::InvalidArgument`] for malformed input; [`Trap::Overflow`] if the value does
+/// not fit an `int64`; [`Trap::TypeMismatch`] for a non-string argument.
+pub fn int64_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let value = parse_decimal(&chars).ok_or(Trap::InvalidArgument)?;
+    i64::try_from(value)
+        .map(|value| Some(Value::Int64(value)))
+        .map_err(|_| Trap::Overflow)
+}
+
+/// `System.Boolean.Parse(string)`: case-insensitive `True` / `False` after trimming.
+///
+/// # Errors
+/// [`Trap::InvalidArgument`] for anything other than (trimmed, case-insensitive)
+/// `true`/`false`; [`Trap::TypeMismatch`] for a non-string argument.
+pub fn boolean_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let lowered: Vec<u16> = trim_ascii(&chars)
+        .iter()
+        .map(|&unit| ascii_lower(unit))
+        .collect();
+    let truthy: Vec<u16> = "true".encode_utf16().collect();
+    let falsy: Vec<u16> = "false".encode_utf16().collect();
+    if lowered == truthy {
+        Ok(Some(Value::Int32(1)))
+    } else if lowered == falsy {
+        Ok(Some(Value::Int32(0)))
+    } else {
+        Err(Trap::InvalidArgument)
+    }
+}
+
+/// The pad character from `args[2]` (a `char`), or a space when the one-argument
+/// overload is called.
+fn pad_char(args: &[Value]) -> Result<u16, Trap> {
+    match args.get(2) {
+        Some(&Value::Int32(unit)) => Ok(unit as u16),
+        None => Ok(b' ' as u16),
+        Some(_) => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// `System.String.PadLeft(int [, char])`: right-justify in a field `width` wide, padding
+/// on the left; the original is returned when it is already at least that wide.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for bad argument types.
+pub fn string_pad_left(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(width)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let pad = pad_char(args)?;
+    let width = usize::try_from(width).unwrap_or(0);
+    let result = if chars.len() >= width {
+        chars
+    } else {
+        let mut out = alloc::vec![pad; width - chars.len()];
+        out.extend_from_slice(&chars);
+        out
+    };
+    let reference = vm.heap_mut().alloc_string(&result);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.PadRight(int [, char])`: left-justify in a field `width` wide, padding
+/// on the right.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for bad argument types.
+pub fn string_pad_right(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let mut chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(width)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let pad = pad_char(args)?;
+    let width = usize::try_from(width).unwrap_or(0);
+    if chars.len() < width {
+        chars.resize(width, pad);
+    }
+    let reference = vm.heap_mut().alloc_string(&chars);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.Insert(int startIndex, string value)`: a copy with `value` inserted at
+/// `startIndex`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for bad argument types; [`Trap::ArgumentOutOfRange`] if
+/// `startIndex` is negative or past the end.
+pub fn string_insert(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(index)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let value = string_arg_chars(vm, args.get(2))?;
+    let index = usize::try_from(index)
+        .ok()
+        .filter(|&index| index <= chars.len())
+        .ok_or(Trap::ArgumentOutOfRange(0))?;
+    let mut out = Vec::with_capacity(chars.len() + value.len());
+    out.extend_from_slice(&chars[..index]);
+    out.extend_from_slice(&value);
+    out.extend_from_slice(&chars[index..]);
+    let reference = vm.heap_mut().alloc_string(&out);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.Remove(int startIndex [, int count])`: a copy with `count` units (or
+/// the tail, for the one-argument overload) removed at `startIndex`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for bad argument types; [`Trap::ArgumentOutOfRange`] if the
+/// range falls outside the string.
+pub fn string_remove(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let Some(&Value::Int32(start)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let start = usize::try_from(start)
+        .ok()
+        .filter(|&start| start <= chars.len())
+        .ok_or(Trap::ArgumentOutOfRange(0))?;
+    let mut out = chars[..start].to_vec();
+    match args.get(2) {
+        Some(&Value::Int32(count)) => {
+            let count = usize::try_from(count).map_err(|_| Trap::ArgumentOutOfRange(1))?;
+            let end = start
+                .checked_add(count)
+                .filter(|&end| end <= chars.len())
+                .ok_or(Trap::ArgumentOutOfRange(1))?;
+            out.extend_from_slice(&chars[end..]);
+        }
+        None => {}
+        Some(_) => return Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+    let reference = vm.heap_mut().alloc_string(&out);
+    Ok(Some(Value::Object(reference)))
+}
+
 /// `System.Object..ctor()`: the base constructor every constructor chains to. With
 /// no object header to initialize here, it is a no-op (it still receives `this`).
 ///

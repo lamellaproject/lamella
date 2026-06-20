@@ -251,6 +251,9 @@ impl Debugger {
     fn run(&mut self, action: Action, events: &mut Vec<(&'static str, Option<Json>)>) {
         let stop = match action {
             Action::Resume => self.backend.resume(),
+            Action::StepIn | Action::StepOver | Action::StepOut if self.backend.has_source() => {
+                self.source_step(action)
+            }
             Action::StepIn => self.backend.step(),
             Action::StepOver => self.step_to_depth(|depth, start| depth <= start),
             Action::StepOut => self.step_to_depth(|depth, start| depth < start),
@@ -275,6 +278,32 @@ impl Debugger {
                 Stop::Running => break Stop::Running,
                 _ if reached(self.backend.depth(), start) => break Stop::Step,
                 _ => {}
+            }
+        }
+    }
+
+    /// Single-steps to the next source statement (sequence point) at the call depth the
+    /// step implies: `stepIn` stops at the next boundary anywhere (descending into a
+    /// call), `next` at the next boundary in this frame or a caller (running a called
+    /// method to completion), `stepOut` at the next boundary after the current method
+    /// returns. Used when the backend has source info; otherwise stepping is per-CIL-op.
+    fn source_step(&mut self, action: Action) -> Stop {
+        let start = self.backend.depth();
+        loop {
+            match self.backend.step() {
+                Stop::Done => break Stop::Done,
+                Stop::Fault(message) => break Stop::Fault(message),
+                Stop::Running => break Stop::Running,
+                _ => {
+                    let reached = match action {
+                        Action::StepIn | Action::Resume => true,
+                        Action::StepOver => self.backend.depth() <= start,
+                        Action::StepOut => self.backend.depth() < start,
+                    };
+                    if reached && self.backend.at_source_boundary() {
+                        break Stop::Step;
+                    }
+                }
             }
         }
     }
@@ -423,6 +452,7 @@ impl Debugger {
 }
 
 /// One execution command, resolved by [`Debugger::run`] into backend calls.
+#[derive(Clone, Copy)]
 enum Action {
     Resume,
     StepIn,

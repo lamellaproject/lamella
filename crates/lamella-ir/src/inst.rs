@@ -189,4 +189,11 @@ pub enum Inst {
         /// The NUL-terminated bytes to emit.
         text: Box<[u8]>,
     },
+    /// Formats the `int32` `value` as signed decimal and writes it with a trailing newline via
+    /// semihosting -- the `Console.WriteLine(int)` primitive. A side effect; the instruction's
+    /// result is a placeholder callers ignore.
+    WriteInt {
+        /// The integer to format and write.
+        value: ValueId,
+    },
 }

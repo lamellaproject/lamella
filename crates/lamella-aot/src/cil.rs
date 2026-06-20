@@ -43,6 +43,8 @@ pub enum CallTarget {
 pub enum Intrinsic {
     /// `System.Diagnostics.Debug.WriteLine(string)` -> semihosting output.
     DebugWriteLine,
+    /// `System.Console.WriteLine(int)` -> a decimal int written over semihosting.
+    ConsoleWriteLineInt,
 }
 
 /// What the lowering needs about a `call` target: how many arguments to pop, whether it
@@ -83,6 +85,13 @@ pub trait CallResolver {
     /// The size in bytes of a value type (an `initobj` type-operand token), from its layout.
     /// Defaults to `None`.
     fn value_type_size(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
+    /// The value type a `newobj` constructs, named by its constructor token: the declaring
+    /// type's [`MirType::ValueType`] (with size), so the lowering can allocate the instance.
+    /// Defaults to `None`.
+    fn newobj_value_type(&self, _operand: &Operand) -> Option<MirType> {
         None
     }
 }
@@ -211,6 +220,7 @@ fn lower_with_source(
                     &mut value_types,
                     &mut stack,
                     &mut locals,
+                    local_types,
                     &args,
                     &mut insts,
                     &mut strings,
@@ -441,6 +451,7 @@ fn apply_value_op(
     value_types: &mut Vec<MirType>,
     stack: &mut Vec<ValueId>,
     locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
     args: &[ValueId],
     insts: &mut Vec<(ValueId, Inst)>,
     strings: &mut Vec<(ValueId, Box<[u8]>)>,
@@ -479,6 +490,7 @@ fn apply_value_op(
             };
             store_local(value_types, locals, stack, insts, *n as usize)?;
         }
+        Opcode::Ldnull => push_const(value_types, stack, insts, 0),
         Opcode::LdcI4M1 => push_const(value_types, stack, insts, -1),
         Opcode::LdcI40 => push_const(value_types, stack, insts, 0),
         Opcode::LdcI41 => push_const(value_types, stack, insts, 1),
@@ -613,7 +625,21 @@ fn apply_value_op(
             let this = last_local_addr
                 .take()
                 .map(|(n, off)| -> Result<ValueId, CilError> {
-                    let base = locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?;
+                    let base = match locals.get(n).and_then(|x| *x) {
+                        Some(base) => base,
+                        None => {
+                            let ty = local_types.get(n).copied().unwrap_or(MirType::I32);
+                            let slot = new_value(value_types, ty);
+                            let init = if matches!(ty, MirType::ValueType { .. }) {
+                                Inst::InitStruct
+                            } else {
+                                Inst::ConstInt { ty, value: 0 }
+                            };
+                            insts.push((slot, init));
+                            *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(slot);
+                            slot
+                        }
+                    };
                     let ptr = new_value(value_types, MirType::ManagedPtr);
                     insts.push((ptr, Inst::FieldAddr { base, offset: off }));
                     Ok(ptr)
@@ -661,6 +687,11 @@ fn apply_value_op(
                         },
                     ));
                 }
+                CallTarget::Intrinsic(Intrinsic::ConsoleWriteLineInt) => {
+                    let value = *call_args.first().ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((result, Inst::WriteInt { value }));
+                }
             }
         }
         Opcode::LdlocaS | Opcode::Ldloca => {
@@ -681,13 +712,11 @@ fn apply_value_op(
             let size = resolver
                 .value_type_size(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
-            let zeroed = new_value(
-                value_types,
-                MirType::ValueType {
-                    handle: lamella_ir::TypeHandle(0),
-                    size,
-                },
-            );
+            let handle = match &inst.operand {
+                Operand::Token(token) => lamella_ir::TypeHandle(token.0),
+                _ => lamella_ir::TypeHandle(0),
+            };
+            let zeroed = new_value(value_types, MirType::ValueType { handle, size });
             insts.push((zeroed, Inst::InitStruct));
             *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(zeroed);
         }
@@ -729,6 +758,45 @@ fn apply_value_op(
                     value,
                 },
             ));
+        }
+        Opcode::Newobj => {
+            let info = resolver
+                .resolve(&inst.operand)
+                .ok_or(CilError::UnresolvedCall)?;
+            let ty = resolver
+                .newobj_value_type(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let temp = new_value(value_types, ty);
+            insts.push((temp, Inst::InitStruct));
+            let this = new_value(value_types, MirType::ManagedPtr);
+            insts.push((
+                this,
+                Inst::FieldAddr {
+                    base: temp,
+                    offset: 0,
+                },
+            ));
+            let explicit = info.args.saturating_sub(1);
+            let mut call_args = Vec::with_capacity(info.args);
+            for _ in 0..explicit {
+                call_args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+            }
+            call_args.reverse();
+            call_args.insert(0, this);
+            match info.target {
+                CallTarget::Internal(callee) => {
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((
+                        result,
+                        Inst::Call {
+                            callee,
+                            args: call_args,
+                        },
+                    ));
+                }
+                CallTarget::Intrinsic(_) => return Err(CilError::UnresolvedCall),
+            }
+            stack.push(temp);
         }
         other => return Err(CilError::Unsupported(other)),
     }
@@ -1237,6 +1305,135 @@ mod tests {
     }
 
     #[test]
+    fn lowers_in_place_struct_ctor() {
+        struct Ctor;
+        impl CallResolver for Ctor {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 3,
+                    has_result: false,
+                    result_type: None,
+                    target: CallTarget::Internal(1),
+                })
+            }
+        }
+        let vec2 = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 8,
+        };
+        let body = MethodBodyImage {
+            max_stack: 3,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(13)),
+                Instruction::simple(Opcode::LdcI48),
+                Instruction::new(Opcode::Call, Operand::None),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &Ctor, &[], &[vec2]).unwrap();
+        let insts: Vec<_> = func.blocks[0].insts.iter().map(|(_, i)| i).collect();
+        assert!(insts.iter().any(|i| matches!(i, Inst::InitStruct)));
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::FieldAddr { offset: 0, .. }))
+        );
+        let call = insts.iter().find_map(|i| match i {
+            Inst::Call { callee, args } => Some((*callee, args.len())),
+            _ => None,
+        });
+        assert_eq!(call, Some((1, 3)));
+        assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
+    fn initobj_carries_its_type_handle() {
+        use lamella_token::Token;
+        struct Sized;
+        impl CallResolver for Sized {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn value_type_size(&self, _operand: &Operand) -> Option<u32> {
+                Some(8)
+            }
+        }
+        let token = Token::new(0x02, 7);
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Initobj, Operand::Token(token)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &Sized).unwrap();
+        assert!(func.value_types.iter().any(|t| matches!(
+            t,
+            MirType::ValueType { handle, size: 8 } if handle.0 == token.0
+        )));
+        assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_rvalue_newobj() {
+        struct Ctor;
+        impl CallResolver for Ctor {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 3,
+                    has_result: false,
+                    result_type: None,
+                    target: CallTarget::Internal(1),
+                })
+            }
+            fn newobj_value_type(&self, _operand: &Operand) -> Option<MirType> {
+                Some(MirType::ValueType {
+                    handle: lamella_ir::TypeHandle(0),
+                    size: 8,
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 3,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
+                Instruction::simple(Opcode::LdcI42),
+                Instruction::new(Opcode::Newobj, Operand::None),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &Ctor).unwrap();
+        let insts: Vec<_> = func.blocks[0].insts.iter().map(|(_, i)| i).collect();
+        assert!(insts.iter().any(|i| matches!(i, Inst::InitStruct)));
+        assert!(
+            insts
+                .iter()
+                .any(|i| matches!(i, Inst::FieldAddr { offset: 0, .. }))
+        );
+        let call = insts.iter().find_map(|i| match i {
+            Inst::Call { callee, args } => Some((*callee, args.len())),
+            _ => None,
+        });
+        assert_eq!(call, Some((1, 3)));
+        assert!(matches!(func.ret, Some(MirType::ValueType { size: 8, .. })));
+        assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
     fn lowers_debug_writeline_to_semihosting() {
         struct DebugMock;
         impl CallResolver for DebugMock {
@@ -1271,6 +1468,43 @@ mod tests {
             _ => None,
         });
         assert_eq!(text.as_deref(), Some(&b"Hi\n\0"[..]));
+    }
+
+    #[test]
+    fn lowers_console_writeline_int_to_writeint() {
+        struct ConsoleMock;
+        impl CallResolver for ConsoleMock {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: false,
+                    result_type: None,
+                    target: CallTarget::Intrinsic(Intrinsic::ConsoleWriteLineInt),
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(42)),
+                Instruction::new(Opcode::Call, Operand::None),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &ConsoleMock).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::WriteInt { .. }))
+        );
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
     }
 
     #[test]

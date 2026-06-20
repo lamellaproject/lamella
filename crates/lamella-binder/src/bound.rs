@@ -166,6 +166,9 @@ pub enum BoundExprKind {
         left: Box<BoundExpr>,
         /// The right operand.
         right: Box<BoundExpr>,
+        /// Whether the operation is in a `checked` context, so emission uses the
+        /// overflow-checking `add.ovf`/`sub.ovf`/`mul.ovf` (14.5.12).
+        checked: bool,
     },
     /// A prefix unary operation (14.6).
     Unary {
@@ -185,6 +188,9 @@ pub enum BoundExprKind {
     Cast {
         /// The operand being cast.
         operand: Box<BoundExpr>,
+        /// Whether the cast is in a `checked` context, so a narrowing integer
+        /// conversion uses `conv.ovf.*` (14.5.12).
+        checked: bool,
     },
     /// An implicit conversion the binder inserts so emission knows to widen a
     /// numeric, box a value type, or treat a reference upcast as a no-op (13.1).
@@ -255,6 +261,10 @@ pub struct Binder {
     /// (`CS0168`/`CS0219`) is seeded with them to avoid a false warning. Reset per
     /// method.
     case_label_uses: alloc::collections::BTreeSet<Box<str>>,
+    /// Whether expressions are currently bound in a `checked` context (14.5.12),
+    /// tracked as the binder descends so each arithmetic/cast node records whether
+    /// emission should use the overflow-checking form. C# 1.0 defaults to unchecked.
+    checked_context: bool,
 }
 
 impl Binder {
@@ -304,6 +314,15 @@ impl Binder {
 
     /// Resolves a type against the reference world, reporting `CS0246` if unknown.
     pub(crate) fn resolve_named_type(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
+        if let TypeSymbol::Named(parts) = ty {
+            if parts.len() == 1 {
+                let name: &str = &parts[0];
+                let hits = self.type_namespaces_containing(name);
+                if hits.len() == 1 {
+                    return type_symbol_in(&hits[0], name);
+                }
+            }
+        }
         resolve_type(&self.world, ty, &mut self.diagnostics, span)
     }
 
@@ -681,6 +700,7 @@ impl Binder {
                 BoundExpr {
                     kind: BoundExprKind::Cast {
                         operand: Box::new(operand),
+                        checked: self.checked_context,
                     },
                     ty,
                 }
@@ -712,7 +732,10 @@ impl Binder {
                 }
             }
             ExprKind::Checked(inner) => {
+                let saved = self.checked_context;
+                self.checked_context = true;
                 let inner = self.bind_expression(inner);
+                self.checked_context = saved;
                 let ty = inner.ty.clone();
                 BoundExpr {
                     kind: BoundExprKind::Checked(Box::new(inner)),
@@ -720,7 +743,10 @@ impl Binder {
                 }
             }
             ExprKind::Unchecked(inner) => {
+                let saved = self.checked_context;
+                self.checked_context = false;
                 let inner = self.bind_expression(inner);
+                self.checked_context = saved;
                 let ty = inner.ty.clone();
                 BoundExpr {
                     kind: BoundExprKind::Unchecked(Box::new(inner)),
@@ -737,6 +763,13 @@ impl Binder {
                 target,
                 value,
             } => self.bind_assignment(*operator, target, value, expr.span),
+            ExprKind::PredefinedType(predefined) => {
+                let ty = TypeSymbol::Special(SpecialType::from_predefined(*predefined));
+                BoundExpr {
+                    kind: BoundExprKind::TypeReference(ty.clone()),
+                    ty,
+                }
+            }
             ExprKind::Parenthesized(inner) => self.bind_expression(inner),
             _ => BoundExpr {
                 kind: BoundExprKind::Error,
@@ -776,6 +809,7 @@ impl Binder {
                 operator,
                 left: Box::new(left),
                 right: Box::new(right),
+                checked: self.checked_context,
             },
             ty,
         }
@@ -991,6 +1025,27 @@ impl Binder {
         if receiver.ty.is_error() {
             return error_expr();
         }
+        if let BoundExprKind::TypeReference(TypeSymbol::Special(special)) = &receiver.kind {
+            let special = *special;
+            if let Some(constant) = predefined_constant(special, name) {
+                let ty = TypeSymbol::Special(special);
+                return BoundExpr {
+                    kind: BoundExprKind::FieldAccess {
+                        receiver: Box::new(receiver),
+                        name: name.into(),
+                        field: Some(FieldReference {
+                            declaring_type: ty.clone(),
+                            name: name.into(),
+                            ty: ty.clone(),
+                            is_static: true,
+                            accessibility: Accessibility::Public,
+                            constant: Some(constant),
+                        }),
+                    },
+                    ty,
+                };
+            }
+        }
         let receiver_kind = receiver_category(&receiver);
         match self.resolve_member(&receiver.ty, name) {
             MemberResolution::Field(field) => {
@@ -1195,6 +1250,9 @@ impl Binder {
         let ty = match &receiver.ty {
             TypeSymbol::Error => TypeSymbol::Error,
             TypeSymbol::Array { element, .. } => (**element).clone(),
+            TypeSymbol::Special(SpecialType::String) if indices.len() == 1 => {
+                TypeSymbol::Special(SpecialType::Char)
+            }
             other => {
                 let type_name = other.to_string();
                 self.diagnostics.push(Diagnostic::new(
@@ -1764,6 +1822,31 @@ fn error_expr() -> BoundExpr {
     }
 }
 
+/// The compile-time constant value of a predefined integral type's `MaxValue` or
+/// `MinValue` member (4.1.5), as a two's-complement `i64` so an `ldc.i4`/`ldc.i8`
+/// reproduces the right bits (`uint.MaxValue` -> -1 as `i32`, `ulong.MaxValue` -> -1
+/// as `i64`). `None` for any other type or member name.
+fn predefined_constant(special: SpecialType, member: &str) -> Option<i64> {
+    use SpecialType as S;
+    let (min, max): (i64, i64) = match special {
+        S::SByte => (i8::MIN as i64, i8::MAX as i64),
+        S::Byte => (0, u8::MAX as i64),
+        S::Int16 => (i16::MIN as i64, i16::MAX as i64),
+        S::UInt16 => (0, u16::MAX as i64),
+        S::Char => (0, u16::MAX as i64),
+        S::Int32 => (i32::MIN as i64, i32::MAX as i64),
+        S::UInt32 => (0, u32::MAX as i64),
+        S::Int64 => (i64::MIN, i64::MAX),
+        S::UInt64 => (0, u64::MAX as i64),
+        _ => return None,
+    };
+    match member {
+        "MaxValue" => Some(max),
+        "MinValue" => Some(min),
+        _ => None,
+    }
+}
+
 /// The outcome of overload resolution over a method group (14.4.2).
 enum OverloadResult {
     /// A unique best overload.
@@ -1860,13 +1943,32 @@ fn is_better(
         if p1 == p2 {
             continue;
         }
-        if converts(model, p1, p2) {
+        if converts(model, p1, p2) || signed_preferred(p1, p2) {
             strictly_better_somewhere = true;
         } else {
             return false;
         }
     }
     strictly_better_somewhere
+}
+
+/// The signed/unsigned better-conversion special cases (14.4.2.3): a signed integral
+/// target is better than a wider-or-equal unsigned one when neither converts to the
+/// other (`sbyte` over byte/ushort/uint/ulong; `short` over ushort/uint/ulong; `int`
+/// over uint/ulong; `long` over ulong). This is what makes `Console.WriteLine(byte)`
+/// resolve to the `int` overload rather than report a spurious CS0121.
+fn signed_preferred(p1: &TypeSymbol, p2: &TypeSymbol) -> bool {
+    use SpecialType as S;
+    let (Some(a), Some(b)) = (as_special(p1), as_special(p2)) else {
+        return false;
+    };
+    matches!(
+        (a, b),
+        (S::SByte, S::Byte | S::UInt16 | S::UInt32 | S::UInt64)
+            | (S::Int16, S::UInt16 | S::UInt32 | S::UInt64)
+            | (S::Int32, S::UInt32 | S::UInt64)
+            | (S::Int64, S::UInt64)
+    )
 }
 
 /// The special type of `ty`, if it is one.

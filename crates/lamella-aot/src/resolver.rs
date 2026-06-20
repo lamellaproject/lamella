@@ -83,6 +83,9 @@ impl CallResolver for MetadataResolver<'_> {
             MethodKind::Reference if is_debug_writeline(&method) => {
                 CallTarget::Intrinsic(Intrinsic::DebugWriteLine)
             }
+            MethodKind::Reference if is_console_writeline_int(&method) => {
+                CallTarget::Intrinsic(Intrinsic::ConsoleWriteLineInt)
+            }
             MethodKind::Reference => return None,
         };
         Some(CallInfo {
@@ -116,6 +119,24 @@ impl CallResolver for MetadataResolver<'_> {
             .value_type_layout(*token, &TargetLayout::ilp32())
             .ok()
             .map(|layout| layout.size)
+    }
+
+    fn newobj_value_type(&self, operand: &Operand) -> Option<MirType> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
+        let type_def = self
+            .assembly
+            .find_type(declaring.namespace, declaring.name)?;
+        let layout = self
+            .assembly
+            .value_type_layout(type_def.token(), &TargetLayout::ilp32())
+            .ok()?;
+        Some(MirType::ValueType {
+            handle: TypeHandle(type_def.token().0),
+            size: layout.size,
+        })
     }
 }
 
@@ -194,6 +215,19 @@ fn is_debug_writeline(method: &ResolvedMethod) -> bool {
         && method
             .declaring_type
             .is_some_and(|t| t.namespace == "System.Diagnostics" && t.name == "Debug")
+}
+
+/// Whether a resolved method is `System.Console.WriteLine(int)` -- the single-`int` overload,
+/// distinguished from the many other `WriteLine` overloads by its parameter type.
+fn is_console_writeline_int(method: &ResolvedMethod) -> bool {
+    method.name == Some("WriteLine")
+        && method
+            .declaring_type
+            .is_some_and(|t| t.namespace == "System" && t.name == "Console")
+        && method
+            .signature
+            .as_ref()
+            .is_some_and(|sig| matches!(sig.parameters.as_slice(), [SigType::I4]))
 }
 
 /// Decodes a `#US` entry (UTF-16 code units plus a trailing flag byte) to a [`String`].
