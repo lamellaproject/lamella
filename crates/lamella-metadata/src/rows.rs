@@ -92,6 +92,10 @@ pub fn columns(table_number: u8) -> Option<&'static [Col]> {
         table::LOCAL_VARIABLE => &[U16, U16, Str],
         table::LOCAL_CONSTANT => &[Str, Blob],
         table::IMPORT_SCOPE => &[Idx(table::IMPORT_SCOPE), Blob],
+        table::STATE_MACHINE_METHOD => &[Idx(table::METHOD_DEF), Idx(table::METHOD_DEF)],
+        table::CUSTOM_DEBUG_INFORMATION => {
+            &[Coded(C::HasCustomDebugInformation), Guid, Blob]
+        }
         _ => return None,
     })
 }

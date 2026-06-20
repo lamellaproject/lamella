@@ -260,7 +260,7 @@ impl<'a> Assembly<'a> {
                 let member = self.member_ref(token.row())?;
                 Some(ResolvedMethod {
                     name: member.name(),
-                    declaring_type: self.parent_type_name(member.parent()),
+                    declaring_type: self.type_token_name(member.parent()),
                     signature: member.method_signature(),
                     kind: MethodKind::Reference,
                 })
@@ -324,6 +324,21 @@ impl<'a> Assembly<'a> {
         None
     }
 
+    /// The signature type of a field, by its `Field` token -- the seam from an `ldfld`/`stfld`
+    /// operand to the field's type, so the lowering can type the loaded value (a reference field
+    /// reads an `ObjectRef`, not an `int`). `None` if the token names no field.
+    #[must_use]
+    pub fn field_signature(&self, field: Token) -> Option<SigType> {
+        if field.table() != table::FIELD {
+            return None;
+        }
+        Field {
+            assembly: *self,
+            index: field.row(),
+        }
+        .signature()
+    }
+
     /// The `TypeDef` that owns the method at `method_index`, found by the method
     /// ranges the `TypeDef.MethodList` column delimits.
     fn method_owner(&self, method_index: u32) -> Option<TypeDef<'a>> {
@@ -336,15 +351,19 @@ impl<'a> Assembly<'a> {
         })
     }
 
-    /// The namespace and name of a `MemberRef` parent that is a type (a `TypeRef`
-    /// or `TypeDef`); `None` for other parents.
-    fn parent_type_name(&self, parent: Token) -> Option<TypeName<'a>> {
-        match parent.table() {
+    /// The namespace and name of a type token -- a `TypeRef` or `TypeDef` (the two
+    /// `TypeDefOrRef` cases that name a concrete type, e.g. a `MemberRef` parent, a base
+    /// type, or a `newarr` element); `None` for any other table (such as a `TypeSpec`,
+    /// which carries a signature rather than a name). Also normalizes a signature's
+    /// `Class`/`ValueType` token to a portable name for cross-assembly matching.
+    #[must_use]
+    pub fn type_token_name(&self, token: Token) -> Option<TypeName<'a>> {
+        match token.table() {
             table::TYPE_REF => self
-                .type_ref(parent.row())
+                .type_ref(token.row())
                 .and_then(|type_ref| type_ref.name()),
             table::TYPE_DEF => self
-                .type_def(parent.row())
+                .type_def(token.row())
                 .and_then(|type_def| type_def.name()),
             _ => None,
         }
@@ -489,6 +508,18 @@ impl<'a> TypeDef<'a> {
     #[must_use]
     pub fn is_sealed(&self) -> bool {
         flags::type_is_sealed(self.flags())
+    }
+
+    /// Whether the type is a value type -- it extends `System.ValueType` or `System.Enum`.
+    /// Reference types (classes) extend `System.Object` or another class, so this is how the
+    /// backend tells a `newobj` of a struct (built in place) from one of a class (heap-allocated).
+    #[must_use]
+    pub fn is_value_type(&self) -> bool {
+        self.assembly
+            .type_token_name(self.extends())
+            .is_some_and(|base| {
+                base.namespace == "System" && matches!(base.name, "ValueType" | "Enum")
+            })
     }
 
     /// The type's fields.
@@ -712,6 +743,18 @@ impl<'a> Method<'a> {
             .map_or(0, |row| row.raw(2))
     }
 
+    /// The method implementation flags (II.23.1.11): the `ImplFlags` column. Its
+    /// `CodeTypeMask` says whether the body is CIL, native, or provided by the runtime
+    /// -- the last is the conforming seam a managed BCL method crosses to a runtime
+    /// intrinsic (see [`crate::flags::method_impl`]).
+    #[must_use]
+    pub fn impl_flags(&self) -> u32 {
+        self.assembly
+            .tables
+            .row(table::METHOD_DEF, self.index)
+            .map_or(0, |row| row.raw(1))
+    }
+
     /// The relative virtual address of the method body, 0 for none (abstract,
     /// extern).
     #[must_use]
@@ -768,6 +811,15 @@ impl<'a> Method<'a> {
         flags::method_is_static(self.flags())
     }
 
+    /// Whether the method's body is provided by the runtime (II.23.1.11 `Runtime`): a
+    /// bodyless method the runtime supplies. This is the conforming seam a managed BCL
+    /// method crosses to a native intrinsic (the standard alternative to the
+    /// non-conforming `internalcall`).
+    #[must_use]
+    pub fn is_runtime_impl(&self) -> bool {
+        flags::method_impl_is_runtime(self.impl_flags())
+    }
+
     /// Whether the method is virtual.
     #[must_use]
     pub fn is_virtual(&self) -> bool {
@@ -789,6 +841,25 @@ impl<'a> Method<'a> {
         (first..last).map(move |index| Param {
             assembly: self.assembly,
             index,
+        })
+    }
+
+    /// Whether a parameter carries `System.ParamArrayAttribute` (II.23.2) -- a C#
+    /// `params` array, so the method is callable with a variable number of trailing
+    /// arguments. Only the last parameter may, but any is checked.
+    #[must_use]
+    pub fn has_param_array(&self) -> bool {
+        self.params().any(|param| {
+            self.assembly
+                .custom_attributes(param.token())
+                .any(|attribute| {
+                    self.assembly
+                        .resolve_method(attribute.constructor)
+                        .and_then(|target| target.declaring_type)
+                        .is_some_and(|name| {
+                            name.namespace == "System" && name.name == "ParamArrayAttribute"
+                        })
+                })
         })
     }
 }
@@ -824,6 +895,12 @@ impl<'a> Param<'a> {
             .tables
             .row(table::PARAM, self.index)
             .map_or(0, |row| row.raw(1))
+    }
+
+    /// This parameter's metadata token (for, e.g., its custom attributes).
+    #[must_use]
+    pub fn token(&self) -> Token {
+        Token::new(table::PARAM, self.index)
     }
 }
 

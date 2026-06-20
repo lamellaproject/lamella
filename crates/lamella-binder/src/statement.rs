@@ -138,8 +138,14 @@ pub enum BoundStmtKind {
         /// The labeled statement.
         body: Box<BoundStmt>,
     },
-    /// A `goto` statement (15.9.3); label resolution is deferred.
-    Goto,
+    /// A `goto` statement (15.9.3), naming the label to branch to.
+    Goto(Box<str>),
+    /// `goto case constant;` -- a jump to a case of the enclosing switch (15.9.3).
+    GotoCase(i64),
+    /// `goto case "string";` -- a jump to a string case of the enclosing switch.
+    GotoCaseString(Box<[u16]>),
+    /// `goto default;` -- a jump to the default section of the enclosing switch.
+    GotoDefault,
     /// A statement form not yet bound, for recovery.
     Error,
 }
@@ -155,10 +161,12 @@ pub struct BoundSwitchSection {
 
 /// A bound `switch` label (15.7.2): a case constant (an integral/char value as
 /// `i64`) or the default.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundSwitchLabel {
-    /// `case constant:` -- the constant's value.
+    /// `case constant:` -- an integral/char/enum constant's value.
     Case(i64),
+    /// `case "string":` -- a string constant (UTF-16), matched by value.
+    CaseString(Box<[u16]>),
     /// `default:`.
     Default,
 }
@@ -276,18 +284,26 @@ impl Binder {
                 let expression = self.bind_expression(expression);
                 self.enter_scope();
                 let mut seen_values: Vec<i64> = Vec::new();
+                let mut seen_strings: Vec<Box<[u16]>> = Vec::new();
                 let mut seen_default = false;
                 let mut bound_sections = Vec::with_capacity(sections.len());
                 for section in sections {
                     let mut labels = Vec::with_capacity(section.labels.len());
                     for label in &section.labels {
                         let bound = self.bind_switch_label(label);
-                        let duplicate = match bound {
-                            BoundSwitchLabel::Case(value) if seen_values.contains(&value) => {
+                        let duplicate = match &bound {
+                            BoundSwitchLabel::Case(value) if seen_values.contains(value) => {
                                 Some(format!("case {value}").into())
                             }
                             BoundSwitchLabel::Case(value) => {
-                                seen_values.push(value);
+                                seen_values.push(*value);
+                                None
+                            }
+                            BoundSwitchLabel::CaseString(text) if seen_strings.contains(text) => {
+                                Some(Box::<str>::from("a duplicate string case"))
+                            }
+                            BoundSwitchLabel::CaseString(text) => {
+                                seen_strings.push(text.clone());
                                 None
                             }
                             BoundSwitchLabel::Default if seen_default => {
@@ -355,7 +371,22 @@ impl Binder {
                 label: label.clone(),
                 body: Box::new(self.bind_statement(statement)),
             },
-            StmtKind::Goto(_) => BoundStmtKind::Goto,
+            StmtKind::Goto(lamella_syntax::ast::GotoTarget::Label(name)) => {
+                BoundStmtKind::Goto(name.clone())
+            }
+            StmtKind::Goto(lamella_syntax::ast::GotoTarget::Case(expr)) => {
+                if let ExprKind::Literal(Literal::String(text)) = &expr.kind {
+                    BoundStmtKind::GotoCaseString(text.clone())
+                } else {
+                    match case_constant(expr).or_else(|| self.enum_case_value(expr)) {
+                        Some(value) => BoundStmtKind::GotoCase(value),
+                        None => BoundStmtKind::Error,
+                    }
+                }
+            }
+            StmtKind::Goto(lamella_syntax::ast::GotoTarget::Default) => {
+                BoundStmtKind::GotoDefault
+            }
             StmtKind::Error => BoundStmtKind::Error,
         };
         BoundStmt {
@@ -370,6 +401,9 @@ impl Binder {
         match label {
             SwitchLabel::Default => BoundSwitchLabel::Default,
             SwitchLabel::Case(expr) => {
+                if let ExprKind::Literal(Literal::String(text)) = &expr.kind {
+                    return BoundSwitchLabel::CaseString(text.clone());
+                }
                 match case_constant(expr).or_else(|| self.enum_case_value(expr)) {
                     Some(value) => BoundSwitchLabel::Case(value),
                     None => {
@@ -494,6 +528,16 @@ impl Binder {
                 ));
             }
             let initializer = declarator.initializer.as_ref().map(|expr| {
+                if matches!(&expr.kind, ExprKind::ArrayInitializer(_)) {
+                    let elements = self.bind_array_initializer(expr, &declared);
+                    return BoundExpr {
+                        kind: BoundExprKind::ArrayCreation {
+                            lengths: Vec::new(),
+                            elements,
+                        },
+                        ty: declared.clone(),
+                    };
+                }
                 let value = self.bind_expression(expr);
                 self.check_convertible(&value.ty, &declared, declarator.span);
                 self.convert(value, &declared)

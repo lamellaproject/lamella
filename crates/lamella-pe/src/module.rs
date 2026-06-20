@@ -8,6 +8,7 @@ use crate::pe::{
 use crate::root::metadata_root;
 use crate::signature::{TypeSig, method_signature};
 use crate::tables::{Column, HeapSizes, TableStream};
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use lamella_metadata::CodedIndex;
 use lamella_metadata::tables::table;
@@ -234,6 +235,17 @@ impl ImageBuilder {
         Token::new(table::MEMBER_REF, row)
     }
 
+    /// Adds a `TypeSpec` row (II.22.39) holding `signature` (a type-signature blob,
+    /// such as a multi-dimensional array type), returning its token -- the parent of
+    /// the array's `.ctor`/`Get`/`Set` member references.
+    pub fn type_spec(&mut self, signature: &[u8]) -> Token {
+        let blob = self.blobs.intern(signature);
+        let row = self
+            .tables
+            .add_row(table::TYPE_SPEC, alloc::vec![Column::BlobRef(blob)]);
+        Token::new(table::TYPE_SPEC, row)
+    }
+
     /// A `TypeRef` to `namespace.name` in `mscorlib`, for naming an external type.
     pub fn type_ref(&mut self, namespace: &str, name: &str) -> Token {
         let scope = self.mscorlib();
@@ -269,6 +281,25 @@ impl ImageBuilder {
             ],
         );
         Token::new(table::FIELD, row)
+    }
+
+    /// Adds a `Constant` row (II.22.9): the literal value attached to `parent` (a
+    /// Field/Param/Property token). `element_type` is the value's element-type byte
+    /// (II.23.1.16) and `value` its little-endian blob -- the form an enum member or
+    /// a `const` field takes. The table is sorted by parent (a `HasConstant` coded
+    /// index), so callers must add constants in increasing parent-row order; its
+    /// sorted bit is set so a reader (the CLR) may binary-search it.
+    pub fn add_constant(&mut self, parent: Token, element_type: u8, value: &[u8]) {
+        let blob = self.blobs.intern(value);
+        self.tables.mark_sorted(table::CONSTANT);
+        self.tables.add_row(
+            table::CONSTANT,
+            alloc::vec![
+                Column::U16(u16::from(element_type)),
+                Column::Coded(CodedIndex::HasConstant, parent),
+                Column::BlobRef(blob),
+            ],
+        );
     }
 
     /// Adds a `Property` row (flags, name, the property-signature blob), returning
@@ -331,6 +362,7 @@ impl ImageBuilder {
         body: &[u8],
         flags: u16,
         impl_flags: u16,
+        parameters: &[Box<str>],
     ) -> Token {
         align4(&mut self.bodies);
         let rva = TEXT_RVA + CLI_HEADER_SIZE + self.bodies.len() as u32;
@@ -350,6 +382,7 @@ impl ImageBuilder {
                 Column::Index(table::PARAM, first_param),
             ],
         );
+        self.add_param_rows(parameters);
         self.method_debug.push(MethodDebug {
             sequence_points: Vec::new(),
             local_signature: 0,
@@ -357,6 +390,23 @@ impl ImageBuilder {
             scope_length: 0,
         });
         Token::new(table::METHOD_DEF, row)
+    }
+
+    /// Adds a `Param` row (II.22.33) per parameter -- `Flags=0`, `Sequence` 1..N, `Name`
+    /// -- so a debugger/PDB consumer can show argument names instead of `argN`. The rows
+    /// follow the just-added `MethodDef` whose `ParamList` points at the first of them.
+    fn add_param_rows(&mut self, parameters: &[Box<str>]) {
+        for (index, parameter) in parameters.iter().enumerate() {
+            let name = self.strings.intern(parameter);
+            self.tables.add_row(
+                table::PARAM,
+                alloc::vec![
+                    Column::U16(0),
+                    Column::U16((index + 1) as u16),
+                    Column::StringRef(name),
+                ],
+            );
+        }
     }
 
     /// Adds an abstract `MethodDef` (RVA 0, no body, IL impl) -- an interface method or
@@ -411,6 +461,18 @@ impl ImageBuilder {
             alloc::vec![
                 Column::Index(table::TYPE_DEF, class.row()),
                 Column::Coded(CodedIndex::TypeDefOrRef, interface),
+            ],
+        );
+    }
+
+    /// Records that `nested` is a type nested in `enclosing` (II.22.32), via a
+    /// `NestedClass` row. The nested type's own `TypeDef` carries an empty namespace.
+    pub fn add_nested_class(&mut self, nested: Token, enclosing: Token) {
+        self.tables.add_row(
+            table::NESTED_CLASS,
+            alloc::vec![
+                Column::Index(table::TYPE_DEF, nested.row()),
+                Column::Index(table::TYPE_DEF, enclosing.row()),
             ],
         );
     }
@@ -515,7 +577,7 @@ mod tests {
 
         let body = [0x06u8, 0x2A];
         let signature = [0x00u8, 0x00, 0x01];
-        let entry = builder.add_method("Main", &signature, &body, PUBLIC_STATIC, IL_MANAGED);
+        let entry = builder.add_method("Main", &signature, &body, PUBLIC_STATIC, IL_MANAGED, &[]);
         assert_eq!(entry.table(), table::METHOD_DEF);
 
         let pe = builder.finish(entry, false);
@@ -532,8 +594,8 @@ mod tests {
         builder.add_type("App", "Program", object, PUBLIC_CLASS);
         let body = [0x06u8, 0x2A];
         let signature = [0x00u8, 0x00, 0x01];
-        let main = builder.add_method("Main", &signature, &body, PUBLIC_STATIC, IL_MANAGED);
-        builder.add_method("Other", &signature, &body, PUBLIC_STATIC, IL_MANAGED);
+        let main = builder.add_method("Main", &signature, &body, PUBLIC_STATIC, IL_MANAGED, &[]);
+        builder.add_method("Other", &signature, &body, PUBLIC_STATIC, IL_MANAGED, &[]);
         builder.set_method_debug(
             main,
             crate::pdb::MethodDebug {

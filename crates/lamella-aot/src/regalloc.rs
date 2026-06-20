@@ -3,7 +3,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use lamella_ir::{BlockId, Function, Inst, Terminator, ValueId};
+use lamella_ir::{BlockId, Function, Inst, MirType, Terminator, ValueId};
 
 /// The values live on entry to and exit from each block, indexed by block number.
 /// Sets are bitsets over value ids (one `bool` per value).
@@ -194,6 +194,33 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::WriteInt { value } => {
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
+                Inst::StringLiteral { .. } => {}
+                Inst::StringEquals { lhs, rhs } => {
+                    mark(&mut lo, &mut hi, &mut defined, *lhs, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *rhs, ip);
+                }
+                Inst::Alloc { .. } => {}
+                Inst::AllocArray { length, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *length, ip);
+                }
+                Inst::ArrayLoad { array, index, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *array, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *index, ip);
+                }
+                Inst::ArrayStore {
+                    array,
+                    index,
+                    value,
+                    ..
+                } => {
+                    mark(&mut lo, &mut hi, &mut defined, *array, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *index, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
+                Inst::StaticLoad { .. } => {}
+                Inst::StaticStore { value, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
                 Inst::ConstInt { .. } => {}
             }
             mark(&mut lo, &mut hi, &mut defined, *result, ip);
@@ -328,6 +355,48 @@ pub fn allocate(intervals: &[Interval], reg_count: usize) -> Allocation {
     }
 }
 
+/// For each block, a per-instruction entry: `Some(roots)` when the instruction is a GC
+/// safepoint (a call or an allocation), listing the `ObjectRef` values live across it -- the
+/// roots a relocating collector must find and update at that return address. A value's own
+/// result is excluded: at the return it is in the result register, not yet a frame slot, and
+/// it was not a pre-existing root during any collection inside the call. Every call is treated
+/// as a safepoint (conservatively may-allocate), so the stack walk finds caller-frame roots.
+pub(crate) fn safepoint_roots(
+    func: &Function,
+    value_types: &[MirType],
+) -> Vec<Vec<Option<Vec<ValueId>>>> {
+    let live = Liveness::analyze(func);
+    let is_ref = |v: usize| matches!(value_types.get(v), Some(MirType::ObjectRef));
+    func.blocks
+        .iter()
+        .enumerate()
+        .map(|(b, block)| {
+            let mut alive = live.live_out[b].clone();
+            each_terminator_use(&block.terminator, |u| set(&mut alive, u));
+            let mut per_inst: Vec<Option<Vec<ValueId>>> = vec![None; block.insts.len()];
+            for (i, (result, inst)) in block.insts.iter().enumerate().rev() {
+                if matches!(
+                    inst,
+                    Inst::Call { .. } | Inst::Alloc { .. } | Inst::AllocArray { .. }
+                ) {
+                    let roots = alive
+                        .iter()
+                        .enumerate()
+                        .filter(|&(v, &a)| a && v != result.index() && is_ref(v))
+                        .map(|(v, _)| ValueId(v as u32))
+                        .collect();
+                    per_inst[i] = Some(roots);
+                }
+                if let Some(slot) = alive.get_mut(result.index()) {
+                    *slot = false;
+                }
+                each_inst_use(inst, |u| set(&mut alive, u));
+            }
+            per_inst
+        })
+        .collect()
+}
+
 /// A fresh bitset over `m` value ids, all clear.
 fn bitset(m: usize) -> Vec<bool> {
     let mut v = Vec::new();
@@ -358,7 +427,7 @@ fn union_into(dst: &mut [bool], src: &[bool]) -> bool {
 }
 
 /// Calls `f` with each value an instruction reads.
-fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
+pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
     match inst {
         Inst::ConstInt { .. } => {}
         Inst::Binary { lhs, rhs, .. } | Inst::Compare { lhs, rhs, .. } => {
@@ -384,6 +453,29 @@ fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::CopyStruct { src } => f(*src),
         Inst::SemihostWrite { .. } => {}
         Inst::WriteInt { value } => f(*value),
+        Inst::StringLiteral { .. } => {}
+        Inst::StringEquals { lhs, rhs } => {
+            f(*lhs);
+            f(*rhs);
+        }
+        Inst::Alloc { .. } => {}
+        Inst::AllocArray { length, .. } => f(*length),
+        Inst::ArrayLoad { array, index, .. } => {
+            f(*array);
+            f(*index);
+        }
+        Inst::ArrayStore {
+            array,
+            index,
+            value,
+            ..
+        } => {
+            f(*array);
+            f(*index);
+            f(*value);
+        }
+        Inst::StaticLoad { .. } => {}
+        Inst::StaticStore { value, .. } => f(*value),
     }
 }
 

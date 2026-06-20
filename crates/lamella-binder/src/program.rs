@@ -112,6 +112,38 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                     body,
                 );
             }
+            Member::Operator {
+                return_type,
+                operator,
+                parameters,
+                body,
+                ..
+            } => {
+                let params = bound_parameters(parameters);
+                binder.bind_method(
+                    Some(enclosing.clone()),
+                    operator.method_name(parameters.len()),
+                    bind_type(return_type),
+                    &params,
+                    body,
+                );
+            }
+            Member::ConversionOperator {
+                direction,
+                target,
+                parameters,
+                body,
+                ..
+            } => {
+                let params = bound_parameters(parameters);
+                binder.bind_method(
+                    Some(enclosing.clone()),
+                    direction.method_name(),
+                    bind_type(target),
+                    &params,
+                    body,
+                );
+            }
             Member::Constructor {
                 parameters, body, ..
             } => {
@@ -159,6 +191,25 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                     if let Some(initializer) = &declarator.initializer {
                         binder.bind_field_initializer(enclosing.clone(), &field_ty, initializer);
                     }
+                }
+            }
+            Member::Destructor { body, .. } => {
+                binder.bind_method(
+                    Some(enclosing.clone()),
+                    "Finalize",
+                    TypeSymbol::Special(SpecialType::Void),
+                    &[],
+                    body,
+                );
+            }
+            Member::NestedType(nested) => {
+                if let NamespaceMember::Type(nested_decl) = nested.as_ref() {
+                    let enclosing_full = if namespace.is_empty() {
+                        String::from(&*declaration.name)
+                    } else {
+                        alloc::format!("{namespace}.{}", declaration.name)
+                    };
+                    bind_type_bodies(binder, &enclosing_full, nested_decl);
                 }
             }
             _ => {}
@@ -289,6 +340,7 @@ mod tests {
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::String)],
             is_static: true,
+            is_params: false,
             accessibility: crate::symbols::Accessibility::Public,
         });
         bcl.insert(console);

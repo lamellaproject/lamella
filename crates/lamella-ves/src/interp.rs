@@ -2,7 +2,7 @@
 
 #[cfg(feature = "bcl")]
 use crate::module::IntrinsicFn;
-use crate::module::{Method, MethodId, Module};
+use crate::module::{Method, MethodId, Module, asm_key};
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
 use crate::value::{Location, Value};
@@ -515,6 +515,7 @@ impl Session {
             len => len - 1,
         };
         let top = &mut frames[current];
+        let asm = module.method_asm(top.method);
         let code = method_code(module, top.method)?;
         let instruction = code.get(top.ip).ok_or(Trap::FellThroughEnd)?;
         top.ip += 1;
@@ -691,7 +692,7 @@ impl Session {
             }
             Flow::LoadField { location, field } => {
                 let slot = module
-                    .field_slot(field)
+                    .field_slot(asm, field)
                     .ok_or(Trap::UnresolvedField(field))?;
                 let value = read_field_at(frames, vm, location, slot);
                 frames
@@ -707,10 +708,10 @@ impl Session {
                 value,
             } => {
                 let slot = module
-                    .field_slot(field)
+                    .field_slot(asm, field)
                     .ok_or(Trap::UnresolvedField(field))?;
                 let type_id = module
-                    .field_type(field)
+                    .field_type(asm, field)
                     .ok_or(Trap::UnresolvedField(field))?;
                 let shape = module
                     .type_field_defaults(type_id)
@@ -721,7 +722,7 @@ impl Session {
             }
             Flow::InitObj { location, kind } => {
                 let value = match module
-                    .type_id_of(kind)
+                    .type_id_of(asm, kind)
                     .and_then(|type_id| module.type_field_defaults(type_id))
                 {
                     Some(defaults) => Value::Struct(defaults.to_vec().into_boxed_slice()),
@@ -781,6 +782,10 @@ fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<
         Location::Element { array, index } => vm.heap().array_get(array, index),
         Location::Static { slot } => vm.static_field(slot),
         Location::Boxed { object } => vm.heap().boxed_value(object),
+        Location::Nested { base, slot } => match read_location_value(frames, vm, (*base).clone()) {
+            Some(Value::Struct(fields)) => fields.get(slot as usize).cloned(),
+            _ => None,
+        },
     }
 }
 
@@ -825,6 +830,16 @@ fn write_location_value(
             .set_boxed_value(object, value)
             .then_some(())
             .ok_or(Trap::NullReference),
+        Location::Nested { base, slot } => {
+            let mut fields = match read_location_value(frames, vm, (*base).clone()) {
+                Some(Value::Struct(fields)) => fields,
+                _ => return Err(Trap::Unsupported(Opcode::Stfld)),
+            };
+            if let Some(target) = fields.get_mut(slot as usize) {
+                *target = value;
+            }
+            write_location_value(frames, vm, *base, Value::Struct(fields))
+        }
     }
 }
 
@@ -919,7 +934,7 @@ fn write_field_at(
     shape: &[Value],
     value: Value,
 ) -> Result<(), Trap> {
-    let mut container = read_location_value(frames, vm, location).unwrap_or(Value::Null);
+    let mut container = read_location_value(frames, vm, location.clone()).unwrap_or(Value::Null);
     if !matches!(container, Value::Struct(_)) {
         container = Value::Struct(shape.to_vec().into_boxed_slice());
     }
@@ -1024,7 +1039,13 @@ fn raise_from(
         }
         match &clause.kind {
             EhKind::Catch(type_token) => {
-                if catch_matches(module, vm, *type_token, exception) {
+                if catch_matches(
+                    module,
+                    module.method_asm(frame.method),
+                    vm,
+                    *type_token,
+                    exception,
+                ) {
                     let finallys = finallys_inside(handlers, fault_ip, clause.try_range);
                     return begin_finallys(
                         frames,
@@ -1174,8 +1195,14 @@ fn finally_handlers(
 /// Whether a `catch` of `type_token` catches `exception`: a same-module type matches
 /// when the exception's runtime type is a subtype; a catch type this module cannot
 /// resolve (`System.Exception` / `System.Object`) is treated as catch-all.
-fn catch_matches(module: &Module, vm: &Vm, type_token: Token, exception: ObjectRef) -> bool {
-    match module.type_id_of(type_token) {
+fn catch_matches(
+    module: &Module,
+    asm: u8,
+    vm: &Vm,
+    type_token: Token,
+    exception: ObjectRef,
+) -> bool {
+    match module.type_id_of(asm, type_token) {
         Some(catch_type) => vm
             .heap()
             .type_of(exception)
@@ -1193,6 +1220,7 @@ fn step(
     instruction: &Instruction,
 ) -> Result<Flow, Trap> {
     let opcode = instruction.opcode;
+    let asm = module.map_or(0, |module| module.method_asm(frame.method));
     match opcode {
         Opcode::Nop => {}
         Opcode::Pop => {
@@ -1218,9 +1246,11 @@ fn step(
             .push(Value::Int32(int8_operand(instruction)? as i32)),
         Opcode::LdcI4 => frame.stack.push(Value::Int32(int32_operand(instruction)?)),
         Opcode::LdcI8 => frame.stack.push(Value::Int64(int64_operand(instruction)?)),
+        #[cfg(feature = "float")]
         Opcode::LdcR4 => frame
             .stack
             .push(Value::Float(f64::from(float32_operand(instruction)?))),
+        #[cfg(feature = "float")]
         Opcode::LdcR8 => frame
             .stack
             .push(Value::Float(float64_operand(instruction)?)),
@@ -1281,6 +1311,7 @@ fn step(
             let value = frame.pop()?;
             frame.stack.push(bitwise_not(value)?);
         }
+        #[cfg(feature = "float")]
         Opcode::Ckfinite => {
             let value = frame.pop()?;
             match value {
@@ -1391,7 +1422,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldstr))?;
             let token = token_operand(instruction)?;
             let chars = module
-                .resolve_string(token)
+                .resolve_string(asm, token)
                 .ok_or(Trap::UnresolvedString(token))?;
             let reference = vm.heap_mut().alloc_string(chars);
             frame.stack.push(Value::Object(reference));
@@ -1400,7 +1431,9 @@ fn step(
         Opcode::Call => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Call))?;
             let token = token_operand(instruction)?;
-            let method = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
+            let method = module
+                .resolve(asm, token)
+                .ok_or(Trap::UnresolvedCall(token))?;
             let arg_count = module
                 .method(method)
                 .ok_or(Trap::NoSuchMethod(method))?
@@ -1412,7 +1445,7 @@ fn step(
         Opcode::Callvirt => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Callvirt))?;
             let token = token_operand(instruction)?;
-            if let Some(param_count) = module.delegate_invoke(token) {
+            if let Some(param_count) = module.delegate_invoke(asm, token) {
                 let args = frame.take_args(param_count + 1)?;
                 let delegate = object_ref(
                     args.first().ok_or(Trap::StackUnderflow)?.clone(),
@@ -1436,8 +1469,8 @@ fn step(
                     None => Err(Trap::TypeMismatch(Opcode::Callvirt)),
                 };
             }
-            let static_method = module.resolve(token);
-            let target_info = module.call_target(token);
+            let static_method = module.resolve(asm, token);
+            let target_info = module.call_target(asm, token);
             let arg_count = match target_info {
                 Some((_, count)) => count,
                 None => {
@@ -1452,13 +1485,19 @@ fn step(
             let sig_key = target_info.map(|(key, _)| key);
             let constraint = frame.pending_constraint.take();
             let runtime_type = match constraint {
-                Some(constraint) => module.type_id_of(constraint),
+                Some(constraint) => module.type_id_of(asm, constraint),
                 None => {
                     let this = object_ref(
                         args.first().ok_or(Trap::StackUnderflow)?.clone(),
                         Opcode::Callvirt,
                     )?;
-                    vm.heap().type_of(this)
+                    vm.heap().type_of(this).or_else(|| {
+                        if vm.heap().is_string(this) {
+                            module.string_type_id()
+                        } else {
+                            None
+                        }
+                    })
                 }
             };
             let method = resolve_callvirt(module, static_method, sig_key, runtime_type)
@@ -1466,9 +1505,11 @@ fn step(
             #[cfg(feature = "bcl")]
             if let Some(constraint) = constraint {
                 if is_object_to_string(module, method) {
-                    if let Some(&Value::ByRef(location)) = args.first() {
-                        if let Some(value) = read_enum_value(frame, frame_index, vm, location) {
-                            if let Some(name) = module.enum_value_name(constraint.0, value) {
+                    if let Some(Value::ByRef(location)) = args.first() {
+                        if let Some(value) =
+                            read_enum_value(frame, frame_index, vm, location.clone())
+                        {
+                            if let Some(name) = module.enum_value_name(asm, constraint.0, value) {
                                 let chars: Vec<u16> = name.encode_utf16().collect();
                                 let string = vm.heap_mut().alloc_string(&chars);
                                 frame.stack.push(Value::Object(string));
@@ -1497,37 +1538,48 @@ fn step(
         Opcode::Jmp => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Jmp))?;
             let token = token_operand(instruction)?;
-            let target = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
+            let target = module
+                .resolve(asm, token)
+                .ok_or(Trap::UnresolvedCall(token))?;
             return Ok(Flow::Jmp(target));
         }
         Opcode::Ldftn => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldftn))?;
             let token = token_operand(instruction)?;
-            let method = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
+            let method = module
+                .resolve(asm, token)
+                .ok_or(Trap::UnresolvedCall(token))?;
             frame.stack.push(Value::NativeInt(i64::from(method)));
         }
         Opcode::Ldvirtftn => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldvirtftn))?;
             let token = token_operand(instruction)?;
             let this = object_ref(frame.pop()?, Opcode::Ldvirtftn)?;
-            let runtime_type = vm.heap().type_of(this);
-            let sig_key = module.call_target(token).map(|(key, _)| key);
-            let method = resolve_callvirt(module, module.resolve(token), sig_key, runtime_type)
-                .ok_or(Trap::UnresolvedCall(token))?;
+            let runtime_type = vm.heap().type_of(this).or_else(|| {
+                if vm.heap().is_string(this) {
+                    module.string_type_id()
+                } else {
+                    None
+                }
+            });
+            let sig_key = module.call_target(asm, token).map(|(key, _)| key);
+            let method =
+                resolve_callvirt(module, module.resolve(asm, token), sig_key, runtime_type)
+                    .ok_or(Trap::UnresolvedCall(token))?;
             frame.stack.push(Value::NativeInt(i64::from(method)));
         }
 
         Opcode::Newobj => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Newobj))?;
             let token = token_operand(instruction)?;
-            if module.is_delegate_ctor(token) {
+            if module.is_delegate_ctor(asm, token) {
                 let method = function_pointer(frame.pop()?)?;
                 let target = frame.pop()?;
                 let delegate = vm.heap_mut().alloc_delegate(target, method);
                 frame.stack.push(Value::Object(delegate));
                 return Ok(Flow::Next);
             }
-            if let Some(rank) = module.md_array_ctor_rank(token) {
+            if let Some(rank) = module.md_array_ctor_rank(asm, token) {
                 let lengths = frame.take_args(rank)?;
                 let dims: Vec<i32> = lengths
                     .iter()
@@ -1541,7 +1593,29 @@ fn step(
                 frame.stack.push(Value::Object(array));
                 return Ok(Flow::Next);
             }
-            let ctor = module.resolve(token).ok_or(Trap::UnresolvedCall(token))?;
+            if let Some(params) = module.string_builder_ctor_params(asm, token) {
+                let args = frame.take_args(params)?;
+                let initial = match args.first() {
+                    Some(&Value::Object(reference)) => vm
+                        .heap()
+                        .as_string(reference)
+                        .map(|units| units.into_owned())
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                let builder = vm.heap_mut().alloc_string_builder(initial);
+                frame.stack.push(Value::Object(builder));
+                return Ok(Flow::Next);
+            }
+            if let Some(params) = module.list_ctor_params(asm, token) {
+                frame.take_args(params)?;
+                let list = vm.heap_mut().alloc_array(Vec::new());
+                frame.stack.push(Value::Object(list));
+                return Ok(Flow::Next);
+            }
+            let ctor = module
+                .resolve(asm, token)
+                .ok_or(Trap::UnresolvedCall(token))?;
             let is_intrinsic = matches!(module.method(ctor), Some(Method::Intrinsic { .. }));
             let (type_id, defaults) = if is_intrinsic {
                 (EXTERNAL_TYPE_ID, Vec::new())
@@ -1571,7 +1645,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldfld))?;
             let token = token_operand(instruction)?;
             let slot = module
-                .field_slot(token)
+                .field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             match frame.pop()? {
                 Value::Object(object) => {
@@ -1602,7 +1676,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Stfld))?;
             let token = token_operand(instruction)?;
             let slot = module
-                .field_slot(token)
+                .field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             let value = frame.pop()?;
             match frame.pop()? {
@@ -1626,7 +1700,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldflda))?;
             let token = token_operand(instruction)?;
             let slot = module
-                .field_slot(token)
+                .field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             match frame.pop()? {
                 Value::Object(object) => {
@@ -1635,6 +1709,12 @@ fn step(
                         .push(Value::ByRef(Location::Field { object, slot }));
                 }
                 Value::Null => return Err(Trap::NullReference),
+                Value::ByRef(base) => {
+                    frame.stack.push(Value::ByRef(Location::Nested {
+                        base: alloc::boxed::Box::new(base),
+                        slot,
+                    }));
+                }
                 _ => return Err(Trap::Unsupported(Opcode::Ldflda)),
             }
         }
@@ -1642,7 +1722,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldsflda))?;
             let token = token_operand(instruction)?;
             let slot = module
-                .static_field_slot(token)
+                .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             vm.init_statics(module.static_field_defaults());
             frame.stack.push(Value::ByRef(Location::Static { slot }));
@@ -1735,14 +1815,16 @@ fn step(
         }
         Opcode::Ldtoken => {
             let token = token_operand(instruction)?;
-            frame.stack.push(Value::NativeInt(i64::from(token.0)));
+            frame
+                .stack
+                .push(Value::NativeInt(i64::from(asm_key(asm, token.0))));
         }
 
         Opcode::Ldsfld => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldsfld))?;
             let token = token_operand(instruction)?;
             let slot = module
-                .static_field_slot(token)
+                .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             vm.init_statics(module.static_field_defaults());
             let value = vm.static_field(slot).ok_or(Trap::UnresolvedField(token))?;
@@ -1752,7 +1834,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Stsfld))?;
             let token = token_operand(instruction)?;
             let slot = module
-                .static_field_slot(token)
+                .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             let value = frame.pop()?;
             vm.init_statics(module.static_field_defaults());
@@ -1763,7 +1845,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Castclass))?;
             let token = token_operand(instruction)?;
             let value = frame.pop()?;
-            if !cast_matches(module, vm, &value, token) {
+            if !cast_matches(module, asm, vm, &value, token) {
                 return Err(Trap::InvalidCast);
             }
             frame.stack.push(value);
@@ -1773,14 +1855,15 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Isinst))?;
             let token = token_operand(instruction)?;
             let value = frame.pop()?;
-            let matched = !matches!(value, Value::Null) && cast_matches(module, vm, &value, token);
+            let matched =
+                !matches!(value, Value::Null) && cast_matches(module, asm, vm, &value, token);
             frame.stack.push(if matched { value } else { Value::Null });
         }
 
         Opcode::Box => {
             let token = token_operand(instruction)?;
             let value = frame.pop()?;
-            let reference = vm.heap_mut().alloc_boxed(token.0, value);
+            let reference = vm.heap_mut().alloc_boxed(asm_key(asm, token.0), value);
             frame.stack.push(Value::Object(reference));
         }
         Opcode::Unbox => {
@@ -1798,7 +1881,7 @@ fn step(
         Opcode::Newarr => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Newarr))?;
             let token = token_operand(instruction)?;
-            let default = module.array_default(token).unwrap_or(Value::Null);
+            let default = module.array_default(asm, token).unwrap_or(Value::Null);
             let length = array_length(frame.pop()?)?;
             let object = vm.heap_mut().alloc_array(alloc::vec![default; length]);
             frame.stack.push(Value::Object(object));
@@ -2010,6 +2093,7 @@ fn wrap_int(kind: IntKind, value: i64) -> Value {
 /// `add`, `sub`, `mul`, `div`, `rem`: floating point when both operands are
 /// floats, otherwise integer.
 fn binary_numeric(opcode: Opcode, a: Value, b: Value) -> Result<Value, Trap> {
+    #[cfg(feature = "float")]
     if let (Value::Float(x), Value::Float(y)) = (&a, &b) {
         let (x, y) = (*x, *y);
         let result = match opcode {
@@ -2130,6 +2214,7 @@ fn negate(value: Value) -> Result<Value, Trap> {
         Value::Int32(x) => Ok(Value::Int32(x.wrapping_neg())),
         Value::Int64(x) => Ok(Value::Int64(x.wrapping_neg())),
         Value::NativeInt(x) => Ok(Value::NativeInt(x.wrapping_neg())),
+        #[cfg(feature = "float")]
         Value::Float(x) => Ok(Value::Float(-x)),
         Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
             Err(Trap::TypeMismatch(Opcode::Neg))
@@ -2151,6 +2236,7 @@ fn bitwise_not(value: Value) -> Result<Value, Trap> {
 /// `conv.i*` widen by sign-extension and `conv.u*` by zero-extension; results
 /// narrower than `int32` fill the slot. `conv.r.un` reads the source as unsigned.
 fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
+    #[cfg(feature = "float")]
     if opcode == Opcode::ConvRUn {
         let unsigned = match value {
             Value::Int32(x) => u64::from(x as u32),
@@ -2160,6 +2246,7 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         return Ok(Value::Float(unsigned as f64));
     }
 
+    #[cfg(feature = "float")]
     if matches!(opcode, Opcode::ConvR4 | Opcode::ConvR8) {
         let float = match value {
             Value::Int32(x) => f64::from(x),
@@ -2179,6 +2266,7 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Value::Int32(x) => (i64::from(x), true),
         Value::Int64(x) => (x, false),
         Value::NativeInt(x) => (x, false),
+        #[cfg(feature = "float")]
         Value::Float(f) => (f as i64, false),
         Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
             return Err(Trap::TypeMismatch(opcode));
@@ -2226,6 +2314,7 @@ fn convert_checked(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Value::Int32(x) => i128::from(x),
         Value::Int64(x) | Value::NativeInt(x) if unsigned_source => i128::from(x as u64),
         Value::Int64(x) | Value::NativeInt(x) => i128::from(x),
+        #[cfg(feature = "float")]
         Value::Float(f) => f as i128,
         _ => return Err(Trap::TypeMismatch(opcode)),
     };
@@ -2292,6 +2381,7 @@ fn relation_of(opcode: Opcode) -> Option<(Relation, bool)> {
 /// with the unordered (NaN) result chosen by the `.un` variant.
 fn compare(opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
     let (relation, unordered_or_unsigned) = relation_of(opcode).ok_or(Trap::Unsupported(opcode))?;
+    #[cfg(feature = "float")]
     if let (Value::Float(x), Value::Float(y)) = (&a, &b) {
         let (x, y) = (*x, *y);
         if x.is_nan() || y.is_nan() {
@@ -2365,6 +2455,7 @@ fn int64_operand(instruction: &Instruction) -> Result<i64, Trap> {
     }
 }
 
+#[cfg(feature = "float")]
 fn float32_operand(instruction: &Instruction) -> Result<f32, Trap> {
     match instruction.operand {
         Operand::Float32(value) => Ok(value),
@@ -2372,6 +2463,7 @@ fn float32_operand(instruction: &Instruction) -> Result<f32, Trap> {
     }
 }
 
+#[cfg(feature = "float")]
 fn float64_operand(instruction: &Instruction) -> Result<f64, Trap> {
     match instruction.operand {
         Operand::Float64(value) => Ok(value),
@@ -2442,13 +2534,13 @@ fn resolve_callvirt(
 /// reference matches when its runtime type is a subtype of the target. Cases this
 /// module cannot verify -- an external target type, or a string/array object with no
 /// declared type -- are treated as a match (unverified).
-fn cast_matches(module: &Module, vm: &Vm, value: &Value, token: Token) -> bool {
+fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) -> bool {
     let reference = match value {
         Value::Null => return true,
         Value::Object(reference) => *reference,
         _ => return false,
     };
-    match (module.type_id_of(token), vm.heap().type_of(reference)) {
+    match (module.type_id_of(asm, token), vm.heap().type_of(reference)) {
         (Some(target), Some(runtime)) => module.is_subtype(runtime, target),
         _ => true,
     }
@@ -2884,6 +2976,7 @@ mod tests {
     fn static_call_adds_two_arguments() {
         let mut module = Module::new();
         let add = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
                 Instruction::simple(Opcode::Ldarg1),
@@ -2893,6 +2986,7 @@ mod tests {
             2,
         );
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
                 Instruction::simple(Opcode::LdcI42),
@@ -2901,7 +2995,7 @@ mod tests {
             ]),
             0,
         );
-        module.bind_token(ADD_TOKEN, add);
+        module.bind_token(0, ADD_TOKEN, add);
 
         assert_eq!(
             super::run(&module, &mut Vm::new(), main, Vec::new()),
@@ -2913,6 +3007,7 @@ mod tests {
     fn recursion_sums_one_to_n_across_frames() {
         let mut module = Module::new();
         let sum = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
                 Instruction::simple(Opcode::LdcI40),
@@ -2929,7 +3024,7 @@ mod tests {
             ]),
             1,
         );
-        module.bind_token(SELF_TOKEN, sum);
+        module.bind_token(0, SELF_TOKEN, sum);
 
         assert_eq!(
             super::run(&module, &mut Vm::new(), sum, alloc::vec![Value::Int32(5)]),
@@ -2941,6 +3036,7 @@ mod tests {
     fn an_unbound_call_token_traps() {
         let mut module = Module::new();
         let main = module.add_method(
+            0,
             method(vec![Instruction::new(
                 Opcode::Call,
                 Operand::Token(ADD_TOKEN),
@@ -2957,13 +3053,14 @@ mod tests {
     fn runaway_recursion_traps_instead_of_crashing() {
         let mut module = Module::new();
         let loop_method = module.add_method(
+            0,
             method(vec![
                 Instruction::new(Opcode::Call, Operand::Token(SELF_TOKEN)),
                 Instruction::simple(Opcode::Ret),
             ]),
             0,
         );
-        module.bind_token(SELF_TOKEN, loop_method);
+        module.bind_token(0, SELF_TOKEN, loop_method);
 
         assert_eq!(
             super::run(&module, &mut Vm::new(), loop_method, Vec::new()),
@@ -2975,6 +3072,7 @@ mod tests {
     fn session_single_steps_and_inspects_the_stack() {
         let mut module = Module::new();
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
                 Instruction::simple(Opcode::LdcI43),
@@ -3009,6 +3107,7 @@ mod tests {
     fn session_pauses_at_a_breakpoint() {
         let mut module = Module::new();
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
                 Instruction::simple(Opcode::LdcI43),
@@ -3038,6 +3137,7 @@ mod tests {
     fn session_exposes_the_call_stack_at_a_breakpoint() {
         let mut module = Module::new();
         let add = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
                 Instruction::simple(Opcode::Ldarg1),
@@ -3047,6 +3147,7 @@ mod tests {
             2,
         );
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
                 Instruction::simple(Opcode::LdcI43),
@@ -3055,7 +3156,7 @@ mod tests {
             ]),
             0,
         );
-        module.bind_token(ADD_TOKEN, add);
+        module.bind_token(0, ADD_TOKEN, add);
         let mut vm = Vm::new();
         let mut session = Session::new(&module, main, Vec::new()).unwrap();
         session.add_breakpoint(add, 0);
@@ -3084,9 +3185,10 @@ mod tests {
 
         let mut module = Module::new();
         let counter = module.add_type(vec![Value::Int32(0)]);
-        module.bind_field(count_field, 0);
+        module.bind_field(0, count_field, 0);
 
         let ctor = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
                 Instruction::simple(Opcode::Ldarg1),
@@ -3096,9 +3198,10 @@ mod tests {
             2,
         );
         module.set_method_type(ctor, counter);
-        module.bind_token(ctor_token, ctor);
+        module.bind_token(0, ctor_token, ctor);
 
         let inc = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
                 Instruction::simple(Opcode::Ldarg0),
@@ -3111,9 +3214,10 @@ mod tests {
             1,
         );
         module.set_method_type(inc, counter);
-        module.bind_token(inc_token, inc);
+        module.bind_token(0, inc_token, inc);
 
         let get = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
                 Instruction::new(Opcode::Ldfld, Operand::Token(count_field)),
@@ -3122,9 +3226,10 @@ mod tests {
             1,
         );
         module.set_method_type(get, counter);
-        module.bind_token(get_token, get);
+        module.bind_token(0, get_token, get);
 
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::new(Opcode::LdcI4S, Operand::Int8(10)),
                 Instruction::new(Opcode::Newobj, Operand::Token(ctor_token)),
@@ -3150,7 +3255,7 @@ mod tests {
     fn arrays_allocate_store_load_and_measure_length() {
         let elem = Token(0x0100_0005);
         let mut module = Module::new();
-        module.bind_array_default(elem, Value::Int32(0));
+        module.bind_array_default(0, elem, Value::Int32(0));
 
         let store = |index: Opcode, value: i8| {
             [
@@ -3187,7 +3292,7 @@ mod tests {
             Instruction::simple(Opcode::Add),
             Instruction::simple(Opcode::Ret),
         ]);
-        let main = module.add_method(method(code), 0);
+        let main = module.add_method(0, method(code), 0);
 
         assert_eq!(
             super::run(&module, &mut Vm::new(), main, Vec::new()),
@@ -3199,8 +3304,9 @@ mod tests {
     fn array_index_out_of_range_throws() {
         let elem = Token(0x0100_0005);
         let mut module = Module::new();
-        module.bind_array_default(elem, Value::Int32(0));
+        module.bind_array_default(0, elem, Value::Int32(0));
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
                 Instruction::new(Opcode::Newarr, Operand::Token(elem)),
@@ -3225,11 +3331,17 @@ mod tests {
         let base = module.add_type(vec![]);
         let derived = module.add_type(vec![]);
 
-        let base_speak =
-            module.add_method(method(vec![Instruction::simple(Opcode::LdcI41), ret()]), 1);
+        let base_speak = module.add_method(
+            0,
+            method(vec![Instruction::simple(Opcode::LdcI41), ret()]),
+            1,
+        );
         module.set_method_type(base_speak, base);
-        let derived_speak =
-            module.add_method(method(vec![Instruction::simple(Opcode::LdcI42), ret()]), 1);
+        let derived_speak = module.add_method(
+            0,
+            method(vec![Instruction::simple(Opcode::LdcI42), ret()]),
+            1,
+        );
         module.set_method_type(derived_speak, derived);
 
         module.set_vtable(base, vec![base_speak]);
@@ -3237,12 +3349,13 @@ mod tests {
         module.bind_method_slot(base_speak, 0);
         module.bind_method_slot(derived_speak, 0);
 
-        let ctor = module.add_method(method(vec![ret()]), 1);
+        let ctor = module.add_method(0, method(vec![ret()]), 1);
         module.set_method_type(ctor, derived);
-        module.bind_token(ctor_token, ctor);
-        module.bind_token(speak_token, base_speak);
+        module.bind_token(0, ctor_token, ctor);
+        module.bind_token(0, speak_token, base_speak);
 
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::new(Opcode::Newobj, Operand::Token(ctor_token)),
                 Instruction::new(Opcode::Callvirt, Operand::Token(speak_token)),
@@ -3263,8 +3376,9 @@ mod tests {
         let bump_token = Token(0x0600_0030);
 
         let mut module = Module::new();
-        module.bind_static_field(field, Value::Int32(0));
+        module.bind_static_field(0, field, Value::Int32(0));
         let bump = module.add_method(
+            0,
             method(vec![
                 Instruction::new(Opcode::Ldsfld, Operand::Token(field)),
                 Instruction::simple(Opcode::LdcI41),
@@ -3274,8 +3388,9 @@ mod tests {
             ]),
             0,
         );
-        module.bind_token(bump_token, bump);
+        module.bind_token(0, bump_token, bump);
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::new(Opcode::Call, Operand::Token(bump_token)),
                 Instruction::new(Opcode::Call, Operand::Token(bump_token)),
@@ -3315,11 +3430,12 @@ mod tests {
         let mut module = Module::new();
         let a = module.add_type(vec![]);
         let b = module.add_type(vec![]);
-        module.bind_type_token(b_token, b);
-        let ctor = module.add_method(method(vec![ret()]), 1);
+        module.bind_type_token(0, b_token, b);
+        let ctor = module.add_method(0, method(vec![ret()]), 1);
         module.set_method_type(ctor, a);
-        module.bind_token(a_ctor, ctor);
+        module.bind_token(0, a_ctor, ctor);
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::new(Opcode::Newobj, Operand::Token(a_ctor)),
                 Instruction::new(op, Operand::Token(b_token)),
@@ -3335,10 +3451,11 @@ mod tests {
         let e_ctor = Token(0x0600_0050);
         let mut module = Module::new();
         let e = module.add_type(vec![]);
-        let ctor = module.add_method(method(vec![ret()]), 1);
+        let ctor = module.add_method(0, method(vec![ret()]), 1);
         module.set_method_type(ctor, e);
-        module.bind_token(e_ctor, ctor);
+        module.bind_token(0, e_ctor, ctor);
         let main = module.add_method(
+            0,
             method(vec![
                 Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
                 Instruction::simple(Opcode::Throw),

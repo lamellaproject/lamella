@@ -1936,7 +1936,32 @@ impl Parser {
         }
         loop {
             let before = self.position;
-            arguments.push(self.parse_expression());
+            let ref_out = match self.current_keyword() {
+                Some(Keyword::Ref) => {
+                    self.bump();
+                    Some(false)
+                }
+                Some(Keyword::Out) => {
+                    self.bump();
+                    Some(true)
+                }
+                _ => None,
+            };
+            let argument = self.parse_expression();
+            let argument = match ref_out {
+                Some(out) => {
+                    let span = argument.span;
+                    Expr::new(
+                        ExprKind::RefArgument {
+                            out,
+                            operand: Box::new(argument),
+                        },
+                        span,
+                    )
+                }
+                None => argument,
+            };
+            arguments.push(argument);
             if self.eat(Punctuator::Comma) {
                 continue;
             }
@@ -2310,6 +2335,9 @@ mod tests {
                 receiver,
                 arguments,
             } => format!("(index {}{})", dump(receiver), dump_args(arguments)),
+            ExprKind::RefArgument { out, operand } => {
+                format!("({} {})", if *out { "out" } else { "ref" }, dump(operand))
+            }
             ExprKind::Unary { operator, operand } => {
                 format!("({} {})", unary_text(*operator), dump(operand))
             }

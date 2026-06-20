@@ -6,6 +6,7 @@
 extern crate alloc;
 
 pub mod cil;
+pub mod debugmap;
 pub mod resolver;
 pub mod target;
 
@@ -13,3 +14,6 @@ mod regalloc;
 
 #[cfg(feature = "arm32")]
 pub mod arm32;
+
+#[cfg(feature = "riscv32")]
+pub mod riscv32;

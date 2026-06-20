@@ -3,6 +3,7 @@
 #[cfg(feature = "gc")]
 use crate::value::Location;
 use crate::value::Value;
+use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
@@ -12,6 +13,54 @@ use alloc::vec::Vec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectRef(u32);
 
+/// The in-heap representation of a `System.String`'s code units, chosen by the string
+/// storage encoding. UTF-16 by default (O(1) indexing, lone surrogates free); the
+/// `string-utf8` feature switches to UTF-8 (~half the size for ASCII text, at O(n) UTF-16
+/// indexing). Either way the [`Heap::as_string`] seam presents .NET UTF-16 semantics. See
+/// `docs/bcl-profiles-and-strings.md` (the surrogate-preserving WTF-8 tier is future).
+#[cfg(not(feature = "string-utf8"))]
+type StrStore = Box<[u16]>;
+#[cfg(feature = "string-utf8")]
+type StrStore = Box<[u8]>;
+
+/// Encodes UTF-16 code units into the backing [`StrStore`] (UTF-16: the units verbatim).
+#[cfg(not(feature = "string-utf8"))]
+fn encode_string(units: &[u16]) -> StrStore {
+    units.into()
+}
+
+/// Encodes UTF-16 code units into UTF-8 bytes; a lone surrogate (unrepresentable in
+/// well-formed UTF-8) re-encodes to U+FFFD -- the well-formed tier's one parity gap.
+#[cfg(feature = "string-utf8")]
+fn encode_string(units: &[u16]) -> StrStore {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 4];
+    for scalar in core::char::decode_utf16(units.iter().copied()) {
+        let scalar = scalar.unwrap_or(core::char::REPLACEMENT_CHARACTER);
+        bytes.extend_from_slice(scalar.encode_utf8(&mut buf).as_bytes());
+    }
+    bytes.into_boxed_slice()
+}
+
+/// Decodes the backing [`StrStore`] to UTF-16 code units, .NET `String` semantics
+/// (UTF-16: borrowed verbatim).
+#[cfg(not(feature = "string-utf8"))]
+pub(crate) fn decode_string(store: &StrStore) -> Cow<'_, [u16]> {
+    Cow::Borrowed(store)
+}
+
+/// Decodes UTF-8 bytes to UTF-16 code units (a supplementary scalar becomes a surrogate
+/// pair, so `String.Length` stays the UTF-16 unit count).
+#[cfg(feature = "string-utf8")]
+pub(crate) fn decode_string(store: &StrStore) -> Cow<'_, [u16]> {
+    let mut units = Vec::new();
+    let mut buf = [0u16; 2];
+    for scalar in core::str::from_utf8(store).unwrap_or("").chars() {
+        units.extend_from_slice(scalar.encode_utf16(&mut buf));
+    }
+    Cow::Owned(units)
+}
+
 /// A heap-allocated object: a `System.String` or an instance of a declared
 /// reference type.
 ///
@@ -20,8 +69,8 @@ pub struct ObjectRef(u32);
 /// fields. (`Eq` is not derived: a field may be a `Float`.)
 #[derive(Debug, Clone, PartialEq)]
 pub enum Object {
-    /// A `System.String`, as its UTF-16 code units.
-    Str(Box<[u16]>),
+    /// A `System.String`, as its encoded code units ([`StrStore`]).
+    Str(StrStore),
     /// An instance of a declared reference type: its type id (an index into the
     /// module's type table) and its instance fields in declaration-order slots.
     Instance {
@@ -62,6 +111,9 @@ pub enum Object {
         /// The bound methods, called in order; the last one's result is the delegate's.
         invocations: Vec<(Value, u32)>,
     },
+    /// A `System.Text.StringBuilder`: a growable buffer of UTF-16 code units. It holds no
+    /// object references, so the collector treats it like a string (nothing to trace).
+    StringBuilder(Vec<u16>),
 }
 
 /// The initial collection threshold (object count) before the live set is known; it
@@ -117,9 +169,10 @@ impl Heap {
         ObjectRef(index)
     }
 
-    /// Interns a UTF-16 string as a `System.String` and returns a reference.
+    /// Interns a UTF-16 string as a `System.String` and returns a reference. The units are
+    /// encoded into the heap's [`StrStore`] (the seam where UTF-8 / WTF-8 storage drops in).
     pub fn alloc_string(&mut self, chars: &[u16]) -> ObjectRef {
-        self.alloc(Object::Str(chars.into()))
+        self.alloc(Object::Str(encode_string(chars)))
     }
 
     /// The object `reference` names, if it is live.
@@ -128,16 +181,18 @@ impl Heap {
         self.objects.get(reference.0 as usize)
     }
 
-    /// The UTF-16 code units of the string at `reference`, if it is a string.
+    /// The UTF-16 code units of the string at `reference`, if it is a string. Borrowed
+    /// under UTF-16 storage; an owned decode under a UTF-8 / WTF-8 store.
     #[must_use]
-    pub fn as_string(&self, reference: ObjectRef) -> Option<&[u16]> {
+    pub fn as_string(&self, reference: ObjectRef) -> Option<Cow<'_, [u16]>> {
         match self.get(reference)? {
-            Object::Str(chars) => Some(chars),
+            Object::Str(store) => Some(decode_string(store)),
             Object::Instance { .. }
             | Object::Array { .. }
             | Object::MdArray { .. }
             | Object::Boxed { .. }
-            | Object::Delegate { .. } => None,
+            | Object::Delegate { .. }
+            | Object::StringBuilder(_) => None,
         }
     }
 
@@ -157,7 +212,8 @@ impl Heap {
             | Object::Array { .. }
             | Object::MdArray { .. }
             | Object::Boxed { .. }
-            | Object::Delegate { .. } => None,
+            | Object::Delegate { .. }
+            | Object::StringBuilder(_) => None,
         }
     }
 
@@ -186,8 +242,16 @@ impl Heap {
             | Object::Array { .. }
             | Object::MdArray { .. }
             | Object::Boxed { .. }
-            | Object::Delegate { .. } => None,
+            | Object::Delegate { .. }
+            | Object::StringBuilder(_) => None,
         }
+    }
+
+    /// Whether the object at `reference` is a heap string -- the basis for supplying
+    /// `System.String` as its runtime type so a `callvirt` reaches String's overrides.
+    #[must_use]
+    pub fn is_string(&self, reference: ObjectRef) -> bool {
+        matches!(self.get(reference), Some(Object::Str(_)))
     }
 
     /// Allocates an array with the given `elements` (already filled with the element
@@ -232,6 +296,28 @@ impl Heap {
     /// Allocates a (multicast) delegate with the given invocation list.
     pub fn alloc_multicast(&mut self, invocations: Vec<(Value, u32)>) -> ObjectRef {
         self.alloc(Object::Delegate { invocations })
+    }
+
+    /// Allocates a `System.Text.StringBuilder` seeded with `initial` code units.
+    pub fn alloc_string_builder(&mut self, initial: Vec<u16>) -> ObjectRef {
+        self.alloc(Object::StringBuilder(initial))
+    }
+
+    /// The code units accumulated in the string builder at `reference`, if it is one.
+    #[must_use]
+    pub fn string_builder_buf(&self, reference: ObjectRef) -> Option<&[u16]> {
+        match self.get(reference)? {
+            Object::StringBuilder(buf) => Some(buf),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the builder buffer at `reference`, if it is one (for `Append`).
+    pub fn string_builder_buf_mut(&mut self, reference: ObjectRef) -> Option<&mut Vec<u16>> {
+        match self.objects.get_mut(reference.0 as usize)? {
+            Object::StringBuilder(buf) => Some(buf),
+            _ => None,
+        }
     }
 
     /// The invocation list of the delegate at `reference`, if it is a delegate.
@@ -285,6 +371,54 @@ impl Heap {
                 }
                 None => false,
             },
+            _ => false,
+        }
+    }
+
+    /// Appends `value` to the array-backed list at `reference` (`ArrayList.Add`), returning
+    /// the new element's index, or `None` if `reference` is not array-backed.
+    pub fn array_push(&mut self, reference: ObjectRef, value: Value) -> Option<usize> {
+        match self.objects.get_mut(reference.0 as usize)? {
+            Object::Array { elements } => {
+                elements.push(value);
+                Some(elements.len() - 1)
+            }
+            _ => None,
+        }
+    }
+
+    /// Removes every element of the list at `reference` (`ArrayList.Clear`). Returns `false`
+    /// if `reference` is not array-backed.
+    pub fn array_clear(&mut self, reference: ObjectRef) -> bool {
+        match self.objects.get_mut(reference.0 as usize) {
+            Some(Object::Array { elements }) => {
+                elements.clear();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Removes the element at `index` of the list at `reference` (`ArrayList.RemoveAt`).
+    /// Returns `false` if not array-backed or `index` is out of range.
+    pub fn array_remove_at(&mut self, reference: ObjectRef, index: usize) -> bool {
+        match self.objects.get_mut(reference.0 as usize) {
+            Some(Object::Array { elements }) if index < elements.len() => {
+                elements.remove(index);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Inserts `value` before `index` of the list at `reference` (`ArrayList.Insert`).
+    /// Returns `false` if not array-backed or `index` is past the end.
+    pub fn array_insert(&mut self, reference: ObjectRef, index: usize, value: Value) -> bool {
+        match self.objects.get_mut(reference.0 as usize) {
+            Some(Object::Array { elements }) if index <= elements.len() => {
+                elements.insert(index, value);
+                true
+            }
             _ => false,
         }
     }
@@ -479,15 +613,25 @@ fn trace(objects: &[Object], live: &mut [bool], work: &mut Vec<usize>) {
     }
 }
 
+/// Visits each heap reference inside a managed-pointer location, recursing through a
+/// nested value-type field address.
+#[cfg(feature = "gc")]
+fn location_refs<F: FnMut(ObjectRef)>(location: &Location, visit: &mut F) {
+    match location {
+        Location::Field { object, .. } | Location::Boxed { object } => visit(*object),
+        Location::Element { array, .. } => visit(*array),
+        Location::Nested { base, .. } => location_refs(base, visit),
+        Location::Local { .. } | Location::Arg { .. } | Location::Static { .. } => {}
+    }
+}
+
 /// Visits each heap reference inside a value -- an object reference, a heap-pointing
 /// byref, or (recursively) a value-type's fields.
 #[cfg(feature = "gc")]
 fn collect_refs<F: FnMut(ObjectRef)>(value: &Value, visit: &mut F) {
     match value {
         Value::Object(reference) => visit(*reference),
-        Value::ByRef(Location::Field { object, .. }) => visit(*object),
-        Value::ByRef(Location::Element { array, .. }) => visit(*array),
-        Value::ByRef(Location::Boxed { object }) => visit(*object),
+        Value::ByRef(location) => location_refs(location, visit),
         Value::Struct(fields) => fields.iter().for_each(|field| collect_refs(field, visit)),
         _ => {}
     }
@@ -504,7 +648,19 @@ fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
         Object::Delegate { invocations } => invocations
             .iter()
             .for_each(|(target, _)| collect_refs(target, visit)),
-        Object::Str(_) => {}
+        Object::Str(_) | Object::StringBuilder(_) => {}
+    }
+}
+
+/// Rewrites each heap reference inside a managed-pointer location, recursing through a
+/// nested value-type field address.
+#[cfg(feature = "gc")]
+fn remap_location(location: &mut Location, remap: &[Option<u32>]) {
+    match location {
+        Location::Field { object, .. } | Location::Boxed { object } => remap_ref(object, remap),
+        Location::Element { array, .. } => remap_ref(array, remap),
+        Location::Nested { base, .. } => remap_location(base, remap),
+        Location::Local { .. } | Location::Arg { .. } | Location::Static { .. } => {}
     }
 }
 
@@ -513,9 +669,7 @@ fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
 fn remap_value(value: &mut Value, remap: &[Option<u32>]) {
     match value {
         Value::Object(reference) => remap_ref(reference, remap),
-        Value::ByRef(Location::Field { object, .. }) => remap_ref(object, remap),
-        Value::ByRef(Location::Element { array, .. }) => remap_ref(array, remap),
-        Value::ByRef(Location::Boxed { object }) => remap_ref(object, remap),
+        Value::ByRef(location) => remap_location(location, remap),
         Value::Struct(fields) => fields.iter_mut().for_each(|f| remap_value(f, remap)),
         _ => {}
     }
@@ -532,7 +686,7 @@ fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
         Object::Delegate { invocations } => invocations
             .iter_mut()
             .for_each(|(target, _)| remap_value(target, remap)),
-        Object::Str(_) => {}
+        Object::Str(_) | Object::StringBuilder(_) => {}
     }
 }
 
@@ -568,7 +722,7 @@ mod gc_tests {
             Value::Object(reference) => reference,
             other => panic!("field not an object: {other:?}"),
         };
-        assert_eq!(heap.as_string(kept), Some(&[b'a' as u16][..]));
+        assert_eq!(heap.as_string(kept).as_deref(), Some(&[b'a' as u16][..]));
     }
 }
 
@@ -582,8 +736,14 @@ mod tests {
         let a = heap.alloc_string(&[b'h' as u16, b'i' as u16]);
         let b = heap.alloc_string(&[b'y' as u16, b'o' as u16]);
         assert_ne!(a, b);
-        assert_eq!(heap.as_string(a), Some(&[b'h' as u16, b'i' as u16][..]));
-        assert_eq!(heap.as_string(b), Some(&[b'y' as u16, b'o' as u16][..]));
+        assert_eq!(
+            heap.as_string(a).as_deref(),
+            Some(&[b'h' as u16, b'i' as u16][..])
+        );
+        assert_eq!(
+            heap.as_string(b).as_deref(),
+            Some(&[b'y' as u16, b'o' as u16][..])
+        );
     }
 
     #[test]

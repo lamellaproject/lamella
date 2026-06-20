@@ -78,6 +78,9 @@ pub struct MethodSymbol {
     pub parameters: Vec<TypeSymbol>,
     /// Whether the method is `static`.
     pub is_static: bool,
+    /// Whether the last parameter is a `params` array (a variable-length trailing
+    /// argument list at the call site).
+    pub is_params: bool,
     /// The method's accessibility.
     pub accessibility: Accessibility,
 }
@@ -104,6 +107,10 @@ pub struct TypeInfo {
     /// The type's instance constructors (each modeled as a method whose
     /// parameters drive `new T(...)` overload resolution).
     pub constructors: Vec<MethodSymbol>,
+    /// For a nested type, the full name of the type it is nested in (e.g. `"Outer"`);
+    /// `None` for a top-level type. Drives the `NestedClass` row and the empty namespace
+    /// on emission.
+    pub enclosing: Option<Box<str>>,
 }
 
 impl TypeInfo {
@@ -120,6 +127,7 @@ impl TypeInfo {
             properties: Vec::new(),
             methods: Vec::new(),
             constructors: Vec::new(),
+            enclosing: None,
         }
     }
 
@@ -201,8 +209,8 @@ impl Model {
             .filter_map(|(key, info)| {
                 info.bases
                     .iter()
-                    .find(|base| self.is_class(base))
-                    .map(|base| (key.clone(), base.clone()))
+                    .find_map(|base| self.resolve_class_base(base))
+                    .map(|base| (key.clone(), base))
             })
             .collect();
         for (key, base) in links {
@@ -215,6 +223,34 @@ impl Model {
     fn is_class(&self, ty: &TypeSymbol) -> bool {
         self.get_by_symbol(ty)
             .is_some_and(|info| info.kind == TypeKind::Class)
+    }
+
+    /// Resolves a written base to the symbol of a class in the model: by exact match,
+    /// else (for an unqualified base such as a `using`-imported `Exception`) by a unique
+    /// simple-name match across namespaces. `None` if it is not a class, or the simple
+    /// name is ambiguous -- base names are not yet resolved through `using` directives,
+    /// so this stands in for that for a BCL base.
+    fn resolve_class_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
+        if self.is_class(base) {
+            return Some(base.clone());
+        }
+        let TypeSymbol::Named(parts) = base else {
+            return None;
+        };
+        if parts.len() != 1 {
+            return None;
+        }
+        let simple = &*parts[0];
+        let mut found: Option<TypeSymbol> = None;
+        for ((namespace, name), info) in &self.types {
+            if &**name == simple && info.kind == TypeKind::Class {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(symbol_from_key(namespace, name));
+            }
+        }
+        found
     }
 
     /// Whether `namespace` is a declared namespace -- some type lives in it or in a
@@ -238,6 +274,39 @@ impl Model {
         }
         table
     }
+
+    /// Every declared type's simple name (with duplicates across namespaces), for
+    /// type-name completion. The caller filters/dedups.
+    pub fn type_names(&self) -> impl Iterator<Item = &str> + '_ {
+        self.types.keys().map(|(_, name)| name.as_ref())
+    }
+
+    /// Marks the type `(namespace, name)` as nested in `enclosing` (its full name).
+    pub fn set_enclosing(&mut self, namespace: &str, name: &str, enclosing: &str) {
+        if let Some(info) = self
+            .types
+            .get_mut(&(String::from(namespace), String::from(name)))
+        {
+            info.enclosing = Some(enclosing.into());
+        }
+    }
+
+    /// The symbol of the model type with the given simple name, when exactly one matches
+    /// (a stand-in for `using`-directive resolution -- used by completion to resolve a
+    /// bare type name like `Console`). `None` if absent or ambiguous.
+    #[must_use]
+    pub fn type_with_simple_name(&self, name: &str) -> Option<TypeSymbol> {
+        let mut found: Option<TypeSymbol> = None;
+        for (namespace, type_name) in self.types.keys() {
+            if &**type_name == name {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(symbol_from_key(namespace, type_name));
+            }
+        }
+        found
+    }
 }
 
 /// Splits a type's dotted name parts into its namespace and simple name.
@@ -255,6 +324,18 @@ fn split_named(parts: &[Box<str>]) -> (String, &str) {
         }
         None => (String::new(), ""),
     }
+}
+
+/// Builds a named-type symbol from a model key (a dotted `namespace` and a simple `name`).
+fn symbol_from_key(namespace: &str, name: &str) -> TypeSymbol {
+    let mut parts: Vec<Box<str>> = Vec::new();
+    if !namespace.is_empty() {
+        for part in namespace.split('.') {
+            parts.push(part.into());
+        }
+    }
+    parts.push(name.into());
+    TypeSymbol::Named(parts.into_boxed_slice())
 }
 
 #[cfg(test)]
@@ -276,6 +357,7 @@ mod tests {
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
             is_static: false,
+            is_params: false,
             accessibility: Accessibility::Public,
         });
         info.methods.push(MethodSymbol {
@@ -283,6 +365,7 @@ mod tests {
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Int32)],
             is_static: false,
+            is_params: false,
             accessibility: Accessibility::Public,
         });
         info.methods.push(MethodSymbol {
@@ -290,6 +373,7 @@ mod tests {
             return_type: TypeSymbol::Special(SpecialType::Void),
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Double)],
             is_static: false,
+            is_params: false,
             accessibility: Accessibility::Public,
         });
         info

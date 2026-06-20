@@ -7,6 +7,7 @@ extern crate alloc;
 
 pub mod bind;
 pub mod bound;
+pub mod complete;
 pub mod conversion;
 pub mod declaration;
 pub mod diagnostic;
@@ -20,6 +21,7 @@ pub mod symbols;
 pub mod types;
 
 pub use bind::bind_type;
+pub use complete::{Completion, CompletionKind, complete};
 pub use bound::{
     Binder, BoundExpr, BoundExprKind, ConversionKind, FieldReference, MethodReference,
     bind_expression,

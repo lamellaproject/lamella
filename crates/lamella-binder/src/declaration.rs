@@ -46,9 +46,15 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 collect_namespace_member(inner_member, &inner, model);
             }
         }
-        NamespaceMember::Type(declaration) => model.insert(type_info(namespace, declaration)),
+        NamespaceMember::Type(declaration) => {
+            model.insert(type_info(namespace, declaration));
+            collect_nested_types(declaration, namespace, model);
+        }
         NamespaceMember::Enum(declaration) => {
             let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Enum);
+            let enum_base = named_symbol("System", "Enum");
+            info.bases.push(enum_base.clone());
+            info.base = Some(enum_base);
             let enum_ty = named_symbol(namespace, &declaration.name);
             let mut next_value: i64 = 0;
             for member in &declaration.members {
@@ -79,10 +85,46 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     .map(|p| bind_type(&p.ty))
                     .collect(),
                 is_static: false,
+                is_params: has_params_array(&declaration.parameters),
                 accessibility: Accessibility::Public,
             });
             model.insert(info);
         }
+    }
+}
+
+/// Collects the class/struct types nested in `declaration`, each keyed under the
+/// enclosing type's full name (so `Outer.Inner` resolves to it) and marked with its
+/// enclosing type (driving the `NestedClass` row + empty namespace at emission). Recurses
+/// for deeper nesting. Nested enums/delegates are a follow-up.
+fn collect_nested_types(declaration: &TypeDecl, namespace: &str, model: &mut Model) {
+    let enclosing_full = qualified_type_name(namespace, &declaration.name);
+    for member in &declaration.members {
+        if let Member::NestedType(nested) = member {
+            collect_namespace_member(nested, &enclosing_full, model);
+            if let Some(name) = nested_member_name(nested) {
+                model.set_enclosing(&enclosing_full, name, &enclosing_full);
+            }
+        }
+    }
+}
+
+/// The simple name of a nested type member (a class/struct/interface/enum/delegate).
+fn nested_member_name(member: &NamespaceMember) -> Option<&str> {
+    match member {
+        NamespaceMember::Type(declaration) => Some(declaration.name.as_ref()),
+        NamespaceMember::Enum(declaration) => Some(declaration.name.as_ref()),
+        NamespaceMember::Delegate(declaration) => Some(declaration.name.as_ref()),
+        NamespaceMember::Namespace(_) => None,
+    }
+}
+
+/// Joins a namespace (possibly empty) and a simple name into a dotted full name.
+fn qualified_type_name(namespace: &str, name: &str) -> alloc::string::String {
+    if namespace.is_empty() {
+        alloc::string::String::from(name)
+    } else {
+        alloc::format!("{namespace}.{name}")
     }
 }
 
@@ -106,6 +148,9 @@ fn enum_member_value(expr: &Expr) -> Option<i64> {
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     let mut info = TypeInfo::new(namespace, &declaration.name, map_kind(declaration.kind));
     info.bases = declaration.bases.iter().map(bind_type).collect();
+    if matches!(declaration.kind, SyntaxTypeKind::Struct) {
+        info.bases.push(named_symbol("System", "ValueType"));
+    }
     let is_interface = matches!(declaration.kind, SyntaxTypeKind::Interface);
     let access = |modifiers: &[Modifier]| {
         if is_interface {
@@ -123,15 +168,21 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 ..
             } => {
                 let field_ty = bind_type(ty);
-                let is_static = is_static(modifiers);
+                let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
+                let is_static = is_static(modifiers) || is_const;
                 let accessibility = access(modifiers);
                 for declarator in declarators {
+                    let constant = if is_const {
+                        declarator.initializer.as_ref().and_then(enum_member_value)
+                    } else {
+                        None
+                    };
                     info.fields.push(FieldSymbol {
                         name: declarator.name.clone(),
                         ty: field_ty.clone(),
                         is_static,
                         accessibility,
-                        constant: None,
+                        constant,
                     });
                 }
             }
@@ -146,7 +197,34 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
                 is_static: is_static(modifiers),
+                is_params: has_params_array(parameters),
                 accessibility: access(modifiers),
+            }),
+            Member::Operator {
+                return_type,
+                operator,
+                parameters,
+                ..
+            } => info.methods.push(MethodSymbol {
+                name: operator.method_name(parameters.len()).into(),
+                return_type: bind_type(return_type),
+                parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
+                is_static: true,
+                is_params: false,
+                accessibility: Accessibility::Public,
+            }),
+            Member::ConversionOperator {
+                direction,
+                target,
+                parameters,
+                ..
+            } => info.methods.push(MethodSymbol {
+                name: direction.method_name().into(),
+                return_type: bind_type(target),
+                parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
+                is_static: true,
+                is_params: false,
+                accessibility: Accessibility::Public,
             }),
             Member::Property {
                 modifiers,
@@ -184,8 +262,16 @@ fn constructor(parameters: &[lamella_syntax::ast::Parameter]) -> MethodSymbol {
         return_type: TypeSymbol::Special(SpecialType::Void),
         parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
         is_static: false,
+        is_params: has_params_array(parameters),
         accessibility: Accessibility::Public,
     }
+}
+
+/// Whether a parameter list ends in a `params` array.
+fn has_params_array(parameters: &[lamella_syntax::ast::Parameter]) -> bool {
+    parameters.last().is_some_and(|parameter| {
+        parameter.modifier == Some(lamella_syntax::ast::ParameterModifier::Params)
+    })
 }
 
 /// A named-type symbol from a namespace and simple name, e.g. `"A.B"` + `Color`

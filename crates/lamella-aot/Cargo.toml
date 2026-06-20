@@ -11,6 +11,7 @@ description = "Lamella's ahead-of-time backend driver: lowers the middle IR to t
 lamella-ir = { path = "../lamella-ir" }
 lamella-cil = { path = "../lamella-cil" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32", optional = true }
+lamella-asm-riscv32 = { path = "../lamella-asm-riscv32", optional = true }
 # The AOT compiler reads an assembly's metadata to resolve call/ldstr tokens (the
 # MetadataResolver); the core IR->native lowering itself stays metadata-free.
 lamella-metadata = { path = "../lamella-metadata" }
@@ -18,6 +19,8 @@ lamella-metadata = { path = "../lamella-metadata" }
 [dev-dependencies]
 # Tests construct metadata tokens directly (e.g. a mock field-offset resolver).
 lamella-token = { path = "../lamella-token" }
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+lamella-usbhid = { path = "../lamella-usbhid" }
 
 [features]
 default = ["arm32"]
@@ -25,6 +28,14 @@ default = ["arm32"]
 # the code generators it needs -- an ARM32 device never builds the RISC-V or WASM
 # paths, and vice versa.
 arm32 = ["dep:lamella-asm-arm32"]
+riscv32 = ["dep:lamella-asm-riscv32"]
+# String storage encoding (runtime's seam): UTF-16 by default. These switch the AOT string blob
+# and the op_Equality compare to UTF-8 (drops lone-surrogate parity) or surrogate-preserving
+# WTF-8. String.Length stays the UTF-16 unit count in all three. Mutually exclusive in intent;
+# string-utf8-wtf8 wins if both are set.
+string-utf16 = []
+string-utf8 = []
+string-utf8-wtf8 = []
 
 [lints]
 workspace = true

@@ -5,13 +5,14 @@ use crate::expr::{EmitError, emit_expression, emit_local, ldelem_opcode};
 use crate::frame::{Frame, Slot};
 use crate::tokens::Tokens;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use lamella_binder::{
     BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, BoundSwitchLabel, SpecialType,
     TypeSymbol, always_exits,
 };
 use lamella_cil::{EhClause, EhKind, Instruction, InstructionRange, Opcode, Operand};
-use lamella_syntax::ast::{AssignmentOperator, PostfixOperator, UnaryOperator};
+use lamella_syntax::ast::{AssignmentOperator, BinaryOperator, PostfixOperator, UnaryOperator};
 use lamella_syntax::span::Span;
 use lamella_token::Token;
 
@@ -63,12 +64,36 @@ struct Labels {
     points: Vec<SequencePoint>,
     handlers: Vec<EhClause>,
     epilogue: Option<Epilogue>,
+    /// Source label names mapped to label ids, so a forward `goto` and its labeled
+    /// statement share one id whichever is emitted first.
+    named: BTreeMap<Box<str>, usize>,
+    /// The enclosing `switch` statements (innermost last), so `goto case`/`goto default`
+    /// can branch to a sibling section's label.
+    switches: Vec<SwitchContext>,
+}
+
+/// A `switch` being emitted: each case value's section label (integral and string),
+/// and the default's, so a `goto case`/`goto default` in any section can branch to it.
+struct SwitchContext {
+    cases: Vec<(i64, usize)>,
+    string_cases: Vec<(Box<[u16]>, usize)>,
+    default: Option<usize>,
 }
 
 impl Labels {
     fn label(&mut self) -> usize {
         self.positions.push(None);
         self.positions.len() - 1
+    }
+
+    /// The label id for a source label `name`, allocated on first reference.
+    fn named_label(&mut self, name: &str) -> usize {
+        if let Some(&id) = self.named.get(name) {
+            return id;
+        }
+        let id = self.label();
+        self.named.insert(name.into(), id);
+        id
     }
 
     fn place(&mut self, label: usize, out: &[Instruction]) {
@@ -155,7 +180,7 @@ pub fn emit_method(
     parameters: &[Box<str>],
     body: &BoundStmt,
 ) -> Result<Vec<Instruction>, EmitError> {
-    let mut frame = Frame::build(parameters, body, 0);
+    let mut frame = Frame::build(parameters, &[], body, 0);
     Ok(lower(
         &mut frame,
         &Tokens::new(),
@@ -166,23 +191,35 @@ pub fn emit_method(
     .0)
 }
 
+/// A constructor's prologue: `ldarg.0; <arguments>; call ctor`. Models both the implicit
+/// parameterless base call (empty `arguments`) and an explicit `this(args)`/`base(args)`
+/// chain.
+pub struct ConstructorPrologue {
+    /// The target `.ctor` token (a sibling, the base, or System.Object's).
+    pub ctor: Token,
+    /// The bound chain arguments, in order.
+    pub arguments: Vec<BoundExpr>,
+}
+
 /// Lowers a method body and reports its local types (for the local signature) and
 /// sequence points (for debug info). `tokens` resolves members; `arg_base` is 1 for
 /// an instance method (argument 0 is `this`), else 0; `return_type` is the method's
-/// return type, for the epilogue a `try` needs.
+/// return type, for the epilogue a `try` needs. `prologue` is the constructor chain
+/// call, if any.
 pub fn emit_body(
     parameters: &[Box<str>],
+    byref_params: &[(Box<str>, TypeSymbol)],
     body: &BoundStmt,
     tokens: &Tokens,
     arg_base: u16,
     return_type: &TypeSymbol,
-    base_ctor: Option<Token>,
+    prologue: Option<&ConstructorPrologue>,
 ) -> Result<EmittedBody, EmitError> {
-    let mut frame = Frame::build(parameters, body, arg_base);
-    let lowered = lower(&mut frame, tokens, body, return_type, base_ctor)?;
+    let mut frame = Frame::build(parameters, byref_params, body, arg_base);
+    let lowered = lower(&mut frame, tokens, body, return_type, prologue)?;
     Ok(EmittedBody {
         code: lowered.0,
-        local_types: frame.local_types().to_vec(),
+        local_types: frame.local_types(),
         local_names: frame.local_names(),
         sequence_points: lowered.1,
         handlers: lowered.2,
@@ -198,7 +235,7 @@ fn lower(
     tokens: &Tokens,
     body: &BoundStmt,
     return_type: &TypeSymbol,
-    base_ctor: Option<Token>,
+    prologue: Option<&ConstructorPrologue>,
 ) -> Result<Lowered, EmitError> {
     let mut labels = Labels::default();
     if contains_try(body) {
@@ -212,9 +249,12 @@ fn lower(
     }
 
     let mut out = Vec::new();
-    if let Some(base_ctor) = base_ctor {
+    if let Some(prologue) = prologue {
         out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
-        out.push(Instruction::new(Opcode::Call, Operand::Token(base_ctor)));
+        for argument in &prologue.arguments {
+            emit_expression(argument, frame, tokens, &mut out)?;
+        }
+        out.push(Instruction::new(Opcode::Call, Operand::Token(prologue.ctor)));
     }
     emit_statement(body, frame, tokens, &mut labels, &mut out)?;
 
@@ -447,12 +487,41 @@ fn emit_statement(
                             out.push(Instruction::simple(Opcode::Ceq));
                             labels.branch(Opcode::Brtrue, section_labels[index], out);
                         }
+                        BoundSwitchLabel::CaseString(text) => {
+                            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(temp)));
+                            let token = tokens.string(text).ok_or(EmitError::Unsupported(
+                                "a switch case string was not minted",
+                            ))?;
+                            out.push(Instruction::new(Opcode::Ldstr, Operand::Token(token)));
+                            crate::expr::emit_string_equality(false, tokens, out)?;
+                            labels.branch(Opcode::Brtrue, section_labels[index], out);
+                        }
                         BoundSwitchLabel::Default => default_label = Some(section_labels[index]),
                     }
                 }
             }
             labels.branch(Opcode::Br, default_label.unwrap_or(end), out);
 
+            let mut switch_cases: Vec<(i64, usize)> = Vec::new();
+            let mut switch_string_cases: Vec<(Box<[u16]>, usize)> = Vec::new();
+            for (index, section) in sections.iter().enumerate() {
+                for label in &section.labels {
+                    match label {
+                        BoundSwitchLabel::Case(value) => {
+                            switch_cases.push((*value, section_labels[index]));
+                        }
+                        BoundSwitchLabel::CaseString(text) => {
+                            switch_string_cases.push((text.clone(), section_labels[index]));
+                        }
+                        BoundSwitchLabel::Default => {}
+                    }
+                }
+            }
+            labels.switches.push(SwitchContext {
+                cases: switch_cases,
+                string_cases: switch_string_cases,
+                default: default_label,
+            });
             labels.loops.push(LoopContext {
                 continue_label: end,
                 break_label: end,
@@ -465,6 +534,7 @@ fn emit_statement(
                 }
             }
             labels.loops.pop();
+            labels.switches.pop();
             labels.place(end, out);
         }
         BoundStmtKind::ForEach {
@@ -520,6 +590,57 @@ fn emit_statement(
             labels.branch(Opcode::Br, test, out);
             labels.place(end, out);
         }
+        BoundStmtKind::Labeled { label, body } => {
+            let id = labels.named_label(label);
+            labels.place(id, out);
+            emit_statement(body, frame, tokens, labels, out)?;
+        }
+        BoundStmtKind::Goto(label) => {
+            let id = labels.named_label(label);
+            labels.branch(Opcode::Br, id, out);
+        }
+        BoundStmtKind::GotoCase(value) => {
+            let target = labels.switches.last().and_then(|switch| {
+                switch
+                    .cases
+                    .iter()
+                    .find(|(case, _)| case == value)
+                    .map(|(_, label)| *label)
+            });
+            match target {
+                Some(label) => labels.branch(Opcode::Br, label, out),
+                None => {
+                    return Err(EmitError::Unsupported(
+                        "goto case with no matching case in the enclosing switch",
+                    ));
+                }
+            }
+        }
+        BoundStmtKind::GotoCaseString(text) => {
+            let target = labels.switches.last().and_then(|switch| {
+                switch
+                    .string_cases
+                    .iter()
+                    .find(|(case, _)| case == text)
+                    .map(|(_, label)| *label)
+            });
+            match target {
+                Some(label) => labels.branch(Opcode::Br, label, out),
+                None => {
+                    return Err(EmitError::Unsupported(
+                        "goto case with no matching string case in the enclosing switch",
+                    ));
+                }
+            }
+        }
+        BoundStmtKind::GotoDefault => match labels.switches.last().and_then(|s| s.default) {
+            Some(label) => labels.branch(Opcode::Br, label, out),
+            None => {
+                return Err(EmitError::Unsupported(
+                    "goto default with no default section in the enclosing switch",
+                ));
+            }
+        },
         _ => {
             return Err(EmitError::Unsupported(
                 "this statement form is not lowered yet",
@@ -703,6 +824,12 @@ fn emit_statement_expression(
             value,
         } => {
             if let BoundExprKind::Local(name) = &target.kind {
+                if let Some((slot, element)) = frame.byref(name) {
+                    out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+                    emit_expression(value, frame, tokens, out)?;
+                    crate::expr::emit_byref_store(element, tokens, out)?;
+                    return Ok(());
+                }
                 emit_expression(value, frame, tokens, out)?;
                 return store_to(frame, name, out);
             }
@@ -724,24 +851,49 @@ fn emit_statement_expression(
                     &target.ty, receiver, indices, value, frame, tokens, out,
                 );
             }
-            if let BoundExprKind::PropertyAccess { receiver, name } = &target.kind {
+            if let BoundExprKind::PropertyAccess {
+                receiver,
+                declaring_type,
+                name,
+            } = &target.kind
+            {
                 return crate::expr::emit_property_store(
-                    &target.ty, receiver, name, value, frame, tokens, out,
+                    &target.ty,
+                    receiver,
+                    declaring_type,
+                    name,
+                    value,
+                    frame,
+                    tokens,
+                    out,
                 );
             }
         }
-        BoundExprKind::Postfix { operator, operand } => {
-            if let BoundExprKind::Local(name) = &operand.kind {
-                return emit_step(frame, name, *operator == PostfixOperator::Increment, out);
+        BoundExprKind::Assignment {
+            operator,
+            target,
+            value,
+        } => {
+            if let Some(binary) = compound_binary_operator(*operator) {
+                return emit_compound(target, binary, Some(value), frame, tokens, out);
             }
+        }
+        BoundExprKind::Postfix { operator, operand } => {
+            let increment = *operator == PostfixOperator::Increment;
+            if try_user_step(operand, increment, frame, tokens, out)? {
+                return Ok(());
+            }
+            return emit_compound(operand, step_operator(increment), None, frame, tokens, out);
         }
         BoundExprKind::Unary {
             operator: operator @ (UnaryOperator::PreIncrement | UnaryOperator::PreDecrement),
             operand,
         } => {
-            if let BoundExprKind::Local(name) = &operand.kind {
-                return emit_step(frame, name, *operator == UnaryOperator::PreIncrement, out);
+            let increment = *operator == UnaryOperator::PreIncrement;
+            if try_user_step(operand, increment, frame, tokens, out)? {
+                return Ok(());
             }
+            return emit_compound(operand, step_operator(increment), None, frame, tokens, out);
         }
         _ => {}
     }
@@ -752,21 +904,200 @@ fn emit_statement_expression(
     Ok(())
 }
 
-/// Increments or decrements a local in place: load, +/- 1, store.
-fn emit_step(
-    frame: &Frame,
-    name: &str,
+/// The binary operator of `++` (Add) or `--` (Subtract).
+fn step_operator(increment: bool) -> BinaryOperator {
+    if increment {
+        BinaryOperator::Add
+    } else {
+        BinaryOperator::Subtract
+    }
+}
+
+/// Emits a user-defined `++`/`--` (op_Increment/op_Decrement) on a local operand as a
+/// statement: read the local, call the operator, store the result back. Returns `false`
+/// when the operand has no such operator (a numeric `++`/`--`, handled by the implicit-`1`
+/// read-modify-write instead).
+fn try_user_step(
+    operand: &BoundExpr,
     increment: bool,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<bool, EmitError> {
+    let name = if increment { "op_Increment" } else { "op_Decrement" };
+    let Some(token) = tokens.method(&operand.ty, name, core::slice::from_ref(&operand.ty)) else {
+        return Ok(false);
+    };
+    let BoundExprKind::Local(local) = &operand.kind else {
+        return Err(EmitError::Unsupported(
+            "user-defined ++/-- of a non-local is not lowered yet",
+        ));
+    };
+    crate::expr::emit_local(local, frame, tokens, out)?;
+    out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+    store_to(frame, local, out)?;
+    Ok(true)
+}
+
+/// Emits a read-modify-write to `target` (an `op=` or, with `rhs` = `None`, a `++`/`--`):
+/// read the target, combine it with the right-hand value via `binary`, and store it
+/// back. The receiver/index is evaluated once. Lowers to 1st-edition CIL only.
+fn emit_compound(
+    target: &BoundExpr,
+    binary: BinaryOperator,
+    rhs: Option<&BoundExpr>,
+    frame: &Frame,
+    tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
-    emit_local(name, frame, out)?;
+    match &target.kind {
+        BoundExprKind::Local(name) => {
+            if let Some((slot, element)) = frame.byref(name) {
+                out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+                emit_local(name, frame, tokens, out)?;
+                emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+                crate::expr::emit_byref_store(element, tokens, out)?;
+                return Ok(());
+            }
+            emit_local(name, frame, tokens, out)?;
+            emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+            store_to(frame, name, out)
+        }
+        BoundExprKind::FieldAccess {
+            receiver,
+            field: Some(field),
+            ..
+        } => {
+            let token = tokens
+                .field(&field.declaring_type, &field.name)
+                .ok_or(EmitError::Unsupported("field outside this module"))?;
+            if field.is_static {
+                out.push(Instruction::new(Opcode::Ldsfld, Operand::Token(token)));
+                emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+                out.push(Instruction::new(Opcode::Stsfld, Operand::Token(token)));
+            } else {
+                crate::expr::emit_field_receiver(field, receiver, frame, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Ldfld, Operand::Token(token)));
+                emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+                out.push(Instruction::new(Opcode::Stfld, Operand::Token(token)));
+            }
+            Ok(())
+        }
+        BoundExprKind::PropertyAccess {
+            receiver,
+            declaring_type,
+            name,
+        } => {
+            if tokens.is_struct(&receiver.ty) || tokens.is_enum(&receiver.ty) {
+                return Err(EmitError::Unsupported(
+                    "compound assignment to a value-type property",
+                ));
+            }
+            let is_static = matches!(receiver.kind, BoundExprKind::TypeReference(_));
+            let getter = tokens
+                .method(declaring_type, &crate::expr::accessor_name("get_", name), &[])
+                .ok_or(EmitError::Unsupported("property getter outside this module"))?;
+            let setter = tokens
+                .method(
+                    declaring_type,
+                    &crate::expr::accessor_name("set_", name),
+                    core::slice::from_ref(&target.ty),
+                )
+                .ok_or(EmitError::Unsupported("property setter outside this module"))?;
+            let opcode = if is_static {
+                Opcode::Call
+            } else {
+                Opcode::Callvirt
+            };
+            if !is_static {
+                emit_expression(receiver, frame, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Dup));
+            }
+            out.push(Instruction::new(opcode, Operand::Token(getter)));
+            emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+            out.push(Instruction::new(opcode, Operand::Token(setter)));
+            Ok(())
+        }
+        BoundExprKind::ElementAccess { receiver, indices } if indices.len() == 1 => {
+            emit_expression(receiver, frame, tokens, out)?;
+            let array = frame.reserve_local(&receiver.ty);
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(array)));
+            emit_expression(&indices[0], frame, tokens, out)?;
+            let index = frame.reserve_local(&TypeSymbol::Special(SpecialType::Int32));
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(index)));
+            let load = crate::expr::ldelem_opcode(&target.ty)?;
+            let store = crate::expr::stelem_opcode(&target.ty)?;
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
+            out.push(Instruction::simple(load));
+            emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+            out.push(Instruction::simple(store));
+            Ok(())
+        }
+        _ => Err(EmitError::Unsupported("compound assignment to this target")),
+    }
+}
+
+/// Pushes the right-hand value (the `op=` value, or the implicit `1` of `++`/`--` in the
+/// target's type) and applies `binary` -- string `+` is `String.Concat`, not `add`.
+fn emit_combine(
+    binary: BinaryOperator,
+    operand_ty: &TypeSymbol,
+    rhs: Option<&BoundExpr>,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    match rhs {
+        Some(value) => emit_expression(value, frame, tokens, out)?,
+        None => push_one(operand_ty, out),
+    }
+    if binary == BinaryOperator::Add
+        && matches!(operand_ty, TypeSymbol::Special(SpecialType::String))
+    {
+        let string = TypeSymbol::Special(SpecialType::String);
+        let token = tokens
+            .method(&string, "Concat", &[string.clone(), string.clone()])
+            .ok_or(EmitError::Unsupported("String.Concat was not minted"))?;
+        out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+        return Ok(());
+    }
+    crate::expr::emit_binary(binary, operand_ty, false, out)
+}
+
+/// Pushes the constant `1` in `ty` (the step of `++`/`--`): `ldc.i4.1`, widened for a
+/// 64-bit target.
+fn push_one(ty: &TypeSymbol, out: &mut Vec<Instruction>) {
     out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
-    out.push(Instruction::simple(if increment {
-        Opcode::Add
-    } else {
-        Opcode::Sub
-    }));
-    store_to(frame, name, out)
+    if matches!(
+        ty,
+        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
+    ) {
+        out.push(Instruction::simple(Opcode::ConvI8));
+    }
+}
+
+/// The binary operator a compound assignment (`op=`) applies, or `None` for simple
+/// `=` (which the dedicated branch handles).
+fn compound_binary_operator(operator: AssignmentOperator) -> Option<BinaryOperator> {
+    use AssignmentOperator as A;
+    use BinaryOperator as B;
+    Some(match operator {
+        A::Assign => return None,
+        A::Add => B::Add,
+        A::Subtract => B::Subtract,
+        A::Multiply => B::Multiply,
+        A::Divide => B::Divide,
+        A::Modulo => B::Modulo,
+        A::And => B::BitwiseAnd,
+        A::Or => B::BitwiseOr,
+        A::Xor => B::BitwiseXor,
+        A::LeftShift => B::LeftShift,
+        A::RightShift => B::RightShift,
+    })
 }
 
 fn store_to(frame: &Frame, name: &str, out: &mut Vec<Instruction>) -> Result<(), EmitError> {
@@ -848,7 +1179,7 @@ mod tests {
         let body = parse_statement("{ int x = 1; return x; }").statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &body);
         let emitted =
-            emit_body(&[], &bound, &Tokens::new(), 0, &int(), None).expect("should lower");
+            emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None).expect("should lower");
 
         let offsets: Vec<u32> = emitted
             .sequence_points

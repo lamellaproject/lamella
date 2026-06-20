@@ -68,6 +68,14 @@ pub enum ExprKind {
         /// The operand it applies to.
         operand: Box<Expr>,
     },
+    /// A `ref`/`out` argument (17.5.1): the address of a variable, passed to a byref
+    /// parameter. `out` additionally means the callee assigns the variable.
+    RefArgument {
+        /// `true` for `out`, `false` for `ref`.
+        out: bool,
+        /// The variable whose address is passed.
+        operand: Box<Expr>,
+    },
     /// A postfix `++` or `--` (14.5.9).
     PostfixUnary {
         /// Whether the operator increments or decrements.
@@ -787,6 +795,18 @@ pub enum ConversionDirection {
     Explicit,
 }
 
+impl ConversionDirection {
+    /// The metadata method name of a user-defined conversion (II.10.3.3): `op_Implicit`
+    /// or `op_Explicit`.
+    #[must_use]
+    pub fn method_name(self) -> &'static str {
+        match self {
+            ConversionDirection::Implicit => "op_Implicit",
+            ConversionDirection::Explicit => "op_Explicit",
+        }
+    }
+}
+
 /// An operator that may be overloaded by an [`Member::Operator`] (17.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverloadableOperator {
@@ -834,6 +854,41 @@ pub enum OverloadableOperator {
     GreaterThanOrEqual,
     /// `<=`.
     LessThanOrEqual,
+}
+
+impl OverloadableOperator {
+    /// The metadata method name of a user-defined operator (II.10.3.1/2): `op_Addition`,
+    /// etc. `+`/`-` are the unary forms with one parameter, the binary forms with two.
+    #[must_use]
+    pub fn method_name(self, param_count: usize) -> &'static str {
+        use OverloadableOperator as O;
+        match self {
+            O::Plus if param_count == 1 => "op_UnaryPlus",
+            O::Plus => "op_Addition",
+            O::Minus if param_count == 1 => "op_UnaryNegation",
+            O::Minus => "op_Subtraction",
+            O::LogicalNot => "op_LogicalNot",
+            O::BitwiseNot => "op_OnesComplement",
+            O::Increment => "op_Increment",
+            O::Decrement => "op_Decrement",
+            O::True => "op_True",
+            O::False => "op_False",
+            O::Multiply => "op_Multiply",
+            O::Divide => "op_Division",
+            O::Remainder => "op_Modulus",
+            O::BitwiseAnd => "op_BitwiseAnd",
+            O::BitwiseOr => "op_BitwiseOr",
+            O::ExclusiveOr => "op_ExclusiveOr",
+            O::LeftShift => "op_LeftShift",
+            O::RightShift => "op_RightShift",
+            O::Equality => "op_Equality",
+            O::Inequality => "op_Inequality",
+            O::GreaterThan => "op_GreaterThan",
+            O::LessThan => "op_LessThan",
+            O::GreaterThanOrEqual => "op_GreaterThanOrEqual",
+            O::LessThanOrEqual => "op_LessThanOrEqual",
+        }
+    }
 }
 
 /// A constructor initializer (17.10.1): `: base(args)` or `: this(args)`.
@@ -986,6 +1041,21 @@ pub enum UnaryOperator {
     PreDecrement,
 }
 
+impl UnaryOperator {
+    /// The user-defined operator method this unary operator resolves to (II.10.3.2),
+    /// or `None` for `++`/`--` (which need lvalue handling) and other non-overloadables.
+    #[must_use]
+    pub fn overload_method_name(self) -> Option<&'static str> {
+        Some(match self {
+            UnaryOperator::Plus => "op_UnaryPlus",
+            UnaryOperator::Minus => "op_UnaryNegation",
+            UnaryOperator::Not => "op_LogicalNot",
+            UnaryOperator::Complement => "op_OnesComplement",
+            UnaryOperator::PreIncrement | UnaryOperator::PreDecrement => return None,
+        })
+    }
+}
+
 /// A postfix unary operator (14.5.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PostfixOperator {
@@ -1034,6 +1104,34 @@ pub enum BinaryOperator {
     LogicalAnd,
     /// `||`.
     LogicalOr,
+}
+
+impl BinaryOperator {
+    /// The user-defined operator method this binary operator resolves to (II.10.3.1),
+    /// or `None` for `&&`/`||`, which are not directly overloadable.
+    #[must_use]
+    pub fn overload_method_name(self) -> Option<&'static str> {
+        use BinaryOperator as B;
+        Some(match self {
+            B::Multiply => "op_Multiply",
+            B::Divide => "op_Division",
+            B::Modulo => "op_Modulus",
+            B::Add => "op_Addition",
+            B::Subtract => "op_Subtraction",
+            B::LeftShift => "op_LeftShift",
+            B::RightShift => "op_RightShift",
+            B::LessThan => "op_LessThan",
+            B::GreaterThan => "op_GreaterThan",
+            B::LessThanOrEqual => "op_LessThanOrEqual",
+            B::GreaterThanOrEqual => "op_GreaterThanOrEqual",
+            B::Equal => "op_Equality",
+            B::NotEqual => "op_Inequality",
+            B::BitwiseAnd => "op_BitwiseAnd",
+            B::BitwiseXor => "op_ExclusiveOr",
+            B::BitwiseOr => "op_BitwiseOr",
+            B::LogicalAnd | B::LogicalOr => return None,
+        })
+    }
 }
 
 /// An assignment operator, simple or compound (14.14).

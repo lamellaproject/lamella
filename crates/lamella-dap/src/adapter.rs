@@ -507,13 +507,14 @@ mod tests {
 
     fn add_program() -> (Module, u32) {
         let mut module = Module::new();
-        let write_line = module.add_intrinsic(lamella_ves::intrinsics::console_write_line, 1);
+        let write_line = module.add_intrinsic(0, lamella_ves::intrinsics::console_write_line, 1);
         let write_line_token = Token(0x0A00_0001);
-        module.bind_token(write_line_token, write_line);
+        module.bind_token(0, write_line_token, write_line);
         let hi: Vec<u16> = "hi".encode_utf16().collect();
         let string_token = Token(0x7000_0001);
-        module.bind_string(string_token, &hi);
+        module.bind_string(0, string_token, &hi);
         let main = module.add_method(
+            0,
             body(vec![
                 Instruction::new(Opcode::Ldstr, Operand::Token(string_token)),
                 Instruction::new(Opcode::Call, Operand::Token(write_line_token)),
@@ -621,6 +622,7 @@ mod tests {
     fn call_program() -> (Module, u32) {
         let mut module = Module::new();
         let add = module.add_method(
+            0,
             body(vec![
                 Instruction::simple(Opcode::Ldarg0),
                 Instruction::simple(Opcode::Ldarg1),
@@ -630,8 +632,9 @@ mod tests {
             2,
         );
         let add_token = Token(0x0600_0002);
-        module.bind_token(add_token, add);
+        module.bind_token(0, add_token, add);
         let main = module.add_method(
+            0,
             body(vec![
                 Instruction::simple(Opcode::LdcI42),
                 Instruction::simple(Opcode::LdcI43),

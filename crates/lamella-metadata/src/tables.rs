@@ -87,6 +87,10 @@ pub mod table {
     pub const LOCAL_CONSTANT: u8 = 0x34;
     /// `ImportScope` (the `using` scope a `LocalScope` sits in).
     pub const IMPORT_SCOPE: u8 = 0x35;
+    /// `StateMachineMethod` (maps a kickoff method to its moved-next method).
+    pub const STATE_MACHINE_METHOD: u8 = 0x36;
+    /// `CustomDebugInformation` (arbitrary per-entity debug blobs; csc emits these).
+    pub const CUSTOM_DEBUG_INFORMATION: u8 = 0x37;
 }
 
 /// An error parsing the tables-stream header.

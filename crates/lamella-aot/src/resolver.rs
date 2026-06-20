@@ -6,9 +6,15 @@ use alloc::vec::Vec;
 
 use lamella_cil::Operand;
 use lamella_ir::{Function, MirType, TypeHandle};
-use lamella_metadata::{Assembly, Method, MethodKind, ResolvedMethod, SigType, TargetLayout};
+use lamella_metadata::tables::table;
+use lamella_metadata::{
+    Assembly, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef,
+};
 
-use crate::cil::{CallInfo, CallResolver, CallTarget, CilError, Intrinsic, lower_method_typed};
+use crate::cil::{
+    ArrayElement, CallInfo, CallResolver, CallTarget, CilError, Intrinsic, ReferenceLayout,
+    lower_method_typed,
+};
 
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
 pub struct MetadataResolver<'a> {
@@ -58,6 +64,16 @@ impl<'a> MetadataResolver<'a> {
                 .map(|&(_, index)| index)
         }
     }
+
+    /// The `TypeDef` a `newobj` constructs, from its constructor token: the constructor's
+    /// declaring type, found by name. Shared by the value-type and reference-type resolutions.
+    fn newobj_type_def(&self, operand: &Operand) -> Option<TypeDef<'a>> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
+        self.assembly.find_type(declaring.namespace, declaring.name)
+    }
 }
 
 impl CallResolver for MetadataResolver<'_> {
@@ -86,6 +102,12 @@ impl CallResolver for MetadataResolver<'_> {
             MethodKind::Reference if is_console_writeline_int(&method) => {
                 CallTarget::Intrinsic(Intrinsic::ConsoleWriteLineInt)
             }
+            MethodKind::Reference if is_string_op_equality(&method) => {
+                CallTarget::Intrinsic(Intrinsic::StringEquals)
+            }
+            MethodKind::Reference if is_object_ctor(&method) => {
+                CallTarget::Intrinsic(Intrinsic::ObjectCtor)
+            }
             MethodKind::Reference => return None,
         };
         Some(CallInfo {
@@ -111,6 +133,14 @@ impl CallResolver for MetadataResolver<'_> {
         self.assembly.field_offset(*token, &TargetLayout::ilp32())
     }
 
+    fn field_type(&self, operand: &Operand) -> Option<MirType> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let signature = self.assembly.field_signature(*token)?;
+        mir_type(&signature, self.assembly, &TargetLayout::ilp32())
+    }
+
     fn value_type_size(&self, operand: &Operand) -> Option<u32> {
         let Operand::Token(token) = operand else {
             return None;
@@ -122,13 +152,10 @@ impl CallResolver for MetadataResolver<'_> {
     }
 
     fn newobj_value_type(&self, operand: &Operand) -> Option<MirType> {
-        let Operand::Token(token) = operand else {
+        let type_def = self.newobj_type_def(operand)?;
+        if !type_def.is_value_type() {
             return None;
-        };
-        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
-        let type_def = self
-            .assembly
-            .find_type(declaring.namespace, declaring.name)?;
+        }
         let layout = self
             .assembly
             .value_type_layout(type_def.token(), &TargetLayout::ilp32())
@@ -136,6 +163,89 @@ impl CallResolver for MetadataResolver<'_> {
         Some(MirType::ValueType {
             handle: TypeHandle(type_def.token().0),
             size: layout.size,
+        })
+    }
+
+    fn newobj_reference_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
+        let type_def = self.newobj_type_def(operand)?;
+        if type_def.is_value_type() {
+            return None;
+        }
+        let layout = self
+            .assembly
+            .value_type_layout(type_def.token(), &TargetLayout::ilp32())
+            .ok()?;
+        Some(ReferenceLayout {
+            handle: TypeHandle(type_def.token().0),
+            size: layout.size,
+            reference_offsets: layout.reference_offsets,
+        })
+    }
+
+    fn array_element(&self, operand: &Operand) -> Option<ArrayElement> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let by_layout = || {
+            self.assembly
+                .value_type_layout(*token, &TargetLayout::ilp32())
+                .map(|layout| layout.size)
+                .unwrap_or(4)
+        };
+        let element_size = match self.assembly.type_token_name(*token) {
+            Some(name) if name.namespace == "System" => match name.name {
+                "Boolean" | "SByte" | "Byte" => 1,
+                "Int16" | "UInt16" | "Char" => 2,
+                "Int32" | "UInt32" | "Single" => 4,
+                "Int64" | "UInt64" | "Double" => 8,
+                _ => by_layout(),
+            },
+            _ => by_layout(),
+        };
+        Some(ArrayElement {
+            handle: TypeHandle(token.0),
+            element_size,
+        })
+    }
+
+    fn static_field_offset(&self, operand: &Operand) -> Option<u32> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        (token.table() == table::FIELD).then(|| (token.row() - 1) * 4)
+    }
+
+    fn boxed_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let handle = TypeHandle(token.0);
+        if let Some(name) = self.assembly.type_token_name(*token) {
+            if name.namespace == "System" {
+                let size = match name.name {
+                    "Boolean" | "SByte" | "Byte" => Some(1),
+                    "Int16" | "UInt16" | "Char" => Some(2),
+                    "Int32" | "UInt32" | "Single" => Some(4),
+                    "Int64" | "UInt64" | "Double" => Some(8),
+                    _ => None,
+                };
+                if let Some(size) = size {
+                    return Some(ReferenceLayout {
+                        handle,
+                        size,
+                        reference_offsets: Vec::new(),
+                    });
+                }
+            }
+        }
+        let layout = self
+            .assembly
+            .value_type_layout(*token, &TargetLayout::ilp32())
+            .ok()?;
+        Some(ReferenceLayout {
+            handle,
+            size: layout.size,
+            reference_offsets: layout.reference_offsets,
         })
     }
 }
@@ -157,6 +267,7 @@ fn mir_type(sig: &SigType, assembly: &Assembly, target: &TargetLayout) -> Option
         SigType::R8 => MirType::F64,
         SigType::IntPtr | SigType::UIntPtr => MirType::NativeInt,
         SigType::Class(_) | SigType::Object | SigType::String => MirType::ObjectRef,
+        SigType::SzArray(_) | SigType::Array { .. } => MirType::ObjectRef,
         SigType::ValueType(token) => MirType::ValueType {
             handle: TypeHandle(token.0),
             size: assembly.value_type_layout(*token, target).ok()?.size,
@@ -228,6 +339,29 @@ fn is_console_writeline_int(method: &ResolvedMethod) -> bool {
             .signature
             .as_ref()
             .is_some_and(|sig| matches!(sig.parameters.as_slice(), [SigType::I4]))
+}
+
+/// Whether a resolved method is `System.Object::.ctor()` -- the base constructor a derived
+/// constructor chains to, which the lowering treats as a no-op.
+fn is_object_ctor(method: &ResolvedMethod) -> bool {
+    method.name == Some(".ctor")
+        && method
+            .declaring_type
+            .is_some_and(|t| t.namespace == "System" && t.name == "Object")
+}
+
+/// Whether a resolved method is `System.String::op_Equality(string, string)` (the `==` operator).
+fn is_string_op_equality(method: &ResolvedMethod) -> bool {
+    method.name == Some("op_Equality")
+        && method
+            .declaring_type
+            .is_some_and(|t| t.namespace == "System" && t.name == "String")
+        && method.signature.as_ref().is_some_and(|sig| {
+            matches!(
+                sig.parameters.as_slice(),
+                [SigType::String, SigType::String]
+            )
+        })
 }
 
 /// Decodes a `#US` entry (UTF-16 code units plus a trailing flag byte) to a [`String`].

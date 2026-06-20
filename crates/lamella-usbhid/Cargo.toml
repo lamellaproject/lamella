@@ -5,7 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Cross-platform USB-HID transport (macOS, Linux, Windows) for CMSIS-DAP debug probes, implemented against each OS's native HID API with no external crates."
+description = "Cross-platform USB-HID transport (macOS, Linux, Windows) for CMSIS-DAP debug probes: native IOKit on macOS, hidraw on Linux, and the windows-sys Win32 bindings on Windows."
+
+[target.'cfg(windows)'.dependencies]
+# Win32 bindings for the HID backend (SetupAPI + HID.dll + file/event I/O). windows-sys is the
+# lighter, more stable of the two official options -- no proc-macro graph, fewer breaking refinements.
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
 
 [lints]
 workspace = true

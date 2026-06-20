@@ -11,7 +11,23 @@ description = "Loads an ECMA-335 assembly into a runnable lamella-ves module."
 lamella-cil = { path = "../lamella-cil" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-token = { path = "../lamella-token" }
-lamella-ves = { path = "../lamella-ves", features = ["bcl", "exceptions"] }
+lamella-ves = { path = "../lamella-ves", default-features = false }
+
+[features]
+# Mirror lamella-ves's BCL surface tiers + capability knobs, so a minimal loader build
+# gates out the same bindings the interpreter does.
+default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental"]
+bcl = ["lamella-ves/bcl"]
+NETMFv4_4 = ["bcl", "lamella-ves/NETMFv4_4"]
+exceptions = ["lamella-ves/exceptions"]
+gc = ["lamella-ves/gc"]
+finalizers = ["gc", "lamella-ves/finalizers"]
+# Floating-point support (Value::Float, float opcodes, float BCL). See lamella-ves.
+float = ["lamella-ves/float"]
+# String storage encoding (default off = UTF-16; on = UTF-8). See lamella-ves.
+string-utf8 = ["lamella-ves/string-utf8"]
+# The floating-point transcendentals (Math.Sqrt/Sin/Pow/...), via libm. See lamella-ves.
+math-transcendental = ["NETMFv4_4", "float", "lamella-ves/math-transcendental"]
 
 [lints]
 workspace = true

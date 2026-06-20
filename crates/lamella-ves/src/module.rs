@@ -126,10 +126,35 @@ pub struct Module {
     /// `newobj` tokens that construct a multi-dimensional array (an array TypeSpec's
     /// `.ctor`), mapped to the array's rank -- newobj allocates from that many lengths.
     md_array_ctors: BTreeMap<u32, u16>,
+    /// `newobj` tokens that construct a `System.Text.StringBuilder`, mapped to the
+    /// constructor's parameter count -- newobj allocates a builder (seeded from a string arg).
+    string_builder_ctors: BTreeMap<u32, u16>,
+    /// `newobj` tokens that construct a `System.Collections.ArrayList`, mapped to the
+    /// constructor's parameter count -- newobj allocates an empty array-backed list.
+    list_ctors: BTreeMap<u32, u16>,
     /// Debug names keyed by method id: the qualified method name and the argument names
     /// in CIL slot order (`this` first for an instance method). Empty unless a loader
     /// records them; the debugger surfaces them on frames and in the arguments view.
     method_debug: BTreeMap<MethodId, MethodDebug>,
+    /// Each method's owning assembly id, indexed by [`MethodId`] -- the assembly whose
+    /// token space the method's CIL resolves against. Single-assembly loads are all 0.
+    method_asm: Vec<u8>,
+    /// The [`TypeId`] of `System.String`, if a loaded assembly defined it. It backs virtual
+    /// dispatch on a heap string: a `callvirt` on a string receiver dispatches through this
+    /// type's vtable (reaching String's Equals / GetHashCode / ToString overrides) since a
+    /// heap string is not a field-carrying instance and so has no per-object type id.
+    string_type_id: Option<u32>,
+}
+
+/// Folds the assembly id into a token key. A token's high byte is its table tag; the largest is
+/// `#US` (user strings) = 0x70, which already has bit 30 set -- so only BIT 31 is free across every
+/// token kind, and it carries the assembly id for the two-assembly case (corlib = 0, program = 1).
+/// The earlier "top two bits" scheme collided `#US` (ldstr) tokens between the corlib and the
+/// program (e.g. the corlib's "False" with the program's "42"). Widen this to a u64
+/// (`asm << 32 | token`) key if more than two assemblies ever load together.
+pub(crate) fn asm_key(asm: u8, token: u32) -> u32 {
+    debug_assert!(asm < 2, "asm_key carries one bit; widen to a u64 key for >2 assemblies");
+    token | ((asm as u32) << 31)
 }
 
 /// Debug display names for one method: its qualified name and its argument names in CIL
@@ -147,50 +172,65 @@ impl Module {
         Module::default()
     }
 
-    /// Adds a managed method and returns its [`MethodId`].
-    pub fn add_method(&mut self, body: MethodBodyImage, arg_count: u16) -> MethodId {
-        self.push(Method::Managed { body, arg_count })
+    /// Adds a managed method belonging to assembly `asm` and returns its [`MethodId`].
+    pub fn add_method(&mut self, asm: u8, body: MethodBodyImage, arg_count: u16) -> MethodId {
+        self.push(asm, Method::Managed { body, arg_count })
     }
 
-    /// Adds a native intrinsic and returns its [`MethodId`].
-    pub fn add_intrinsic(&mut self, func: IntrinsicFn, arg_count: u16) -> MethodId {
-        self.push(Method::Intrinsic { func, arg_count })
+    /// Adds a native intrinsic belonging to assembly `asm` and returns its [`MethodId`].
+    pub fn add_intrinsic(&mut self, asm: u8, func: IntrinsicFn, arg_count: u16) -> MethodId {
+        self.push(asm, Method::Intrinsic { func, arg_count })
     }
 
-    fn push(&mut self, method: Method) -> MethodId {
+    fn push(&mut self, asm: u8, method: Method) -> MethodId {
         let id = self.methods.len() as MethodId;
         self.methods.push(method);
+        self.method_asm.push(asm);
         id
     }
 
-    /// Binds a `call` token to the method it resolves to (standing in for
-    /// metadata's `MethodDef`/`MemberRef` resolution).
-    pub fn bind_token(&mut self, token: Token, method: MethodId) {
-        self.by_token.insert(token.0, method);
-    }
-
-    /// Binds an `ldstr` token to the UTF-16 string it loads (standing in for the
-    /// `#US` user-string heap).
-    pub fn bind_string(&mut self, token: Token, chars: &[u16]) {
-        self.strings.insert(token.0, chars.into());
-    }
-
-    /// The method a `call` token resolves to, if any.
+    /// The assembly id that owns `method` (the token space its CIL resolves against);
+    /// 0 for any method not explicitly recorded.
     #[must_use]
-    pub fn resolve(&self, token: Token) -> Option<MethodId> {
-        self.by_token.get(&token.0).copied()
+    pub fn method_asm(&self, id: MethodId) -> u8 {
+        self.method_asm.get(id as usize).copied().unwrap_or(0)
     }
 
-    /// The string an `ldstr` token loads, if any.
+    /// Binds a `call` token in assembly `asm` to the method it resolves to (standing in
+    /// for metadata's `MethodDef`/`MemberRef` resolution).
+    pub fn bind_token(&mut self, asm: u8, token: Token, method: MethodId) {
+        self.by_token.insert(asm_key(asm, token.0), method);
+    }
+
+    /// Binds an `ldstr` token in assembly `asm` to the UTF-16 string it loads (standing
+    /// in for the `#US` user-string heap).
+    pub fn bind_string(&mut self, asm: u8, token: Token, chars: &[u16]) {
+        self.strings.insert(asm_key(asm, token.0), chars.into());
+    }
+
+    /// The method a `call` token in assembly `asm` resolves to, if any.
     #[must_use]
-    pub fn resolve_string(&self, token: Token) -> Option<&[u16]> {
-        self.strings.get(&token.0).map(AsRef::as_ref)
+    pub fn resolve(&self, asm: u8, token: Token) -> Option<MethodId> {
+        self.by_token.get(&asm_key(asm, token.0)).copied()
+    }
+
+    /// The string an `ldstr` token in assembly `asm` loads, if any.
+    #[must_use]
+    pub fn resolve_string(&self, asm: u8, token: Token) -> Option<&[u16]> {
+        self.strings.get(&asm_key(asm, token.0)).map(AsRef::as_ref)
     }
 
     /// The method with the given id, if it exists.
     #[must_use]
     pub fn method(&self, id: MethodId) -> Option<&Method> {
         self.methods.get(id as usize)
+    }
+
+    /// The number of declared reference types in the module -- the global [`TypeId`]
+    /// offset at which the next assembly's first type will land in a multi-assembly load.
+    #[must_use]
+    pub fn type_count(&self) -> usize {
+        self.types.len()
     }
 
     /// Records debug names for method `id`: its qualified name (e.g. `Program.Fact`) and
@@ -236,20 +276,20 @@ impl Module {
         self.method_type.insert(method, type_id);
     }
 
-    /// Binds an `ldfld`/`stfld` field token to its instance-field slot.
-    pub fn bind_field(&mut self, token: Token, slot: u32) {
-        self.field_slots.insert(token.0, slot);
+    /// Binds an `ldfld`/`stfld` field token in assembly `asm` to its instance-field slot.
+    pub fn bind_field(&mut self, asm: u8, token: Token, slot: u32) {
+        self.field_slots.insert(asm_key(asm, token.0), slot);
     }
 
-    /// Records the declaring type of an instance-field token.
-    pub fn bind_field_type(&mut self, token: Token, type_id: TypeId) {
-        self.field_types.insert(token.0, type_id);
+    /// Records the declaring type of an instance-field token in assembly `asm`.
+    pub fn bind_field_type(&mut self, asm: u8, token: Token, type_id: TypeId) {
+        self.field_types.insert(asm_key(asm, token.0), type_id);
     }
 
-    /// The declaring type of a field token, if recorded.
+    /// The declaring type of a field token in assembly `asm`, if recorded.
     #[must_use]
-    pub fn field_type(&self, token: Token) -> Option<TypeId> {
-        self.field_types.get(&token.0).copied()
+    pub fn field_type(&self, asm: u8, token: Token) -> Option<TypeId> {
+        self.field_types.get(&asm_key(asm, token.0)).copied()
     }
 
     /// The declaring type of `method`, if recorded.
@@ -258,10 +298,10 @@ impl Module {
         self.method_type.get(&method).copied()
     }
 
-    /// The instance-field slot a field token names, if bound.
+    /// The instance-field slot a field token in assembly `asm` names, if bound.
     #[must_use]
-    pub fn field_slot(&self, token: Token) -> Option<u32> {
-        self.field_slots.get(&token.0).copied()
+    pub fn field_slot(&self, asm: u8, token: Token) -> Option<u32> {
+        self.field_slots.get(&asm_key(asm, token.0)).copied()
     }
 
     /// The zero values of `type_id`'s instance fields, for allocating an instance.
@@ -280,15 +320,16 @@ impl Module {
         }
     }
 
-    /// Binds a `newarr` element-type token to the zero value its elements take.
-    pub fn bind_array_default(&mut self, token: Token, default: Value) {
-        self.array_defaults.insert(token.0, default);
+    /// Binds a `newarr` element-type token in assembly `asm` to the zero value its
+    /// elements take.
+    pub fn bind_array_default(&mut self, asm: u8, token: Token, default: Value) {
+        self.array_defaults.insert(asm_key(asm, token.0), default);
     }
 
-    /// The zero value of a `newarr` element-type token's elements, if bound.
+    /// The zero value of a `newarr` element-type token's elements in assembly `asm`, if bound.
     #[must_use]
-    pub fn array_default(&self, token: Token) -> Option<Value> {
-        self.array_defaults.get(&token.0).cloned()
+    pub fn array_default(&self, asm: u8, token: Token) -> Option<Value> {
+        self.array_defaults.get(&asm_key(asm, token.0)).cloned()
     }
 
     /// Sets `type_id`'s virtual method table (slot -> implementation).
@@ -320,17 +361,18 @@ impl Module {
             .copied()
     }
 
-    /// Registers a static field with its zero value, assigning the next storage slot.
-    pub fn bind_static_field(&mut self, token: Token, default: Value) {
+    /// Registers a static field in assembly `asm` with its zero value, assigning the next
+    /// storage slot.
+    pub fn bind_static_field(&mut self, asm: u8, token: Token, default: Value) {
         let slot = self.static_defaults.len();
         self.static_defaults.push(default);
-        self.static_fields.insert(token.0, slot);
+        self.static_fields.insert(asm_key(asm, token.0), slot);
     }
 
-    /// The storage slot of a static field token, if registered.
+    /// The storage slot of a static field token in assembly `asm`, if registered.
     #[must_use]
-    pub fn static_field_slot(&self, token: Token) -> Option<usize> {
-        self.static_fields.get(&token.0).copied()
+    pub fn static_field_slot(&self, asm: u8, token: Token) -> Option<usize> {
+        self.static_fields.get(&asm_key(asm, token.0)).copied()
     }
 
     /// The zero values of all static fields, indexed by slot (to initialize storage).
@@ -356,29 +398,37 @@ impl Module {
         self.finalizers.get(&type_id).copied()
     }
 
-    /// Records that the enum type `token` has a constant `name` with underlying `value`.
-    pub fn set_enum_constant(&mut self, token: u32, value: i64, name: String) {
+    /// Records that the enum type `token` in assembly `asm` has a constant `name` with
+    /// underlying `value`.
+    pub fn set_enum_constant(&mut self, asm: u8, token: u32, value: i64, name: String) {
         self.enum_constants
-            .entry(token)
+            .entry(asm_key(asm, token))
             .or_default()
             .insert(value, name);
     }
 
-    /// The name of the constant with underlying `value` in the enum type `token`, if any.
+    /// The name of the constant with underlying `value` in the enum type `token` of
+    /// assembly `asm`, if any.
     #[must_use]
-    pub fn enum_value_name(&self, token: u32, value: i64) -> Option<&str> {
+    pub fn enum_value_name(&self, asm: u8, token: u32, value: i64) -> Option<&str> {
         self.enum_constants
-            .get(&token)
+            .get(&asm_key(asm, token))
             .and_then(|constants| constants.get(&value))
             .map(String::as_str)
     }
 
-    /// The underlying value of the constant named `name` in the enum type `token`, if any
-    /// -- the reverse of [`Self::enum_value_name`], for `Enum.Parse`.
+    /// The underlying value of the constant named `name` in the enum type `token` of
+    /// assembly `asm`, if any -- the reverse of [`Self::enum_value_name`], for `Enum.Parse`.
     #[must_use]
-    pub fn enum_value_by_name(&self, token: u32, name: &str, ignore_case: bool) -> Option<i64> {
+    pub fn enum_value_by_name(
+        &self,
+        asm: u8,
+        token: u32,
+        name: &str,
+        ignore_case: bool,
+    ) -> Option<i64> {
         self.enum_constants
-            .get(&token)?
+            .get(&asm_key(asm, token))?
             .iter()
             .find_map(|(value, constant)| {
                 let matched = if ignore_case {
@@ -390,15 +440,28 @@ impl Module {
             })
     }
 
-    /// Records that the enum type `token` has a 64-bit underlying type (long / ulong).
-    pub fn set_enum_wide(&mut self, token: u32) {
-        self.enum_wide.insert(token);
+    /// Records that the enum type `token` in assembly `asm` has a 64-bit underlying type
+    /// (long / ulong).
+    pub fn set_enum_wide(&mut self, asm: u8, token: u32) {
+        self.enum_wide.insert(asm_key(asm, token));
     }
 
-    /// Whether the enum type `token` has a 64-bit underlying type.
+    /// Whether the enum type `token` in assembly `asm` has a 64-bit underlying type.
     #[must_use]
-    pub fn enum_is_wide(&self, token: u32) -> bool {
-        self.enum_wide.contains(&token)
+    pub fn enum_is_wide(&self, asm: u8, token: u32) -> bool {
+        self.enum_wide.contains(&asm_key(asm, token))
+    }
+
+    /// Records the [`TypeId`] of `System.String`, so a `callvirt` on a heap string can supply
+    /// it as the receiver's runtime type and dispatch through String's vtable.
+    pub fn set_string_type_id(&mut self, id: u32) {
+        self.string_type_id = Some(id);
+    }
+
+    /// The [`TypeId`] of `System.String`, if a loaded assembly defined it.
+    #[must_use]
+    pub fn string_type_id(&self) -> Option<u32> {
+        self.string_type_id
     }
 
     /// The static constructors, in the order to run them.
@@ -414,15 +477,15 @@ impl Module {
         }
     }
 
-    /// Binds a `TypeDef` token to its [`TypeId`] (for `castclass` / `isinst`).
-    pub fn bind_type_token(&mut self, token: Token, type_id: TypeId) {
-        self.type_tokens.insert(token.0, type_id);
+    /// Binds a `TypeDef` token in assembly `asm` to its [`TypeId`] (for `castclass` / `isinst`).
+    pub fn bind_type_token(&mut self, asm: u8, token: Token, type_id: TypeId) {
+        self.type_tokens.insert(asm_key(asm, token.0), type_id);
     }
 
-    /// The [`TypeId`] a type token names, if it is a same-module type.
+    /// The [`TypeId`] a type token in assembly `asm` names, if it is a same-module type.
     #[must_use]
-    pub fn type_id_of(&self, token: Token) -> Option<TypeId> {
-        self.type_tokens.get(&token.0).copied()
+    pub fn type_id_of(&self, asm: u8, token: Token) -> Option<TypeId> {
+        self.type_tokens.get(&asm_key(asm, token.0)).copied()
     }
 
     /// Whether `sub` is `ancestor` or a type derived from it, walking the base chain.
@@ -459,52 +522,87 @@ impl Module {
             .copied()
     }
 
-    /// Records a `callvirt` token's target signature key and argument count, for
-    /// dispatching a method with no vtable slot / no resolvable body.
-    pub fn bind_call_target(&mut self, token: Token, sig_key: String, arg_count: u16) {
-        self.call_targets.insert(token.0, (sig_key, arg_count));
+    /// Records a `callvirt` token's target signature key and argument count in assembly
+    /// `asm`, for dispatching a method with no vtable slot / no resolvable body.
+    pub fn bind_call_target(&mut self, asm: u8, token: Token, sig_key: String, arg_count: u16) {
+        self.call_targets
+            .insert(asm_key(asm, token.0), (sig_key, arg_count));
     }
 
-    /// A `callvirt` token's target signature key and argument count, if recorded.
+    /// A `callvirt` token's target signature key and argument count in assembly `asm`, if
+    /// recorded.
     #[must_use]
-    pub fn call_target(&self, token: Token) -> Option<(&str, u16)> {
+    pub fn call_target(&self, asm: u8, token: Token) -> Option<(&str, u16)> {
         self.call_targets
-            .get(&token.0)
+            .get(&asm_key(asm, token.0))
             .map(|(key, count)| (key.as_str(), *count))
     }
 
-    /// Marks `token` as a delegate constructor, so `newobj` on it builds a delegate.
-    pub fn mark_delegate_ctor(&mut self, token: Token) {
-        self.delegate_ctors.insert(token.0);
+    /// Marks `token` in assembly `asm` as a delegate constructor, so `newobj` on it builds
+    /// a delegate.
+    pub fn mark_delegate_ctor(&mut self, asm: u8, token: Token) {
+        self.delegate_ctors.insert(asm_key(asm, token.0));
     }
 
-    /// Whether `token` constructs a delegate.
+    /// Whether `token` in assembly `asm` constructs a delegate.
     #[must_use]
-    pub fn is_delegate_ctor(&self, token: Token) -> bool {
-        self.delegate_ctors.contains(&token.0)
+    pub fn is_delegate_ctor(&self, asm: u8, token: Token) -> bool {
+        self.delegate_ctors.contains(&asm_key(asm, token.0))
     }
 
-    /// Marks `token` as a multi-dimensional array constructor of the given `rank`, so
-    /// `newobj` allocates the array from that many length arguments.
-    pub fn mark_md_array_ctor(&mut self, token: Token, rank: u16) {
-        self.md_array_ctors.insert(token.0, rank);
+    /// Marks `token` in assembly `asm` as a multi-dimensional array constructor of the given
+    /// `rank`, so `newobj` allocates the array from that many length arguments.
+    pub fn mark_md_array_ctor(&mut self, asm: u8, token: Token, rank: u16) {
+        self.md_array_ctors.insert(asm_key(asm, token.0), rank);
     }
 
-    /// The rank of the multi-dimensional array `token` constructs, if it constructs one.
+    /// The rank of the multi-dimensional array `token` constructs in assembly `asm`, if it
+    /// constructs one.
     #[must_use]
-    pub fn md_array_ctor_rank(&self, token: Token) -> Option<u16> {
-        self.md_array_ctors.get(&token.0).copied()
+    pub fn md_array_ctor_rank(&self, asm: u8, token: Token) -> Option<u16> {
+        self.md_array_ctors.get(&asm_key(asm, token.0)).copied()
     }
 
-    /// Marks `token` as a delegate `Invoke` taking `param_count` parameters.
-    pub fn mark_delegate_invoke(&mut self, token: Token, param_count: u16) {
-        self.delegate_invokes.insert(token.0, param_count);
+    /// Marks `token` in assembly `asm` as a `StringBuilder` constructor taking `params`
+    /// parameters, so `newobj` allocates a builder instead of running a managed constructor.
+    pub fn mark_string_builder_ctor(&mut self, asm: u8, token: Token, params: u16) {
+        self.string_builder_ctors
+            .insert(asm_key(asm, token.0), params);
     }
 
-    /// The parameter count of the delegate `Invoke` named by `token`, if it is one.
+    /// The parameter count of the `StringBuilder` constructor `token` names in assembly
+    /// `asm`, if it is one.
     #[must_use]
-    pub fn delegate_invoke(&self, token: Token) -> Option<u16> {
-        self.delegate_invokes.get(&token.0).copied()
+    pub fn string_builder_ctor_params(&self, asm: u8, token: Token) -> Option<u16> {
+        self.string_builder_ctors
+            .get(&asm_key(asm, token.0))
+            .copied()
+    }
+
+    /// Marks `token` in assembly `asm` as an `ArrayList` constructor taking `params`
+    /// parameters, so `newobj` allocates an empty list instead of running a managed constructor.
+    pub fn mark_list_ctor(&mut self, asm: u8, token: Token, params: u16) {
+        self.list_ctors.insert(asm_key(asm, token.0), params);
+    }
+
+    /// The parameter count of the `ArrayList` constructor `token` names in assembly `asm`,
+    /// if it is one.
+    #[must_use]
+    pub fn list_ctor_params(&self, asm: u8, token: Token) -> Option<u16> {
+        self.list_ctors.get(&asm_key(asm, token.0)).copied()
+    }
+
+    /// Marks `token` in assembly `asm` as a delegate `Invoke` taking `param_count` parameters.
+    pub fn mark_delegate_invoke(&mut self, asm: u8, token: Token, param_count: u16) {
+        self.delegate_invokes
+            .insert(asm_key(asm, token.0), param_count);
+    }
+
+    /// The parameter count of the delegate `Invoke` named by `token` in assembly `asm`, if
+    /// it is one.
+    #[must_use]
+    pub fn delegate_invoke(&self, asm: u8, token: Token) -> Option<u16> {
+        self.delegate_invokes.get(&asm_key(asm, token.0)).copied()
     }
 }
 

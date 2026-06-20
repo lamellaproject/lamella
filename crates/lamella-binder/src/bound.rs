@@ -81,6 +81,15 @@ pub enum BoundExprKind {
     Literal(Literal),
     /// A reference to a local variable or parameter (14.5.2).
     Local(Box<str>),
+    /// A `ref`/`out` argument (17.5.1): the address of the inner variable, passed to a
+    /// byref parameter. Its type is the variable's type. `out` assigns the variable (so
+    /// it need not be assigned beforehand); `ref` requires it already assigned.
+    Ref {
+        /// `true` for `out`, `false` for `ref`.
+        out: bool,
+        /// The variable whose address is passed.
+        operand: Box<BoundExpr>,
+    },
     /// The `this` access (14.5.7); its type is the enclosing type.
     This,
     /// A `base` access (14.5.8); its type is the enclosing type's base class, used
@@ -107,6 +116,9 @@ pub enum BoundExprKind {
     PropertyAccess {
         /// The receiver the property is read from.
         receiver: Box<BoundExpr>,
+        /// The type that declares the property (a base, for an inherited one) -- the
+        /// `get_`/`set_` accessor is named on it, not the receiver's static type.
+        declaring_type: TypeSymbol,
         /// The property name.
         name: Box<str>,
     },
@@ -137,8 +149,12 @@ pub enum BoundExprKind {
     },
     /// An array creation `new T[...]` (14.5.10.2); its type is the array type.
     ArrayCreation {
-        /// The dimension-length expressions.
+        /// The dimension-length expressions (empty when the size comes from
+        /// `elements`).
         lengths: Vec<BoundExpr>,
+        /// The `{ ... }` initializer elements, converted to the element type; empty for
+        /// a sized-but-uninitialized array.
+        elements: Vec<BoundExpr>,
     },
     /// An object creation `new T(args)` (14.5.10.1); its type is the created type.
     ObjectCreation {
@@ -208,6 +224,8 @@ pub enum BoundExprKind {
         operation: TypeTestOperation,
         /// The operand.
         operand: Box<BoundExpr>,
+        /// The type tested against (`isinst` names it).
+        target: TypeSymbol,
     },
     /// An assignment, simple or compound (14.14); its type is the target's.
     Assignment {
@@ -227,8 +245,9 @@ pub enum BoundExprKind {
         /// The value when false.
         when_false: Box<BoundExpr>,
     },
-    /// A `typeof` expression (14.5.11); its type is `System.Type`.
-    TypeOf,
+    /// A `typeof` expression (14.5.11), naming the type it reflects; its type is
+    /// `System.Type`.
+    TypeOf(TypeSymbol),
     /// A `checked` expression (14.5.12); the type is the operand's.
     Checked(Box<BoundExpr>),
     /// An `unchecked` expression (14.5.12); the type is the operand's.
@@ -330,6 +349,37 @@ impl Binder {
     /// that walk the model's inheritance graph (13.1).
     pub(crate) fn converts(&self, from: &TypeSymbol, to: &TypeSymbol) -> bool {
         converts(&self.model, from, to)
+            || self.user_conversion(from, to, "op_Implicit").is_some()
+    }
+
+    /// A user-defined conversion method (`op_Implicit`/`op_Explicit`) taking `from` and
+    /// returning `to`, declared on either the source or target type (17.9.3). The static
+    /// call a `from -> to` conversion lowers to.
+    fn user_conversion(
+        &self,
+        from: &TypeSymbol,
+        to: &TypeSymbol,
+        name: &str,
+    ) -> Option<MethodReference> {
+        for owner in [from, to] {
+            for method in self.methods_in_chain(owner, name) {
+                if method.parameters.len() == 1
+                    && &method.parameters[0] == from
+                    && &method.return_type == to
+                {
+                    let declaring_type =
+                        self.declaring_type_in_chain(owner, name, &method.parameters);
+                    return Some(MethodReference {
+                        declaring_type,
+                        name: name.into(),
+                        parameters: method.parameters,
+                        return_type: method.return_type,
+                        is_static: true,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Reports a failed implicit conversion at `span`: `CS0266` when an explicit
@@ -360,21 +410,53 @@ impl Binder {
     /// boxes, or upcasts as needed (13.1). Returns `expr` unchanged when the types
     /// match or no implicit conversion applies (the site reports any error).
     pub(crate) fn convert(&self, expr: BoundExpr, target: &TypeSymbol) -> BoundExpr {
-        if expr.ty == *target
-            || expr.ty.is_error()
-            || target.is_error()
-            || !self.converts(&expr.ty, target)
-        {
+        if expr.ty == *target || expr.ty.is_error() || target.is_error() {
             return expr;
         }
-        let conversion = self.conversion_kind(&expr.ty, target);
-        BoundExpr {
-            kind: BoundExprKind::Conversion {
-                operand: Box::new(expr),
-                conversion,
-            },
-            ty: target.clone(),
+        if converts(&self.model, &expr.ty, target) {
+            let conversion = self.conversion_kind(&expr.ty, target);
+            return BoundExpr {
+                kind: BoundExprKind::Conversion {
+                    operand: Box::new(expr),
+                    conversion,
+                },
+                ty: target.clone(),
+            };
         }
+        if let Some(method) = self.user_conversion(&expr.ty, target, "op_Implicit") {
+            return BoundExpr {
+                ty: target.clone(),
+                kind: BoundExprKind::Call {
+                    callee: Box::new(error_expr()),
+                    arguments: alloc::vec![expr],
+                    method: Some(method),
+                },
+            };
+        }
+        expr
+    }
+
+    /// Binds an array initializer `{ e, ... }` against `array_ty`, converting each
+    /// element to the array's element type. Used for `new T[]{...}` and `T[] a = {...}`.
+    pub(crate) fn bind_array_initializer(
+        &mut self,
+        init: &Expr,
+        array_ty: &TypeSymbol,
+    ) -> Vec<BoundExpr> {
+        let ExprKind::ArrayInitializer(elements) = &init.kind else {
+            return Vec::new();
+        };
+        let element_ty = match array_ty {
+            TypeSymbol::Array { element, .. } => (**element).clone(),
+            _ => TypeSymbol::Error,
+        };
+        elements
+            .iter()
+            .map(|element| {
+                let bound = self.bind_expression(element);
+                self.convert(bound, &element_ty)
+            })
+            .collect()
     }
 
     /// Converts `value` to the enclosing method's return type, for a `return`.
@@ -535,6 +617,53 @@ impl Binder {
         bound
     }
 
+    /// Binds a constructor initializer `: this(args)` / `: base(args)`: the arguments are
+    /// bound in a scope with the constructor's parameters, then matched to a constructor
+    /// of the sibling (`this`) or base type. Returns the target `.ctor` reference and the
+    /// bound arguments, or `None` if it does not resolve.
+    pub fn bind_constructor_chain(
+        &mut self,
+        enclosing: &TypeSymbol,
+        parameters: &[(Box<str>, TypeSymbol)],
+        initializer: &lamella_syntax::ast::ConstructorInitializer,
+    ) -> Option<(MethodReference, Vec<BoundExpr>)> {
+        self.current_type = Some(enclosing.clone());
+        self.enter_scope();
+        for (name, ty) in parameters {
+            self.declare_local(name, ty.clone());
+        }
+        let arguments: Vec<BoundExpr> = initializer
+            .arguments
+            .iter()
+            .map(|argument| self.bind_expression(argument))
+            .collect();
+        self.exit_scope();
+        self.current_type = None;
+        let target = match initializer.kind {
+            lamella_syntax::ast::ConstructorInitializerKind::This => enclosing.clone(),
+            lamella_syntax::ast::ConstructorInitializerKind::Base => {
+                self.type_info_of(enclosing)?.base.clone()?
+            }
+        };
+        let constructors = self.type_info_of(&target)?.constructors.clone();
+        let argument_types: Vec<TypeSymbol> =
+            arguments.iter().map(|argument| argument.ty.clone()).collect();
+        let chosen = match resolve_overload(&self.model, &constructors, &argument_types) {
+            OverloadResult::Resolved(method) => method,
+            _ => return None,
+        };
+        Some((
+            MethodReference {
+                declaring_type: target,
+                name: ".ctor".into(),
+                parameters: chosen.parameters,
+                return_type: TypeSymbol::Special(SpecialType::Void),
+                is_static: false,
+            },
+            arguments,
+        ))
+    }
+
     /// Binds a field initializer in `enclosing`'s context and checks it converts
     /// to the field's type (`CS0029`).
     pub fn bind_field_initializer(
@@ -655,7 +784,7 @@ impl Binder {
                 lengths,
                 rank,
                 extra_ranks,
-                ..
+                initializer,
             } => {
                 let lengths = lengths
                     .iter()
@@ -668,8 +797,12 @@ impl Binder {
                     }
                     ty = ty.into_array(*rank);
                 }
+                let elements = initializer
+                    .as_ref()
+                    .map(|init| self.bind_array_initializer(init, &ty))
+                    .unwrap_or_default();
                 BoundExpr {
-                    kind: BoundExprKind::ArrayCreation { lengths },
+                    kind: BoundExprKind::ArrayCreation { lengths, elements },
                     ty,
                 }
             }
@@ -679,23 +812,46 @@ impl Binder {
                 right,
             } => self.bind_binary(*operator, left, right, expr.span),
             ExprKind::Unary { operator, operand } => self.bind_unary(*operator, operand, expr.span),
+            ExprKind::RefArgument { out, operand } => {
+                let operand = self.bind_expression(operand);
+                let ty = operand.ty.clone();
+                BoundExpr {
+                    kind: BoundExprKind::Ref {
+                        out: *out,
+                        operand: Box::new(operand),
+                    },
+                    ty,
+                }
+            }
             ExprKind::PostfixUnary { operator, operand } => {
                 self.bind_postfix(*operator, operand, expr.span)
             }
             ExprKind::Cast { target, operand } => {
                 let operand = self.bind_expression(operand);
                 let ty = self.resolve_named_type(&bind_type(target), target.span);
-                if !operand.ty.is_error()
-                    && !ty.is_error()
-                    && !can_cast(&self.model, &operand.ty, &ty)
-                {
-                    self.diagnostics.push(Diagnostic::new(
-                        DiagnosticKind::CannotCast {
-                            from: operand.ty.to_string().into(),
-                            to: ty.to_string().into(),
-                        },
-                        target.span,
-                    ));
+                if !operand.ty.is_error() && !ty.is_error() {
+                    if let Some(method) = self
+                        .user_conversion(&operand.ty, &ty, "op_Explicit")
+                        .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Implicit"))
+                    {
+                        return BoundExpr {
+                            ty,
+                            kind: BoundExprKind::Call {
+                                callee: Box::new(error_expr()),
+                                arguments: alloc::vec![operand],
+                                method: Some(method),
+                            },
+                        };
+                    }
+                    if !can_cast(&self.model, &operand.ty, &ty) {
+                        self.diagnostics.push(Diagnostic::new(
+                            DiagnosticKind::CannotCast {
+                                from: operand.ty.to_string().into(),
+                                to: ty.to_string().into(),
+                            },
+                            target.span,
+                        ));
+                    }
                 }
                 BoundExpr {
                     kind: BoundExprKind::Cast {
@@ -714,20 +870,21 @@ impl Binder {
                 let target = self.resolve_named_type(&bind_type(target), target.span);
                 let ty = match operation {
                     TypeTestOperation::Is => TypeSymbol::Special(SpecialType::Boolean),
-                    TypeTestOperation::As => target,
+                    TypeTestOperation::As => target.clone(),
                 };
                 BoundExpr {
                     kind: BoundExprKind::TypeTest {
                         operation: *operation,
                         operand: Box::new(operand),
+                        target,
                     },
                     ty,
                 }
             }
             ExprKind::TypeOf(target) => {
-                let _ = self.resolve_named_type(&bind_type(target), target.span);
+                let target_ty = self.resolve_named_type(&bind_type(target), target.span);
                 BoundExpr {
-                    kind: BoundExprKind::TypeOf,
+                    kind: BoundExprKind::TypeOf(target_ty),
                     ty: system_type(),
                 }
             }
@@ -794,6 +951,9 @@ impl Binder {
         } else if let Some(result) = binary_result_type(operator, &left.ty, &right.ty) {
             result
         } else {
+            if let Some(call) = self.bind_user_binary_operator(operator, &left, &right) {
+                return call;
+            }
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::OperatorNotApplicable {
                     operator: operator_symbol(operator).into(),
@@ -813,6 +973,41 @@ impl Binder {
             },
             ty,
         }
+    }
+
+    /// Resolves a binary operator to a user-defined `op_*` method on either operand's
+    /// type, as a static call -- the lowering of `a + b` for overloaded operators.
+    fn bind_user_binary_operator(
+        &mut self,
+        operator: BinaryOperator,
+        left: &BoundExpr,
+        right: &BoundExpr,
+    ) -> Option<BoundExpr> {
+        let name = operator.overload_method_name()?;
+        let argument_types = [left.ty.clone(), right.ty.clone()];
+        for owner in [&left.ty, &right.ty] {
+            let candidates = self.methods_in_chain(owner, name);
+            if let OverloadResult::Resolved(method) =
+                resolve_overload(&self.model, &candidates, &argument_types)
+            {
+                let declaring_type = self.declaring_type_in_chain(owner, name, &method.parameters);
+                return Some(BoundExpr {
+                    ty: method.return_type.clone(),
+                    kind: BoundExprKind::Call {
+                        callee: Box::new(error_expr()),
+                        arguments: alloc::vec![left.clone(), right.clone()],
+                        method: Some(MethodReference {
+                            declaring_type,
+                            name: name.into(),
+                            parameters: method.parameters,
+                            return_type: method.return_type,
+                            is_static: true,
+                        }),
+                    },
+                });
+            }
+        }
+        None
     }
 
     /// Whether `ty` is an enum type declared in the model.
@@ -860,7 +1055,22 @@ impl Binder {
             operand.ty.clone()
         } else if let Some(result) = unary_result_type(operator, &operand.ty) {
             result
+        } else if matches!(
+            operator,
+            UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
+        ) && self.has_step_operator(
+            &operand.ty,
+            if operator == UnaryOperator::PreIncrement {
+                "op_Increment"
+            } else {
+                "op_Decrement"
+            },
+        ) {
+            operand.ty.clone()
         } else {
+            if let Some(call) = self.bind_user_unary_operator(operator, &operand) {
+                return call;
+            }
             self.report_unary(unary_operator_symbol(operator), &operand.ty, span);
             TypeSymbol::Error
         };
@@ -873,6 +1083,38 @@ impl Binder {
         }
     }
 
+    /// Resolves a unary operator to a user-defined `op_*` method on the operand's type,
+    /// as a static call.
+    fn bind_user_unary_operator(
+        &mut self,
+        operator: UnaryOperator,
+        operand: &BoundExpr,
+    ) -> Option<BoundExpr> {
+        let name = operator.overload_method_name()?;
+        let argument_types = [operand.ty.clone()];
+        let candidates = self.methods_in_chain(&operand.ty, name);
+        if let OverloadResult::Resolved(method) =
+            resolve_overload(&self.model, &candidates, &argument_types)
+        {
+            let declaring_type = self.declaring_type_in_chain(&operand.ty, name, &method.parameters);
+            return Some(BoundExpr {
+                ty: method.return_type.clone(),
+                kind: BoundExprKind::Call {
+                    callee: Box::new(error_expr()),
+                    arguments: alloc::vec![operand.clone()],
+                    method: Some(MethodReference {
+                        declaring_type,
+                        name: name.into(),
+                        parameters: method.parameters,
+                        return_type: method.return_type,
+                        is_static: true,
+                    }),
+                },
+            });
+        }
+        None
+    }
+
     fn bind_postfix(
         &mut self,
         operator: PostfixOperator,
@@ -880,9 +1122,15 @@ impl Binder {
         span: Span,
     ) -> BoundExpr {
         let operand = self.bind_expression(operand_expr);
+        let step = match operator {
+            PostfixOperator::Increment => "op_Increment",
+            PostfixOperator::Decrement => "op_Decrement",
+        };
         let ty = if operand.ty.is_error() {
             TypeSymbol::Error
-        } else if as_special(&operand.ty).is_some_and(SpecialType::is_numeric) {
+        } else if as_special(&operand.ty).is_some_and(SpecialType::is_numeric)
+            || self.has_step_operator(&operand.ty, step)
+        {
             operand.ty.clone()
         } else {
             let symbol = match operator {
@@ -899,6 +1147,16 @@ impl Binder {
             },
             ty,
         }
+    }
+
+    /// Whether `ty` declares a user-defined `op_Increment`/`op_Decrement` (named by
+    /// `step`) -- a static method taking and returning `ty`.
+    fn has_step_operator(&self, ty: &TypeSymbol, step: &str) -> bool {
+        self.methods_in_chain(ty, step).iter().any(|method| {
+            method.parameters.len() == 1
+                && &method.parameters[0] == ty
+                && &method.return_type == ty
+        })
     }
 
     fn report_unary(&mut self, operator: &str, operand: &TypeSymbol, span: Span) {
@@ -1077,6 +1335,7 @@ impl Binder {
                 BoundExpr {
                     kind: BoundExprKind::PropertyAccess {
                         receiver: Box::new(receiver),
+                        declaring_type,
                         name: name.into(),
                     },
                     ty,
@@ -1124,6 +1383,7 @@ impl Binder {
             BoundExprKind::MethodGroup { receiver, .. } => Some(receiver_category(receiver)),
             _ => None,
         };
+        let mut params_method = false;
         let mut resolved = match group {
             Some((receiver_ty, name))
                 if !arguments.iter().any(|argument| argument.ty.is_error()) =>
@@ -1135,6 +1395,7 @@ impl Binder {
                     .collect();
                 self.resolve_call(&name, &receiver_ty, &candidates, &argument_types, span)
                     .map(|method| {
+                        params_method = method.is_params;
                         let declaring_type = self.declaring_type_in_chain(
                             &receiver_ty,
                             &method.name,
@@ -1175,6 +1436,15 @@ impl Binder {
                 span,
             );
         }
+        let arguments = match resolved.as_ref() {
+            Some(method) if params_method => self.bind_params_arguments(method, arguments),
+            Some(method) if method.parameters.len() == arguments.len() => arguments
+                .into_iter()
+                .zip(method.parameters.iter())
+                .map(|(argument, parameter)| self.convert(argument, parameter))
+                .collect(),
+            _ => arguments,
+        };
         let ty = resolved
             .as_ref()
             .map_or(TypeSymbol::Error, |method| method.return_type.clone());
@@ -1186,6 +1456,48 @@ impl Binder {
             },
             ty,
         }
+    }
+
+    /// Binds the arguments of a call to a `params` method: an array supplied directly
+    /// (normal form) converts 1:1; otherwise the trailing arguments are wrapped into a
+    /// new array of the element type (expanded form).
+    fn bind_params_arguments(
+        &mut self,
+        method: &MethodReference,
+        arguments: Vec<BoundExpr>,
+    ) -> Vec<BoundExpr> {
+        let param_count = method.parameters.len();
+        let fixed = param_count.saturating_sub(1);
+        let array_ty = method.parameters[fixed].clone();
+        if arguments.len() == param_count && self.converts(&arguments[fixed].ty, &array_ty) {
+            return arguments
+                .into_iter()
+                .zip(method.parameters.iter())
+                .map(|(argument, parameter)| self.convert(argument, parameter))
+                .collect();
+        }
+        let element_ty = match &array_ty {
+            TypeSymbol::Array { element, .. } => (**element).clone(),
+            _ => TypeSymbol::Error,
+        };
+        let mut bound = Vec::with_capacity(param_count);
+        let mut remaining = arguments.into_iter();
+        for parameter in &method.parameters[..fixed] {
+            if let Some(argument) = remaining.next() {
+                bound.push(self.convert(argument, parameter));
+            }
+        }
+        let elements: Vec<BoundExpr> = remaining
+            .map(|argument| self.convert(argument, &element_ty))
+            .collect();
+        bound.push(BoundExpr {
+            kind: BoundExprKind::ArrayCreation {
+                lengths: Vec::new(),
+                elements,
+            },
+            ty: array_ty,
+        });
+        bound
     }
 
     /// Resolves a call to a method group by overload resolution (14.4.2),
@@ -1481,7 +1793,8 @@ impl Binder {
 
     /// Looks a member up on a type, walking the base-class chain (14.3, 14.5.4).
     fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
-        let mut current = self.type_info_of(ty);
+        let lookup = member_lookup_type(ty);
+        let mut current = self.type_info_of(&lookup);
         if current.is_none() {
             return MemberResolution::Unknown;
         }
@@ -1520,10 +1833,15 @@ impl Binder {
     /// Every method named `name` on `ty` or any of its base classes -- the method
     /// group an invocation resolves over (most-derived first).
     fn methods_in_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
-        let mut methods = Vec::new();
-        let mut current = self.type_info_of(ty);
+        let mut methods: Vec<MethodSymbol> = Vec::new();
+        let lookup = member_lookup_type(ty);
+        let mut current = self.type_info_of(&lookup);
         while let Some(info) = current {
-            methods.extend(info.methods_named(name).cloned());
+            for method in info.methods_named(name) {
+                if !methods.iter().any(|kept| kept.parameters == method.parameters) {
+                    methods.push(method.clone());
+                }
+            }
             current = info.base.as_ref().and_then(|base| self.type_info_of(base));
         }
         methods
@@ -1539,7 +1857,8 @@ impl Binder {
         name: &str,
         parameters: &[TypeSymbol],
     ) -> TypeSymbol {
-        let mut current = self.type_info_of(ty);
+        let lookup = member_lookup_type(ty);
+        let mut current = self.type_info_of(&lookup);
         while let Some(info) = current {
             if info
                 .methods_named(name)
@@ -1549,7 +1868,7 @@ impl Binder {
             }
             current = info.base.as_ref().and_then(|base| self.type_info_of(base));
         }
-        ty.clone()
+        lookup
     }
 
     /// Binds a simple name (14.5.2). For now a name resolves only to a local
@@ -1574,10 +1893,13 @@ impl Binder {
                         },
                     };
                 }
-                MemberResolution::Property { ty, .. } => {
+                MemberResolution::Property {
+                    declaring_type, ty, ..
+                } => {
                     return BoundExpr {
                         kind: BoundExprKind::PropertyAccess {
                             receiver: Box::new(self.this_expr()),
+                            declaring_type,
                             name: name.into(),
                         },
                         ty,
@@ -1904,14 +2226,41 @@ fn resolve_overload(
     OverloadResult::WrongArgumentCount
 }
 
-/// Whether a method is applicable to the arguments: the counts match and every
-/// argument converts to its parameter (14.4.2.1).
+/// Whether a method is applicable to the arguments: in normal form the counts match
+/// and every argument converts to its parameter (14.4.2.1); a `params` method is also
+/// applicable in expanded form, where the trailing arguments fill its array.
 fn is_applicable(model: &Model, method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
-    method.parameters.len() == arguments.len()
+    if method.parameters.len() == arguments.len()
         && arguments
             .iter()
             .zip(&method.parameters)
             .all(|(argument, parameter)| converts(model, argument, parameter))
+    {
+        return true;
+    }
+    method.is_params && is_applicable_expanded(model, method, arguments)
+}
+
+/// Whether a `params` method applies in expanded form (14.4.2.1): the leading fixed
+/// parameters convert, and every trailing argument converts to the array's element type.
+fn is_applicable_expanded(model: &Model, method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
+    let fixed = method.parameters.len().saturating_sub(1);
+    if arguments.len() < fixed {
+        return false;
+    }
+    if !arguments[..fixed]
+        .iter()
+        .zip(&method.parameters[..fixed])
+        .all(|(argument, parameter)| converts(model, argument, parameter))
+    {
+        return false;
+    }
+    let TypeSymbol::Array { element, .. } = &method.parameters[fixed] else {
+        return false;
+    };
+    arguments[fixed..]
+        .iter()
+        .all(|argument| converts(model, argument, element))
 }
 
 /// The single applicable candidate better than every other, or `None` when none
@@ -1982,6 +2331,22 @@ fn as_special(ty: &TypeSymbol) -> Option<SpecialType> {
 /// The `System.Type` named type, the result of a `typeof` expression (14.5.11).
 fn system_type() -> TypeSymbol {
     TypeSymbol::Named([Box::from("System"), Box::from("Type")].into())
+}
+
+/// `System.Array`, whose members (Length, GetLength, ...) an array's member access
+/// resolves against.
+fn system_array() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("System"), Box::from("Array")].into())
+}
+
+/// The type whose members a receiver of type `ty` resolves against: `System.Array`
+/// for an array (its members live there), otherwise `ty` itself.
+fn member_lookup_type(ty: &TypeSymbol) -> TypeSymbol {
+    if matches!(ty, TypeSymbol::Array { .. }) {
+        system_array()
+    } else {
+        ty.clone()
+    }
 }
 
 /// The type of a conditional expression from its branch types (14.13): the branch
@@ -2435,6 +2800,7 @@ mod tests {
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
             is_static: false,
+            is_params: false,
             accessibility: crate::symbols::Accessibility::Public,
         });
         model.insert(widget);
@@ -2519,6 +2885,7 @@ mod tests {
             return_type: TypeSymbol::Special(SpecialType::Double),
             parameters: Vec::new(),
             is_static: false,
+            is_params: false,
             accessibility: crate::symbols::Accessibility::Public,
         });
         let mut model = Model::new();
@@ -2872,6 +3239,7 @@ mod tests {
                 return_type,
                 parameters,
                 is_static: false,
+                is_params: false,
                 accessibility: crate::symbols::Accessibility::Public,
             }
         }
@@ -3206,6 +3574,7 @@ mod tests {
             return_type: int.clone(),
             parameters: alloc::vec![int.clone()],
             is_static: false,
+            is_params: false,
             accessibility: crate::symbols::Accessibility::Public,
         });
         let mut model = Model::new();

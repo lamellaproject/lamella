@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 
 use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, OperandKind};
 use lamella_ir::{
-    BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId,
+    BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, TypeHandle,
+    ValueId,
 };
 
 /// Why a method body could not be lowered to MIR.
@@ -45,6 +46,11 @@ pub enum Intrinsic {
     DebugWriteLine,
     /// `System.Console.WriteLine(int)` -> a decimal int written over semihosting.
     ConsoleWriteLineInt,
+    /// `System.String::op_Equality(string, string)` -> an ordinal length-then-content compare.
+    StringEquals,
+    /// `System.Object::.ctor()` -- the implicit base constructor a derived constructor chains to.
+    /// A no-op: the object header is the runtime allocator's, and there is no managed base state.
+    ObjectCtor,
 }
 
 /// What the lowering needs about a `call` target: how many arguments to pop, whether it
@@ -82,6 +88,13 @@ pub trait CallResolver {
         None
     }
 
+    /// The MIR type of a field (an `ldfld` operand token), so the lowering types the loaded
+    /// value -- a reference field reads an `ObjectRef` (a chained `a.Next.V` then dereferences
+    /// it), not an `int`. Defaults to `None` (the lowering falls back to `int32`).
+    fn field_type(&self, _operand: &Operand) -> Option<MirType> {
+        None
+    }
+
     /// The size in bytes of a value type (an `initobj` type-operand token), from its layout.
     /// Defaults to `None`.
     fn value_type_size(&self, _operand: &Operand) -> Option<u32> {
@@ -90,10 +103,58 @@ pub trait CallResolver {
 
     /// The value type a `newobj` constructs, named by its constructor token: the declaring
     /// type's [`MirType::ValueType`] (with size), so the lowering can allocate the instance.
-    /// Defaults to `None`.
+    /// `None` for a reference type (use [`CallResolver::newobj_reference_layout`]).
     fn newobj_value_type(&self, _operand: &Operand) -> Option<MirType> {
         None
     }
+
+    /// The layout of the reference type a `newobj` constructs, named by its constructor token:
+    /// its identity, payload size, and reference-field offsets (the GC trace map), so the
+    /// lowering can allocate the object on the heap. `None` for a value type or unresolved type.
+    fn newobj_reference_layout(&self, _operand: &Operand) -> Option<ReferenceLayout> {
+        None
+    }
+
+    /// The element of an array a `newarr` allocates, named by its element-type token: the array
+    /// type's identity (for the emitted TypeDesc) and the element's size in bytes (so the lowering
+    /// sizes `4 + length*element_size`). Defaults to `None` (the lowering cannot allocate it).
+    fn array_element(&self, _operand: &Operand) -> Option<ArrayElement> {
+        None
+    }
+
+    /// The byte offset of a static field (an `ldsfld`/`stsfld` operand token) within the module's
+    /// static storage region. Defaults to `None`.
+    fn static_field_offset(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
+    /// The heap layout for `box`/`unbox.any` of the value type named by the operand token: the
+    /// boxed payload's size (the value's width) and reference-offset map, with the type's identity
+    /// (its TypeDesc, which IS the box's type identity per the GC ABI -- payload is value bytes
+    /// only, no type tag). Defaults to `None`.
+    fn boxed_layout(&self, _operand: &Operand) -> Option<ReferenceLayout> {
+        None
+    }
+}
+
+/// The layout of a reference type a `newobj` allocates: its identity ([`TypeHandle`]), payload
+/// size in bytes, and the byte offsets of its reference fields within the payload (the GC map).
+pub struct ReferenceLayout {
+    /// The reference type's identity, for the emitted TypeDesc.
+    pub handle: TypeHandle,
+    /// The object's payload size in bytes.
+    pub size: u32,
+    /// The byte offsets of the fields holding an `ObjectRef`/`&`, for the collector to trace.
+    pub reference_offsets: Vec<u32>,
+}
+
+/// The element of an array a `newarr` allocates: the array type's identity (for its TypeDesc) and
+/// the size in bytes of one element.
+pub struct ArrayElement {
+    /// The array type's identity, for the emitted TypeDesc.
+    pub handle: TypeHandle,
+    /// The size in bytes of one element.
+    pub element_size: u32,
 }
 
 /// A [`CallResolver`] for call-free bodies: every resolution fails. The default for the
@@ -172,6 +233,8 @@ fn lower_with_source(
     let mut mir_blocks: Vec<BasicBlock> = Vec::with_capacity(blocks.len());
     let mut source_map: Vec<Vec<u32>> = Vec::with_capacity(blocks.len());
     let mut exit_locals: Vec<Vec<Option<ValueId>>> = vec![Vec::new(); blocks.len()];
+    let original_block_count = blocks.len();
+    let mut split_blocks: Vec<BasicBlock> = Vec::new();
 
     for (b, &(start, end)) in blocks.iter().enumerate() {
         let mut locals: Vec<Option<ValueId>> = if b == 0 {
@@ -194,7 +257,7 @@ fn lower_with_source(
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
         let mut il_index: Vec<u32> = Vec::new();
         let mut terminator: Option<Terminator> = None;
-        let mut last_local_addr: Option<(usize, u32)> = None;
+        let mut last_local_addr: Option<(AddrOf, u32)> = None;
 
         for i in start..end {
             let inst = &code[i];
@@ -211,8 +274,26 @@ fn lower_with_source(
                     local_count,
                     &mut stack,
                     &locals,
+                    local_types,
                     &mut value_types,
                     &mut insts,
+                    &mut split_blocks,
+                    original_block_count,
+                )?);
+            } else if is_last && inst.opcode == Opcode::Switch {
+                terminator = Some(build_switch(
+                    inst,
+                    end,
+                    &block_of,
+                    &is_merge,
+                    local_count,
+                    &mut stack,
+                    &locals,
+                    local_types,
+                    &mut value_types,
+                    &mut insts,
+                    &mut split_blocks,
+                    original_block_count,
                 )?);
             } else {
                 apply_value_op(
@@ -244,6 +325,7 @@ fn lower_with_source(
                     is_merge(next),
                     local_count,
                     &locals,
+                    local_types,
                     &mut value_types,
                     &mut insts,
                 );
@@ -270,6 +352,11 @@ fn lower_with_source(
             terminator: Some(terminator),
         });
         source_map.push(il_index);
+    }
+
+    for split in split_blocks {
+        mir_blocks.push(split);
+        source_map.push(Vec::new());
     }
 
     let ret = mir_blocks.iter().find_map(|blk| match &blk.terminator {
@@ -443,6 +530,57 @@ fn narrow_to_i32(
     Ok(())
 }
 
+/// Where a pending `ldloca`/`ldarga` address points -- a local or an argument slot -- which
+/// the next field-access or call op resolves to its MIR value.
+#[derive(Clone, Copy)]
+enum AddrOf {
+    /// A local variable, by index.
+    Local(usize),
+    /// An argument, by index.
+    Arg(usize),
+}
+
+impl AddrOf {
+    /// The MIR value of the addressed local or argument, if defined.
+    fn value(self, locals: &[Option<ValueId>], args: &[ValueId]) -> Option<ValueId> {
+        match self {
+            AddrOf::Local(n) => locals.get(n).and_then(|v| *v),
+            AddrOf::Arg(n) => args.get(n).copied(),
+        }
+    }
+}
+
+/// Resolves a pending address source to the MIR value it points at, allocating an
+/// uninitialized struct local's zeroed slot on demand: `Point a; a.X = 1;` (definite
+/// assignment, no `initobj`) writes through `&a` before `a` is ever stored, and an in-place
+/// `new A(...)` constructs into one. Arguments are always defined on entry, so the fill-in
+/// is locals-only.
+fn addr_base(
+    source: AddrOf,
+    locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
+    args: &[ValueId],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<ValueId, CilError> {
+    if let Some(base) = source.value(locals, args) {
+        return Ok(base);
+    }
+    let AddrOf::Local(n) = source else {
+        return Err(CilError::BadOperand);
+    };
+    let ty = local_types.get(n).copied().unwrap_or(MirType::I32);
+    let slot = new_value(value_types, ty);
+    let init = if matches!(ty, MirType::ValueType { .. }) {
+        Inst::InitStruct
+    } else {
+        Inst::ConstInt { ty, value: 0 }
+    };
+    insts.push((slot, init));
+    *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(slot);
+    Ok(slot)
+}
+
 /// Applies one value-producing CIL instruction to the abstract state. Control-flow
 /// terminators (`ret` and the branches) are handled by the caller, not here.
 #[allow(clippy::too_many_arguments)]
@@ -456,7 +594,7 @@ fn apply_value_op(
     insts: &mut Vec<(ValueId, Inst)>,
     strings: &mut Vec<(ValueId, Box<[u8]>)>,
     resolver: &dyn CallResolver,
-    last_local_addr: &mut Option<(usize, u32)>,
+    last_local_addr: &mut Option<(AddrOf, u32)>,
 ) -> Result<(), CilError> {
     match inst.opcode {
         Opcode::Nop => {}
@@ -490,7 +628,17 @@ fn apply_value_op(
             };
             store_local(value_types, locals, stack, insts, *n as usize)?;
         }
-        Opcode::Ldnull => push_const(value_types, stack, insts, 0),
+        Opcode::Ldnull => {
+            let result = new_value(value_types, MirType::ObjectRef);
+            insts.push((
+                result,
+                Inst::ConstInt {
+                    ty: MirType::ObjectRef,
+                    value: 0,
+                },
+            ));
+            stack.push(result);
+        }
         Opcode::LdcI4M1 => push_const(value_types, stack, insts, -1),
         Opcode::LdcI40 => push_const(value_types, stack, insts, 0),
         Opcode::LdcI41 => push_const(value_types, stack, insts, 1),
@@ -614,32 +762,24 @@ fn apply_value_op(
             let bytes = resolver
                 .user_string(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
-            let value = new_value(value_types, MirType::I32);
+            let utf16: Box<[u16]> = core::str::from_utf8(&bytes)
+                .unwrap_or("")
+                .encode_utf16()
+                .collect::<Vec<u16>>()
+                .into_boxed_slice();
+            let value = new_value(value_types, MirType::ObjectRef);
+            insts.push((value, Inst::StringLiteral { utf16 }));
             strings.push((value, bytes));
             stack.push(value);
         }
-        Opcode::Call => {
+        Opcode::Call | Opcode::Callvirt => {
             let info = resolver
                 .resolve(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
             let this = last_local_addr
                 .take()
-                .map(|(n, off)| -> Result<ValueId, CilError> {
-                    let base = match locals.get(n).and_then(|x| *x) {
-                        Some(base) => base,
-                        None => {
-                            let ty = local_types.get(n).copied().unwrap_or(MirType::I32);
-                            let slot = new_value(value_types, ty);
-                            let init = if matches!(ty, MirType::ValueType { .. }) {
-                                Inst::InitStruct
-                            } else {
-                                Inst::ConstInt { ty, value: 0 }
-                            };
-                            insts.push((slot, init));
-                            *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(slot);
-                            slot
-                        }
-                    };
+                .map(|(source, off)| -> Result<ValueId, CilError> {
+                    let base = addr_base(source, locals, local_types, args, value_types, insts)?;
                     let ptr = new_value(value_types, MirType::ManagedPtr);
                     insts.push((ptr, Inst::FieldAddr { base, offset: off }));
                     Ok(ptr)
@@ -692,23 +832,40 @@ fn apply_value_op(
                     let result = new_value(value_types, MirType::I32);
                     insts.push((result, Inst::WriteInt { value }));
                 }
+                CallTarget::Intrinsic(Intrinsic::StringEquals) => {
+                    let lhs = *call_args.first().ok_or(CilError::StackUnderflow)?;
+                    let rhs = *call_args.get(1).ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((result, Inst::StringEquals { lhs, rhs }));
+                    stack.push(result);
+                }
+                CallTarget::Intrinsic(Intrinsic::ObjectCtor) => {
+                }
             }
         }
         Opcode::LdlocaS | Opcode::Ldloca => {
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            *last_local_addr = Some((*n as usize, 0));
+            *last_local_addr = Some((AddrOf::Local(*n as usize), 0));
+        }
+        Opcode::LdargaS | Opcode::Ldarga => {
+            let Operand::Variable(n) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            *last_local_addr = Some((AddrOf::Arg(*n as usize), 0));
         }
         Opcode::Ldflda => {
-            let (n, offset) = last_local_addr.take().ok_or(CilError::BadOperand)?;
+            let (source, offset) = last_local_addr.take().ok_or(CilError::BadOperand)?;
             let field = resolver
                 .field_offset(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
-            *last_local_addr = Some((n, offset + field));
+            *last_local_addr = Some((source, offset + field));
         }
         Opcode::Initobj => {
-            let (n, _) = last_local_addr.take().ok_or(CilError::BadOperand)?;
+            let (AddrOf::Local(n), _) = last_local_addr.take().ok_or(CilError::BadOperand)? else {
+                return Err(CilError::BadOperand);
+            };
             let size = resolver
                 .value_type_size(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
@@ -722,8 +879,8 @@ fn apply_value_op(
         }
         Opcode::Ldfld => {
             let (base, base_offset) = match last_local_addr.take() {
-                Some((n, off)) => (
-                    locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?,
+                Some((source, off)) => (
+                    addr_base(source, locals, local_types, args, value_types, insts)?,
                     off,
                 ),
                 None => (stack.pop().ok_or(CilError::StackUnderflow)?, 0),
@@ -732,15 +889,16 @@ fn apply_value_op(
                 + resolver
                     .field_offset(&inst.operand)
                     .ok_or(CilError::BadOperand)?;
-            let result = new_value(value_types, MirType::I32);
+            let field_ty = resolver.field_type(&inst.operand).unwrap_or(MirType::I32);
+            let result = new_value(value_types, field_ty);
             insts.push((result, Inst::FieldLoad { base, offset }));
             stack.push(result);
         }
         Opcode::Stfld => {
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
             let (base, base_offset) = match last_local_addr.take() {
-                Some((n, off)) => (
-                    locals.get(n).and_then(|x| *x).ok_or(CilError::BadOperand)?,
+                Some((source, off)) => (
+                    addr_base(source, locals, local_types, args, value_types, insts)?,
                     off,
                 ),
                 None => (stack.pop().ok_or(CilError::StackUnderflow)?, 0),
@@ -759,23 +917,192 @@ fn apply_value_op(
                 },
             ));
         }
+        Opcode::Newarr => {
+            let element = resolver
+                .array_element(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let length = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = new_value(value_types, MirType::ObjectRef);
+            insts.push((
+                array,
+                Inst::AllocArray {
+                    handle: element.handle,
+                    length,
+                    element_size: element.element_size,
+                },
+            ));
+            stack.push(array);
+        }
+        Opcode::LdelemI8 => {
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::I64);
+            insts.push((
+                result,
+                Inst::ArrayLoad {
+                    array,
+                    index,
+                    element_size: 8,
+                    signed: true,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::StelemI8 => {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::ArrayStore {
+                    array,
+                    index,
+                    value,
+                    element_size: 8,
+                },
+            ));
+        }
+        Opcode::LdelemI1
+        | Opcode::LdelemU1
+        | Opcode::LdelemI2
+        | Opcode::LdelemU2
+        | Opcode::LdelemI4
+        | Opcode::LdelemU4 => {
+            let (element_size, signed) = match inst.opcode {
+                Opcode::LdelemI1 => (1, true),
+                Opcode::LdelemU1 => (1, false),
+                Opcode::LdelemI2 => (2, true),
+                Opcode::LdelemU2 => (2, false),
+                _ => (4, false),
+            };
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::I32);
+            insts.push((
+                result,
+                Inst::ArrayLoad {
+                    array,
+                    index,
+                    element_size,
+                    signed,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::StelemI1 | Opcode::StelemI2 | Opcode::StelemI4 => {
+            let element_size = match inst.opcode {
+                Opcode::StelemI1 => 1,
+                Opcode::StelemI2 => 2,
+                _ => 4,
+            };
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::ArrayStore {
+                    array,
+                    index,
+                    value,
+                    element_size,
+                },
+            ));
+        }
+        Opcode::LdelemRef => {
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::ObjectRef);
+            insts.push((
+                result,
+                Inst::ArrayLoad {
+                    array,
+                    index,
+                    element_size: 4,
+                    signed: false,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::StelemRef => {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::ArrayStore {
+                    array,
+                    index,
+                    value,
+                    element_size: 4,
+                },
+            ));
+        }
+        Opcode::Ldlen => {
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::I32);
+            insts.push((
+                result,
+                Inst::FieldLoad {
+                    base: array,
+                    offset: 0,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::Ldsfld => {
+            let offset = resolver
+                .static_field_offset(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let field_ty = resolver.field_type(&inst.operand).unwrap_or(MirType::I32);
+            let result = new_value(value_types, field_ty);
+            insts.push((result, Inst::StaticLoad { offset }));
+            stack.push(result);
+        }
+        Opcode::Stsfld => {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let offset = resolver
+                .static_field_offset(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((placeholder, Inst::StaticStore { offset, value }));
+        }
         Opcode::Newobj => {
             let info = resolver
                 .resolve(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
-            let ty = resolver
-                .newobj_value_type(&inst.operand)
-                .ok_or(CilError::BadOperand)?;
-            let temp = new_value(value_types, ty);
-            insts.push((temp, Inst::InitStruct));
-            let this = new_value(value_types, MirType::ManagedPtr);
-            insts.push((
-                this,
-                Inst::FieldAddr {
-                    base: temp,
-                    offset: 0,
-                },
-            ));
+            let (this, result_value) = match resolver.newobj_value_type(&inst.operand) {
+                Some(ty) => {
+                    let temp = new_value(value_types, ty);
+                    insts.push((temp, Inst::InitStruct));
+                    let this = new_value(value_types, MirType::ManagedPtr);
+                    insts.push((
+                        this,
+                        Inst::FieldAddr {
+                            base: temp,
+                            offset: 0,
+                        },
+                    ));
+                    (this, temp)
+                }
+                None => {
+                    let layout = resolver
+                        .newobj_reference_layout(&inst.operand)
+                        .ok_or(CilError::BadOperand)?;
+                    let obj = new_value(value_types, MirType::ObjectRef);
+                    insts.push((
+                        obj,
+                        Inst::Alloc {
+                            handle: layout.handle,
+                            payload_size: layout.size,
+                            ref_offsets: layout.reference_offsets.into_boxed_slice(),
+                        },
+                    ));
+                    (obj, obj)
+                }
+            };
             let explicit = info.args.saturating_sub(1);
             let mut call_args = Vec::with_capacity(info.args);
             for _ in 0..explicit {
@@ -796,7 +1123,53 @@ fn apply_value_op(
                 }
                 CallTarget::Intrinsic(_) => return Err(CilError::UnresolvedCall),
             }
-            stack.push(temp);
+            stack.push(result_value);
+        }
+        Opcode::Box => {
+            let layout = resolver
+                .boxed_layout(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            if layout.size > 4 {
+                return Err(CilError::Unsupported(inst.opcode));
+            }
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let obj = new_value(value_types, MirType::ObjectRef);
+            insts.push((
+                obj,
+                Inst::Alloc {
+                    handle: layout.handle,
+                    payload_size: layout.size,
+                    ref_offsets: layout.reference_offsets.into_boxed_slice(),
+                },
+            ));
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::FieldStore {
+                    base: obj,
+                    offset: 0,
+                    value,
+                },
+            ));
+            stack.push(obj);
+        }
+        Opcode::UnboxAny => {
+            let layout = resolver
+                .boxed_layout(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            if layout.size > 4 {
+                return Err(CilError::Unsupported(inst.opcode));
+            }
+            let obj = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::I32);
+            insts.push((
+                result,
+                Inst::FieldLoad {
+                    base: obj,
+                    offset: 0,
+                },
+            ));
+            stack.push(result);
         }
         other => return Err(CilError::Unsupported(other)),
     }
@@ -811,6 +1184,7 @@ fn merge_args(
     target_is_merge: bool,
     local_count: usize,
     locals: &[Option<ValueId>],
+    local_types: &[MirType],
     value_types: &mut Vec<MirType>,
     insts: &mut Vec<(ValueId, Inst)>,
 ) -> Vec<ValueId> {
@@ -821,14 +1195,14 @@ fn merge_args(
         .map(|slot| match locals.get(slot).copied().flatten() {
             Some(value) => value,
             None => {
-                let zero = new_value(value_types, MirType::I32);
-                insts.push((
-                    zero,
-                    Inst::ConstInt {
-                        ty: MirType::I32,
-                        value: 0,
-                    },
-                ));
+                let ty = local_types.get(slot).copied().unwrap_or(MirType::I32);
+                let zero = new_value(value_types, ty);
+                let init = if matches!(ty, MirType::ValueType { .. }) {
+                    Inst::InitStruct
+                } else {
+                    Inst::ConstInt { ty, value: 0 }
+                };
+                insts.push((zero, init));
                 zero
             }
         })
@@ -846,8 +1220,11 @@ fn build_branch(
     local_count: usize,
     stack: &mut Vec<ValueId>,
     locals: &[Option<ValueId>],
+    local_types: &[MirType],
     value_types: &mut Vec<MirType>,
     insts: &mut Vec<(ValueId, Inst)>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
 ) -> Result<Terminator, CilError> {
     let Operand::Target(target_instr) = &inst.operand else {
         return Err(CilError::BadOperand);
@@ -856,7 +1233,14 @@ fn build_branch(
 
     match control_flow::branch_kind(inst.opcode) {
         Some(control_flow::BranchKind::Unconditional) => {
-            let args = merge_args(is_merge(target), local_count, locals, value_types, insts);
+            let args = merge_args(
+                is_merge(target),
+                local_count,
+                locals,
+                local_types,
+                value_types,
+                insts,
+            );
             Ok(Terminator::Jump {
                 target: BlockId(target as u32),
                 args,
@@ -864,11 +1248,22 @@ fn build_branch(
         }
         Some(control_flow::BranchKind::Conditional) => {
             let other = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow)?;
-            if is_merge(target) || is_merge(other) {
-                return Err(CilError::UnsupportedControlFlow);
-            }
             let (cond, if_true, if_false) =
                 build_condition(inst.opcode, target, other, stack, value_types, insts)?;
+            let mut split = |block: usize| {
+                split_edge_to_merge(
+                    block,
+                    is_merge,
+                    local_count,
+                    locals,
+                    local_types,
+                    value_types,
+                    split_blocks,
+                    block_count,
+                )
+            };
+            let if_true = split(if_true);
+            let if_false = split(if_false);
             Ok(Terminator::Branch {
                 cond,
                 if_true: BlockId(if_true as u32),
@@ -879,6 +1274,175 @@ fn build_branch(
         }
         None => Err(CilError::UnsupportedControlFlow),
     }
+}
+
+/// Builds the terminator for a block ending in `switch`: a cascade of equality tests that
+/// realizes the jump table, since MIR has no switch terminator. CIL `switch (t0, .., t_{N-1})`
+/// pops an index (typed int32 / native int, treated unsigned for the range check) and branches
+/// to `t_index` when `index < N`, else falls through to `fallthrough` (the default). The
+/// equality cascade `index == 0 -> t0; index == 1 -> t1; ...; else default` matches that exactly:
+/// an index outside `[0, N-1]` equals no case and reaches the default. The case-0 test is this
+/// block's own terminator; tests for cases 1..N-1 become fresh param-less blocks chained through
+/// their not-matched edge. Every case target and the default route through `split_edge_to_merge`,
+/// so a merge target is still reached by a `Jump` that carries the locals (the switch block's
+/// locals, shared by every arm -- `switch` reads but does not write locals).
+#[allow(clippy::too_many_arguments)]
+fn build_switch(
+    inst: &Instruction,
+    fallthrough: usize,
+    block_of: &impl Fn(usize) -> Option<usize>,
+    is_merge: &impl Fn(usize) -> bool,
+    local_count: usize,
+    stack: &mut Vec<ValueId>,
+    locals: &[Option<ValueId>],
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+) -> Result<Terminator, CilError> {
+    let Operand::Switch(targets) = &inst.operand else {
+        return Err(CilError::BadOperand);
+    };
+    let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+
+    let default = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow)?;
+    let mut not_matched = split_edge_to_merge(
+        default,
+        is_merge,
+        local_count,
+        locals,
+        local_types,
+        value_types,
+        split_blocks,
+        block_count,
+    );
+
+    for case in (1..targets.len()).rev() {
+        let target = block_of(targets[case] as usize).ok_or(CilError::UnsupportedControlFlow)?;
+        let matched = split_edge_to_merge(
+            target,
+            is_merge,
+            local_count,
+            locals,
+            local_types,
+            value_types,
+            split_blocks,
+            block_count,
+        );
+        let test_block = block_count + split_blocks.len();
+        let mut test_insts: Vec<(ValueId, Inst)> = Vec::new();
+        let cond = emit_case_test(index, case as i64, value_types, &mut test_insts);
+        split_blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: test_insts,
+            terminator: Some(Terminator::Branch {
+                cond,
+                if_true: BlockId(matched as u32),
+                true_args: Vec::new(),
+                if_false: BlockId(not_matched as u32),
+                false_args: Vec::new(),
+            }),
+        });
+        not_matched = test_block;
+    }
+
+    let Some(&first) = targets.first() else {
+        return Ok(Terminator::Jump {
+            target: BlockId(not_matched as u32),
+            args: Vec::new(),
+        });
+    };
+    let target0 = block_of(first as usize).ok_or(CilError::UnsupportedControlFlow)?;
+    let matched = split_edge_to_merge(
+        target0,
+        is_merge,
+        local_count,
+        locals,
+        local_types,
+        value_types,
+        split_blocks,
+        block_count,
+    );
+    let cond = emit_case_test(index, 0, value_types, insts);
+    Ok(Terminator::Branch {
+        cond,
+        if_true: BlockId(matched as u32),
+        true_args: Vec::new(),
+        if_false: BlockId(not_matched as u32),
+        false_args: Vec::new(),
+    })
+}
+
+/// Emits `index == case` (one switch arm's selector equality) into `insts`, returning the
+/// boolean result. The constant is typed to match the index so the compare's operands agree
+/// (the index is int32 / native int, both `MirType::I32` on a 32-bit target).
+fn emit_case_test(
+    index: ValueId,
+    case: i64,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let index_ty = value_types
+        .get(index.index())
+        .copied()
+        .unwrap_or(MirType::I32);
+    let konst = new_value(value_types, index_ty);
+    insts.push((
+        konst,
+        Inst::ConstInt {
+            ty: index_ty,
+            value: case,
+        },
+    ));
+    let cond = new_value(value_types, MirType::I32);
+    insts.push((
+        cond,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: index,
+            rhs: konst,
+        },
+    ));
+    cond
+}
+
+/// If `block` is a merge, splits the critical edge into it: appends a fresh param-less block
+/// that jumps to the merge carrying the branching block's `locals`, and returns its index.
+/// Otherwise returns `block` unchanged. So a conditional branch never targets a merge directly.
+#[allow(clippy::too_many_arguments)]
+fn split_edge_to_merge(
+    block: usize,
+    is_merge: &impl Fn(usize) -> bool,
+    local_count: usize,
+    locals: &[Option<ValueId>],
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+) -> usize {
+    if !is_merge(block) {
+        return block;
+    }
+    let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+    let args = merge_args(
+        true,
+        local_count,
+        locals,
+        local_types,
+        value_types,
+        &mut insts,
+    );
+    let index = block_count + split_blocks.len();
+    split_blocks.push(BasicBlock {
+        params: Vec::new(),
+        insts,
+        terminator: Some(Terminator::Jump {
+            target: BlockId(block as u32),
+            args,
+        }),
+    });
+    index
 }
 
 /// Builds the condition value for a conditional branch and resolves which block is
@@ -938,7 +1502,12 @@ fn scan_slots(code: &[Instruction]) -> (usize, usize) {
             Opcode::Ldarg1 => args = args.max(2),
             Opcode::Ldarg2 => args = args.max(3),
             Opcode::Ldarg3 => args = args.max(4),
-            Opcode::LdargS | Opcode::Ldarg | Opcode::StargS | Opcode::Starg => {
+            Opcode::LdargS
+            | Opcode::Ldarg
+            | Opcode::StargS
+            | Opcode::Starg
+            | Opcode::LdargaS
+            | Opcode::Ldarga => {
                 if let Operand::Variable(n) = &instruction.operand {
                     args = args.max(*n as usize + 1);
                 }
@@ -1187,7 +1756,14 @@ mod control_flow {
                 out.push(index + 1);
             }
             None => {
-                if !is_return(inst.opcode) {
+                if inst.opcode == Opcode::Switch {
+                    if let Operand::Switch(targets) = &inst.operand {
+                        for &t in targets.iter() {
+                            out.push(t as usize);
+                        }
+                    }
+                    out.push(index + 1);
+                } else if !is_return(inst.opcode) {
                     out.push(index + 1);
                 }
             }
@@ -1205,6 +1781,13 @@ mod control_flow {
             if branch_kind(inst.opcode).is_some() {
                 if let Operand::Target(t) = &inst.operand {
                     leaders.insert(*t as usize);
+                }
+                leaders.insert(i + 1);
+            } else if inst.opcode == Opcode::Switch {
+                if let Operand::Switch(targets) = &inst.operand {
+                    for &t in targets.iter() {
+                        leaders.insert(t as usize);
+                    }
                 }
                 leaders.insert(i + 1);
             } else if is_return(inst.opcode) {
@@ -1508,6 +2091,130 @@ mod tests {
     }
 
     #[test]
+    fn lowers_ldarga_for_a_struct_argument() {
+        use lamella_token::Token;
+        struct Fields;
+        impl CallResolver for Fields {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn field_offset(&self, _operand: &Operand) -> Option<u32> {
+                Some(0)
+            }
+        }
+        let point = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(2),
+            size: 8,
+        };
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(99)),
+                Instruction::new(Opcode::Stfld, Operand::Token(Token::new(0x04, 1))),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &Fields, &[point], &[]).unwrap();
+        let arg0 = func.blocks[0].params[0];
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldStore { base, .. } if *base == arg0))
+        );
+        assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
+    fn i64_local_through_a_merge_is_typed() {
+        let i64s = [MirType::I64, MirType::I64];
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::ConvI8),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::new(Opcode::BrS, Operand::Target(9)),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::ConvI8),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::simple(Opcode::ConvI8),
+                Instruction::simple(Opcode::Clt),
+                Instruction::new(Opcode::BrtrueS, Operand::Target(4)),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Stloc1),
+                Instruction::simple(Opcode::Ldloc1),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &i64s).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::I64));
+    }
+
+    #[test]
+    fn lowers_string_op_equality_to_a_compare() {
+        struct StringMock;
+        impl CallResolver for StringMock {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 2,
+                    has_result: true,
+                    result_type: Some(MirType::I32),
+                    target: CallTarget::Intrinsic(Intrinsic::StringEquals),
+                })
+            }
+            fn user_string(&self, _operand: &Operand) -> Option<Box<[u8]>> {
+                Some(b"x".to_vec().into_boxed_slice())
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Ldstr, Operand::None),
+                Instruction::new(Opcode::Ldstr, Operand::None),
+                Instruction::new(Opcode::Call, Operand::None),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &StringMock).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts = &func.blocks[0].insts;
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|(_, i)| matches!(i, Inst::StringLiteral { .. }))
+                .count(),
+            2
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::StringEquals { .. }))
+        );
+        assert_eq!(func.ret, Some(MirType::I32));
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
     fn lowers_arguments_and_locals() {
         let body = MethodBodyImage {
             max_stack: 2,
@@ -1611,6 +2318,33 @@ mod tests {
     }
 
     #[test]
+    fn lowers_a_conditional_branch_into_a_merge() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::new(Opcode::BleS, Operand::Target(7)),
+                Instruction::simple(Opcode::LdcI47),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.blocks.len(), 4);
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
     fn discovers_an_if_else_cfg() {
         let code = [
             Instruction::simple(Opcode::Ldarg0),
@@ -1627,6 +2361,250 @@ mod tests {
         assert!(preds[0].is_empty());
         assert_eq!(preds[1], vec![0]);
         assert_eq!(preds[2], vec![0]);
+    }
+
+    #[test]
+    fn lowers_a_switch() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::Switch, Operand::Switch(vec![4, 6, 8].into())),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
+                Instruction::simple(Opcode::Ret),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(10)),
+                Instruction::simple(Opcode::Ret),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(20)),
+                Instruction::simple(Opcode::Ret),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(30)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let eq_tests = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|(_, i)| matches!(i, Inst::Compare { op: CmpOp::Eq, .. }))
+            .count();
+        assert_eq!(eq_tests, 3);
+        assert_eq!(func.blocks.len(), 7);
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn switch_splits_a_merge_case_edge() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::Switch, Operand::Switch(vec![3].into())),
+                Instruction::new(Opcode::BrS, Operand::Target(3)),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(42)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.blocks.len(), 4);
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn discovers_a_switch_cfg() {
+        let code = [
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::Switch, Operand::Switch(vec![4, 6, 8].into())),
+            Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
+            Instruction::simple(Opcode::Ret),
+            Instruction::new(Opcode::LdcI4S, Operand::Int8(10)),
+            Instruction::simple(Opcode::Ret),
+            Instruction::new(Opcode::LdcI4S, Operand::Int8(20)),
+            Instruction::simple(Opcode::Ret),
+            Instruction::new(Opcode::LdcI4S, Operand::Int8(30)),
+            Instruction::simple(Opcode::Ret),
+        ];
+        let blocks = control_flow::discover_blocks(&code);
+        assert_eq!(blocks, vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]);
+        let preds = control_flow::predecessors(&code, &blocks);
+        assert!(preds[0].is_empty());
+        assert_eq!(preds[1], vec![0]);
+        assert_eq!(preds[2], vec![0]);
+        assert_eq!(preds[3], vec![0]);
+        assert_eq!(preds[4], vec![0]);
+    }
+
+    #[test]
+    fn lowers_reference_array_element_access() {
+        use lamella_token::Token;
+        struct Arrays;
+        impl CallResolver for Arrays {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn array_element(&self, _: &Operand) -> Option<ArrayElement> {
+                Some(ArrayElement {
+                    handle: lamella_ir::TypeHandle(9),
+                    element_size: 4,
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 4,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::new(Opcode::Newarr, Operand::Token(Token::new(0x01, 2))),
+                Instruction::simple(Opcode::Dup),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Ldnull),
+                Instruction::simple(Opcode::StelemRef),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdelemRef),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &Arrays).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::ArrayStore {
+                element_size: 4,
+                ..
+            }
+        )));
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::ArrayLoad {
+                element_size: 4,
+                signed: false,
+                ..
+            }
+        )));
+        assert_eq!(func.ret, Some(MirType::ObjectRef));
+    }
+
+    #[test]
+    fn lowers_long_array_element_access() {
+        use lamella_token::Token;
+        struct LongArrays;
+        impl CallResolver for LongArrays {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn array_element(&self, _: &Operand) -> Option<ArrayElement> {
+                Some(ArrayElement {
+                    handle: lamella_ir::TypeHandle(8),
+                    element_size: 8,
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 4,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::new(Opcode::Newarr, Operand::Token(Token::new(0x01, 1))),
+                Instruction::simple(Opcode::Dup),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::new(Opcode::LdcI8, Operand::Int64(42)),
+                Instruction::simple(Opcode::StelemI8),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdelemI8),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &LongArrays).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::ArrayStore {
+                element_size: 8,
+                ..
+            }
+        )));
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::ArrayLoad {
+                element_size: 8,
+                ..
+            }
+        )));
+        assert_eq!(func.ret, Some(MirType::I64));
+    }
+
+    #[test]
+    fn lowers_box_and_unbox() {
+        use lamella_token::Token;
+        struct BoxMock;
+        impl CallResolver for BoxMock {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn boxed_layout(&self, _: &Operand) -> Option<ReferenceLayout> {
+                Some(ReferenceLayout {
+                    handle: lamella_ir::TypeHandle(7),
+                    size: 4,
+                    reference_offsets: Vec::new(),
+                })
+            }
+        }
+        let int = Operand::Token(Token::new(0x01, 7));
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
+                Instruction::new(Opcode::Box, int.clone()),
+                Instruction::new(Opcode::UnboxAny, int),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &BoxMock).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::Alloc {
+                payload_size: 4,
+                ..
+            }
+        )));
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldStore { offset: 0, .. }))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldLoad { offset: 0, .. }))
+        );
+        assert_eq!(func.ret, Some(MirType::I32));
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower_module_gc(&[func], 0x09).is_ok());
     }
 
     #[test]

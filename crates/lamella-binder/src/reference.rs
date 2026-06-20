@@ -68,6 +68,7 @@ fn type_info(assembly: &Assembly, type_def: &lamella_metadata::TypeDef) -> Optio
                 .map(|parameter| sigtype_to_symbol(assembly, parameter))
                 .collect(),
             is_static: !signature.has_this,
+            is_params: false,
             accessibility: Accessibility::Public,
         };
         let property = method_name
@@ -156,9 +157,37 @@ fn token_type_symbol(assembly: &Assembly, token: Token) -> TypeSymbol {
         _ => None,
     };
     match name {
-        Some(TypeName { namespace, name }) => named_symbol(namespace, name),
+        Some(TypeName { namespace, name }) => match special_for_named(namespace, name) {
+            Some(special) => TypeSymbol::Special(special),
+            None => named_symbol(namespace, name),
+        },
         None => TypeSymbol::Error,
     }
+}
+
+/// The [`SpecialType`] of a core BCL type named `System.<name>` (`Object`, `String`,
+/// or a numeric/`bool`/`char` primitive), or `None` for any other named type.
+fn special_for_named(namespace: &str, name: &str) -> Option<SpecialType> {
+    if namespace != "System" {
+        return None;
+    }
+    Some(match name {
+        "Object" => SpecialType::Object,
+        "String" => SpecialType::String,
+        "Boolean" => SpecialType::Boolean,
+        "Char" => SpecialType::Char,
+        "SByte" => SpecialType::SByte,
+        "Byte" => SpecialType::Byte,
+        "Int16" => SpecialType::Int16,
+        "UInt16" => SpecialType::UInt16,
+        "Int32" => SpecialType::Int32,
+        "UInt32" => SpecialType::UInt32,
+        "Int64" => SpecialType::Int64,
+        "UInt64" => SpecialType::UInt64,
+        "Single" => SpecialType::Single,
+        "Double" => SpecialType::Double,
+        _ => return None,
+    })
 }
 
 /// A named-type symbol from a namespace (empty or dotted) and a simple name.

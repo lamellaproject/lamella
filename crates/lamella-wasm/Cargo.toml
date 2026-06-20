@@ -19,6 +19,9 @@ lamella-ves = { path = "../lamella-ves" }
 lamella-dap = { path = "../lamella-dap", optional = true }
 # The compile feature pulls in the compiler (source -> assembly) for in-page builds.
 lamella-assemble = { path = "../lamella-assemble", optional = true }
+# Completion (IntelliSense) drives the binder + parser directly.
+lamella-binder = { path = "../lamella-binder", optional = true }
+lamella-syntax = { path = "../lamella-syntax", optional = true }
 serde_json = { version = "1", optional = true }
 
 [features]
@@ -29,8 +32,14 @@ selftest = []
 # debugging. Off by default so the run-only .wasm stays lean (no serde).
 dap = ["dep:lamella-dap", "dep:serde_json"]
 # Adds the in-page compiler (lamella_compile: C# source -> assembly + PDB + diagnostics)
-# so Studio compiles the user's own code client-side. Off by default.
-compile = ["dep:lamella-assemble", "dep:serde_json"]
+# and completion (lamella_complete: IntelliSense) so Studio builds + assists the user's
+# own code client-side. Off by default.
+compile = [
+    "dep:lamella-assemble",
+    "dep:lamella-binder",
+    "dep:lamella-syntax",
+    "dep:serde_json",
+]
 
 [lints]
 workspace = true

@@ -21,7 +21,9 @@ pub enum Value {
     /// host; the width becomes target-configurable with the device tiers.
     NativeInt(i64),
     /// A floating-point value. The CLI tracks one native float type `F`; it is
-    /// held as `f64` (III permits carrying higher internal precision).
+    /// held as `f64` (III permits carrying higher internal precision). Gated by `float`:
+    /// the no-float tier omits it and the floating-point opcodes that produce it.
+    #[cfg(feature = "float")]
     Float(f64),
     /// An object reference (`O`): a handle to a heap object.
     Object(ObjectRef),
@@ -37,7 +39,7 @@ pub enum Value {
 /// Where a managed pointer ([`Value::ByRef`]) points. A pointer into a frame names the
 /// frame by its index in the call stack, so a callee can dereference a pointer to its
 /// caller's local or argument; a pointer into the heap or statics is frame-independent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Location {
     /// A local-variable slot of the frame at the given call-stack index.
     Local {
@@ -77,6 +79,14 @@ pub enum Location {
         /// The boxed object.
         object: ObjectRef,
     },
+    /// A field within a value-type (struct) instance addressed by `base` -- the managed
+    /// pointer `ldflda` yields for a nested value-type field (e.g. `o.inner.x`).
+    Nested {
+        /// The location of the containing struct.
+        base: alloc::boxed::Box<Location>,
+        /// The field slot within that struct.
+        slot: u32,
+    },
 }
 
 impl Value {
@@ -87,6 +97,7 @@ impl Value {
         match self {
             Value::Int32(value) => *value != 0,
             Value::Int64(value) | Value::NativeInt(value) => *value != 0,
+            #[cfg(feature = "float")]
             Value::Float(value) => *value != 0.0,
             Value::Object(_) | Value::ByRef(_) | Value::Struct(_) => true,
             Value::Null => false,

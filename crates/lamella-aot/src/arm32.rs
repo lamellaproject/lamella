@@ -162,7 +162,16 @@ fn lower_inst(
         | Inst::FieldAddr { .. }
         | Inst::CopyStruct { .. } => return Err(LowerError::CallUnsupported),
         Inst::Call { .. } => return Err(LowerError::CallUnsupported),
-        Inst::SemihostWrite { .. } | Inst::WriteInt { .. } => {
+        Inst::SemihostWrite { .. }
+        | Inst::WriteInt { .. }
+        | Inst::StringLiteral { .. }
+        | Inst::StringEquals { .. }
+        | Inst::Alloc { .. }
+        | Inst::AllocArray { .. }
+        | Inst::ArrayLoad { .. }
+        | Inst::ArrayStore { .. }
+        | Inst::StaticLoad { .. }
+        | Inst::StaticStore { .. } => {
             return Err(LowerError::CallUnsupported);
         }
     }
@@ -241,17 +250,20 @@ fn load_const_word(
     Ok(())
 }
 
-/// Loads call arguments into the AAPCS registers starting at `start_reg`: each takes one
-/// register per word, a doubleword (i64/F64) is even-aligned, and overflow past r3 is a
-/// [`LowerError::CallUnsupported`].
+/// Loads call arguments per the AAPCS: each word into a register (`start_reg`..r3, a
+/// doubleword even-aligned), then the remainder into an 8-byte-aligned outgoing stack area.
+/// Returns the stack bytes reserved, which the caller reclaims (`add sp`) after the `BL`.
 fn load_call_args(
     enc: &mut Encoder,
     value_types: &[MirType],
     slot: &impl Fn(ValueId) -> u16,
     args: &[ValueId],
     start_reg: u8,
-) -> Result<(), LowerError> {
+) -> Result<u16, LowerError> {
     let mut reg = start_reg;
+    let mut reg_plan: Vec<(u8, ValueId, u16)> = Vec::new();
+    let mut stack_plan: Vec<(u16, ValueId, u16)> = Vec::new();
+    let mut stack_used = 0u16;
     for &a in args {
         let ty = value_types.get(a.0 as usize).copied();
         let words = ty.map_or(1, |t| (t.stack_slot_bytes() / 4).max(1));
@@ -259,34 +271,61 @@ fn load_call_args(
             reg += 1;
         }
         for w in 0..words {
-            let r = Reg::new(reg)
-                .filter(|_| reg < 4)
-                .ok_or(LowerError::CallUnsupported)?;
-            enc.ldr_sp(r, slot(a) + (w as u16) * 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            reg += 1;
+            let woff = (w as u16) * 4;
+            if reg < 4 {
+                reg_plan.push((reg, a, woff));
+                reg += 1;
+            } else {
+                stack_plan.push((stack_used, a, woff));
+                stack_used += 4;
+            }
         }
     }
-    Ok(())
+    let stack_bytes = (stack_used + 7) & !7;
+    if stack_bytes > 0 && start_reg != 0 {
+        return Err(LowerError::CallUnsupported);
+    }
+    if stack_bytes > 0 {
+        enc.sub_sp(stack_bytes)
+            .map_err(|_| LowerError::TooManyValues)?;
+    }
+    for &(stack_off, a, woff) in &stack_plan {
+        enc.ldr_sp(Reg::R3, slot(a) + stack_bytes + woff)
+            .map_err(|_| LowerError::TooManyValues)?;
+        enc.str_sp(Reg::R3, stack_off)
+            .map_err(|_| LowerError::TooManyValues)?;
+    }
+    for &(r, a, woff) in &reg_plan {
+        let dst = Reg::new(r).ok_or(LowerError::CallUnsupported)?;
+        enc.ldr_sp(dst, slot(a) + stack_bytes + woff)
+            .map_err(|_| LowerError::TooManyValues)?;
+    }
+    Ok(stack_bytes)
 }
 
-/// Lowers a straight-line integer [`Function`] whose value count exceeds the
-/// eight registers, by giving each value a stack slot at `[sp, #value*4]` and
-/// shuttling operands through scratch registers r0 and r1. The frame is bounded
-/// by the `SUB SP` reach (508 bytes, so up to 127 values); spilling is not yet
-/// combined with control flow.
+/// Whether a field-access base is a pointer to dereference -- a managed pointer (`this`) or
+/// a heap object reference -- rather than a value type held inline in its own stack slot.
+fn is_pointer_base(value_types: &[MirType], base: ValueId) -> bool {
+    matches!(
+        value_types.get(base.0 as usize),
+        Some(MirType::ManagedPtr | MirType::ObjectRef)
+    )
+}
+
 /// Lowers one instruction of a spilled function: load its operands from their
 /// stack slots into scratch registers (r0-r3), compute, and leave the result in
 /// r0 for the caller to store.
+#[allow(clippy::too_many_arguments)]
 fn lower_spilled_inst(
     enc: &mut Encoder,
     pool: &mut Vec<(Label, u32)>,
     strings: &mut Vec<(Label, Box<[u8]>)>,
+    string_blobs: &mut Vec<(Label, Box<[u16]>)>,
     value_types: &[MirType],
     slot: &impl Fn(ValueId) -> u16,
     inst: &Inst,
     func_labels: &[Label],
-) -> Result<(), LowerError> {
+) -> Result<Option<u32>, LowerError> {
     match inst {
         Inst::ConstInt {
             ty: MirType::I64,
@@ -339,9 +378,10 @@ fn lower_spilled_inst(
                     enc.eors(Reg::R1, Reg::R3)
                         .map_err(|_| LowerError::TooManyValues)?;
                 }
-                BinOp::Mul | BinOp::Shl | BinOp::ShrSigned | BinOp::ShrUnsigned => {
-                    return Err(LowerError::TooManyValues);
-                }
+                BinOp::Mul => emit_mul64(enc)?,
+                BinOp::Shl => emit_shl64(enc)?,
+                BinOp::ShrSigned => emit_shr64(enc, true)?,
+                BinOp::ShrUnsigned => emit_shr64(enc, false)?,
             }
         }
         Inst::Binary { op, lhs, rhs } => {
@@ -422,11 +462,17 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::Call { callee, args } => {
-            load_call_args(enc, value_types, slot, args, 0)?;
+            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
             let target = *func_labels
                 .get(*callee as usize)
                 .ok_or(LowerError::CallUnsupported)?;
             enc.bl(target);
+            let return_pc = enc.position();
+            if stack_bytes > 0 {
+                enc.add_sp(stack_bytes)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+            return Ok(Some(return_pc));
         }
         Inst::Store { address, value } => {
             enc.ldr_sp(Reg::R0, slot(*address))
@@ -443,7 +489,7 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::FieldLoad { base, offset } => {
-            if matches!(value_types.get(base.0 as usize), Some(MirType::ManagedPtr)) {
+            if is_pointer_base(value_types, *base) {
                 enc.ldr_sp(Reg::R0, slot(*base))
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.ldr_imm(Reg::R0, Reg::R0, *offset as u16)
@@ -460,7 +506,7 @@ fn lower_spilled_inst(
         } => {
             enc.ldr_sp(Reg::R0, slot(*value))
                 .map_err(|_| LowerError::TooManyValues)?;
-            if matches!(value_types.get(base.0 as usize), Some(MirType::ManagedPtr)) {
+            if is_pointer_base(value_types, *base) {
                 enc.ldr_sp(Reg::R1, slot(*base))
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.str_imm(Reg::R0, Reg::R1, *offset as u16)
@@ -471,8 +517,17 @@ fn lower_spilled_inst(
             }
         }
         Inst::FieldAddr { base, offset } => {
-            enc.add_sp_imm(Reg::R0, slot(*base) + *offset as u16)
-                .map_err(|_| LowerError::TooManyValues)?;
+            if is_pointer_base(value_types, *base) {
+                enc.ldr_sp(Reg::R0, slot(*base))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                if *offset != 0 {
+                    enc.adds_imm8(Reg::R0, *offset as u8)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+            } else {
+                enc.add_sp_imm(Reg::R0, slot(*base) + *offset as u16)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
         }
         Inst::InitStruct | Inst::CopyStruct { .. } => {}
         Inst::Convert { value, kind } => {
@@ -509,6 +564,258 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             emit_write_int(enc)?;
         }
+        Inst::StringLiteral { utf16 } => {
+            let entry = enc.new_label();
+            string_blobs.push((entry, utf16.clone()));
+            enc.adr(Reg::R0, entry)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::StringEquals { lhs, rhs } => {
+            enc.ldr_sp(Reg::R0, slot(*lhs))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*rhs))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_string_equals(enc)?;
+        }
+        Inst::ArrayLoad {
+            array,
+            index,
+            element_size,
+            signed,
+        } => {
+            enc.ldr_sp(Reg::R0, slot(*array))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*index))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_array_bounds_check(enc)?;
+            scale_index(enc, pool, *element_size)?;
+            enc.adds_imm3(Reg::R0, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            if *element_size == 8 {
+                enc.adds(Reg::R2, Reg::R0, Reg::R1)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R0, Reg::R2, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R1, Reg::R2, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                match (*element_size, *signed) {
+                    (1, true) => enc.ldrsb_reg(Reg::R0, Reg::R0, Reg::R1),
+                    (1, false) => enc.ldrb_reg(Reg::R0, Reg::R0, Reg::R1),
+                    (2, true) => enc.ldrsh_reg(Reg::R0, Reg::R0, Reg::R1),
+                    (2, false) => enc.ldrh_reg(Reg::R0, Reg::R0, Reg::R1),
+                    _ => enc.ldr_reg(Reg::R0, Reg::R0, Reg::R1),
+                }
+                .map_err(|_| LowerError::TooManyValues)?;
+            }
+        }
+        Inst::ArrayStore {
+            array,
+            index,
+            value,
+            element_size,
+        } => {
+            enc.ldr_sp(Reg::R0, slot(*array))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*index))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_array_bounds_check(enc)?;
+            scale_index(enc, pool, *element_size)?;
+            enc.adds_imm3(Reg::R0, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            if *element_size == 8 {
+                enc.adds(Reg::R0, Reg::R0, Reg::R1)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R2, slot(*value))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R3, slot(*value) + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R2, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R3, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                enc.ldr_sp(Reg::R2, slot(*value))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                match *element_size {
+                    1 => enc.strb_reg(Reg::R2, Reg::R0, Reg::R1),
+                    2 => enc.strh_reg(Reg::R2, Reg::R0, Reg::R1),
+                    _ => enc.str_reg(Reg::R2, Reg::R0, Reg::R1),
+                }
+                .map_err(|_| LowerError::TooManyValues)?;
+            }
+        }
+        Inst::StaticLoad { offset } => {
+            load_const_word(enc, pool, Reg::R0, STATIC_FIELD_BASE + *offset)?;
+            enc.ldr_imm(Reg::R0, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::StaticStore { offset, value } => {
+            load_const_word(enc, pool, Reg::R0, STATIC_FIELD_BASE + *offset)?;
+            enc.ldr_sp(Reg::R1, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.str_imm(Reg::R1, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::Alloc { .. } | Inst::AllocArray { .. } => return Err(LowerError::CallUnsupported),
+    }
+    Ok(None)
+}
+
+/// The absolute base of the module's static-field storage in RAM. A convention for now (a real
+/// target would place this region and pass its base like the GC allocator address); scalar statics
+/// live here at their byte offsets, between the semihosting output word and the GC heap.
+const STATIC_FIELD_BASE: u32 = 0x2000_1000;
+
+/// Emits the array bounds check: with `r0` = the array and `r1` = the index, traps (`udf`) unless
+/// `index < length` (the length at `[array+0]`), compared UNSIGNED so a negative index -- a huge
+/// unsigned value -- traps too, matching `IndexOutOfRangeException`'s effect. Until the exception
+/// model lands, an out-of-range access aborts rather than throwing a catchable exception.
+fn emit_array_bounds_check(enc: &mut Encoder) -> Result<(), LowerError> {
+    enc.ldr_imm(Reg::R2, Reg::R0, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.cmp_reg(Reg::R1, Reg::R2)
+        .map_err(|_| LowerError::TooManyValues)?;
+    let ok = enc.new_label();
+    enc.b_cond(Cond::CarryClear, ok);
+    enc.udf(0);
+    enc.bind_label(ok);
+    Ok(())
+}
+
+/// Emits a 64-bit multiply `a * b` (mod 2^64) with `a` in r0:r1 (lo:hi) and `b` in r2:r3, leaving
+/// the product in r0:r1. ARMv6-M has only the truncating 32x32->32 `MULS`, so the full 32x32->64 of
+/// the low halves is built from the four 16x16 partial products (each fits 32 bits); the cross terms
+/// a_lo*b_hi and a_hi*b_lo are scaled by 2^32, so only their low 32 bits reach the high word.
+/// r4-r7 are saved and restored, so nothing the caller holds in them is disturbed.
+fn emit_mul64(enc: &mut Encoder) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    enc.push_registers(0xF0, false);
+    enc.mov_reg(Reg::R4, Reg::R0);
+    enc.muls(Reg::R4, Reg::R3).map_err(oops)?;
+    enc.muls(Reg::R1, Reg::R2).map_err(oops)?;
+    enc.adds(Reg::R4, Reg::R4, Reg::R1).map_err(oops)?;
+    enc.uxth(Reg::R1, Reg::R0).map_err(oops)?;
+    enc.lsrs_imm(Reg::R0, Reg::R0, 16).map_err(oops)?;
+    enc.uxth(Reg::R3, Reg::R2).map_err(oops)?;
+    enc.lsrs_imm(Reg::R2, Reg::R2, 16).map_err(oops)?;
+    enc.mov_reg(Reg::R5, Reg::R1);
+    enc.muls(Reg::R5, Reg::R3).map_err(oops)?;
+    enc.mov_reg(Reg::R6, Reg::R0);
+    enc.muls(Reg::R6, Reg::R2).map_err(oops)?;
+    enc.muls(Reg::R1, Reg::R2).map_err(oops)?;
+    enc.muls(Reg::R0, Reg::R3).map_err(oops)?;
+    enc.lsls_imm(Reg::R7, Reg::R1, 16).map_err(oops)?;
+    enc.lsrs_imm(Reg::R1, Reg::R1, 16).map_err(oops)?;
+    enc.adds(Reg::R5, Reg::R5, Reg::R7).map_err(oops)?;
+    enc.adcs(Reg::R6, Reg::R1).map_err(oops)?;
+    enc.lsls_imm(Reg::R7, Reg::R0, 16).map_err(oops)?;
+    enc.lsrs_imm(Reg::R0, Reg::R0, 16).map_err(oops)?;
+    enc.adds(Reg::R5, Reg::R5, Reg::R7).map_err(oops)?;
+    enc.adcs(Reg::R6, Reg::R0).map_err(oops)?;
+    enc.adds(Reg::R6, Reg::R6, Reg::R4).map_err(oops)?;
+    enc.mov_reg(Reg::R0, Reg::R5);
+    enc.mov_reg(Reg::R1, Reg::R6);
+    enc.pop_registers(0xF0, false);
+    Ok(())
+}
+
+/// Emits a 64-bit left shift `a << n` with `a` in r0:r1 (lo:hi) and the count in r2, leaving the
+/// result in r0:r1. C# masks the count to 6 bits, and a register shift past 31 must be split, so
+/// `n >= 32` and `n < 32` are separate paths. r4-r7 are saved/restored.
+fn emit_shl64(enc: &mut Encoder) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    enc.push_registers(0xF0, false);
+    enc.movs_imm(Reg::R3, 63).map_err(oops)?;
+    enc.ands(Reg::R2, Reg::R3).map_err(oops)?;
+    enc.cmp_imm(Reg::R2, 32).map_err(oops)?;
+    let ge32 = enc.new_label();
+    let done = enc.new_label();
+    enc.b_cond(Cond::CarrySet, ge32);
+    enc.mov_reg(Reg::R4, Reg::R0);
+    enc.lsls_reg(Reg::R4, Reg::R2).map_err(oops)?;
+    enc.mov_reg(Reg::R5, Reg::R1);
+    enc.lsls_reg(Reg::R5, Reg::R2).map_err(oops)?;
+    enc.movs_imm(Reg::R6, 32).map_err(oops)?;
+    enc.subs(Reg::R6, Reg::R6, Reg::R2).map_err(oops)?;
+    enc.mov_reg(Reg::R7, Reg::R0);
+    enc.lsrs_reg(Reg::R7, Reg::R6).map_err(oops)?;
+    enc.orrs(Reg::R5, Reg::R7).map_err(oops)?;
+    enc.b(done);
+    enc.bind_label(ge32);
+    enc.movs_imm(Reg::R4, 0).map_err(oops)?;
+    enc.movs_imm(Reg::R6, 32).map_err(oops)?;
+    enc.subs(Reg::R6, Reg::R2, Reg::R6).map_err(oops)?;
+    enc.mov_reg(Reg::R5, Reg::R0);
+    enc.lsls_reg(Reg::R5, Reg::R6).map_err(oops)?;
+    enc.bind_label(done);
+    enc.mov_reg(Reg::R0, Reg::R4);
+    enc.mov_reg(Reg::R1, Reg::R5);
+    enc.pop_registers(0xF0, false);
+    Ok(())
+}
+
+/// Emits a 64-bit right shift `a >> n` with `a` in r0:r1 (lo:hi) and the count in r2, leaving the
+/// result in r0:r1. `signed` selects arithmetic (sign-filling, for `long`) over logical (zero-fill,
+/// for `ulong`); the high-word fill differs only in the `n >= 32` case. r4-r7 are saved/restored.
+fn emit_shr64(enc: &mut Encoder, signed: bool) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    enc.push_registers(0xF0, false);
+    enc.movs_imm(Reg::R3, 63).map_err(oops)?;
+    enc.ands(Reg::R2, Reg::R3).map_err(oops)?;
+    enc.cmp_imm(Reg::R2, 32).map_err(oops)?;
+    let ge32 = enc.new_label();
+    let done = enc.new_label();
+    enc.b_cond(Cond::CarrySet, ge32);
+    enc.mov_reg(Reg::R4, Reg::R0);
+    enc.lsrs_reg(Reg::R4, Reg::R2).map_err(oops)?;
+    enc.movs_imm(Reg::R6, 32).map_err(oops)?;
+    enc.subs(Reg::R6, Reg::R6, Reg::R2).map_err(oops)?;
+    enc.mov_reg(Reg::R7, Reg::R1);
+    enc.lsls_reg(Reg::R7, Reg::R6).map_err(oops)?;
+    enc.orrs(Reg::R4, Reg::R7).map_err(oops)?;
+    enc.mov_reg(Reg::R5, Reg::R1);
+    if signed {
+        enc.asrs_reg(Reg::R5, Reg::R2).map_err(oops)?;
+    } else {
+        enc.lsrs_reg(Reg::R5, Reg::R2).map_err(oops)?;
+    }
+    enc.b(done);
+    enc.bind_label(ge32);
+    enc.movs_imm(Reg::R6, 32).map_err(oops)?;
+    enc.subs(Reg::R6, Reg::R2, Reg::R6).map_err(oops)?;
+    enc.mov_reg(Reg::R4, Reg::R1);
+    if signed {
+        enc.asrs_reg(Reg::R4, Reg::R6).map_err(oops)?;
+        enc.asrs_imm(Reg::R5, Reg::R1, 31).map_err(oops)?;
+    } else {
+        enc.lsrs_reg(Reg::R4, Reg::R6).map_err(oops)?;
+        enc.movs_imm(Reg::R5, 0).map_err(oops)?;
+    }
+    enc.bind_label(done);
+    enc.mov_reg(Reg::R0, Reg::R4);
+    enc.mov_reg(Reg::R1, Reg::R5);
+    enc.pop_registers(0xF0, false);
+    Ok(())
+}
+
+/// Scales the array index in `r1` by `element_size` in place: a shift for a power of two, else a
+/// multiply (the constant goes through `r2`). Leaves `r1 *= element_size`.
+fn scale_index(
+    enc: &mut Encoder,
+    pool: &mut Vec<(Label, u32)>,
+    element_size: u32,
+) -> Result<(), LowerError> {
+    if element_size == 1 {
+        return Ok(());
+    }
+    if element_size.is_power_of_two() {
+        enc.lsls_imm(Reg::R1, Reg::R1, element_size.trailing_zeros() as u8)
+            .map_err(|_| LowerError::TooManyValues)?;
+    } else {
+        load_const_word(enc, pool, Reg::R2, element_size)?;
+        enc.muls(Reg::R1, Reg::R2)
+            .map_err(|_| LowerError::TooManyValues)?;
     }
     Ok(())
 }
@@ -574,22 +881,144 @@ fn emit_write_int(enc: &mut Encoder) -> Result<(), LowerError> {
     Ok(())
 }
 
+/// Emits `System.String::op_Equality`: an ordinal equality of the two string pointers in r0 and
+/// r1 (each an ObjectRef to the build's string blob, or null), leaving 0/1 in r0. Two nulls are
+/// equal, null and non-null are not, otherwise length-then-content over the stored units/bytes.
+/// Pure compares plus an element loop (no divide). Saves/restores r4-r7.
+fn emit_string_equals(enc: &mut Encoder) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    enc.push_registers(0b1111_0000, false);
+    let not_same = enc.new_label();
+    let zero = enc.new_label();
+    let equal = enc.new_label();
+    let done = enc.new_label();
+    let loop_top = enc.new_label();
+    enc.cmp_reg(Reg::R0, Reg::R1).map_err(oops)?;
+    enc.b_cond(Cond::Ne, not_same);
+    enc.movs_imm(Reg::R0, 1).map_err(oops)?;
+    enc.b(done);
+    enc.bind_label(not_same);
+    enc.cmp_imm(Reg::R0, 0).map_err(oops)?;
+    enc.b_cond(Cond::Eq, zero);
+    enc.cmp_imm(Reg::R1, 0).map_err(oops)?;
+    enc.b_cond(Cond::Eq, zero);
+    enc.ldr_imm(Reg::R4, Reg::R0, 0).map_err(oops)?;
+    enc.ldr_imm(Reg::R5, Reg::R1, 0).map_err(oops)?;
+    enc.cmp_reg(Reg::R4, Reg::R5).map_err(oops)?;
+    enc.b_cond(Cond::Ne, zero);
+    #[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
+    {
+        enc.adds_imm8(Reg::R0, 4).map_err(oops)?;
+        enc.adds_imm8(Reg::R1, 4).map_err(oops)?;
+        enc.lsls_imm(Reg::R4, Reg::R4, 1).map_err(oops)?;
+        enc.movs_imm(Reg::R6, 0).map_err(oops)?;
+        enc.bind_label(loop_top);
+        enc.cmp_reg(Reg::R6, Reg::R4).map_err(oops)?;
+        enc.b_cond(Cond::CarrySet, equal);
+        enc.ldrh_reg(Reg::R7, Reg::R0, Reg::R6).map_err(oops)?;
+        enc.ldrh_reg(Reg::R5, Reg::R1, Reg::R6).map_err(oops)?;
+        enc.cmp_reg(Reg::R7, Reg::R5).map_err(oops)?;
+        enc.b_cond(Cond::Ne, zero);
+        enc.adds_imm8(Reg::R6, 2).map_err(oops)?;
+        enc.b(loop_top);
+    }
+    #[cfg(any(feature = "string-utf8", feature = "string-utf8-wtf8"))]
+    {
+        enc.ldr_imm(Reg::R4, Reg::R0, 4).map_err(oops)?;
+        enc.ldr_imm(Reg::R5, Reg::R1, 4).map_err(oops)?;
+        enc.cmp_reg(Reg::R4, Reg::R5).map_err(oops)?;
+        enc.b_cond(Cond::Ne, zero);
+        enc.adds_imm8(Reg::R0, 8).map_err(oops)?;
+        enc.adds_imm8(Reg::R1, 8).map_err(oops)?;
+        enc.movs_imm(Reg::R6, 0).map_err(oops)?;
+        enc.bind_label(loop_top);
+        enc.cmp_reg(Reg::R6, Reg::R4).map_err(oops)?;
+        enc.b_cond(Cond::CarrySet, equal);
+        enc.ldrb_reg(Reg::R7, Reg::R0, Reg::R6).map_err(oops)?;
+        enc.ldrb_reg(Reg::R5, Reg::R1, Reg::R6).map_err(oops)?;
+        enc.cmp_reg(Reg::R7, Reg::R5).map_err(oops)?;
+        enc.b_cond(Cond::Ne, zero);
+        enc.adds_imm8(Reg::R6, 1).map_err(oops)?;
+        enc.b(loop_top);
+    }
+    enc.bind_label(equal);
+    enc.movs_imm(Reg::R0, 1).map_err(oops)?;
+    enc.b(done);
+    enc.bind_label(zero);
+    enc.movs_imm(Reg::R0, 0).map_err(oops)?;
+    enc.bind_label(done);
+    enc.pop_registers(0b1111_0000, false);
+    Ok(())
+}
+
+/// Encodes a string's UTF-16 units to the build's UTF-8 storage bytes: standard UTF-8 (lossy on
+/// lone surrogates) for `string-utf8`, surrogate-preserving WTF-8 for `string-utf8-wtf8`.
+#[cfg(all(feature = "string-utf8", not(feature = "string-utf8-wtf8")))]
+fn encode_string_bytes(units: &[u16]) -> Vec<u8> {
+    alloc::string::String::from_utf16_lossy(units).into_bytes()
+}
+
+/// WTF-8: a surrogate pair combines to its code point; a lone surrogate is encoded as its own
+/// (3-byte) code point, preserving the interpreter's surrogate parity.
+#[cfg(feature = "string-utf8-wtf8")]
+fn encode_string_bytes(units: &[u16]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < units.len() {
+        let u = units[i] as u32;
+        let code = if (0xD800..=0xDBFF).contains(&u)
+            && i + 1 < units.len()
+            && (0xDC00..=0xDFFF).contains(&(units[i + 1] as u32))
+        {
+            let lo = units[i + 1] as u32;
+            i += 2;
+            0x1_0000 + ((u - 0xD800) << 10) + (lo - 0xDC00)
+        } else {
+            i += 1;
+            u
+        };
+        if code < 0x80 {
+            out.push(code as u8);
+        } else if code < 0x800 {
+            out.push(0xC0 | (code >> 6) as u8);
+            out.push(0x80 | (code & 0x3F) as u8);
+        } else if code < 0x1_0000 {
+            out.push(0xE0 | (code >> 12) as u8);
+            out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+            out.push(0x80 | (code & 0x3F) as u8);
+        } else {
+            out.push(0xF0 | (code >> 18) as u8);
+            out.push(0x80 | ((code >> 12) & 0x3F) as u8);
+            out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+            out.push(0x80 | (code & 0x3F) as u8);
+        }
+    }
+    out
+}
+
 /// Lowers a function whose values do not fit in registers into a shared encoder.
 /// Every value gets a stack slot; each instruction loads its operands into scratch
 /// registers, computes, and stores the result. Control flow is handled: because a
 /// block's parameter values are distinct from any argument value, the parameter
 /// copies on a jump need no ordering. `func_labels` resolves calls.
+#[allow(clippy::too_many_arguments)]
 fn lower_spilled_into(
     func: &Function,
     enc: &mut Encoder,
     func_labels: &[Label],
+    alloc_addr: Option<u32>,
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
+    stack_maps: &mut Vec<StackMapEntry>,
 ) -> Result<(), LowerError> {
-    let has_calls = func
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
+    let has_calls = func.blocks.iter().any(|b| {
+        b.insts.iter().any(|(_, i)| {
+            matches!(
+                i,
+                Inst::Call { .. } | Inst::Alloc { .. } | Inst::AllocArray { .. }
+            )
+        })
+    });
     let lr_bytes = if has_calls { 4 } else { 0 };
     let mut offsets: Vec<u16> = Vec::with_capacity(func.value_types.len());
     let mut used = 0u16;
@@ -609,8 +1038,27 @@ fn lower_spilled_into(
     let frame = frame as u16;
     let slot = |v: ValueId| offsets[v.0 as usize];
 
+    let safepoints = crate::regalloc::safepoint_roots(func, &func.value_types);
+    let record_safepoint =
+        |stack_maps: &mut Vec<StackMapEntry>, index: usize, inst_pos: usize, return_pc: u32| {
+            if let Some(roots) = safepoints
+                .get(index)
+                .and_then(|b| b.get(inst_pos))
+                .and_then(Option::as_ref)
+            {
+                stack_maps.push(StackMapEntry {
+                    return_pc,
+                    frame_size: frame,
+                    ref_offsets: roots.iter().map(|v| slot(*v)).collect(),
+                });
+            }
+        };
+
     let mut pool: Vec<(Label, u32)> = Vec::new();
     let mut strings: Vec<(Label, Box<[u8]>)> = Vec::new();
+    let mut string_blobs: Vec<(Label, Box<[u16]>)> = Vec::new();
+    let mut type_descs: Vec<(Label, Box<[u32]>)> = Vec::new();
+    let mut type_desc_labels: Vec<(lamella_ir::TypeHandle, Label)> = Vec::new();
     if has_calls {
         enc.push_registers(0, true);
     }
@@ -626,6 +1074,7 @@ fn lower_spilled_into(
             .map_err(|_| LowerError::TooManyValues)?;
         reg = 1;
     }
+    let mut stack_param_off = 0u16;
     for &param in &entry_block.params {
         let ty = func.value_type(param);
         let words = ty.map_or(1, |t| (t.stack_slot_bytes() / 4).max(1));
@@ -633,12 +1082,19 @@ fn lower_spilled_into(
             reg += 1;
         }
         for w in 0..words {
-            let r = Reg::new(reg)
-                .filter(|_| reg < 4)
-                .ok_or(LowerError::TooManyValues)?;
-            enc.str_sp(r, slot(param) + (w as u16) * 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            reg += 1;
+            let woff = (w as u16) * 4;
+            if reg < 4 {
+                let r = Reg::new(reg).unwrap_or(Reg::R0);
+                enc.str_sp(r, slot(param) + woff)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                reg += 1;
+            } else {
+                enc.ldr_sp(Reg::R0, frame + lr_bytes as u16 + stack_param_off)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_sp(Reg::R0, slot(param) + woff)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                stack_param_off += 4;
+            }
         }
     }
 
@@ -690,18 +1146,108 @@ fn lower_spilled_into(
                         .get(*callee as usize)
                         .ok_or(LowerError::CallUnsupported)?;
                     enc.bl(target);
+                    record_safepoint(stack_maps, index, inst_pos, enc.position());
                     continue;
                 }
             }
-            lower_spilled_inst(
+            if let Inst::Alloc {
+                handle,
+                payload_size,
+                ref_offsets,
+            } = inst
+            {
+                let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
+                let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
+                    Some((_, label)) => *label,
+                    None => {
+                        let label = enc.new_label();
+                        let mut words: Vec<u32> = Vec::with_capacity(2 + ref_offsets.len());
+                        words.push(*payload_size);
+                        words.push(ref_offsets.len() as u32);
+                        words.extend_from_slice(ref_offsets);
+                        type_descs.push((label, words.into_boxed_slice()));
+                        type_desc_labels.push((*handle, label));
+                        label
+                    }
+                };
+                load_const_word(enc, &mut pool, Reg::R0, *payload_size)?;
+                enc.adr(Reg::R1, desc_label)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                load_const_word(enc, &mut pool, Reg::R2, alloc)?;
+                enc.blx(Reg::R2);
+                record_safepoint(stack_maps, index, inst_pos, enc.position());
+                let ok = enc.new_label();
+                enc.cmp_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.b_cond(Cond::Ne, ok);
+                enc.udf(0);
+                enc.bind_label(ok);
+                enc.str_sp(Reg::R0, slot(*result))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                continue;
+            }
+            if let Inst::AllocArray {
+                handle,
+                length,
+                element_size,
+            } = inst
+            {
+                let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
+                let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
+                    Some((_, label)) => *label,
+                    None => {
+                        let label = enc.new_label();
+                        type_descs.push((label, alloc::vec![0u32, 0u32].into_boxed_slice()));
+                        type_desc_labels.push((*handle, label));
+                        label
+                    }
+                };
+                enc.ldr_sp(Reg::R0, slot(*length))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                if *element_size != 1 {
+                    if element_size.is_power_of_two() {
+                        enc.lsls_imm(Reg::R0, Reg::R0, element_size.trailing_zeros() as u8)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    } else {
+                        load_const_word(enc, &mut pool, Reg::R1, *element_size)?;
+                        enc.muls(Reg::R0, Reg::R1)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
+                }
+                enc.adds_imm8(Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.adr(Reg::R1, desc_label)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                load_const_word(enc, &mut pool, Reg::R2, alloc)?;
+                enc.blx(Reg::R2);
+                record_safepoint(stack_maps, index, inst_pos, enc.position());
+                let ok = enc.new_label();
+                enc.cmp_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.b_cond(Cond::Ne, ok);
+                enc.udf(0);
+                enc.bind_label(ok);
+                enc.ldr_sp(Reg::R1, slot(*length))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R1, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_sp(Reg::R0, slot(*result))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                continue;
+            }
+            let call_pc = lower_spilled_inst(
                 enc,
                 &mut pool,
                 &mut strings,
+                &mut string_blobs,
                 &func.value_types,
                 &slot,
                 inst,
                 func_labels,
             )?;
+            if let Some(return_pc) = call_pc {
+                record_safepoint(stack_maps, index, inst_pos, return_pc);
+            }
             enc.str_sp(Reg::R0, slot(*result))
                 .map_err(|_| LowerError::TooManyValues)?;
             if func.value_type(*result) == Some(MirType::I64) {
@@ -805,17 +1351,59 @@ fn lower_spilled_into(
         enc.bind_label(entry);
         enc.emit_bytes(&text);
     }
+    for (entry, utf16) in string_blobs {
+        enc.align_to_word();
+        enc.bind_label(entry);
+        #[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
+        {
+            enc.emit_word(utf16.len() as u32);
+            for &unit in utf16.iter() {
+                enc.emit_u16(unit);
+            }
+        }
+        #[cfg(any(feature = "string-utf8", feature = "string-utf8-wtf8"))]
+        {
+            let bytes = encode_string_bytes(&utf16);
+            enc.emit_word(utf16.len() as u32);
+            enc.emit_word(bytes.len() as u32);
+            enc.emit_bytes(&bytes);
+        }
+    }
+    for (entry, words) in type_descs {
+        enc.align_to_word();
+        enc.bind_label(entry);
+        for &word in words.iter() {
+            enc.emit_word(word);
+        }
+    }
     Ok(())
 }
 
 /// Lowers an integer [`Function`] -- straight-line or branching -- to ARMv6-M
 /// Thumb machine code via the AAPCS convention. See the module documentation for
 /// the supported slice.
-/// How a function's values are placed: in registers (with the callee-saved set to
-/// preserve), or spilled to the stack when more values are live at once than there
-/// are registers.
+/// Where a value lives in a register/spill mix: a machine register, or a spill slot at
+/// a byte offset from the stack pointer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Home {
+    Reg(Reg),
+    Spill(u16),
+}
+
+/// How a function's values are placed: all in registers (with the callee-saved set to
+/// preserve); a register/spill mix (the rest reach the stack, reserving r0/r1 to shuttle
+/// spilled operands); or every value spilled (the fully general path for the cases the
+/// register path does not model -- i64, value types, semihosting, calls with live values).
 enum Assignment {
-    Registers { regs: Vec<Reg>, saved: u8 },
+    Registers {
+        regs: Vec<Reg>,
+        saved: u8,
+    },
+    Mixed {
+        homes: Vec<Home>,
+        saved: u8,
+        frame: u16,
+    },
     Spilled,
 }
 
@@ -824,11 +1412,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     if lamella_ir::verify(func).is_err() {
         return Err(LowerError::NotWellFormed);
     }
-    if func
-        .value_types
-        .iter()
-        .any(|ty| ty.is_float() || matches!(ty, MirType::ObjectRef))
-    {
+    if func.value_types.iter().any(|ty| ty.is_float()) {
         return Err(LowerError::NonIntegerValue);
     }
     if func.value_types.iter().any(|ty| {
@@ -839,10 +1423,41 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     }) {
         return Ok(Assignment::Spilled);
     }
+    if func.params.len() > 4
+        || func.blocks.iter().any(|b| {
+            b.insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::Call { args, .. } if args.len() > 4))
+        })
+    {
+        return Ok(Assignment::Spilled);
+    }
     if func.blocks.iter().any(|b| {
-        b.insts
-            .iter()
-            .any(|(_, i)| matches!(i, Inst::SemihostWrite { .. } | Inst::WriteInt { .. }))
+        b.insts.iter().any(|(_, i)| {
+            matches!(
+                i,
+                Inst::SemihostWrite { .. }
+                    | Inst::WriteInt { .. }
+                    | Inst::StringLiteral { .. }
+                    | Inst::StringEquals { .. }
+                    | Inst::Alloc { .. }
+                    | Inst::AllocArray { .. }
+                    | Inst::ArrayLoad { .. }
+                    | Inst::ArrayStore { .. }
+                    | Inst::StaticLoad { .. }
+                    | Inst::StaticStore { .. }
+            )
+        })
+    }) {
+        return Ok(Assignment::Spilled);
+    }
+    if func.blocks.iter().any(|b| {
+        b.insts.iter().any(|(_, i)| {
+            matches!(
+                i,
+                Inst::FieldLoad { .. } | Inst::FieldStore { .. } | Inst::FieldAddr { .. }
+            )
+        })
     }) {
         return Ok(Assignment::Spilled);
     }
@@ -853,37 +1468,88 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     if has_calls && crate::regalloc::Liveness::analyze(func).any_value_live_across_call(func) {
         return Ok(Assignment::Spilled);
     }
-    let regs: Vec<Reg> = if func.value_types.len() <= 8 {
-        (0..func.value_types.len())
+    if func.value_types.len() <= 8 {
+        let regs: Vec<Reg> = (0..func.value_types.len())
             .map(|i| Reg::new(i as u8).unwrap_or(Reg::R0))
-            .collect()
-    } else {
-        let live = crate::regalloc::Liveness::analyze(func);
-        let intervals = crate::regalloc::live_intervals(func, &live);
-        let allocation = crate::regalloc::allocate(&intervals, 8);
-        if allocation.spill_count > 0 {
-            return Ok(Assignment::Spilled);
-        }
-        allocation
+            .collect();
+        return Ok(Assignment::Registers {
+            saved: contiguous_callee_saved(&regs),
+            regs,
+        });
+    }
+    let live = crate::regalloc::Liveness::analyze(func);
+    let intervals = crate::regalloc::live_intervals(func, &live);
+    let full = crate::regalloc::allocate(&intervals, 8);
+    if full.spill_count == 0 {
+        let regs: Vec<Reg> = full
             .locations
             .iter()
             .map(|loc| match loc {
                 crate::regalloc::Location::Register(r) => Reg::new(*r as u8).unwrap_or(Reg::R0),
                 crate::regalloc::Location::Spill(_) => Reg::R0,
             })
-            .collect()
-    };
-    let registers_used = regs
+            .collect();
+        return Ok(Assignment::Registers {
+            saved: contiguous_callee_saved(&regs),
+            regs,
+        });
+    }
+    let allocatable = [Reg::R2, Reg::R3, Reg::R4, Reg::R5, Reg::R6, Reg::R7];
+    let mixed = crate::regalloc::allocate(&intervals, allocatable.len());
+    let homes: Vec<Home> = mixed
+        .locations
+        .iter()
+        .map(|loc| match loc {
+            crate::regalloc::Location::Register(r) => Home::Reg(allocatable[*r as usize]),
+            crate::regalloc::Location::Spill(slot) => Home::Spill((*slot as u16) * 4),
+        })
+        .collect();
+    let saved = sparse_callee_saved(&homes);
+    let has_calls = func
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
+    let lr_bytes = if has_calls { 4 } else { 0 };
+    let pushed = saved.count_ones() as usize * 4 + lr_bytes;
+    let frame = ((pushed + mixed.spill_count as usize * 4 + 7) & !7usize) - pushed;
+    if frame > 508 {
+        return Err(LowerError::TooManyValues);
+    }
+    Ok(Assignment::Mixed {
+        homes,
+        saved,
+        frame: frame as u16,
+    })
+}
+
+/// The callee-saved push mask (r4-r7) for a contiguous register assignment: every
+/// preserved register up to the highest one used. Matches the trivial and no-spill
+/// scans, which claim registers in a low-to-high prefix.
+fn contiguous_callee_saved(regs: &[Reg]) -> u8 {
+    let used = regs
         .iter()
         .map(|r| u32::from(r.number()) + 1)
         .max()
         .unwrap_or(0);
-    let saved: u8 = if registers_used > 4 {
-        (((1u16 << registers_used.min(8)) - (1u16 << 4)) & 0xF0) as u8
+    if used > 4 {
+        (((1u16 << used.min(8)) - (1u16 << 4)) & 0xF0) as u8
     } else {
         0
-    };
-    Ok(Assignment::Registers { regs, saved })
+    }
+}
+
+/// The callee-saved push mask (r4-r7) for a register/spill mix: exactly the preserved
+/// registers that hold a value, since the scan over r2-r7 may leave gaps.
+fn sparse_callee_saved(homes: &[Home]) -> u8 {
+    let mut mask = 0u8;
+    for h in homes {
+        if let Home::Reg(r) = h {
+            if (4..=7).contains(&r.number()) {
+                mask |= 1 << r.number();
+            }
+        }
+    }
+    mask
 }
 
 /// Lowers a `Call`: arguments into r0-r3, `BL` to the callee, result from r0. The
@@ -1059,6 +1725,350 @@ fn lower_into(
     Ok(())
 }
 
+/// Lowers a function whose values do not all fit in registers into a shared encoder,
+/// as a register/spill mix. Register-homed values stay in their register; a spilled
+/// value lives in the stack frame and is loaded into a scratch register (r0/r1) around
+/// each instruction that uses it, then stored back if it is the result. Control flow,
+/// calls, and loop back-edges reuse the same per-instruction emitter as the all-register
+/// path; only operand loads and result stores are added. `func_labels` resolves calls.
+#[allow(clippy::too_many_arguments)]
+fn lower_mixed_into(
+    func: &Function,
+    enc: &mut Encoder,
+    homes: &[Home],
+    saved: u8,
+    frame: u16,
+    func_labels: &[Label],
+    source_map: &[Vec<u32>],
+    line_table: &mut Vec<(u32, u32)>,
+) -> Result<(), LowerError> {
+    let has_calls = func
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
+    let home = |v: ValueId| homes.get(v.index()).copied().unwrap_or(Home::Reg(Reg::R0));
+
+    if has_calls || saved != 0 {
+        enc.push_registers(saved, has_calls);
+    }
+    if frame > 0 {
+        enc.sub_sp(frame).map_err(|_| LowerError::TooManyValues)?;
+    }
+
+    let mut pool: Vec<(Label, u32)> = Vec::new();
+
+    let entry_block = func
+        .blocks
+        .get(func.entry.index())
+        .ok_or(LowerError::ControlFlowUnsupported)?;
+    let param_moves: Vec<(Home, Home)> = entry_block
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (home(*p), Home::Reg(Reg::new(i as u8).unwrap_or(Reg::R0))))
+        .collect();
+    emit_home_moves(enc, &param_moves, Reg::R0)?;
+
+    let block_labels: Vec<Label> = (0..func.blocks.len()).map(|_| enc.new_label()).collect();
+    match block_labels.get(func.entry.index()) {
+        Some(entry) if func.entry != BlockId(0) => enc.b(*entry),
+        Some(_) => {}
+        None => return Err(LowerError::ControlFlowUnsupported),
+    }
+
+    for (index, block) in func.blocks.iter().enumerate() {
+        enc.bind_label(block_labels[index]);
+
+        let fused = match &block.terminator {
+            Some(Terminator::Branch { cond, .. }) => match block.insts.last() {
+                Some((r, Inst::Compare { op, lhs, rhs })) if r == cond => Some((*op, *lhs, *rhs)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let body = if fused.is_some() {
+            &block.insts[..block.insts.len() - 1]
+        } else {
+            &block.insts[..]
+        };
+
+        for (inst_pos, (result, inst)) in body.iter().enumerate() {
+            if let Some(&cil) = source_map.get(index).and_then(|b| b.get(inst_pos)) {
+                line_table.push((enc.position(), cil));
+            }
+            if let Inst::Call { callee, args } = inst {
+                lower_mixed_call(enc, &home, *result, *callee, args, func_labels)?;
+            } else {
+                lower_mixed_value(enc, &mut pool, &home, *result, inst)?;
+            }
+        }
+
+        if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
+            line_table.push((enc.position(), cil));
+        }
+        match &block.terminator {
+            Some(Terminator::Return(value)) => {
+                if let Some(v) = value {
+                    load_home(enc, home(*v), Reg::R0)?;
+                }
+                if frame > 0 {
+                    enc.add_sp(frame).map_err(|_| LowerError::TooManyValues)?;
+                }
+                if has_calls {
+                    enc.pop_registers(saved, true);
+                } else if saved != 0 {
+                    enc.pop_registers(saved, false);
+                    enc.bx(Reg::LR);
+                } else {
+                    enc.bx(Reg::LR);
+                }
+            }
+            Some(Terminator::Jump { target, args }) => {
+                let params = &func
+                    .block(*target)
+                    .ok_or(LowerError::ControlFlowUnsupported)?
+                    .params;
+                if args.len() != params.len() {
+                    return Err(LowerError::ControlFlowUnsupported);
+                }
+                let moves: Vec<(Home, Home)> = params
+                    .iter()
+                    .zip(args)
+                    .map(|(p, a)| (home(*p), home(*a)))
+                    .collect();
+                emit_home_moves(enc, &moves, Reg::R0)?;
+                let label = *block_labels
+                    .get(target.index())
+                    .ok_or(LowerError::ControlFlowUnsupported)?;
+                enc.b(label);
+            }
+            Some(Terminator::Branch {
+                cond,
+                if_true,
+                true_args,
+                if_false,
+                false_args,
+            }) => {
+                if !true_args.is_empty() || !false_args.is_empty() {
+                    return Err(LowerError::ControlFlowUnsupported);
+                }
+                let true_label = *block_labels
+                    .get(if_true.index())
+                    .ok_or(LowerError::ControlFlowUnsupported)?;
+                let false_label = *block_labels
+                    .get(if_false.index())
+                    .ok_or(LowerError::ControlFlowUnsupported)?;
+                let condition = match fused {
+                    Some((op, lhs, rhs)) => {
+                        let a = read_to_scratch(enc, home(lhs), Reg::R0)?;
+                        let b = read_to_scratch(enc, home(rhs), Reg::R1)?;
+                        enc.cmp_reg(a, b).map_err(|_| LowerError::TooManyValues)?;
+                        cmpop_to_cond(op)
+                    }
+                    None => {
+                        let c = read_to_scratch(enc, home(*cond), Reg::R0)?;
+                        enc.cmp_imm(c, 0).map_err(|_| LowerError::TooManyValues)?;
+                        Cond::Ne
+                    }
+                };
+                enc.b_cond(condition, true_label);
+                enc.b(false_label);
+            }
+            Some(Terminator::Unreachable) => {
+                enc.udf(0);
+            }
+            None => return Err(LowerError::ControlFlowUnsupported),
+        }
+    }
+
+    if !pool.is_empty() {
+        enc.align_to_word();
+        for (entry, value) in pool {
+            enc.bind_label(entry);
+            enc.emit_word(value);
+        }
+    }
+    Ok(())
+}
+
+/// Lowers one value-defining instruction of the mixed path: load each spilled operand
+/// into a scratch register (r0 then r1 -- at most two distinct spilled operands appear),
+/// emit through the shared [`lower_inst`], and store the result back if it is spilled.
+/// A spilled result is computed in r0; the per-instruction emitter tolerates a result
+/// register that reuses an operand's (the operand is consumed in the same instruction).
+fn lower_mixed_value(
+    enc: &mut Encoder,
+    pool: &mut Vec<(Label, u32)>,
+    home: &impl Fn(ValueId) -> Home,
+    result: ValueId,
+    inst: &Inst,
+) -> Result<(), LowerError> {
+    const SCRATCH: [Reg; 2] = [Reg::R0, Reg::R1];
+    let mut uses: Vec<ValueId> = Vec::new();
+    crate::regalloc::each_inst_use(inst, |v| {
+        if !uses.contains(&v) {
+            uses.push(v);
+        }
+    });
+    let mut resolved: Vec<(ValueId, Reg)> = Vec::with_capacity(uses.len());
+    let mut next_scratch = 0usize;
+    for v in uses {
+        let reg = match home(v) {
+            Home::Reg(r) => r,
+            Home::Spill(off) => {
+                let s = *SCRATCH.get(next_scratch).ok_or(LowerError::TooManyValues)?;
+                next_scratch += 1;
+                enc.ldr_sp(s, off).map_err(|_| LowerError::TooManyValues)?;
+                s
+            }
+        };
+        resolved.push((v, reg));
+    }
+    let result_reg = match home(result) {
+        Home::Reg(r) => r,
+        Home::Spill(_) => Reg::R0,
+    };
+    let assign = |v: ValueId| -> Reg {
+        if v == result {
+            result_reg
+        } else {
+            resolved
+                .iter()
+                .find(|(u, _)| *u == v)
+                .map(|(_, r)| *r)
+                .unwrap_or(Reg::R0)
+        }
+    };
+    lower_inst(enc, pool, result, inst, &assign)?;
+    if !matches!(inst, Inst::Store { .. }) {
+        if let Home::Spill(off) = home(result) {
+            enc.str_sp(result_reg, off)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+    }
+    Ok(())
+}
+
+/// Lowers a `Call` in the mixed path: move each argument into its AAPCS register (r0-r3),
+/// `BL`, then move the result from r0 to its home. No value is live across the call on this
+/// path (such a function is fully spilled), so clobbering the argument registers is safe.
+fn lower_mixed_call(
+    enc: &mut Encoder,
+    home: &impl Fn(ValueId) -> Home,
+    result: ValueId,
+    callee: u32,
+    args: &[ValueId],
+    func_labels: &[Label],
+) -> Result<(), LowerError> {
+    if args.len() > 4 {
+        return Err(LowerError::CallUnsupported);
+    }
+    let moves: Vec<(Home, Home)> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (Home::Reg(Reg::new(i as u8).unwrap_or(Reg::R0)), home(*a)))
+        .collect();
+    emit_home_moves(enc, &moves, Reg::R0)?;
+    let target = *func_labels
+        .get(callee as usize)
+        .ok_or(LowerError::CallUnsupported)?;
+    enc.bl(target);
+    match home(result) {
+        Home::Reg(r) => {
+            if r != Reg::R0 {
+                enc.mov_reg(r, Reg::R0);
+            }
+        }
+        Home::Spill(off) => {
+            enc.str_sp(Reg::R0, off)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reads a value into a register: a register-homed value is already there; a spilled one
+/// is loaded into `scratch`. Returns the register the value is in.
+fn read_to_scratch(enc: &mut Encoder, home: Home, scratch: Reg) -> Result<Reg, LowerError> {
+    match home {
+        Home::Reg(r) => Ok(r),
+        Home::Spill(off) => {
+            enc.ldr_sp(scratch, off)
+                .map_err(|_| LowerError::TooManyValues)?;
+            Ok(scratch)
+        }
+    }
+}
+
+/// Moves a value into `dst` -- a register move (skipped if already there) or a load.
+fn load_home(enc: &mut Encoder, home: Home, dst: Reg) -> Result<(), LowerError> {
+    match home {
+        Home::Reg(r) => {
+            if r != dst {
+                enc.mov_reg(dst, r);
+            }
+        }
+        Home::Spill(off) => {
+            enc.ldr_sp(dst, off)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+    }
+    Ok(())
+}
+
+/// Emits a set of moves between value homes so they take effect as if simultaneous, the
+/// general form of [`emit_parallel_move`] over registers and spill slots. Distinct values
+/// have distinct slots, so the only cross-move register hazards are register-to-register
+/// (handled by the cycle-safe register move); the phases below order the rest so every
+/// source is read in its original location. `mem_scratch` (r0/r1, never a value home)
+/// shuttles a slot-to-slot move.
+fn emit_home_moves(
+    enc: &mut Encoder,
+    moves: &[(Home, Home)],
+    mem_scratch: Reg,
+) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    let active: Vec<(Home, Home)> = moves
+        .iter()
+        .copied()
+        .filter(|(d, s)| !same_home(*d, *s))
+        .collect();
+    for &(d, s) in &active {
+        if let (Home::Spill(off), Home::Reg(r)) = (d, s) {
+            enc.str_sp(r, off).map_err(oops)?;
+        }
+    }
+    let reg_moves: Vec<(Reg, Reg)> = active
+        .iter()
+        .filter_map(|&(d, s)| match (d, s) {
+            (Home::Reg(d), Home::Reg(s)) => Some((d, s)),
+            _ => None,
+        })
+        .collect();
+    emit_parallel_move(enc, &reg_moves);
+    for &(d, s) in &active {
+        if let (Home::Reg(r), Home::Spill(off)) = (d, s) {
+            enc.ldr_sp(r, off).map_err(oops)?;
+        }
+    }
+    for &(d, s) in &active {
+        if let (Home::Spill(doff), Home::Spill(soff)) = (d, s) {
+            enc.ldr_sp(mem_scratch, soff).map_err(oops)?;
+            enc.str_sp(mem_scratch, doff).map_err(oops)?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether two homes are the same place (so a move between them is a no-op).
+fn same_home(a: Home, b: Home) -> bool {
+    match (a, b) {
+        (Home::Reg(x), Home::Reg(y)) => x == y,
+        (Home::Spill(x), Home::Spill(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Maps native code offsets to CIL byte offsets, ascending by offset, so a
 /// debugger can take a native PC and recover the CIL instruction being executed. Built
 /// by [`lower_debug`] from a `cil::CilSourceMap`.
@@ -1077,6 +2087,46 @@ impl LineTable {
     }
 }
 
+/// One GC safepoint's stack map: the `ObjectRef` roots live in the frame when a call or
+/// allocation returns, for a relocating collector to find and update. `return_pc` is the native
+/// code offset of the instruction after the call (add the method's load address for the device
+/// PC); each `ref_offsets` entry is a byte offset from SP-at-the-call of a spilled root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackMapEntry {
+    /// The return address of the safepoint -- a native code offset, the collector's lookup key.
+    pub return_pc: u32,
+    /// The frame the safepoint opened, in bytes; the collector steps past it to the caller.
+    pub frame_size: u16,
+    /// Byte offsets from SP-at-the-call of the live `ObjectRef` roots in the frame.
+    pub ref_offsets: Vec<u16>,
+}
+
+/// The GC stack maps for a lowered program -- one entry per safepoint, sorted by `return_pc` for
+/// the collector's binary search. The all-spilled path keeps every root in a frame slot, so the
+/// map names slot offsets only; on this path no callee-saved register is used (`saved == 0`), so
+/// the saved LR a frame walk reads sits at `SP-at-the-call + frame_size`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StackMaps(pub Vec<StackMapEntry>);
+
+impl StackMaps {
+    /// The little-endian wire format the collector consumes: `u32 count`, then each entry as
+    /// `u32 return_pc; u16 frame_size; u16 nrefs; u16 ref_offsets[nrefs]`.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.0.len() as u32).to_le_bytes());
+        for entry in &self.0 {
+            out.extend_from_slice(&entry.return_pc.to_le_bytes());
+            out.extend_from_slice(&entry.frame_size.to_le_bytes());
+            out.extend_from_slice(&(entry.ref_offsets.len() as u16).to_le_bytes());
+            for &offset in &entry.ref_offsets {
+                out.extend_from_slice(&offset.to_le_bytes());
+            }
+        }
+        out
+    }
+}
+
 /// Lowers a single function to ARM32 machine code. A function that calls another
 /// must go through [`lower_module`], which resolves the call targets.
 pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
@@ -1086,7 +2136,14 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
         Assignment::Registers { regs, saved } => {
             lower_into(func, &mut enc, &regs, saved, &[], &[], &mut _lines)?
         }
-        Assignment::Spilled => lower_spilled_into(func, &mut enc, &[], &[], &mut _lines)?,
+        Assignment::Mixed {
+            homes,
+            saved,
+            frame,
+        } => lower_mixed_into(func, &mut enc, &homes, saved, frame, &[], &[], &mut _lines)?,
+        Assignment::Spilled => {
+            lower_spilled_into(func, &mut enc, &[], None, &[], &mut _lines, &mut Vec::new())?
+        }
     }
     enc.finish()
         .map(|assembled| assembled.bytes)
@@ -1106,7 +2163,29 @@ pub fn lower_debug(
         Assignment::Registers { regs, saved } => {
             lower_into(func, &mut enc, &regs, saved, &[], source_map, &mut lines)?
         }
-        Assignment::Spilled => lower_spilled_into(func, &mut enc, &[], source_map, &mut lines)?,
+        Assignment::Mixed {
+            homes,
+            saved,
+            frame,
+        } => lower_mixed_into(
+            func,
+            &mut enc,
+            &homes,
+            saved,
+            frame,
+            &[],
+            source_map,
+            &mut lines,
+        )?,
+        Assignment::Spilled => lower_spilled_into(
+            func,
+            &mut enc,
+            &[],
+            None,
+            source_map,
+            &mut lines,
+            &mut Vec::new(),
+        )?,
     }
     let bytes = enc
         .finish()
@@ -1119,22 +2198,72 @@ pub fn lower_debug(
 /// direct calls between them resolved. `Call { callee }` names function index
 /// `callee` in `funcs`.
 pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
+    lower_module_inner(funcs, None).map(|(bytes, _)| bytes)
+}
+
+/// Lowers a whole program whose reference-type allocations call the garbage-collected
+/// runtime allocator at absolute address `alloc_addr` -- `lamella_gc_alloc(payload_size,
+/// &TypeDesc) -> payload*`, AAPCS (size in r0, descriptor in r1, result in r0). Each `Alloc`
+/// lowers to `blx` that address with a null-check; the type descriptors are emitted per type.
+pub fn lower_module_gc(funcs: &[Function], alloc_addr: u32) -> Result<Vec<u8>, LowerError> {
+    lower_module_inner(funcs, Some(alloc_addr)).map(|(bytes, _)| bytes)
+}
+
+/// As [`lower_module_gc`], but also returns the GC [`StackMaps`] -- one entry per safepoint
+/// (every call and allocation), naming the live `ObjectRef` roots for a relocating collector.
+pub fn lower_module_gc_mapped(
+    funcs: &[Function],
+    alloc_addr: u32,
+) -> Result<(Vec<u8>, StackMaps), LowerError> {
+    lower_module_inner(funcs, Some(alloc_addr))
+}
+
+fn lower_module_inner(
+    funcs: &[Function],
+    alloc_addr: Option<u32>,
+) -> Result<(Vec<u8>, StackMaps), LowerError> {
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     let mut _lines = Vec::new();
+    let mut stack_maps: Vec<StackMapEntry> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
         enc.bind_label(func_labels[index]);
         match prepare(func)? {
             Assignment::Registers { regs, saved } => {
                 lower_into(func, &mut enc, &regs, saved, &func_labels, &[], &mut _lines)?;
             }
+            Assignment::Mixed {
+                homes,
+                saved,
+                frame,
+            } => {
+                lower_mixed_into(
+                    func,
+                    &mut enc,
+                    &homes,
+                    saved,
+                    frame,
+                    &func_labels,
+                    &[],
+                    &mut _lines,
+                )?;
+            }
             Assignment::Spilled => {
-                lower_spilled_into(func, &mut enc, &func_labels, &[], &mut _lines)?;
+                lower_spilled_into(
+                    func,
+                    &mut enc,
+                    &func_labels,
+                    alloc_addr,
+                    &[],
+                    &mut _lines,
+                    &mut stack_maps,
+                )?;
             }
         }
     }
+    stack_maps.sort_by_key(|entry| entry.return_pc);
     enc.finish()
-        .map(|assembled| assembled.bytes)
+        .map(|assembled| (assembled.bytes, StackMaps(stack_maps)))
         .map_err(|_| LowerError::CodeTooLarge)
 }
 
@@ -1158,6 +2287,17 @@ impl TargetLowering for Arm32 {
 mod tests {
     use super::*;
     use lamella_ir::{BasicBlock, BlockId, MirType};
+
+    #[cfg(feature = "string-utf8-wtf8")]
+    #[test]
+    fn wtf8_encodes_surrogate_pairs_and_lone_surrogates() {
+        assert_eq!(
+            encode_string_bytes(&[0xD834, 0xDD1E]),
+            [0xF0, 0x9D, 0x84, 0x9E]
+        );
+        assert_eq!(encode_string_bytes(&[0xD800]), [0xED, 0xA0, 0x80]);
+        assert_eq!(encode_string_bytes(&[0x61, 0x62]), [0x61, 0x62]);
+    }
 
     #[test]
     fn lowers_constant_return() {
@@ -1262,6 +2402,94 @@ mod tests {
         assert!(
             bytes.windows(2).any(|w| w == [0x59, 0x41]),
             "ADCS (carry add) present"
+        );
+    }
+
+    #[test]
+    fn lowers_an_i64_mul() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::I64, MirType::I64, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 6,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 7,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Mul,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(
+            bytes.windows(2).any(|w| w == [0xF0, 0xB4]),
+            "the 64-bit multiply's saved-scratch prologue is present"
+        );
+    }
+
+    #[test]
+    fn lowers_an_i64_shift() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::I64, MirType::I32, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 1,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 5,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Shl,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(
+            bytes.windows(2).any(|w| w == [0xF0, 0xB4]),
+            "the 64-bit shift's saved-scratch prologue is present"
         );
     }
 
@@ -1702,6 +2930,63 @@ mod tests {
     }
 
     #[test]
+    fn lowers_a_six_parameter_function() {
+        let func = Function {
+            params: vec![MirType::I32; 6],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32; 11],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: (0..6u32).map(ValueId).collect(),
+                insts: vec![
+                    (
+                        ValueId(6),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                    (
+                        ValueId(7),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(6),
+                            rhs: ValueId(2),
+                        },
+                    ),
+                    (
+                        ValueId(8),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(7),
+                            rhs: ValueId(3),
+                        },
+                    ),
+                    (
+                        ValueId(9),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(8),
+                            rhs: ValueId(4),
+                        },
+                    ),
+                    (
+                        ValueId(10),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(9),
+                            rhs: ValueId(5),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(10)))),
+            }],
+        };
+        assert!(lower(&func).is_ok());
+    }
+
+    #[test]
     fn lowers_a_two_function_call() {
         let add = Function {
             params: vec![MirType::I32, MirType::I32],
@@ -1831,11 +3116,15 @@ mod tests {
     }
 
     #[test]
-    fn lowers_a_spilled_branch() {
+    fn lowers_a_spilled_branch_as_a_register_spill_mix() {
         let func = spilled_branch_function();
         assert!(lamella_ir::verify(&func).is_ok());
+        assert!(matches!(prepare(&func).unwrap(), Assignment::Mixed { .. }));
         let bytes = lower(&func).unwrap();
-        assert_eq!(bytes[1], 0xB0);
+        assert!(
+            bytes[1] == 0xB4 || bytes[1] == 0xB5,
+            "opens by pushing the callee-saved registers"
+        );
         assert_eq!(&bytes[bytes.len() - 2..], &[0x70, 0x47]);
     }
 
@@ -2374,5 +3663,299 @@ mod tests {
             *true_args = vec![ValueId(0)];
         }
         assert!(lower(&func).is_err());
+    }
+
+    /// A pure-integer loop with more values live in its body than there are registers:
+    /// the loop-carried sum and counter, the limit and increment, and six invariants
+    /// used only at the exit -- ten live at once. The linear scan spills some, so it
+    /// lowers as a register/spill mix rather than falling to the all-spilled path.
+    fn many_value_loop() -> Function {
+        let n = |v: u32| ValueId(v);
+        let constant = |v: u32, value: i64| {
+            (
+                n(v),
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value,
+                },
+            )
+        };
+        let add = |v: u32, lhs: u32, rhs: u32| {
+            (
+                n(v),
+                Inst::Binary {
+                    op: BinOp::Add,
+                    lhs: n(lhs),
+                    rhs: n(rhs),
+                },
+            )
+        };
+        Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32; 26],
+            entry: BlockId(0),
+            blocks: vec![
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![
+                        constant(0, 1),
+                        constant(6, 1),
+                        constant(7, 1),
+                        constant(8, 1),
+                        constant(9, 1),
+                        constant(10, 1),
+                        constant(11, 1),
+                        constant(12, 0),
+                        constant(13, 1),
+                        constant(14, 8),
+                    ],
+                    terminator: Some(Terminator::Jump {
+                        target: BlockId(1),
+                        args: vec![n(12), n(13)],
+                    }),
+                },
+                BasicBlock {
+                    params: vec![n(15), n(16)],
+                    insts: vec![(
+                        n(17),
+                        Inst::Compare {
+                            op: CmpOp::SignedGt,
+                            lhs: n(16),
+                            rhs: n(14),
+                        },
+                    )],
+                    terminator: Some(Terminator::Branch {
+                        cond: n(17),
+                        if_true: BlockId(3),
+                        true_args: Vec::new(),
+                        if_false: BlockId(2),
+                        false_args: Vec::new(),
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![add(18, 15, 16), add(19, 16, 0)],
+                    terminator: Some(Terminator::Jump {
+                        target: BlockId(1),
+                        args: vec![n(18), n(19)],
+                    }),
+                },
+                BasicBlock {
+                    params: Vec::new(),
+                    insts: vec![
+                        add(20, 15, 6),
+                        add(21, 20, 7),
+                        add(22, 21, 8),
+                        add(23, 22, 9),
+                        add(24, 23, 10),
+                        add(25, 24, 11),
+                    ],
+                    terminator: Some(Terminator::Return(Some(n(25)))),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_spilling_loop_takes_the_register_spill_mix() {
+        let func = many_value_loop();
+        assert!(lamella_ir::verify(&func).is_ok());
+        match prepare(&func).unwrap() {
+            Assignment::Mixed { homes, frame, .. } => {
+                assert!(frame > 0, "the mix needs a spill frame");
+                assert!(
+                    homes.iter().any(|h| matches!(h, Home::Reg(_))),
+                    "some values stay in registers"
+                );
+                assert!(
+                    homes.iter().any(|h| matches!(h, Home::Spill(_))),
+                    "some values spill"
+                );
+                assert!(
+                    homes
+                        .iter()
+                        .all(|h| !matches!(h, Home::Reg(r) if r.number() < 2)),
+                    "the scratch registers are not allocated to values"
+                );
+            }
+            _ => panic!("expected the register/spill mix"),
+        }
+        let bytes = lower(&func).expect("the mix lowers");
+        assert!(!bytes.is_empty());
+    }
+
+    #[test]
+    fn home_moves_break_a_register_cycle_and_shuttle_slots() {
+        let mut enc = Encoder::new();
+        emit_home_moves(
+            &mut enc,
+            &[
+                (Home::Reg(Reg::R2), Home::Reg(Reg::R3)),
+                (Home::Reg(Reg::R3), Home::Reg(Reg::R2)),
+                (Home::Spill(0), Home::Spill(4)),
+                (Home::Reg(Reg::R2), Home::Reg(Reg::R2)),
+            ],
+            Reg::R0,
+        )
+        .unwrap();
+        assert!(!enc.finish().unwrap().bytes.is_empty());
+    }
+
+    #[test]
+    fn lowers_a_reference_type_allocation() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: lamella_ir::TypeHandle(1),
+                        payload_size: 12,
+                        ref_offsets: vec![4u32, 8u32].into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let bytes = lower_module_gc(core::slice::from_ref(&func), 0x09)
+            .expect("the GC entry lowers an alloc");
+        assert!(
+            bytes.windows(4).any(|w| w == [12, 0, 0, 0]),
+            "payload_size word emitted"
+        );
+        assert!(
+            bytes.windows(4).any(|w| w == [2, 0, 0, 0]),
+            "nrefs word emitted"
+        );
+        assert!(lower_module(&[func]).is_err());
+    }
+
+    #[test]
+    fn emits_a_safepoint_stack_map_for_a_live_root() {
+        let alloc = || Inst::Alloc {
+            handle: lamella_ir::TypeHandle(1),
+            payload_size: 4,
+            ref_offsets: Vec::new().into_boxed_slice(),
+        };
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![
+                MirType::ObjectRef,
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), alloc()),
+                    (ValueId(1), alloc()),
+                    (
+                        ValueId(2),
+                        Inst::FieldLoad {
+                            base: ValueId(0),
+                            offset: 0,
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::FieldLoad {
+                            base: ValueId(1),
+                            offset: 0,
+                        },
+                    ),
+                    (
+                        ValueId(4),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(2),
+                            rhs: ValueId(3),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(4)))),
+            }],
+        };
+        let (_code, maps) = lower_module_gc_mapped(&[func], 0x09).expect("lowers with stack maps");
+        assert_eq!(maps.0.len(), 2);
+        assert!(maps.0[0].return_pc <= maps.0[1].return_pc);
+        let with_roots: Vec<_> = maps
+            .0
+            .iter()
+            .filter(|e| !e.ref_offsets.is_empty())
+            .collect();
+        assert_eq!(with_roots.len(), 1);
+        assert_eq!(with_roots[0].ref_offsets, vec![0]);
+        assert_eq!(&maps.encode()[0..4], &2u32.to_le_bytes());
+    }
+
+    #[test]
+    fn emits_a_stack_map_at_a_call_holding_a_root() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(1),
+                            payload_size: 4,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::FieldLoad {
+                            base: ValueId(0),
+                            offset: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let helper = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let (_code, maps) =
+            lower_module_gc_mapped(&[main, helper], 0x09).expect("lowers with stack maps");
+        assert_eq!(maps.0.len(), 2);
+        assert!(
+            maps.0.iter().any(|e| e.ref_offsets == vec![0]),
+            "the call holding `a` names it as a root"
+        );
     }
 }

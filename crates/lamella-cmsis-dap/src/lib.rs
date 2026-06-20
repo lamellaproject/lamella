@@ -38,6 +38,7 @@ const DBGKEY: u32 = 0xa05f_0000;
 const C_DEBUGEN: u32 = 1 << 0;
 const C_HALT: u32 = 1 << 1;
 const C_STEP: u32 = 1 << 2;
+const C_MASKINTS: u32 = 1 << 3;
 const S_REGRDY: u32 = 1 << 16;
 const S_HALT: u32 = 1 << 17;
 const DCRSR_WRITE: u32 = 1 << 16;
@@ -49,12 +50,25 @@ const NVMC_REN: u32 = 0;
 const NVMC_WEN: u32 = 1;
 const NVMC_EEN: u32 = 2;
 
+const SAMD21_CTRLA: u32 = 0x4100_4000;
+const SAMD21_CTRLB: u32 = 0x4100_4004;
+const SAMD21_INTFLAG: u32 = 0x4100_4014;
+const SAMD21_ADDR: u32 = 0x4100_401c;
+const SAMD21_CMDEX: u32 = 0xa500;
+const SAMD21_CMD_ER: u32 = 0x02;
+const SAMD21_CMD_WP: u32 = 0x04;
+const SAMD21_CMD_PBC: u32 = 0x44;
+const SAMD21_PAGE: usize = 64;
+const SAMD21_ROW: u32 = 256;
+const SAMD21_MANW: u32 = 1 << 7;
+
 const AIRCR: u32 = 0xe000_ed0c;
 const AIRCR_SYSRESETREQ: u32 = 0x05fa_0004;
 
 const FP_CTRL: u32 = 0xe000_2000;
 const FP_COMP0: u32 = 0xe000_2008;
 
+#[cfg(feature = "usbhid")]
 impl Transport for lamella_usbhid::Device {
     fn write_packet(&mut self, data: &[u8]) -> Result<(), TransportError> {
         self.write_report(data)
@@ -200,10 +214,21 @@ impl<T: Transport> Dap<T> {
         self.write_word(DHCSR, DBGKEY | C_DEBUGEN)
     }
 
-    /// Single-steps one instruction; the core must already be halted.
+    /// Single-steps one instruction; the core must already be halted. Interrupts (PendSV,
+    /// SysTick, external) are masked across the step so it advances the program rather than
+    /// entering a pending handler.
+    ///
+    /// Per the Armv6-M ARM (DDI0419E, C1.5 Debug event behavior), `C_MASKINTS` must be set in a
+    /// write SEPARATE from the one that clears `C_HALT` -- changing `C_MASKINTS` while clearing
+    /// `C_HALT` in a single write is UNPREDICTABLE. So this masks while still halted, then steps,
+    /// then unmasks while halted again -- the last write keeps a subsequent `resume` (which
+    /// clears `C_HALT`) from having to change `C_MASKINTS` in the same write, which would itself
+    /// be UNPREDICTABLE.
     pub fn step(&mut self) -> Result<(), DapError> {
-        self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_STEP)?;
-        self.poll_dhcsr(S_HALT, "core halt")
+        self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_HALT | C_MASKINTS)?;
+        self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_STEP | C_MASKINTS)?;
+        self.poll_dhcsr(S_HALT, "core halt")?;
+        self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_HALT)
     }
 
     /// Returns whether the core is currently halted.
@@ -267,6 +292,44 @@ impl<T: Transport> Dap<T> {
             }
         }
         Err(DapError::Timeout("flash controller"))
+    }
+
+    /// Erases the SAMD21 flash row (256 bytes) containing `address`, via the NVMCTRL. Halt the
+    /// core first so it is not fetching from flash during the erase.
+    pub fn erase_flash_row_samd21(&mut self, address: u32) -> Result<(), DapError> {
+        self.write_word(SAMD21_ADDR, (address & !(SAMD21_ROW - 1)) / 2)?;
+        self.samd21_command(SAMD21_CMD_ER)
+    }
+
+    /// Programs consecutive 32-bit `words` to SAMD21 flash from `address`, via the NVMCTRL, one
+    /// 64-byte page at a time (the rows must already be erased). Manual write, per datasheet
+    /// 22.6.4.3.1: clear the page buffer, fill it through the flash address space, issue a
+    /// read-memory barrier, set the page address, then Write-Page.
+    pub fn write_flash_samd21(&mut self, address: u32, words: &[u32]) -> Result<(), DapError> {
+        let ctrlb = self.read_word(SAMD21_CTRLB)?;
+        self.write_word(SAMD21_CTRLB, ctrlb | SAMD21_MANW)?;
+        for (page, chunk) in words.chunks(SAMD21_PAGE / 4).enumerate() {
+            let page_addr = address + (page as u32) * SAMD21_PAGE as u32;
+            self.samd21_command(SAMD21_CMD_PBC)?;
+            for (i, &word) in chunk.iter().enumerate() {
+                self.write_word(page_addr + (i as u32) * 4, word)?;
+            }
+            self.read_word(page_addr)?;
+            self.write_word(SAMD21_ADDR, page_addr / 2)?;
+            self.samd21_command(SAMD21_CMD_WP)?;
+        }
+        Ok(())
+    }
+
+    /// Issues an NVMCTRL command (CMDEX key + `cmd`) and waits for the controller to be ready.
+    fn samd21_command(&mut self, cmd: u32) -> Result<(), DapError> {
+        self.write_word(SAMD21_CTRLA, SAMD21_CMDEX | cmd)?;
+        for _ in 0..1000 {
+            if self.read_word(SAMD21_INTFLAG)? & 1 != 0 {
+                return Ok(());
+            }
+        }
+        Err(DapError::Timeout("SAMD21 flash controller"))
     }
 
     /// Resets the core (SYSRESETREQ) and resumes it, so it restarts from the reset
@@ -457,6 +520,27 @@ mod tests {
     }
 
     #[test]
+    fn step_masks_interrupts_in_a_separate_write_then_unmasks() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let halted = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x00, 0x00, 0x02, 0x00];
+        let replies = vec![
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            halted,
+            ack.clone(),
+            ack.clone(),
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.step().unwrap();
+        assert_eq!(&dap.transport.sent[1][4..8], &0xa05f_000bu32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[3][4..8], &0xa05f_000du32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[7][4..8], &0xa05f_0003u32.to_le_bytes());
+    }
+
+    #[test]
     fn read_core_reg_selects_then_reads_dcrdr() {
         let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
         let regrdy = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00];
@@ -533,6 +617,57 @@ mod tests {
         dap.write_flash(0x0003_f000, &[0xcafe_babe]).unwrap();
         assert_eq!(&dap.transport.sent[1][4..8], &1u32.to_le_bytes());
         assert_eq!(&dap.transport.sent[5][4..8], &0xcafe_babeu32.to_le_bytes());
+    }
+
+    #[test]
+    fn samd21_erase_row_drives_nvmctrl() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let ready = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00];
+        let replies = vec![
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ready,
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.erase_flash_row_samd21(0x0000_0100).unwrap();
+        assert_eq!(&dap.transport.sent[1][4..8], &0x80u32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[3][4..8], &0x0000_a502u32.to_le_bytes());
+    }
+
+    #[test]
+    fn samd21_write_flash_fills_buffer_then_writes_page() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let ready = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00];
+        let ctrlb = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
+        let flash = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0xff, 0xff, 0xff, 0xff];
+        let replies = vec![
+            ack.clone(),
+            ctrlb,
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ready.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            flash,
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            ready,
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.write_flash_samd21(0x0, &[0xcafe_babe]).unwrap();
+        assert_eq!(&dap.transport.sent[3][4..8], &0x80u32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[9][4..8], &0xcafe_babeu32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[15][4..8], &0x0000_a504u32.to_le_bytes());
     }
 
     #[test]

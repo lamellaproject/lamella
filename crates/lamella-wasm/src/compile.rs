@@ -127,6 +127,71 @@ pub unsafe extern "C" fn lamella_compile(
     result_buffer(compile(source, refs))
 }
 
+/// Builds completion JSON (`{ items: [{ label, kind, detail }] }`) for the caret at byte
+/// `offset` in `source`, against `refs`. Parses + builds the model (BCL refs + the unit),
+/// then asks the binder's completion engine.
+fn complete_json(source: &[u8], offset: usize, refs: &[u8]) -> Vec<u8> {
+    let source = core::str::from_utf8(source).unwrap_or("");
+    let unit = lamella_syntax::parser::parse_compilation_unit(source).unit;
+    let mut model = lamella_binder::Model::new();
+    for blob in split_refs(refs) {
+        if let Ok(assembly) = Assembly::read(blob) {
+            lamella_binder::load_assembly(&mut model, &assembly);
+        }
+    }
+    lamella_binder::collect_into(&mut model, &unit);
+    model.link_bases();
+    let items: Vec<serde_json::Value> = lamella_binder::complete(source, &unit, &model, offset)
+        .into_iter()
+        .map(|item| {
+            serde_json::json!({
+                "label": &*item.label,
+                "kind": kind_label(item.kind),
+                "detail": &*item.detail,
+            })
+        })
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "items": items })).unwrap_or_default()
+}
+
+fn kind_label(kind: lamella_binder::CompletionKind) -> &'static str {
+    use lamella_binder::CompletionKind;
+    match kind {
+        CompletionKind::Field => "field",
+        CompletionKind::Property => "property",
+        CompletionKind::Method => "method",
+        CompletionKind::Type => "type",
+        CompletionKind::Local => "local",
+        CompletionKind::Parameter => "parameter",
+        CompletionKind::Keyword => "keyword",
+    }
+}
+
+/// Completions (IntelliSense) for the caret at byte `offset` in the C# at
+/// `src_ptr..src_ptr + src_len`, against the references packed at `refs_ptr..+refs_len`.
+/// Returns a `[u32 len][JSON]` buffer (free with `lamella_dealloc(result, 4 + len)`);
+/// the JSON is `{ items: [{ label, kind, detail }] }`.
+///
+/// # Safety
+/// Both pointer/length pairs must be buffers the host filled via prior `lamella_alloc`
+/// (a zero-length `refs` is allowed and means no references).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_complete(
+    src_ptr: *const u8,
+    src_len: usize,
+    offset: usize,
+    refs_ptr: *const u8,
+    refs_len: usize,
+) -> *mut u8 {
+    let source = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    let refs: &[u8] = if refs_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(refs_ptr, refs_len) }
+    };
+    result_buffer(complete_json(source, offset, refs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +215,23 @@ mod tests {
         assert!(image_len > 0, "expected an emitted image");
         assert_eq!(json["diagnostics"].as_array().unwrap().len(), 0);
         assert!(json["emitError"].is_null());
+    }
+
+    #[test]
+    fn completes_a_locals_members() {
+        let source = "class Widget { public int Count; public int Area() { return 0; } } \
+                      class P { static int M() { Widget w; return w.Z; } }";
+        let offset = source.find("w.").unwrap() + 2;
+        let json = complete_json(source.as_bytes(), offset, &0u32.to_le_bytes());
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let labels: Vec<&str> = value["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["label"].as_str().unwrap())
+            .collect();
+        assert!(labels.contains(&"Count"), "got {labels:?}");
+        assert!(labels.contains(&"Area"), "got {labels:?}");
     }
 
     #[test]

@@ -2,13 +2,14 @@
 
 use crate::frame::{Frame, Slot};
 use crate::tokens::Tokens;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_binder::{
     BoundExpr, BoundExprKind, ConversionKind, FieldReference, SpecialType, TypeSymbol,
 };
 use lamella_cil::{Instruction, Opcode, Operand};
-use lamella_syntax::ast::{BinaryOperator, Literal, UnaryOperator};
+use lamella_syntax::ast::{BinaryOperator, Literal, PostfixOperator, UnaryOperator};
 
 /// Why an expression could not be lowered to CIL yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +29,7 @@ pub fn emit_expression(
 ) -> Result<(), EmitError> {
     match &expr.kind {
         BoundExprKind::Literal(literal) => emit_literal(literal, &expr.ty, tokens, out),
-        BoundExprKind::Local(name) => emit_local(name, frame, out),
+        BoundExprKind::Local(name) => emit_local(name, frame, tokens, out),
         BoundExprKind::Binary {
             operator,
             left,
@@ -44,25 +45,48 @@ pub fn emit_expression(
                 emit_expression(right, frame, tokens, out)?;
                 let is_string =
                     |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(SpecialType::String));
-                if matches!(operator, BinaryOperator::Add)
-                    && is_string(&left.ty)
-                    && is_string(&right.ty)
-                {
+                let strings = is_string(&left.ty) && is_string(&right.ty);
+                if matches!(operator, BinaryOperator::Add) && strings {
                     let string = TypeSymbol::Special(SpecialType::String);
                     let token = tokens
                         .method(&string, "Concat", &[string.clone(), string.clone()])
                         .ok_or(EmitError::Unsupported("String.Concat was not minted"))?;
                     out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
                     Ok(())
+                } else if matches!(
+                    operator,
+                    BinaryOperator::Equal | BinaryOperator::NotEqual
+                ) && strings
+                {
+                    emit_string_equality(*operator == BinaryOperator::NotEqual, tokens, out)
                 } else {
                     emit_binary(*operator, &left.ty, *checked, out)
                 }
             }
         },
+        BoundExprKind::Unary {
+            operator: operator @ (UnaryOperator::PreIncrement | UnaryOperator::PreDecrement),
+            operand,
+        } => emit_step_expression(
+            operand,
+            false,
+            *operator == UnaryOperator::PreIncrement,
+            frame,
+            tokens,
+            out,
+        ),
         BoundExprKind::Unary { operator, operand } => {
             emit_expression(operand, frame, tokens, out)?;
             emit_unary(*operator, out)
         }
+        BoundExprKind::Postfix { operator, operand } => emit_step_expression(
+            operand,
+            true,
+            *operator == PostfixOperator::Increment,
+            frame,
+            tokens,
+            out,
+        ),
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
             emit_expression(inner, frame, tokens, out)
         }
@@ -95,9 +119,11 @@ pub fn emit_expression(
         BoundExprKind::FieldAccess {
             receiver, field, ..
         } => emit_field_load(field.as_ref(), receiver, frame, tokens, out),
-        BoundExprKind::PropertyAccess { receiver, name } => {
-            emit_property_load(receiver, name, frame, tokens, out)
-        }
+        BoundExprKind::PropertyAccess {
+            receiver,
+            declaring_type,
+            name,
+        } => emit_property_load(receiver, declaring_type, name, frame, tokens, out),
         BoundExprKind::This | BoundExprKind::Base => {
             out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
             Ok(())
@@ -118,8 +144,8 @@ pub fn emit_expression(
             tokens,
             out,
         ),
-        BoundExprKind::ArrayCreation { lengths } => {
-            emit_array_creation(&expr.ty, lengths, frame, tokens, out)
+        BoundExprKind::ArrayCreation { lengths, elements } => {
+            emit_array_creation(&expr.ty, lengths, elements, frame, tokens, out)
         }
         BoundExprKind::ElementAccess { receiver, indices } => {
             emit_element_load(&expr.ty, receiver, indices, frame, tokens, out)
@@ -129,6 +155,23 @@ pub fn emit_expression(
             when_true,
             when_false,
         } => emit_conditional(condition, when_true, when_false, frame, tokens, out),
+        BoundExprKind::TypeOf(target) => emit_typeof(target, tokens, out),
+        BoundExprKind::TypeTest {
+            operation,
+            operand,
+            target,
+        } => {
+            emit_expression(operand, frame, tokens, out)?;
+            let token = tokens.type_token(target).ok_or(EmitError::Unsupported(
+                "a type test against a type with no metadata token",
+            ))?;
+            out.push(Instruction::new(Opcode::Isinst, Operand::Token(token)));
+            if matches!(operation, lamella_syntax::ast::TypeTestOperation::Is) {
+                out.push(Instruction::simple(Opcode::Ldnull));
+                out.push(Instruction::simple(Opcode::CgtUn));
+            }
+            Ok(())
+        }
         _ => Err(EmitError::Unsupported(
             "this expression form is not lowered yet",
         )),
@@ -188,6 +231,7 @@ fn emit_conditional(
 fn emit_array_creation(
     array_ty: &TypeSymbol,
     lengths: &[BoundExpr],
+    elements: &[BoundExpr],
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -195,17 +239,54 @@ fn emit_array_creation(
     let TypeSymbol::Array { element, rank } = array_ty else {
         return Err(EmitError::Unsupported("array creation of a non-array type"));
     };
-    if *rank != 1 || lengths.len() != 1 {
+    if *rank >= 2 {
+        for length in lengths {
+            emit_expression(length, frame, tokens, out)?;
+        }
+        let ctor = tokens
+            .method(array_ty, ".ctor", &array_int_params(lengths.len()))
+            .ok_or(EmitError::Unsupported("array .ctor was not minted"))?;
+        out.push(Instruction::new(Opcode::Newobj, Operand::Token(ctor)));
+        return Ok(());
+    }
+    let element_token = tokens
+        .type_token(element)
+        .ok_or(EmitError::Unsupported("array element type has no token"))?;
+    if !elements.is_empty() || lengths.is_empty() {
+        if let Some(length) = lengths.first() {
+            emit_expression(length, frame, tokens, out)?;
+        } else {
+            out.push(Instruction::new(
+                Opcode::LdcI4,
+                Operand::Int32(elements.len() as i32),
+            ));
+        }
+        out.push(Instruction::new(Opcode::Newarr, Operand::Token(element_token)));
+        let store = stelem_opcode(element)?;
+        for (index, value) in elements.iter().enumerate() {
+            out.push(Instruction::simple(Opcode::Dup));
+            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(index as i32)));
+            emit_expression(value, frame, tokens, out)?;
+            out.push(Instruction::simple(store));
+        }
+        return Ok(());
+    }
+    if lengths.len() != 1 {
         return Err(EmitError::Unsupported(
-            "only single-dimension arrays are lowered",
+            "a single-dimension array takes one length",
         ));
     }
     emit_expression(&lengths[0], frame, tokens, out)?;
-    let token = tokens
-        .type_token(element)
-        .ok_or(EmitError::Unsupported("array element type has no token"))?;
-    out.push(Instruction::new(Opcode::Newarr, Operand::Token(token)));
+    out.push(Instruction::new(Opcode::Newarr, Operand::Token(element_token)));
     Ok(())
+}
+
+/// The `int32` parameter-key types of an array's `.ctor`/`Get`/`Set` (one per
+/// dimension), matching how the member tokens are recorded in the pre-pass.
+pub(crate) fn array_int_params(rank: usize) -> Vec<TypeSymbol> {
+    (0..rank)
+        .map(|_| TypeSymbol::Special(SpecialType::Int32))
+        .collect()
 }
 
 /// Lowers `a[i]`: the array and index are pushed, then `ldelem.*` for the element.
@@ -217,10 +298,19 @@ fn emit_element_load(
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if indices.len() >= 2 {
+        emit_expression(receiver, frame, tokens, out)?;
+        for index in indices {
+            emit_expression(index, frame, tokens, out)?;
+        }
+        let get = tokens
+            .method(&receiver.ty, "Get", &array_int_params(indices.len()))
+            .ok_or(EmitError::Unsupported("array Get was not minted"))?;
+        out.push(Instruction::new(Opcode::Call, Operand::Token(get)));
+        return Ok(());
+    }
     if indices.len() != 1 {
-        return Err(EmitError::Unsupported(
-            "only single-dimension element access is lowered",
-        ));
+        return Err(EmitError::Unsupported("element access needs an index"));
     }
     emit_expression(receiver, frame, tokens, out)?;
     emit_expression(&indices[0], frame, tokens, out)?;
@@ -250,10 +340,22 @@ pub(crate) fn emit_element_store(
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if indices.len() >= 2 {
+        emit_expression(receiver, frame, tokens, out)?;
+        for index in indices {
+            emit_expression(index, frame, tokens, out)?;
+        }
+        emit_expression(value, frame, tokens, out)?;
+        let mut set_params = array_int_params(indices.len());
+        set_params.push(element_ty.clone());
+        let set = tokens
+            .method(&receiver.ty, "Set", &set_params)
+            .ok_or(EmitError::Unsupported("array Set was not minted"))?;
+        out.push(Instruction::new(Opcode::Call, Operand::Token(set)));
+        return Ok(());
+    }
     if indices.len() != 1 {
-        return Err(EmitError::Unsupported(
-            "only single-dimension element access is lowered",
-        ));
+        return Err(EmitError::Unsupported("element access needs an index"));
     }
     emit_expression(receiver, frame, tokens, out)?;
     emit_expression(&indices[0], frame, tokens, out)?;
@@ -288,7 +390,7 @@ pub(crate) fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError
 }
 
 /// The `stelem.*` opcode for writing an element of the given type.
-fn stelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError> {
+pub(crate) fn stelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError> {
     Ok(match element_ty {
         TypeSymbol::Special(special) => match special {
             SpecialType::SByte | SpecialType::Byte | SpecialType::Boolean => Opcode::StelemI1,
@@ -383,15 +485,28 @@ fn emit_call(
     let Some(method) = method else {
         return Err(EmitError::Unsupported("a call that did not resolve"));
     };
-    let on_value_type = tokens.is_struct(&method.declaring_type);
-    let is_base_call = matches!(
-        &callee.kind,
-        BoundExprKind::MethodGroup { receiver, .. } if matches!(receiver.kind, BoundExprKind::Base)
-    );
+    let receiver = match &callee.kind {
+        BoundExprKind::MethodGroup { receiver, .. } => Some(&**receiver),
+        _ => None,
+    };
+    let value_type_receiver = match receiver {
+        Some(r) if tokens.is_struct(&r.ty) || tokens.is_enum(&r.ty) => Some(&r.ty),
+        _ => None,
+    };
+    let is_base_call = matches!(receiver, Some(r) if matches!(r.kind, BoundExprKind::Base));
+    let inherited_value_call =
+        matches!(value_type_receiver, Some(ty) if method.declaring_type != *ty);
     if !method.is_static {
         match &callee.kind {
             BoundExprKind::MethodGroup { receiver, .. } => {
-                if on_value_type {
+                if inherited_value_call {
+                    emit_expression(receiver, frame, tokens, out)?;
+                    let box_token =
+                        tokens.type_token(&receiver.ty).ok_or(EmitError::Unsupported(
+                            "a virtual call on a value type with no metadata token",
+                        ))?;
+                    out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
+                } else if value_type_receiver.is_some() {
                     emit_value_type_receiver(receiver, frame, tokens, out)?;
                 } else {
                     emit_expression(receiver, frame, tokens, out)?;
@@ -401,20 +516,44 @@ fn emit_call(
         }
     }
     for argument in arguments {
-        emit_expression(argument, frame, tokens, out)?;
+        if let BoundExprKind::Ref { operand, .. } = &argument.kind {
+            emit_ref_argument(operand, frame, tokens, out)?;
+        } else {
+            emit_expression(argument, frame, tokens, out)?;
+        }
     }
     let token = tokens
         .method(&method.declaring_type, &method.name, &method.parameters)
         .ok_or(EmitError::Unsupported(
             "call to a method outside this module",
         ))?;
-    let opcode = if method.is_static || on_value_type || is_base_call {
+    let opcode = if inherited_value_call {
+        Opcode::Callvirt
+    } else if method.is_static || value_type_receiver.is_some() || is_base_call {
         Opcode::Call
     } else {
         Opcode::Callvirt
     };
     out.push(Instruction::new(opcode, Operand::Token(token)));
     Ok(())
+}
+
+/// Pushes the address of a `ref`/`out` argument variable: a byref parameter's slot
+/// already holds the address (`ldarg`), otherwise it is the variable's address
+/// (`ldloca`/`ldarga`/`ldflda`).
+fn emit_ref_argument(
+    operand: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if let BoundExprKind::Local(name) = &operand.kind {
+        if let Some((slot, _)) = frame.byref(name) {
+            out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+            return Ok(());
+        }
+    }
+    emit_value_type_receiver(operand, frame, tokens, out)
 }
 
 /// Lowers a field read: `ldsfld` for a static field, the receiver then `ldfld`
@@ -478,6 +617,7 @@ pub(crate) fn emit_field_store(
 /// the `get_Name` accessor. A static property is accessed through its type.
 fn emit_property_load(
     receiver: &BoundExpr,
+    declaring_type: &TypeSymbol,
     name: &str,
     frame: &Frame,
     tokens: &Tokens,
@@ -488,7 +628,7 @@ fn emit_property_load(
         emit_expression(receiver, frame, tokens, out)?;
     }
     let token = tokens
-        .method(&receiver.ty, &accessor_name("get_", name), &[])
+        .method(declaring_type, &accessor_name("get_", name), &[])
         .ok_or(EmitError::Unsupported(
             "property getter outside this module",
         ))?;
@@ -506,6 +646,7 @@ fn emit_property_load(
 pub(crate) fn emit_property_store(
     property_ty: &TypeSymbol,
     receiver: &BoundExpr,
+    declaring_type: &TypeSymbol,
     name: &str,
     value: &BoundExpr,
     frame: &Frame,
@@ -519,7 +660,7 @@ pub(crate) fn emit_property_store(
     emit_expression(value, frame, tokens, out)?;
     let token = tokens
         .method(
-            &receiver.ty,
+            declaring_type,
             &accessor_name("set_", name),
             core::slice::from_ref(property_ty),
         )
@@ -536,7 +677,7 @@ pub(crate) fn emit_property_store(
 }
 
 /// The `get_`/`set_` accessor method name for a property.
-fn accessor_name(prefix: &str, property: &str) -> String {
+pub(crate) fn accessor_name(prefix: &str, property: &str) -> String {
     let mut name = String::from(prefix);
     name.push_str(property);
     name
@@ -561,7 +702,8 @@ fn emit_cast(
         let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
             "unboxing to a value type with no metadata token",
         ))?;
-        out.push(Instruction::new(Opcode::UnboxAny, Operand::Token(token)));
+        out.push(Instruction::new(Opcode::Unbox, Operand::Token(token)));
+        out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
         return Ok(());
     }
     if tokens.is_enum(to) {
@@ -581,15 +723,15 @@ fn emit_cast(
 }
 
 /// Whether `ty` is a value type that boxes/unboxes by token: a numeric/`bool`/`char`
-/// primitive or a module struct (an enum is erased to its underlying integer, so it
-/// is excluded here).
+/// primitive, or a module struct or enum (an enum boxes/unboxes as its own type, so
+/// `(Color)someObject` is `unbox.any Color`).
 pub(crate) fn is_value_type(ty: &TypeSymbol, tokens: &Tokens) -> bool {
     match ty {
         TypeSymbol::Special(special) => !matches!(
             special,
             SpecialType::Object | SpecialType::String | SpecialType::Void
         ),
-        _ => tokens.is_struct(ty),
+        _ => tokens.is_struct(ty) || tokens.is_enum(ty),
     }
 }
 
@@ -642,6 +784,10 @@ fn emit_local_address(
     frame: &Frame,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if let Some((slot, _)) = frame.byref(name) {
+        out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+        return Ok(());
+    }
     match frame.slot(name) {
         Some(Slot::Argument(slot)) => {
             out.push(Instruction::new(Opcode::Ldarga, Operand::Variable(slot)));
@@ -661,7 +807,7 @@ fn emit_local_address(
 /// Emits a field-access receiver. A field of a value type (a struct) held in a local
 /// or parameter is reached through its address (`ldloca`/`ldarga`), so a read avoids a
 /// copy and a write stores back in place; every other receiver is emitted as a value.
-fn emit_field_receiver(
+pub(crate) fn emit_field_receiver(
     field: &FieldReference,
     receiver: &BoundExpr,
     frame: &Frame,
@@ -705,15 +851,37 @@ fn emit_value_type_receiver(
             out.push(Instruction::new(Opcode::Ldflda, Operand::Token(token)));
             Ok(())
         }
-        _ => emit_expression(receiver, frame, tokens, out),
+        BoundExprKind::This | BoundExprKind::Base => {
+            emit_expression(receiver, frame, tokens, out)
+        }
+        _ => {
+            emit_expression(receiver, frame, tokens, out)?;
+            let slot = frame.reserve_local(&receiver.ty);
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+            out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+            Ok(())
+        }
     }
 }
 
 pub(crate) fn emit_local(
     name: &str,
     frame: &Frame,
+    tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if let Some((slot, element)) = frame.byref(name) {
+        out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+        if tokens.is_struct(element) || tokens.is_enum(element) {
+            let token = tokens
+                .type_token(element)
+                .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
+            out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
+        } else {
+            out.push(Instruction::simple(ldind_opcode(element)));
+        }
+        return Ok(());
+    }
     match frame.slot(name) {
         Some(Slot::Argument(slot)) => {
             out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
@@ -722,6 +890,123 @@ pub(crate) fn emit_local(
             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
         }
         None => return Err(EmitError::Unsupported("read of a name with no frame slot")),
+    }
+    Ok(())
+}
+
+/// Lowers `x++`/`x--`/`++x`/`--x` used in EXPRESSION position (leaving its value) for a
+/// non-byref local: load; (postfix) dup; +/-1; (prefix) dup; store. Postfix leaves the
+/// old value on the stack, prefix the new.
+fn emit_step_expression(
+    operand: &BoundExpr,
+    postfix: bool,
+    increment: bool,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let BoundExprKind::Local(name) = &operand.kind else {
+        return Err(EmitError::Unsupported(
+            "++/-- of a non-local in expression position is not lowered yet",
+        ));
+    };
+    if frame.byref(name).is_some() {
+        return Err(EmitError::Unsupported(
+            "++/-- of a byref parameter in expression position",
+        ));
+    }
+    let store = match frame.slot(name) {
+        Some(Slot::Local(slot)) => Instruction::new(Opcode::Stloc, Operand::Variable(slot)),
+        Some(Slot::Argument(slot)) => Instruction::new(Opcode::Starg, Operand::Variable(slot)),
+        None => return Err(EmitError::Unsupported("++/-- of a name with no frame slot")),
+    };
+    let step_name = if increment { "op_Increment" } else { "op_Decrement" };
+    if let Some(token) = tokens.method(&operand.ty, step_name, core::slice::from_ref(&operand.ty))
+    {
+        if postfix {
+            emit_local(name, frame, tokens, out)?;
+        }
+        emit_local(name, frame, tokens, out)?;
+        out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+        out.push(store);
+        if !postfix {
+            emit_local(name, frame, tokens, out)?;
+        }
+        return Ok(());
+    }
+    emit_local(name, frame, tokens, out)?;
+    if postfix {
+        out.push(Instruction::simple(Opcode::Dup));
+    }
+    out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
+    if matches!(
+        operand.ty,
+        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
+    ) {
+        out.push(Instruction::simple(Opcode::ConvI8));
+    }
+    out.push(Instruction::simple(if increment {
+        Opcode::Add
+    } else {
+        Opcode::Sub
+    }));
+    if !postfix {
+        out.push(Instruction::simple(Opcode::Dup));
+    }
+    out.push(store);
+    Ok(())
+}
+
+/// The `ldind.*` opcode that loads a value of `ty` through a managed pointer (the
+/// signed/unsigned width follows the type, as csc emits for a byref read).
+pub(crate) fn ldind_opcode(ty: &TypeSymbol) -> Opcode {
+    match ty {
+        TypeSymbol::Special(SpecialType::Boolean | SpecialType::Byte) => Opcode::LdindU1,
+        TypeSymbol::Special(SpecialType::SByte) => Opcode::LdindI1,
+        TypeSymbol::Special(SpecialType::Int16) => Opcode::LdindI2,
+        TypeSymbol::Special(SpecialType::UInt16 | SpecialType::Char) => Opcode::LdindU2,
+        TypeSymbol::Special(SpecialType::Int32) => Opcode::LdindI4,
+        TypeSymbol::Special(SpecialType::UInt32) => Opcode::LdindU4,
+        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64) => Opcode::LdindI8,
+        TypeSymbol::Special(SpecialType::Single) => Opcode::LdindR4,
+        TypeSymbol::Special(SpecialType::Double) => Opcode::LdindR8,
+        _ => Opcode::LdindRef,
+    }
+}
+
+/// The `stind.*` opcode that stores a value of `ty` through a managed pointer (a
+/// size-keyed store, sign-agnostic).
+pub(crate) fn stind_opcode(ty: &TypeSymbol) -> Opcode {
+    match ty {
+        TypeSymbol::Special(
+            SpecialType::Boolean | SpecialType::Byte | SpecialType::SByte,
+        ) => Opcode::StindI1,
+        TypeSymbol::Special(SpecialType::Int16 | SpecialType::UInt16 | SpecialType::Char) => {
+            Opcode::StindI2
+        }
+        TypeSymbol::Special(SpecialType::Int32 | SpecialType::UInt32) => Opcode::StindI4,
+        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64) => Opcode::StindI8,
+        TypeSymbol::Special(SpecialType::Single) => Opcode::StindR4,
+        TypeSymbol::Special(SpecialType::Double) => Opcode::StindR8,
+        _ => Opcode::StindRef,
+    }
+}
+
+/// Emits the store-through-a-byref instruction for a referent of type `element` (the
+/// address and value are already on the stack): `stobj <token>` for a value type
+/// (struct/enum -- there is no `stind` for one), else the width-appropriate `stind`.
+pub(crate) fn emit_byref_store(
+    element: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if tokens.is_struct(element) || tokens.is_enum(element) {
+        let token = tokens
+            .type_token(element)
+            .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
+        out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
+    } else {
+        out.push(Instruction::simple(stind_opcode(element)));
     }
     Ok(())
 }
@@ -778,7 +1063,58 @@ fn emit_literal(
     Ok(())
 }
 
-fn emit_binary(
+/// Lowers `typeof(T)`: `ldtoken T` pushes a RuntimeTypeHandle, then
+/// `System.Type::GetTypeFromHandle` turns it into the `System.Type`.
+fn emit_typeof(
+    target: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let type_token = tokens
+        .type_token(target)
+        .ok_or(EmitError::Unsupported("typeof of a type with no token"))?;
+    out.push(Instruction::new(Opcode::Ldtoken, Operand::Token(type_token)));
+    let method = tokens
+        .method(
+            &system_type_symbol(),
+            "GetTypeFromHandle",
+            &[runtime_type_handle_symbol()],
+        )
+        .ok_or(EmitError::Unsupported("Type::GetTypeFromHandle was not minted"))?;
+    out.push(Instruction::new(Opcode::Call, Operand::Token(method)));
+    Ok(())
+}
+
+/// `System.Type` -- the result of `typeof` and the receiver of `GetTypeFromHandle`.
+pub(crate) fn system_type_symbol() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("System"), Box::from("Type")].into())
+}
+
+/// `System.RuntimeTypeHandle` -- the value `ldtoken` pushes for a type.
+pub(crate) fn runtime_type_handle_symbol() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("System"), Box::from("RuntimeTypeHandle")].into())
+}
+
+/// Emits string value comparison: `call bool String::op_Equality(string, string)`,
+/// negated (`ldc.i4.0; ceq`) for `!=`. The operands are already on the stack.
+pub(crate) fn emit_string_equality(
+    negate: bool,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let string = TypeSymbol::Special(SpecialType::String);
+    let token = tokens
+        .method(&string, "op_Equality", &[string.clone(), string.clone()])
+        .ok_or(EmitError::Unsupported("String.op_Equality was not minted"))?;
+    out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+    if negate {
+        out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+        out.push(Instruction::simple(Opcode::Ceq));
+    }
+    Ok(())
+}
+
+pub(crate) fn emit_binary(
     operator: BinaryOperator,
     operand_ty: &TypeSymbol,
     checked: bool,

@@ -52,11 +52,12 @@ mod tests {
 
     fn program() -> (Module, u32) {
         let mut module = Module::new();
-        let write_line = module.add_intrinsic(lamella_ves::intrinsics::console_write_line, 1);
-        module.bind_token(Token(0x0A00_0001), write_line);
+        let write_line = module.add_intrinsic(0, lamella_ves::intrinsics::console_write_line, 1);
+        module.bind_token(0, Token(0x0A00_0001), write_line);
         let hi: Vec<u16> = "hi".encode_utf16().collect();
-        module.bind_string(Token(0x7000_0001), &hi);
+        module.bind_string(0, Token(0x7000_0001), &hi);
         let main = module.add_method(
+            0,
             MethodBodyImage {
                 max_stack: 8,
                 init_locals: true,

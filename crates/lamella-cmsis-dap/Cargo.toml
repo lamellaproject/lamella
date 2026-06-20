@@ -10,5 +10,12 @@ description = "A CMSIS-DAP debug-probe host -- the command protocol and ADIv5/SW
 [lints]
 workspace = true
 
+[features]
+default = ["usbhid"]
+# The native USB-HID transport (`lamella-usbhid`). Disable for non-native targets such as wasm32,
+# where the embedder supplies its own `Transport` (e.g. the browser's WebHID via a JS shim); the
+# protocol / ADIv5 logic and `Dap<T: Transport>` stay target-independent either way.
+usbhid = ["dep:lamella-usbhid"]
+
 [dependencies]
-lamella-usbhid = { path = "../lamella-usbhid" }
+lamella-usbhid = { path = "../lamella-usbhid", optional = true }

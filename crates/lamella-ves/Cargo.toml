@@ -10,14 +10,20 @@ description = "The Lamella virtual execution system: a CIL interpreter implement
 [dependencies]
 lamella-cil = { path = "../lamella-cil" }
 lamella-token = { path = "../lamella-token" }
+# Accurate no_std transcendental math (sqrt/sin/cos/pow/log/exp), behind `math-transcendental`.
+# A MUSL/fdlibm port (the accurate option; a fast/approximate alternative is a future knob).
+libm = { version = "0.2.16", optional = true }
 
 [features]
-default = ["bcl", "exceptions", "gc", "finalizers"]
-# The BCL intrinsics (System.Console / System.String / Object..ctor). Off => the
-# minimal interpreter core (arithmetic, control flow, the object model) with no BCL
-# surface -- the smallest build for a constrained target. The runtime side of a
-# capability-profile surface knob.
+default = ["bcl", "NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental"]
+# The base BCL intrinsics (System.Console / System.String core / Object..ctor): the
+# ECMA-335 Kernel Profile floor. Off => the minimal interpreter core (arithmetic,
+# control flow, the object model) with no BCL surface -- the smallest build for a
+# constrained target. The runtime side of a capability-profile surface knob.
 bcl = []
+# The additional .NET Micro Framework v4.4 BCL surface beyond the Kernel Profile
+# (richer String, Math, Char, parsing). Off => the Kernel-only floor. A surface knob.
+NETMFv4_4 = ["bcl"]
 # Structured exception handling (throw / try-catch / finally). Off => those opcodes
 # are unsupported and the unwinder is stripped under LTO -- the smallest tier, where a
 # fault terminates rather than unwinds. A capability-profile knob.
@@ -31,6 +37,20 @@ gc = []
 # `gc` (only a collector detects unreachability). Off => no finalization machinery, the
 # embedded default. A capability-profile knob.
 finalizers = ["gc"]
+# Floating-point support: the `Value::Float` value, the float CIL opcodes (ldc.r4/r8, conv.r*,
+# float arithmetic / comparison, ckfinite) and the float BCL (Double.ToString, the Math double
+# overloads). Off => the no-float tier: those opcodes trap and the float code is compiled out --
+# for the smallest targets that have no FPU and use no float. A capability-profile knob.
+float = []
+# String storage encoding (a developer knob; .NET UTF-16 String semantics hold either way).
+# Default (feature off) = UTF-16 (O(1) indexing). On = UTF-8 (~half the ASCII-text memory,
+# O(n) UTF-16 indexing; the well-formed tier -- WTF-8 surrogate parity is a future feature).
+string-utf8 = []
+# The floating-point transcendentals (Math.Sqrt/Sin/Cos/Tan/Pow/Log/Log10/Exp), backed by the
+# `libm` crate. A floating-point knob: off => they bind nothing and libm is not compiled (the
+# rounding + arithmetic float ops stay). FUTURE (for discussion): a fast/approximate backend
+# (e.g. micromath) selectable against libm -- an accuracy-vs-size/speed knob.
+math-transcendental = ["NETMFv4_4", "float", "dep:libm"]
 
 [lints]
 workspace = true

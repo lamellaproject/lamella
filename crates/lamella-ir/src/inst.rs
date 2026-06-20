@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::function::ValueId;
-use crate::types::MirType;
+use crate::types::{MirType, TypeHandle};
 
 /// A binary arithmetic or bitwise operator. Both operands and the result share
 /// one [`MirType`]; where signedness matters it is part of the operator (the two
@@ -194,6 +194,90 @@ pub enum Inst {
     /// result is a placeholder callers ignore.
     WriteInt {
         /// The integer to format and write.
+        value: ValueId,
+    },
+    /// A static string literal: the result is an `ObjectRef` to a read-only UTF-16 blob
+    /// `[u32 length_in_utf16_units][UTF-16LE units]` the target lowering emits. (The build's
+    /// string-storage encoding -- UTF-16 by default; the consumer reads the unit count at
+    /// offset 0 for `String.Length`.)
+    StringLiteral {
+        /// The string's UTF-16 code units.
+        utf16: Box<[u16]>,
+    },
+    /// Compares two strings (`ObjectRef`s to UTF-16 blobs, or null) for ordinal equality -- the
+    /// CLI's `System.String::op_Equality`. The result is an `int32` 0 or 1: two nulls are equal,
+    /// null and non-null are not, otherwise compared length-then-content.
+    StringEquals {
+        /// The left string.
+        lhs: ValueId,
+        /// The right string.
+        rhs: ValueId,
+    },
+    /// Allocates a garbage-collected object of a reference type on the managed heap -- the
+    /// reference-type `newobj` (and, later, `box`). The result is an `ObjectRef` to the
+    /// zero-initialized payload. The target lowers it to a `lamella_gc_alloc(payload_size,
+    /// &TypeDesc) -> payload*` runtime call (an allocation safepoint) and emits the type's
+    /// `TypeDesc` -- the GC trace map -- from the fields below. The front end carries the map
+    /// here because the backend has no metadata access.
+    Alloc {
+        /// The reference type's identity, so allocations of one type share a single TypeDesc.
+        handle: TypeHandle,
+        /// The payload size in bytes (the object's fields, from the type's layout).
+        payload_size: u32,
+        /// The byte offsets within the payload of the fields that hold an `ObjectRef`/`&` --
+        /// the roots the emitted TypeDesc lists for the collector to trace and relocate.
+        ref_offsets: Box<[u32]>,
+    },
+    /// Allocates a garbage-collected array of `length` elements of `element_size` bytes -- the
+    /// CLI's `newarr`. The payload is `[u32 length][elements...]`; the result is an `ObjectRef`
+    /// to it. Lowers to `lamella_gc_alloc(4 + length*element_size, &TypeDesc)` (a safepoint) and
+    /// stores the length at offset 0. `ldlen` reads that length word (a `FieldLoad` at offset 0).
+    AllocArray {
+        /// The array type's identity, for the emitted TypeDesc.
+        handle: TypeHandle,
+        /// The number of elements.
+        length: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
+    /// Loads element `index` of `array` -- the CLI's `ldelem`. The result is the element at
+    /// `array + 4 + index*element_size` (the 4-byte length prefix is skipped). A sub-word element
+    /// is sign- or zero-extended to the 32-bit result per `signed` (`ldelem.i1` vs `ldelem.u1`).
+    ArrayLoad {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The element index.
+        index: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+        /// Whether a sub-word element is sign-extended (signed) or zero-extended (unsigned).
+        signed: bool,
+    },
+    /// Stores `value` into element `index` of `array` -- the CLI's `stelem`. A side effect; the
+    /// instruction's result is a placeholder callers ignore.
+    ArrayStore {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The element index.
+        index: ValueId,
+        /// The value to store (its width comes from its type).
+        value: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
+    /// Loads a static field -- the CLI's `ldsfld`. `offset` is the field's byte offset within the
+    /// module's static storage region (the target adds its static base). Static fields holding an
+    /// `ObjectRef` are GC roots the collector must scan; only scalar statics are lowered so far.
+    StaticLoad {
+        /// The field's byte offset within the static region.
+        offset: u32,
+    },
+    /// Stores `value` into a static field -- the CLI's `stsfld`. A side effect; the result is a
+    /// placeholder callers ignore.
+    StaticStore {
+        /// The field's byte offset within the static region.
+        offset: u32,
+        /// The value to store.
         value: ValueId,
     },
 }

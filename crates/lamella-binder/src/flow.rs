@@ -18,6 +18,7 @@ pub fn always_exits(stmt: &BoundStmt) -> bool {
     use BoundStmtKind as Kind;
     match &stmt.kind {
         Kind::Return(_) | Kind::Throw(_) => true,
+        Kind::Goto(_) | Kind::GotoCase(_) | Kind::GotoCaseString(_) | Kind::GotoDefault => true,
         Kind::Block(statements) => statements.iter().any(always_exits),
         Kind::If {
             then_branch,
@@ -123,7 +124,10 @@ fn collect_locals(
         | BoundStmtKind::Error
         | BoundStmtKind::Break
         | BoundStmtKind::Continue
-        | BoundStmtKind::Goto => {}
+        | BoundStmtKind::Goto(_)
+        | BoundStmtKind::GotoCase(_)
+        | BoundStmtKind::GotoCaseString(_)
+        | BoundStmtKind::GotoDefault => {}
         BoundStmtKind::Block(statements) => {
             for statement in statements {
                 collect_locals(statement, used, declared);
@@ -226,11 +230,12 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
         | BoundExprKind::Base
         | BoundExprKind::TypeReference(_)
         | BoundExprKind::NamespaceReference(_)
-        | BoundExprKind::TypeOf
+        | BoundExprKind::TypeOf(_)
         | BoundExprKind::Error => {}
         BoundExprKind::FieldAccess { receiver, .. }
         | BoundExprKind::PropertyAccess { receiver, .. }
         | BoundExprKind::MethodGroup { receiver, .. } => collect_uses(receiver, used),
+        BoundExprKind::Ref { operand, .. } => collect_uses(operand, used),
         BoundExprKind::Call {
             callee, arguments, ..
         } => {
@@ -245,9 +250,12 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
                 collect_uses(index, used);
             }
         }
-        BoundExprKind::ArrayCreation { lengths } => {
+        BoundExprKind::ArrayCreation { lengths, elements } => {
             for length in lengths {
                 collect_uses(length, used);
+            }
+            for element in elements {
+                collect_uses(element, used);
             }
         }
         BoundExprKind::ObjectCreation { arguments, .. } => {
@@ -331,7 +339,14 @@ impl Unreachable {
     fn statement(&mut self, stmt: &BoundStmt) -> bool {
         use BoundStmtKind as Kind;
         match &stmt.kind {
-            Kind::Return(_) | Kind::Throw(_) | Kind::Break | Kind::Continue | Kind::Goto => false,
+            Kind::Return(_)
+            | Kind::Throw(_)
+            | Kind::Break
+            | Kind::Continue
+            | Kind::Goto(_)
+            | Kind::GotoCase(_)
+            | Kind::GotoCaseString(_)
+            | Kind::GotoDefault => false,
             Kind::Expression(_) | Kind::Local { .. } | Kind::Empty | Kind::Error => true,
             Kind::Block(statements) => self.block(statements),
             Kind::If {
@@ -430,7 +445,10 @@ fn loop_breaks(stmt: &BoundStmt) -> bool {
         Kind::Return(_)
         | Kind::Throw(_)
         | Kind::Continue
-        | Kind::Goto
+        | Kind::Goto(_)
+        | Kind::GotoCase(_)
+        | Kind::GotoCaseString(_)
+        | Kind::GotoDefault
         | Kind::Expression(_)
         | Kind::Local { .. }
         | Kind::Empty
@@ -582,7 +600,12 @@ impl Analyzer<'_> {
                 }
                 Flow::Exits
             }
-            BoundStmtKind::Break | BoundStmtKind::Continue | BoundStmtKind::Goto => Flow::Exits,
+            BoundStmtKind::Break
+            | BoundStmtKind::Continue
+            | BoundStmtKind::Goto(_)
+            | BoundStmtKind::GotoCase(_)
+            | BoundStmtKind::GotoCaseString(_)
+            | BoundStmtKind::GotoDefault => Flow::Exits,
             BoundStmtKind::Switch {
                 expression,
                 sections,
@@ -662,7 +685,7 @@ impl Analyzer<'_> {
             | BoundExprKind::Base
             | BoundExprKind::TypeReference(_)
             | BoundExprKind::NamespaceReference(_)
-            | BoundExprKind::TypeOf
+            | BoundExprKind::TypeOf(_)
             | BoundExprKind::Error => {}
             BoundExprKind::FieldAccess { receiver, .. }
             | BoundExprKind::PropertyAccess { receiver, .. }
@@ -683,9 +706,12 @@ impl Analyzer<'_> {
                     self.expression(index, assigned, span);
                 }
             }
-            BoundExprKind::ArrayCreation { lengths } => {
+            BoundExprKind::ArrayCreation { lengths, elements } => {
                 for length in lengths {
                     self.expression(length, assigned, span);
+                }
+                for element in elements {
+                    self.expression(element, assigned, span);
                 }
             }
             BoundExprKind::ObjectCreation { arguments, .. } => {
@@ -708,6 +734,18 @@ impl Analyzer<'_> {
                     operator,
                     UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
                 ) {
+                    if let BoundExprKind::Local(name) = &operand.kind {
+                        assigned.insert(name.clone());
+                    }
+                }
+            }
+            BoundExprKind::Ref { out, operand } => {
+                if *out {
+                    if let BoundExprKind::Local(name) = &operand.kind {
+                        assigned.insert(name.clone());
+                    }
+                } else {
+                    self.expression(operand, assigned, span);
                     if let BoundExprKind::Local(name) = &operand.kind {
                         assigned.insert(name.clone());
                     }

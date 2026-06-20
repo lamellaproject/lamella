@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use lamella_binder::{BoundStmt, BoundStmtKind, SpecialType, TypeSymbol};
 
 /// Where a named variable lives in a method frame.
@@ -18,7 +19,14 @@ pub enum Slot {
 #[derive(Debug, Default)]
 pub struct Frame {
     slots: BTreeMap<Box<str>, Slot>,
-    local_types: Vec<TypeSymbol>,
+    /// The local-variable types in slot order. Behind a `RefCell` so a compiler
+    /// temporary (e.g. spilling a value-type rvalue receiver) can be reserved during
+    /// expression emission, which holds the frame only by shared reference.
+    local_types: RefCell<Vec<TypeSymbol>>,
+    /// The referent type of each byref (`ref`/`out`) parameter, by name. Such a
+    /// parameter's argument slot holds an address: a read derefs it (`ldind`), a write
+    /// stores through it (`stind`).
+    byref_types: BTreeMap<Box<str>, TypeSymbol>,
 }
 
 impl Frame {
@@ -32,12 +40,20 @@ impl Frame {
     /// for an instance method, whose argument 0 is `this`; 0 for a static method),
     /// then the locals the body declares.
     #[must_use]
-    pub fn build(parameters: &[Box<str>], body: &BoundStmt, arg_base: u16) -> Frame {
+    pub fn build(
+        parameters: &[Box<str>],
+        byref_params: &[(Box<str>, TypeSymbol)],
+        body: &BoundStmt,
+        arg_base: u16,
+    ) -> Frame {
         let mut frame = Frame::default();
         for (index, name) in parameters.iter().enumerate() {
             frame
                 .slots
                 .insert(name.clone(), Slot::Argument(index as u16 + arg_base));
+        }
+        for (name, ty) in byref_params {
+            frame.byref_types.insert(name.clone(), ty.clone());
         }
         frame.collect_locals(body);
         frame
@@ -49,23 +65,34 @@ impl Frame {
         self.slots.get(name).copied()
     }
 
+    /// The argument slot and referent type of `name` when it is a byref (`ref`/`out`)
+    /// parameter, so a read derefs (`ldind`) and a write stores through it (`stind`).
+    #[must_use]
+    pub fn byref(&self, name: &str) -> Option<(u16, &TypeSymbol)> {
+        let ty = self.byref_types.get(name)?;
+        match self.slots.get(name)? {
+            Slot::Argument(slot) => Some((*slot, ty)),
+            Slot::Local(_) => None,
+        }
+    }
+
     /// The number of local-variable slots (the method's `.locals` count).
     #[must_use]
     pub fn local_count(&self) -> u16 {
-        self.local_types.len() as u16
+        self.local_types.borrow().len() as u16
     }
 
     /// The local-variable types in slot order, for the local signature.
     #[must_use]
-    pub fn local_types(&self) -> &[TypeSymbol] {
-        &self.local_types
+    pub fn local_types(&self) -> Vec<TypeSymbol> {
+        self.local_types.borrow().clone()
     }
 
     /// The local-variable names in slot order, for debug info. (Parallel to
     /// [`Frame::local_types`].)
     #[must_use]
     pub fn local_names(&self) -> Vec<Box<str>> {
-        let mut names = alloc::vec![Box::<str>::from(""); self.local_types.len()];
+        let mut names = alloc::vec![Box::<str>::from(""); self.local_types.borrow().len()];
         for (name, slot) in &self.slots {
             if let Slot::Local(index) = slot {
                 names[*index as usize] = name.clone();
@@ -75,16 +102,18 @@ impl Frame {
     }
 
     fn declare_local(&mut self, name: &str, ty: &TypeSymbol) {
-        let slot = Slot::Local(self.local_types.len() as u16);
-        self.slots.insert(name.into(), slot);
-        self.local_types.push(ty.clone());
+        let slot = self.reserve_local(ty);
+        self.slots.insert(name.into(), Slot::Local(slot));
     }
 
     /// Reserves an unnamed local of `ty` (a compiler temporary, such as the value a
-    /// `return` inside a `try` parks before leaving), returning its slot index.
-    pub fn reserve_local(&mut self, ty: &TypeSymbol) -> u16 {
-        let slot = self.local_types.len() as u16;
-        self.local_types.push(ty.clone());
+    /// `return` inside a `try` parks before leaving, or a spilled value-type rvalue
+    /// receiver), returning its slot index. Takes `&self` so emission can reserve a
+    /// temporary while holding the frame by shared reference.
+    pub fn reserve_local(&self, ty: &TypeSymbol) -> u16 {
+        let mut locals = self.local_types.borrow_mut();
+        let slot = locals.len() as u16;
+        locals.push(ty.clone());
         slot
     }
 

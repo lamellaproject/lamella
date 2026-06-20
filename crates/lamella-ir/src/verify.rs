@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use crate::function::{BlockId, Function, Terminator, ValueId};
-use crate::inst::Inst;
+use crate::inst::{BinOp, Inst};
 use crate::types::MirType;
 
 /// A way in which a [`Function`] is not well formed.
@@ -123,11 +123,14 @@ fn check_inst(
                 expect(*ty, rt, errors);
             }
         }
-        Inst::Binary { lhs, rhs, .. } => {
+        Inst::Binary { op, lhs, rhs } => {
             let a = use_value(func, defined, *lhs, errors);
             let b = use_value(func, defined, *rhs, errors);
-            if let (Some(a), Some(b)) = (a, b) {
-                expect(a, b, errors);
+            let is_shift = matches!(op, BinOp::Shl | BinOp::ShrSigned | BinOp::ShrUnsigned);
+            if !is_shift {
+                if let (Some(a), Some(b)) = (a, b) {
+                    expect(a, b, errors);
+                }
             }
             if let (Some(a), Some(r)) = (a, result_ty) {
                 expect(a, r, errors);
@@ -191,6 +194,45 @@ fn check_inst(
         Inst::SemihostWrite { .. } => {
         }
         Inst::WriteInt { value } => {
+            use_value(func, defined, *value, errors);
+        }
+        Inst::StringLiteral { .. } => {
+        }
+        Inst::StringEquals { lhs, rhs } => {
+            use_value(func, defined, *lhs, errors);
+            use_value(func, defined, *rhs, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::I32, r, errors);
+            }
+        }
+        Inst::Alloc { .. } => {
+            if let Some(r) = result_ty {
+                expect(MirType::ObjectRef, r, errors);
+            }
+        }
+        Inst::AllocArray { length, .. } => {
+            use_value(func, defined, *length, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::ObjectRef, r, errors);
+            }
+        }
+        Inst::ArrayLoad { array, index, .. } => {
+            use_value(func, defined, *array, errors);
+            use_value(func, defined, *index, errors);
+        }
+        Inst::ArrayStore {
+            array,
+            index,
+            value,
+            ..
+        } => {
+            use_value(func, defined, *array, errors);
+            use_value(func, defined, *index, errors);
+            use_value(func, defined, *value, errors);
+        }
+        Inst::StaticLoad { .. } => {
+        }
+        Inst::StaticStore { value, .. } => {
             use_value(func, defined, *value, errors);
         }
     }
@@ -356,6 +398,32 @@ mod tests {
     }
 
     #[test]
+    fn alloc_must_produce_an_object_ref() {
+        let mut f = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: crate::types::TypeHandle(1),
+                        payload_size: 8,
+                        ref_offsets: vec![4u32].into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        assert_eq!(verify(&f), Ok(()));
+        f.value_types[0] = MirType::I32;
+        f.ret = Some(MirType::I32);
+        assert!(verify(&f).is_err());
+    }
+
+    #[test]
     fn missing_terminator_is_caught() {
         let mut f = add_function();
         f.blocks[0].terminator = None;
@@ -412,5 +480,51 @@ mod tests {
                 found: MirType::I32
             }
         )));
+    }
+
+    #[test]
+    fn shift_count_may_be_narrower_than_the_value() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I64),
+            value_types: vec![MirType::I64, MirType::I32, MirType::I64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I64,
+                            value: 1,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 5,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Shl,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert_eq!(verify(&func), Ok(()));
+        let mut bad = func;
+        bad.blocks[0].insts[2].1 = Inst::Binary {
+            op: BinOp::Add,
+            lhs: ValueId(0),
+            rhs: ValueId(1),
+        };
+        assert!(verify(&bad).is_err());
     }
 }

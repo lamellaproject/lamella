@@ -68,7 +68,7 @@ impl InterpreterBackend {
         let mut seq_boundaries = BTreeMap::new();
         if let Ok(pdb) = PortablePdb::read(&pdb_bytes) {
             for rid in 1..=pdb.method_count() {
-                if let Some(id) = module.resolve(Token::new(METHOD_DEF, rid)) {
+                if let Some(id) = module.resolve(0, Token::new(METHOD_DEF, rid)) {
                     method_rid.insert(id, rid);
                     let offsets: BTreeSet<u32> = pdb
                         .sequence_points(rid)
@@ -248,7 +248,7 @@ impl DebugBackend for InterpreterBackend {
     fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
         let pdb = PortablePdb::read(self.pdb.as_ref()?).ok()?;
         let (method_rid, il_offset) = pdb.resolve_breakpoint(document, line)?;
-        let method = self.module.resolve(Token::new(METHOD_DEF, method_rid))?;
+        let method = self.module.resolve(0, Token::new(METHOD_DEF, method_rid))?;
         let index = self.il_offset_to_index(method, il_offset)?;
         Some(encode_address(method, index))
     }
@@ -399,7 +399,7 @@ fn format_value(vm: &Vm, value: Value) -> (String, String) {
         Value::Float(f) => (f.to_string(), "double".to_owned()),
         Value::Object(reference) => match vm.heap().as_string(reference) {
             Some(chars) => (
-                format!("\"{}\"", String::from_utf16_lossy(chars)),
+                format!("\"{}\"", String::from_utf16_lossy(&chars)),
                 "string".to_owned(),
             ),
             None => ("object".to_owned(), "object".to_owned()),

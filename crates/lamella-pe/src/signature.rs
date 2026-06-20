@@ -56,6 +56,16 @@ pub enum TypeSig {
     ValueType(Token),
     /// A single-dimension zero-based array of the element type.
     SzArray(Box<TypeSig>),
+    /// A managed reference (`&`) to the referent type -- a `ref`/`out` parameter.
+    ByRef(Box<TypeSig>),
+    /// A multi-dimensional (rectangular) array of the element type with the given
+    /// rank, zero-based with no fixed sizes -- the form a `T[,]` TypeSpec takes.
+    Array {
+        /// The element type.
+        element: Box<TypeSig>,
+        /// The number of dimensions (>= 2 for a rectangular array).
+        rank: u32,
+    },
 }
 
 fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
@@ -87,6 +97,17 @@ fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
         TypeSig::SzArray(elem) => {
             out.push(element::SZARRAY);
             encode_type(elem, out);
+        }
+        TypeSig::ByRef(referent) => {
+            out.push(element::BYREF);
+            encode_type(referent, out);
+        }
+        TypeSig::Array { element: elem, rank } => {
+            out.push(element::ARRAY);
+            encode_type(elem, out);
+            compress_u32(*rank, out);
+            compress_u32(0, out);
+            compress_u32(0, out);
         }
     }
 }
