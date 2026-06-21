@@ -1,22 +1,26 @@
-// Lamella managed corlib (from scratch). -- System.Int32
+// Lamella managed corlib (from scratch). -- System.Int64
 namespace System
 {
-    public struct Int32 : IComparable
+    public struct Int64 : IComparable
     {
-        public const int MaxValue = 2147483647;
-        public const int MinValue = -2147483648;
+        public const long MaxValue = 9223372036854775807;
+        public const long MinValue = -9223372036854775808;
 
         public override bool Equals(object obj)
         {
-            if (obj is int) return this == (int)obj;
+            if (obj is long) return this == (long)obj;
             return false;
         }
 
-        public bool Equals(int obj) { return this == obj; }
+        public bool Equals(long obj) { return this == obj; }
 
-        public override int GetHashCode() { return this; }
+        public override int GetHashCode()
+        {
+            long value = this;
+            return (int)value ^ (int)(value >> 32);
+        }
 
-        public int CompareTo(int value)
+        public int CompareTo(long value)
         {
             if (this < value) return -1;
             if (this > value) return 1;
@@ -26,20 +30,20 @@ namespace System
         public int CompareTo(object obj)
         {
             if (obj == null) return 1;
-            return CompareTo((int)obj);
+            return CompareTo((long)obj);
         }
 
         public override string ToString()
         {
-            int value = this;
+            long value = this;
             if (value == 0) return "0";
             bool negative = value < 0;
-            int n = negative ? value : -value;
-            char[] buffer = new char[16];
+            long n = negative ? value : -value;
+            char[] buffer = new char[24];
             int pos = buffer.Length;
             while (n != 0)
             {
-                int digit = -(n % 10);
+                int digit = (int)(-(n % 10));
                 pos = pos - 1;
                 buffer[pos] = (char)('0' + digit);
                 n = n / 10;
@@ -50,7 +54,7 @@ namespace System
             return result.ToString();
         }
 
-        public static int Parse(string s)
+        public static long Parse(string s)
         {
             if ((object)s == null) throw new ArgumentNullException("s");
             int end = s.Length;
@@ -61,25 +65,25 @@ namespace System
             if (i < end && s[i] == '-') { negative = true; i = i + 1; }
             else if (i < end && s[i] == '+') { i = i + 1; }
             if (i >= end) throw new FormatException("Input string was not in a correct format.");
-            int result = 0;
+            long result = 0;
             while (i < end)
             {
                 char c = s[i];
                 if (c < '0' || c > '9') throw new FormatException("Input string was not in a correct format.");
                 int digit = c - '0';
-                if (result < (MinValue + digit) / 10) throw new OverflowException("Value was either too large or too small for an Int32.");
+                if (result < (MinValue + digit) / 10) throw new OverflowException("Value was either too large or too small for an Int64.");
                 result = result * 10 - digit;
                 i = i + 1;
             }
             if (!negative)
             {
-                if (result == MinValue) throw new OverflowException("Value was either too large or too small for an Int32.");
+                if (result == MinValue) throw new OverflowException("Value was either too large or too small for an Int64.");
                 return -result;
             }
             return result;
         }
 
-        public static bool TryParse(string s, out int result)
+        public static bool TryParse(string s, out long result)
         {
             result = 0;
             if (s == null || s.Length == 0) return false;
@@ -91,7 +95,7 @@ namespace System
             if (i < end && s[i] == '-') { negative = true; i = i + 1; }
             else if (i < end && s[i] == '+') { i = i + 1; }
             if (i >= end) return false;
-            int value = 0;
+            long value = 0;
             while (i < end)
             {
                 char c = s[i];

@@ -9,6 +9,7 @@ use lamella_ir::{Function, MirType, TypeHandle};
 use lamella_metadata::tables::table;
 use lamella_metadata::{
     Assembly, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef,
+    exception_tag_for_name,
 };
 use lamella_token::Token;
 
@@ -121,6 +122,98 @@ impl<'a> MetadataResolver<'a> {
         }
         false
     }
+
+    /// The vtable of a type, slot by slot: each entry is `(name, parameter types, the MethodDef rid of
+    /// the most-derived implementation)`. Built ECMA-335 / `lamella-load::build_vtables`-style so the
+    /// AOT and interpreter agree on slots: walk this-module bases root-first, inheriting their slots; a
+    /// virtual whose `newslot` flag (II.23.1.10) is clear and whose NAME + PARAMETER TYPES match an
+    /// inherited slot REPLACES it (an override), otherwise it APPENDS in MethodDef order. The base walk
+    /// is bounded against a malformed cyclic `extends`. (BCL base virtuals are not slotted -- the
+    /// resolver is single-assembly -- so numbering is user-hierarchy-relative, which native dispatch is
+    /// self-consistent with; matching the interpreter's absolute numbering is the mixed-mode bridge.)
+    fn vtable_methods(&self, type_def: TypeDef<'a>) -> Vec<(Option<&'a str>, Vec<SigType>, u32)> {
+        let mut chain = Vec::new();
+        let mut current = Some(type_def);
+        for _ in 0..64 {
+            let Some(td) = current else {
+                break;
+            };
+            chain.push(td);
+            let base = td.extends();
+            current = if base.table() == table::TYPE_DEF && base.row() != 0 {
+                self.assembly.type_def(base.row())
+            } else {
+                None
+            };
+        }
+        let mut slots: Vec<(Option<&'a str>, Vec<SigType>, u32)> = Vec::new();
+        for td in chain.into_iter().rev() {
+            for method in td.methods() {
+                if !method.is_virtual() {
+                    continue;
+                }
+                let name = method.name();
+                let params = method
+                    .signature()
+                    .map(|sig| sig.parameters)
+                    .unwrap_or_default();
+                let rid = method.rid();
+                let newslot = method.flags() & 0x0100 != 0;
+                if !newslot {
+                    if let Some(entry) = slots
+                        .iter_mut()
+                        .find(|(n, p, _)| *n == name && *p == params)
+                    {
+                        entry.2 = rid;
+                        continue;
+                    }
+                }
+                slots.push((name, params, rid));
+            }
+        }
+        slots
+    }
+
+    /// Every this-module type's vtable as a list of FUNCTION INDICES in slot order -- the backend
+    /// emits this table before the type's TypeDesc so `callvirt` indexes it. Each slot's most-derived
+    /// MethodDef rid is mapped to its module function index; a type whose vtable is empty, or any of
+    /// whose slots is not a module function (e.g. an abstract type, never instantiated), is omitted.
+    /// Keyed by the type's handle (`TypeHandle(token.0)`), matching the handle its `Alloc`/TypeDesc use.
+    #[must_use]
+    pub fn vtables(&self) -> Vec<(TypeHandle, Vec<u32>)> {
+        let mut result = Vec::new();
+        for type_def in self.assembly.type_defs() {
+            let methods = self.vtable_methods(type_def);
+            if methods.is_empty() {
+                continue;
+            }
+            let indices: Vec<u32> = methods
+                .iter()
+                .filter_map(|(_, _, rid)| self.function_index(*rid))
+                .collect();
+            if indices.len() == methods.len() {
+                result.push((TypeHandle(type_def.token().0), indices));
+            }
+        }
+        result
+    }
+
+    /// Every this-module type's `type_tag` for the TypeDesc the AOT emits: `exception_tag_for_name`
+    /// of its full name (the shared FNV-1a32 scheme, so an exception type's `type_tag` EQUALS its
+    /// exception tag -- one tag space for all types). The interpreter computes the same from metadata,
+    /// so a shared object's type is identified identically both ways -- the mixed-mode type-identity
+    /// bridge (runtime's `docs/mixed-mode-object-model.md`). Keyed by `TypeHandle(token.0)`.
+    #[must_use]
+    pub fn type_tags(&self) -> Vec<(TypeHandle, u32)> {
+        self.assembly
+            .type_defs()
+            .filter_map(|type_def| {
+                let name = self.assembly.type_token_name(type_def.token())?;
+                let tag = exception_tag_for_name(name.namespace, name.name);
+                Some((TypeHandle(type_def.token().0), tag))
+            })
+            .collect()
+    }
 }
 
 impl CallResolver for MetadataResolver<'_> {
@@ -205,6 +298,34 @@ impl CallResolver for MetadataResolver<'_> {
             .value_type_layout(*token, &TargetLayout::ilp32())
             .ok()
             .map(|layout| layout.size)
+    }
+
+    fn field_on_reference_type(&self, operand: &Operand) -> bool {
+        let Operand::Token(token) = operand else {
+            return false;
+        };
+        let declaring = match token.table() {
+            table::MEMBER_REF => self.assembly.member_ref(token.row()).map(|m| m.parent()),
+            table::FIELD => self
+                .assembly
+                .type_defs()
+                .find(|type_def| type_def.fields().any(|field| field.token() == *token))
+                .map(|type_def| type_def.token()),
+            _ => None,
+        };
+        let Some(declaring) = declaring.filter(|t| t.table() == table::TYPE_DEF) else {
+            return false;
+        };
+        let Some(base) = self
+            .assembly
+            .type_def(declaring.row())
+            .map(|type_def| type_def.extends())
+        else {
+            return false;
+        };
+        !self.assembly.type_token_name(base).is_some_and(|name| {
+            name.namespace == "System" && matches!(name.name, "ValueType" | "Enum")
+        })
     }
 
     fn newobj_value_type(&self, operand: &Operand) -> Option<MirType> {
@@ -326,6 +447,115 @@ impl CallResolver for MetadataResolver<'_> {
             })
     }
 
+    fn builtin_exception_tag(&self, namespace: &str, name: &str) -> Option<u32> {
+        Some(exception_tag_for_name(namespace, name))
+    }
+
+    fn subtype_tags(&self, operand: &Operand) -> Vec<u32> {
+        let Operand::Token(token) = operand else {
+            return Vec::new();
+        };
+        let Some(catch_token) = self.type_token_of(*token) else {
+            return Vec::new();
+        };
+        let Some(catch_name) = self.assembly.type_token_name(catch_token) else {
+            return Vec::new();
+        };
+        let mut tags = Vec::new();
+        tags.push(self.assembly.exception_tag(catch_token));
+        for type_def in self.assembly.type_defs() {
+            let mut current = type_def.extends();
+            for _ in 0..64 {
+                if current.row() == 0 {
+                    break;
+                }
+                let Some(name) = self.assembly.type_token_name(current) else {
+                    break;
+                };
+                if name.namespace == catch_name.namespace && name.name == catch_name.name {
+                    let tag = self.assembly.exception_tag(type_def.token());
+                    if tag != 0 && !tags.contains(&tag) {
+                        tags.push(tag);
+                    }
+                    break;
+                }
+                if current.table() != table::TYPE_DEF {
+                    break;
+                }
+                let Some(base_def) = self.assembly.type_def(current.row()) else {
+                    break;
+                };
+                current = base_def.extends();
+            }
+        }
+        let catch_tag = self.assembly.exception_tag(catch_token);
+        for type_ref in self.assembly.type_refs() {
+            let Some(chain) = self.assembly.exception_base_chain(type_ref.token()) else {
+                continue;
+            };
+            if chain.contains(&catch_tag) {
+                if let Some(&leaf) = chain.first() {
+                    if leaf != 0 && !tags.contains(&leaf) {
+                        tags.push(leaf);
+                    }
+                }
+            }
+        }
+        if catch_name.namespace == "System" && catch_name.name == "SystemException" {
+            for trap in [
+                "IndexOutOfRangeException",
+                "NullReferenceException",
+                "InvalidCastException",
+            ] {
+                let tag = exception_tag_for_name("System", trap);
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
+        }
+        tags
+    }
+
+    fn cast_subtype_handles(&self, operand: &Operand) -> Vec<TypeHandle> {
+        let Operand::Token(token) = operand else {
+            return Vec::new();
+        };
+        let Some(target) = self.type_token_of(*token) else {
+            return Vec::new();
+        };
+        let Some(target_name) = self.assembly.type_token_name(target) else {
+            return Vec::new();
+        };
+        let mut handles = Vec::new();
+        handles.push(TypeHandle(target.0));
+        for type_def in self.assembly.type_defs() {
+            let mut current = type_def.extends();
+            for _ in 0..64 {
+                if current.row() == 0 {
+                    break;
+                }
+                let Some(name) = self.assembly.type_token_name(current) else {
+                    break;
+                };
+                if name.namespace == target_name.namespace && name.name == target_name.name {
+                    let handle = TypeHandle(type_def.token().0);
+                    if !handles.contains(&handle) {
+                        handles.push(handle);
+                    }
+                    break;
+                }
+                if current.table() != table::TYPE_DEF {
+                    break;
+                }
+                let Some(base_def) = self.assembly.type_def(current.row()) else {
+                    break;
+                };
+                current = base_def.extends();
+            }
+        }
+        handles
+    }
+
     fn boxed_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
         let Operand::Token(token) = operand else {
             return None;
@@ -358,6 +588,50 @@ impl CallResolver for MetadataResolver<'_> {
             size: layout.size,
             reference_offsets: layout.reference_offsets,
         })
+    }
+
+    fn boxed_value_type(&self, operand: &Operand) -> Option<MirType> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        if let Some(name) = self.assembly.type_token_name(*token) {
+            if name.namespace == "System" {
+                match name.name {
+                    "Boolean" | "SByte" | "Byte" | "Int16" | "UInt16" | "Char" | "Int32"
+                    | "UInt32" => return Some(MirType::I32),
+                    "Single" => return Some(MirType::F32),
+                    "Int64" | "UInt64" => return Some(MirType::I64),
+                    "Double" => return Some(MirType::F64),
+                    _ => {}
+                }
+            }
+        }
+        let layout = self
+            .assembly
+            .value_type_layout(*token, &TargetLayout::ilp32())
+            .ok()?;
+        Some(MirType::ValueType {
+            handle: TypeHandle(token.0),
+            size: layout.size,
+        })
+    }
+
+    fn virtual_slot(&self, operand: &Operand) -> Option<usize> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        if token.table() != table::METHOD_DEF {
+            return None;
+        }
+        let type_token = self.type_token_of(*token)?;
+        if type_token.table() != table::TYPE_DEF {
+            return None;
+        }
+        let type_def = self.assembly.type_def(type_token.row())?;
+        let rid = token.row();
+        self.vtable_methods(type_def)
+            .iter()
+            .position(|(_, _, method_rid)| *method_rid == rid)
     }
 }
 
@@ -420,6 +694,29 @@ pub fn lower_methods(assembly: &Assembly, methods: &[Method]) -> Result<Vec<Func
             lower_method_typed(&body, &resolver, &arg_types, &local_types).map(|(func, _)| func)
         })
         .collect()
+}
+
+/// Like [`lower_methods`], but also returns each method's [`crate::cil::CilSourceMap`] (the MIR-block
+/// to CIL-offset map a debug line table is built from). So a whole multi-method program lowers WITH
+/// debug info and its CROSS-METHOD CALLS RESOLVE -- unlike single-method `cil::lower_method_debug`,
+/// which `UnresolvedCall`-panics on a call to another method. Pair with `arm32::lower_module_debug`.
+pub fn lower_methods_debug(
+    assembly: &Assembly,
+    methods: &[Method],
+) -> Result<(Vec<Function>, Vec<crate::cil::CilSourceMap>), CilError> {
+    let rids: Vec<u32> = methods.iter().map(Method::rid).collect();
+    let resolver = MetadataResolver::for_module(assembly, &rids);
+    let target = TargetLayout::ilp32();
+    let mut funcs = Vec::with_capacity(methods.len());
+    let mut maps = Vec::with_capacity(methods.len());
+    for method in methods {
+        let body = method.body().ok_or(CilError::MissingBody)?;
+        let (arg_types, local_types) = slot_types(assembly, method, &target);
+        let (func, map) = lower_method_typed(&body, &resolver, &arg_types, &local_types)?;
+        funcs.push(func);
+        maps.push(map);
+    }
+    Ok((funcs, maps))
 }
 
 /// A method's argument and local MIR types, from its signature and local-variable

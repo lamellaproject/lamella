@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.TimeSpan
 namespace System
 {
-    public struct TimeSpan
+    public struct TimeSpan : IComparable
     {
         public const long TicksPerMillisecond = 10000;
         public const long TicksPerSecond = 10000000;
@@ -47,5 +47,91 @@ namespace System
         public static TimeSpan FromMinutes(double value) { return new TimeSpan((long)(value * (double)TicksPerMinute)); }
         public static TimeSpan FromHours(double value) { return new TimeSpan((long)(value * (double)TicksPerHour)); }
         public static TimeSpan FromDays(double value) { return new TimeSpan((long)(value * (double)TicksPerDay)); }
+
+        public static TimeSpan FromTicks(long value) { return new TimeSpan(value); }
+
+        public TimeSpan Negate() { return new TimeSpan(-_ticks); }
+        public static TimeSpan operator -(TimeSpan t) { return new TimeSpan(-t._ticks); }
+
+        public static TimeSpan operator +(TimeSpan left, TimeSpan right) { return new TimeSpan(left._ticks + right._ticks); }
+        public static TimeSpan operator -(TimeSpan left, TimeSpan right) { return new TimeSpan(left._ticks - right._ticks); }
+
+        public static bool operator ==(TimeSpan left, TimeSpan right) { return left._ticks == right._ticks; }
+        public static bool operator !=(TimeSpan left, TimeSpan right) { return left._ticks != right._ticks; }
+        public static bool operator <(TimeSpan left, TimeSpan right) { return left._ticks < right._ticks; }
+        public static bool operator >(TimeSpan left, TimeSpan right) { return left._ticks > right._ticks; }
+        public static bool operator <=(TimeSpan left, TimeSpan right) { return left._ticks <= right._ticks; }
+        public static bool operator >=(TimeSpan left, TimeSpan right) { return left._ticks >= right._ticks; }
+
+        public int CompareTo(TimeSpan value)
+        {
+            if (_ticks < value._ticks) return -1;
+            if (_ticks > value._ticks) return 1;
+            return 0;
+        }
+
+        public int CompareTo(object obj)
+        {
+            if (obj == null) return 1;
+            return CompareTo((TimeSpan)obj);
+        }
+
+        public bool Equals(TimeSpan value) { return _ticks == value._ticks; }
+
+        public override bool Equals(object obj)
+        {
+            if (obj == null) return false;
+            return _ticks == ((TimeSpan)obj)._ticks;
+        }
+
+        public override int GetHashCode()
+        {
+            return (int)_ticks ^ (int)(_ticks >> 32);
+        }
+
+        private static void AppendPadded(System.Text.StringBuilder builder, int value, int width)
+        {
+            char[] digits = new char[width];
+            int n = value;
+            for (int i = width - 1; i >= 0; i--)
+            {
+                digits[i] = (char)('0' + n % 10);
+                n = n / 10;
+            }
+            for (int i = 0; i < width; i++) builder.Append(digits[i]);
+        }
+
+        public override string ToString()
+        {
+            System.Text.StringBuilder result = new System.Text.StringBuilder();
+            long ticks = _ticks;
+            if (ticks < 0)
+            {
+                result.Append('-');
+                ticks = -ticks;
+            }
+            long days = ticks / TicksPerDay;
+            long rest = ticks % TicksPerDay;
+            int hours = (int)(rest / TicksPerHour);
+            int minutes = (int)((rest / TicksPerMinute) % 60);
+            int seconds = (int)((rest / TicksPerSecond) % 60);
+            int fraction = (int)(rest % TicksPerSecond);
+            if (days != 0)
+            {
+                result.Append(days);
+                result.Append('.');
+            }
+            AppendPadded(result, hours, 2);
+            result.Append(':');
+            AppendPadded(result, minutes, 2);
+            result.Append(':');
+            AppendPadded(result, seconds, 2);
+            if (fraction != 0)
+            {
+                result.Append('.');
+                AppendPadded(result, fraction, 7);
+            }
+            return result.ToString();
+        }
     }
 }

@@ -44,8 +44,9 @@ pub enum Value {
     TypedRef {
         /// Where the typed reference points (the managed pointer it carries).
         location: Location,
-        /// The asm-folded type handle of the referent (matches `ldtoken` / a `Type`).
-        type_token: u32,
+        /// The asm-folded type handle of the referent (matches `ldtoken` / a `Type`): the
+        /// assembly in the high 32 bits, the metadata token in the low 32.
+        type_token: u64,
     },
 }
 
@@ -90,12 +91,20 @@ pub enum Location {
         /// The instance-field slot.
         slot: u32,
     },
-    /// An element of a heap array.
+    /// An element of a heap array. Addresses element `index`, optionally adjusted by a raw
+    /// `byte_offset` from pointer arithmetic on a pinned-array pointer (a C# `fixed (int* p =
+    /// arr)` walks `p` by `i * sizeof(elem)` bytes). `ldelema` yields one with `byte_offset
+    /// == 0`; `add`/`sub` of such a pointer and an integer step the byte offset, and an
+    /// `ldind`/`stind` through it resolves to element `index + byte_offset / element_width`
+    /// (the offset is a whole multiple of the element width for the indexing csc emits).
     Element {
         /// The heap array.
         array: ObjectRef,
-        /// The element index.
+        /// The element index the pointer was formed at.
         index: usize,
+        /// A raw byte offset added to the element base by pointer arithmetic (0 for a plain
+        /// `ldelema` pointer; a multiple of the element width once walked by `p[i]`).
+        byte_offset: u32,
     },
     /// A static-field storage slot.
     Static {

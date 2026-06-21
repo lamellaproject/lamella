@@ -167,7 +167,7 @@ fn lower_inst(
         | Inst::FieldStore { .. }
         | Inst::FieldAddr { .. }
         | Inst::CopyStruct { .. } => return Err(LowerError::CallUnsupported),
-        Inst::Call { .. } => return Err(LowerError::CallUnsupported),
+        Inst::Call { .. } | Inst::CallVirtual { .. } => return Err(LowerError::CallUnsupported),
         Inst::SemihostWrite { .. }
         | Inst::WriteInt { .. }
         | Inst::StringLiteral { .. }
@@ -182,7 +182,9 @@ fn lower_inst(
         | Inst::Array2DLoad { .. }
         | Inst::Array2DStore { .. }
         | Inst::StaticLoad { .. }
-        | Inst::StaticStore { .. } => {
+        | Inst::StaticStore { .. }
+        | Inst::LoadTypeDesc { .. }
+        | Inst::TypeDescAddr { .. } => {
             return Err(LowerError::CallUnsupported);
         }
     }
@@ -336,6 +338,7 @@ fn lower_spilled_inst(
     value_types: &[MirType],
     slot: &impl Fn(ValueId) -> u16,
     inst: &Inst,
+    result_ty: Option<MirType>,
     func_labels: &[Label],
 ) -> Result<Option<u32>, LowerError> {
     match inst {
@@ -498,6 +501,41 @@ fn lower_spilled_inst(
             }
             return Ok(Some(return_pc));
         }
+        Inst::CallVirtual {
+            slot: vtable_slot,
+            args,
+        } => {
+            let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
+            let entry_offset = vtable_slot
+                .checked_mul(4)
+                .and_then(|x| x.checked_add(4))
+                .filter(|&offset| offset <= 255)
+                .ok_or(LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R0, slot(receiver))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.subs_imm8(Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R0, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.mov_reg(Reg::R1, Reg::R0);
+            enc.subs_imm8(Reg::R1, entry_offset as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R1, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R0, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R0, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.mov_reg(Reg::R12, Reg::R0);
+            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            enc.blx(Reg::R12);
+            let return_pc = enc.position();
+            if stack_bytes > 0 {
+                enc.add_sp(stack_bytes)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+            return Ok(Some(return_pc));
+        }
         Inst::Store { address, value } => {
             enc.ldr_sp(Reg::R0, slot(*address))
                 .map_err(|_| LowerError::TooManyValues)?;
@@ -513,14 +551,23 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::FieldLoad { base, offset } => {
+            let two_words = matches!(result_ty, Some(MirType::I64 | MirType::F64));
             if is_pointer_base(value_types, *base) {
-                enc.ldr_sp(Reg::R0, slot(*base))
+                enc.ldr_sp(Reg::R2, slot(*base))
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_imm(Reg::R0, Reg::R0, *offset as u16)
+                enc.ldr_imm(Reg::R0, Reg::R2, *offset as u16)
                     .map_err(|_| LowerError::TooManyValues)?;
+                if two_words {
+                    enc.ldr_imm(Reg::R1, Reg::R2, *offset as u16 + 4)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
             } else {
                 enc.ldr_sp(Reg::R0, slot(*base) + *offset as u16)
                     .map_err(|_| LowerError::TooManyValues)?;
+                if two_words {
+                    enc.ldr_sp(Reg::R1, slot(*base) + *offset as u16 + 4)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
             }
         }
         Inst::FieldStore {
@@ -528,16 +575,34 @@ fn lower_spilled_inst(
             offset,
             value,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
-            if is_pointer_base(value_types, *base) {
+            let two_words = matches!(
+                value_types.get(value.0 as usize),
+                Some(MirType::I64 | MirType::F64)
+            );
+            let base_ptr = is_pointer_base(value_types, *base);
+            if base_ptr {
                 enc.ldr_sp(Reg::R1, slot(*base))
                     .map_err(|_| LowerError::TooManyValues)?;
+            }
+            enc.ldr_sp(Reg::R0, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+            if base_ptr {
                 enc.str_imm(Reg::R0, Reg::R1, *offset as u16)
                     .map_err(|_| LowerError::TooManyValues)?;
             } else {
                 enc.str_sp(Reg::R0, slot(*base) + *offset as u16)
                     .map_err(|_| LowerError::TooManyValues)?;
+            }
+            if two_words {
+                enc.ldr_sp(Reg::R0, slot(*value) + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                if base_ptr {
+                    enc.str_imm(Reg::R0, Reg::R1, *offset as u16 + 4)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                } else {
+                    enc.str_sp(Reg::R0, slot(*base) + *offset as u16 + 4)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
             }
         }
         Inst::FieldAddr { base, offset } => {
@@ -690,7 +755,11 @@ fn lower_spilled_inst(
             enc.str_imm(Reg::R1, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::Alloc { .. } | Inst::AllocArray { .. } | Inst::AllocArray2D { .. } => {
+        Inst::Alloc { .. }
+        | Inst::AllocArray { .. }
+        | Inst::AllocArray2D { .. }
+        | Inst::LoadTypeDesc { .. }
+        | Inst::TypeDescAddr { .. } => {
             return Err(LowerError::CallUnsupported);
         }
         Inst::Array2DLoad {
@@ -1300,12 +1369,14 @@ fn lower_spilled_into(
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
     stack_maps: &mut Vec<StackMapEntry>,
+    vtables: &[(lamella_ir::TypeHandle, Vec<u32>)],
 ) -> Result<(), LowerError> {
     let has_calls = func.blocks.iter().any(|b| {
         b.insts.iter().any(|(_, i)| {
             matches!(
                 i,
                 Inst::Call { .. }
+                    | Inst::CallVirtual { .. }
                     | Inst::Alloc { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
@@ -1479,6 +1550,33 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 continue;
             }
+            if let Inst::TypeDescAddr { handle } = inst {
+                let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
+                    Some((_, label)) => *label,
+                    None => {
+                        let label = enc.new_label();
+                        type_descs.push((label, alloc::vec![0u32, 0u32].into_boxed_slice()));
+                        type_desc_labels.push((*handle, label));
+                        label
+                    }
+                };
+                enc.adr(Reg::R0, desc_label)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_sp(Reg::R0, slot(*result))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                continue;
+            }
+            if let Inst::LoadTypeDesc { object } = inst {
+                enc.ldr_sp(Reg::R0, slot(*object))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.subs_imm8(Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R0, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_sp(Reg::R0, slot(*result))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                continue;
+            }
             if let Inst::AllocArray {
                 handle,
                 length,
@@ -1594,6 +1692,7 @@ fn lower_spilled_into(
                 &func.value_types,
                 &slot,
                 inst,
+                func.value_type(*result),
                 func_labels,
             )?;
             if let Some(return_pc) = call_pc {
@@ -1601,7 +1700,7 @@ fn lower_spilled_into(
             }
             enc.str_sp(Reg::R0, slot(*result))
                 .map_err(|_| LowerError::TooManyValues)?;
-            if func.value_type(*result) == Some(MirType::I64) {
+            if matches!(func.value_type(*result), Some(MirType::I64 | MirType::F64)) {
                 enc.str_sp(Reg::R1, slot(*result) + 4)
                     .map_err(|_| LowerError::TooManyValues)?;
             }
@@ -1722,6 +1821,19 @@ fn lower_spilled_into(
     }
     for (entry, words) in type_descs {
         enc.align_to_word();
+        if let Some(handle) = type_desc_labels
+            .iter()
+            .find(|(_, label)| *label == entry)
+            .map(|(handle, _)| *handle)
+        {
+            if let Some((_, indices)) = vtables.iter().find(|(h, _)| *h == handle) {
+                for &func_index in indices.iter().rev() {
+                    if let Some(&label) = func_labels.get(func_index as usize) {
+                        enc.data_word_diff(entry, label);
+                    }
+                }
+            }
+        }
         enc.bind_label(entry);
         for &word in words.iter() {
             enc.emit_word(word);
@@ -1809,6 +1921,9 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::Array2DStore { .. }
                     | Inst::StaticLoad { .. }
                     | Inst::StaticStore { .. }
+                    | Inst::LoadTypeDesc { .. }
+                    | Inst::TypeDescAddr { .. }
+                    | Inst::CallVirtual { .. }
             )
         })
     }) {
@@ -2438,6 +2553,10 @@ fn same_home(a: Home, b: Home) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineTable(pub Vec<(u32, u32)>);
 
+/// Per-method debug info from [`lower_module_debug`]: for each method, its function's image offset
+/// paired with its [`LineTable`], so a native PC maps to a method, then a CIL offset, then source.
+pub type MethodLineTables = Vec<(u32, LineTable)>;
+
 impl LineTable {
     /// The CIL byte offset whose native code contains `offset` -- the last entry at or
     /// before it, or `None` if `offset` precedes all code.
@@ -2504,9 +2623,16 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
             saved,
             frame,
         } => lower_mixed_into(func, &mut enc, &homes, saved, frame, &[], &[], &mut _lines)?,
-        Assignment::Spilled => {
-            lower_spilled_into(func, &mut enc, &[], None, &[], &mut _lines, &mut Vec::new())?
-        }
+        Assignment::Spilled => lower_spilled_into(
+            func,
+            &mut enc,
+            &[],
+            None,
+            &[],
+            &mut _lines,
+            &mut Vec::new(),
+            &[],
+        )?,
     }
     enc.finish()
         .map(|assembled| assembled.bytes)
@@ -2548,6 +2674,7 @@ pub fn lower_debug(
             source_map,
             &mut lines,
             &mut Vec::new(),
+            &[],
         )?,
     }
     let bytes = enc
@@ -2561,7 +2688,7 @@ pub fn lower_debug(
 /// direct calls between them resolved. `Call { callee }` names function index
 /// `callee` in `funcs`.
 pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, None).map(|(bytes, _)| bytes)
+    lower_module_inner(funcs, None, &[], &[]).map(|(bytes, _, _)| bytes)
 }
 
 /// Lowers a whole program whose reference-type allocations call the garbage-collected
@@ -2569,7 +2696,18 @@ pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
 /// &TypeDesc) -> payload*`, AAPCS (size in r0, descriptor in r1, result in r0). Each `Alloc`
 /// lowers to `blx` that address with a null-check; the type descriptors are emitted per type.
 pub fn lower_module_gc(funcs: &[Function], alloc_addr: u32) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr)).map(|(bytes, _)| bytes)
+    lower_module_inner(funcs, Some(alloc_addr), &[], &[]).map(|(bytes, _, _)| bytes)
+}
+
+/// As [`lower_module_gc`], but with per-type VTABLES (`(type handle, function indices in slot order)`)
+/// emitted before each TypeDesc, so `callvirt` dispatches through `obj-4`'s descriptor. The resolver
+/// produces the table via `MetadataResolver::vtables`.
+pub fn lower_module_gc_vtables(
+    funcs: &[Function],
+    alloc_addr: u32,
+    vtables: &[(lamella_ir::TypeHandle, Vec<u32>)],
+) -> Result<Vec<u8>, LowerError> {
+    lower_module_inner(funcs, Some(alloc_addr), vtables, &[]).map(|(bytes, _, _)| bytes)
 }
 
 /// As [`lower_module_gc`], but also returns the GC [`StackMaps`] -- one entry per safepoint
@@ -2578,26 +2716,57 @@ pub fn lower_module_gc_mapped(
     funcs: &[Function],
     alloc_addr: u32,
 ) -> Result<(Vec<u8>, StackMaps), LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr))
+    lower_module_inner(funcs, Some(alloc_addr), &[], &[]).map(|(bytes, maps, _)| (bytes, maps))
+}
+
+/// Lowers a whole multi-method program WITH debug line tables -- the module variant of [`lower_debug`].
+/// `source_maps[i]` is method `i`'s `CilSourceMap` (from `resolver::lower_methods_debug`); returns the
+/// image bytes plus, per method, `(its function's image offset, its LineTable)` -- a native code offset
+/// maps via the table to a CIL byte offset, then via the method's source map to source. `alloc_addr`
+/// is `Some` for a program that allocates (the GC path), `None` otherwise. Unlike single-method
+/// `cil::lower_method_debug`, cross-method calls resolve, so a real multi-method program is debuggable.
+pub fn lower_module_debug(
+    funcs: &[Function],
+    alloc_addr: Option<u32>,
+    source_maps: &[crate::cil::CilSourceMap],
+) -> Result<(Vec<u8>, MethodLineTables), LowerError> {
+    lower_module_inner(funcs, alloc_addr, &[], source_maps).map(|(bytes, _, lines)| (bytes, lines))
 }
 
 fn lower_module_inner(
     funcs: &[Function],
     alloc_addr: Option<u32>,
-) -> Result<(Vec<u8>, StackMaps), LowerError> {
+    vtables: &[(lamella_ir::TypeHandle, Vec<u32>)],
+    source_maps: &[crate::cil::CilSourceMap],
+) -> Result<(Vec<u8>, StackMaps, MethodLineTables), LowerError> {
+    let original_count = funcs.len();
     let mut program = funcs.to_vec();
     crate::stringgen::lower_string_concat(&mut program);
     crate::stringgen::lower_int_to_string(&mut program);
     let funcs = &program;
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
-    let mut _lines = Vec::new();
     let mut stack_maps: Vec<StackMapEntry> = Vec::new();
+    let mut method_lines: Vec<(u32, LineTable)> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
+        let func_offset = enc.position();
         enc.bind_label(func_labels[index]);
+        let source_map = source_maps
+            .get(index)
+            .map(|m| m.0.as_slice())
+            .unwrap_or(&[]);
+        let mut lines = Vec::new();
         match prepare(func)? {
             Assignment::Registers { regs, saved } => {
-                lower_into(func, &mut enc, &regs, saved, &func_labels, &[], &mut _lines)?;
+                lower_into(
+                    func,
+                    &mut enc,
+                    &regs,
+                    saved,
+                    &func_labels,
+                    source_map,
+                    &mut lines,
+                )?;
             }
             Assignment::Mixed {
                 homes,
@@ -2611,8 +2780,8 @@ fn lower_module_inner(
                     saved,
                     frame,
                     &func_labels,
-                    &[],
-                    &mut _lines,
+                    source_map,
+                    &mut lines,
                 )?;
             }
             Assignment::Spilled => {
@@ -2621,16 +2790,20 @@ fn lower_module_inner(
                     &mut enc,
                     &func_labels,
                     alloc_addr,
-                    &[],
-                    &mut _lines,
+                    source_map,
+                    &mut lines,
                     &mut stack_maps,
+                    vtables,
                 )?;
             }
+        }
+        if index < original_count {
+            method_lines.push((func_offset, LineTable(lines)));
         }
     }
     stack_maps.sort_by_key(|entry| entry.return_pc);
     enc.finish()
-        .map(|assembled| (assembled.bytes, StackMaps(stack_maps)))
+        .map(|assembled| (assembled.bytes, StackMaps(stack_maps), method_lines))
         .map_err(|_| LowerError::CodeTooLarge)
 }
 
@@ -4200,6 +4373,48 @@ mod tests {
             "nrefs word emitted"
         );
         assert!(lower_module(&[func]).is_err());
+    }
+
+    #[test]
+    fn emits_a_vtable_before_the_type_descriptor() {
+        let allocator = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: lamella_ir::TypeHandle(1),
+                        payload_size: 4,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let method = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: Vec::new(),
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: Vec::new(),
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let module = [allocator, method];
+        let plain = lower_module_gc(&module, 0x09).expect("plain module lowers");
+        let with_vtable =
+            lower_module_gc_vtables(&module, 0x09, &[(lamella_ir::TypeHandle(1), vec![1])])
+                .expect("vtable module lowers");
+        assert!(
+            with_vtable.len() > plain.len(),
+            "the vtable word is emitted before the descriptor"
+        );
     }
 
     #[test]

@@ -78,7 +78,7 @@ impl Liveness {
             let mut live = self.live_out[b].clone();
             each_terminator_use(&block.terminator, |u| set(&mut live, u));
             for (result, inst) in block.insts.iter().rev() {
-                if matches!(inst, Inst::Call { .. })
+                if matches!(inst, Inst::Call { .. } | Inst::CallVirtual { .. })
                     && live
                         .iter()
                         .enumerate()
@@ -155,7 +155,7 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *lhs, ip);
                     mark(&mut lo, &mut hi, &mut defined, *rhs, ip);
                 }
-                Inst::Call { args, .. } => {
+                Inst::Call { args, .. } | Inst::CallVirtual { args, .. } => {
                     for arg in args {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
@@ -187,6 +187,10 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::FieldAddr { base, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *base, ip);
                 }
+                Inst::LoadTypeDesc { object } => {
+                    mark(&mut lo, &mut hi, &mut defined, *object, ip);
+                }
+                Inst::TypeDescAddr { .. } => {}
                 Inst::CopyStruct { src } => {
                     mark(&mut lo, &mut hi, &mut defined, *src, ip);
                 }
@@ -406,7 +410,10 @@ pub(crate) fn safepoint_roots(
             for (i, (result, inst)) in block.insts.iter().enumerate().rev() {
                 if matches!(
                     inst,
-                    Inst::Call { .. } | Inst::Alloc { .. } | Inst::AllocArray { .. }
+                    Inst::Call { .. }
+                        | Inst::CallVirtual { .. }
+                        | Inst::Alloc { .. }
+                        | Inst::AllocArray { .. }
                 ) {
                     let roots = alive
                         .iter()
@@ -463,7 +470,9 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*lhs);
             f(*rhs);
         }
-        Inst::Call { args, .. } => args.iter().for_each(|a| f(*a)),
+        Inst::Call { args, .. } | Inst::CallVirtual { args, .. } => {
+            args.iter().for_each(|a| f(*a));
+        }
         Inst::Store { address, value } => {
             f(*address);
             f(*value);
@@ -479,6 +488,8 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*value);
         }
         Inst::FieldAddr { base, .. } => f(*base),
+        Inst::LoadTypeDesc { object } => f(*object),
+        Inst::TypeDescAddr { .. } => {}
         Inst::CopyStruct { src } => f(*src),
         Inst::SemihostWrite { .. } => {}
         Inst::WriteInt { value } => f(*value),

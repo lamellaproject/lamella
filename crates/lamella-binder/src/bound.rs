@@ -6,10 +6,11 @@ use crate::conversion::{can_cast, converts};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::resolve::{TypeTable, resolve_type};
 use crate::special::SpecialType;
-use crate::symbols::{Accessibility, MethodSymbol, Model, TypeInfo, TypeKind};
+use crate::symbols::{Accessibility, EventSymbol, MethodSymbol, Model, TypeInfo, TypeKind};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
@@ -279,6 +280,34 @@ struct MethodContext {
     return_type: TypeSymbol,
 }
 
+/// The result of binding one REPL submission ([`Binder::bind_submission`]): the bound
+/// `Submit$N` body, its return type, and the session variables it introduced.
+#[derive(Debug, Clone)]
+pub struct SubmissionBinding {
+    /// The bound submission body -- a block of the session-field stores and statements,
+    /// ending in a boxed `return` for a trailing display expression.
+    pub body: crate::statement::BoundStmt,
+    /// The `Submit$N` method's return type: `object` for a display expression, else `void`.
+    pub return_type: TypeSymbol,
+    /// The session variables this submission introduced, in declaration order, each with
+    /// its stable `__Repl` field name -- the caller commits them so later submissions see
+    /// them (and rebinds the source name on a redefinition). A field the runtime cannot
+    /// resolve against the loaded `__Repl` it adds (inference).
+    pub new_fields: Vec<DeclaredField>,
+}
+
+/// A session variable a submission introduced: its source name, the stable `__Repl` field
+/// name it was assigned (the source name, or `x$2` on a redefinition), and its type.
+#[derive(Debug, Clone)]
+pub struct DeclaredField {
+    /// The C# name the user wrote.
+    pub source: Box<str>,
+    /// The stable `__Repl` field name (the source name, or a fresh `x$2` on redefinition).
+    pub stable: Box<str>,
+    /// The field's type.
+    pub ty: TypeSymbol,
+}
+
 /// Binds expressions, accumulating the semantic diagnostics found. Holds a stack
 /// of local-variable scopes for name resolution.
 #[derive(Debug, Default)]
@@ -290,6 +319,10 @@ pub struct Binder {
     current_type: Option<TypeSymbol>,
     current_method: Option<MethodContext>,
     imported_namespaces: Vec<Box<str>>,
+    /// `using X = N.T;` aliases in scope, each the alias name and its target type, so an
+    /// unqualified `X` resolves to the target (16.4.1). Scoped per namespace block alongside
+    /// `imported_namespaces`.
+    aliases: Vec<(Box<str>, TypeSymbol)>,
     /// Locals referenced in `switch` case-label expressions of the method being
     /// bound -- they are folded out of the bound tree, so the unused-local check
     /// (`CS0168`/`CS0219`) is seeded with them to avoid a false warning. Reset per
@@ -299,6 +332,24 @@ pub struct Binder {
     /// tracked as the binder descends so each arithmetic/cast node records whether
     /// emission should use the overflow-checking form. C# 1.0 defaults to unchecked.
     checked_context: bool,
+    /// In REPL session mode, the name of the parameter standing in for the persistent
+    /// `__Repl` instance (`s`). When set, an unqualified name that resolves to a member
+    /// of the enclosing type reads through `s` (a parameter) instead of `this` -- the
+    /// submission method is a static `Submit$N(__Repl s)`, so session locals are fields
+    /// of `s`, not of a non-existent `this`. `None` in ordinary binding.
+    session_receiver: Option<Box<str>>,
+    /// In REPL session mode, each session variable's source name -> (its stable `__Repl`
+    /// field name, its type). An unqualified name found here reads `s.<stable>` (14.5.2
+    /// through `s`). It is keyed by SOURCE name and maps to the STABLE field name so a
+    /// type-changing redefinition -- which adds a fresh field `x$2` and rebinds source `x`
+    /// to it -- resolves correctly. Empty (so a no-op) in ordinary binding.
+    session_fields: BTreeMap<String, (Box<str>, TypeSymbol)>,
+    /// How many enclosing loops (`for`/`while`/`do`/`foreach`) the binder is inside, so a
+    /// `break`/`continue` with no enclosing loop is `CS0139`. Reset per method.
+    loop_depth: u32,
+    /// How many enclosing `switch` statements the binder is inside (a `break` is also valid
+    /// in a switch). Reset per method.
+    switch_depth: u32,
 }
 
 impl Binder {
@@ -346,11 +397,34 @@ impl Binder {
         crate::flow::collect_uses(expr, &mut self.case_label_uses);
     }
 
+    /// Resolves a syntactic type name to its canonical type via the namespaces and aliases
+    /// in scope (e.g. `Type` with `using System;` -> `System.Type`), for the emitter to mint
+    /// an external type's `TypeRef` in a signature. Resolution-only; reports no diagnostic.
+    #[must_use]
+    pub fn resolve_type(&self, ty: &TypeSymbol) -> TypeSymbol {
+        if let TypeSymbol::Named(parts) = ty {
+            if parts.len() == 1 {
+                let name: &str = &parts[0];
+                if let Some(target) = self.alias_target(name) {
+                    return target;
+                }
+                let hits = self.type_namespaces_containing(name);
+                if hits.len() == 1 {
+                    return type_symbol_in(&hits[0], name);
+                }
+            }
+        }
+        ty.clone()
+    }
+
     /// Resolves a type against the reference world, reporting `CS0246` if unknown.
     pub(crate) fn resolve_named_type(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
         if let TypeSymbol::Named(parts) = ty {
             if parts.len() == 1 {
                 let name: &str = &parts[0];
+                if let Some(target) = self.alias_target(name) {
+                    return target;
+                }
                 let hits = self.type_namespaces_containing(name);
                 if hits.len() == 1 {
                     return type_symbol_in(&hits[0], name);
@@ -378,7 +452,25 @@ impl Binder {
     /// `value` is assignable to `target` (including the constant-expression rule). Error
     /// types are skipped so a prior failure does not cascade.
     pub(crate) fn check_assignable(&mut self, value: &BoundExpr, target: &TypeSymbol, span: Span) {
-        if value.ty.is_error() || target.is_error() {
+        if target.is_error() {
+            return;
+        }
+        if let BoundExprKind::MethodGroup { name, .. } = &value.kind {
+            let to_delegate = self
+                .type_info_of(target)
+                .is_some_and(|info| info.kind == TypeKind::Delegate);
+            if !to_delegate {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::MethodGroupToNonDelegate {
+                        method: name.clone(),
+                        target: target.to_string().into(),
+                    },
+                    span,
+                ));
+            }
+            return;
+        }
+        if value.ty.is_error() {
             return;
         }
         if !self.assignable(value, target) {
@@ -575,16 +667,32 @@ impl Binder {
         self.imported_namespaces.push(namespace.into());
     }
 
-    /// A marker for the current set of imported namespaces, to scope the usings of
-    /// a namespace block: snapshot before, restore after.
-    #[must_use]
-    pub fn import_scope(&self) -> usize {
-        self.imported_namespaces.len()
+    /// Brings a `using X = N.T;` alias into scope: an unqualified `X` resolves to `target`
+    /// (16.4.1).
+    pub fn import_alias(&mut self, name: &str, target: TypeSymbol) {
+        self.aliases.push((name.into(), target));
     }
 
-    /// Restores the imported namespaces to an earlier [`Binder::import_scope`].
-    pub fn restore_import_scope(&mut self, scope: usize) {
-        self.imported_namespaces.truncate(scope);
+    /// The target type of an in-scope alias `name`, if any (the most recent wins).
+    fn alias_target(&self, name: &str) -> Option<TypeSymbol> {
+        self.aliases
+            .iter()
+            .rev()
+            .find(|(alias, _)| &**alias == name)
+            .map(|(_, target)| target.clone())
+    }
+
+    /// A marker for the current set of imported namespaces and aliases, to scope the usings
+    /// of a namespace block: snapshot before, restore after.
+    #[must_use]
+    pub fn import_scope(&self) -> (usize, usize) {
+        (self.imported_namespaces.len(), self.aliases.len())
+    }
+
+    /// Restores the imported namespaces and aliases to an earlier [`Binder::import_scope`].
+    pub fn restore_import_scope(&mut self, scope: (usize, usize)) {
+        self.imported_namespaces.truncate(scope.0);
+        self.aliases.truncate(scope.1);
     }
 
     /// The current type's namespace, if any, for unqualified type resolution.
@@ -646,6 +754,8 @@ impl Binder {
         });
         self.enter_scope();
         self.case_label_uses.clear();
+        self.loop_depth = 0;
+        self.switch_depth = 0;
         for (parameter, ty) in parameters {
             self.declare_local(parameter, ty.clone());
         }
@@ -676,6 +786,165 @@ impl Binder {
         self.current_method = None;
         self.current_type = None;
         bound
+    }
+
+    /// Binds one REPL submission as the body of a `Submit$N(__Repl s)` method, in
+    /// session mode: the enclosing type is `__Repl` and the implicit receiver is the
+    /// parameter `receiver` (`s`), so an unqualified session variable reads/writes a
+    /// field of `s` (14.5.2 against `s` rather than `this`). `initial_fields` maps each
+    /// PRIOR session variable's source name to its stable field name + type (for reads);
+    /// `occurrences` counts how many times each source name has already been declared (so
+    /// a redefinition picks a fresh `x$2`). The introduced variables come back in
+    /// [`SubmissionBinding::new_fields`] for the caller to commit.
+    ///
+    /// A TOP-LEVEL local declaration is not a real local: it is a persistent field, so
+    /// `T x = init;` lowers to the field store `s.<stable> = init` (a declarator with no
+    /// initializer just registers the field, which keeps its zero default), and a
+    /// redefinition `T x = ...;` adds a fresh field `x$2` and rebinds source `x` to it.
+    /// Every other statement -- including a declaration nested inside a block, an ordinary
+    /// local of that block -- is bound normally. Diagnostics accumulate as usual; the
+    /// caller drains them with [`Binder::into_diagnostics`].
+    pub fn bind_submission(
+        &mut self,
+        repl_type: TypeSymbol,
+        receiver: &str,
+        statements: &[lamella_syntax::ast::Stmt],
+        trailing: Option<&Expr>,
+        initial_fields: BTreeMap<String, (Box<str>, TypeSymbol)>,
+        mut occurrences: BTreeMap<String, u32>,
+    ) -> SubmissionBinding {
+        use crate::statement::{BoundStmt, BoundStmtKind};
+        use lamella_syntax::ast::StmtKind;
+
+        let body_span = statements
+            .first()
+            .map(|statement| statement.span)
+            .or_else(|| trailing.map(|expr| expr.span))
+            .unwrap_or(Span::empty_at(0));
+        self.current_type = Some(repl_type.clone());
+        self.session_receiver = Some(receiver.into());
+        self.session_fields = initial_fields;
+        self.current_method = Some(MethodContext {
+            name: "Submit".into(),
+            return_type: TypeSymbol::Special(SpecialType::Void),
+        });
+        self.enter_scope();
+        self.case_label_uses.clear();
+        self.loop_depth = 0;
+        self.switch_depth = 0;
+
+        let mut bound = Vec::new();
+        let mut new_fields = Vec::new();
+        for statement in statements {
+            match &statement.kind {
+                StmtKind::LocalDeclaration { ty, declarators } => {
+                    let field_ty = self.resolve_named_type(&bind_type(ty), ty.span);
+                    for declarator in declarators {
+                        let source: &str = &declarator.name;
+                        let value = declarator.initializer.as_ref().map(|initializer| {
+                            let value = self.bind_expression(initializer);
+                            self.check_assignable(&value, &field_ty, declarator.span);
+                            self.convert(value, &field_ty)
+                        });
+                        let count = occurrences.get(source).copied().unwrap_or(0);
+                        let stable: Box<str> = if count == 0 {
+                            source.into()
+                        } else {
+                            format!("{source}${}", count + 1).into()
+                        };
+                        occurrences.insert(source.into(), count + 1);
+                        self.session_fields
+                            .insert(source.into(), (stable.clone(), field_ty.clone()));
+                        new_fields.push(DeclaredField {
+                            source: source.into(),
+                            stable: stable.clone(),
+                            ty: field_ty.clone(),
+                        });
+                        if let Some(value) = value {
+                            let target =
+                                self.session_field_access(receiver, &repl_type, &stable, &field_ty);
+                            let assignment = BoundExpr {
+                                ty: field_ty.clone(),
+                                kind: BoundExprKind::Assignment {
+                                    operator: AssignmentOperator::Assign,
+                                    target: Box::new(target),
+                                    value: Box::new(value),
+                                },
+                            };
+                            bound.push(BoundStmt {
+                                kind: BoundStmtKind::Expression(assignment),
+                                span: declarator.span,
+                            });
+                        }
+                    }
+                }
+                _ => bound.push(self.bind_statement(statement)),
+            }
+        }
+
+        let mut return_type = TypeSymbol::Special(SpecialType::Void);
+        if let Some(expr) = trailing {
+            let value = self.bind_expression(expr);
+            if value.ty.is_void() || value.ty.is_error() {
+                bound.push(BoundStmt {
+                    kind: BoundStmtKind::Expression(value),
+                    span: expr.span,
+                });
+            } else {
+                let object = TypeSymbol::Special(SpecialType::Object);
+                let display = self.convert(value, &object);
+                bound.push(BoundStmt {
+                    kind: BoundStmtKind::Return(Some(display)),
+                    span: expr.span,
+                });
+                return_type = object;
+            }
+        }
+
+        self.exit_scope();
+        self.session_receiver = None;
+        self.session_fields = BTreeMap::new();
+        self.current_type = None;
+        self.current_method = None;
+        SubmissionBinding {
+            body: BoundStmt {
+                kind: BoundStmtKind::Block(bound),
+                span: body_span,
+            },
+            return_type,
+            new_fields,
+        }
+    }
+
+    /// A read/write of session field `name` of type `ty`, declared on `repl_type` and
+    /// reached through the session receiver parameter `receiver` (`s`). The field is a
+    /// public instance field of `__Repl`, so emission lowers it to `ldarg.0` (the `s`
+    /// instance) + `ldfld`/`stfld` of the `<repl>.__Repl::name` reference.
+    fn session_field_access(
+        &self,
+        receiver: &str,
+        repl_type: &TypeSymbol,
+        name: &str,
+        ty: &TypeSymbol,
+    ) -> BoundExpr {
+        BoundExpr {
+            ty: ty.clone(),
+            kind: BoundExprKind::FieldAccess {
+                receiver: Box::new(BoundExpr {
+                    kind: BoundExprKind::Local(receiver.into()),
+                    ty: repl_type.clone(),
+                }),
+                name: name.into(),
+                field: Some(FieldReference {
+                    declaring_type: repl_type.clone(),
+                    name: name.into(),
+                    ty: ty.clone(),
+                    is_static: false,
+                    accessibility: Accessibility::Public,
+                    constant: None,
+                }),
+            },
+        }
     }
 
     /// Binds a constructor initializer `: this(args)` / `: base(args)`: the arguments are
@@ -778,6 +1047,29 @@ impl Binder {
     /// Closes the innermost scope.
     pub fn exit_scope(&mut self) {
         self.scopes.pop();
+    }
+
+    /// Enters / leaves a loop body, so `break`/`continue` know they have an enclosing loop.
+    pub(crate) fn enter_loop(&mut self) {
+        self.loop_depth += 1;
+    }
+    pub(crate) fn exit_loop(&mut self) {
+        self.loop_depth = self.loop_depth.saturating_sub(1);
+    }
+    /// Enters / leaves a `switch`, so `break` knows it has an enclosing switch.
+    pub(crate) fn enter_switch(&mut self) {
+        self.switch_depth += 1;
+    }
+    pub(crate) fn exit_switch(&mut self) {
+        self.switch_depth = self.switch_depth.saturating_sub(1);
+    }
+    /// Whether a `continue` is valid here (inside a loop).
+    pub(crate) fn in_loop(&self) -> bool {
+        self.loop_depth > 0
+    }
+    /// Whether a `break` is valid here (inside a loop or a switch).
+    pub(crate) fn in_loop_or_switch(&self) -> bool {
+        self.loop_depth > 0 || self.switch_depth > 0
     }
 
     /// Declares a local variable or parameter in the innermost scope.
@@ -1029,9 +1321,22 @@ impl Binder {
     ) -> BoundExpr {
         let left = self.bind_expression(left_expr);
         let right = self.bind_expression(right_expr);
+        if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
+            && !left.ty.is_error()
+            && !right.ty.is_error()
+            && self
+                .type_info_of(&left.ty)
+                .is_some_and(|info| info.kind == TypeKind::Struct)
+        {
+            if let Some(call) = self.bind_user_binary_operator(operator, &left, &right) {
+                return call;
+            }
+        }
         let ty = if left.ty.is_error() || right.ty.is_error() {
             TypeSymbol::Error
         } else if let Some(result) = self.enum_binary_result(operator, &left.ty, &right.ty) {
+            result
+        } else if let Some(result) = pointer_binary_result(operator, &left.ty, &right.ty) {
             result
         } else if let Some(result) = binary_result_type(operator, &left.ty, &right.ty) {
             result
@@ -1319,6 +1624,51 @@ impl Binder {
         }
     }
 
+    /// Lowers an event subscription `receiver.E += h` (or `-=`) from outside the declaring
+    /// type to a call of the event's `add_E`/`remove_E` accessor (17.7), the handler
+    /// converted to the event's delegate type.
+    fn bind_event_subscription(
+        &mut self,
+        receiver: BoundExpr,
+        event: &EventSymbol,
+        declaring: &TypeSymbol,
+        operator: AssignmentOperator,
+        value_expr: &Expr,
+    ) -> BoundExpr {
+        let value = self.bind_expression(value_expr);
+        let handler = self.convert(value, &event.ty);
+        let prefix = if matches!(operator, AssignmentOperator::Add) {
+            "add_"
+        } else {
+            "remove_"
+        };
+        let mut accessor = String::from(prefix);
+        accessor.push_str(&event.name);
+        let void = TypeSymbol::Special(SpecialType::Void);
+        let method = MethodReference {
+            declaring_type: declaring.clone(),
+            name: accessor.clone().into(),
+            parameters: alloc::vec![event.ty.clone()],
+            return_type: void.clone(),
+            is_static: event.is_static,
+        };
+        let callee = BoundExpr {
+            ty: TypeSymbol::Error,
+            kind: BoundExprKind::MethodGroup {
+                receiver: Box::new(receiver),
+                name: accessor.into(),
+            },
+        };
+        BoundExpr {
+            kind: BoundExprKind::Call {
+                callee: Box::new(callee),
+                arguments: alloc::vec![handler],
+                method: Some(method),
+            },
+            ty: void,
+        }
+    }
+
     fn bind_assignment(
         &mut self,
         operator: AssignmentOperator,
@@ -1351,6 +1701,25 @@ impl Binder {
                     return self
                         .bind_indexer_call(bound_receiver, "set_Item", args, span)
                         .unwrap_or_else(error_expr);
+                }
+            }
+        }
+        if matches!(
+            operator,
+            AssignmentOperator::Add | AssignmentOperator::Subtract
+        ) {
+            if let ExprKind::MemberAccess { receiver, name } = &target_expr.kind {
+                let bound_receiver = self.bind_expression(receiver);
+                if let Some((event, declaring)) = self.event_declaration(&bound_receiver.ty, name) {
+                    if self.outside_event_declarer(&declaring) {
+                        return self.bind_event_subscription(
+                            bound_receiver,
+                            &event,
+                            &declaring,
+                            operator,
+                            value_expr,
+                        );
+                    }
                 }
             }
         }
@@ -1515,6 +1884,15 @@ impl Binder {
                 };
             }
         }
+        if let Some((_, declaring)) = self.event_declaration(&receiver.ty, name) {
+            if self.outside_event_declarer(&declaring) {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::EventOutsideAddRemove { event: name.into() },
+                    span,
+                ));
+                return error_expr();
+            }
+        }
         let receiver_kind = receiver_category(&receiver);
         match self.resolve_member(&receiver.ty, name) {
             MemberResolution::Field(field) => {
@@ -1606,31 +1984,36 @@ impl Binder {
             _ => None,
         };
         let mut params_method = false;
+        let has_method_group = arguments
+            .iter()
+            .any(|argument| matches!(argument.kind, BoundExprKind::MethodGroup { .. }));
+        let real_error = arguments.iter().any(|argument| {
+            argument.ty.is_error() && !matches!(argument.kind, BoundExprKind::MethodGroup { .. })
+        });
         let mut resolved = match group {
-            Some((receiver_ty, name))
-                if !arguments.iter().any(|argument| argument.ty.is_error()) =>
-            {
+            Some((receiver_ty, name)) if !real_error => {
                 let candidates = self.methods_in_chain(&receiver_ty, &name);
-                let argument_types: Vec<TypeSymbol> = arguments
-                    .iter()
-                    .map(|argument| argument.ty.clone())
-                    .collect();
-                self.resolve_call(&name, &receiver_ty, &candidates, &argument_types, span)
-                    .map(|method| {
-                        params_method = method.is_params;
-                        let declaring_type = self.declaring_type_in_chain(
-                            &receiver_ty,
-                            &method.name,
-                            &method.parameters,
-                        );
-                        MethodReference {
-                            declaring_type,
-                            name: method.name,
-                            parameters: method.parameters,
-                            return_type: method.return_type,
-                            is_static: method.is_static,
-                        }
-                    })
+                let chosen = if has_method_group {
+                    self.resolve_with_method_groups(&name, &receiver_ty, &candidates, &arguments, span)
+                } else {
+                    let argument_types: Vec<TypeSymbol> = arguments
+                        .iter()
+                        .map(|argument| argument.ty.clone())
+                        .collect();
+                    self.resolve_call(&name, &receiver_ty, &candidates, &argument_types, span)
+                };
+                chosen.map(|method| {
+                    params_method = method.is_params;
+                    let declaring_type =
+                        self.declaring_type_in_chain(&receiver_ty, &method.name, &method.parameters);
+                    MethodReference {
+                        declaring_type,
+                        name: method.name,
+                        parameters: method.parameters,
+                        return_type: method.return_type,
+                        is_static: method.is_static,
+                    }
+                })
             }
             _ => None,
         };
@@ -1770,6 +2153,54 @@ impl Binder {
         }
     }
 
+    /// Resolves a call/constructor whose arguments include a method group (which has no
+    /// type on its own, so it is excluded from the type-based [`resolve_call`]). A candidate
+    /// applies when its parameter count matches, each ordinary argument is assignable to its
+    /// parameter, and each method-group argument's parameter is a DELEGATE type -- the group
+    /// converts to it (15.4), and `convert` builds the delegate at the call site. Returns the
+    /// unique applicable method (reporting CS0122 if inaccessible, CS0121 if two apply),
+    /// else `None`.
+    fn resolve_with_method_groups(
+        &mut self,
+        name: &str,
+        declaring: &TypeSymbol,
+        candidates: &[MethodSymbol],
+        arguments: &[BoundExpr],
+        span: Span,
+    ) -> Option<MethodSymbol> {
+        let applicable: Vec<MethodSymbol> = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.parameters.len() == arguments.len()
+                    && arguments.iter().zip(&candidate.parameters).all(
+                        |(argument, parameter)| {
+                            if matches!(argument.kind, BoundExprKind::MethodGroup { .. }) {
+                                self.type_info_of(parameter)
+                                    .is_some_and(|info| info.kind == TypeKind::Delegate)
+                            } else {
+                                self.assignable(argument, parameter)
+                            }
+                        },
+                    )
+            })
+            .cloned()
+            .collect();
+        match applicable.as_slice() {
+            [method] => {
+                self.check_accessible(declaring, method.accessibility, name, span);
+                Some(method.clone())
+            }
+            [] => None,
+            _ => {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::AmbiguousCall { method: name.into() },
+                    span,
+                ));
+                None
+            }
+        }
+    }
+
     fn bind_element_access(
         &mut self,
         receiver_expr: &Expr,
@@ -1885,28 +2316,51 @@ impl Binder {
         {
             return self.bind_delegate_creation(&target_ty, &arguments, span);
         }
+        let has_method_group = arguments
+            .iter()
+            .any(|argument| matches!(argument.kind, BoundExprKind::MethodGroup { .. }));
+        let real_error = arguments.iter().any(|argument| {
+            argument.ty.is_error() && !matches!(argument.kind, BoundExprKind::MethodGroup { .. })
+        });
         let mut constructor = None;
+        let mut arguments = arguments;
         let ty = if target_ty.is_error() {
             TypeSymbol::Error
         } else {
-            if !arguments.iter().any(|argument| argument.ty.is_error()) {
+            if !real_error {
                 if let Some(constructors) = self
                     .type_info_of(&target_ty)
                     .map(|info| info.constructors.clone())
                 {
-                    let argument_types: Vec<TypeSymbol> = arguments
-                        .iter()
-                        .map(|argument| argument.ty.clone())
-                        .collect();
-                    constructor = self
-                        .check_constructor(&target_ty, &constructors, &argument_types, span)
-                        .map(|chosen| MethodReference {
+                    let chosen = if has_method_group {
+                        self.resolve_with_method_groups(
+                            ".ctor",
+                            &target_ty,
+                            &constructors,
+                            &arguments,
+                            span,
+                        )
+                    } else {
+                        let argument_types: Vec<TypeSymbol> =
+                            arguments.iter().map(|argument| argument.ty.clone()).collect();
+                        self.check_constructor(&target_ty, &constructors, &argument_types, span)
+                    };
+                    if let Some(chosen) = chosen {
+                        if has_method_group && chosen.parameters.len() == arguments.len() {
+                            arguments = core::mem::take(&mut arguments)
+                                .into_iter()
+                                .zip(chosen.parameters.iter())
+                                .map(|(argument, parameter)| self.convert(argument, parameter))
+                                .collect();
+                        }
+                        constructor = Some(MethodReference {
                             declaring_type: target_ty.clone(),
                             name: ".ctor".into(),
                             parameters: chosen.parameters,
                             return_type: TypeSymbol::Special(SpecialType::Void),
                             is_static: false,
                         });
+                    }
                 }
             }
             target_ty
@@ -2016,18 +2470,62 @@ impl Binder {
         None
     }
 
-    /// Whether a member of `declaring` with this accessibility is reachable from
-    /// the current context (10.5.1). Public, protected, and internal are treated
-    /// as accessible for now; `private` requires the access to be from the
-    /// declaring type itself.
     fn is_accessible(&self, declaring: &TypeSymbol, accessibility: Accessibility) -> bool {
         match accessibility {
-            Accessibility::Public
-            | Accessibility::Protected
-            | Accessibility::Internal
-            | Accessibility::ProtectedInternal => true,
-            Accessibility::Private => self.current_type.as_ref() == Some(declaring),
+            Accessibility::Public => true,
+            Accessibility::Internal => !self.type_is_external(declaring),
+            Accessibility::ProtectedInternal => {
+                !self.type_is_external(declaring) || self.current_derives_from(declaring)
+            }
+            Accessibility::Private => self.in_private_scope_of(declaring),
+            Accessibility::Protected => {
+                self.in_private_scope_of(declaring) || self.current_derives_from(declaring)
+            }
         }
+    }
+
+    /// Whether `ty` comes from a referenced assembly (so its `internal` members are not
+    /// accessible from the unit being compiled).
+    fn type_is_external(&self, ty: &TypeSymbol) -> bool {
+        self.type_info_of(ty).is_some_and(|info| info.is_external)
+    }
+
+    /// Whether the current type is `declaring` or a type nested (at any depth) within it --
+    /// the scope a `private` member is accessible from (10.5.1).
+    fn in_private_scope_of(&self, declaring: &TypeSymbol) -> bool {
+        let Some(current) = &self.current_type else {
+            return false;
+        };
+        if current == declaring {
+            return true;
+        }
+        let declaring_name = declaring.to_string();
+        let mut info = self.type_info_of(current);
+        while let Some(type_info) = info {
+            match type_info.enclosing.as_deref() {
+                None => return false,
+                Some(enclosing) if enclosing == declaring_name => return true,
+                Some(enclosing) => info = self.type_info_of(&named_symbol_from_dotted(enclosing)),
+            }
+        }
+        false
+    }
+
+    /// Whether the current type derives from `declaring` -- the extra scope a `protected`
+    /// member adds (a simplification of 10.5.3; the access-through-an-instance-of-the-derived-
+    /// type rule is not enforced).
+    fn current_derives_from(&self, declaring: &TypeSymbol) -> bool {
+        let Some(current) = &self.current_type else {
+            return false;
+        };
+        let mut info = self.type_info_of(current);
+        while let Some(base) = info.and_then(|type_info| type_info.base.clone()) {
+            if &base == declaring {
+                return true;
+            }
+            info = self.type_info_of(&base);
+        }
+        false
     }
 
     /// Reports `CS0122` when a member is not accessible from the current context.
@@ -2075,6 +2573,27 @@ impl Binder {
     }
 
     /// Looks a member up on a type, walking the base-class chain (14.3, 14.5.4).
+    /// If `name` is a field-like event reachable on `ty` (itself or a base), returns the
+    /// event and the symbol of the type that declares it. `+=`/`-=` route through its
+    /// accessors from outside that type (17.7), and any other use there is CS0070.
+    fn event_declaration(&self, ty: &TypeSymbol, name: &str) -> Option<(EventSymbol, TypeSymbol)> {
+        let lookup = member_lookup_type(ty);
+        let mut current = self.type_info_of(&lookup);
+        while let Some(info) = current {
+            if let Some(event) = info.find_event(name) {
+                return Some((event.clone(), type_symbol_in(&info.namespace, &info.name)));
+            }
+            current = info.base.as_ref().and_then(|base| self.type_info_of(base));
+        }
+        None
+    }
+
+    /// Whether code currently being bound is outside the type that declares `event_owner`
+    /// (so `+=`/`-=` must route through accessors and other uses are CS0070).
+    fn outside_event_declarer(&self, declaring: &TypeSymbol) -> bool {
+        !self.in_private_scope_of(declaring)
+    }
+
     fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
         let lookup = member_lookup_type(ty);
         let mut current = self.type_info_of(&lookup);
@@ -2086,7 +2605,7 @@ impl Binder {
                 return MemberResolution::Field(FieldReference {
                     declaring_type: type_symbol_in(&info.namespace, &info.name),
                     name: field.name.clone(),
-                    ty: field.ty.clone(),
+                    ty: self.resolve_type(&field.ty),
                     is_static: field.is_static,
                     accessibility: field.accessibility,
                     constant: field.constant,
@@ -2095,7 +2614,7 @@ impl Binder {
             if let Some(property) = info.find_property(name) {
                 return MemberResolution::Property {
                     declaring_type: type_symbol_in(&info.namespace, &info.name),
-                    ty: property.ty.clone(),
+                    ty: self.resolve_type(&property.ty),
                     accessibility: property.accessibility,
                     is_static: property.is_static,
                 };
@@ -2313,13 +2832,19 @@ impl Binder {
                 ty: ty.clone(),
             };
         }
+        if let Some(receiver) = self.session_receiver.clone() {
+            if let Some((stable, ty)) = self.session_fields.get(name).cloned() {
+                let repl_type = self.current_type.clone().unwrap_or(TypeSymbol::Error);
+                return self.session_field_access(&receiver, &repl_type, &stable, &ty);
+            }
+        }
         if let Some(current) = self.current_type.clone() {
             match self.resolve_member(&current, name) {
                 MemberResolution::Field(field) => {
                     return BoundExpr {
                         ty: field.ty.clone(),
                         kind: BoundExprKind::FieldAccess {
-                            receiver: Box::new(self.this_expr()),
+                            receiver: Box::new(self.implicit_receiver()),
                             name: name.into(),
                             field: Some(field),
                         },
@@ -2330,7 +2855,7 @@ impl Binder {
                 } => {
                     return BoundExpr {
                         kind: BoundExprKind::PropertyAccess {
-                            receiver: Box::new(self.this_expr()),
+                            receiver: Box::new(self.implicit_receiver()),
                             declaring_type,
                             name: name.into(),
                         },
@@ -2340,7 +2865,7 @@ impl Binder {
                 MemberResolution::MethodGroup => {
                     return BoundExpr {
                         kind: BoundExprKind::MethodGroup {
-                            receiver: Box::new(self.this_expr()),
+                            receiver: Box::new(self.implicit_receiver()),
                             name: name.into(),
                         },
                         ty: TypeSymbol::Error,
@@ -2348,6 +2873,12 @@ impl Binder {
                 }
                 MemberResolution::NoSuchMember(_) | MemberResolution::Unknown => {}
             }
+        }
+        if let Some(target) = self.alias_target(name) {
+            return BoundExpr {
+                kind: BoundExprKind::TypeReference(target.clone()),
+                ty: target,
+            };
         }
         let hits = self.type_namespaces_containing(name);
         if hits.len() == 1 {
@@ -2418,6 +2949,22 @@ impl Binder {
         }
     }
 
+    /// The receiver an implicit member access reads through: `this` normally, or the
+    /// `s: __Repl` parameter in REPL session mode. A submission's `Submit$N` is a
+    /// static method, so its session locals -- modeled as fields of the enclosing
+    /// `__Repl` -- are reached through the parameter `s` (`ldarg.0; ldfld`), not a
+    /// `this` it does not have. Both carry the enclosing type, so member lookup is
+    /// identical; only the emitted receiver differs.
+    fn implicit_receiver(&self) -> BoundExpr {
+        match &self.session_receiver {
+            Some(name) => BoundExpr {
+                kind: BoundExprKind::Local(name.clone()),
+                ty: self.current_type.clone().unwrap_or(TypeSymbol::Error),
+            },
+            None => self.this_expr(),
+        }
+    }
+
     /// The `base` access, typed as the enclosing type's base class (the error type
     /// when there is no enclosing type or it has no base, for recovery).
     fn base_expr(&self) -> BoundExpr {
@@ -2439,6 +2986,34 @@ impl Binder {
 pub fn bind_expression(expr: &Expr) -> BoundExpr {
     let mut binder = Binder::new();
     binder.bind_expression(expr)
+}
+
+/// The result type of pointer arithmetic (18.5.6, unsafe): `p + n` / `n + p` / `p - n`
+/// (a `T*`, the integer scaled by `sizeof(T)`) and `p - q` (a `long`, the element-count
+/// difference). `None` when neither operand is a pointer (a plain numeric op handles it).
+fn pointer_binary_result(
+    operator: BinaryOperator,
+    left: &TypeSymbol,
+    right: &TypeSymbol,
+) -> Option<TypeSymbol> {
+    use BinaryOperator::{Add, Subtract};
+    let integral = |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(special) if special.is_integral());
+    match (operator, left, right) {
+        (Add, TypeSymbol::Pointer(_), other) | (Add, other, TypeSymbol::Pointer(_))
+            if integral(other) =>
+        {
+            Some(if matches!(left, TypeSymbol::Pointer(_)) {
+                left.clone()
+            } else {
+                right.clone()
+            })
+        }
+        (Subtract, TypeSymbol::Pointer(_), other) if integral(other) => Some(left.clone()),
+        (Subtract, TypeSymbol::Pointer(a), TypeSymbol::Pointer(b)) if a == b => {
+            Some(TypeSymbol::Special(SpecialType::Int64))
+        }
+        _ => None,
+    }
 }
 
 /// The result type of a binary operator on operand types, or `None` if the
@@ -2547,6 +3122,12 @@ fn qualified_type_symbol(namespace: &str, name: &str) -> TypeSymbol {
     let mut parts: Vec<Box<str>> = namespace.split('.').map(Box::from).collect();
     parts.push(Box::from(name));
     TypeSymbol::Named(parts.into_boxed_slice())
+}
+
+/// A named-type symbol from a full dotted name (e.g. `Outer` or `Ns.Outer`), as a type's
+/// `enclosing` is stored -- the inverse of [`TypeSymbol`]'s `Display`.
+fn named_symbol_from_dotted(dotted: &str) -> TypeSymbol {
+    TypeSymbol::Named(dotted.split('.').map(Box::from).collect())
 }
 
 /// A named-type symbol from a namespace (possibly empty) and a simple name.
@@ -3330,6 +3911,39 @@ mod tests {
         assert!(binder.diagnostics().is_empty());
         binder.bind_expression(&parse_expression("w.missing").expr);
         assert_eq!(binder.diagnostics().last().map(Diagnostic::code), Some(117));
+    }
+
+    #[test]
+    fn internal_member_of_a_referenced_assembly_is_cs0122() {
+        use crate::symbols::{Accessibility, FieldSymbol, TypeInfo, TypeKind};
+        let internal_field = |name: &str| FieldSymbol {
+            name: name.into(),
+            ty: TypeSymbol::Special(SpecialType::Int32),
+            is_static: false,
+            is_readonly: false,
+            accessibility: Accessibility::Internal,
+            constant: None,
+        };
+        let mut model = Model::new();
+        let mut external = TypeInfo::new("", "Lib", TypeKind::Class);
+        external.is_external = true;
+        external.fields.push(internal_field("Secret"));
+        model.insert(external);
+        let mut here = TypeInfo::new("", "Here", TypeKind::Class);
+        here.fields.push(internal_field("Shared"));
+        model.insert(here);
+
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        binder.declare_local("lib", TypeSymbol::Named(["Lib".into()].into()));
+        binder.declare_local("here", TypeSymbol::Named(["Here".into()].into()));
+
+        binder.bind_expression(&parse_expression("lib.Secret").expr);
+        assert_eq!(binder.diagnostics().last().map(Diagnostic::code), Some(122));
+
+        let before = binder.diagnostics().len();
+        binder.bind_expression(&parse_expression("here.Shared").expr);
+        assert_eq!(binder.diagnostics().len(), before);
     }
 
     #[test]

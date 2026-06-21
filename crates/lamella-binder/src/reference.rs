@@ -46,6 +46,7 @@ fn type_info(
     };
 
     let mut info = TypeInfo::new(namespace, name, kind);
+    info.is_external = true;
     if let Some(base) = base {
         info.bases.push(base.clone());
         info.base = Some(base);
@@ -57,7 +58,7 @@ fn type_info(
                 ty: sigtype_to_symbol(assembly, &signature),
                 is_static: false,
                 is_readonly: false,
-                accessibility: Accessibility::Public,
+                accessibility: member_accessibility(field.flags()),
                 constant: None,
             });
         }
@@ -78,7 +79,7 @@ fn type_info(
             is_params: method
                 .params()
                 .any(|parameter| param_array.contains(&parameter.token().row())),
-            accessibility: Accessibility::Public,
+            accessibility: member_accessibility(method.flags()),
         };
         let property = method_name
             .strip_prefix("get_")
@@ -107,6 +108,17 @@ fn type_info(
         }
     }
     Some(info)
+}
+
+/// Maps a referenced member's access flags (the low 3 bits, II.23.1.5 / II.23.1.10) to an
+/// accessibility. Only `internal` (Assembly / FamANDAssem) is read -- it is enforced across
+/// assemblies as CS0122; every other level stays Public, so existing public/protected BCL
+/// access is unchanged (we model neither cross-assembly protected nor InternalsVisibleTo).
+fn member_accessibility(flags: u32) -> Accessibility {
+    match flags & 0x0007 {
+        0x0002 | 0x0003 => Accessibility::Internal,
+        _ => Accessibility::Public,
+    }
 }
 
 /// Maps a metadata signature element to a [`TypeSymbol`].

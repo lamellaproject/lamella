@@ -52,9 +52,6 @@ fn main() -> ExitCode {
     repl()
 }
 
-/// Runs each `line` as a submission against one [`lamella_repl::ReplSession`], in order,
-/// printing the output of each (a declaration prints nothing). Exits nonzero on the first
-/// error -- so `--session "int x = 5;" "x * 2"` prints `10` then exits 0.
 fn session_oneshot(lines: &[String]) -> ExitCode {
     let mut session = match lamella_repl::ReplSession::new() {
         Ok(session) => session,
@@ -76,20 +73,6 @@ fn session_oneshot(lines: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The interactive STATEFUL prompt. Unlike [`repl`], state declared on one line is visible to
-/// later lines (the `__Repl` instance is reused, with fields migrated forward). Two ergonomic
-/// layers sit on top of [`lamella_repl::ReplSession`]:
-///
-/// - MULTI-LINE input: lines are accumulated into one submission until
-///   [`lamella_repl::submission_is_complete`] says the brackets balance and the statement is
-///   terminated (or it is a bare expression). While a submission is incomplete the prompt
-///   changes to a continuation marker; a BLANK line force-submits whatever has accumulated so a
-///   user is never stranded mid-block.
-/// - META-COMMANDS: a line that begins with `:` at the START of a submission is a meta-command
-///   (`:history`, `:reset`, `:help`, `:quit`), handled here and kept OUT of the C# classifier.
-///   An in-session history records each C# submission for `:history` to list.
-///
-/// A bad submission is reported and the loop continues; EOF (or `:quit`) exits.
 fn session_repl() -> ExitCode {
     let mut session = match lamella_repl::ReplSession::new() {
         Ok(session) => session,
@@ -168,8 +151,6 @@ fn session_repl() -> ExitCode {
     }
 }
 
-/// Records `submission` in `history` and runs it against `session`, printing its output or the
-/// error. Shared by the normal completed-submission path and the EOF flush.
 fn run_submission(
     session: &mut lamella_repl::ReplSession,
     history: &mut Vec<String>,
@@ -183,19 +164,12 @@ fn run_submission(
     let _ = io::stdout().flush();
 }
 
-/// What a meta-command asks the [`session_repl`] loop to do next.
 enum Meta {
-    /// Handled in place (e.g. `:history`, `:help`); keep the current session and buffer.
     Continue,
-    /// Discard the session and history and start fresh.
     Reset,
-    /// Leave the REPL.
     Quit,
 }
 
-/// Interprets a `:`-prefixed meta-command (the text AFTER the colon). `:history` lists prior
-/// submissions, `:reset` clears the session, `:help` prints the command list, `:quit`/`:exit`
-/// leave. An unknown command prints a hint. Meta-commands never reach the C# classifier.
 fn handle_meta(command: &str, history: &[String]) -> Meta {
     match command.trim() {
         "history" => {
@@ -228,8 +202,6 @@ fn handle_meta(command: &str, history: &[String]) -> Meta {
     }
 }
 
-/// The interactive prompt loop: read a line, evaluate it, print the result or the
-/// error, repeat until EOF.
 fn repl() -> ExitCode {
     let stdin = io::stdin();
     let mut stdout = io::stdout();

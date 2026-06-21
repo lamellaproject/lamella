@@ -9,7 +9,25 @@ use alloc::vec::Vec;
 /// reference conversions that walk `model`'s inheritance graph (13.1).
 #[must_use]
 pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
-    has_implicit_conversion(from, to) || reference_conversion(model, from, to)
+    has_implicit_conversion(from, to)
+        || reference_conversion(model, from, to)
+        || delegate_to_base(model, from, to)
+}
+
+/// Every delegate type derives from `System.MulticastDelegate` (and so `System.Delegate`),
+/// an implicit reference conversion the reference model does not spell out -- so a delegate
+/// argument satisfies a `Delegate` parameter (e.g. `Delegate.Combine`).
+fn delegate_to_base(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    (is_system_type(to, "Delegate") || is_system_type(to, "MulticastDelegate"))
+        && model
+            .get_by_symbol(from)
+            .is_some_and(|info| info.kind == TypeKind::Delegate)
+}
+
+/// Whether `ty` is the named BCL type `System.<name>`.
+fn is_system_type(ty: &TypeSymbol, name: &str) -> bool {
+    matches!(ty, TypeSymbol::Named(parts)
+        if parts.len() == 2 && &*parts[0] == "System" && &*parts[1] == name)
 }
 
 /// Whether an explicit conversion (a cast) exists from `from` to `to` (13.2): any

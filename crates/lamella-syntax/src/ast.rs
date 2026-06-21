@@ -673,6 +673,8 @@ pub enum Member {
         ty: TypeRef,
         /// The declared fields.
         declarators: Vec<VariableDeclarator>,
+        /// The member's attributes (24.2).
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -694,6 +696,8 @@ pub enum Member {
         /// name like `I.M`. `None` for an ordinary method. Such a method is callable
         /// only through the interface, never by its simple name.
         explicit_interface: Option<TypeRef>,
+        /// The member's attributes (24.2).
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -726,6 +730,11 @@ pub enum Member {
         getter: Option<Accessor>,
         /// The `set` accessor, if present.
         setter: Option<Accessor>,
+        /// The explicitly implemented interface for `int I.P { ... }` (20.4.1), naming
+        /// its accessors `I.get_P`/`I.set_P`. `None` for an ordinary property.
+        explicit_interface: Option<TypeRef>,
+        /// The member's attributes (24.2).
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -737,6 +746,8 @@ pub enum Member {
         ty: TypeRef,
         /// The declared events.
         declarators: Vec<VariableDeclarator>,
+        /// The member's attributes (24.2).
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -753,6 +764,11 @@ pub enum Member {
         adder: Option<Accessor>,
         /// The `remove` accessor, if present.
         remover: Option<Accessor>,
+        /// The explicitly implemented interface for `event H I.E { ... }` (20.4.1), naming
+        /// its accessors `I.add_E`/`I.remove_E`. `None` for an ordinary custom-accessor event.
+        explicit_interface: Option<TypeRef>,
+        /// The member's attributes (24.2).
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -819,6 +835,21 @@ pub enum Member {
     NestedType(Box<NamespaceMember>),
     /// A placeholder for a member that could not be parsed, for recovery.
     Error,
+}
+
+impl Member {
+    /// Attaches the parsed attribute sections to a member that carries them (24.2). A member
+    /// kind that does not yet model attributes ignores them.
+    pub fn set_attributes(&mut self, attributes: Vec<AttributeSection>) {
+        match self {
+            Member::Field { attributes: slot, .. }
+            | Member::Method { attributes: slot, .. }
+            | Member::Property { attributes: slot, .. }
+            | Member::EventField { attributes: slot, .. }
+            | Member::Event { attributes: slot, .. } => *slot = attributes,
+            _ => {}
+        }
+    }
 }
 
 /// The name an explicit interface member implementation carries in metadata and in

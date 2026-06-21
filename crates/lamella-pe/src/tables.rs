@@ -86,6 +86,20 @@ impl TableStream {
         self.sorted |= 1u64 << table;
     }
 
+    /// Sorts `table`'s rows by the encoded value of their first column -- a coded parent
+    /// index -- and marks it sorted. The required-sorted tables a reader binary-searches by
+    /// parent (e.g. `CustomAttribute` by `HasCustomAttribute`) need this when rows are added
+    /// out of parent order. Safe only for a table no other table indexes into by row.
+    pub fn sort_by_coded_parent(&mut self, table: u8) {
+        if let Some(rows) = self.rows.get_mut(&table) {
+            rows.sort_by_key(|row| match row.first() {
+                Some(Column::Coded(kind, token)) => kind.encode(*token),
+                _ => 0,
+            });
+        }
+        self.sorted |= 1u64 << table;
+    }
+
     /// The number of rows in `table`.
     #[must_use]
     pub fn row_count(&self, table: u8) -> u32 {

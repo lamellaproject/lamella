@@ -23,11 +23,41 @@ namespace System.Collections
         }
         public object Pop()
         {
+            if (size == 0) throw new InvalidOperationException("Stack empty.");
             size = size - 1;
             object value = items[size];
             items[size] = null;
             return value;
         }
-        public object Peek() { return items[size - 1]; }
+
+        public object Peek()
+        {
+            if (size == 0) throw new InvalidOperationException("Stack empty.");
+            return items[size - 1];
+        }
+
+        public void Clear()
+        {
+            for (int i = 0; i < size; i++) items[i] = null;
+            size = 0;
+        }
+
+        public object[] ToArray()
+        {
+            object[] result = new object[size];
+            for (int i = 0; i < size; i++) result[i] = items[size - 1 - i];
+            return result;
+        }
+
+        public bool Contains(object value)
+        {
+            for (int i = 0; i < size; i++)
+            {
+                object item = items[i];
+                if (value == null) { if (item == null) return true; }
+                else if (item != null && item.Equals(value)) return true;
+            }
+            return false;
+        }
     }
 }

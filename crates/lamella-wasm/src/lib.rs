@@ -1,6 +1,8 @@
 //! Embedding the interpreter: run a managed assembly and capture its result.
 
 pub mod abi;
+#[cfg(feature = "aot")]
+pub mod aot;
 #[cfg(feature = "compile")]
 pub mod compile;
 #[cfg(feature = "dap")]

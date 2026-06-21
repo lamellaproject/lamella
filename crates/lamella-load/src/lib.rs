@@ -20,8 +20,9 @@ use lamella_ves::intrinsics::{
     console_write_bool, console_write_char, console_write_int32, console_write_int64,
     console_write_line, console_write_line_bool, console_write_line_char, console_write_line_empty,
     console_write_line_int32, console_write_line_int64, console_write_line_object,
-    delegate_combine, delegate_remove, enum_is_defined, enum_parse, exception_ctor,
-    exception_get_message, int32_to_string, int64_to_string, md_array_address, md_array_get,
+    datetime_now_ticks, delegate_combine, delegate_remove, enum_is_defined, enum_parse, exception_ctor,
+    exception_get_message, int32_to_string, int64_to_string, interlocked_compare_exchange,
+    md_array_address, md_array_get,
     md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
     object_reference_equals, object_to_string,
     initialize_array, string_concat, string_concat_object2, string_concat_object3, string_concat3,
@@ -44,8 +45,10 @@ use lamella_ves::intrinsics::{
     math_abs_int32, math_abs_int64, math_max_int32, math_max_int64, math_min_int32, math_min_int64,
     math_sign_int32, math_sign_int64, queue_dequeue, queue_peek, stack_peek, stack_pop,
     string_builder_append_char, string_builder_append_int, string_builder_append_string,
-    string_builder_get_length, string_builder_insert, string_builder_remove,
-    string_builder_replace_char, string_builder_to_string, string_contains, string_ends_with,
+    string_builder_get_capacity, string_builder_get_char, string_builder_get_length,
+    string_builder_insert, string_builder_remove, string_builder_replace_char,
+    string_builder_set_char, string_builder_set_length, string_builder_to_string,
+    string_contains, string_ends_with,
     string_index_of_char, string_index_of_string, string_insert, string_join,
     string_last_index_of_char, string_pad_left, string_pad_right, string_remove,
     string_replace_char, string_replace_string, string_split_char, string_starts_with,
@@ -56,6 +59,11 @@ use lamella_ves::intrinsics::{
     console_write_double, console_write_line_double, convert_to_int32_double, double_to_string,
     math_abs_f64, math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64, math_round_f64,
     math_sign_f64, math_truncate_f64,
+};
+#[cfg(all(feature = "NETMFv4_4", feature = "float"))]
+use lamella_ves::intrinsics::{
+    bitconverter_double_to_int64_bits, bitconverter_int32_bits_to_single,
+    bitconverter_int64_bits_to_double, bitconverter_single_to_int32_bits,
 };
 #[cfg(feature = "math-transcendental")]
 use lamella_ves::intrinsics::{
@@ -105,13 +113,13 @@ impl fmt::Display for LoadError {
 /// type, method name, and parameter types -- to its [`MethodId`]. Built while loading an
 /// assembly, it lets a later assembly resolve a cross-assembly call to the defining
 /// assembly's method by name (the metadata `MemberRef` carries the name, not a `MethodId`).
-type NameIndex = BTreeMap<String, MethodId>;
+pub type NameIndex = BTreeMap<String, MethodId>;
 
 /// A type index mapping a type's qualified name (`namespace.name`) to its global
 /// [`crate::TypeId`]. Built while loading each assembly, it lets a cross-assembly interface
 /// reference -- a `TypeRef` an implementing type names (e.g. a program class implementing
 /// `[corlib]System.IComparable`) -- resolve to the defining assembly's `TypeId` by name.
-type TypeNameIndex = BTreeMap<String, TypeId>;
+pub type TypeNameIndex = BTreeMap<String, TypeId>;
 
 /// A static-field index mapping a field's qualified name (`namespace.type.field`) to the
 /// module storage slot [`Module::bind_static_field`] assigned it. Built while loading each
@@ -258,6 +266,17 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
 /// The REPL emits a `/target:library` session class and invokes a named method by id (never an
 /// entry), so this lets it load that image directly instead of carrying an unused dummy `Main`.
 pub fn load_library(assembly: &Assembly) -> Result<Module, LoadError> {
+    Ok(load_bootstrap(assembly).0)
+}
+
+/// Loads the incremental-REPL bootstrap library exactly as [`load_library`] does, but also
+/// returns the name indices it built -- the method [`NameIndex`] and type [`TypeNameIndex`], each
+/// keyed by qualified name. These seed a [`DeltaContext`] so a later submission delta (loaded
+/// through [`load_delta`]) can resolve a cross-assembly reference into the bootstrap BY NAME -- a
+/// declared type's base `System.Object::.ctor`, or the `<repl>.__Repl` the delta references. (The
+/// static-field index is internal to one assembly's load and not needed across deltas.)
+#[must_use]
+pub fn load_bootstrap(assembly: &Assembly) -> (Module, NameIndex, TypeNameIndex) {
     let mut module = Module::new();
     let mut index = NameIndex::new();
     let mut type_index = TypeNameIndex::new();
@@ -271,7 +290,316 @@ pub fn load_library(assembly: &Assembly) -> Result<Module, LoadError> {
         &mut field_index,
         false,
     );
-    Ok(module)
+    (module, index, type_index)
+}
+
+/// The assembly id of the first incremental-REPL submission delta; the persistent bootstrap
+/// module owns asm 0, so deltas start one past it. Each [`load_delta`] takes the NEXT slot
+/// ([`DeltaContext::next_asm`]) rather than reusing one, so every loaded delta's token space
+/// stays distinct and all live deltas resolve simultaneously -- the corlib/`__Repl`/delta trio
+/// (and every later delta) coexist. [`crate::Module::asm_key`] is a u64 key (the assembly in the
+/// high 32 bits), so up to 256 (`u8`) assemblies can be resolved at once.
+const FIRST_DELTA_ASM: u8 = 1;
+
+/// The persistent state a [`load_delta`] caller threads across submissions: the global
+/// [`crate::TypeId`] of the bootstrap's `__Repl`, and the stable `field name -> instance slot`
+/// map of the fields added to it so far. A submission delta references a prior field by name,
+/// which this maps back to its slot; a name absent here is a NEW field the delta introduces.
+pub struct DeltaContext {
+    repl_type: TypeId,
+    /// `__Repl` field name -> instance slot, in the stable order fields were added. The runtime
+    /// contract is the field NAME (per the compiler's incremental-emit design): a delta names a
+    /// persistent field by name, and the slot it occupies never moves (fields only append).
+    field_slots: BTreeMap<String, u32>,
+    /// The persistent method [`NameIndex`], seeded from the bootstrap ([`load_bootstrap`]) and
+    /// grown by every delta. It lets a delta resolve a cross-assembly method call by name -- a
+    /// declared type's base `System.Object::.ctor`, say -- the same way [`load_with_corlib`]
+    /// resolves a program's call into the corlib.
+    index: NameIndex,
+    /// The persistent type [`TypeNameIndex`], seeded from the bootstrap and grown by every delta.
+    /// A type a delta DECLARES (e.g. `Foo`) is indexed here by qualified name, so a LATER delta's
+    /// `Foo` TypeRef -- its base reference, an `isinst`, etc. -- resolves to the same [`TypeId`].
+    type_index: TypeNameIndex,
+    /// The persistent static-field index, threaded so a delta's cross-assembly `ldsfld`/`stsfld`
+    /// resolves to a prior assembly's storage slot by name (the same role it plays in
+    /// [`load_with_corlib`]).
+    static_field_index: FieldNameIndex,
+    /// Each declared type's INSTANCE fields by qualified name (`namespace.type.field`) -> instance
+    /// slot, recorded as a delta's types load. A later delta's cross-assembly instance FieldRef to
+    /// one (e.g. `[decl]Foo::X`, an `ldfld`/`stfld`) resolves to the slot by name -- the instance
+    /// analog of `static_field_index`, which the shared loader does not build (it handles
+    /// cross-assembly method and static-field references, but not instance FieldRefs).
+    instance_field_index: BTreeMap<String, u32>,
+    /// The assembly id the NEXT submission delta loads under. Starts at [`FIRST_DELTA_ASM`] (one
+    /// past the bootstrap's asm 0) and advances per [`load_delta`], so every delta gets a DISTINCT
+    /// token space and all live deltas resolve simultaneously (the cap is 256 assemblies, the
+    /// `u8` range -- [`crate::Module::asm_key`] folds the asm id into the high 32 bits of a u64).
+    next_delta_asm: u8,
+}
+
+impl DeltaContext {
+    /// Opens an incremental-REPL context over the bootstrap's `__Repl` type. `repl_type` is the
+    /// global [`crate::TypeId`] of the (initially field-less) `<repl>.__Repl` the bootstrap
+    /// loaded; the caller finds it the same way [`load`] anchors a session class -- via the
+    /// declaring type of `<repl>.__Repl..ctor`. `index` / `type_index` are the bootstrap's name
+    /// indices ([`load_bootstrap`]), seeding cross-assembly name resolution so a delta that
+    /// declares a type can chain its `.ctor` to `[bootstrap]System.Object` and a later delta can
+    /// name that type. The field maps start empty (the bootstrap `__Repl` carries no declared
+    /// state, and no delta has declared a type yet); each [`load_delta`] grows them.
+    #[must_use]
+    pub fn new(repl_type: TypeId, index: NameIndex, type_index: TypeNameIndex) -> DeltaContext {
+        DeltaContext {
+            repl_type,
+            field_slots: BTreeMap::new(),
+            index,
+            type_index,
+            static_field_index: FieldNameIndex::new(),
+            instance_field_index: BTreeMap::new(),
+            next_delta_asm: FIRST_DELTA_ASM,
+        }
+    }
+
+    /// The assembly id the NEXT [`load_delta`] will bind its delta under (one past the previous
+    /// delta, starting at [`FIRST_DELTA_ASM`]). Exposed so a caller can confirm the slot a
+    /// submission landed in -- e.g. asserting later submissions run at asm >= 3, past the
+    /// two-assembly cap the old single-bit `asm_key` imposed.
+    #[must_use]
+    pub fn next_delta_asm(&self) -> u8 {
+        self.next_delta_asm
+    }
+
+    /// The instance slots of the `__Repl` fields added so far (one per field added by a prior
+    /// delta), so the caller can grow the live instance to match the grown type after
+    /// [`load_delta`] reports new fields.
+    #[must_use]
+    pub fn field_count(&self) -> usize {
+        self.field_slots.len()
+    }
+}
+
+/// What loading one submission delta produced: the `MethodId` of its `Submit$N` (to run against
+/// the persistent `__Repl` instance) and the zero-default value of each field it ADDED to
+/// `__Repl`, in slot order. The caller grows the single live instance by appending these
+/// defaults ([`crate::Heap::grow_instance`]) before running the method, so the new fields exist
+/// on the instance the submission writes.
+pub struct DeltaInfo {
+    /// The `Submit$N` method to run with the persistent `__Repl` instance as its sole argument.
+    pub submit: MethodId,
+    /// The zero defaults of the fields this delta added to `__Repl`, in the order added (each
+    /// already appended to the type's layout; the caller appends them to the live instance).
+    pub new_field_defaults: Vec<Value>,
+}
+
+/// Why [`load_delta`] could not bind a submission delta.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaError {
+    /// The delta assembly defines no `Submit$N` method (a delta must carry exactly one).
+    NoSubmitMethod,
+    /// The `Submit$N` method has no IL body to run.
+    SubmitHasNoBody,
+    /// A `__Repl` field reference in the delta could not be typed (its `MemberRef` carried no
+    /// field signature), so the runtime cannot size a new field for it.
+    UntypedFieldRef,
+}
+
+impl fmt::Display for DeltaError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            DeltaError::NoSubmitMethod => "delta defines no Submit$N method",
+            DeltaError::SubmitHasNoBody => "delta Submit$N method has no body",
+            DeltaError::UntypedFieldRef => "delta __Repl field reference has no signature",
+        })
+    }
+}
+
+/// Loads one incremental-REPL submission `delta` into the persistent `module`, resolving its
+/// references against the bootstrap's `__Repl` (and any type a prior delta declared, recorded in
+/// `context`) and binding its `Submit$N` method so it can be run by id.
+///
+/// The delta is a standalone assembly (per `docs/repl-incremental-model.md`). At minimum it
+/// carries a `Submit$N(__Repl s)` static method whose body reads/writes `__Repl` fields through
+/// `MemberRef` FieldRefs and (for an expression submission) boxes its result to `object` and
+/// returns it. A submission that DECLARES a type additionally carries a FULL `TypeDef` for it
+/// (e.g. `Foo { int32 X; .ctor }`, in the REPL global namespace), which the loader REGISTERS into
+/// the persistent module so a LATER delta can name it.
+///
+/// Loading is two passes:
+/// 1. The shared per-assembly loader ([`load_assembly`]) runs over the delta under this delta's
+///    own assembly slot ([`DeltaContext::next_delta_asm`], distinct per delta). It registers every
+///    type the delta declares (field layout, vtable, `.ctor`/methods, type token, NAME index) and
+///    binds `Submit$N` and all its SAME-MODULE tokens -- a `newobj`/`stfld` of a same-delta
+///    declared type, and a `ldstr`. Cross-assembly METHOD calls (a declared type's base
+///    `System.Object::.ctor`) and static-field references resolve by name through the persistent
+///    indices the bootstrap seeded.
+/// 2. A FieldRef pass binds the cross-assembly INSTANCE FieldRefs the shared loader does not
+///    handle: a FieldRef whose parent names `__Repl` is matched by NAME against `context` -- a
+///    known name binds to its slot; an UNKNOWN name is a NEW field, [`crate::Module::add_type_field`]
+///    grows `__Repl` by it and the new default is reported in [`DeltaInfo::new_field_defaults`]; a
+///    FieldRef to another declared type (e.g. `[decl]Foo::X`) binds to that field's slot by name.
+///
+/// The handshake "new fields = the `__Repl` references that do not resolve" still falls straight
+/// out of pass 2; no side manifest is needed. The caller then grows the live instance by the
+/// reported defaults and runs [`DeltaInfo::submit`].
+///
+/// # Errors
+/// [`DeltaError::NoSubmitMethod`] / [`DeltaError::SubmitHasNoBody`] if the delta carries no
+/// runnable `Submit$N`; [`DeltaError::UntypedFieldRef`] if a new `__Repl` field's `MemberRef` has
+/// no signature to size it from.
+pub fn load_delta(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    delta: &Assembly,
+) -> Result<DeltaInfo, DeltaError> {
+    let mut submit_row: Option<u32> = None;
+    let mut method_row: u32 = 0;
+    for type_def in delta.type_defs() {
+        for method in type_def.methods() {
+            method_row += 1;
+            if method.name().is_some_and(|name| name.starts_with("Submit$")) {
+                submit_row = Some(method_row);
+            }
+        }
+    }
+    let submit_row = submit_row.ok_or(DeltaError::NoSubmitMethod)?;
+
+    let delta_asm = context.next_delta_asm;
+
+    load_assembly(
+        module,
+        delta,
+        delta_asm,
+        &mut context.index,
+        &mut context.type_index,
+        &mut context.static_field_index,
+        true,
+    );
+
+    index_instance_fields(module, delta, delta_asm, &mut context.instance_field_index);
+
+    let submit = module
+        .resolve(delta_asm, Token::new(METHOD_DEF, submit_row))
+        .ok_or(DeltaError::SubmitHasNoBody)?;
+
+    let new_field_defaults = bind_delta_field_refs(module, context, delta, delta_asm)?;
+
+    context.next_delta_asm = context.next_delta_asm.saturating_add(1);
+
+    Ok(DeltaInfo {
+        submit,
+        new_field_defaults,
+    })
+}
+
+/// Indexes every INSTANCE field of every type the delta declares by qualified name
+/// (`namespace.type.field`) -> instance slot, reading the slot the shared loader already bound
+/// under the field's own `FieldDef` token. A later delta's cross-assembly instance FieldRef to one
+/// (e.g. `[decl]Foo::X`) is then resolvable by name in [`bind_delta_field_refs`] -- the instance
+/// analog of the static-field-by-name index, which the shared loader builds but the instance one
+/// it does not.
+fn index_instance_fields(
+    module: &Module,
+    delta: &Assembly,
+    delta_asm: u8,
+    instance_field_index: &mut BTreeMap<String, u32>,
+) {
+    let mut field_row: u32 = 0;
+    for type_def in delta.type_defs() {
+        let declaring = type_def.name();
+        for field in type_def.fields() {
+            field_row += 1;
+            if field.is_static() {
+                continue;
+            }
+            let token = Token::new(FIELD, field_row);
+            if let (Some(declaring), Some(name), Some(slot)) =
+                (declaring, field.name(), module.field_slot(delta_asm, token))
+            {
+                instance_field_index.insert(field_name_key(declaring, name), slot);
+            }
+        }
+    }
+}
+
+/// Binds every cross-assembly INSTANCE FieldRef (an `ldfld`/`stfld`/`ldflda` `MemberRef`) across
+/// all of the delta's method bodies, returning the zero defaults of the `__Repl` fields the delta
+/// ADDED (in the order they were added). A FieldRef to `__Repl` is grown-or-bound; a FieldRef to
+/// another declared type binds to that field's slot by name. A same-module FieldDef (a delta's own
+/// declared-type field, e.g. `Foo::X` in the declaring delta) is already bound by [`load_assembly`]
+/// and so is skipped here (it is not a `MemberRef`).
+fn bind_delta_field_refs(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    delta: &Assembly,
+    delta_asm: u8,
+) -> Result<Vec<Value>, DeltaError> {
+    let mut new_field_defaults: Vec<Value> = Vec::new();
+    for type_def in delta.type_defs() {
+        for method in type_def.methods() {
+            let Some(body) = method.body() else {
+                continue;
+            };
+            for instruction in body.code.iter() {
+                let Operand::Token(token) = &instruction.operand else {
+                    continue;
+                };
+                if !matches!(
+                    instruction.opcode,
+                    Opcode::Ldfld | Opcode::Stfld | Opcode::Ldflda
+                ) || token.table() != MEMBER_REF
+                {
+                    continue;
+                }
+                if let Some(default) = bind_delta_field(module, context, delta, delta_asm, *token)? {
+                    new_field_defaults.push(default);
+                }
+            }
+        }
+    }
+    Ok(new_field_defaults)
+}
+
+/// Binds one `__Repl` FieldRef token (an `ldfld`/`stfld`/`ldflda` `MemberRef`) in a delta to an
+/// instance slot. A FieldRef to another DECLARED type (e.g. `[decl]Foo::X`) binds to that field's
+/// slot, resolved by qualified name through the persistent instance-field index. A FieldRef to
+/// `__Repl` binds to its slot by field name, adding a new field to `__Repl` if the name is unknown.
+/// Returns the new field's zero default when it grew `__Repl`, or `None` otherwise.
+///
+/// Order matters: the declared-type lookup (parent-qualified) is tried FIRST, so a `Foo::X`
+/// reference never reaches the `__Repl` grow path. `__Repl`'s own fields are never in the
+/// declared-type index (no delta DECLARES `__Repl`), so a `__Repl` FieldRef always falls through
+/// to the by-bare-name path the incremental model defines.
+fn bind_delta_field(
+    module: &mut Module,
+    context: &mut DeltaContext,
+    delta: &Assembly,
+    delta_asm: u8,
+    token: Token,
+) -> Result<Option<Value>, DeltaError> {
+    let Some(member) = delta.member_ref(token.row()) else {
+        return Ok(None);
+    };
+    let Some(name) = member.name() else {
+        return Ok(None);
+    };
+    if let Some(declaring) = delta.type_token_name(member.parent()) {
+        let key = field_name_key(declaring, name);
+        if let Some(&slot) = context.instance_field_index.get(&key) {
+            module.bind_field(delta_asm, token, slot);
+            return Ok(None);
+        }
+    }
+    if let Some(&slot) = context.field_slots.get(name) {
+        module.bind_field(delta_asm, token, slot);
+        return Ok(None);
+    }
+    let signature = member.field_type().ok_or(DeltaError::UntypedFieldRef)?;
+    let default = default_field_value(Some(signature));
+    let slot = module
+        .add_type_field(context.repl_type, default.clone())
+        .unwrap_or(0);
+    module.bind_field(delta_asm, token, slot);
+    context.field_slots.insert(String::from(name), slot);
+    Ok(Some(default))
 }
 
 /// Loads a managed corlib (assembly 0) and a program (assembly 1) into one [`Module`],
@@ -405,6 +733,7 @@ fn load_assembly(
             }
             type_index.insert(type_name_key(name), type_id);
             module.bind_type_name(asm, Token::new(TYPE_DEF, type_row), name.name.into());
+            module.bind_type_full_name(type_id, type_name_key(name));
             if let Some(kind) = primitive_value_kind(name.namespace, name.name) {
                 module.set_primitive_type_token(asm, Token::new(TYPE_DEF, type_row), &kind);
             }
@@ -628,10 +957,18 @@ fn load_assembly(
     );
     bind_field_rva_data(assembly, module, asm, &ldtoken_field_tokens);
     bind_static_field_refs(assembly, module, asm, field_index, &static_field_ref_tokens);
-    bind_type_names(assembly, module, asm, &ldtoken_type_tokens);
+    bind_type_names(assembly, module, asm, type_index, &ldtoken_type_tokens);
     classify_type_test_tokens(assembly, module, asm, type_index, &type_test_tokens);
     bind_type_sizes(assembly, module, asm, &value_type_tokens, &sizeof_tokens);
-    build_field_layouts(module, asm, type_offset, &type_extends, &own_fields);
+    build_field_layouts(
+        module,
+        assembly,
+        asm,
+        type_offset,
+        type_index,
+        &type_extends,
+        &own_fields,
+    );
     build_vtables(
         module,
         assembly,
@@ -800,11 +1137,19 @@ fn bind_generic_calls(
         else {
             continue;
         };
-        if parent_type.namespace == "System"
-            && parent_type.name == "Array"
-            && member.name() == Some("Empty")
-        {
-            let id = module.add_intrinsic(asm, array_empty as IntrinsicFn, 0);
+        let recognized: Option<(IntrinsicFn, u16)> = match (
+            parent_type.namespace,
+            parent_type.name,
+            member.name(),
+        ) {
+            ("System", "Array", Some("Empty")) => Some((array_empty as IntrinsicFn, 0)),
+            ("System.Threading", "Interlocked", Some("CompareExchange")) => {
+                Some((interlocked_compare_exchange as IntrinsicFn, 3))
+            }
+            _ => None,
+        };
+        if let Some((function, arg_count)) = recognized {
+            let id = module.add_intrinsic(asm, function, arg_count);
             module.bind_token(asm, *token, id);
         }
     }
@@ -975,6 +1320,30 @@ fn bcl_intrinsic(
         ("Object", "ToString") => to_string_overload(object_to_string, signature),
         ("Delegate", "Combine") => Some(delegate_combine),
         ("Delegate", "Remove") => Some(delegate_remove),
+        ("DateTime", "NowTicks") => match parameters_of(signature) {
+            [] => Some(datetime_now_ticks),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("BitConverter", "DoubleToInt64Bits") => match parameters_of(signature) {
+            [SigType::R8] => Some(bitconverter_double_to_int64_bits),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("BitConverter", "Int64BitsToDouble") => match parameters_of(signature) {
+            [SigType::I8] => Some(bitconverter_int64_bits_to_double),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("BitConverter", "SingleToInt32Bits") => match parameters_of(signature) {
+            [SigType::R4] => Some(bitconverter_single_to_int32_bits),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("BitConverter", "Int32BitsToSingle") => match parameters_of(signature) {
+            [SigType::I4] => Some(bitconverter_int32_bits_to_single),
+            _ => None,
+        },
         _ => None,
     };
     if base.is_some() {
@@ -1035,9 +1404,17 @@ fn bind_array_defaults(
 }
 
 /// Marks each `newobj` token whose constructor is declared by a value type, so the
-/// interpreter builds a struct value in place rather than a heap instance. Only a
-/// same-assembly `MethodDef` token can name a value type defined here; a `MemberRef`
-/// newobj (a delegate / external type) is not a struct construction we model.
+/// interpreter builds a struct value in place rather than a heap instance.
+///
+/// A same-assembly `MethodDef` token names a value type defined here (its row is in
+/// `value_type_method_rows`). A `MemberRef` newobj of a value type defined in ANOTHER loaded
+/// assembly (e.g. a program's `new System.DateTime(...)` against the managed corlib) must be
+/// marked too -- otherwise the rvalue `new Struct(...)` allocates a heap object and the struct
+/// loses value semantics (a chained `new DateTime(..).AddMonths(8).Day` then reads the wrong
+/// `this`). `bind_bcl_calls` has already bound such a `MemberRef` to the defining assembly's
+/// ctor [`MethodId`], so resolving it here and asking whether that method declares a value type
+/// covers the cross-assembly case. A delegate / reference-type `MemberRef` ctor declares no
+/// value type, so it is left for the heap path.
 fn mark_value_type_ctors(
     module: &mut Module,
     asm: u8,
@@ -1045,7 +1422,14 @@ fn mark_value_type_ctors(
     value_type_method_rows: &BTreeSet<u32>,
 ) {
     for token in newobj_tokens {
-        if token.table() == METHOD_DEF && value_type_method_rows.contains(&token.row()) {
+        let is_value_type_ctor = if token.table() == METHOD_DEF {
+            value_type_method_rows.contains(&token.row())
+        } else {
+            module
+                .resolve(asm, *token)
+                .is_some_and(|ctor| module.method_declares_value_type(ctor))
+        };
+        if is_value_type_ctor {
             module.mark_value_type_ctor(asm, *token);
         }
     }
@@ -1138,11 +1522,17 @@ fn bind_type_names(
     assembly: &Assembly,
     module: &mut Module,
     asm: u8,
+    type_index: &TypeNameIndex,
     type_tokens: &BTreeSet<Token>,
 ) {
     for token in type_tokens {
         if let Some(name) = assembly.type_token_name(*token) {
             module.bind_type_name(asm, *token, name.name.into());
+            if module.type_id_of(asm, *token).is_none() {
+                if let Some(id) = type_index.get(&type_name_key(name)).copied() {
+                    module.bind_type_token(asm, *token, id);
+                }
+            }
         }
     }
 }
@@ -1275,19 +1665,76 @@ fn primitive_value_kind(namespace: &str, name: &str) -> Option<Value> {
     })
 }
 
+/// How a type's base resolves for instance-field layout: a same-assembly base (a local index,
+/// recursed in this pass), a cross-assembly base already loaded (its full field layout inherited
+/// directly), or no base. Mirrors [`BaseVtable`] -- the field layout needs the SAME cross-assembly
+/// resolution the vtable does, so a program class extending a corlib class (e.g. a user exception
+/// extending `System.Exception`) carries the base's instance fields ahead of its own.
+enum BaseFields {
+    /// A same-assembly base at this local index -- its layout is computed in this same pass.
+    Local(usize),
+    /// A previously loaded (cross-assembly) base's full field defaults, prepended to this type's
+    /// own fields so the derived instance reserves the base's slots first.
+    Extern(Vec<Value>),
+    /// No (or an unresolvable) base: the layout is this type's own fields only.
+    None,
+}
+
+/// Resolves type `local`'s base for field layout (see [`BaseFields`]). The same resolution
+/// [`resolve_base_vtable`] uses: a same-assembly `TypeDef` base is a local index; a `TypeRef`
+/// base resolves by qualified name through `type_index` (to a local index if inside this load's
+/// own range, else a previously loaded type whose stored field defaults seed this layout).
+fn resolve_base_fields(
+    module: &Module,
+    assembly: &Assembly,
+    type_offset: usize,
+    type_index: &TypeNameIndex,
+    extends: &[Token],
+    local: usize,
+) -> BaseFields {
+    if let Some(base) = base_type_id(extends[local], extends.len()) {
+        return BaseFields::Local(base);
+    }
+    let extends_token = extends[local];
+    if extends_token.table() != TYPE_REF {
+        return BaseFields::None;
+    }
+    let Some(global) = assembly
+        .type_token_name(extends_token)
+        .and_then(|name| type_index.get(&type_name_key(name)).copied())
+    else {
+        return BaseFields::None;
+    };
+    if let Some(base_local) = (global as usize)
+        .checked_sub(type_offset)
+        .filter(|&i| i < extends.len() && i != local)
+    {
+        return BaseFields::Local(base_local);
+    }
+    match module.type_field_defaults(global) {
+        Some(defaults) => BaseFields::Extern(defaults.to_vec()),
+        None => BaseFields::None,
+    }
+}
+
 /// Computes each type's full instance-field layout (base fields first, then own) and
 /// binds each own field token to its cumulative slot, so a derived instance carries
 /// its inherited fields at the same slots its base uses.
 fn build_field_layouts(
     module: &mut Module,
+    assembly: &Assembly,
     asm: u8,
     type_offset: usize,
+    type_index: &TypeNameIndex,
     extends: &[Token],
     own_fields: &[Vec<(Token, Value)>],
 ) {
+    let bases: Vec<BaseFields> = (0..extends.len())
+        .map(|local| resolve_base_fields(module, assembly, type_offset, type_index, extends, local))
+        .collect();
     let mut memo: Vec<Option<Vec<Value>>> = alloc::vec![None; extends.len()];
     for local in 0..extends.len() {
-        let full = field_layout(local, extends, own_fields, &mut memo);
+        let full = field_layout(local, &bases, own_fields, &mut memo);
         let base_count = full.len() - own_fields[local].len();
         for (index, (token, _)) in own_fields[local].iter().enumerate() {
             module.bind_field(asm, *token, (base_count + index) as u32);
@@ -1300,16 +1747,17 @@ fn build_field_layouts(
 /// followed by its own instance fields.
 fn field_layout(
     type_id: usize,
-    extends: &[Token],
+    bases: &[BaseFields],
     own_fields: &[Vec<(Token, Value)>],
     memo: &mut [Option<Vec<Value>>],
 ) -> Vec<Value> {
     if let Some(layout) = &memo[type_id] {
         return layout.clone();
     }
-    let mut layout = match base_type_id(extends[type_id], extends.len()) {
-        Some(base) => field_layout(base, extends, own_fields, memo),
-        None => Vec::new(),
+    let mut layout = match &bases[type_id] {
+        BaseFields::Local(base) => field_layout(*base, bases, own_fields, memo),
+        BaseFields::Extern(defaults) => defaults.clone(),
+        BaseFields::None => Vec::new(),
     };
     layout.extend(
         own_fields[type_id]
@@ -2006,11 +2454,27 @@ mod extended {
                 [] => Some(string_builder_get_length),
                 _ => None,
             },
-            ("StringBuilder", "Insert") => match parameters_of(signature) {
+            ("StringBuilder", "SetLengthCore") => match parameters_of(signature) {
+                [SigType::I4] => Some(string_builder_set_length),
+                _ => None,
+            },
+            ("StringBuilder", "get_Capacity") => match parameters_of(signature) {
+                [] => Some(string_builder_get_capacity),
+                _ => None,
+            },
+            ("StringBuilder", "get_Chars") => match parameters_of(signature) {
+                [SigType::I4] => Some(string_builder_get_char),
+                _ => None,
+            },
+            ("StringBuilder", "SetCharsCore") => match parameters_of(signature) {
+                [SigType::I4, SigType::Char] => Some(string_builder_set_char),
+                _ => None,
+            },
+            ("StringBuilder", "InsertCore") => match parameters_of(signature) {
                 [SigType::I4, SigType::String] => Some(string_builder_insert),
                 _ => None,
             },
-            ("StringBuilder", "Remove") => match parameters_of(signature) {
+            ("StringBuilder", "RemoveCore") => match parameters_of(signature) {
                 [SigType::I4, SigType::I4] => Some(string_builder_remove),
                 _ => None,
             },

@@ -23,12 +23,42 @@ namespace System.Collections
         }
         public object Dequeue()
         {
+            if (size == 0) throw new InvalidOperationException("Queue empty.");
             object value = items[0];
             for (int i = 1; i < size; i++) items[i - 1] = items[i];
             size = size - 1;
             items[size] = null;
             return value;
         }
-        public object Peek() { return items[0]; }
+
+        public object Peek()
+        {
+            if (size == 0) throw new InvalidOperationException("Queue empty.");
+            return items[0];
+        }
+
+        public void Clear()
+        {
+            for (int i = 0; i < size; i++) items[i] = null;
+            size = 0;
+        }
+
+        public object[] ToArray()
+        {
+            object[] result = new object[size];
+            for (int i = 0; i < size; i++) result[i] = items[i];
+            return result;
+        }
+
+        public bool Contains(object value)
+        {
+            for (int i = 0; i < size; i++)
+            {
+                object item = items[i];
+                if (value == null) { if (item == null) return true; }
+                else if (item != null && item.Equals(value)) return true;
+            }
+            return false;
+        }
     }
 }

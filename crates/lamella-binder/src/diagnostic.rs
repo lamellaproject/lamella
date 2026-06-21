@@ -113,6 +113,22 @@ pub enum DiagnosticKind {
         /// The qualified member name.
         member: Box<str>,
     },
+    /// `CS0070`: a field-like event used from outside its declaring type anywhere other
+    /// than the left of `+=`/`-=`.
+    EventOutsideAddRemove {
+        /// The qualified event name.
+        event: Box<str>,
+    },
+    /// `CS0139`: a `break`/`continue` with no enclosing loop (or switch, for `break`).
+    NoEnclosingLoop,
+    /// `CS0428`: a method group is used where a non-delegate type is expected (it was not
+    /// invoked and does not convert to the target).
+    MethodGroupToNonDelegate {
+        /// The method group's name.
+        method: Box<str>,
+        /// The non-delegate target type.
+        target: Box<str>,
+    },
     /// `CS0150`: a constant value was expected (e.g. a non-constant `case` label).
     ConstantExpected,
     /// `CS0152`: a `switch` has two labels with the same value (or two `default`s).
@@ -287,6 +303,9 @@ impl DiagnosticKind {
             DiagnosticKind::ArgumentConversion { .. } => 1503,
             DiagnosticKind::AmbiguousCall { .. } => 121,
             DiagnosticKind::Inaccessible { .. } => 122,
+            DiagnosticKind::EventOutsideAddRemove { .. } => 70,
+            DiagnosticKind::NoEnclosingLoop => 139,
+            DiagnosticKind::MethodGroupToNonDelegate { .. } => 428,
             DiagnosticKind::ConstantExpected => 150,
             DiagnosticKind::DuplicateCaseLabel { .. } => 152,
             DiagnosticKind::SwitchFallThrough => 163,
@@ -384,6 +403,18 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::Inaccessible { member } => {
                 write!(f, "'{member}' is inaccessible due to its protection level")
             }
+            DiagnosticKind::EventOutsideAddRemove { event } => write!(
+                f,
+                "The event '{event}' can only appear on the left hand side of += or -= \
+                 (except when used from within the type that declares it)"
+            ),
+            DiagnosticKind::NoEnclosingLoop => {
+                write!(f, "No enclosing loop out of which to break or continue")
+            }
+            DiagnosticKind::MethodGroupToNonDelegate { method, target } => write!(
+                f,
+                "Cannot convert method group '{method}' to non-delegate type '{target}'"
+            ),
             DiagnosticKind::ConstantExpected => write!(f, "A constant value is expected"),
             DiagnosticKind::DuplicateCaseLabel { label } => write!(
                 f,

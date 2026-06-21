@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+#[cfg(feature = "exceptions")]
+pub mod exception;
 pub mod interp;
 #[cfg(feature = "bcl")]
 pub mod intrinsics;
@@ -13,7 +15,11 @@ pub mod object;
 pub mod trap;
 pub mod value;
 
-pub use interp::{FrameView, Session, Status, Vm, run, run_method};
+#[cfg(feature = "exceptions")]
+pub use exception::{exception_tag, tag_is_exact, tag_is_subtype};
+pub use interp::{
+    CodeLocation, FrameView, NamedValue, Session, Status, Stop, StopReason, Vm, run, run_method,
+};
 pub use module::{IntrinsicFn, Method, MethodId, Module, TypeId};
 pub use object::{Heap, Object, ObjectRef};
 pub use trap::Trap;

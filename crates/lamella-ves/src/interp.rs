@@ -6,8 +6,8 @@ use crate::module::{Method, MethodId, Module, asm_key};
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
 use crate::value::{Location, Value};
-use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::string::String;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_cil::{
     EhClause, EhKind, Instruction, InstructionRange, MethodBodyImage, Opcode, Operand,
@@ -41,6 +41,21 @@ pub struct Vm {
     /// Set by `GC.Collect`: the next safepoint collects regardless of the heap threshold.
     #[cfg(feature = "gc")]
     force_collect: bool,
+    /// The exception currently propagating without (yet) a handler: set the moment a
+    /// `throw`/`rethrow` begins its search and cleared the instant a `catch`/`filter`
+    /// accepts it, so if the search exhausts the call stack this still holds the culprit.
+    /// A [`Session`] armed with [`Session::set_pause_on_unhandled_exception`] reads it to
+    /// report the object on a [`StopReason::Exception`] pause. Always `None` (and never set)
+    /// without the `exceptions` feature.
+    #[cfg(feature = "exceptions")]
+    unhandled: Option<ObjectRef>,
+    /// The current time, as a count of 100-nanosecond ticks since the .NET epoch
+    /// (0001-01-01 00:00:00). The interpreter core is no_std and has no clock of its own:
+    /// the embedder sets this (the host from `std::time`, a device from its RTC) via
+    /// [`Vm::set_now_ticks`], and `DateTime.Now`/`UtcNow`/`Today` read it through the
+    /// `datetime_now_ticks` intrinsic. It defaults to 0 (the epoch) when the embedder
+    /// never sets it, so an unconfigured host reads a defined value rather than garbage.
+    now_ticks: i64,
 }
 
 impl Vm {
@@ -112,6 +127,23 @@ impl Vm {
         }
     }
 
+    /// Sets the current time the host clock seam reports, as 100-nanosecond ticks since
+    /// the .NET epoch (0001-01-01 00:00:00). The embedder supplies this -- the host from
+    /// `std::time`, a device from its RTC -- and `DateTime.Now`/`UtcNow`/`Today` read it.
+    /// For v1 these are all UTC-based (no timezone), so `Now` and `UtcNow` report the same
+    /// value.
+    pub fn set_now_ticks(&mut self, ticks: i64) {
+        self.now_ticks = ticks;
+    }
+
+    /// The current time in 100-nanosecond ticks since the .NET epoch, as last set by
+    /// [`Vm::set_now_ticks`] (0 -- the epoch -- if never set). The `datetime_now_ticks`
+    /// intrinsic returns this to the managed `DateTime.Now`/`UtcNow`.
+    #[must_use]
+    pub fn now_ticks(&self) -> i64 {
+        self.now_ticks
+    }
+
     /// Records `message` (a heap string) as `exception`'s message, for
     /// `Exception.Message`.
     pub fn set_exception_message(&mut self, exception: ObjectRef, message: ObjectRef) {
@@ -122,6 +154,21 @@ impl Vm {
     #[must_use]
     pub fn exception_message(&self, exception: ObjectRef) -> Option<ObjectRef> {
         self.exception_messages.get(&exception).copied()
+    }
+
+    /// Records `exception` as the one currently propagating (set as a throw/fault begins its
+    /// search), so an unhandled-exception pause can report it if the search exhausts the
+    /// stack. The stepping loop discards it the moment a handler accepts (the unwind returns
+    /// without a trap), so it cannot mis-attribute a later exception.
+    #[cfg(feature = "exceptions")]
+    fn note_unhandled(&mut self, exception: ObjectRef) {
+        self.unhandled = Some(exception);
+    }
+
+    /// Takes the exception that escaped without a handler, if one did.
+    #[cfg(feature = "exceptions")]
+    fn take_unhandled(&mut self) -> Option<ObjectRef> {
+        self.unhandled.take()
     }
 }
 
@@ -382,8 +429,105 @@ pub fn run(
 /// debugger can own the module it steps, and the heap and console outlive a session.
 pub struct Session {
     frames: Vec<Frame>,
-    breakpoints: BTreeSet<(MethodId, u32)>,
+    /// Instruction breakpoints keyed by `(method, instruction-index)`, each mapped to
+    /// whether it is enabled. A disabled breakpoint is remembered (so a debugger can
+    /// toggle it back on) but does not pause execution. A `BTreeMap` rather than a set so
+    /// enable/disable need not re-send the address.
+    breakpoints: BTreeMap<(MethodId, u32), bool>,
     result: Option<Option<Value>>,
+    /// When set, an exception that unwinds off the bottom of the call stack pauses the
+    /// session ([`StopReason::Exception`]) with the thrown object reported, rather than
+    /// ending the run with [`Trap::UnhandledException`]. Off by default, so
+    /// [`Session::run`]/[`Session::resume`]/[`Session::step`] keep their abort-on-unhandled
+    /// behaviour; a debugger opts in via [`Session::set_pause_on_unhandled_exception`].
+    #[cfg(feature = "exceptions")]
+    pause_on_exception: bool,
+    /// The exception object an unhandled-exception pause parked on, so
+    /// [`Session::stopped_exception`] can report it. The call stack has unwound by then (an
+    /// unhandled exception is terminal), so the object -- not the frames -- is the
+    /// inspectable artifact. Cleared when the run advances again; always `None` without
+    /// `pause_on_exception`.
+    #[cfg(feature = "exceptions")]
+    unhandled_exception: Option<ObjectRef>,
+}
+
+/// A code location: a method and the index of an instruction within it -- the unit a
+/// breakpoint addresses and a [`Stop`] reports. This is the interpreter-side ("CIL
+/// offset") location the device-agnostic debug seam carries; a driver maps it to source
+/// (via a PDB) or to a wire address as it sees fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CodeLocation {
+    /// The method the location is in.
+    pub method: MethodId,
+    /// The index (not byte offset) of the instruction within the method.
+    pub instruction: u32,
+}
+
+/// Why a [`Session`] run loop ([`Session::continue_`], [`Session::step_into`],
+/// [`Session::step_over`], [`Session::step_out`]) stopped.
+///
+/// This is the device-agnostic stop seam: the on-device wireline stub and the host
+/// `lamella-dap` backend both read it. It is the [`Session`]-level counterpart of the
+/// host adapter's `Stop`, kept in the no_std core so a device driver shares it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// Paused at the program's first instruction (the explicit stop-at-entry a debugger
+    /// requests before any code runs). Reserved for a driver that begins paused; the run
+    /// loops here never originate it (they report `Breakpoint` / `Step` / `Exited`).
+    EntryPoint,
+    /// Paused before an enabled breakpoint's instruction.
+    Breakpoint,
+    /// A single-step (into/over/out) completed.
+    Step,
+    /// The program ran to completion. The [`Stop`]'s `location` is then `None` and its
+    /// `returned` holds the entry method's result.
+    Exited,
+    /// An exception unwound off the bottom of the call stack and the session was
+    /// configured to pause on it ([`Session::set_pause_on_unhandled_exception`]); the call
+    /// stack has unwound, and [`Session::stopped_exception`] gives the thrown object.
+    #[cfg(feature = "exceptions")]
+    Exception,
+}
+
+/// The outcome of a [`Session`] run-loop call: why it stopped, and where (the location of
+/// the top frame when it stopped, or `None` once the program has finished and the call
+/// stack is empty).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Stop {
+    /// Why the run loop stopped.
+    pub reason: StopReason,
+    /// The location execution is paused at (the top frame's method + instruction), or
+    /// `None` if the program ran to completion.
+    pub location: Option<CodeLocation>,
+    /// The value the entry method returned, present only when the program ran to
+    /// completion (`location` is then `None`).
+    pub returned: Option<Value>,
+}
+
+/// One named, inspectable value -- a field or element a debugger drilled into via
+/// [`Session::expand`]. A driver renders/types the `value` itself (e.g. `lamella-dap`'s
+/// `format_value`); the core supplies the name and the raw [`Value`].
+#[derive(Debug, Clone)]
+pub struct NamedValue {
+    /// The display name (`field0` for an instance field by slot, `[2]` for an array
+    /// element, `value` for a box's content).
+    pub name: String,
+    /// The value itself, for display or further expansion.
+    pub value: Value,
+}
+
+/// Whether `value` can be drilled into by [`Session::expand`] -- an object instance with
+/// fields, an array with elements, or a box. A bare scalar cannot.
+#[must_use]
+fn is_expandable(vm: &Vm, value: &Value) -> bool {
+    match value {
+        Value::Object(reference) => {
+            vm.heap().array_len(*reference).is_some()
+                || vm.heap().boxed_value(*reference).is_some()
+                || matches!(vm.heap().get(*reference), Some(crate::object::Object::Instance { .. }))
+        }
+        _ => false,
+    }
 }
 
 /// The state of a [`Session`] after a step or resume.
@@ -422,19 +566,42 @@ impl Session {
     pub fn new(module: &Module, entry: MethodId, args: Vec<Value>) -> Result<Session, Trap> {
         Ok(Session {
             frames: alloc::vec![new_frame(module, entry, args)?],
-            breakpoints: BTreeSet::new(),
+            breakpoints: BTreeMap::new(),
             result: None,
+            #[cfg(feature = "exceptions")]
+            pause_on_exception: false,
+            #[cfg(feature = "exceptions")]
+            unhandled_exception: None,
         })
     }
 
-    /// Sets a breakpoint before instruction `instruction` of `method`.
+    /// Sets (and enables) a breakpoint before instruction `instruction` of `method`. Setting
+    /// one that already exists re-enables it.
     pub fn add_breakpoint(&mut self, method: MethodId, instruction: u32) {
-        self.breakpoints.insert((method, instruction));
+        self.breakpoints.insert((method, instruction), true);
     }
 
-    /// Clears a breakpoint set by [`Session::add_breakpoint`].
+    /// Clears a breakpoint set by [`Session::add_breakpoint`] (forgotten entirely, unlike
+    /// [`Session::set_breakpoint_enabled`] with `false`, which keeps it disabled).
     pub fn remove_breakpoint(&mut self, method: MethodId, instruction: u32) {
         self.breakpoints.remove(&(method, instruction));
+    }
+
+    /// Enables or disables the breakpoint at `(method, instruction)`, creating it (in the
+    /// requested state) if it does not exist. A disabled breakpoint is remembered but does
+    /// not pause execution -- the toggle a DAP `setBreakpoints` with `enabled: false`, or a
+    /// wireline `Disable`, maps to.
+    pub fn set_breakpoint_enabled(&mut self, method: MethodId, instruction: u32, enabled: bool) {
+        self.breakpoints.insert((method, instruction), enabled);
+    }
+
+    /// Whether an enabled breakpoint is set at `(method, instruction)`.
+    #[must_use]
+    pub fn is_breakpoint_enabled(&self, method: MethodId, instruction: u32) -> bool {
+        self.breakpoints
+            .get(&(method, instruction))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Removes all breakpoints (e.g. when a debugger replaces the whole set).
@@ -442,12 +609,32 @@ impl Session {
         self.breakpoints.clear();
     }
 
-    /// Whether the session is currently sitting at a breakpoint -- the next
-    /// [`Session::resume`] would pause immediately. A debugger uses this to step
-    /// off a breakpoint before continuing.
+    /// Whether the session is currently sitting on an enabled breakpoint -- the next
+    /// [`Session::resume`] / [`Session::continue_`] would pause immediately. A debugger uses
+    /// this to step off a breakpoint before continuing.
     #[must_use]
     pub fn is_at_breakpoint(&self) -> bool {
         self.at_breakpoint()
+    }
+
+    /// Makes an exception that unwinds off the bottom of the call stack pause the session
+    /// ([`StopReason::Exception`], the faulting frames still inspectable) instead of ending
+    /// the run with [`Trap::UnhandledException`]. Only the new [`Session::continue_`] /
+    /// `step_*` loop honours it; [`Session::run`]/[`Session::resume`]/[`Session::step`] keep
+    /// aborting, so existing callers (and the differential) are unaffected. No-op without the
+    /// `exceptions` feature (nothing throws).
+    #[cfg(feature = "exceptions")]
+    pub fn set_pause_on_unhandled_exception(&mut self, pause: bool) {
+        self.pause_on_exception = pause;
+    }
+
+    /// The exception object the session is parked on after a [`StopReason::Exception`] stop,
+    /// if any. The faulting frames sit beneath it ([`Session::frame`]), and
+    /// [`Session::expand`] reads its fields. `None` at any other stop.
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    pub fn stopped_exception(&self) -> Option<ObjectRef> {
+        self.unhandled_exception
     }
 
     /// Executes exactly one instruction, ignoring breakpoints.
@@ -516,9 +703,231 @@ impl Session {
 
     fn at_breakpoint(&self) -> bool {
         match self.frames.last() {
-            Some(frame) => self.breakpoints.contains(&(frame.method, frame.ip as u32)),
+            Some(frame) => {
+                self.breakpoints
+                    .get(&(frame.method, frame.ip as u32))
+                    .copied()
+                    == Some(true)
+            }
             None => false,
         }
+    }
+
+    /// The location execution is paused at -- the top (innermost) frame's method and
+    /// instruction index -- or `None` once the program has finished. This is the location a
+    /// [`Stop`] reports, exposed on its own so a driver can read "where am I" without a step.
+    #[must_use]
+    pub fn location(&self) -> Option<CodeLocation> {
+        self.frames.last().map(|frame| CodeLocation {
+            method: frame.method,
+            instruction: frame.ip as u32,
+        })
+    }
+
+    /// The `this` reference of the innermost frame -- argument slot 0 when `module` records
+    /// that method's first argument as `this` (i.e. it is an instance method) -- or `None`
+    /// for a static method (or when no debug names are loaded). A debugger surfaces this
+    /// distinctly from the other arguments.
+    #[must_use]
+    pub fn this(&self, module: &Module) -> Option<Value> {
+        let frame = self.frames.last()?;
+        module
+            .arg_name(frame.method, 0)
+            .filter(|name| *name == "this")
+            .and_then(|_| frame.args.first())
+            .cloned()
+    }
+
+    /// Resumes until an enabled breakpoint, an unhandled exception
+    /// ([`Session::set_pause_on_unhandled_exception`]), or completion -- the device-agnostic
+    /// "continue" the wireline and `lamella-dap` both drive. Unlike [`Session::resume`], it
+    /// reports *why* it stopped and *where* via a [`Stop`], and (when enabled) pauses on an
+    /// unhandled exception rather than trapping. It steps off a breakpoint it is already
+    /// sitting on before running, so a repeated `continue_` makes progress.
+    ///
+    /// # Errors
+    /// Returns a [`Trap`] if an instruction faults in a way that is not a catchable,
+    /// pausable exception (malformed CIL, stack overflow, an unresolved token, ...).
+    pub fn continue_(&mut self, module: &Module, vm: &mut Vm) -> Result<Stop, Trap> {
+        if let Some(result) = &self.result {
+            return Ok(self.done(result.clone()));
+        }
+        if self.at_breakpoint() {
+            if let Some(stop) = self.tick(module, vm)? {
+                return Ok(stop);
+            }
+        }
+        loop {
+            if self.at_breakpoint() {
+                return Ok(self.stop(StopReason::Breakpoint));
+            }
+            if let Some(stop) = self.tick(module, vm)? {
+                return Ok(stop);
+            }
+        }
+    }
+
+    /// Single-steps one instruction, descending into a call -- "step into". Stops at the
+    /// next instruction wherever it lands (the callee's first instruction across a call, or
+    /// the next instruction in this frame), or earlier on an enabled breakpoint / a pausable
+    /// unhandled exception.
+    ///
+    /// # Errors
+    /// Returns a [`Trap`] as [`Session::continue_`] does.
+    pub fn step_into(&mut self, module: &Module, vm: &mut Vm) -> Result<Stop, Trap> {
+        if let Some(result) = &self.result {
+            return Ok(self.done(result.clone()));
+        }
+        match self.tick(module, vm)? {
+            Some(stop) => Ok(stop),
+            None if self.at_breakpoint() => Ok(self.stop(StopReason::Breakpoint)),
+            None => Ok(self.stop(StopReason::Step)),
+        }
+    }
+
+    /// Steps over a call -- "step over" / DAP `next`. A call at the current instruction runs
+    /// to completion (back to this frame or a caller) before stopping; otherwise it behaves
+    /// like [`Session::step_into`]. An enabled breakpoint hit inside the stepped-over call
+    /// takes priority and pauses there.
+    ///
+    /// # Errors
+    /// Returns a [`Trap`] as [`Session::continue_`] does.
+    pub fn step_over(&mut self, module: &Module, vm: &mut Vm) -> Result<Stop, Trap> {
+        let start = self.depth();
+        self.step_until(module, vm, |session| session.depth() <= start)
+    }
+
+    /// Steps out of the current method -- "step out" / DAP `stepOut`. Runs until the current
+    /// method returns (the call stack is shallower than it is now), then stops at the next
+    /// instruction in the caller, or earlier on an enabled breakpoint / a pausable unhandled
+    /// exception.
+    ///
+    /// # Errors
+    /// Returns a [`Trap`] as [`Session::continue_`] does.
+    pub fn step_out(&mut self, module: &Module, vm: &mut Vm) -> Result<Stop, Trap> {
+        let start = self.depth();
+        self.step_until(module, vm, |session| session.depth() < start)
+    }
+
+    /// Single-steps until `reached` holds (after a step that completes), a breakpoint is hit,
+    /// an exception pauses, or the program finishes -- the shared engine of `step_over` /
+    /// `step_out`.
+    fn step_until(
+        &mut self,
+        module: &Module,
+        vm: &mut Vm,
+        reached: impl Fn(&Session) -> bool,
+    ) -> Result<Stop, Trap> {
+        if let Some(result) = &self.result {
+            return Ok(self.done(result.clone()));
+        }
+        loop {
+            if let Some(stop) = self.tick(module, vm)? {
+                return Ok(stop);
+            }
+            if self.at_breakpoint() {
+                return Ok(self.stop(StopReason::Breakpoint));
+            }
+            if reached(self) {
+                return Ok(self.stop(StopReason::Step));
+            }
+        }
+    }
+
+    /// Advances exactly one instruction for the stepping/continue loop, mapping its outcome
+    /// to an early-stop [`Stop`] (completion, or -- when armed -- a pausable unhandled
+    /// exception) or `None` to keep going. A breakpoint is *not* detected here (the callers
+    /// check `at_breakpoint` at the right boundary); this only runs the instruction.
+    fn tick(&mut self, module: &Module, vm: &mut Vm) -> Result<Option<Stop>, Trap> {
+        #[cfg(feature = "exceptions")]
+        {
+            self.unhandled_exception = None;
+        }
+        let outcome = self.advance(module, vm);
+        match outcome {
+            Ok(Status::Done(value)) => {
+                #[cfg(feature = "exceptions")]
+                let _ = vm.take_unhandled();
+                Ok(Some(self.done(value)))
+            }
+            Ok(Status::Running | Status::Paused) => {
+                #[cfg(feature = "exceptions")]
+                let _ = vm.take_unhandled();
+                Ok(None)
+            }
+            #[cfg(feature = "exceptions")]
+            Err(Trap::UnhandledException) if self.pause_on_exception => {
+                self.unhandled_exception = vm.take_unhandled();
+                Ok(Some(self.stop(StopReason::Exception)))
+            }
+            Err(trap) => Err(trap),
+        }
+    }
+
+    /// Builds a [`Stop`] for stopping (still executing) at the current top-frame location.
+    fn stop(&self, reason: StopReason) -> Stop {
+        Stop {
+            reason,
+            location: self.location(),
+            returned: None,
+        }
+    }
+
+    /// Builds the completion [`Stop`] (no location; the call stack is empty).
+    fn done(&self, returned: Option<Value>) -> Stop {
+        Stop {
+            reason: StopReason::Exited,
+            location: None,
+            returned,
+        }
+    }
+
+    /// Expands an inspectable `value` into its constituents for a debugger's variable tree:
+    /// an object instance's fields (`fieldN` by slot), an array's elements (`[i]`), or a
+    /// box's single inner value. A scalar (or any value that is not a heap aggregate) expands
+    /// to nothing. `vm` owns the heap the references point into. This is the read side of
+    /// variable drill-down the wireline and the DAP `variables` request both use. (Instance
+    /// field *names* live in metadata a driver can layer on; the core names them by slot.)
+    #[must_use]
+    pub fn expand(&self, vm: &Vm, value: &Value) -> Vec<NamedValue> {
+        let Value::Object(reference) = value else {
+            return Vec::new();
+        };
+        let reference = *reference;
+        if let Some(len) = vm.heap().array_len(reference) {
+            return (0..len)
+                .filter_map(|index| {
+                    vm.heap().array_get(reference, index).map(|value| NamedValue {
+                        name: alloc::format!("[{index}]"),
+                        value,
+                    })
+                })
+                .collect();
+        }
+        if let Some(inner) = vm.heap().boxed_value(reference) {
+            return alloc::vec![NamedValue {
+                name: "value".to_string(),
+                value: inner,
+            }];
+        }
+        if let Some(crate::object::Object::Instance { fields, .. }) = vm.heap().get(reference) {
+            return fields
+                .iter()
+                .enumerate()
+                .map(|(slot, value)| NamedValue {
+                    name: alloc::format!("field{slot}"),
+                    value: value.clone(),
+                })
+                .collect();
+        }
+        Vec::new()
+    }
+
+    /// Whether `value` can be drilled into with [`Session::expand`] (so a driver knows to
+    /// offer it as expandable). `vm` owns the heap.
+    #[must_use]
+    pub fn is_expandable(&self, vm: &Vm, value: &Value) -> bool {
+        is_expandable(vm, value)
     }
 
     /// Executes one instruction of the top frame and applies its effect to the
@@ -608,7 +1017,11 @@ impl Session {
                 }
                 Some(Method::Intrinsic { func, .. }) => {
                     let func = *func;
-                    let args = deref_byref_args(frames, vm, args);
+                    let args = if is_compare_exchange(module, method) {
+                        args
+                    } else {
+                        deref_byref_args(frames, vm, args)
+                    };
                     match func(vm, module, &args) {
                         Ok(result) => {
                             if let Some(value) = result {
@@ -622,7 +1035,10 @@ impl Session {
                         }
                         #[cfg(feature = "exceptions")]
                         Err(trap) => match catchable_fault(&trap, vm) {
-                            Some(exception) => raise(frames, module, vm, exception),
+                            Some(exception) => {
+                                vm.note_unhandled(exception);
+                                raise(frames, module, vm, exception)
+                            }
                             None => Err(trap),
                         },
                         #[cfg(not(feature = "exceptions"))]
@@ -687,7 +1103,11 @@ impl Session {
                 }
                 None => Err(Trap::NoSuchMethod(ctor)),
             },
-            Flow::Throw(exception) => raise(frames, module, vm, exception),
+            Flow::Throw(exception) => {
+                #[cfg(feature = "exceptions")]
+                vm.note_unhandled(exception);
+                raise(frames, module, vm, exception)
+            }
             Flow::Leave(target) => {
                 let finallys = {
                     let method = frames.last().ok_or(Trap::StackUnderflow)?.method;
@@ -826,6 +1246,21 @@ impl Session {
     }
 }
 
+/// The array element index a `Location::Element` addresses: its base `index` advanced by the
+/// raw `byte_offset` a pinned-array pointer accumulated (`fixed (int* p = arr)` then `p[i]`).
+/// The offset is a whole multiple of the element width for the indexing csc emits; with a
+/// zero offset (a plain `ldelema` pointer) this is just the base index. Falls back to the
+/// base index if the element width is unknown (an empty array -- not dereferenceable anyway).
+fn array_element_index(vm: &Vm, array: ObjectRef, index: usize, byte_offset: u32) -> usize {
+    if byte_offset == 0 {
+        return index;
+    }
+    match vm.heap().array_element_width(array) {
+        Some(width) if width != 0 => index + (byte_offset as usize) / width,
+        _ => index,
+    }
+}
+
 /// The whole value at a managed-pointer `location` -- a frame local/arg, a heap
 /// object's field, an array element, or a static field -- if present.
 fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<Value> {
@@ -835,7 +1270,13 @@ fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<
         }
         Location::Arg { frame, slot } => frames.get(frame).and_then(|f| f.args.get(slot)).cloned(),
         Location::Field { object, slot } => vm.heap().instance_field(object, slot),
-        Location::Element { array, index } => vm.heap().array_get(array, index),
+        Location::Element {
+            array,
+            index,
+            byte_offset,
+        } => vm
+            .heap()
+            .array_get(array, array_element_index(vm, array, index, byte_offset)),
         Location::Static { slot } => vm.static_field(slot),
         Location::Boxed { object } => vm.heap().boxed_value(object),
         Location::Nested { base, slot } => match read_location_value(frames, vm, (*base).clone()) {
@@ -873,11 +1314,17 @@ fn write_location_value(
             .set_instance_field(object, slot, value)
             .then_some(())
             .ok_or(Trap::NullReference),
-        Location::Element { array, index } => vm
-            .heap_mut()
-            .array_set(array, index, value)
-            .then_some(())
-            .ok_or(Trap::IndexOutOfRange(index as i32)),
+        Location::Element {
+            array,
+            index,
+            byte_offset,
+        } => {
+            let element = array_element_index(vm, array, index, byte_offset);
+            vm.heap_mut()
+                .array_set(array, element, value)
+                .then_some(())
+                .ok_or(Trap::IndexOutOfRange(element as i32))
+        }
         Location::Static { slot } => {
             vm.set_static_field(slot, value);
             Ok(())
@@ -954,7 +1401,13 @@ fn read_enum_value(frame: &Frame, frame_index: usize, vm: &Vm, location: Locatio
         Location::Local { frame: f, slot } if f == frame_index => frame.locals.get(slot).cloned(),
         Location::Arg { frame: f, slot } if f == frame_index => frame.args.get(slot).cloned(),
         Location::Field { object, slot } => vm.heap().instance_field(object, slot),
-        Location::Element { array, index } => vm.heap().array_get(array, index),
+        Location::Element {
+            array,
+            index,
+            byte_offset,
+        } => vm
+            .heap()
+            .array_get(array, array_element_index(vm, array, index, byte_offset)),
         Location::Static { slot } => vm.static_field(slot),
         _ => None,
     }?;
@@ -974,6 +1427,26 @@ fn is_object_to_string(module: &Module, method: MethodId) -> bool {
     } else {
         false
     }
+}
+
+/// Whether `method` is the `Interlocked.CompareExchange` intrinsic, so its first argument is
+/// passed as the raw managed pointer (to write back through it) rather than dereferenced like
+/// an ordinary intrinsic's by-ref argument. Always `false` without the `bcl` intrinsics.
+#[cfg(feature = "bcl")]
+fn is_compare_exchange(module: &Module, method: MethodId) -> bool {
+    if let Some(Method::Intrinsic { func, .. }) = module.method(method) {
+        core::ptr::fn_addr_eq(
+            *func,
+            crate::intrinsics::interlocked_compare_exchange as IntrinsicFn,
+        )
+    } else {
+        false
+    }
+}
+
+#[cfg(not(feature = "bcl"))]
+fn is_compare_exchange(_module: &Module, _method: MethodId) -> bool {
+    false
 }
 
 /// Stores `value` at `slot`, growing `slots` with `Null` placeholders to reach it.
@@ -1412,7 +1885,18 @@ fn step(
         | Opcode::ConvR8
         | Opcode::ConvRUn => {
             let value = frame.pop()?;
-            frame.stack.push(convert(opcode, value)?);
+            let converted = match value {
+                Value::ByRef(_)
+                    if matches!(
+                        opcode,
+                        Opcode::ConvU | Opcode::ConvI | Opcode::ConvU8 | Opcode::ConvI8
+                    ) =>
+                {
+                    value
+                }
+                other => convert(opcode, other)?,
+            };
+            frame.stack.push(converted);
         }
         Opcode::ConvOvfI1
         | Opcode::ConvOvfI1Un
@@ -1680,16 +2164,28 @@ fn step(
                 return Ok(Flow::Next);
             }
             if let Some(params) = module.string_builder_ctor_params(asm, token) {
+                const DEFAULT_CAPACITY: usize = 16;
                 let args = frame.take_args(params)?;
-                let initial = match args.first() {
-                    Some(&Value::Object(reference)) => vm
-                        .heap()
-                        .as_string(reference)
-                        .map(|units| units.into_owned())
-                        .unwrap_or_default(),
-                    _ => Vec::new(),
+                let (initial, capacity) = match args.first() {
+                    Some(&Value::Object(reference)) => {
+                        let units = vm
+                            .heap()
+                            .as_string(reference)
+                            .map(|units| units.into_owned())
+                            .unwrap_or_default();
+                        (units, DEFAULT_CAPACITY)
+                    }
+                    Some(&Value::Int32(requested)) => {
+                        let capacity = if requested <= 0 {
+                            DEFAULT_CAPACITY
+                        } else {
+                            requested as usize
+                        };
+                        (Vec::new(), capacity)
+                    }
+                    _ => (Vec::new(), DEFAULT_CAPACITY),
                 };
-                let builder = vm.heap_mut().alloc_string_builder(initial);
+                let builder = vm.heap_mut().alloc_string_builder(initial, capacity);
                 frame.stack.push(Value::Object(builder));
                 return Ok(Flow::Next);
             }
@@ -1830,9 +2326,11 @@ fn step(
                 .array_len(array)
                 .ok_or(Trap::TypeMismatch(Opcode::Ldelema))?;
             let index = bounded_index(index, len)?;
-            frame
-                .stack
-                .push(Value::ByRef(Location::Element { array, index }));
+            frame.stack.push(Value::ByRef(Location::Element {
+                array,
+                index,
+                byte_offset: 0,
+            }));
         }
         Opcode::Initobj => {
             let token = token_operand(instruction)?;
@@ -1941,7 +2439,7 @@ fn step(
             let token = token_operand(instruction)?;
             frame
                 .stack
-                .push(Value::NativeInt(i64::from(asm_key(asm, token.0))));
+                .push(Value::NativeInt(asm_key(asm, token.0) as i64));
         }
 
         Opcode::Ldsfld => {
@@ -2036,6 +2534,13 @@ fn step(
                 .heap()
                 .array_get(array, index)
                 .ok_or(Trap::IndexOutOfRange(index as i32))?;
+            let value = match (instruction.opcode, value) {
+                (Opcode::LdelemU1, Value::Int32(raw)) => Value::Int32(raw & 0xFF),
+                (Opcode::LdelemI1, Value::Int32(raw)) => Value::Int32(i32::from(raw as u8 as i8)),
+                (Opcode::LdelemU2, Value::Int32(raw)) => Value::Int32(raw & 0xFFFF),
+                (Opcode::LdelemI2, Value::Int32(raw)) => Value::Int32(i32::from(raw as u16 as i16)),
+                (_, value) => value,
+            };
             frame.stack.push(value);
         }
 
@@ -2133,7 +2638,7 @@ fn step(
         #[cfg(feature = "typed-references")]
         Opcode::Refanytype => match frame.pop()? {
             Value::TypedRef { type_token, .. } => {
-                frame.stack.push(Value::NativeInt(i64::from(type_token)));
+                frame.stack.push(Value::NativeInt(type_token as i64));
             }
             _ => return Err(Trap::TypeMismatch(Opcode::Refanytype)),
         },
@@ -2447,13 +2952,15 @@ fn pointer_offset(value: &Value) -> Option<i64> {
     }
 }
 
-/// `add`/`sub` of a `localloc` (`Location::Stack`) pointer and an integer byte offset,
-/// yielding the adjusted pointer -- the pointer walk behind C# `stackalloc` indexing.
-/// Returns `Ok(None)` when neither operand is such a pointer, so the caller falls back to
-/// ordinary numeric arithmetic; `add` accepts the offset on either side (it is
-/// commutative), `sub` only as `pointer - offset` (III.1.5). Pointer-minus-pointer to a
-/// byte count is left to the numeric path (a `Location` is not an integer there, so it
-/// traps): csc does not emit it for the stackalloc patterns, and it is noted as deferred.
+/// `add`/`sub` of a raw byte-addressed pointer and an integer byte offset, yielding the
+/// adjusted pointer. This is the pointer walk behind C# `stackalloc` indexing (a
+/// `Location::Stack` localloc pointer) and behind `fixed`-array indexing (a `Location::Element`
+/// pointer into a pinned array, whose byte offset an eventual `ldind`/`stind` divides by the
+/// element width). Returns `Ok(None)` when neither operand is such a pointer, so the caller
+/// falls back to ordinary numeric arithmetic; `add` accepts the offset on either side (it is
+/// commutative), `sub` only as `pointer - offset` (III.1.5). Pointer-minus-pointer to a byte
+/// count is left to the numeric path (a `Location` is not an integer there, so it traps): csc
+/// does not emit it for these patterns, and it is noted as deferred.
 fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Option<Value>, Trap> {
     let add = matches!(opcode, Opcode::Add | Opcode::AddOvf | Opcode::AddOvfUn);
     let sub = matches!(opcode, Opcode::Sub | Opcode::SubOvf | Opcode::SubOvfUn);
@@ -2461,13 +2968,13 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
         return Ok(None);
     }
     let (location, offset) = match (a, b) {
-        (Value::ByRef(location @ Location::Stack { .. }), other) => {
+        (Value::ByRef(location), other) if is_raw_pointer(location) => {
             let Some(delta) = pointer_offset(other) else {
                 return Ok(None);
             };
             (location, delta)
         }
-        (other, Value::ByRef(location @ Location::Stack { .. })) if add => {
+        (other, Value::ByRef(location)) if add && is_raw_pointer(location) => {
             let Some(delta) = pointer_offset(other) else {
                 return Ok(None);
             };
@@ -2475,21 +2982,37 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
         }
         _ => return Ok(None),
     };
-    let Location::Stack {
-        frame,
-        buffer,
-        offset: base,
-    } = location
-    else {
-        return Ok(None);
-    };
     let signed = if sub { -offset } else { offset };
-    let walked = i64::from(*base).wrapping_add(signed) as u32;
-    Ok(Some(Value::ByRef(Location::Stack {
-        frame: *frame,
-        buffer: *buffer,
-        offset: walked,
-    })))
+    let walked = |base: u32| i64::from(base).wrapping_add(signed) as u32;
+    let stepped = match location {
+        Location::Stack {
+            frame,
+            buffer,
+            offset: base,
+        } => Location::Stack {
+            frame: *frame,
+            buffer: *buffer,
+            offset: walked(*base),
+        },
+        Location::Element {
+            array,
+            index,
+            byte_offset,
+        } => Location::Element {
+            array: *array,
+            index: *index,
+            byte_offset: walked(*byte_offset),
+        },
+        _ => return Ok(None),
+    };
+    Ok(Some(Value::ByRef(stepped)))
+}
+
+/// Whether a managed pointer is one of the raw byte-addressed kinds that pointer arithmetic
+/// walks: a `localloc` (`stackalloc`) buffer pointer or a pinned-array element pointer. The
+/// typed-slot kinds (a frame local/arg, a field, a static, a box) are not byte-addressed.
+fn is_raw_pointer(location: &Location) -> bool {
+    matches!(location, Location::Stack { .. } | Location::Element { .. })
 }
 
 /// The integer-only binary operations, computed at the result category's width.
@@ -2982,10 +3505,10 @@ fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) 
         if box_token == asm_key(asm, token.0) {
             return true;
         }
-        if let (Some(box_type), Some(target)) =
-            (module.type_id_by_handle(box_token), target_type_id)
-        {
-            return module.implements_interface(box_type, target);
+        if let Some(box_type) = module.type_id_by_handle(box_token) {
+            if let Some(target) = target_type_id {
+                return box_type == target || module.implements_interface(box_type, target);
+            }
         }
         return false;
     }
@@ -3079,6 +3602,7 @@ impl Session {
                     visit(value);
                 }
                 visit_optional_ref(&mut frame.new_object, visit);
+                visit_optional_location(&mut frame.new_value, visit);
                 visit_optional_ref(&mut frame.current_exception, visit);
                 if let Some(pending) = &mut frame.pending {
                     match &mut pending.then {
@@ -3158,6 +3682,28 @@ fn visit_ref(reference: &mut ObjectRef, visit: &mut dyn FnMut(&mut Value)) {
     visit(&mut wrapped);
     if let Value::Object(new) = wrapped {
         *reference = new;
+    }
+}
+
+/// Relocates a managed-pointer root (a [`Location`]) by mirroring it through a temporary
+/// `Value::ByRef`; the visitor marks the heap object the pointer reaches and, on the
+/// relocation pass, rewrites the contained `ObjectRef`. Used for `frame.new_value` -- the
+/// pointer to the under-construction value type's box, which a GC during the constructor
+/// body must relocate or the struct read back on return dangles to a stale (relocated)
+/// object.
+#[cfg(feature = "gc")]
+fn visit_location(location: &mut Location, visit: &mut dyn FnMut(&mut Value)) {
+    let mut wrapped = Value::ByRef(location.clone());
+    visit(&mut wrapped);
+    if let Value::ByRef(new) = wrapped {
+        *location = new;
+    }
+}
+
+#[cfg(feature = "gc")]
+fn visit_optional_location(slot: &mut Option<Location>, visit: &mut dyn FnMut(&mut Value)) {
+    if let Some(location) = slot {
+        visit_location(location, visit);
     }
 }
 
@@ -3943,6 +4489,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn isinst_matches_a_boxed_value_type_via_a_cross_assembly_token() {
+        let box_token = Token(0x0100_0007);
+        let test_token = Token(0x0100_0009);
+        let vt_ctor = Token(0x0600_0041);
+        let mut module = Module::new();
+        let vt = module.add_type(vec![Value::Int32(0)]);
+        module.set_type_is_value_type(vt, true);
+        module.bind_type_token(0, box_token, vt);
+        module.bind_type_token(0, test_token, vt);
+        let ctor = module.add_method(0, method(vec![ret()]), 1);
+        module.set_method_type(ctor, vt);
+        module.bind_token(0, vt_ctor, ctor);
+        module.mark_value_type_ctor(0, vt_ctor);
+        let main = module.add_method(
+            0,
+            method(vec![
+                Instruction::new(Opcode::Newobj, Operand::Token(vt_ctor)),
+                Instruction::new(Opcode::Box, Operand::Token(box_token)),
+                Instruction::new(Opcode::Isinst, Operand::Token(test_token)),
+                Instruction::new(Opcode::BrtrueS, Operand::Target(6)),
+                Instruction::simple(Opcode::LdcI40),
+                ret(),
+                Instruction::simple(Opcode::LdcI41),
+                ret(),
+            ]),
+            0,
+        );
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Int32(1)))
+        );
+    }
+
     fn cast_program(op: Opcode) -> (Module, MethodId) {
         let b_token = Token(0x0200_0002);
         let a_ctor = Token(0x0600_0040);
@@ -4086,5 +4666,281 @@ mod tests {
 
     fn ret() -> Instruction {
         Instruction::simple(Opcode::Ret)
+    }
+
+    mod debug_core {
+        use super::*;
+
+        fn call_program() -> (Module, MethodId, MethodId) {
+            let mut module = Module::new();
+            let add = module.add_method(
+                0,
+                method(vec![
+                    Instruction::simple(Opcode::Ldarg0),
+                    Instruction::simple(Opcode::Ldarg1),
+                    Instruction::simple(Opcode::Add),
+                    ret(),
+                ]),
+                2,
+            );
+            module.bind_token(0, ADD_TOKEN, add);
+            let main = module.add_method(
+                0,
+                method(vec![
+                    Instruction::simple(Opcode::LdcI42),
+                    Instruction::simple(Opcode::LdcI43),
+                    Instruction::new(Opcode::Call, Operand::Token(ADD_TOKEN)),
+                    ret(),
+                ]),
+                0,
+            );
+            (module, main, add)
+        }
+
+        #[test]
+        fn continue_stops_at_an_enabled_breakpoint_then_runs_to_completion() {
+            let (module, main, _add) = call_program();
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.add_breakpoint(main, 2);
+
+            let stop = session.continue_(&module, &mut vm).unwrap();
+            assert_eq!(stop.reason, StopReason::Breakpoint);
+            assert_eq!(
+                stop.location,
+                Some(CodeLocation {
+                    method: main,
+                    instruction: 2,
+                })
+            );
+            assert_eq!(
+                session.frame(0).unwrap().stack,
+                [Value::Int32(2), Value::Int32(3)].as_slice()
+            );
+            let stop = session.continue_(&module, &mut vm).unwrap();
+            assert_eq!(stop.location, None);
+            assert_eq!(stop.returned, Some(Value::Int32(5)));
+        }
+
+        #[test]
+        fn a_disabled_breakpoint_does_not_pause_and_re_enabling_restores_it() {
+            let (module, main, _add) = call_program();
+            let mut vm = Vm::new();
+
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.add_breakpoint(main, 2);
+            session.set_breakpoint_enabled(main, 2, false);
+            assert!(!session.is_breakpoint_enabled(main, 2));
+            let stop = session.continue_(&module, &mut vm).unwrap();
+            assert_eq!(stop.returned, Some(Value::Int32(5)));
+            assert_eq!(stop.location, None);
+
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.set_breakpoint_enabled(main, 2, false);
+            session.set_breakpoint_enabled(main, 2, true);
+            assert!(session.is_breakpoint_enabled(main, 2));
+            let stop = session.continue_(&module, &mut vm).unwrap();
+            assert_eq!(stop.reason, StopReason::Breakpoint);
+            assert_eq!(stop.location.unwrap().instruction, 2);
+        }
+
+        #[test]
+        fn step_into_descends_into_a_call_while_step_over_runs_it_to_completion() {
+            let (module, main, add) = call_program();
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.step_into(&module, &mut vm).unwrap();
+            session.step_into(&module, &mut vm).unwrap();
+            assert_eq!(session.depth(), 1);
+            let stop = session.step_into(&module, &mut vm).unwrap();
+            assert_eq!(stop.reason, StopReason::Step);
+            assert_eq!(session.depth(), 2);
+            assert_eq!(stop.location.unwrap().method, add);
+            assert_eq!(stop.location.unwrap().instruction, 0);
+
+            let (module, main, _add) = call_program();
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.step_into(&module, &mut vm).unwrap();
+            session.step_into(&module, &mut vm).unwrap();
+            let stop = session.step_over(&module, &mut vm).unwrap();
+            assert_eq!(stop.reason, StopReason::Step);
+            assert_eq!(session.depth(), 1);
+            assert_eq!(stop.location.unwrap().method, main);
+        }
+
+        #[test]
+        fn step_out_returns_to_the_caller() {
+            let (module, main, _add) = call_program();
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.step_into(&module, &mut vm).unwrap();
+            session.step_into(&module, &mut vm).unwrap();
+            session.step_into(&module, &mut vm).unwrap();
+            assert_eq!(session.depth(), 2);
+            let stop = session.step_out(&module, &mut vm).unwrap();
+            assert_eq!(stop.reason, StopReason::Step);
+            assert_eq!(session.depth(), 1);
+            assert_eq!(stop.location.unwrap().method, main);
+        }
+
+        #[test]
+        fn a_breakpoint_inside_a_stepped_over_call_takes_priority() {
+            let (module, main, add) = call_program();
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.add_breakpoint(add, 2);
+            session.step_into(&module, &mut vm).unwrap();
+            session.step_into(&module, &mut vm).unwrap();
+            let stop = session.step_over(&module, &mut vm).unwrap();
+            assert_eq!(stop.reason, StopReason::Breakpoint);
+            assert_eq!(stop.location.unwrap().method, add);
+            assert_eq!(session.depth(), 2);
+        }
+
+        #[test]
+        fn location_and_this_report_the_innermost_frame() {
+            let v_field = Token(0x0400_00A1);
+            let read_token = Token(0x0600_00A1);
+            let ctor_token = Token(0x0600_00A2);
+            let mut module = Module::new();
+            let c = module.add_type(vec![Value::Int32(0)]);
+            module.bind_field(0, v_field, 0);
+            let ctor = module.add_method(0, method(vec![ret()]), 1);
+            module.set_method_type(ctor, c);
+            module.bind_token(0, ctor_token, ctor);
+            let read = module.add_method(
+                0,
+                method(vec![
+                    Instruction::simple(Opcode::Ldarg0),
+                    Instruction::new(Opcode::Ldfld, Operand::Token(v_field)),
+                    ret(),
+                ]),
+                1,
+            );
+            module.set_method_type(read, c);
+            module.bind_token(0, read_token, read);
+            module.set_method_debug(read, "C.Read".into(), alloc::vec!["this".into()]);
+            let main = module.add_method(
+                0,
+                method(vec![
+                    Instruction::new(Opcode::Newobj, Operand::Token(ctor_token)),
+                    Instruction::new(Opcode::Callvirt, Operand::Token(read_token)),
+                    ret(),
+                ]),
+                0,
+            );
+
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.add_breakpoint(read, 0);
+            let stop = session.continue_(&module, &mut vm).unwrap();
+            assert_eq!(stop.reason, StopReason::Breakpoint);
+            assert_eq!(session.location().unwrap().method, read);
+            assert!(matches!(session.this(&module), Some(Value::Object(_))));
+            assert!(session.this(&module).is_some());
+            assert_eq!(module.arg_name(main, 0), None);
+        }
+
+        #[test]
+        fn expand_reads_array_elements_and_object_fields() {
+            let mut vm = Vm::new();
+            let array = vm
+                .heap_mut()
+                .alloc_array(alloc::vec![Value::Int32(10), Value::Int32(20), Value::Int32(30)]);
+            let instance = vm
+                .heap_mut()
+                .alloc_instance(0, alloc::vec![Value::Int32(7), Value::Null]);
+
+            let mut module = Module::new();
+            let main = module.add_method(0, method(vec![ret()]), 0);
+            let session = Session::new(&module, main, Vec::new()).unwrap();
+
+            assert!(session.expand(&vm, &Value::Int32(5)).is_empty());
+            assert!(!session.is_expandable(&vm, &Value::Int32(5)));
+
+            assert!(session.is_expandable(&vm, &Value::Object(array)));
+            let elements = session.expand(&vm, &Value::Object(array));
+            assert_eq!(elements.len(), 3);
+            assert_eq!(elements[0].name, "[0]");
+            assert_eq!(elements[0].value, Value::Int32(10));
+            assert_eq!(elements[2].value, Value::Int32(30));
+
+            assert!(session.is_expandable(&vm, &Value::Object(instance)));
+            let fields = session.expand(&vm, &Value::Object(instance));
+            assert_eq!(fields.len(), 2);
+            assert_eq!(fields[0].name, "field0");
+            assert_eq!(fields[0].value, Value::Int32(7));
+            assert_eq!(fields[1].value, Value::Null);
+        }
+
+        #[cfg(feature = "exceptions")]
+        #[test]
+        fn pause_on_unhandled_exception_reports_the_exception_instead_of_trapping() {
+            let e_ctor = Token(0x0600_00B1);
+            let mut module = Module::new();
+            let e = module.add_type(vec![]);
+            let ctor = module.add_method(0, method(vec![ret()]), 1);
+            module.set_method_type(ctor, e);
+            module.bind_token(0, e_ctor, ctor);
+            let main = module.add_method(
+                0,
+                method(vec![
+                    Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
+                    Instruction::simple(Opcode::Throw),
+                    ret(),
+                ]),
+                0,
+            );
+
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            assert_eq!(
+                session.continue_(&module, &mut vm),
+                Err(Trap::UnhandledException)
+            );
+
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.set_pause_on_unhandled_exception(true);
+            let stop = session.continue_(&module, &mut vm).unwrap();
+            assert_eq!(stop.reason, StopReason::Exception);
+            assert!(session.stopped_exception().is_some());
+        }
+
+        #[cfg(feature = "exceptions")]
+        #[test]
+        fn a_caught_exception_does_not_trigger_the_exception_pause() {
+            use lamella_cil::{EhClause, EhKind, InstructionRange};
+            let e_ctor = Token(0x0600_00C1);
+            let catch_type = Token(0x0100_00C2);
+            let mut module = Module::new();
+            let e = module.add_type(vec![]);
+            let ctor = module.add_method(0, method(vec![ret()]), 1);
+            module.set_method_type(ctor, e);
+            module.bind_token(0, e_ctor, ctor);
+            let mut body = method(vec![
+                Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
+                Instruction::simple(Opcode::Throw),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(42)),
+                ret(),
+            ]);
+            body.handlers = alloc::vec![EhClause {
+                try_range: InstructionRange { start: 0, end: 2 },
+                handler_range: InstructionRange { start: 2, end: 5 },
+                kind: EhKind::Catch(catch_type),
+            }]
+            .into_boxed_slice();
+            let main = module.add_method(0, body, 0);
+
+            let mut vm = Vm::new();
+            let mut session = Session::new(&module, main, Vec::new()).unwrap();
+            session.set_pause_on_unhandled_exception(true);
+            let stop = session.continue_(&module, &mut vm).unwrap();
+            assert_eq!(stop.returned, Some(Value::Int32(42)));
+            assert_eq!(session.stopped_exception(), None);
+        }
     }
 }

@@ -146,7 +146,7 @@ fn check_inst(
                 expect(MirType::I32, r, errors);
             }
         }
-        Inst::Call { args, .. } => {
+        Inst::Call { args, .. } | Inst::CallVirtual { args, .. } => {
             for &arg in args {
                 use_value(func, defined, arg, errors);
             }
@@ -187,6 +187,11 @@ fn check_inst(
         }
         Inst::FieldAddr { base, .. } => {
             use_value(func, defined, *base, errors);
+        }
+        Inst::LoadTypeDesc { object } => {
+            use_value(func, defined, *object, errors);
+        }
+        Inst::TypeDescAddr { .. } => {
         }
         Inst::CopyStruct { src } => {
             use_value(func, defined, *src, errors);

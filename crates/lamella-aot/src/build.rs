@@ -1,10 +1,12 @@
 //! The AOT build entry point: compile a CIL assembly to a target's native bytes in one call. This is
-//! the library face of the pipeline the `wasm-program` example drives -- the website's client-side
-//! `lamella_aot_build(cil, target)` widget exporter (a wasm binding around this) turns a C# assembly
-//! into a `.wasm` widget in the browser. No filesystem or `std`: it takes the CIL bytes and returns
-//! the output bytes, so it runs inside the browser's compile-only wasm.
+//! the library face of the pipeline the `wasm-program`/`deploy-microbit` examples drive -- the
+//! website's client-side `lamella_aot_build(cil, target)` exporter (a wasm binding around this) turns
+//! a C# assembly into a `.wasm` widget OR a flashable chip image in the browser. No filesystem or
+//! `std`: it takes the CIL bytes and returns the output bytes, so it runs inside the compile-only wasm.
 
+#[cfg(feature = "wasm")]
 use alloc::format;
+#[cfg(feature = "wasm")]
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,8 +14,11 @@ use alloc::vec::Vec;
 use lamella_ir::{BasicBlock, BlockId, Function, Inst, MirType, Terminator, TypeHandle, ValueId};
 use lamella_metadata::{Assembly, SigType, TargetLayout};
 
+#[cfg(feature = "arm32")]
+use crate::arm32;
 use crate::cil;
 use crate::resolver::MetadataResolver;
+#[cfg(feature = "wasm")]
 use crate::wasm;
 
 /// Why an AOT build failed.
@@ -23,16 +28,23 @@ pub enum BuildError {
     Parse,
     /// The target string is not one this build supports.
     UnsupportedTarget,
-    /// A function could not be lowered to the target.
-    Lower(wasm::LowerError),
+    /// A function could not be lowered to the WASM target.
+    #[cfg(feature = "wasm")]
+    LowerWasm(wasm::LowerError),
+    /// A function could not be lowered to the ARM32 target.
+    #[cfg(feature = "arm32")]
+    LowerArm(arm32::LowerError),
 }
 
 /// Compiles a CIL assembly to native bytes for `target`. `target = "wasm"` emits a WebAssembly module
 /// with the embedding ABI (per-method exports + `alloc`/`dealloc` + memory) -- the C# -> `.wasm`
-/// widget. Chip targets (an ARM boot image) are a follow-up.
+/// widget. A chip `target` (e.g. "microbit") emits a flashable bare-metal Cortex-M image.
 pub fn build(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     match target {
+        #[cfg(feature = "wasm")]
         "wasm" => build_wasm(cil),
+        #[cfg(feature = "arm32")]
+        "microbit" => build_cortex_m(cil, target),
         _ => Err(BuildError::UnsupportedTarget),
     }
 }
@@ -40,13 +52,36 @@ pub fn build(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
 /// Compiles a CIL assembly to a WebAssembly module: every method lowered through the same
 /// `resolver` + `cil` front end the ARM/RISC-V backends use, then `wasm::lower_module_with_exports`.
 /// Exports every public static method by name (the widget surface) plus `main` for the entry, if any.
+#[cfg(feature = "wasm")]
 pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
     let funcs = lower_assembly(&assembly, entry);
     let exports = method_exports(&assembly, entry.is_some());
     let export_refs: Vec<(&str, u32)> = exports.iter().map(|(n, i)| (n.as_str(), *i)).collect();
-    wasm::lower_module_with_exports(&funcs, &export_refs).map_err(BuildError::Lower)
+    wasm::lower_module_with_exports(&funcs, &export_refs).map_err(BuildError::LowerWasm)
+}
+
+/// Compiles a CIL assembly to a flashable bare-metal image for a Cortex-M chip `target` (e.g.
+/// "microbit"): every method lowered through the same front end and laid out by `arm32::lower_module`,
+/// the entry's trampoline at code offset 0, behind a minimal vector table (initial SP, then a reset
+/// vector pointing at that trampoline, Thumb bit set). The entry method IS the program -- it should
+/// loop forever, since an embedded reset handler never returns.
+#[cfg(feature = "arm32")]
+pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
+    let initial_sp: u32 = match target {
+        "microbit" => 0x2000_4000,
+        _ => return Err(BuildError::UnsupportedTarget),
+    };
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let entry = find_main(&assembly);
+    let funcs = lower_assembly(&assembly, entry);
+    let code = arm32::lower_module(&funcs).map_err(BuildError::LowerArm)?;
+    let mut image = Vec::with_capacity(8 + code.len());
+    image.extend_from_slice(&initial_sp.to_le_bytes());
+    image.extend_from_slice(&0x0000_0009u32.to_le_bytes());
+    image.extend_from_slice(&code);
+    Ok(image)
 }
 
 /// The MethodDef row of a static `Main` (the run-once widget entry), if the assembly has one.
@@ -78,7 +113,7 @@ fn mir_type(sig: &SigType, assembly: &Assembly) -> MirType {
                 .map(|layout| layout.size)
                 .unwrap_or(0);
             MirType::ValueType {
-                handle: TypeHandle(token.row()),
+                handle: TypeHandle(token.0),
                 size,
             }
         }
@@ -166,6 +201,7 @@ fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Vec<Function> {
 /// The embedding ABI's export list: `main` (the entry trampoline at index 0, if there is an entry)
 /// plus every public static method by a `<Type>_<Method>` name (overloads disambiguated by arity then
 /// rid), each at its MethodDef row = WASM function index, so a page's JS calls them by name.
+#[cfg(feature = "wasm")]
 fn method_exports(assembly: &Assembly, has_main: bool) -> Vec<(String, u32)> {
     let mut exports = Vec::new();
     let mut taken: Vec<String> = Vec::new();
@@ -195,4 +231,25 @@ fn method_exports(assembly: &Assembly, has_main: bool) -> Vec<(String, u32)> {
         }
     }
     exports
+}
+
+#[cfg(all(test, feature = "arm32"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_an_unknown_target() {
+        assert!(matches!(
+            build(b"any bytes", "no-such-chip"),
+            Err(BuildError::UnsupportedTarget)
+        ));
+    }
+
+    #[test]
+    fn reports_malformed_cil_for_a_chip_target() {
+        assert!(matches!(
+            build(b"not a managed assembly", "microbit"),
+            Err(BuildError::Parse)
+        ));
+    }
 }

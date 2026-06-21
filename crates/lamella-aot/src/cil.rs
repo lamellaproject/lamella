@@ -114,6 +114,14 @@ pub trait CallResolver {
         None
     }
 
+    /// Whether a field (an `ldfld`/`stfld` operand token) is declared on a REFERENCE type, so its
+    /// instance can be null and the access is a null-deref candidate. A field on a value type (a
+    /// struct) is excluded -- the "object" is a struct value/address, never null. Defaults to
+    /// `false` (a resolver with no type hierarchy makes no null-deref leaders).
+    fn field_on_reference_type(&self, _operand: &Operand) -> bool {
+        false
+    }
+
     /// The value type a `newobj` constructs, named by its constructor token: the declaring
     /// type's [`MirType::ValueType`] (with size), so the lowering can allocate the instance.
     /// `None` for a reference type (use [`CallResolver::newobj_reference_layout`]).
@@ -167,11 +175,52 @@ pub trait CallResolver {
         false
     }
 
+    /// The set of tags a `catch (T)` clause matches: `T`'s own tag plus the tags of every type
+    /// that derives from `T` (a thrown subtype the catch must take). The default is exact-match
+    /// only -- just `T`'s tag -- so a resolver with no type hierarchy keeps the original behavior;
+    /// the metadata resolver adds in-program subtypes by walking `extends`. (BCL subtypes live in
+    /// another assembly and are added later from the compiler's emitted base-chain vectors.)
+    fn subtype_tags(&self, operand: &Operand) -> Vec<u32> {
+        self.exception_tag(operand).into_iter().collect()
+    }
+
+    /// The type HANDLES a `castclass T` accepts: `T`'s own handle plus the handles of every
+    /// in-program type that derives from `T` (a subtype the cast must also accept). Each handle
+    /// names a TypeDesc to compare the cast object's runtime type against. Empty by default; the
+    /// metadata resolver walks `extends`. (BCL subtypes are not enumerable here, so a cast to a BCL
+    /// base accepts only the exact type for now.)
+    fn cast_subtype_handles(&self, _operand: &Operand) -> Vec<TypeHandle> {
+        Vec::new()
+    }
+
+    /// The exception tag of a BUILTIN throwable named directly (no token), so a synthesized check
+    /// can raise it -- e.g. `System.IndexOutOfRangeException` from an array bounds check. The tag
+    /// matches a `catch` that names the same type. Defaults to `None`.
+    fn builtin_exception_tag(&self, _namespace: &str, _name: &str) -> Option<u32> {
+        None
+    }
+
     /// The heap layout for `box`/`unbox.any` of the value type named by the operand token: the
     /// boxed payload's size (the value's width) and reference-offset map, with the type's identity
     /// (its TypeDesc, which IS the box's type identity per the GC ABI -- payload is value bytes
     /// only, no type tag). Defaults to `None`.
     fn boxed_layout(&self, _operand: &Operand) -> Option<ReferenceLayout> {
+        None
+    }
+
+    /// The MIR type a `box`/`unbox.any` value type lowers to: `i32` for a sub-word or 32-bit scalar,
+    /// `f32`/`i64`/`f64` for the wider scalars, or a `ValueType` for a struct. Used to type the
+    /// `unbox.any` result so a multi-word scalar reads its full width. Defaults to None.
+    fn boxed_value_type(&self, _operand: &Operand) -> Option<MirType> {
+        None
+    }
+
+    /// The vtable slot a virtual `callvirt` target dispatches through: its index in its declaring
+    /// type's vtable (the same index across the hierarchy, so the receiver's runtime-type vtable at
+    /// this slot is the override to call). `None` for a non-virtual target, or one this resolver
+    /// cannot place (an interface/abstract method, or a cross-module ref) -- dispatched directly.
+    /// Defaults to None (direct dispatch everywhere).
+    fn virtual_slot(&self, _operand: &Operand) -> Option<usize> {
         None
     }
 }
@@ -256,7 +305,9 @@ fn lower_with_source(
         };
         running = running.wrapping_add(opcode + operand);
     }
-    let blocks = control_flow::discover_blocks(code, &body.handlers);
+    let blocks = control_flow::discover_blocks(code, &body.handlers, &|op| {
+        resolver.field_on_reference_type(op)
+    });
     let preds = control_flow::predecessors(code, &blocks);
     let (arg_count, local_count) = scan_slots(code);
 
@@ -285,10 +336,71 @@ fn lower_with_source(
                 .position(|clause| clause.handler_range.start as usize == start)
         })
         .collect();
-    let throw_clause: Vec<Option<usize>> = blocks
+    let throw_clauses: Vec<Vec<usize>> = blocks
         .iter()
         .map(|&(start, end)| {
-            catch_clauses
+            let mut covering: Vec<usize> = catch_clauses
+                .iter()
+                .enumerate()
+                .filter(|(_, clause)| {
+                    clause.try_range.start as usize <= start && end <= clause.try_range.end as usize
+                })
+                .map(|(index, _)| index)
+                .collect();
+            covering.sort_by_key(|&i| {
+                catch_clauses[i].try_range.end - catch_clauses[i].try_range.start
+            });
+            covering
+        })
+        .collect();
+
+    let finally_clauses: Vec<&EhClause> = body
+        .handlers
+        .iter()
+        .filter(|clause| matches!(clause.kind, EhKind::Finally))
+        .collect();
+    let finally_handler_block: Vec<usize> = finally_clauses
+        .iter()
+        .map(|clause| {
+            blocks
+                .iter()
+                .position(|&(start, _)| start == clause.handler_range.start as usize)
+                .unwrap_or(0)
+        })
+        .collect();
+    let in_range = |idx: usize, range: lamella_cil::InstructionRange| {
+        (range.start as usize) <= idx && idx < (range.end as usize)
+    };
+    let finally_continuation_block: Vec<Option<usize>> = finally_clauses
+        .iter()
+        .map(|clause| {
+            (clause.try_range.start as usize..clause.try_range.end as usize).find_map(|i| {
+                match (code[i].opcode, &code[i].operand) {
+                    (Opcode::Leave | Opcode::LeaveS, Operand::Target(t))
+                        if !in_range(*t as usize, clause.try_range) =>
+                    {
+                        block_of(*t as usize)
+                    }
+                    _ => None,
+                }
+            })
+        })
+        .collect();
+    let finally_handler: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|&(start, _)| {
+            finally_clauses
+                .iter()
+                .position(|clause| clause.handler_range.start as usize == start)
+        })
+        .collect();
+    let finally_continuation: Vec<bool> = (0..blocks.len())
+        .map(|b| finally_continuation_block.contains(&Some(b)))
+        .collect();
+    let finally_protect: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|&(start, end)| {
+            finally_clauses
                 .iter()
                 .enumerate()
                 .filter(|(_, clause)| {
@@ -296,6 +408,38 @@ fn lower_with_source(
                 })
                 .min_by_key(|(_, clause)| clause.try_range.end - clause.try_range.start)
                 .map(|(index, _)| index)
+        })
+        .collect();
+    let leave_exits: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|&(_, end)| {
+            let last = end.checked_sub(1)?;
+            let inst = code.get(last)?;
+            if !matches!(inst.opcode, Opcode::Leave | Opcode::LeaveS) {
+                return None;
+            }
+            let Operand::Target(target) = &inst.operand else {
+                return None;
+            };
+            let block = block_of(last)?;
+            let clause = finally_protect[block]?;
+            (!in_range(*target as usize, finally_clauses[clause].try_range)).then_some(clause)
+        })
+        .collect();
+    let unwind_finally = |b: usize| finally_protect[b].map(|clause| finally_handler_block[clause]);
+    let takes_local_params =
+        |b: usize| is_merge(b) || finally_handler[b].is_some() || finally_continuation[b];
+    let trap_access: Vec<Option<TrapKind>> = blocks
+        .iter()
+        .enumerate()
+        .map(|(b, &(start, _))| {
+            let kind = trap_kind_at(&code[start], resolver);
+            if throw_clauses[b].is_empty()
+                && !matches!(kind, Some(TrapKind::Cast(_)) | Some(TrapKind::CastClass(_)))
+            {
+                return None;
+            }
+            kind
         })
         .collect();
 
@@ -327,7 +471,18 @@ fn lower_with_source(
                 .collect();
             params.push(new_value(&mut value_types, MirType::ObjectRef));
             params
-        } else if is_merge(b) {
+        } else if trap_access[b].is_some() {
+            let mut params: Vec<ValueId> = (0..local_count)
+                .map(|i| {
+                    let ty = local_types.get(i).copied().unwrap_or(MirType::I32);
+                    new_value(&mut value_types, ty)
+                })
+                .collect();
+            for ty in trap_operand_types(&code[blocks[b].0], resolver) {
+                params.push(new_value(&mut value_types, ty));
+            }
+            params
+        } else if takes_local_params(b) {
             (0..local_count)
                 .map(|i| {
                     let ty = local_types.get(i).copied().unwrap_or(MirType::I32);
@@ -356,7 +511,13 @@ fn lower_with_source(
                 .take(local_count)
                 .map(|&p| Some(p))
                 .collect()
-        } else if is_merge(b) {
+        } else if trap_access[b].is_some() {
+            block_params[b]
+                .iter()
+                .take(local_count)
+                .map(|&p| Some(p))
+                .collect()
+        } else if takes_local_params(b) {
             block_params[b].iter().map(|&p| Some(p)).collect()
         } else {
             let pred = *preds[b].first().ok_or(CilError::UnsupportedControlFlow)?;
@@ -371,9 +532,14 @@ fn lower_with_source(
         locals.resize(local_count, None);
 
         let mut stack: Vec<ValueId> = Vec::new();
-        if handler_clause[b].is_some() {
-            if let Some(&exception) = block_params[b].get(local_count) {
-                stack.push(exception);
+        let current_exception = handler_clause[b].and(block_params[b].get(local_count).copied());
+        if let Some(exception) = current_exception {
+            stack.push(exception);
+        }
+        if trap_access[b].is_some() {
+            let operand_count = trap_operand_types(&code[start], resolver).len();
+            for k in 0..operand_count {
+                stack.push(block_params[b][local_count + k]);
             }
         }
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
@@ -387,11 +553,18 @@ fn lower_with_source(
             let before = insts.len();
             if is_last && inst.opcode == Opcode::Ret {
                 terminator = Some(Terminator::Return(stack.pop()));
-            } else if is_last && inst.opcode == Opcode::Throw {
+            } else if is_last && matches!(inst.opcode, Opcode::Throw | Opcode::Rethrow) {
+                if inst.opcode == Opcode::Rethrow {
+                    let exception =
+                        current_exception.ok_or(CilError::Unsupported(Opcode::Rethrow))?;
+                    stack.push(exception);
+                }
                 terminator = Some(build_eh_throw(
-                    throw_clause[b],
+                    &throw_clauses[b],
                     &catch_clauses,
                     &handler_block_of_clause,
+                    finally_protect[b],
+                    &finally_handler_block,
                     resolver,
                     &mut stack,
                     &locals,
@@ -403,9 +576,35 @@ fn lower_with_source(
                     original_block_count,
                     &mut propagate_fixups,
                 )?);
+            } else if is_last && inst.opcode == Opcode::Endfinally {
+                let clause = finally_handler[b].ok_or(CilError::UnsupportedControlFlow)?;
+                terminator = Some(build_eh_endfinally(
+                    finally_continuation_block[clause],
+                    &locals,
+                    local_count,
+                    local_types,
+                    &mut value_types,
+                    &mut insts,
+                    &mut split_blocks,
+                    original_block_count,
+                    &mut propagate_fixups,
+                ));
             } else if is_last
                 && matches!(inst.opcode, Opcode::Leave | Opcode::LeaveS)
-                && throw_clause[b].is_some()
+                && leave_exits[b].is_some()
+            {
+                let clause = leave_exits[b].expect("checked is_some above");
+                terminator = Some(build_eh_finally_leave(
+                    finally_handler_block[clause],
+                    &locals,
+                    local_count,
+                    local_types,
+                    &mut value_types,
+                    &mut insts,
+                ));
+            } else if is_last
+                && matches!(inst.opcode, Opcode::Leave | Opcode::LeaveS)
+                && !throw_clauses[b].is_empty()
             {
                 let Operand::Target(target_instr) = &inst.operand else {
                     return Err(CilError::BadOperand);
@@ -414,9 +613,10 @@ fn lower_with_source(
                     block_of(*target_instr as usize).ok_or(CilError::UnsupportedControlFlow)?;
                 terminator = Some(build_eh_leave(
                     leave_target,
-                    throw_clause[b].expect("checked is_some above"),
+                    &throw_clauses[b],
                     &catch_clauses,
                     &handler_block_of_clause,
+                    unwind_finally(b),
                     resolver,
                     &is_merge,
                     &locals,
@@ -484,17 +684,45 @@ fn lower_with_source(
                 if next >= blocks.len() {
                     return Err(CilError::UnsupportedControlFlow);
                 }
-                let merge_args = merge_args(
-                    is_merge(next),
-                    local_count,
-                    &locals,
-                    local_types,
-                    &mut value_types,
-                    &mut insts,
-                );
-                Terminator::Jump {
-                    target: BlockId(next as u32),
-                    args: merge_args,
+                if let Some(kind) = trap_access[next].clone() {
+                    let operand_count = trap_operand_types(&code[blocks[next].0], resolver).len();
+                    let mut operands = Vec::with_capacity(operand_count);
+                    for _ in 0..operand_count {
+                        operands.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+                    }
+                    operands.reverse();
+                    build_trap_access_check(
+                        next,
+                        kind,
+                        &operands,
+                        &throw_clauses[b],
+                        &catch_clauses,
+                        &handler_block_of_clause,
+                        finally_protect[b],
+                        &finally_handler_block,
+                        resolver,
+                        &locals,
+                        local_count,
+                        local_types,
+                        &mut value_types,
+                        &mut insts,
+                        &mut split_blocks,
+                        original_block_count,
+                        &mut propagate_fixups,
+                    )?
+                } else {
+                    let merge_args = merge_args(
+                        is_merge(next),
+                        local_count,
+                        &locals,
+                        local_types,
+                        &mut value_types,
+                        &mut insts,
+                    );
+                    Terminator::Jump {
+                        target: BlockId(next as u32),
+                        args: merge_args,
+                    }
                 }
             }
         };
@@ -1075,13 +1303,20 @@ fn apply_value_op(
             match info.target {
                 CallTarget::Internal(callee) => {
                     let result = new_value(value_types, info.result_type.unwrap_or(MirType::I32));
-                    insts.push((
-                        result,
-                        Inst::Call {
+                    let slot = (inst.opcode == Opcode::Callvirt)
+                        .then(|| resolver.virtual_slot(&inst.operand))
+                        .flatten();
+                    let call_inst = match slot {
+                        Some(slot) => Inst::CallVirtual {
+                            slot: slot as u32,
+                            args: call_args,
+                        },
+                        None => Inst::Call {
                             callee,
                             args: call_args,
                         },
-                    ));
+                    };
+                    insts.push((result, call_inst));
                     if info.has_result {
                         stack.push(result);
                     }
@@ -1473,10 +1708,13 @@ fn apply_value_op(
             let layout = resolver
                 .boxed_layout(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
-            if layout.size > 4 {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            if matches!(
+                value_types.get(value.0 as usize),
+                Some(MirType::ValueType { .. })
+            ) {
                 return Err(CilError::Unsupported(inst.opcode));
             }
-            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
             let obj = new_value(value_types, MirType::ObjectRef);
             insts.push((
                 obj,
@@ -1498,14 +1736,14 @@ fn apply_value_op(
             stack.push(obj);
         }
         Opcode::UnboxAny => {
-            let layout = resolver
-                .boxed_layout(&inst.operand)
+            let result_ty = resolver
+                .boxed_value_type(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
-            if layout.size > 4 {
+            if matches!(result_ty, MirType::ValueType { .. }) {
                 return Err(CilError::Unsupported(inst.opcode));
             }
             let obj = stack.pop().ok_or(CilError::StackUnderflow)?;
-            let result = new_value(value_types, MirType::I32);
+            let result = new_value(value_types, result_ty);
             insts.push((
                 result,
                 Inst::FieldLoad {
@@ -1514,6 +1752,10 @@ fn apply_value_op(
                 },
             ));
             stack.push(result);
+        }
+        Opcode::Castclass => {
+            let object = stack.pop().ok_or(CilError::StackUnderflow)?;
+            stack.push(object);
         }
         other => return Err(CilError::Unsupported(other)),
     }
@@ -1564,12 +1806,14 @@ fn zero_inst(ty: MirType) -> Inst {
 }
 
 /// How a synthesized dispatch decides a catch clause matches the in-flight exception.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum DispatchMatch {
     /// `catch (System.Exception)` / `catch {}`: any in-flight exception (a nonzero tag) matches.
     CatchAll,
-    /// `catch (T)`: only this exact type tag matches (subtyping is a later increment).
-    ExactTag(u32),
+    /// `catch (T)`: the in-flight tag matches any tag in this set -- `T`'s own tag (exact match)
+    /// plus the tags of every in-program subtype of `T` (so a thrown subtype is caught). A single
+    /// element is the plain exact-match case.
+    Tags(Vec<u32>),
 }
 
 /// The match rule and handler block for the catch clause at `clause_index`.
@@ -1586,25 +1830,41 @@ fn catch_dispatch(
     let match_kind = if resolver.is_catch_all_type(&operand) {
         DispatchMatch::CatchAll
     } else {
-        let tag = resolver
-            .exception_tag(&operand)
-            .ok_or(CilError::Unsupported(Opcode::Throw))?;
-        DispatchMatch::ExactTag(tag)
+        let tags = resolver.subtype_tags(&operand);
+        if tags.is_empty() {
+            return Err(CilError::Unsupported(Opcode::Throw));
+        }
+        DispatchMatch::Tags(tags)
     };
     Ok((match_kind, handler_block_of_clause[clause_index]))
 }
 
-/// Synthesizes a per-try dispatch (and its clear/propagate blocks), appended after the originals
-/// with stable ids: `dispatch -> { clear -> handler, propagate }`. The dispatch loads
-/// `g_exception_tag` and tests it against `match_kind`; on a match `clear` resets the tag and jumps
-/// to the handler carrying the throw-point `locals` plus the caught exception (captured as an
-/// `ObjectRef` BEFORE clearing -- a catch variable is an exception reference, so it stays typed `O`
-/// through any later merge); on no match it propagates (returns with the tag still set, filled once
-/// the return type is known). Returns the dispatch block's id.
+/// Maps catch clause indices (in first-match order) to their (match rule, handler block) pairs, for
+/// a dispatch cascade.
+fn catch_dispatch_list(
+    clause_indices: &[usize],
+    resolver: &dyn CallResolver,
+    catch_clauses: &[&EhClause],
+    handler_block_of_clause: &[usize],
+) -> Result<Vec<(DispatchMatch, usize)>, CilError> {
+    clause_indices
+        .iter()
+        .map(|&c| catch_dispatch(resolver, catch_clauses, handler_block_of_clause, c))
+        .collect()
+}
+
+/// Synthesizes a per-try dispatch cascade, appended after the originals with stable ids. Each catch
+/// in `catches` (in first-match order) gets a dispatch block -- load `g_exception_tag`, test it
+/// against the catch's `match_kind` -- whose no-match edge falls through to the next catch, and a
+/// clear block that resets the tag and enters the handler carrying the throw-point `locals` plus the
+/// caught exception (captured as an `ObjectRef` BEFORE clearing -- a catch variable is an exception
+/// reference, so it stays typed `O` through any later merge). The final no-match runs an enclosing
+/// `finally` first (the `unwind`) when one guards the try, else propagates (returns with the tag set,
+/// filled once the return type is known). Returns the first dispatch block's id.
 #[allow(clippy::too_many_arguments)]
 fn synthesize_dispatch(
-    match_kind: DispatchMatch,
-    handler_block: usize,
+    catches: &[(DispatchMatch, usize)],
+    unwind: Option<usize>,
     locals: &[Option<ValueId>],
     local_count: usize,
     local_types: &[MirType],
@@ -1613,111 +1873,163 @@ fn synthesize_dispatch(
     block_count: usize,
     propagate_fixups: &mut Vec<usize>,
 ) -> usize {
-    let dispatch = block_count + split_blocks.len();
-    let clear = dispatch + 1;
-    let propagate = dispatch + 2;
+    let base = block_count + split_blocks.len();
+    let no_match_block = base + 2 * catches.len();
 
-    let mut dispatch_insts: Vec<(ValueId, Inst)> = Vec::new();
-    let loaded = new_value(value_types, MirType::I32);
-    dispatch_insts.push((
-        loaded,
-        Inst::StaticLoad {
-            offset: G_EXCEPTION_TAG_OFFSET,
-        },
-    ));
-    let cond = match match_kind {
-        DispatchMatch::CatchAll => loaded,
-        DispatchMatch::ExactTag(tag) => {
-            let expected = new_value(value_types, MirType::I32);
-            dispatch_insts.push((
-                expected,
-                Inst::ConstInt {
-                    ty: MirType::I32,
-                    value: i64::from(tag),
-                },
-            ));
-            let matched = new_value(value_types, MirType::I32);
-            dispatch_insts.push((
-                matched,
-                Inst::Compare {
-                    op: CmpOp::Eq,
-                    lhs: loaded,
-                    rhs: expected,
-                },
-            ));
-            matched
+    for (i, (match_kind, handler_block)) in catches.iter().enumerate() {
+        let clear = base + 2 * i + 1;
+        let next = if i + 1 < catches.len() {
+            base + 2 * (i + 1)
+        } else {
+            no_match_block
+        };
+
+        let mut dispatch_insts: Vec<(ValueId, Inst)> = Vec::new();
+        let loaded = new_value(value_types, MirType::I32);
+        dispatch_insts.push((
+            loaded,
+            Inst::StaticLoad {
+                offset: G_EXCEPTION_TAG_OFFSET,
+            },
+        ));
+        let cond = match match_kind {
+            DispatchMatch::CatchAll => loaded,
+            DispatchMatch::Tags(tags) => {
+                let mut cond: Option<ValueId> = None;
+                for &tag in tags {
+                    let expected = new_value(value_types, MirType::I32);
+                    dispatch_insts.push((
+                        expected,
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: i64::from(tag),
+                        },
+                    ));
+                    let matched = new_value(value_types, MirType::I32);
+                    dispatch_insts.push((
+                        matched,
+                        Inst::Compare {
+                            op: CmpOp::Eq,
+                            lhs: loaded,
+                            rhs: expected,
+                        },
+                    ));
+                    cond = Some(match cond {
+                        None => matched,
+                        Some(prev) => {
+                            let combined = new_value(value_types, MirType::I32);
+                            dispatch_insts.push((
+                                combined,
+                                Inst::Binary {
+                                    op: BinOp::Or,
+                                    lhs: prev,
+                                    rhs: matched,
+                                },
+                            ));
+                            combined
+                        }
+                    });
+                }
+                cond.unwrap_or(loaded)
+            }
+        };
+        split_blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: dispatch_insts,
+            terminator: Some(Terminator::Branch {
+                cond,
+                if_true: BlockId(clear as u32),
+                true_args: Vec::new(),
+                if_false: BlockId(next as u32),
+                false_args: Vec::new(),
+            }),
+        });
+
+        let mut clear_insts: Vec<(ValueId, Inst)> = Vec::new();
+        let exception = new_value(value_types, MirType::ObjectRef);
+        clear_insts.push((
+            exception,
+            Inst::StaticLoad {
+                offset: G_EXCEPTION_TAG_OFFSET,
+            },
+        ));
+        let zero = new_value(value_types, MirType::I32);
+        clear_insts.push((
+            zero,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: 0,
+            },
+        ));
+        let cleared = new_value(value_types, MirType::I32);
+        clear_insts.push((
+            cleared,
+            Inst::StaticStore {
+                offset: G_EXCEPTION_TAG_OFFSET,
+                value: zero,
+            },
+        ));
+        let mut handler_args = merge_args(
+            true,
+            local_count,
+            locals,
+            local_types,
+            value_types,
+            &mut clear_insts,
+        );
+        handler_args.push(exception);
+        split_blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: clear_insts,
+            terminator: Some(Terminator::Jump {
+                target: BlockId(*handler_block as u32),
+                args: handler_args,
+            }),
+        });
+    }
+
+    let no_match = match unwind {
+        Some(finally) => {
+            let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
+            let args = merge_args(
+                true,
+                local_count,
+                locals,
+                local_types,
+                value_types,
+                &mut landing_insts,
+            );
+            let index = block_count + split_blocks.len();
+            split_blocks.push(BasicBlock {
+                params: Vec::new(),
+                insts: landing_insts,
+                terminator: Some(Terminator::Jump {
+                    target: BlockId(finally as u32),
+                    args,
+                }),
+            });
+            index
         }
+        None => push_propagate(split_blocks, block_count, propagate_fixups),
     };
+    debug_assert_eq!(no_match, no_match_block);
 
-    let mut clear_insts: Vec<(ValueId, Inst)> = Vec::new();
-    let exception = new_value(value_types, MirType::ObjectRef);
-    clear_insts.push((
-        exception,
-        Inst::StaticLoad {
-            offset: G_EXCEPTION_TAG_OFFSET,
-        },
-    ));
-    let zero = new_value(value_types, MirType::I32);
-    clear_insts.push((
-        zero,
-        Inst::ConstInt {
-            ty: MirType::I32,
-            value: 0,
-        },
-    ));
-    let cleared = new_value(value_types, MirType::I32);
-    clear_insts.push((
-        cleared,
-        Inst::StaticStore {
-            offset: G_EXCEPTION_TAG_OFFSET,
-            value: zero,
-        },
-    ));
-    let mut handler_args = merge_args(
-        true,
-        local_count,
-        locals,
-        local_types,
-        value_types,
-        &mut clear_insts,
-    );
-    handler_args.push(exception);
-
-    split_blocks.push(BasicBlock {
-        params: Vec::new(),
-        insts: dispatch_insts,
-        terminator: Some(Terminator::Branch {
-            cond,
-            if_true: BlockId(clear as u32),
-            true_args: Vec::new(),
-            if_false: BlockId(propagate as u32),
-            false_args: Vec::new(),
-        }),
-    });
-    split_blocks.push(BasicBlock {
-        params: Vec::new(),
-        insts: clear_insts,
-        terminator: Some(Terminator::Jump {
-            target: BlockId(handler_block as u32),
-            args: handler_args,
-        }),
-    });
-    let propagate_actual = push_propagate(split_blocks, block_count, propagate_fixups);
-    debug_assert_eq!(propagate_actual, propagate);
-
-    dispatch
+    base
 }
 
 /// Builds the terminator for a block ending in `throw` (the no-GC tag model). The exception's
-/// tag -- the value `newobj E` produced -- is stored into `g_exception_tag`, then control goes to
-/// a synthesized dispatch ([`synthesize_dispatch`]) for the enclosing catch (`throw_clause`); an
-/// uncaught throw propagates directly (returns with the tag set, filled once the return type is
-/// known via `propagate_fixups`).
+/// tag -- the value `newobj E` produced -- is stored into `g_exception_tag`, then control goes to a
+/// synthesized dispatch ([`synthesize_dispatch`]) for the enclosing catch (`throw_clause`); else, if
+/// the throw is inside a `finally`-protected try (`finally_protect`), to that finally (which runs and
+/// then propagates); else it propagates directly (returns with the tag set, filled once the return
+/// type is known via `propagate_fixups`).
 #[allow(clippy::too_many_arguments)]
 fn build_eh_throw(
-    throw_clause: Option<usize>,
+    throw_clauses: &[usize],
     catch_clauses: &[&EhClause],
     handler_block_of_clause: &[usize],
+    finally_protect: Option<usize>,
+    finally_handler_block: &[usize],
     resolver: &dyn CallResolver,
     stack: &mut Vec<ValueId>,
     locals: &[Option<ValueId>],
@@ -1739,33 +2051,42 @@ fn build_eh_throw(
         },
     ));
 
-    let Some(clause_index) = throw_clause else {
-        let propagate = push_propagate(split_blocks, block_count, propagate_fixups);
+    if !throw_clauses.is_empty() {
+        let catches = catch_dispatch_list(
+            throw_clauses,
+            resolver,
+            catch_clauses,
+            handler_block_of_clause,
+        )?;
+        let unwind = finally_protect.map(|clause| finally_handler_block[clause]);
+        let dispatch = synthesize_dispatch(
+            &catches,
+            unwind,
+            locals,
+            local_count,
+            local_types,
+            value_types,
+            split_blocks,
+            block_count,
+            propagate_fixups,
+        );
         return Ok(Terminator::Jump {
-            target: BlockId(propagate as u32),
+            target: BlockId(dispatch as u32),
             args: Vec::new(),
         });
-    };
+    }
 
-    let (match_kind, handler_block) = catch_dispatch(
-        resolver,
-        catch_clauses,
-        handler_block_of_clause,
-        clause_index,
-    )?;
-    let dispatch = synthesize_dispatch(
-        match_kind,
-        handler_block,
-        locals,
-        local_count,
-        local_types,
-        value_types,
-        split_blocks,
-        block_count,
-        propagate_fixups,
-    );
+    if let Some(finally_clause) = finally_protect {
+        let args = merge_args(true, local_count, locals, local_types, value_types, insts);
+        return Ok(Terminator::Jump {
+            target: BlockId(finally_handler_block[finally_clause] as u32),
+            args,
+        });
+    }
+
+    let propagate = push_propagate(split_blocks, block_count, propagate_fixups);
     Ok(Terminator::Jump {
-        target: BlockId(dispatch as u32),
+        target: BlockId(propagate as u32),
         args: Vec::new(),
     })
 }
@@ -1780,9 +2101,10 @@ fn build_eh_throw(
 #[allow(clippy::too_many_arguments)]
 fn build_eh_leave(
     leave_target: usize,
-    clause_index: usize,
+    throw_clauses: &[usize],
     catch_clauses: &[&EhClause],
     handler_block_of_clause: &[usize],
+    unwind: Option<usize>,
     resolver: &dyn CallResolver,
     is_merge: &impl Fn(usize) -> bool,
     locals: &[Option<ValueId>],
@@ -1794,11 +2116,11 @@ fn build_eh_leave(
     block_count: usize,
     propagate_fixups: &mut Vec<usize>,
 ) -> Result<Terminator, CilError> {
-    let (match_kind, handler_block) = catch_dispatch(
+    let catches = catch_dispatch_list(
+        throw_clauses,
         resolver,
         catch_clauses,
         handler_block_of_clause,
-        clause_index,
     )?;
     let in_flight = new_value(value_types, MirType::I32);
     insts.push((
@@ -1808,8 +2130,8 @@ fn build_eh_leave(
         },
     ));
     let dispatch = synthesize_dispatch(
-        match_kind,
-        handler_block,
+        &catches,
+        unwind,
         locals,
         local_count,
         local_types,
@@ -1835,6 +2157,366 @@ fn build_eh_leave(
         if_false: BlockId(landing as u32),
         false_args: Vec::new(),
     })
+}
+
+/// The kind of runtime check a may-trap access needs, and the builtin exception it raises.
+#[derive(Clone)]
+enum TrapKind {
+    /// An array element access: `index >= length` (unsigned) -> `IndexOutOfRangeException`.
+    Bounds,
+    /// A field load on an object from the stack: `base == 0` -> `NullReferenceException`.
+    NullRef,
+    /// `unbox.any T`: the boxed value's TypeDesc must equal `&TypeDesc(T)` (the carried `handle`) --
+    /// an exact type check, since a value type has no subtypes -> `InvalidCastException`.
+    Cast(TypeHandle),
+    /// `castclass T`: the object's runtime TypeDesc must be one of the target's accepted handles
+    /// (`T` plus its in-program subtypes); if none match -> `InvalidCastException`.
+    CastClass(Vec<TypeHandle>),
+}
+
+/// The trap a block's FIRST instruction needs, or `None` if it is not a trap-leader: a bounds check
+/// for an array access, or a null check for a field access (`ldfld`/`stfld`) whose field is declared
+/// on a REFERENCE type (so its object can be null). The reference-type gate is the same one
+/// `discover_blocks` used to make the leader, so the two agree.
+fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapKind> {
+    let opcode = inst.opcode;
+    if control_flow::is_may_trap_access(opcode) {
+        return Some(TrapKind::Bounds);
+    }
+    if matches!(opcode, Opcode::Ldfld | Opcode::Stfld)
+        && resolver.field_on_reference_type(&inst.operand)
+    {
+        return Some(TrapKind::NullRef);
+    }
+    if opcode == Opcode::UnboxAny {
+        if let Some(layout) = resolver.boxed_layout(&inst.operand) {
+            return Some(TrapKind::Cast(layout.handle));
+        }
+    }
+    if opcode == Opcode::Castclass {
+        let handles = resolver.cast_subtype_handles(&inst.operand);
+        if !handles.is_empty() {
+            return Some(TrapKind::CastClass(handles));
+        }
+    }
+    None
+}
+
+/// The operand types a may-trap access takes off the stack, so a trap-access block can receive them
+/// as trailing parameters: `[array, index]` for an array load, `[array, index, value]` for an array
+/// store (the value's width follows the element -- `i8` -> I64, `ref` -> O, else I32), `[object]` for
+/// a field load, `[object, value]` for a field store (the value typed by the field). Empty for a
+/// non-access opcode.
+fn trap_operand_types(inst: &Instruction, resolver: &dyn CallResolver) -> Vec<MirType> {
+    let opcode = inst.opcode;
+    if matches!(opcode, Opcode::Ldfld | Opcode::UnboxAny | Opcode::Castclass) {
+        return vec![MirType::ObjectRef];
+    }
+    if opcode == Opcode::Stfld {
+        let value = resolver.field_type(&inst.operand).unwrap_or(MirType::I32);
+        return vec![MirType::ObjectRef, value];
+    }
+    if control_flow::is_may_trap_load(opcode) {
+        return vec![MirType::ObjectRef, MirType::I32];
+    }
+    let value = match opcode {
+        Opcode::StelemI8 => MirType::I64,
+        Opcode::StelemRef => MirType::ObjectRef,
+        Opcode::StelemI1 | Opcode::StelemI2 | Opcode::StelemI4 => MirType::I32,
+        _ => return Vec::new(),
+    };
+    vec![MirType::ObjectRef, MirType::I32, value]
+}
+
+/// Builds the terminator for a block that flows into a may-trap access (the next block): the
+/// synthesized runtime check. `operands` is what the block left on its stack -- `[array, index]` for
+/// an array load, `[array, index, value]` for a store, `[object]` for a field load. By `kind` it
+/// computes the failure condition -- an out-of-range array index (unsigned `index >= length`, so a
+/// negative index traps too) or a null field base (`object == 0`) -- and on failure routes to the
+/// enclosing handler exactly as `throw new <builtin>()` would: storing the type's tag and going to
+/// the catch dispatch / finally / propagation via [`build_eh_throw`]. Otherwise control falls to the
+/// access block through a landing carrying the locals plus the operands, so the access runs with the
+/// check passed.
+#[allow(clippy::too_many_arguments)]
+fn build_trap_access_check(
+    access_block: usize,
+    kind: TrapKind,
+    operands: &[ValueId],
+    throw_clauses: &[usize],
+    catch_clauses: &[&EhClause],
+    handler_block_of_clause: &[usize],
+    finally_protect: Option<usize>,
+    finally_handler_block: &[usize],
+    resolver: &dyn CallResolver,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+    propagate_fixups: &mut Vec<usize>,
+) -> Result<Terminator, CilError> {
+    let (failed, exception_name) = match kind {
+        TrapKind::Bounds => {
+            let array = operands[0];
+            let index = operands[1];
+            let length = new_value(value_types, MirType::I32);
+            insts.push((
+                length,
+                Inst::FieldLoad {
+                    base: array,
+                    offset: 0,
+                },
+            ));
+            let oob = new_value(value_types, MirType::I32);
+            insts.push((
+                oob,
+                Inst::Compare {
+                    op: CmpOp::UnsignedGe,
+                    lhs: index,
+                    rhs: length,
+                },
+            ));
+            (oob, "IndexOutOfRangeException")
+        }
+        TrapKind::NullRef => {
+            let object = operands[0];
+            let null = new_value(value_types, MirType::ObjectRef);
+            insts.push((
+                null,
+                Inst::ConstInt {
+                    ty: MirType::ObjectRef,
+                    value: 0,
+                },
+            ));
+            let is_null = new_value(value_types, MirType::I32);
+            insts.push((
+                is_null,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: object,
+                    rhs: null,
+                },
+            ));
+            (is_null, "NullReferenceException")
+        }
+        TrapKind::Cast(handle) => {
+            let object = operands[0];
+            let box_desc = new_value(value_types, MirType::I32);
+            insts.push((box_desc, Inst::LoadTypeDesc { object }));
+            let expected = new_value(value_types, MirType::I32);
+            insts.push((expected, Inst::TypeDescAddr { handle }));
+            let mismatch = new_value(value_types, MirType::I32);
+            insts.push((
+                mismatch,
+                Inst::Compare {
+                    op: CmpOp::Ne,
+                    lhs: box_desc,
+                    rhs: expected,
+                },
+            ));
+            (mismatch, "InvalidCastException")
+        }
+        TrapKind::CastClass(handles) => {
+            let object = operands[0];
+            let object_desc = new_value(value_types, MirType::I32);
+            insts.push((object_desc, Inst::LoadTypeDesc { object }));
+            let mut matched: Option<ValueId> = None;
+            for handle in &handles {
+                let expected = new_value(value_types, MirType::I32);
+                insts.push((expected, Inst::TypeDescAddr { handle: *handle }));
+                let eq = new_value(value_types, MirType::I32);
+                insts.push((
+                    eq,
+                    Inst::Compare {
+                        op: CmpOp::Eq,
+                        lhs: object_desc,
+                        rhs: expected,
+                    },
+                ));
+                matched = Some(match matched {
+                    None => eq,
+                    Some(prev) => {
+                        let combined = new_value(value_types, MirType::I32);
+                        insts.push((
+                            combined,
+                            Inst::Binary {
+                                op: BinOp::Or,
+                                lhs: prev,
+                                rhs: eq,
+                            },
+                        ));
+                        combined
+                    }
+                });
+            }
+            let matched = matched.unwrap_or(object_desc);
+            let zero = new_value(value_types, MirType::I32);
+            insts.push((
+                zero,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ));
+            let mismatch = new_value(value_types, MirType::I32);
+            insts.push((
+                mismatch,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: matched,
+                    rhs: zero,
+                },
+            ));
+            (mismatch, "InvalidCastException")
+        }
+    };
+
+    let tag = resolver
+        .builtin_exception_tag("System", exception_name)
+        .ok_or(CilError::UnsupportedControlFlow)?;
+    let mut trap_insts: Vec<(ValueId, Inst)> = Vec::new();
+    let tag_value = new_value(value_types, MirType::I32);
+    trap_insts.push((
+        tag_value,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from(tag),
+        },
+    ));
+    let mut trap_stack = vec![tag_value];
+    let trap_terminator = build_eh_throw(
+        throw_clauses,
+        catch_clauses,
+        handler_block_of_clause,
+        finally_protect,
+        finally_handler_block,
+        resolver,
+        &mut trap_stack,
+        locals,
+        local_count,
+        local_types,
+        value_types,
+        &mut trap_insts,
+        split_blocks,
+        block_count,
+        propagate_fixups,
+    )?;
+    let trap = block_count + split_blocks.len();
+    split_blocks.push(BasicBlock {
+        params: Vec::new(),
+        insts: trap_insts,
+        terminator: Some(trap_terminator),
+    });
+
+    let landing = block_count + split_blocks.len();
+    let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
+    let mut access_args = merge_args(
+        true,
+        local_count,
+        locals,
+        local_types,
+        value_types,
+        &mut landing_insts,
+    );
+    access_args.extend_from_slice(operands);
+    split_blocks.push(BasicBlock {
+        params: Vec::new(),
+        insts: landing_insts,
+        terminator: Some(Terminator::Jump {
+            target: BlockId(access_block as u32),
+            args: access_args,
+        }),
+    });
+
+    Ok(Terminator::Branch {
+        cond: failed,
+        if_true: BlockId(trap as u32),
+        true_args: Vec::new(),
+        if_false: BlockId(landing as u32),
+        false_args: Vec::new(),
+    })
+}
+
+/// Builds the terminator for a `leave` that exits a try with a `finally`: a plain jump to the
+/// finally handler carrying the locals. The finally runs, then its `endfinally` epilogue resumes at
+/// the leave target -- there is no tag check here (the `endfinally` decides resume vs propagate).
+fn build_eh_finally_leave(
+    finally_handler: usize,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Terminator {
+    let args = merge_args(true, local_count, locals, local_types, value_types, insts);
+    Terminator::Jump {
+        target: BlockId(finally_handler as u32),
+        args,
+    }
+}
+
+/// Builds the terminator for a finally handler's `endfinally`: load the in-flight tag and, when it
+/// is nonzero, propagate (the exception passed through the finally); otherwise resume at the
+/// finally's normal continuation (the pending leave target), carrying the finally's locals through a
+/// landing block (a `Branch` edge carries no arguments). When the try always throws there is no
+/// normal continuation, so the finally simply propagates. The propagation return value is filled in
+/// once the function's return type is known.
+#[allow(clippy::too_many_arguments)]
+fn build_eh_endfinally(
+    continuation: Option<usize>,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+    propagate_fixups: &mut Vec<usize>,
+) -> Terminator {
+    let Some(continuation) = continuation else {
+        let propagate = push_propagate(split_blocks, block_count, propagate_fixups);
+        return Terminator::Jump {
+            target: BlockId(propagate as u32),
+            args: Vec::new(),
+        };
+    };
+    let in_flight = new_value(value_types, MirType::I32);
+    insts.push((
+        in_flight,
+        Inst::StaticLoad {
+            offset: G_EXCEPTION_TAG_OFFSET,
+        },
+    ));
+    let landing = block_count + split_blocks.len();
+    let propagate = landing + 1;
+    let mut landing_insts: Vec<(ValueId, Inst)> = Vec::new();
+    let cont_args = merge_args(
+        true,
+        local_count,
+        locals,
+        local_types,
+        value_types,
+        &mut landing_insts,
+    );
+    split_blocks.push(BasicBlock {
+        params: Vec::new(),
+        insts: landing_insts,
+        terminator: Some(Terminator::Jump {
+            target: BlockId(continuation as u32),
+            args: cont_args,
+        }),
+    });
+    let propagate_actual = push_propagate(split_blocks, block_count, propagate_fixups);
+    debug_assert_eq!(propagate_actual, propagate);
+    Terminator::Branch {
+        cond: in_flight,
+        if_true: BlockId(propagate as u32),
+        true_args: Vec::new(),
+        if_false: BlockId(landing as u32),
+        false_args: Vec::new(),
+    }
 }
 
 /// Pushes a propagation block -- an exit that returns, leaving `g_exception_tag` set -- and
@@ -2381,9 +3063,51 @@ mod control_flow {
         }
     }
 
-    /// Whether an opcode ends control flow with no fall-through.
+    /// Whether an opcode ends control flow with no fall-through. `endfinally` ends a finally
+    /// handler -- control resumes at the pending leave target or the unwind, never the next
+    /// instruction -- so it is a block terminator like `ret`/`throw`.
     fn is_return(op: Opcode) -> bool {
-        matches!(op, Opcode::Ret | Opcode::Throw | Opcode::Rethrow)
+        matches!(
+            op,
+            Opcode::Ret | Opcode::Throw | Opcode::Rethrow | Opcode::Endfinally
+        )
+    }
+
+    /// Whether an opcode is a bounds-checked array element LOAD -- one that raises
+    /// `IndexOutOfRangeException` on an out-of-range index. The lowering hoists a bounds check ahead
+    /// of these (inside a catch-protected try) so the trap can route to a handler.
+    pub fn is_may_trap_load(op: Opcode) -> bool {
+        matches!(
+            op,
+            Opcode::LdelemI1
+                | Opcode::LdelemU1
+                | Opcode::LdelemI2
+                | Opcode::LdelemU2
+                | Opcode::LdelemI4
+                | Opcode::LdelemU4
+                | Opcode::LdelemI8
+                | Opcode::LdelemRef
+        )
+    }
+
+    /// Whether an opcode is a bounds-checked array element STORE -- like a load it raises
+    /// `IndexOutOfRangeException` out of range, but takes three operands (array, index, value) and
+    /// leaves no result.
+    pub fn is_may_trap_store(op: Opcode) -> bool {
+        matches!(
+            op,
+            Opcode::StelemI1
+                | Opcode::StelemI2
+                | Opcode::StelemI4
+                | Opcode::StelemI8
+                | Opcode::StelemRef
+        )
+    }
+
+    /// Whether an opcode is a bounds-checked array element access (load or store), so the lowering
+    /// hoists a bounds check ahead of it.
+    pub fn is_may_trap_access(op: Opcode) -> bool {
+        is_may_trap_load(op) || is_may_trap_store(op)
     }
 
     /// The instruction indices control can reach from the terminator at `index`.
@@ -2421,7 +3145,11 @@ mod control_flow {
     /// Leaders are instruction 0, every branch target, the instruction after a branch or a
     /// return, and every exception-region boundary (a try/handler/filter start or end), so a
     /// protected region and its handler are clean block boundaries the EH lowering can map.
-    pub fn discover_blocks(code: &[Instruction], handlers: &[EhClause]) -> Vec<(usize, usize)> {
+    pub fn discover_blocks(
+        code: &[Instruction],
+        handlers: &[EhClause],
+        is_reference_field: &dyn Fn(&Operand) -> bool,
+    ) -> Vec<(usize, usize)> {
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
         leaders.insert(0);
         for (i, inst) in code.iter().enumerate() {
@@ -2448,6 +3176,19 @@ mod control_flow {
             leaders.insert(clause.handler_range.end as usize);
             if let EhKind::Filter { filter_start } = clause.kind {
                 leaders.insert(filter_start as usize);
+            }
+        }
+        for (i, inst) in code.iter().enumerate() {
+            let is_field_null_deref = matches!(inst.opcode, Opcode::Ldfld | Opcode::Stfld)
+                && is_reference_field(&inst.operand);
+            let is_cast = matches!(inst.opcode, Opcode::UnboxAny | Opcode::Castclass);
+            let in_catch_try = handlers.iter().any(|clause| {
+                matches!(clause.kind, EhKind::Catch(_))
+                    && (clause.try_range.start as usize..clause.try_range.end as usize).contains(&i)
+            });
+            if ((is_may_trap_access(inst.opcode) || is_field_null_deref) && in_catch_try) || is_cast
+            {
+                leaders.insert(i);
             }
         }
         let starts: Vec<usize> = leaders.into_iter().filter(|&l| l < code.len()).collect();
@@ -3011,7 +3752,7 @@ mod tests {
             Instruction::simple(Opcode::LdcI41),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code, &[]);
+        let blocks = control_flow::discover_blocks(&code, &[], &|_| false);
         assert_eq!(blocks, vec![(0, 3), (3, 5), (5, 7)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());
@@ -3091,7 +3832,7 @@ mod tests {
             Instruction::new(Opcode::LdcI4S, Operand::Int8(30)),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code, &[]);
+        let blocks = control_flow::discover_blocks(&code, &[], &|_| false);
         assert_eq!(blocks, vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());
@@ -3222,6 +3963,12 @@ mod tests {
                     size: 4,
                     reference_offsets: Vec::new(),
                 })
+            }
+            fn boxed_value_type(&self, _: &Operand) -> Option<MirType> {
+                Some(MirType::I32)
+            }
+            fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+                Some(0x8000_0001)
             }
         }
         let int = Operand::Token(Token::new(0x01, 7));

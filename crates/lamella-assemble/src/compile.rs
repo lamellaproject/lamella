@@ -10,27 +10,28 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_binder::{
     Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, ConversionKind,
-    Diagnostic as BinderDiagnostic, Model, SpecialType, TypeSymbol,
+    Diagnostic as BinderDiagnostic, FieldReference, Model, SpecialType, TypeSymbol,
     bind_compilation_unit_with_references, bind_type, collect_into, load_assembly,
 };
 use lamella_cil::{Instruction, MethodBodyImage, encode_with_offsets, write_method_body};
-use lamella_metadata::Assembly;
 use lamella_metadata::signature::element;
+use lamella_metadata::{Assembly, encode_exception_base_chain, exception_tag_for_name};
 use lamella_pe::{
     ImageBuilder, LocalVariable, MethodDebug, SequencePoint, TypeSig, field_signature,
     local_signature, method_signature, property_signature, type_signature,
 };
 use lamella_syntax::ast::{
-    AssignmentOperator, CompilationUnit, ConstructorInitializer, ConstructorInitializerKind,
-    DelegateDecl, EnumDecl, Expr, ExprKind, Literal, Member, Modifier, NamespaceMember, Parameter,
-    ParameterModifier, QualifiedName, Stmt, StmtKind, TypeDecl, TypeKind, TypeRef, UsingDirective,
-    UsingKind, VariableDeclarator, explicit_interface_member_name,
+    AssignmentOperator, AttributeArgument, AttributeSection, CompilationUnit, ConstructorInitializer,
+    ConstructorInitializerKind, DelegateDecl, EnumDecl, Expr, ExprKind, Literal, Member, Modifier,
+    NamespaceMember, Parameter, ParameterModifier, QualifiedName, Stmt, StmtKind, TypeDecl, TypeKind,
+    TypeRef, UsingDirective, UsingKind, VariableDeclarator, explicit_interface_member_name,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
 use lamella_syntax::parser::parse_compilation_unit;
 use lamella_syntax::span::Span;
 use lamella_token::Token;
 
+const TYPE_REF: u8 = 0x01;
 const TYPE_DEF: u8 = 0x02;
 const FIELD: u8 = 0x04;
 const METHOD_DEF: u8 = 0x06;
@@ -52,6 +53,7 @@ const DELEGATE_CTOR_FLAGS: u16 = METHOD_PUBLIC | METHOD_HIDEBYSIG | 0x0800 | 0x1
 const DELEGATE_INVOKE_FLAGS: u16 =
     METHOD_PUBLIC | METHOD_HIDEBYSIG | METHOD_VIRTUAL | METHOD_NEWSLOT;
 const FIELD_PUBLIC: u16 = 0x0006;
+const FIELD_PRIVATE: u16 = 0x0001;
 const FIELD_STATIC: u16 = 0x0010;
 const CTOR_FLAGS: u16 = 0x0006 | 0x0800 | 0x1000;
 const CCTOR_FLAGS: u16 = 0x0001 | METHOD_STATIC | METHOD_HIDEBYSIG | 0x0800 | 0x1000;
@@ -77,7 +79,7 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-    fn from_syntax(diagnostic: &SyntaxDiagnostic) -> Diagnostic {
+    pub(crate) fn from_syntax(diagnostic: &SyntaxDiagnostic) -> Diagnostic {
         Diagnostic {
             code: diagnostic.code(),
             severity: diagnostic.severity(),
@@ -86,7 +88,7 @@ impl Diagnostic {
         }
     }
 
-    fn from_binder(diagnostic: &BinderDiagnostic) -> Diagnostic {
+    pub(crate) fn from_binder(diagnostic: &BinderDiagnostic) -> Diagnostic {
         Diagnostic {
             code: diagnostic.code(),
             severity: diagnostic.severity(),
@@ -250,6 +252,7 @@ fn build_image(
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let mut tokens = assign_tokens(unit);
     let mut binder = Binder::with_model(reference_model(unit, references));
+    mark_external_value_types(binder.model(), &mut tokens);
     let mut image = ImageBuilder::new(module_name, assembly_name);
     let object = image.object_type();
     let mut entry_point = None;
@@ -268,6 +271,7 @@ fn build_image(
         "",
         context.as_ref(),
     )?;
+    emit_exception_base_chains(&mut image, binder.model(), &tokens);
     let is_dll = entry_point.is_none();
     let entry = entry_point.unwrap_or(Token::new(0, 0));
     let pdb = debug.map(|(_, path)| image.build_pdb(path, entry));
@@ -278,6 +282,362 @@ fn build_image(
     Ok((image, pdb))
 }
 
+/// Emits an `<ExceptionBaseChain>` custom attribute on each referenced EXTERNAL exception
+/// type, carrying its base-chain tag vector, so the AOT -- which loads only the program, not
+/// the BCL -- can read a BCL throwable's `[tag(E), tag(base), ..., tag(System.Exception)]`
+/// for the middle-base subtype test. An in-program exception is a `TypeDef` whose chain the
+/// AOT walks itself, so it gets no attribute. The marker `<ExceptionBaseChain>::.ctor` is
+/// minted once, lazily, only when there is at least one exception type to annotate.
+fn emit_exception_base_chains(image: &mut ImageBuilder, model: &Model, tokens: &Tokens) {
+    let mut chains: Vec<(Token, Vec<u32>)> = Vec::new();
+    for (namespace, name) in model.type_keys() {
+        let symbol = named_symbol(namespace, name);
+        let Some(token) = tokens.type_token(&symbol) else {
+            continue;
+        };
+        if token.table() != TYPE_REF {
+            continue;
+        }
+        if let Some(chain) = exception_base_chain_tags(model, &symbol) {
+            chains.push((token, chain));
+        }
+    }
+    if chains.is_empty() {
+        return;
+    }
+    let marker = image.type_ref("", "<ExceptionBaseChain>");
+    let ctor = image.member_ref(marker, ".ctor", &method_signature(true, &[], &TypeSig::Void));
+    for (token, chain) in chains {
+        image.add_custom_attribute(token, ctor, &encode_exception_base_chain(&chain));
+    }
+}
+
+/// The base-chain tag vector for an exception type -- `[tag(E), tag(base(E)), ...,
+/// tag(System.Exception)]`, leaf first -- or `None` if `symbol` does not derive from
+/// `System.Exception` per the model. Tags are by name, matching `Assembly::exception_tag`.
+fn exception_base_chain_tags(model: &Model, symbol: &TypeSymbol) -> Option<Vec<u32>> {
+    let mut chain = Vec::new();
+    let mut current = symbol.clone();
+    loop {
+        let (namespace, name) = split_type_name(&current)?;
+        chain.push(exception_tag_for_name(&namespace, &name));
+        if namespace == "System" && name == "Exception" {
+            return Some(chain);
+        }
+        if chain.len() > 64 {
+            return None;
+        }
+        current = model.get_by_symbol(&current).and_then(|info| info.base.clone())?;
+    }
+}
+
+/// Emits a `CustomAttribute` row for each user attribute applied to `parent` (24.2): the
+/// attribute type's constructor (matched by positional-argument count) and a value blob of
+/// its fixed arguments (II.23.3). An attribute whose type/constructor does not resolve, or
+/// whose arguments are not constant literals this encodes, is skipped (lenient -- the same
+/// posture as an unlowered construct).
+fn emit_attributes(
+    image: &mut ImageBuilder,
+    binder: &Binder,
+    tokens: &Tokens,
+    parent: Token,
+    sections: &[AttributeSection],
+) {
+    for section in sections {
+        if section.target.is_some() {
+            continue;
+        }
+        for attribute in &section.attributes {
+            emit_one_attribute(image, binder, tokens, parent, attribute);
+        }
+    }
+}
+
+fn emit_one_attribute(
+    image: &mut ImageBuilder,
+    binder: &Binder,
+    tokens: &Tokens,
+    parent: Token,
+    attribute: &lamella_syntax::ast::Attribute,
+) {
+    let model = binder.model();
+    let mut positional: Vec<&Expr> = Vec::new();
+    let mut named: Vec<(&str, &Expr)> = Vec::new();
+    for argument in &attribute.arguments {
+        match argument {
+            AttributeArgument::Positional(expr) => positional.push(expr),
+            AttributeArgument::Named { name, value } => named.push((name, value)),
+        }
+    }
+    let Some((attribute_ty, parameters)) =
+        resolve_attribute(model, &attribute.name, positional.len())
+    else {
+        return;
+    };
+    let mut blob = alloc::vec![0x01u8, 0x00];
+    for (expr, parameter) in positional.iter().zip(&parameters) {
+        if encode_value(model, expr, parameter, &mut blob).is_none() {
+            return;
+        }
+    }
+    let Ok(named_count) = u16::try_from(named.len()) else {
+        return;
+    };
+    blob.extend_from_slice(&named_count.to_le_bytes());
+    for (name, value) in &named {
+        if encode_named_argument(binder, &attribute_ty, name, value, &mut blob).is_none() {
+            return;
+        }
+    }
+    let Some(constructor) = tokens.method(&attribute_ty, ".ctor", &parameters) else {
+        return;
+    };
+    image.add_custom_attribute(parent, constructor, &blob);
+}
+
+/// Resolves an attribute name to its type and the parameter types of the constructor taking
+/// `arg_count` positional arguments, trying the name as written and with an `Attribute`
+/// suffix (24.2). `None` if neither resolves to a type with such a constructor.
+fn resolve_attribute(
+    model: &Model,
+    name: &QualifiedName,
+    arg_count: usize,
+) -> Option<(TypeSymbol, Vec<TypeSymbol>)> {
+    for candidate in attribute_candidates(name) {
+        if let Some(info) = model.get_by_symbol(&candidate) {
+            if let Some(constructor) = info
+                .constructors
+                .iter()
+                .find(|constructor| constructor.parameters.len() == arg_count)
+            {
+                return Some((candidate, constructor.parameters.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// The candidate type symbols for an attribute name: as written, and with an `Attribute`
+/// suffix on the final identifier (`[My]` -> `My`, then `MyAttribute`).
+fn attribute_candidates(name: &QualifiedName) -> Vec<TypeSymbol> {
+    let parts: Vec<Box<str>> = name.parts.iter().cloned().collect();
+    let mut suffixed = parts.clone();
+    if let Some(last) = suffixed.last_mut() {
+        let mut full = String::from(&**last);
+        full.push_str("Attribute");
+        *last = full.into();
+    }
+    alloc::vec![
+        TypeSymbol::Named(parts.into()),
+        TypeSymbol::Named(suffixed.into()),
+    ]
+}
+
+/// Encodes one attribute argument value into the blob by its target type (II.23.3): an
+/// integral/bool/char/string literal, a `typeof(T)` (the type's name as a SerString), or an
+/// enum constant (its underlying integer). `None` (skip the attribute) for anything else.
+fn encode_value(model: &Model, expr: &Expr, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Option<()> {
+    match &expr.kind {
+        ExprKind::Literal(literal) => encode_literal(literal, ty, blob),
+        ExprKind::TypeOf(target) => {
+            encode_ser_string(&type_serialization_name(target), blob);
+            Some(())
+        }
+        _ => {
+            let (enum_ty, value) = enum_member_constant(model, expr)?;
+            encode_integer(enum_underlying(model, &enum_ty), value as u64, blob)
+        }
+    }
+}
+
+/// Encodes a constant literal by its target type.
+fn encode_literal(literal: &Literal, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Option<()> {
+    let TypeSymbol::Special(special) = ty else {
+        return None;
+    };
+    match (special, literal) {
+        (SpecialType::Boolean, Literal::Boolean(value)) => blob.push(u8::from(*value)),
+        (SpecialType::Char, Literal::Character(value)) => {
+            blob.extend_from_slice(&value.to_le_bytes());
+        }
+        (SpecialType::String, Literal::String(units)) => {
+            encode_ser_string(&String::from_utf16_lossy(units), blob);
+        }
+        (_, Literal::Integer { value, .. }) => return encode_integer(*special, *value, blob),
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Encodes a named attribute argument (II.23.3): the FIELD (0x53) / PROPERTY (0x54) tag, the
+/// target's element type, its name, and the value. The target is resolved as a field or
+/// property of the attribute type. `None` (skip) if it is neither or cannot be encoded.
+fn encode_named_argument(
+    binder: &Binder,
+    attribute_ty: &TypeSymbol,
+    name: &str,
+    value: &Expr,
+    blob: &mut Vec<u8>,
+) -> Option<()> {
+    let (tag, target_ty) = {
+        let info = binder.model().get_by_symbol(attribute_ty)?;
+        if let Some(field) = info.find_field(name) {
+            (0x53u8, field.ty.clone())
+        } else if let Some(property) = info.find_property(name) {
+            (0x54u8, property.ty.clone())
+        } else {
+            return None;
+        }
+    };
+    let target_ty = binder.resolve_type(&target_ty);
+    blob.push(tag);
+    encode_element_type(binder.model(), &target_ty, blob)?;
+    encode_ser_string(name, blob);
+    encode_value(binder.model(), value, &target_ty, blob)
+}
+
+/// Encodes the FieldOrPropType of a named argument (II.23.3): a primitive's element-type
+/// code, `0x50` for `System.Type`, or `0x55` and the enum's name for an enum.
+fn encode_element_type(model: &Model, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Option<()> {
+    if let TypeSymbol::Special(special) = ty {
+        blob.push(primitive_element_code(*special)?);
+        return Some(());
+    }
+    if is_system_type(ty, "Type") {
+        blob.push(0x50);
+        return Some(());
+    }
+    if model
+        .get_by_symbol(ty)
+        .is_some_and(|info| info.kind == lamella_binder::TypeKind::Enum)
+    {
+        blob.push(0x55);
+        encode_ser_string(&type_name(ty), blob);
+        return Some(());
+    }
+    None
+}
+
+/// The blob element-type code (II.23.1.16) of a primitive type, or `None` for one with none.
+fn primitive_element_code(special: SpecialType) -> Option<u8> {
+    Some(match special {
+        SpecialType::Boolean => 0x02,
+        SpecialType::Char => 0x03,
+        SpecialType::SByte => 0x04,
+        SpecialType::Byte => 0x05,
+        SpecialType::Int16 => 0x06,
+        SpecialType::UInt16 => 0x07,
+        SpecialType::Int32 => 0x08,
+        SpecialType::UInt32 => 0x09,
+        SpecialType::Int64 => 0x0A,
+        SpecialType::UInt64 => 0x0B,
+        SpecialType::Single => 0x0C,
+        SpecialType::Double => 0x0D,
+        SpecialType::String => 0x0E,
+        _ => return None,
+    })
+}
+
+/// The CLR name a `typeof(T)` serializes to in a custom attribute (II.23.3) -- the type's
+/// namespace-qualified name (the runtime resolves it in the attribute's assembly / mscorlib).
+fn type_serialization_name(target: &TypeRef) -> String {
+    type_name(&bind_type(target))
+}
+
+/// A type's `namespace.name` (or bare `name` in the global namespace).
+fn type_name(ty: &TypeSymbol) -> String {
+    if let TypeSymbol::Special(special) = ty {
+        let (namespace, name) = special.full_name();
+        return joined_name(namespace, name);
+    }
+    match split_type_name(ty) {
+        Some((namespace, name)) => joined_name(&namespace, &name),
+        None => String::new(),
+    }
+}
+
+/// Joins `namespace.name`, or just `name` when the namespace is empty.
+fn joined_name(namespace: &str, name: &str) -> String {
+    if namespace.is_empty() {
+        return String::from(name);
+    }
+    let mut full = String::from(namespace);
+    full.push('.');
+    full.push_str(name);
+    full
+}
+
+/// Whether `ty` is the named BCL type `System.<name>`.
+fn is_system_type(ty: &TypeSymbol, name: &str) -> bool {
+    matches!(split_type_name(ty), Some((namespace, type_name)) if namespace == "System" && type_name == name)
+}
+
+/// Resolves an enum-constant argument `E.V` to its enum type and underlying integer value.
+fn enum_member_constant(model: &Model, expr: &Expr) -> Option<(TypeSymbol, i64)> {
+    let ExprKind::MemberAccess { receiver, name } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Name(enum_name) = &receiver.kind else {
+        return None;
+    };
+    let enum_ty = TypeSymbol::Named([enum_name.clone()].into());
+    let info = model.get_by_symbol(&enum_ty)?;
+    if info.kind != lamella_binder::TypeKind::Enum {
+        return None;
+    }
+    let value = info.find_field(name)?.constant?;
+    Some((enum_ty, value))
+}
+
+/// An enum's underlying integral type (from its `value__` field), defaulting to `int`.
+fn enum_underlying(model: &Model, enum_ty: &TypeSymbol) -> SpecialType {
+    match model
+        .get_by_symbol(enum_ty)
+        .and_then(|info| info.find_field("value__"))
+        .map(|field| &field.ty)
+    {
+        Some(TypeSymbol::Special(special)) => *special,
+        _ => SpecialType::Int32,
+    }
+}
+
+/// Encodes an integer constant of width `special` little-endian; `None` for a non-integral.
+fn encode_integer(special: SpecialType, value: u64, blob: &mut Vec<u8>) -> Option<()> {
+    match special {
+        SpecialType::SByte | SpecialType::Byte => blob.push(value as u8),
+        SpecialType::Int16 | SpecialType::UInt16 => {
+            blob.extend_from_slice(&(value as u16).to_le_bytes());
+        }
+        SpecialType::Int32 | SpecialType::UInt32 => {
+            blob.extend_from_slice(&(value as u32).to_le_bytes());
+        }
+        SpecialType::Int64 | SpecialType::UInt64 => blob.extend_from_slice(&value.to_le_bytes()),
+        _ => return None,
+    }
+    Some(())
+}
+
+/// A `SerString` (II.23.3): a compressed unsigned byte-length, then the UTF-8 bytes.
+fn encode_ser_string(text: &str, blob: &mut Vec<u8>) {
+    encode_compressed_u32(text.len() as u32, blob);
+    blob.extend_from_slice(text.as_bytes());
+}
+
+/// Compresses an unsigned integer into the metadata blob form (II.23.2).
+fn encode_compressed_u32(value: u32, blob: &mut Vec<u8>) {
+    if value < 0x80 {
+        blob.push(value as u8);
+    } else if value < 0x4000 {
+        blob.push((0x80 | (value >> 8)) as u8);
+        blob.push(value as u8);
+    } else {
+        blob.push((0xC0 | (value >> 24)) as u8);
+        blob.push((value >> 16) as u8);
+        blob.push((value >> 8) as u8);
+        blob.push(value as u8);
+    }
+}
+
 /// The PDB file name beside an assembly: the module name with a `.pdb` extension.
 fn pdb_file_name(module_name: &str) -> String {
     let stem = module_name
@@ -286,6 +646,159 @@ fn pdb_file_name(module_name: &str) -> String {
     let mut name = String::from(stem);
     name.push_str(".pdb");
     name
+}
+
+/// Emits the incremental-REPL BOOTSTRAP module: a library assembly defining
+/// `<repl>.__Repl` as an empty `public class` extending `System.Object`, with a public
+/// parameterless instance `.ctor` (`ldarg.0; call object::.ctor(); ret`). The runtime
+/// loads this once at session open and creates the single persistent `__Repl` instance;
+/// every later submission delta references this type by name and grows it. Defining
+/// `__Repl` here single-sources its identity in the compiler. (See `session.rs`.)
+pub(crate) fn build_bootstrap_delta(
+    module_name: &str,
+    assembly_name: &str,
+) -> Result<Vec<u8>, crate::EmitError> {
+    let tokens = Tokens::new();
+    let mut image = ImageBuilder::new(module_name, assembly_name);
+    let object = image.object_type();
+    image.add_type("<repl>", "__Repl", object, PUBLIC_CLASS);
+
+    let prologue = ConstructorPrologue {
+        ctor: image.object_ctor(),
+        arguments: Vec::new(),
+    };
+    let empty = BoundStmt {
+        kind: BoundStmtKind::Block(Vec::new()),
+        span: Span::empty_at(0),
+    };
+    let emitted = emit_body(
+        &[],
+        &[],
+        &empty,
+        &tokens,
+        1,
+        &TypeSymbol::Special(SpecialType::Void),
+        Some(&prologue),
+    )?;
+    let body_image = MethodBodyImage {
+        max_stack: max_stack(&emitted.code).max(1),
+        init_locals: false,
+        local_var_sig: None,
+        code: emitted.code.into_boxed_slice(),
+        handlers: emitted.handlers.into_boxed_slice(),
+    };
+    let body_bytes = write_method_body(&body_image)
+        .map_err(|_| crate::EmitError::Unsupported("bootstrap .ctor body could not be written"))?;
+    let ctor_sig = method_signature(true, &[], &TypeSig::Void);
+    image.add_method(".ctor", &ctor_sig, &body_bytes, CTOR_FLAGS, IL_MANAGED, &[]);
+    Ok(image.finish(Token::new(0, 0), true))
+}
+
+/// Emits one incremental-REPL SUBMISSION delta: a library module that references the
+/// persistent `<repl>.__Repl` (a `TypeRef`, never a `TypeDef`) and carries one static
+/// method `Submit$index(__Repl s)` whose body is `bound`. Session variables are fields of
+/// `s` reached by `ldarg.0` + `ldfld`/`stfld` of `<repl>.__Repl::name` `FieldRef`s; a
+/// field the runtime cannot resolve against the loaded `__Repl` is a NEW session variable
+/// it adds (inference). The method lives on a fresh holder type `<repl>.Submission$index`,
+/// unique per submission so holders do not collide when deltas merge into the one
+/// persistent module. `return_type` is `void` for a statement submission (and `object`,
+/// boxed, for an expression submission -- a following increment).
+pub(crate) fn build_submission_delta(
+    bound: &BoundStmt,
+    repl_type: &TypeSymbol,
+    index: u64,
+    return_type: &TypeSymbol,
+    type_members: &[NamespaceMember],
+    model: &Model,
+    module_name: &str,
+    assembly_name: &str,
+) -> Result<Vec<u8>, crate::EmitError> {
+    let mut tokens = Tokens::new();
+    let mut image = ImageBuilder::new(module_name, assembly_name);
+    let object = image.object_type();
+
+    if !type_members.is_empty() {
+        let mut next_type = 1u32;
+        let mut next_field = 0u32;
+        let mut next_method = 0u32;
+        collect_tokens(
+            &mut tokens,
+            &mut next_type,
+            &mut next_field,
+            &mut next_method,
+            type_members,
+            "",
+        );
+        let mut binder = Binder::with_model(model.clone());
+        let mut entry_point = None;
+        emit_namespace(
+            &mut image,
+            &mut binder,
+            object,
+            &mut tokens,
+            &mut entry_point,
+            &[],
+            type_members,
+            "",
+            None,
+        )?;
+    }
+
+    mint_named_type_token(repl_type, &mut image, &mut tokens);
+    mint_references(bound, &mut image, &mut tokens);
+
+    let holder_name = format!("Submission${index}");
+    image.add_type("<repl>", &holder_name, object, PUBLIC_CLASS);
+
+    let parameter_names = [Box::<str>::from("s")];
+    let emitted = emit_body(
+        &parameter_names,
+        &[],
+        bound,
+        &tokens,
+        0,
+        return_type,
+        None,
+    )?;
+    let local_var_sig = if emitted.local_types.is_empty() {
+        None
+    } else {
+        let locals: Vec<TypeSig> = emitted
+            .local_types
+            .iter()
+            .map(|ty| type_sig(&tokens, ty))
+            .collect::<Result<_, _>>()?;
+        Some(image.add_standalone_sig(&local_signature(&locals)))
+    };
+    let max_stack = if emitted.handlers.is_empty() {
+        max_stack(&emitted.code)
+    } else {
+        max_stack(&emitted.code).max(1)
+    };
+    let body_image = MethodBodyImage {
+        max_stack,
+        init_locals: local_var_sig.is_some(),
+        local_var_sig,
+        code: emitted.code.into_boxed_slice(),
+        handlers: emitted.handlers.into_boxed_slice(),
+    };
+    let body_bytes = write_method_body(&body_image)
+        .map_err(|_| crate::EmitError::Unsupported("submission body could not be written"))?;
+    let signature = method_signature(
+        false,
+        &[type_sig(&tokens, repl_type)?],
+        &type_sig(&tokens, return_type)?,
+    );
+    let method_name = format!("Submit${index}");
+    image.add_method(
+        &method_name,
+        &signature,
+        &body_bytes,
+        METHOD_PUBLIC | METHOD_STATIC,
+        IL_MANAGED,
+        &parameter_names,
+    );
+    Ok(image.finish(Token::new(0, 0), true))
 }
 
 /// Source context for resolving a statement's span to line/column while emitting.
@@ -308,8 +821,11 @@ fn emit_namespace(
 ) -> Result<(), crate::EmitError> {
     let scope = binder.import_scope();
     for using in usings {
-        if let UsingKind::Namespace(name) = &using.kind {
-            binder.import_namespace(&join_namespace("", name));
+        match &using.kind {
+            UsingKind::Namespace(name) => binder.import_namespace(&join_namespace("", name)),
+            UsingKind::Alias { name, target } => {
+                binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
+            }
         }
     }
     for member in members {
@@ -384,7 +900,7 @@ fn emit_interface(
     declaration: &TypeDecl,
 ) -> Result<(), crate::EmitError> {
     let nil = Token::new(TYPE_DEF, 0);
-    image.add_type(namespace, &declaration.name, nil, INTERFACE_FLAGS);
+    let type_token = image.add_type(namespace, &declaration.name, nil, INTERFACE_FLAGS);
     for member in &declaration.members {
         if let Member::Method {
             return_type,
@@ -404,6 +920,74 @@ fn emit_interface(
             );
             image.add_abstract_method(name, &signature, IFACE_METHOD_FLAGS);
         }
+    }
+    let mut first_property = None;
+    for member in &declaration.members {
+        if let Member::Property {
+            ty, name, getter, setter, ..
+        } = member
+        {
+            let property_ty = bind_type(ty);
+            let element = type_sig(tokens, &property_ty)?;
+            let property = image.add_property(name, &property_signature(true, &element), 0);
+            if getter.is_some() {
+                let signature = method_signature(true, &[], &element);
+                let token = image.add_abstract_method(
+                    &accessor_name("get_", name),
+                    &signature,
+                    IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                );
+                image.add_method_semantics(SEMANTICS_GETTER, token, property);
+            }
+            if setter.is_some() {
+                let signature = method_signature(true, &[element.clone()], &TypeSig::Void);
+                let token = image.add_abstract_method(
+                    &accessor_name("set_", name),
+                    &signature,
+                    IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                );
+                image.add_method_semantics(SEMANTICS_SETTER, token, property);
+            }
+            first_property.get_or_insert(property);
+        }
+    }
+    if let Some(first) = first_property {
+        image.add_property_map(type_token, first);
+    }
+    let mut first_event = None;
+    for member in &declaration.members {
+        if let Member::EventField {
+            ty, declarators, ..
+        } = member
+        {
+            let event_ty = bind_type(ty);
+            let event_type_token =
+                tokens
+                    .type_token(&event_ty)
+                    .ok_or(crate::EmitError::Unsupported(
+                        "an interface event whose delegate type has no metadata token",
+                    ))?;
+            let signature = method_signature(true, &[type_sig(tokens, &event_ty)?], &TypeSig::Void);
+            for declarator in declarators {
+                let event = image.add_event(&declarator.name, event_type_token);
+                let add = image.add_abstract_method(
+                    &accessor_name("add_", &declarator.name),
+                    &signature,
+                    IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                );
+                image.add_method_semantics(SEMANTICS_ADDON, add, event);
+                let remove = image.add_abstract_method(
+                    &accessor_name("remove_", &declarator.name),
+                    &signature,
+                    IFACE_METHOD_FLAGS | SPECIAL_NAME,
+                );
+                image.add_method_semantics(SEMANTICS_REMOVEON, remove, event);
+                first_event.get_or_insert(event);
+            }
+        }
+    }
+    if let Some(first) = first_event {
+        image.add_event_map(type_token, first);
     }
     Ok(())
 }
@@ -534,6 +1118,7 @@ fn emit_type(
     let is_struct = declaration.kind == TypeKind::Struct;
     let enclosing = named_symbol(namespace, &declaration.name);
     if matches!(declaration.kind, TypeKind::Interface) {
+        mint_member_signature_types(binder, &declaration.members, image, tokens);
         return emit_interface(image, tokens, namespace, declaration);
     }
     let (base_class, nested_in): (Option<TypeSymbol>, Option<Box<str>>) = {
@@ -570,6 +1155,8 @@ fn emit_type(
             image.add_nested_class(type_token, enclosing_token);
         }
     }
+    emit_attributes(image, binder, tokens, type_token, &declaration.attributes);
+    mint_member_signature_types(binder, &declaration.members, image, tokens);
     let interface_tokens: Vec<Token> = {
         let model = binder.model();
         model
@@ -596,10 +1183,16 @@ fn emit_type(
             modifiers,
             ty,
             declarators,
+            attributes,
             ..
         } = member
         {
             emit_field(image, tokens, modifiers, ty, declarators)?;
+            for declarator in declarators {
+                if let Some(field_token) = tokens.field(&enclosing, &declarator.name) {
+                    emit_attributes(image, binder, tokens, field_token, attributes);
+                }
+            }
         }
         if let Member::EventField {
             modifiers,
@@ -608,7 +1201,16 @@ fn emit_type(
             ..
         } = member
         {
-            emit_field(image, tokens, modifiers, ty, declarators)?;
+            let signature = field_signature(&type_sig(tokens, &bind_type(ty))?);
+            let flags = FIELD_PRIVATE
+                | if modifiers.contains(&Modifier::Static) {
+                    FIELD_STATIC
+                } else {
+                    0
+                };
+            for declarator in declarators {
+                image.add_field(&declarator.name, &signature, flags);
+            }
         }
     }
     if !is_struct && !declares_instance_constructor(declaration) {
@@ -661,6 +1263,7 @@ fn emit_type(
                 parameters,
                 body: Some(body),
                 explicit_interface,
+                attributes,
                 ..
             } => {
                 let token = emit_one_method(
@@ -677,6 +1280,7 @@ fn emit_type(
                     explicit_interface.as_ref(),
                     debug,
                 )?;
+                emit_attributes(image, binder, tokens, token, attributes);
                 if entry_point.is_none()
                     && &**name == "Main"
                     && modifiers.contains(&Modifier::Static)
@@ -774,6 +1378,8 @@ fn emit_type(
             name,
             getter,
             setter,
+            explicit_interface,
+            attributes,
             ..
         } = member
         {
@@ -787,15 +1393,228 @@ fn emit_type(
                 name,
                 getter.as_ref().and_then(|accessor| accessor.body.as_ref()),
                 setter.as_ref().and_then(|accessor| accessor.body.as_ref()),
+                explicit_interface.as_ref(),
                 debug,
             )?;
+            emit_attributes(image, binder, tokens, property, attributes);
             first_property.get_or_insert(property);
         }
     }
     if let Some(first) = first_property {
         image.add_property_map(type_token, first);
     }
+    let mut first_event = None;
+    for member in &declaration.members {
+        if let Member::EventField {
+            modifiers,
+            ty,
+            declarators,
+            attributes,
+            ..
+        } = member
+        {
+            let event_ty = bind_type(ty);
+            let is_static = modifiers.contains(&Modifier::Static);
+            for declarator in declarators {
+                let event = emit_event(
+                    image,
+                    binder,
+                    tokens,
+                    &enclosing,
+                    &declarator.name,
+                    &event_ty,
+                    is_static,
+                    debug,
+                )?;
+                emit_attributes(image, binder, tokens, event, attributes);
+                first_event.get_or_insert(event);
+            }
+        }
+        if let Member::Event {
+            ty,
+            name,
+            adder,
+            remover,
+            explicit_interface,
+            attributes,
+            ..
+        } = member
+        {
+            let event_ty = bind_type(ty);
+            let event = emit_custom_event(
+                image,
+                binder,
+                tokens,
+                &enclosing,
+                name,
+                &event_ty,
+                adder.as_ref().and_then(|accessor| accessor.body.as_ref()),
+                remover.as_ref().and_then(|accessor| accessor.body.as_ref()),
+                explicit_interface.as_ref(),
+                debug,
+            )?;
+            emit_attributes(image, binder, tokens, event, attributes);
+            first_event.get_or_insert(event);
+        }
+    }
+    if let Some(first) = first_event {
+        image.add_event_map(type_token, first);
+    }
     Ok(())
+}
+
+/// Emits a field-like event (17.7): public `add_E`/`remove_E` accessors that combine/remove
+/// a handler on the private backing field (`E += value` / `E -= value`, via the existing
+/// delegate-combine lowering), plus an Event row linking them through MethodSemantics.
+#[allow(clippy::too_many_arguments)]
+fn emit_event(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    name: &str,
+    event_ty: &TypeSymbol,
+    is_static: bool,
+    debug: Option<&DebugContext>,
+) -> Result<Token, crate::EmitError> {
+    let void = TypeSymbol::Special(SpecialType::Void);
+    let flags = METHOD_PUBLIC
+        | SPECIAL_NAME
+        | METHOD_HIDEBYSIG
+        | if is_static { METHOD_STATIC } else { 0 };
+    let params = [(Box::<str>::from("value"), event_ty.clone())];
+    let add = emit_method_body(
+        image,
+        binder,
+        tokens,
+        enclosing,
+        &accessor_name("add_", name),
+        &void,
+        &params,
+        &[],
+        &event_accessor_body(name, AssignmentOperator::Add),
+        is_static,
+        flags,
+        None,
+        debug,
+    )?;
+    let remove = emit_method_body(
+        image,
+        binder,
+        tokens,
+        enclosing,
+        &accessor_name("remove_", name),
+        &void,
+        &params,
+        &[],
+        &event_accessor_body(name, AssignmentOperator::Subtract),
+        is_static,
+        flags,
+        None,
+        debug,
+    )?;
+    let event_type_token = tokens
+        .type_token(event_ty)
+        .ok_or(crate::EmitError::Unsupported(
+            "an event whose delegate type has no metadata token",
+        ))?;
+    let event = image.add_event(name, event_type_token);
+    image.add_method_semantics(SEMANTICS_ADDON, add, event);
+    image.add_method_semantics(SEMANTICS_REMOVEON, remove, event);
+    Ok(event)
+}
+
+/// Emits a custom-accessor event (`event H E { add {...} remove {...} }`, 17.7.1): its
+/// user-written add/remove bodies plus an Event row. An explicit-interface event names its
+/// accessors `I.add_E`/`I.remove_E`, private hidebysig newslot virtual final with a
+/// MethodImpl (like an explicit method); an ordinary one's accessors are public.
+#[allow(clippy::too_many_arguments)]
+fn emit_custom_event(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    name: &str,
+    event_ty: &TypeSymbol,
+    add_body: Option<&lamella_syntax::ast::Stmt>,
+    remove_body: Option<&lamella_syntax::ast::Stmt>,
+    explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
+    debug: Option<&DebugContext>,
+) -> Result<Token, crate::EmitError> {
+    let void = TypeSymbol::Special(SpecialType::Void);
+    let flags = if explicit_interface.is_some() {
+        METHOD_PRIVATE
+            | METHOD_VIRTUAL
+            | METHOD_FINAL
+            | METHOD_NEWSLOT
+            | METHOD_HIDEBYSIG
+            | SPECIAL_NAME
+    } else {
+        METHOD_PUBLIC | SPECIAL_NAME | METHOD_HIDEBYSIG
+    };
+    let params = [(Box::<str>::from("value"), event_ty.clone())];
+    let accessor_token = |prefix: &str,
+                          body: Option<&lamella_syntax::ast::Stmt>,
+                          image: &mut ImageBuilder,
+                          binder: &mut Binder,
+                          tokens: &mut Tokens|
+     -> Result<Option<Token>, crate::EmitError> {
+        let Some(body) = body else { return Ok(None) };
+        let accessor = accessor_name(prefix, name);
+        let method_name = explicit_accessor_name(explicit_interface, &accessor);
+        let token = emit_method_body(
+            image, binder, tokens, enclosing, &method_name, &void, &params, &[], body, false,
+            flags, None, debug,
+        )?;
+        if let Some(interface) = explicit_interface {
+            emit_explicit_interface_impl(
+                image, tokens, enclosing, interface, &accessor, &params, &void, token,
+            )?;
+        }
+        Ok(Some(token))
+    };
+    let add = accessor_token("add_", add_body, image, binder, tokens)?;
+    let remove = accessor_token("remove_", remove_body, image, binder, tokens)?;
+    let event_type_token = tokens
+        .type_token(event_ty)
+        .ok_or(crate::EmitError::Unsupported(
+            "an event whose delegate type has no metadata token",
+        ))?;
+    let event_name = match explicit_interface {
+        Some(interface) => explicit_interface_member_name(interface, name),
+        None => String::from(name),
+    };
+    let event = image.add_event(&event_name, event_type_token);
+    if let Some(add) = add {
+        image.add_method_semantics(SEMANTICS_ADDON, add, event);
+    }
+    if let Some(remove) = remove {
+        image.add_method_semantics(SEMANTICS_REMOVEON, remove, event);
+    }
+    Ok(event)
+}
+
+/// The synthesized body of an event accessor: `{ E op= value; }` -- a compound assignment
+/// of the implicit `value` parameter onto the backing field, which the binder lowers to
+/// `Delegate.Combine`/`Remove` exactly as a source `E += h` inside the type would.
+fn event_accessor_body(field: &str, operator: AssignmentOperator) -> Stmt {
+    let span = Span::new(0, 0);
+    let reference = |text: &str| Expr::new(ExprKind::Name(text.into()), span);
+    let assignment = Expr::new(
+        ExprKind::Assignment {
+            operator,
+            target: Box::new(reference(field)),
+            value: Box::new(reference("value")),
+        },
+        span,
+    );
+    Stmt::new(
+        StmtKind::Block(alloc::vec![Stmt::new(
+            StmtKind::Expression(assignment),
+            span
+        )]),
+        span,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1214,7 +2033,10 @@ fn build_method_debug(
 /// returning the property type, a setter taking `value`).
 const SEMANTICS_SETTER: u16 = 0x0001;
 const SEMANTICS_GETTER: u16 = 0x0002;
+const SEMANTICS_ADDON: u16 = 0x0008;
+const SEMANTICS_REMOVEON: u16 = 0x0010;
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn emit_property(
     image: &mut ImageBuilder,
@@ -1226,52 +2048,72 @@ fn emit_property(
     name: &str,
     getter_body: Option<&lamella_syntax::ast::Stmt>,
     setter_body: Option<&lamella_syntax::ast::Stmt>,
+    explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let property_ty = bind_type(ty);
-    let is_static = modifiers.contains(&Modifier::Static);
-    let flags = METHOD_PUBLIC | SPECIAL_NAME | if is_static { METHOD_STATIC } else { 0 };
+    let is_static = explicit_interface.is_none() && modifiers.contains(&Modifier::Static);
+    let flags = if explicit_interface.is_some() {
+        METHOD_PRIVATE
+            | METHOD_VIRTUAL
+            | METHOD_FINAL
+            | METHOD_NEWSLOT
+            | METHOD_HIDEBYSIG
+            | SPECIAL_NAME
+    } else {
+        METHOD_PUBLIC | SPECIAL_NAME | if is_static { METHOD_STATIC } else { 0 }
+    };
 
+    let property_name = match explicit_interface {
+        Some(interface) => explicit_interface_member_name(interface, name),
+        None => String::from(name),
+    };
     let signature = property_signature(!is_static, &type_sig(tokens, &property_ty)?);
-    let property = image.add_property(name, &signature, 0);
+    let property = image.add_property(&property_name, &signature, 0);
+    let void = TypeSymbol::Special(SpecialType::Void);
 
     if let Some(body) = getter_body {
+        let accessor = accessor_name("get_", name);
+        let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let getter = emit_method_body(
-            image,
-            binder,
-            tokens,
-            enclosing,
-            &accessor_name("get_", name),
-            &property_ty,
-            &[],
-            &[],
-            body,
-            is_static,
-            flags,
-            None,
-            debug,
+            image, binder, tokens, enclosing, &method_name, &property_ty, &[], &[], body,
+            is_static, flags, None, debug,
         )?;
+        if let Some(interface) = explicit_interface {
+            emit_explicit_interface_impl(
+                image, tokens, enclosing, interface, &accessor, &[], &property_ty, getter,
+            )?;
+        }
         image.add_method_semantics(SEMANTICS_GETTER, getter, property);
     }
     if let Some(body) = setter_body {
+        let accessor = accessor_name("set_", name);
+        let method_name = explicit_accessor_name(explicit_interface, &accessor);
+        let params = [(Box::from("value"), property_ty.clone())];
         let setter = emit_method_body(
-            image,
-            binder,
-            tokens,
-            enclosing,
-            &accessor_name("set_", name),
-            &TypeSymbol::Special(SpecialType::Void),
-            &[(Box::from("value"), property_ty.clone())],
-            &[],
-            body,
-            is_static,
-            flags,
-            None,
-            debug,
+            image, binder, tokens, enclosing, &method_name, &void, &params, &[], body,
+            is_static, flags, None, debug,
         )?;
+        if let Some(interface) = explicit_interface {
+            emit_explicit_interface_impl(
+                image, tokens, enclosing, interface, &accessor, &params, &void, setter,
+            )?;
+        }
         image.add_method_semantics(SEMANTICS_SETTER, setter, property);
     }
     Ok(property)
+}
+
+/// The `MethodDef` name of a property accessor: `I.get_P` for an explicit-interface
+/// implementation (matching the token pre-pass and the model), else the plain `get_P`.
+fn explicit_accessor_name(
+    explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
+    accessor: &str,
+) -> String {
+    match explicit_interface {
+        Some(interface) => explicit_interface_member_name(interface, accessor),
+        None => String::from(accessor),
+    }
 }
 
 /// The `get_`/`set_` accessor method name for a property.
@@ -1514,8 +2356,19 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 }
             }
         }
-        BoundExprKind::FieldAccess { receiver, .. }
-        | BoundExprKind::MethodGroup { receiver, .. } => mint_in_expr(receiver, image, tokens),
+        BoundExprKind::FieldAccess {
+            receiver, field, ..
+        } => {
+            mint_in_expr(receiver, image, tokens);
+            if let Some(field) = field {
+                if field.constant.is_none()
+                    && tokens.field(&field.declaring_type, &field.name).is_none()
+                {
+                    mint_field_ref(field, image, tokens);
+                }
+            }
+        }
+        BoundExprKind::MethodGroup { receiver, .. } => mint_in_expr(receiver, image, tokens),
         BoundExprKind::PropertyAccess {
             receiver,
             declaring_type,
@@ -1694,6 +2547,27 @@ fn mint_member_ref(
     );
 }
 
+/// Mints a `MemberRef` (a FieldRef) for a field on a type outside this module -- the
+/// persistent REPL `__Repl` (a session variable) or a BCL field -- so emission can name
+/// it. Mirrors [`mint_member_ref`]: the declaring type and the field's own type are
+/// tokenized first (the latter so its signature encodes), then a `MemberRef` carrying a
+/// FIELD signature is recorded under the field's identity. The declaring type's `TypeRef`
+/// is reused as the member's parent. A no-op if the declaring type or the field type
+/// cannot be tokenized.
+fn mint_field_ref(field: &FieldReference, image: &mut ImageBuilder, tokens: &mut Tokens) {
+    mint_named_type_token(&field.declaring_type, image, tokens);
+    mint_named_type_token(&field.ty, image, tokens);
+    let Some(parent) = tokens.type_token(&field.declaring_type) else {
+        return;
+    };
+    let Ok(field_sig) = type_sig(tokens, &field.ty) else {
+        return;
+    };
+    let signature = field_signature(&field_sig);
+    let member = image.member_ref(parent, &field.name, &signature);
+    tokens.insert_field(&field.declaring_type, &field.name, member);
+}
+
 /// Mints a `TypeRef` token for a type used where a token is needed (e.g. an array
 /// element type), unless one already exists (a source `TypeDef`, or a previously
 /// minted ref). Primitives resolve to their `System` type in the BCL.
@@ -1792,6 +2666,27 @@ fn system_type_name(special: SpecialType) -> Option<(&'static str, &'static str)
 /// `type_sig` can encode it (a `Class`, or `ValueType` for a value type). A no-op for a
 /// predefined type, an array, the error type, or a type already tokenized (a this-module
 /// `TypeDef` or a previously minted ref).
+/// Marks every referenced struct/enum as a value type in `tokens`, so `type_sig` emits it as
+/// `ValueType` rather than `Class` (a class reference to a value type is a load-time mismatch).
+/// This-module structs/enums are already marked by the token pre-pass.
+fn mark_external_value_types(model: &Model, tokens: &mut Tokens) {
+    let value_types: Vec<(TypeSymbol, lamella_binder::TypeKind)> = model
+        .type_keys()
+        .map(|(namespace, name)| named_symbol(namespace, name))
+        .filter_map(|symbol| {
+            let info = model.get_by_symbol(&symbol)?;
+            info.is_external.then_some((symbol, info.kind))
+        })
+        .collect();
+    for (symbol, kind) in value_types {
+        match kind {
+            lamella_binder::TypeKind::Struct => tokens.insert_struct(&symbol),
+            lamella_binder::TypeKind::Enum => tokens.insert_enum(&symbol),
+            _ => {}
+        }
+    }
+}
+
 fn mint_named_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut Tokens) {
     if !matches!(ty, TypeSymbol::Named(_)) || tokens.type_token(ty).is_some() {
         return;
@@ -1799,6 +2694,78 @@ fn mint_named_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut
     if let Some((namespace, name)) = split_type_name(ty) {
         let token = image.type_ref(&namespace, &name);
         tokens.insert_type(ty, token);
+    }
+}
+
+/// Mints the external `TypeRef` for a syntactic signature type name -- resolved using-aware
+/// through the binder (`Type` with `using System;` -> `System.Type`) -- and inserts it under
+/// the SYNTACTIC key, so `type_sig` (which keys on `bind_type`) finds it. A this-module type
+/// already has its TypeDef (the guard skips it); primitives/arrays/pointers `type_sig` builds
+/// directly.
+fn mint_signature_type(
+    binder: &Binder,
+    syntactic: &TypeSymbol,
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) {
+    if !matches!(syntactic, TypeSymbol::Named(_)) || tokens.type_token(syntactic).is_some() {
+        return;
+    }
+    if let Some((namespace, name)) = split_type_name(&binder.resolve_type(syntactic)) {
+        let token = image.type_ref(&namespace, &name);
+        tokens.insert_type(syntactic, token);
+    }
+}
+
+/// Mints the external types named in a type's member SIGNATURES (field, method
+/// parameter/return, property, event, operator, indexer types), so `type_sig` finds them
+/// even when a type appears only in a signature and not in any body (which `mint_references`
+/// would otherwise be the only thing to catch).
+fn mint_member_signature_types(
+    binder: &Binder,
+    members: &[Member],
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) {
+    for member in members {
+        match member {
+            Member::Field { ty, .. }
+            | Member::Property { ty, .. }
+            | Member::EventField { ty, .. }
+            | Member::Event { ty, .. }
+            | Member::Indexer { ty, .. } => {
+                mint_signature_type(binder, &bind_type(ty), image, tokens);
+            }
+            Member::Method {
+                return_type,
+                parameters,
+                ..
+            }
+            | Member::Operator {
+                return_type,
+                parameters,
+                ..
+            } => {
+                mint_signature_type(binder, &bind_type(return_type), image, tokens);
+                for parameter in parameters {
+                    mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+                }
+            }
+            Member::ConversionOperator {
+                target, parameters, ..
+            } => {
+                mint_signature_type(binder, &bind_type(target), image, tokens);
+                for parameter in parameters {
+                    mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+                }
+            }
+            Member::Constructor { parameters, .. } => {
+                for parameter in parameters {
+                    mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -2070,13 +3037,15 @@ fn collect_tokens(
                         }
                     }
                     if let Member::EventField { declarators, .. } = member {
-                        for declarator in declarators {
-                            *next_field += 1;
-                            tokens.insert_field(
-                                &declaring,
-                                &declarator.name,
-                                Token::new(FIELD, *next_field),
-                            );
+                        if !is_interface {
+                            for declarator in declarators {
+                                *next_field += 1;
+                                tokens.insert_field(
+                                    &declaring,
+                                    &declarator.name,
+                                    Token::new(FIELD, *next_field),
+                                );
+                            }
                         }
                     }
                 }
@@ -2184,27 +3153,84 @@ fn collect_tokens(
                         name,
                         getter,
                         setter,
+                        explicit_interface,
                         ..
                     } = member
                     {
                         let property_ty = bind_type(ty);
-                        if getter.as_ref().and_then(|a| a.body.as_ref()).is_some() {
+                        if getter
+                            .as_ref()
+                            .is_some_and(|a| a.body.is_some() || is_interface)
+                        {
                             *next_method += 1;
                             tokens.insert_method(
                                 &declaring,
-                                &accessor_name("get_", name),
+                                &explicit_accessor_name(
+                                    explicit_interface.as_ref(),
+                                    &accessor_name("get_", name),
+                                ),
                                 &[],
                                 Token::new(METHOD_DEF, *next_method),
                             );
                         }
-                        if setter.as_ref().and_then(|a| a.body.as_ref()).is_some() {
+                        if setter
+                            .as_ref()
+                            .is_some_and(|a| a.body.is_some() || is_interface)
+                        {
                             *next_method += 1;
                             tokens.insert_method(
                                 &declaring,
-                                &accessor_name("set_", name),
+                                &explicit_accessor_name(
+                                    explicit_interface.as_ref(),
+                                    &accessor_name("set_", name),
+                                ),
                                 &[property_ty],
                                 Token::new(METHOD_DEF, *next_method),
                             );
+                        }
+                    }
+                }
+                for member in &declaration.members {
+                    if let Member::EventField {
+                        ty, declarators, ..
+                    } = member
+                    {
+                        let event_ty = bind_type(ty);
+                        for declarator in declarators {
+                            for prefix in ["add_", "remove_"] {
+                                *next_method += 1;
+                                tokens.insert_method(
+                                    &declaring,
+                                    &accessor_name(prefix, &declarator.name),
+                                    &[event_ty.clone()],
+                                    Token::new(METHOD_DEF, *next_method),
+                                );
+                            }
+                        }
+                    }
+                    if let Member::Event {
+                        ty,
+                        name,
+                        adder,
+                        remover,
+                        explicit_interface,
+                        ..
+                    } = member
+                    {
+                        let event_ty = bind_type(ty);
+                        for (prefix, present) in [("add_", adder.is_some()), ("remove_", remover.is_some())] {
+                            if present {
+                                *next_method += 1;
+                                tokens.insert_method(
+                                    &declaring,
+                                    &explicit_accessor_name(
+                                        explicit_interface.as_ref(),
+                                        &accessor_name(prefix, name),
+                                    ),
+                                    &[event_ty.clone()],
+                                    Token::new(METHOD_DEF, *next_method),
+                                );
+                            }
                         }
                     }
                 }
@@ -2336,6 +3362,53 @@ mod tests {
         let pe = lamella_metadata::pe::PeImage::parse(&image).expect("valid PE");
         assert_eq!(pe.cli_header_rva(), lamella_pe::pe::TEXT_RVA);
         assert!(lamella_metadata::image::MetadataImage::read(&image).is_ok());
+    }
+
+    #[test]
+    fn referenced_exception_carries_its_base_chain() {
+        let refs = parse_compilation_unit(
+            "namespace System { \
+                public class Exception { } \
+                public class SystemException : Exception { } \
+                public class ArithmeticException : SystemException { } \
+                public class DivideByZeroException : ArithmeticException { } }",
+        )
+        .unit;
+        let ref_image = compile_unit(&refs, "refs.dll", "refs")
+            .image
+            .expect("ref image");
+        let reference = Assembly::read(&ref_image).expect("ref assembly");
+
+        let program = parse_compilation_unit(
+            "public class P { public object M() { \
+                return new System.DivideByZeroException(); } }",
+        )
+        .unit;
+        let compiled =
+            compile_unit_with_references(&program, "p.dll", "p", core::slice::from_ref(&reference));
+        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        let image = compiled
+            .image
+            .unwrap_or_else(|| panic!("program image; emit_error = {:?}", compiled.emit_error));
+        let assembly = Assembly::read(&image).expect("program assembly");
+
+        let token = (1..)
+            .map_while(|index| assembly.type_ref(index).map(|t| (index, t)))
+            .find(|(_, t)| {
+                t.name()
+                    .is_some_and(|n| n.namespace == "System" && n.name == "DivideByZeroException")
+            })
+            .map(|(index, _)| Token::new(TYPE_REF, index))
+            .expect("a DivideByZeroException TypeRef");
+        assert_eq!(
+            assembly.exception_base_chain(token),
+            Some(alloc::vec![
+                exception_tag_for_name("System", "DivideByZeroException"),
+                exception_tag_for_name("System", "ArithmeticException"),
+                exception_tag_for_name("System", "SystemException"),
+                exception_tag_for_name("System", "Exception"),
+            ])
+        );
     }
 
     #[test]

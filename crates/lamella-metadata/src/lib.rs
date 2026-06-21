@@ -33,6 +33,7 @@ pub use pe::{PeError, PeImage};
 pub use reader::{
     Assembly, AssemblyRef, CustomAttribute, Event, ExceptionClause, ExceptionHandlerKind, Field,
     MemberRef, Method, MethodKind, Param, Property, ResolvedMethod, TypeDef, TypeName, TypeRef,
+    encode_exception_base_chain, exception_tag_for_name,
 };
 pub use rows::{Col, Row, Tables, columns};
 pub use signature::{MethodSig, SigError, SigType, parse_field, parse_method, parse_type};

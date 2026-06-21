@@ -28,6 +28,12 @@ pub enum RelocKind {
     /// take the halfword-scaled PC-relative offset (A6.7.10), a reach of about
     /// +/-256 bytes.
     ThumbBranchCond8,
+    /// A relaxed conditional branch occupying TWO halfwords: an inverted `B<!c>`
+    /// over a following `B` (encoding T2). [`Encoder::finish`] grows a
+    /// [`RelocKind::ThumbBranchCond8`] into this when its +/-256-byte reach is
+    /// exceeded -- ARMv6-M has no wide conditional branch, so the condition is
+    /// inverted to skip an unconditional `B` with the wider +/-2 KB reach.
+    ThumbBranchCond8Long,
     /// A PC-relative literal load (`LDR` (literal), encoding T1): the low 8 bits
     /// take the word-scaled distance from `Align(PC, 4)` to the pool entry
     /// (Armv6-M ARM (DDI 0419E), A6.7.27), which must lie ahead within about 1 KB.
@@ -87,6 +93,10 @@ pub struct Encoder {
     labels: Vec<Option<u32>>,
     /// Internal references to patch in `finish`: `(site, kind, label index)`.
     fixups: Vec<(u32, RelocKind, u32)>,
+    /// Position-independent data words to patch in `finish`: `(site, from label, to label)`, each
+    /// filled with `to_offset - from_offset` -- a placement-invariant relative reference (a vtable
+    /// entry relative to its type descriptor, so the image works wherever it is loaded).
+    diffs: Vec<(u32, u32, u32)>,
     relocs: Vec<Reloc>,
 }
 
@@ -812,6 +822,15 @@ impl Encoder {
         self.bytes.extend_from_slice(&[0; 4]);
     }
 
+    /// Emits a 32-bit data word holding `to`'s offset minus `from`'s -- a placement-invariant relative
+    /// reference, patched in [`Encoder::finish`]. A vtable entry uses this (the method's address
+    /// relative to its type descriptor) so dispatch is correct wherever the image is loaded.
+    pub fn data_word_diff(&mut self, from: Label, to: Label) {
+        let at = self.position();
+        self.diffs.push((at, from.0, to.0));
+        self.bytes.extend_from_slice(&[0; 4]);
+    }
+
     /// Emits a 32-bit data word referring to an external `symbol`, recorded as a
     /// [`Reloc`] for the link step.
     pub fn data_word_symbol(&mut self, symbol: u32) {
@@ -824,6 +843,54 @@ impl Encoder {
         self.bytes.extend_from_slice(&[0; 4]);
     }
 
+    /// Grows any conditional branch whose +/-256-byte reach is exceeded into the two-halfword
+    /// inverted-skip form (ARMv6-M has no wide `B<c>`): `B<!cond>` over a following `B`, which
+    /// reaches +/-2 KB. Inserting the extra halfword shifts every later label and reference, so a
+    /// grown branch can push another out of range -- the pass repeats until all are in range. Each
+    /// conditional branch grows at most once (it then has the wider reach), so this terminates.
+    fn relax_conditional_branches(&mut self) -> Result<(), AssembleError> {
+        loop {
+            let mut grew = false;
+            for idx in 0..self.fixups.len() {
+                let (at, kind, label_id) = self.fixups[idx];
+                if kind != RelocKind::ThumbBranchCond8 {
+                    continue;
+                }
+                let target = match self.labels.get(label_id as usize) {
+                    Some(Some(offset)) => *offset,
+                    _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+                };
+                let offset = i64::from(target) - (i64::from(at) + 4);
+                if (-256..=254).contains(&offset) && offset % 2 == 0 {
+                    continue;
+                }
+                let insert = (at + 2) as usize;
+                self.bytes.splice(insert..insert, [0x00, 0xE0, 0x00, 0xBF]);
+                for slot in self.labels.iter_mut().flatten() {
+                    if *slot >= at + 2 {
+                        *slot += 4;
+                    }
+                }
+                for (fixup_at, _, _) in &mut self.fixups {
+                    if *fixup_at >= at + 2 {
+                        *fixup_at += 4;
+                    }
+                }
+                for reloc in &mut self.relocs {
+                    if reloc.at >= at + 2 {
+                        reloc.at += 4;
+                    }
+                }
+                self.fixups[idx].1 = RelocKind::ThumbBranchCond8Long;
+                grew = true;
+                break;
+            }
+            if !grew {
+                return Ok(());
+            }
+        }
+    }
+
     /// Resolves every internal label reference and returns the finished image
     /// plus the external relocations the link step must still apply.
     ///
@@ -832,6 +899,7 @@ impl Encoder {
     /// Returns [`AssembleError::UnboundLabel`] if any referenced label was never
     /// bound.
     pub fn finish(mut self) -> Result<Assembled, AssembleError> {
+        self.relax_conditional_branches()?;
         let branch_offset =
             |at: u32, target: u32, min: i64, max: i64| -> Result<u16, AssembleError> {
                 let offset = i64::from(target) - (i64::from(at) + 4);
@@ -865,6 +933,20 @@ impl Encoder {
                         slot.copy_from_slice(&(base | (imm & 0x00FF)).to_le_bytes());
                     }
                 }
+                RelocKind::ThumbBranchCond8Long => {
+                    let cond = self
+                        .bytes
+                        .get(site..site + 2)
+                        .map_or(0, |s| (u16::from_le_bytes([s[0], s[1]]) >> 8) & 0xF);
+                    let inverted = cond ^ 1;
+                    if let Some(slot) = self.bytes.get_mut(site..site + 2) {
+                        slot.copy_from_slice(&(0xD000 | (inverted << 8) | 1).to_le_bytes());
+                    }
+                    let imm = branch_offset(*at + 2, target, -2048, 2046)?;
+                    if let Some(slot) = self.bytes.get_mut(site + 2..site + 4) {
+                        slot.copy_from_slice(&(0xE000 | (imm & 0x07FF)).to_le_bytes());
+                    }
+                }
                 RelocKind::ThumbLdrLit8 => {
                     let pc = i64::from((*at + 4) & !3u32);
                     let offset = i64::from(target) - pc;
@@ -896,6 +978,21 @@ impl Encoder {
                         slot[2..4].copy_from_slice(&hw2.to_le_bytes());
                     }
                 }
+            }
+        }
+        for &(at, from_id, to_id) in &self.diffs {
+            let from = match self.labels.get(from_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(from_id))),
+            };
+            let to = match self.labels.get(to_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(to_id))),
+            };
+            let diff = (to as i32).wrapping_sub(from as i32) as u32;
+            let site = at as usize;
+            if let Some(slot) = self.bytes.get_mut(site..site + 4) {
+                slot.copy_from_slice(&diff.to_le_bytes());
             }
         }
         Ok(Assembled {
@@ -1066,12 +1163,28 @@ mod tests {
     fn branch_out_of_range_is_a_controlled_error() {
         let mut enc = Encoder::new();
         let target = enc.new_label();
+        enc.b(target);
+        for _ in 0..2500 {
+            enc.nop();
+        }
+        enc.bind_label(target);
+        assert_eq!(enc.finish(), Err(AssembleError::BranchOutOfRange { at: 0 }));
+    }
+
+    #[test]
+    fn conditional_branch_relaxes_when_out_of_range() {
+        let mut enc = Encoder::new();
+        let target = enc.new_label();
         enc.b_cond(Cond::Eq, target);
         for _ in 0..400 {
             enc.nop();
         }
         enc.bind_label(target);
-        assert_eq!(enc.finish(), Err(AssembleError::BranchOutOfRange { at: 0 }));
+        let out = enc.finish().expect("relaxed, not rejected");
+        assert_eq!(out.bytes.len(), 6 + 400 * 2);
+        assert_eq!(&out.bytes[0..2], &[0x01, 0xD1]);
+        assert_eq!(&out.bytes[2..4], &[0x90, 0xE1]);
+        assert_eq!(&out.bytes[4..6], &[0x00, 0xBF]);
     }
 
     #[test]
@@ -1219,8 +1332,8 @@ mod tests {
 
         let mut e = Encoder::new();
         let l = e.new_label();
-        e.b_cond(Cond::Eq, l);
-        for _ in 0..400 {
+        e.b(l);
+        for _ in 0..2500 {
             e.nop();
         }
         e.bind_label(l);

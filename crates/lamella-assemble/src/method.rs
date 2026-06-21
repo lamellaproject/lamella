@@ -872,6 +872,12 @@ fn emit_statement_expression(
                     &target.ty, receiver, indices, value, frame, tokens, out,
                 );
             }
+            if let BoundExprKind::Dereference { operand } = &target.kind {
+                emit_expression(operand, frame, tokens, out)?;
+                emit_expression(value, frame, tokens, out)?;
+                out.push(Instruction::simple(crate::expr::stind_opcode(&target.ty)));
+                return Ok(());
+            }
             if let BoundExprKind::PropertyAccess {
                 receiver,
                 declaring_type,

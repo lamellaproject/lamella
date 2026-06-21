@@ -83,6 +83,48 @@ pub fn parse_compilation_unit(source: &str) -> ParsedCompilationUnit {
     }
 }
 
+/// The result of parsing a REPL submission: the top-level statement list, the optional
+/// trailing display expression, and the diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSubmission {
+    /// The submission's leading `using` directives (16.3); the session model accumulates
+    /// them so later submissions resolve names without qualification.
+    pub usings: Vec<UsingDirective>,
+    /// The submission's top-level type and namespace declarations (a `class`/`struct`/
+    /// `enum`/etc.); the session emits each as a TypeDef the runtime adds to the module,
+    /// and accumulates them so later submissions reference them.
+    pub types: Vec<NamespaceMember>,
+    /// The submission's top-level statements, in source order. A top-level local
+    /// declaration here is a persistent session variable -- the incremental-REPL
+    /// session model lowers it to a field of the `__Repl` instance -- with `Error`
+    /// placeholders where recovery was needed.
+    pub statements: Vec<Stmt>,
+    /// A trailing bare expression (no `;`, running to end of input), the submission's
+    /// DISPLAY value: the session model returns it boxed to `object` for the REPL to
+    /// print. `None` when the submission ends in a statement.
+    pub trailing: Option<Expr>,
+    /// Lexical and syntactic diagnostics, in source order.
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Lexes and parses `source` as a REPL submission: leading `using` directives (16.3), a
+/// sequence of top-level statements (ECMA-334 1st ed, clause 15), and an optional trailing
+/// bare expression (the display value), consumed to end of input. C# 1.0 has no top-level
+/// statements in a compilation unit, so this is a REPL-only entry beside [`parse_statement`];
+/// the session model binds the result against the persistent `__Repl` scope.
+#[must_use]
+pub fn parse_submission(source: &str) -> ParsedSubmission {
+    let mut parser = Parser::new(tokenize(source));
+    let (usings, types, statements, trailing) = parser.parse_submission();
+    ParsedSubmission {
+        usings,
+        types,
+        statements,
+        trailing,
+        diagnostics: parser.diagnostics,
+    }
+}
+
 /// A recursive-descent parser over a filtered token stream.
 struct Parser {
     /// The significant tokens, trivia removed, always ending in `EndOfFile`.
@@ -249,6 +291,77 @@ impl Parser {
             return self.parse_labeled(start);
         }
         self.parse_declaration_or_expression_statement(start)
+    }
+
+    /// Parses a REPL submission: leading `using` directives (16.3), then top-level
+    /// statements until end of input (15), then an optional trailing bare expression (one
+    /// with no `;`, running to end of input) returned separately as the submission's
+    /// DISPLAY value -- C# interactive semantics, where `x * 2` prints its value but
+    /// `x * 2;` does not. Mirrors [`Parser::parse_block`]'s statement loop (no closing
+    /// brace, the same no-progress guard).
+    fn parse_submission(
+        &mut self,
+    ) -> (Vec<UsingDirective>, Vec<NamespaceMember>, Vec<Stmt>, Option<Expr>) {
+        let mut usings = Vec::new();
+        while self.current_keyword() == Some(Keyword::Using) && !self.next_is(Punctuator::OpenParen)
+        {
+            usings.push(self.parse_using_directive());
+        }
+        let mut types = Vec::new();
+        let mut statements = Vec::new();
+        let mut trailing = None;
+        while !matches!(self.current().kind, TokenKind::EndOfFile) {
+            if self.at_namespace_member() {
+                types.push(self.parse_namespace_member());
+                continue;
+            }
+            let saved_position = self.position;
+            let saved_diagnostics = self.diagnostics.len();
+            let expr = self.parse_expression();
+            if matches!(self.current().kind, TokenKind::EndOfFile)
+                && !matches!(expr.kind, ExprKind::Error)
+            {
+                trailing = Some(expr);
+                break;
+            }
+            self.position = saved_position;
+            self.diagnostics.truncate(saved_diagnostics);
+
+            let before = self.position;
+            statements.push(self.parse_statement());
+            if self.position == before {
+                self.bump();
+            }
+        }
+        (usings, types, statements, trailing)
+    }
+
+    /// Whether the current position begins a namespace member -- a `namespace`, or, past
+    /// any attributes and modifiers, a `class`/`struct`/`interface`/`enum`/`delegate`
+    /// keyword -- rather than a statement. A leading modifier alone is not enough, since
+    /// `const int x = 5;` is a local declaration; the speculative skip (fully backtracked)
+    /// looks for the type-kind keyword behind the modifiers.
+    fn at_namespace_member(&mut self) -> bool {
+        if self.current_keyword() == Some(Keyword::Namespace) {
+            return true;
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let _ = self.parse_attribute_sections();
+        let _ = self.parse_modifiers();
+        let is_type = matches!(
+            self.current_keyword(),
+            Some(
+                Keyword::Class
+                    | Keyword::Struct
+                    | Keyword::Interface
+                    | Keyword::Enum
+                    | Keyword::Delegate
+            )
+        );
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        is_type
     }
 
     /// Parses a block `{ statements }` (15.2), with the scanner at the `{`.
@@ -1172,7 +1285,14 @@ impl Parser {
                 self.parse_type_kind_declaration(attributes, modifiers, start),
             ));
         }
-        let _ = attributes;
+        let mut member = self.parse_member_body(modifiers, start);
+        member.set_attributes(attributes);
+        member
+    }
+
+    /// Parses a member after its attribute sections and modifiers have been consumed; the
+    /// caller attaches the attributes to the result via [`Member::set_attributes`].
+    fn parse_member_body(&mut self, modifiers: Vec<Modifier>, start: u32) -> Member {
         if self.current_keyword() == Some(Keyword::Event) {
             return self.parse_event(modifiers, start);
         }
@@ -1233,6 +1353,7 @@ impl Parser {
                 parameters,
                 body,
                 explicit_interface: None,
+                attributes: Vec::new(),
                 span: Span::new(start, end),
             };
         }
@@ -1254,6 +1375,9 @@ impl Parser {
                 TypeRefKind::Name(parts),
                 Span::new(name_start, interface_end),
             );
+            if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                return self.parse_property(modifiers, ty, member, Some(explicit_interface), start);
+            }
             let parameters = self.parse_parameter_list();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 let block = self.parse_block();
@@ -1270,6 +1394,7 @@ impl Parser {
                 parameters,
                 body,
                 explicit_interface: Some(explicit_interface),
+                attributes: Vec::new(),
                 span: Span::new(start, end),
             };
         }
@@ -1277,7 +1402,7 @@ impl Parser {
             && self.next_is(Punctuator::OpenBrace)
         {
             let (name, _) = self.expect_identifier();
-            return self.parse_property(modifiers, ty, name, start);
+            return self.parse_property(modifiers, ty, name, None, start);
         }
         if matches!(self.current().kind, TokenKind::Identifier(_)) {
             let declarators = self.parse_variable_declarators();
@@ -1286,6 +1411,7 @@ impl Parser {
                 modifiers,
                 ty,
                 declarators,
+                attributes: Vec::new(),
                 span: Span::new(start, end),
             };
         }
@@ -1337,12 +1463,14 @@ impl Parser {
         (getter, setter, end)
     }
 
-    /// Parses a property given the modifiers, type, and name already parsed (17.6).
+    /// Parses a property given the modifiers, type, and name already parsed (17.6), and an
+    /// explicitly implemented interface for `int I.P { ... }` (20.4.1), else `None`.
     fn parse_property(
         &mut self,
         modifiers: Vec<Modifier>,
         ty: TypeRef,
         name: Box<str>,
+        explicit_interface: Option<TypeRef>,
         start: u32,
     ) -> Member {
         let (getter, setter, end) = self.parse_accessor_block();
@@ -1352,6 +1480,8 @@ impl Parser {
             name,
             getter,
             setter,
+            explicit_interface,
+            attributes: Vec::new(),
             span: Span::new(start, end),
         }
     }
@@ -1362,6 +1492,34 @@ impl Parser {
     fn parse_event(&mut self, modifiers: Vec<Modifier>, start: u32) -> Member {
         self.bump();
         let ty = self.parse_type();
+        if matches!(self.current().kind, TokenKind::Identifier(_)) && self.next_is(Punctuator::Dot)
+        {
+            let name_start = self.current().span.start;
+            let (first, mut prev_end) = self.expect_identifier();
+            let mut parts = alloc::vec![first];
+            let mut interface_end = prev_end;
+            while self.current_punctuator() == Some(Punctuator::Dot) {
+                self.bump();
+                interface_end = prev_end;
+                let (part, part_end) = self.expect_identifier();
+                parts.push(part);
+                prev_end = part_end;
+            }
+            let name = parts.pop().expect("a qualified member name has >= 2 parts");
+            let explicit_interface =
+                TypeRef::new(TypeRefKind::Name(parts), Span::new(name_start, interface_end));
+            let (adder, remover, end) = self.parse_event_accessor_block();
+            return Member::Event {
+                modifiers,
+                ty,
+                name,
+                adder,
+                remover,
+                explicit_interface: Some(explicit_interface),
+                attributes: Vec::new(),
+                span: Span::new(start, end),
+            };
+        }
         if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::OpenBrace)
         {
@@ -1373,6 +1531,8 @@ impl Parser {
                 name,
                 adder,
                 remover,
+                explicit_interface: None,
+                attributes: Vec::new(),
                 span: Span::new(start, end),
             };
         }
@@ -1382,6 +1542,7 @@ impl Parser {
             modifiers,
             ty,
             declarators,
+            attributes: Vec::new(),
             span: Span::new(start, end),
         }
     }
@@ -2124,7 +2285,9 @@ impl Parser {
     fn parse_type(&mut self) -> TypeRef {
         let mut base = self.parse_non_array_type();
         let start = base.span.start;
-        while self.current_punctuator() == Some(Punctuator::Asterisk) {
+        while !matches!(base.kind, TypeRefKind::Error)
+            && self.current_punctuator() == Some(Punctuator::Asterisk)
+        {
             let end = self.current().span.end;
             self.bump();
             base = TypeRef::new(TypeRefKind::Pointer(Box::new(base)), Span::new(start, end));

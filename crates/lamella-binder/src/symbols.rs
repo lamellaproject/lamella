@@ -69,6 +69,21 @@ pub struct PropertySymbol {
     pub accessibility: Accessibility,
 }
 
+/// A field-like event of a type (17.7): its `add`/`remove` accessors combine/remove a
+/// handler on a backing delegate field. Outside the declaring type, `+=`/`-=` route through
+/// the accessors and any other use is `CS0070`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSymbol {
+    /// The event's name.
+    pub name: Box<str>,
+    /// The event's (delegate) type.
+    pub ty: TypeSymbol,
+    /// Whether the event is `static`.
+    pub is_static: bool,
+    /// The event's accessibility (the visibility of its `add`/`remove` accessors).
+    pub accessibility: Accessibility,
+}
+
 /// A method of a type (17.5), reduced to what overload resolution needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodSymbol {
@@ -106,6 +121,9 @@ pub struct TypeInfo {
     pub properties: Vec<PropertySymbol>,
     /// The type's methods.
     pub methods: Vec<MethodSymbol>,
+    /// The type's field-like events (17.7), in addition to their backing delegate field in
+    /// `fields`. Drives `+=`/`-=` routing through the accessors and `CS0070`.
+    pub events: Vec<EventSymbol>,
     /// The type's instance constructors (each modeled as a method whose
     /// parameters drive `new T(...)` overload resolution).
     pub constructors: Vec<MethodSymbol>,
@@ -113,6 +131,9 @@ pub struct TypeInfo {
     /// `None` for a top-level type. Drives the `NestedClass` row and the empty namespace
     /// on emission.
     pub enclosing: Option<Box<str>>,
+    /// Whether this type comes from a referenced assembly (not the unit being compiled), so
+    /// an `internal` member of it is `CS0122` from here (cross-assembly internal).
+    pub is_external: bool,
 }
 
 impl TypeInfo {
@@ -128,8 +149,10 @@ impl TypeInfo {
             fields: Vec::new(),
             properties: Vec::new(),
             methods: Vec::new(),
+            events: Vec::new(),
             constructors: Vec::new(),
             enclosing: None,
+            is_external: false,
         }
     }
 
@@ -138,6 +161,12 @@ impl TypeInfo {
     #[must_use]
     pub fn find_field(&self, name: &str) -> Option<&FieldSymbol> {
         self.fields.iter().find(|field| &*field.name == name)
+    }
+
+    /// The field-like event with the given name declared directly on this type.
+    #[must_use]
+    pub fn find_event(&self, name: &str) -> Option<&EventSymbol> {
+        self.events.iter().find(|event| &*event.name == name)
     }
 
     /// The property with the given name declared directly on this type.

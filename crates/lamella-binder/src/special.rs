@@ -133,6 +133,18 @@ impl SpecialType {
         )
     }
 
+    /// Whether the type is an integral type (4.1.5): the numeric types other than the
+    /// floating-point ones and `decimal` (so `sbyte`..`ulong` and `char`). The offset of
+    /// pointer arithmetic must be integral.
+    #[must_use]
+    pub fn is_integral(self) -> bool {
+        self.is_numeric()
+            && !matches!(
+                self,
+                SpecialType::Single | SpecialType::Double | SpecialType::Decimal
+            )
+    }
+
     /// Whether the type is an unsigned integral type (4.1.5): `byte`, `ushort`,
     /// `uint`, `ulong`, and `char` (16-bit unsigned). These select the `.un` CIL
     /// forms for division, remainder, right shift, and the relational operators.

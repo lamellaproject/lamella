@@ -10,6 +10,7 @@ pub mod debug;
 pub mod expr;
 pub mod frame;
 pub mod method;
+pub mod session;
 pub mod tokens;
 
 pub use compile::{
@@ -20,4 +21,5 @@ pub use debug::{LineMap, SpanLines};
 pub use expr::{EmitError, emit_expression};
 pub use frame::{Frame, Slot};
 pub use method::{EmittedBody, SequencePoint, emit_method, max_stack};
+pub use session::{Session, SubmissionResult};
 pub use tokens::Tokens;

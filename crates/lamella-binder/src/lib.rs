@@ -25,8 +25,8 @@ pub use complete::{
     Completion, CompletionKind, Hover, SignatureHelp, complete, hover, signature_help,
 };
 pub use bound::{
-    Binder, BoundExpr, BoundExprKind, ConversionKind, FieldReference, MethodReference,
-    bind_expression,
+    Binder, BoundExpr, BoundExprKind, ConversionKind, DeclaredField, FieldReference,
+    MethodReference, SubmissionBinding, bind_expression,
 };
 pub use conversion::has_implicit_conversion;
 pub use declaration::{collect_into, collect_model, collect_types};
@@ -41,5 +41,8 @@ pub use special::SpecialType;
 pub use statement::{
     BoundCatch, BoundDeclarator, BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection,
 };
-pub use symbols::{FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind};
+pub use symbols::{
+    Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo,
+    TypeKind,
+};
 pub use types::TypeSymbol;

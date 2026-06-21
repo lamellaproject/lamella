@@ -98,8 +98,9 @@ pub enum Object {
     /// A boxed value type (III.4.1 `box`): a heap copy of a value-type value, tagged
     /// with the value type's token so `unbox` / `unbox.any` and casts can recover it.
     Boxed {
-        /// The boxed value type's token (from the `box` instruction).
-        type_token: u32,
+        /// The boxed value type's asm-folded token (the `asm_key` of the `box` instruction's
+        /// operand) -- the assembly in the high 32 bits, the metadata token in the low 32.
+        type_token: u64,
         /// The boxed value (a copy of the value-type value).
         value: Value,
     },
@@ -113,7 +114,16 @@ pub enum Object {
     },
     /// A `System.Text.StringBuilder`: a growable buffer of UTF-16 code units. It holds no
     /// object references, so the collector treats it like a string (nothing to trace).
-    StringBuilder(Vec<u16>),
+    /// `capacity` tracks .NET's observable `Capacity` (>= the live length, default 16,
+    /// doubling when an append outgrows it) independently of the backing `Vec`'s own
+    /// allocation, so `get_Capacity` reports the .NET value rather than Rust's growth.
+    StringBuilder {
+        /// The accumulated UTF-16 code units (the live content; `buf.len()` is `Length`).
+        buf: Vec<u16>,
+        /// The observable `Capacity`: always `>= buf.len()`, 16 by default, doubled when an
+        /// append outgrows it (.NET's growth rule), tracked apart from the `Vec`'s own.
+        capacity: usize,
+    },
 }
 
 /// The initial collection threshold (object count) before the live set is known; it
@@ -192,7 +202,7 @@ impl Heap {
             | Object::MdArray { .. }
             | Object::Boxed { .. }
             | Object::Delegate { .. }
-            | Object::StringBuilder(_) => None,
+            | Object::StringBuilder { .. } => None,
         }
     }
 
@@ -213,7 +223,7 @@ impl Heap {
             | Object::MdArray { .. }
             | Object::Boxed { .. }
             | Object::Delegate { .. }
-            | Object::StringBuilder(_) => None,
+            | Object::StringBuilder { .. } => None,
         }
     }
 
@@ -232,6 +242,27 @@ impl Heap {
         }
     }
 
+    /// Grows the instance at `reference` by appending `additional` zero-default field slots,
+    /// keeping every existing field value (including an `ObjectRef`, which stays valid because
+    /// the object is grown in place on the SAME heap -- no relocation). Returns the new field
+    /// count, or `None` if `reference` is not an instance.
+    ///
+    /// This is the runtime half of incremental-REPL instance growth: when a submission delta
+    /// adds field(s) to the persistent `__Repl` type ([`crate::Module::add_type_field`]), the
+    /// single live `__Repl` instance is grown to match by this call, so a later submission can
+    /// read/write the new slot. Growing in place (rather than re-allocating a larger instance
+    /// and copying) means a reference-typed prior field's `ObjectRef` is never disturbed -- the
+    /// exact property that lets reference-typed REPL state survive across submissions.
+    pub fn grow_instance(&mut self, reference: ObjectRef, additional: &[Value]) -> Option<usize> {
+        match self.objects.get_mut(reference.0 as usize)? {
+            Object::Instance { fields, .. } => {
+                fields.extend_from_slice(additional);
+                Some(fields.len())
+            }
+            _ => None,
+        }
+    }
+
     /// The type id of the instance at `reference`, if it is an instance (the basis
     /// for virtual dispatch once that lands).
     #[must_use]
@@ -243,7 +274,7 @@ impl Heap {
             | Object::MdArray { .. }
             | Object::Boxed { .. }
             | Object::Delegate { .. }
-            | Object::StringBuilder(_) => None,
+            | Object::StringBuilder { .. } => None,
         }
     }
 
@@ -260,8 +291,9 @@ impl Heap {
         self.alloc(Object::Array { elements })
     }
 
-    /// Allocates a boxed value type tagged with `type_token` and returns a reference.
-    pub fn alloc_boxed(&mut self, type_token: u32, value: Value) -> ObjectRef {
+    /// Allocates a boxed value type tagged with the asm-folded `type_token` and returns a
+    /// reference.
+    pub fn alloc_boxed(&mut self, type_token: u64, value: Value) -> ObjectRef {
         self.alloc(Object::Boxed { type_token, value })
     }
 
@@ -277,7 +309,7 @@ impl Heap {
     /// The value type's token a box is tagged with (the asm-folded token from the `box`
     /// site), if `reference` is a box -- the basis for a precise type test on a boxed value.
     #[must_use]
-    pub fn boxed_type_token(&self, reference: ObjectRef) -> Option<u32> {
+    pub fn boxed_type_token(&self, reference: ObjectRef) -> Option<u64> {
         match self.get(reference)? {
             Object::Boxed { type_token, .. } => Some(*type_token),
             _ => None,
@@ -308,16 +340,22 @@ impl Heap {
         self.alloc(Object::Delegate { invocations })
     }
 
-    /// Allocates a `System.Text.StringBuilder` seeded with `initial` code units.
-    pub fn alloc_string_builder(&mut self, initial: Vec<u16>) -> ObjectRef {
-        self.alloc(Object::StringBuilder(initial))
+    /// Allocates a `System.Text.StringBuilder` seeded with `initial` code units and an
+    /// observable `Capacity` of at least `capacity` (raised to the seed length so the
+    /// invariant `capacity >= length` always holds, e.g. a long seed string).
+    pub fn alloc_string_builder(&mut self, initial: Vec<u16>, capacity: usize) -> ObjectRef {
+        let capacity = capacity.max(initial.len());
+        self.alloc(Object::StringBuilder {
+            buf: initial,
+            capacity,
+        })
     }
 
     /// The code units accumulated in the string builder at `reference`, if it is one.
     #[must_use]
     pub fn string_builder_buf(&self, reference: ObjectRef) -> Option<&[u16]> {
         match self.get(reference)? {
-            Object::StringBuilder(buf) => Some(buf),
+            Object::StringBuilder { buf, .. } => Some(buf),
             _ => None,
         }
     }
@@ -325,8 +363,32 @@ impl Heap {
     /// Mutable access to the builder buffer at `reference`, if it is one (for `Append`).
     pub fn string_builder_buf_mut(&mut self, reference: ObjectRef) -> Option<&mut Vec<u16>> {
         match self.objects.get_mut(reference.0 as usize)? {
-            Object::StringBuilder(buf) => Some(buf),
+            Object::StringBuilder { buf, .. } => Some(buf),
             _ => None,
+        }
+    }
+
+    /// The observable `Capacity` of the builder at `reference`, if it is one.
+    #[must_use]
+    pub fn string_builder_capacity(&self, reference: ObjectRef) -> Option<usize> {
+        match self.get(reference)? {
+            Object::StringBuilder { capacity, .. } => Some(*capacity),
+            _ => None,
+        }
+    }
+
+    /// Raises the builder's tracked `Capacity` to cover `length`, by .NET's growth rule:
+    /// when the new length outgrows the current capacity, the capacity becomes the larger
+    /// of the needed length and twice the old capacity (so repeated appends double it).
+    /// A length within the current capacity leaves it unchanged. Call after any op that
+    /// extends the buffer (append / insert) so `get_Capacity` matches .NET.
+    pub fn string_builder_grow_capacity(&mut self, reference: ObjectRef, length: usize) {
+        if let Some(Object::StringBuilder { capacity, .. }) =
+            self.objects.get_mut(reference.0 as usize)
+        {
+            if length > *capacity {
+                *capacity = length.max(capacity.saturating_mul(2));
+            }
         }
     }
 
@@ -358,6 +420,22 @@ impl Heap {
             Object::Array { elements } if dim == 0 => i32::try_from(elements.len()).ok(),
             _ => None,
         }
+    }
+
+    /// The width in bytes of an element of the array at `reference`, read off its first
+    /// element (every element of an array has the same width). Used to translate a
+    /// pinned-array pointer's raw byte offset back into an element index (a `fixed` pointer
+    /// walks in bytes; the heap stores whole `Value` elements). `None` if `reference` is not
+    /// an array, or an empty one (no element to size, and a `fixed` pointer into it cannot be
+    /// dereferenced anyway).
+    #[must_use]
+    pub fn array_element_width(&self, reference: ObjectRef) -> Option<usize> {
+        let first = match self.get(reference)? {
+            Object::Array { elements } => elements.first(),
+            Object::MdArray { elements, .. } => elements.first(),
+            _ => return None,
+        };
+        first.map(value_storage_width)
     }
 
     /// The element at `index` of the array at `reference`, if it is an array with
@@ -686,7 +764,7 @@ fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
         Object::Delegate { invocations } => invocations
             .iter()
             .for_each(|(target, _)| collect_refs(target, visit)),
-        Object::Str(_) | Object::StringBuilder(_) => {}
+        Object::Str(_) | Object::StringBuilder { .. } => {}
     }
 }
 
@@ -729,7 +807,7 @@ fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
         Object::Delegate { invocations } => invocations
             .iter_mut()
             .for_each(|(target, _)| remap_value(target, remap)),
-        Object::Str(_) | Object::StringBuilder(_) => {}
+        Object::Str(_) | Object::StringBuilder { .. } => {}
     }
 }
 
@@ -738,6 +816,24 @@ fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
 fn remap_ref(reference: &mut ObjectRef, remap: &[Option<u32>]) {
     if let Some(Some(new)) = remap.get(reference.0 as usize) {
         reference.0 = *new;
+    }
+}
+
+/// The storage width in bytes of an array element holding this `Value` -- the element size
+/// a pinned-array (`fixed`) pointer steps by. Element slots hold a reduced stack value, so
+/// the width follows the value kind: a 32-bit element (the common `int[]` / `bool[]` /
+/// `char[]` case, all widened to `Int32` on the stack) is 4 bytes, a 64-bit element 8, a
+/// reference one host word. Sub-`int32` typed arrays are not laid out distinctly yet, so a
+/// 32-bit slot is the right stride for the integer arrays csc pins here.
+#[must_use]
+fn value_storage_width(value: &Value) -> usize {
+    match value {
+        Value::Int32(_) => 4,
+        Value::Int64(_) => 8,
+        Value::NativeInt(_) => 8,
+        #[cfg(feature = "float")]
+        Value::Float(_) => 8,
+        _ => core::mem::size_of::<usize>(),
     }
 }
 

@@ -466,6 +466,24 @@ pub fn string_concat3(
     Ok(Some(Value::Object(reference)))
 }
 
+/// The host clock seam: the current time as 100-nanosecond ticks since the .NET epoch
+/// (0001-01-01 00:00:00), read from the [`Vm`]. Backs the managed `DateTime.Now` /
+/// `DateTime.UtcNow` (which wrap it in `new DateTime(ticks)`). The interpreter core is
+/// no_std and keeps no clock of its own -- the embedder sets the value via
+/// [`Vm::set_now_ticks`] (the host from `std::time`, a device from its RTC), defaulting
+/// to 0 (the epoch). For v1 there is no timezone, so `Now` and `UtcNow` report the same
+/// UTC-based ticks.
+///
+/// # Errors
+/// Never; the signature matches the intrinsic ABI (it takes no arguments).
+pub fn datetime_now_ticks(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int64(vm.now_ticks())))
+}
+
 /// The additional NETMFv4_4-profile BCL surface, beyond the ECMA-335 Kernel
 /// Profile. Gated by `NETMFv4_4` so a Kernel-only build omits it entirely; its public
 /// intrinsics are re-exported below so `crate::intrinsics::*` paths are unchanged.
@@ -1703,11 +1721,14 @@ mod extended {
         }
     }
 
-    /// Appends `units` to the string builder at `reference`.
+    /// Appends `units` to the string builder at `reference`, growing its tracked
+    /// `Capacity` by .NET's rule when the result outgrows it.
     fn string_builder_extend(vm: &mut Vm, reference: ObjectRef, units: &[u16]) -> Result<(), Trap> {
         match vm.heap_mut().string_builder_buf_mut(reference) {
             Some(buffer) => {
                 buffer.extend_from_slice(units);
+                let length = buffer.len();
+                vm.heap_mut().string_builder_grow_capacity(reference, length);
                 Ok(())
             }
             None => Err(Trap::TypeMismatch(Opcode::Call)),
@@ -1894,6 +1915,190 @@ mod extended {
             }
             None => Err(Trap::TypeMismatch(Opcode::Call)),
         }
+    }
+
+    /// `StringBuilder.Length` setter core (`SetLengthCore`): truncates the buffer when
+    /// `value` is below the current length, or extends it with NUL (`\0`) code units when
+    /// above -- exactly .NET's `Length` set, which pads the grown tail with `'\0'`. The
+    /// observable `Capacity` grows by the usual rule when the new length outgrows it. The
+    /// public managed `Length` setter rejects a negative value (a catchable
+    /// `ArgumentOutOfRangeException`) before this runs; a stray negative here is also
+    /// rejected, defensively, as out of range.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-builder receiver or non-int argument;
+    /// [`Trap::ArgumentOutOfRange`] for a negative length.
+    pub fn string_builder_set_length(
+        vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let Some(&Value::Int32(value)) = args.get(1) else {
+            return Err(Trap::TypeMismatch(Opcode::Call));
+        };
+        let length = usize::try_from(value).map_err(|_| Trap::ArgumentOutOfRange(1))?;
+        let this = receiver_ref(args)?;
+        match vm.heap_mut().string_builder_buf_mut(this) {
+            Some(buffer) => {
+                buffer.resize(length, 0u16);
+                vm.heap_mut().string_builder_grow_capacity(this, length);
+                Ok(None)
+            }
+            None => Err(Trap::TypeMismatch(Opcode::Call)),
+        }
+    }
+
+    /// `StringBuilder.Capacity` getter: the tracked capacity (>= `Length`).
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] if the receiver is not a string builder.
+    pub fn string_builder_get_capacity(
+        vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let this = receiver_ref(args)?;
+        let capacity = vm
+            .heap()
+            .string_builder_capacity(this)
+            .ok_or(Trap::TypeMismatch(Opcode::Call))?;
+        Ok(Some(Value::Int32(capacity as i32)))
+    }
+
+    /// `StringBuilder.this[int]` getter (`get_Chars`): the code unit at `index`. .NET's
+    /// indexer getter raises `IndexOutOfRangeException` (NOT `ArgumentOutOfRangeException`,
+    /// which is what its *setter* raises) outside `[0, Length)`, so the bound is checked
+    /// here and surfaces as [`Trap::IndexOutOfRange`] -- the trap that presents as
+    /// `IndexOutOfRangeException` to a managed `catch`.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-builder receiver or non-int index;
+    /// [`Trap::IndexOutOfRange`] if `index` is outside the live content.
+    pub fn string_builder_get_char(
+        vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let Some(&Value::Int32(index)) = args.get(1) else {
+            return Err(Trap::TypeMismatch(Opcode::Call));
+        };
+        let this = receiver_ref(args)?;
+        let buffer = vm
+            .heap()
+            .string_builder_buf(this)
+            .ok_or(Trap::TypeMismatch(Opcode::Call))?;
+        let unit = usize::try_from(index)
+            .ok()
+            .and_then(|i| buffer.get(i))
+            .copied()
+            .ok_or(Trap::IndexOutOfRange(index))?;
+        Ok(Some(Value::Int32(i32::from(unit))))
+    }
+
+    /// `StringBuilder.this[int]` setter core (`SetCharCore`): stores `value` at `index`.
+    /// The public managed setter performs the `[0, Length)` bound check (raising a catchable
+    /// `ArgumentOutOfRangeException`, matching .NET's indexer setter) before this runs; an
+    /// out-of-range index here is rejected defensively as [`Trap::IndexOutOfRange`].
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-builder receiver or bad argument types;
+    /// [`Trap::IndexOutOfRange`] if `index` is outside the live content.
+    pub fn string_builder_set_char(
+        vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let (index, unit) = match (args.get(1), args.get(2)) {
+            (Some(&Value::Int32(index)), Some(&Value::Int32(unit))) => (index, unit as u16),
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        };
+        let this = receiver_ref(args)?;
+        let buffer = vm
+            .heap_mut()
+            .string_builder_buf_mut(this)
+            .ok_or(Trap::TypeMismatch(Opcode::Call))?;
+        let slot = usize::try_from(index)
+            .ok()
+            .and_then(|i| buffer.get_mut(i))
+            .ok_or(Trap::IndexOutOfRange(index))?;
+        *slot = unit;
+        Ok(None)
+    }
+
+    /// `System.BitConverter.DoubleToInt64Bits(double)`: the IEEE-754 bit pattern of the
+    /// double as an `Int64`, the building block the managed `BitConverter.GetBytes(double)` /
+    /// `ToDouble` use (pure managed C# cannot reinterpret a `double`'s bits without `unsafe`).
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-double argument.
+    #[cfg(feature = "float")]
+    pub fn bitconverter_double_to_int64_bits(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let value = match args.first() {
+            Some(&Value::Float(value)) => value,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        };
+        Ok(Some(Value::Int64(value.to_bits() as i64)))
+    }
+
+    /// `System.BitConverter.Int64BitsToDouble(long)`: the `double` whose IEEE-754 bit
+    /// pattern is `value`. The inverse of [`bitconverter_double_to_int64_bits`].
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-long argument.
+    #[cfg(feature = "float")]
+    pub fn bitconverter_int64_bits_to_double(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let bits = match args.first() {
+            Some(&Value::Int64(bits)) => bits,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        };
+        Ok(Some(Value::Float(f64::from_bits(bits as u64))))
+    }
+
+    /// `System.BitConverter.SingleToInt32Bits(float)`: the IEEE-754 bit pattern of the value
+    /// as a single-precision `Int32`. The VM holds a `float` as an `f64`, so it is narrowed
+    /// to `f32` first (it already carries a single-rounded value), matching .NET's 4-byte
+    /// `GetBytes(float)`.
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-floating argument.
+    #[cfg(feature = "float")]
+    pub fn bitconverter_single_to_int32_bits(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let value = match args.first() {
+            Some(&Value::Float(value)) => value,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        };
+        Ok(Some(Value::Int32((value as f32).to_bits() as i32)))
+    }
+
+    /// `System.BitConverter.Int32BitsToSingle(int)`: the `float` whose single-precision
+    /// IEEE-754 bit pattern is `value` (widened to the VM's `f64` float). The inverse of
+    /// [`bitconverter_single_to_int32_bits`].
+    ///
+    /// # Errors
+    /// [`Trap::TypeMismatch`] for a non-int argument.
+    #[cfg(feature = "float")]
+    pub fn bitconverter_int32_bits_to_single(
+        _vm: &mut Vm,
+        _module: &Module,
+        args: &[Value],
+    ) -> Result<Option<Value>, Trap> {
+        let bits = match args.first() {
+            Some(&Value::Int32(bits)) => bits,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        };
+        Ok(Some(Value::Float(f64::from(f32::from_bits(bits as u32)))))
     }
 
     /// An `i32` index argument as a `usize` (a negative index is out of range).
@@ -2509,7 +2714,7 @@ fn object_text(vm: &Vm, module: &Module, value: Option<&Value>) -> String {
     match value {
         Some(Value::Object(reference)) => match vm.heap().get(*reference) {
             Some(Object::Str(chars)) => String::from_utf16_lossy(&decode_string(chars)),
-            Some(Object::StringBuilder(buffer)) => String::from_utf16_lossy(buffer),
+            Some(Object::StringBuilder { buf, .. }) => String::from_utf16_lossy(buf),
             Some(Object::Boxed { type_token, value }) => boxed_text(module, *type_token, value),
             _ => String::from("object"),
         },
@@ -2554,12 +2759,12 @@ pub fn string_concat_object3(
 }
 
 /// Renders a boxed value type: an enum as its constant name (when the value is a known
-/// constant of that enum), otherwise the underlying value's text. The boxed `type_token`
-/// already carries its owning assembly (folded in at the `box` site), so the enum maps are
-/// queried with assembly 0.
-fn boxed_text(module: &Module, type_token: u32, value: &Value) -> String {
+/// constant of that enum), otherwise the underlying value's text. The boxed `type_token` is
+/// the asm-folded handle (the assembly folded in at the `box` site), so the enum maps are
+/// queried by that handle directly.
+fn boxed_text(module: &Module, type_token: u64, value: &Value) -> String {
     if let Some(integer) = enum_underlying(value) {
-        if let Some(name) = module.enum_value_name(0, type_token, integer) {
+        if let Some(name) = module.enum_value_name_by_handle(type_token, integer) {
             return String::from(name);
         }
     }
@@ -2625,6 +2830,78 @@ pub fn delegate_remove(
     }
     let reference = vm.heap_mut().alloc_multicast(invocations);
     Ok(Some(Value::Object(reference)))
+}
+
+/// `System.Threading.Interlocked.CompareExchange<T>(ref T location, T value, T comparand)`:
+/// if `*location` equals `comparand`, set `*location = value`; return the original `*location`
+/// either way. csc lowers a field-like event's `+=`/`-=` to a compare-and-swap retry loop
+/// around this. The interpreter is single-threaded, so the compare-and-set is a plain
+/// (non-atomic) one -- with no other thread to race, the swap always observes the comparand
+/// and the loop completes on its first iteration.
+///
+/// The first argument arrives as the raw managed pointer (`&`, un-dereferenced -- the call
+/// dispatch keeps it so for this intrinsic). Only a heap-reachable pointer is supported (a
+/// field, array element, static, or box -- which is what `ldflda` on an event's backing field
+/// yields); the comparison is by stack-value identity (reference identity for the delegate /
+/// object references compared here, matching `Interlocked`'s reference semantics).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the first argument is not a managed pointer the heap can reach.
+pub fn interlocked_compare_exchange(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let location = match args.first() {
+        Some(Value::ByRef(location)) => location.clone(),
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let value = args.get(1).cloned().unwrap_or(Value::Null);
+    let comparand = args.get(2).cloned().unwrap_or(Value::Null);
+    let original = read_vm_location(vm, &location)?;
+    if original == comparand {
+        write_vm_location(vm, &location, value)?;
+    }
+    Ok(Some(original))
+}
+
+/// Reads the value at a heap-reachable managed pointer using only the `Vm` an intrinsic holds
+/// (it has no call frames, so a pointer into a frame local/argument is out of reach).
+fn read_vm_location(vm: &Vm, location: &crate::value::Location) -> Result<Value, Trap> {
+    use crate::value::Location;
+    let value = match *location {
+        Location::Field { object, slot } => vm.heap().instance_field(object, slot),
+        Location::Element { array, index, .. } => vm.heap().array_get(array, index),
+        Location::Static { slot } => vm.static_field(slot),
+        Location::Boxed { object } => vm.heap().boxed_value(object),
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    Ok(value.unwrap_or(Value::Null))
+}
+
+/// Writes `value` at a heap-reachable managed pointer using only the `Vm` (see
+/// [`read_vm_location`]).
+fn write_vm_location(
+    vm: &mut Vm,
+    location: &crate::value::Location,
+    value: Value,
+) -> Result<(), Trap> {
+    use crate::value::Location;
+    let ok = match *location {
+        Location::Field { object, slot } => vm.heap_mut().set_instance_field(object, slot, value),
+        Location::Element { array, index, .. } => vm.heap_mut().array_set(array, index, value),
+        Location::Static { slot } => {
+            vm.set_static_field(slot, value);
+            true
+        }
+        Location::Boxed { object } => vm.heap_mut().set_boxed_value(object, value),
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(Trap::NullReference)
+    }
 }
 
 /// The invocation list of a delegate value (empty for null or a non-delegate).
@@ -2742,7 +3019,7 @@ pub fn object_get_type(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<O
                 .flatten()
         })
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
-    Ok(Some(Value::NativeInt(i64::from(handle))))
+    Ok(Some(Value::NativeInt(handle as i64)))
 }
 
 /// `System.Enum.Parse(Type, string)`: the enum constant named by the string, boxed.
@@ -2756,11 +3033,11 @@ pub fn enum_parse(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option
         .and_then(|raw| {
             let name = raw.trim();
             module
-                .enum_value_by_name(0, token, name, ignore_case)
+                .enum_value_by_name_handle(token, name, ignore_case)
                 .or_else(|| name.parse::<i64>().ok())
         })
         .ok_or(Trap::InvalidArgument)?;
-    let boxed_value = if module.enum_is_wide(0, token) {
+    let boxed_value = if module.enum_is_wide_by_handle(token) {
         Value::Int64(value)
     } else {
         Value::Int32(value as i32)
@@ -2783,30 +3060,29 @@ pub fn enum_is_defined(
     let defined = match args.get(1) {
         Some(Value::Object(reference)) => match vm.heap().get(*reference) {
             Some(Object::Str(chars)) => module
-                .enum_value_by_name(
-                    0,
+                .enum_value_by_name_handle(
                     token,
                     &String::from_utf16_lossy(&decode_string(chars)),
                     false,
                 )
                 .is_some(),
             Some(Object::Boxed { value, .. }) => enum_underlying(value)
-                .is_some_and(|n| module.enum_value_name(0, token, n).is_some()),
+                .is_some_and(|n| module.enum_value_name_by_handle(token, n).is_some()),
             _ => false,
         },
-        Some(other) => {
-            enum_underlying(other).is_some_and(|n| module.enum_value_name(0, token, n).is_some())
-        }
+        Some(other) => enum_underlying(other)
+            .is_some_and(|n| module.enum_value_name_by_handle(token, n).is_some()),
         None => false,
     };
     Ok(Some(Value::Int32(i32::from(defined))))
 }
 
-/// The type token a `RuntimeTypeHandle` / `Type` argument carries (it is modeled as a
-/// native-int handle holding the token).
-fn type_handle_token(arg: Option<&Value>) -> u32 {
+/// The asm-folded type handle a `RuntimeTypeHandle` / `Type` argument carries (it is modeled as
+/// a native-int holding the folded token: the assembly in the high 32 bits, the token in the
+/// low 32). Read back bit-for-bit as a u64 so the asm id survives.
+fn type_handle_token(arg: Option<&Value>) -> u64 {
     match arg {
-        Some(Value::NativeInt(handle)) => *handle as u32,
+        Some(Value::NativeInt(handle)) => *handle as u64,
         _ => 0,
     }
 }
@@ -2832,7 +3108,7 @@ pub fn type_get_name(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
         return Err(Trap::TypeMismatch(Opcode::Callvirt));
     };
     let name = module
-        .type_name_by_handle(handle as u32)
+        .type_name_by_handle(handle as u64)
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
     Ok(Some(alloc_str(vm, name)))
 }
@@ -2856,7 +3132,7 @@ pub fn initialize_array(
         _ => return Err(Trap::TypeMismatch(Opcode::Call)),
     };
     let handle = type_handle_token(args.get(1));
-    let Some(data) = module.field_rva(0, lamella_token::Token(handle)) else {
+    let Some(data) = module.field_rva_by_handle(handle) else {
         return Ok(None);
     };
     let Some(length) = vm.heap().array_len(array) else {
@@ -2980,6 +3256,7 @@ pub fn md_array_address(
     Ok(Some(Value::ByRef(crate::value::Location::Element {
         array,
         index: flat,
+        byte_offset: 0,
     })))
 }
 

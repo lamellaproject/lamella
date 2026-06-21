@@ -41,6 +41,9 @@ pub fn emit_expression(
             }
             BinaryOperator::LogicalOr => emit_short_circuit(left, right, true, frame, tokens, out),
             _ => {
+                if emit_pointer_arithmetic(*operator, left, right, frame, tokens, out)? {
+                    return Ok(());
+                }
                 emit_expression(left, frame, tokens, out)?;
                 emit_expression(right, frame, tokens, out)?;
                 let is_string =
@@ -665,15 +668,20 @@ fn emit_property_load(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     let is_static = matches!(receiver.kind, BoundExprKind::TypeReference(_));
+    let value_type_receiver = !is_static && is_value_type(&receiver.ty, tokens);
     if !is_static {
-        emit_expression(receiver, frame, tokens, out)?;
+        if value_type_receiver {
+            emit_value_type_receiver(receiver, frame, tokens, out)?;
+        } else {
+            emit_expression(receiver, frame, tokens, out)?;
+        }
     }
     let token = tokens
         .method(declaring_type, &accessor_name("get_", name), &[])
         .ok_or(EmitError::Unsupported(
             "property getter outside this module",
         ))?;
-    let opcode = if is_static {
+    let opcode = if is_static || value_type_receiver {
         Opcode::Call
     } else {
         Opcode::Callvirt
@@ -695,8 +703,13 @@ pub(crate) fn emit_property_store(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     let is_static = matches!(receiver.kind, BoundExprKind::TypeReference(_));
+    let value_type_receiver = !is_static && is_value_type(&receiver.ty, tokens);
     if !is_static {
-        emit_expression(receiver, frame, tokens, out)?;
+        if value_type_receiver {
+            emit_value_type_receiver(receiver, frame, tokens, out)?;
+        } else {
+            emit_expression(receiver, frame, tokens, out)?;
+        }
     }
     emit_expression(value, frame, tokens, out)?;
     let token = tokens
@@ -708,7 +721,7 @@ pub(crate) fn emit_property_store(
         .ok_or(EmitError::Unsupported(
             "property setter outside this module",
         ))?;
-    let opcode = if is_static {
+    let opcode = if is_static || value_type_receiver {
         Opcode::Call
     } else {
         Opcode::Callvirt
@@ -1236,6 +1249,63 @@ pub(crate) fn emit_string_equality(
         out.push(Instruction::simple(Opcode::Ceq));
     }
     Ok(())
+}
+
+/// Lowers pointer arithmetic (18.5.6, unsafe), returning whether it handled the operator:
+/// `p + n` / `n + p` push the pointer then `n * sizeof(T)` and `add`; `p - n` does the same
+/// with `sub`; `p - q` subtracts the pointers and divides by `sizeof(T)` (the element
+/// count). The integer is scaled by the element size, exactly as `p[i]` is.
+fn emit_pointer_arithmetic(
+    operator: BinaryOperator,
+    left: &BoundExpr,
+    right: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<bool, EmitError> {
+    let pointer_element = |ty: &TypeSymbol| match ty {
+        TypeSymbol::Pointer(element) => Some((**element).clone()),
+        _ => None,
+    };
+    match operator {
+        BinaryOperator::Add => {
+            let (pointer, offset, element) = if let Some(element) = pointer_element(&left.ty) {
+                (left, right, element)
+            } else if let Some(element) = pointer_element(&right.ty) {
+                (right, left, element)
+            } else {
+                return Ok(false);
+            };
+            emit_expression(pointer, frame, tokens, out)?;
+            emit_expression(offset, frame, tokens, out)?;
+            emit_sizeof(&element, tokens, out)?;
+            out.push(Instruction::simple(Opcode::Mul));
+            out.push(Instruction::simple(Opcode::Add));
+            Ok(true)
+        }
+        BinaryOperator::Subtract => {
+            if let (Some(element), Some(_)) =
+                (pointer_element(&left.ty), pointer_element(&right.ty))
+            {
+                emit_expression(left, frame, tokens, out)?;
+                emit_expression(right, frame, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Sub));
+                emit_sizeof(&element, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Div));
+                return Ok(true);
+            }
+            if let Some(element) = pointer_element(&left.ty) {
+                emit_expression(left, frame, tokens, out)?;
+                emit_expression(right, frame, tokens, out)?;
+                emit_sizeof(&element, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Mul));
+                out.push(Instruction::simple(Opcode::Sub));
+                return Ok(true);
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
 }
 
 pub(crate) fn emit_binary(

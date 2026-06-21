@@ -244,7 +244,9 @@ impl Binder {
             }
             StmtKind::While { condition, body } => {
                 let condition = self.bind_condition(condition);
+                self.enter_loop();
                 let body = Box::new(self.bind_statement(body));
+                self.exit_loop();
                 BoundStmtKind::While { condition, body }
             }
             StmtKind::Return(value) => {
@@ -254,7 +256,9 @@ impl Binder {
                 BoundStmtKind::Return(value)
             }
             StmtKind::DoWhile { body, condition } => {
+                self.enter_loop();
                 let body = Box::new(self.bind_statement(body));
+                self.exit_loop();
                 let condition = self.bind_condition(condition);
                 BoundStmtKind::DoWhile { body, condition }
             }
@@ -274,7 +278,9 @@ impl Binder {
                 let element_type = self.resolve_named_type(&bind_type(ty), ty.span);
                 self.enter_scope();
                 self.declare_local(name, element_type.clone());
+                self.enter_loop();
                 let body = Box::new(self.bind_statement(body));
+                self.exit_loop();
                 self.exit_scope();
                 BoundStmtKind::ForEach {
                     name: name.clone(),
@@ -283,8 +289,18 @@ impl Binder {
                     body,
                 }
             }
-            StmtKind::Break => BoundStmtKind::Break,
-            StmtKind::Continue => BoundStmtKind::Continue,
+            StmtKind::Break => {
+                if !self.in_loop_or_switch() {
+                    self.report(Diagnostic::new(DiagnosticKind::NoEnclosingLoop, stmt.span));
+                }
+                BoundStmtKind::Break
+            }
+            StmtKind::Continue => {
+                if !self.in_loop() {
+                    self.report(Diagnostic::new(DiagnosticKind::NoEnclosingLoop, stmt.span));
+                }
+                BoundStmtKind::Continue
+            }
             StmtKind::Throw(value) => {
                 BoundStmtKind::Throw(value.as_ref().map(|expr| self.bind_expression(expr)))
             }
@@ -295,6 +311,7 @@ impl Binder {
                 let switch_span = expression.span;
                 let expression = self.bind_expression(expression);
                 self.enter_scope();
+                self.enter_switch();
                 let mut seen_values: Vec<i64> = Vec::new();
                 let mut seen_strings: Vec<Box<[u16]>> = Vec::new();
                 let mut seen_default = false;
@@ -351,6 +368,7 @@ impl Binder {
                     }
                     bound_sections.push(BoundSwitchSection { labels, statements });
                 }
+                self.exit_switch();
                 self.exit_scope();
                 BoundStmtKind::Switch {
                     expression,
@@ -543,7 +561,9 @@ impl Binder {
             .iter()
             .map(|iterator| self.bind_expression(iterator))
             .collect();
+        self.enter_loop();
         let body = Box::new(self.bind_statement(body));
+        self.exit_loop();
         self.exit_scope();
         BoundStmtKind::For {
             initializer,

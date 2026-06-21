@@ -5,7 +5,8 @@ use crate::bind::bind_type;
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::symbols::{
-    Accessibility, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind,
+    Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo,
+    TypeKind,
 };
 use crate::types::TypeSymbol;
 use alloc::string::String;
@@ -206,8 +207,26 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         accessibility,
                         constant: None,
                     });
+                    info.events.push(EventSymbol {
+                        name: declarator.name.clone(),
+                        ty: field_ty.clone(),
+                        is_static,
+                        accessibility,
+                    });
                 }
             }
+            Member::Event {
+                modifiers,
+                ty,
+                name,
+                explicit_interface: None,
+                ..
+            } => info.events.push(EventSymbol {
+                name: name.clone(),
+                ty: bind_type(ty),
+                is_static: is_static(modifiers),
+                accessibility: access(modifiers),
+            }),
             Member::Method {
                 modifiers,
                 return_type,

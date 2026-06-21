@@ -161,6 +161,16 @@ pub enum Inst {
         /// The argument values, in order (placed in the ABI's argument registers).
         args: Vec<ValueId>,
     },
+    /// A virtual call dispatched through the receiver's vtable. `args[0]` is the receiver, whose
+    /// `obj-4` TypeDesc anchors the vtable; the target is `[TypeDesc - 4 - slot*4]` (laid out by the
+    /// backend's vtable emission). Produces the callee's return value, like [`Inst::Call`], and is a
+    /// safepoint (the call may collect).
+    CallVirtual {
+        /// The called method's vtable slot.
+        slot: u32,
+        /// The argument values, in order; `args[0]` is the receiver (`this`).
+        args: Vec<ValueId>,
+    },
     /// Stores `value` to the 32-bit memory address held in `address` -- the
     /// memory-mapped-I/O write primitive. The write is a side effect; the
     /// instruction's own result value is a placeholder that callers ignore.
@@ -276,6 +286,21 @@ pub enum Inst {
         /// The byte offsets within the payload of the fields that hold an `ObjectRef`/`&` --
         /// the roots the emitted TypeDesc lists for the collector to trace and relocate.
         ref_offsets: Box<[u32]>,
+    },
+    /// Loads the TypeDesc pointer of a heap object -- the word the allocator wrote in the header
+    /// just before the payload (`object - 4` per the GC ABI). The runtime type identity of a boxed
+    /// value / reference, compared against [`Inst::TypeDescAddr`] for an `unbox.any`/`castclass`
+    /// type check. Result is the descriptor address (an `i32` on a 32-bit target).
+    LoadTypeDesc {
+        /// The heap object (an `ObjectRef`).
+        object: ValueId,
+    },
+    /// The address of the TypeDesc the backend emits for `handle` -- the same per-type descriptor an
+    /// `Alloc` of that type points at. Compared against [`Inst::LoadTypeDesc`]: equal addresses mean
+    /// the same runtime type (descriptors are deduplicated per type). Result is that address.
+    TypeDescAddr {
+        /// The type whose TypeDesc address this is.
+        handle: TypeHandle,
     },
     /// Allocates a garbage-collected array of `length` elements of `element_size` bytes -- the
     /// CLI's `newarr`. The payload is `[u32 length][elements...]`; the result is an `ObjectRef`

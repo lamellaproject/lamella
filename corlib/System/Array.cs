@@ -7,6 +7,24 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] public object GetValue(int index) { return null; }
         [Lamella.Runtime.RuntimeProvided] public void SetValue(object value, int index) { }
 
+        public static int IndexOf(Array array, object value)
+        {
+            int n = array.Length;
+            for (int i = 0; i < n; i++)
+            {
+                object element = array.GetValue(i);
+                if (value == null)
+                {
+                    if (element == null) return i;
+                }
+                else if (element != null && element.Equals(value))
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
         public static void Reverse(Array array)
         {
             int i = 0;

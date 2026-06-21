@@ -59,8 +59,11 @@ fn bind_namespace_body(
 ) {
     let scope = binder.import_scope();
     for using in usings {
-        if let UsingKind::Namespace(name) = &using.kind {
-            binder.import_namespace(&dotted(name));
+        match &using.kind {
+            UsingKind::Namespace(name) => binder.import_namespace(&dotted(name)),
+            UsingKind::Alias { name, target } => {
+                binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
+            }
         }
     }
     for member in members {

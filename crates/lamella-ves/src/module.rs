@@ -90,50 +90,50 @@ impl Method {
 #[derive(Clone, Default)]
 pub struct Module {
     methods: Vec<Method>,
-    by_token: BTreeMap<u32, MethodId>,
-    strings: BTreeMap<u32, Box<[u16]>>,
+    by_token: BTreeMap<u64, MethodId>,
+    strings: BTreeMap<u64, Box<[u16]>>,
     /// Declared reference types, indexed by [`TypeId`].
     types: Vec<TypeInfo>,
     /// A method's declaring type (so `newobj` can find the type to instantiate).
     method_type: BTreeMap<MethodId, TypeId>,
     /// An `ldfld`/`stfld` field token mapped to its instance-field slot.
-    field_slots: BTreeMap<u32, u32>,
+    field_slots: BTreeMap<u64, u32>,
     /// An instance-field token mapped to its declaring type, so a `stfld` through a
     /// managed pointer can size the value-type instance it materializes.
-    field_types: BTreeMap<u32, TypeId>,
+    field_types: BTreeMap<u64, TypeId>,
     /// A `newarr` element-type token mapped to its elements' zero value.
-    array_defaults: BTreeMap<u32, Value>,
+    array_defaults: BTreeMap<u64, Value>,
     /// A virtual method's vtable slot (only virtual methods appear).
     method_slots: BTreeMap<MethodId, u32>,
     /// A static field token mapped to its storage slot in the [`crate::interp::Vm`].
-    static_fields: BTreeMap<u32, usize>,
+    static_fields: BTreeMap<u64, usize>,
     /// The zero value of each static field, indexed by storage slot.
     static_defaults: Vec<Value>,
     /// The static constructors (`.cctor`), to run before the entry point.
     static_ctors: Vec<MethodId>,
     /// A `TypeDef` token mapped to its [`TypeId`] (for `castclass` / `isinst`).
-    type_tokens: BTreeMap<u32, TypeId>,
+    type_tokens: BTreeMap<u64, TypeId>,
     /// The reverse of `type_tokens`: a [`TypeId`] mapped to its declaring type's asm-folded
     /// `TypeDef` token (its `Type` handle), so `Object.GetType()` on a reference instance can
     /// hand back the same handle `typeof` / `Type.Name` use.
-    type_handles: BTreeMap<TypeId, u32>,
+    type_handles: BTreeMap<TypeId, u64>,
     /// A `callvirt` token mapped to its target's `(signature key, arg count)`, for
     /// dispatching interface / abstract methods whose target has no vtable slot (and
     /// may have no resolvable body).
-    call_targets: BTreeMap<u32, (String, u16)>,
+    call_targets: BTreeMap<u64, (String, u16)>,
     /// Explicit interface implementations (II.22.27 `MethodImpl`): the implementing body
     /// for a `(declaring TypeId, overridden method handle)` pair. The handle is the
     /// asm-folded token of the interface/virtual method named at the `callvirt` site (the
     /// `MethodImpl.MethodDeclaration`). An explicit body (`int IA.Value()`) is private and
     /// named after the interface, so it is reachable only through this map -- a plain
     /// signature match never finds it and cannot tell `IA.Value` from `IB.Value`.
-    explicit_overrides: BTreeMap<(TypeId, u32), MethodId>,
+    explicit_overrides: BTreeMap<(TypeId, u64), MethodId>,
     /// `newobj` tokens that construct a delegate (a delegate type's `.ctor`): instead
     /// of running a constructor, the (target, method) on the stack become a delegate.
-    delegate_ctors: BTreeSet<u32>,
+    delegate_ctors: BTreeSet<u64>,
     /// A delegate type's `Invoke` token mapped to its parameter count, so `callvirt` on
     /// it calls the delegate's bound method with the bound target.
-    delegate_invokes: BTreeMap<u32, u16>,
+    delegate_invokes: BTreeMap<u64, u16>,
     /// A value/reference type's `Finalize` method (a destructor), if it declares one --
     /// the finalizer the collector runs when an instance becomes unreachable. Kept
     /// unconditionally (it is tiny); the finalization machinery that consumes it is
@@ -141,19 +141,19 @@ pub struct Module {
     finalizers: BTreeMap<TypeId, MethodId>,
     /// Each enum type's constants (keyed by its `TypeDef` token): the underlying integer
     /// value mapped to the constant name, so `Enum.ToString` can render the name.
-    enum_constants: BTreeMap<u32, BTreeMap<i64, String>>,
+    enum_constants: BTreeMap<u64, BTreeMap<i64, String>>,
     /// Tokens of enum types whose underlying type is 64-bit (long / ulong), so `Enum.Parse`
     /// boxes their values as int64 to match the declared type.
-    enum_wide: BTreeSet<u32>,
+    enum_wide: BTreeSet<u64>,
     /// `newobj` tokens that construct a multi-dimensional array (an array TypeSpec's
     /// `.ctor`), mapped to the array's rank -- newobj allocates from that many lengths.
-    md_array_ctors: BTreeMap<u32, u16>,
+    md_array_ctors: BTreeMap<u64, u16>,
     /// `newobj` tokens that construct a `System.Text.StringBuilder`, mapped to the
     /// constructor's parameter count -- newobj allocates a builder (seeded from a string arg).
-    string_builder_ctors: BTreeMap<u32, u16>,
+    string_builder_ctors: BTreeMap<u64, u16>,
     /// `newobj` tokens that construct a `System.Collections.ArrayList`, mapped to the
     /// constructor's parameter count -- newobj allocates an empty array-backed list.
-    list_ctors: BTreeMap<u32, u16>,
+    list_ctors: BTreeMap<u64, u16>,
     /// Debug names keyed by method id: the qualified method name and the argument names
     /// in CIL slot order (`this` first for an instance method). Empty unless a loader
     /// records them; the debugger surfaces them on frames and in the arguments view.
@@ -176,28 +176,36 @@ pub struct Module {
     /// means an `Int32`-kind element boxes as `System.Int32` regardless of the narrower CTS
     /// element type -- precise enough for the comparison/interface surface and matching the
     /// element type of the `int[]` the accessor is exercised on.
-    primitive_int32_token: Option<u32>,
-    primitive_int64_token: Option<u32>,
-    primitive_native_int_token: Option<u32>,
+    primitive_int32_token: Option<u64>,
+    primitive_int64_token: Option<u64>,
+    primitive_native_int_token: Option<u64>,
     #[cfg(feature = "float")]
-    primitive_float_token: Option<u32>,
+    primitive_float_token: Option<u64>,
     /// `newobj` tokens whose declaring type is a value type (a struct): such a `newobj`
     /// must construct a struct VALUE in place (passing `this` by managed pointer to the
     /// ctor) and leave that value -- not a heap instance -- on the stack.
-    value_type_ctors: BTreeSet<u32>,
+    value_type_ctors: BTreeSet<u64>,
     /// The raw little-endian initializer bytes of a field with an RVA data blob, keyed by
     /// the field token, for `RuntimeHelpers.InitializeArray` (a `T[] a = {...}` of a
     /// constant primitive array). Sized to the declaring blob; the interpreter slices it
     /// per the array's element width.
-    field_rva_data: BTreeMap<u32, Box<[u8]>>,
+    field_rva_data: BTreeMap<u64, Box<[u8]>>,
     /// Type tokens (in `castclass` / `isinst` / `box` operands) classified by their external
     /// identity -- `System.Object` (a universal catch-all target) or `System.String` -- so a
     /// type test on a boxed value or a heap string is precise rather than unverified.
-    object_type_tokens: BTreeSet<u32>,
-    string_type_tokens: BTreeSet<u32>,
+    object_type_tokens: BTreeSet<u64>,
+    string_type_tokens: BTreeSet<u64>,
     /// The simple (unqualified) name of each `ldtoken`'d type, keyed by its asm-folded token,
     /// for `System.Type.get_Name` (a `typeof(T).Name`).
-    type_names: BTreeMap<u32, String>,
+    type_names: BTreeMap<u64, String>,
+    /// Each declared type's FULL name (`namespace.name`, or the bare `name` in the global
+    /// namespace), keyed by [`TypeId`]. The simple `type_names` above is keyed by token and is
+    /// enough for `Type.Name`; the exception TAG model needs the full name, because the tag is
+    /// FNV-1a over `namespace.name` and a bare `Exception` must NOT collide with
+    /// `System.Exception`. Populated by the loader alongside the type's other facts; used by
+    /// [`Self::exception_tag_of`] / [`Self::exception_base_chain`] so the interpreter's tags equal
+    /// the compiler's and AOT's for the same type.
+    type_full_names: BTreeMap<TypeId, String>,
     /// Each type's vtable slots as `(signature key, implementation)` pairs, in slot order,
     /// keyed by [`TypeId`] -- the loader's view of the vtable it also flattened into the
     /// MethodId-only [`TypeInfo::vtable`]. A type whose base is reached by a cross-assembly
@@ -211,18 +219,17 @@ pub struct Module {
     /// layout size, or a primitive's fixed width), keyed by its asm-folded token. The one
     /// fact `sizeof` (III.4.25) pushes; struct sizes come from the shared
     /// `lamella_metadata::value_type_layout`, so the interpreter, AOT, and GC agree.
-    type_sizes: BTreeMap<u32, u32>,
+    type_sizes: BTreeMap<u64, u32>,
 }
 
-/// Folds the assembly id into a token key. A token's high byte is its table tag; the largest is
-/// `#US` (user strings) = 0x70, which already has bit 30 set -- so only BIT 31 is free across every
-/// token kind, and it carries the assembly id for the two-assembly case (corlib = 0, program = 1).
-/// The earlier "top two bits" scheme collided `#US` (ldstr) tokens between the corlib and the
-/// program (e.g. the corlib's "False" with the program's "42"). Widen this to a u64
-/// (`asm << 32 | token`) key if more than two assemblies ever load together.
-pub(crate) fn asm_key(asm: u8, token: u32) -> u32 {
-    debug_assert!(asm < 2, "asm_key carries one bit; widen to a u64 key for >2 assemblies");
-    token | ((asm as u32) << 31)
+/// Folds the assembly id into a token key: the assembly in the HIGH 32 bits, the metadata token
+/// in the low 32. A `u64` key keeps every assembly's token space disjoint without overlapping the
+/// token's own table tag (the high byte of the 32-bit token), so up to 256 assemblies (a `u8` asm
+/// id) can be resolved simultaneously -- the incremental REPL needs three at once (corlib + the
+/// persistent `__Repl` + a running delta). The earlier single-bit `token | (asm << 31)` scheme
+/// capped this at two assemblies and would have collided a third's tokens with the first's.
+pub(crate) fn asm_key(asm: u8, token: u32) -> u64 {
+    ((asm as u64) << 32) | (token as u64)
 }
 
 /// Debug display names for one method: its qualified name and its argument names in CIL
@@ -390,6 +397,22 @@ impl Module {
         }
     }
 
+    /// Appends one instance field of zero value `default` to an ALREADY-LOADED `type_id`,
+    /// returning the new field's slot index (its position in the grown layout). This is the
+    /// incremental-REPL seam: a submission delta naming a `__Repl` field the persistent type
+    /// does not yet have grows the type by this one slot, and the caller grows the single live
+    /// instance to match ([`crate::Heap::grow_instance`]). Appending keeps every prior slot
+    /// stable, so a field's slot (and the values already stored there) never shifts. Returns
+    /// `None` if `type_id` is not a declared type.
+    pub fn add_type_field(&mut self, type_id: TypeId, default: Value) -> Option<u32> {
+        let info = self.types.get_mut(type_id as usize)?;
+        let slot = info.field_defaults.len() as u32;
+        let mut grown = Vec::from(core::mem::take(&mut info.field_defaults));
+        grown.push(default);
+        info.field_defaults = grown.into_boxed_slice();
+        Some(slot)
+    }
+
     /// Binds a `newarr` element-type token in assembly `asm` to the zero value its
     /// elements take.
     pub fn bind_array_default(&mut self, asm: u8, token: Token, default: Value) {
@@ -505,8 +528,16 @@ impl Module {
     /// assembly `asm`, if any.
     #[must_use]
     pub fn enum_value_name(&self, asm: u8, token: u32, value: i64) -> Option<&str> {
+        self.enum_value_name_by_handle(asm_key(asm, token), value)
+    }
+
+    /// The name of the constant with underlying `value` in the enum type identified by an
+    /// already-asm-folded `handle` (the box tag / `RuntimeTypeHandle` an intrinsic holds, so it
+    /// keys the map directly rather than re-folding a raw token).
+    #[must_use]
+    pub fn enum_value_name_by_handle(&self, handle: u64, value: i64) -> Option<&str> {
         self.enum_constants
-            .get(&asm_key(asm, token))
+            .get(&handle)
             .and_then(|constants| constants.get(&value))
             .map(String::as_str)
     }
@@ -521,8 +552,20 @@ impl Module {
         name: &str,
         ignore_case: bool,
     ) -> Option<i64> {
+        self.enum_value_by_name_handle(asm_key(asm, token), name, ignore_case)
+    }
+
+    /// The underlying value of the constant named `name` in the enum type identified by an
+    /// already-asm-folded `handle` -- the by-handle form for an intrinsic holding a folded tag.
+    #[must_use]
+    pub fn enum_value_by_name_handle(
+        &self,
+        handle: u64,
+        name: &str,
+        ignore_case: bool,
+    ) -> Option<i64> {
         self.enum_constants
-            .get(&asm_key(asm, token))?
+            .get(&handle)?
             .iter()
             .find_map(|(value, constant)| {
                 let matched = if ignore_case {
@@ -540,10 +583,11 @@ impl Module {
         self.enum_wide.insert(asm_key(asm, token));
     }
 
-    /// Whether the enum type `token` in assembly `asm` has a 64-bit underlying type.
+    /// Whether the enum type identified by an already-asm-folded `handle` has a 64-bit underlying
+    /// type (long / ulong) -- the by-handle form for an intrinsic holding a folded tag.
     #[must_use]
-    pub fn enum_is_wide(&self, asm: u8, token: u32) -> bool {
-        self.enum_wide.contains(&asm_key(asm, token))
+    pub fn enum_is_wide_by_handle(&self, handle: u64) -> bool {
+        self.enum_wide.contains(&handle)
     }
 
     /// Records the [`TypeId`] of `System.String`, so a `callvirt` on a heap string can supply
@@ -582,7 +626,7 @@ impl Module {
     /// when no corlib registered the kind (then the element boxes with a placeholder tag, as
     /// before).
     #[must_use]
-    pub fn primitive_type_token(&self, value: &Value) -> Option<u32> {
+    pub fn primitive_type_token(&self, value: &Value) -> Option<u64> {
         match value {
             Value::Int32(_) => self.primitive_int32_token,
             Value::Int64(_) => self.primitive_int64_token,
@@ -645,7 +689,7 @@ impl Module {
     /// what `Object.GetType()` hands back for a reference instance so a following `.Name`
     /// resolves through the same path `typeof(T).Name` uses.
     #[must_use]
-    pub fn type_handle_of(&self, type_id: TypeId) -> Option<u32> {
+    pub fn type_handle_of(&self, type_id: TypeId) -> Option<u64> {
         self.type_handles.get(&type_id).copied()
     }
 
@@ -659,7 +703,7 @@ impl Module {
     /// (A boxed value carries its value type's folded token; this maps it back to a [`TypeId`]
     /// so a cast on the box can consult the value type's implemented interfaces.)
     #[must_use]
-    pub fn type_id_by_handle(&self, handle: u32) -> Option<TypeId> {
+    pub fn type_id_by_handle(&self, handle: u64) -> Option<TypeId> {
         self.type_tokens.get(&handle).copied()
     }
 
@@ -678,13 +722,18 @@ impl Module {
         false
     }
 
-    /// Whether `type_id` implements `interface_id` -- directly, or by inheriting an
-    /// implementation from a base type. Walks `type_id`'s base chain (bounded by the type
-    /// count, like [`Self::is_subtype`]); a type matches when it lists `interface_id` among
-    /// the interfaces it implements (recorded by [`Self::set_type_interfaces`]).
+    /// Whether `type_id` implements `interface_id` -- directly, by inheriting an
+    /// implementation from a base type, or because an implemented interface itself extends
+    /// `interface_id`. Walks `type_id`'s base chain (a type matches when it lists
+    /// `interface_id` among the interfaces it implements, recorded by
+    /// [`Self::set_type_interfaces`]) AND the interface-extends-interface graph reachable
+    /// from each implemented interface.
     ///
     #[must_use]
     pub fn implements_interface(&self, type_id: TypeId, interface_id: TypeId) -> bool {
+        let mut visited = Vec::new();
+        let mut pending = Vec::new();
+
         let mut current = Some(type_id);
         for _ in 0..=self.types.len() {
             match current {
@@ -692,12 +741,31 @@ impl Module {
                     let Some(info) = self.types.get(id as usize) else {
                         break;
                     };
-                    if info.interfaces.contains(&interface_id) {
-                        return true;
+                    for &iface in &info.interfaces {
+                        if !pending.contains(&iface) {
+                            pending.push(iface);
+                        }
                     }
                     current = info.base;
                 }
                 None => break,
+            }
+        }
+
+        while let Some(iface) = pending.pop() {
+            if iface == interface_id {
+                return true;
+            }
+            if visited.contains(&iface) {
+                continue;
+            }
+            visited.push(iface);
+            if let Some(info) = self.types.get(iface as usize) {
+                for &base_iface in &info.interfaces {
+                    if !visited.contains(&base_iface) {
+                        pending.push(base_iface);
+                    }
+                }
             }
         }
         false
@@ -847,12 +915,12 @@ impl Module {
         self.field_rva_data.insert(asm_key(asm, token.0), data.into());
     }
 
-    /// The raw initializer bytes of a field token in assembly `asm`, if it has an RVA blob.
+    /// The raw initializer bytes of a field identified by an already-asm-folded `handle` (the
+    /// `RuntimeFieldHandle` an `ldtoken <field>` pushed), if it has an RVA blob -- keyed by the
+    /// handle directly, as the intrinsic holds the folded form.
     #[must_use]
-    pub fn field_rva(&self, asm: u8, token: Token) -> Option<&[u8]> {
-        self.field_rva_data
-            .get(&asm_key(asm, token.0))
-            .map(AsRef::as_ref)
+    pub fn field_rva_by_handle(&self, handle: u64) -> Option<&[u8]> {
+        self.field_rva_data.get(&handle).map(AsRef::as_ref)
     }
 
     /// Records that a type token in assembly `asm` names `System.Object` (a universal
@@ -887,8 +955,59 @@ impl Module {
     /// The simple name of a type token, keyed by its asm-folded value (the handle a
     /// `Type` intrinsic receives), if recorded.
     #[must_use]
-    pub fn type_name_by_handle(&self, handle: u32) -> Option<&str> {
+    pub fn type_name_by_handle(&self, handle: u64) -> Option<&str> {
         self.type_names.get(&handle).map(String::as_str)
+    }
+
+    /// Records `type_id`'s FULL name (`namespace.name`, or the bare `name` in the global
+    /// namespace), the form the exception TAG model hashes. The loader supplies this from
+    /// metadata so the interpreter's per-type tag equals the compiler's and the AOT image's.
+    pub fn bind_type_full_name(&mut self, type_id: TypeId, full_name: String) {
+        self.type_full_names.insert(type_id, full_name);
+    }
+
+    /// The full name (`namespace.name`) recorded for `type_id`, if any.
+    #[must_use]
+    pub fn type_full_name(&self, type_id: TypeId) -> Option<&str> {
+        self.type_full_names.get(&type_id).map(String::as_str)
+    }
+
+    /// The exception TAG of `type_id`: [`crate::exception::exception_tag`] of its full name. `None`
+    /// if no full name was recorded (so `0`, the no-exception sentinel, is never produced from a
+    /// missing name). Identical to `lamella_metadata::Assembly::exception_tag` for the same type,
+    /// so a thrown exception is identified the same way in the interpreter, the AOT image, and the
+    /// emitter -- the basis for crossing the AOT <-> interpreter boundary in mixed mode.
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    pub fn exception_tag_of(&self, type_id: TypeId) -> Option<u32> {
+        self.type_full_name(type_id)
+            .map(crate::exception::exception_tag)
+    }
+
+    /// `type_id`'s base-chain tag VECTOR -- `[tag(type_id), tag(base), ..., tag(System.Exception)]`,
+    /// leaf-first up the `extends` chain -- the membership vector a catch is tested against in mixed
+    /// mode. Walks the same base chain [`Self::is_subtype`] does (bounded by the type count, so
+    /// malformed cyclic metadata cannot loop forever); a type with no recorded full name contributes
+    /// no entry but the walk continues to its base. This vector and a live `is_subtype` walk give the
+    /// same catch verdict (`exception::tag_is_subtype(catch_tag, &chain)` == `is_subtype(thrown, catch)`),
+    /// the equivalence the AOT contract relies on.
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    pub fn exception_base_chain(&self, type_id: TypeId) -> Vec<u32> {
+        let mut chain = Vec::new();
+        let mut current = Some(type_id);
+        for _ in 0..=self.types.len() {
+            match current {
+                Some(id) => {
+                    if let Some(tag) = self.exception_tag_of(id) {
+                        chain.push(tag);
+                    }
+                    current = self.types.get(id as usize).and_then(|info| info.base);
+                }
+                None => break,
+            }
+        }
+        chain
     }
 
     /// Records the byte `size` of the type a `sizeof` operand token names in assembly `asm`
@@ -924,5 +1043,40 @@ mod tests {
         assert_eq!(module.arg_name(0, 3), None);
         assert_eq!(module.method_name(1), None);
         assert_eq!(module.arg_name(1, 0), None);
+    }
+
+    #[test]
+    fn implements_interface_walks_the_interface_extends_chain() {
+        let mut module = Module::new();
+        let ienumerable = module.add_type(Vec::new());
+        let icollection = module.add_type(Vec::new());
+        let ilist = module.add_type(Vec::new());
+        let idictionary = module.add_type(Vec::new());
+        let icomparer = module.add_type(Vec::new());
+        let array_list = module.add_type(Vec::new());
+        let hashtable = module.add_type(Vec::new());
+
+        module.set_type_interfaces(icollection, Vec::from([ienumerable]));
+        module.set_type_interfaces(ilist, Vec::from([icollection]));
+        module.set_type_interfaces(idictionary, Vec::from([icollection]));
+        module.set_type_interfaces(array_list, Vec::from([ilist]));
+        module.set_type_interfaces(hashtable, Vec::from([idictionary]));
+
+        assert!(module.implements_interface(array_list, ilist));
+        assert!(module.implements_interface(array_list, icollection));
+        assert!(module.implements_interface(array_list, ienumerable));
+        assert!(!module.implements_interface(array_list, icomparer));
+        assert!(!module.implements_interface(array_list, idictionary));
+
+        assert!(module.implements_interface(hashtable, idictionary));
+        assert!(module.implements_interface(hashtable, icollection));
+        assert!(module.implements_interface(hashtable, ienumerable));
+        assert!(!module.implements_interface(hashtable, ilist));
+
+        let derived = module.add_type(Vec::new());
+        module.set_type_base(derived, Some(array_list));
+        assert!(module.implements_interface(derived, ilist));
+        assert!(module.implements_interface(derived, ienumerable));
+        assert!(!module.implements_interface(derived, icomparer));
     }
 }

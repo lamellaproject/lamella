@@ -11,6 +11,7 @@ description = "A host-PC C# REPL that bootstrap-compiles each line with csc and 
 # file, shells out to csc, then loads and runs the resulting assembly on the
 # interpreter -- the same load-and-run path as lamella-load's run-assembly example.
 [dependencies]
+lamella-assemble = { path = "../lamella-assemble" }
 lamella-load = { path = "../lamella-load" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-ves = { path = "../lamella-ves" }

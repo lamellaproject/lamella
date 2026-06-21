@@ -302,6 +302,25 @@ impl ImageBuilder {
         );
     }
 
+    /// Adds a `CustomAttribute` row (II.22.10): the `value` blob (an attribute-argument
+    /// blob) attached to `parent` (a `HasCustomAttribute` token) and identified by
+    /// `constructor` (its `.ctor`, a MethodDef/MemberRef -- the `CustomAttributeType`).
+    ///
+    /// Rows may be added in any order; `finish` sorts the table by parent (a reader, e.g.
+    /// the CLR, binary-searches it by `HasCustomAttribute`). Used both for user attributes
+    /// and synthesized markers such as the AOT base-chain vector (`<ExceptionBaseChain>`).
+    pub fn add_custom_attribute(&mut self, parent: Token, constructor: Token, value: &[u8]) {
+        let blob = self.blobs.intern(value);
+        self.tables.add_row(
+            table::CUSTOM_ATTRIBUTE,
+            alloc::vec![
+                Column::Coded(CodedIndex::HasCustomAttribute, parent),
+                Column::Coded(CodedIndex::CustomAttributeType, constructor),
+                Column::BlobRef(blob),
+            ],
+        );
+    }
+
     /// Adds a `Property` row (flags, name, the property-signature blob), returning
     /// its token. Add a type's properties right after its accessor methods.
     pub fn add_property(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {
@@ -330,8 +349,36 @@ impl ImageBuilder {
         );
     }
 
-    /// Links an accessor method to its property via a `MethodSemantics` row
-    /// (II.22.28). `semantics` is `0x1` for a setter, `0x2` for a getter.
+    /// Adds an `Event` row (II.22.13): flags, name, and the event's delegate type as a
+    /// `TypeDefOrRef`. Add a type's events right after its accessor methods. Returns its
+    /// token, which is also the `HasSemantics` parent of its add/remove accessors.
+    pub fn add_event(&mut self, name: &str, event_type: Token) -> Token {
+        let name = self.strings.intern(name);
+        let row = self.tables.add_row(
+            table::EVENT,
+            alloc::vec![
+                Column::U16(0),
+                Column::StringRef(name),
+                Column::Coded(CodedIndex::TypeDefOrRef, event_type),
+            ],
+        );
+        Token::new(table::EVENT, row)
+    }
+
+    /// Maps a type to its first `Event` row (II.22.12), so the type's event range is known.
+    /// Call once per type that declares an event.
+    pub fn add_event_map(&mut self, type_token: Token, first_event: Token) {
+        self.tables.add_row(
+            table::EVENT_MAP,
+            alloc::vec![
+                Column::Index(table::TYPE_DEF, type_token.row()),
+                Column::Index(table::EVENT, first_event.row()),
+            ],
+        );
+    }
+
+    /// Links an accessor method to its property or event via a `MethodSemantics` row
+    /// (II.22.28). `semantics` is `0x1` setter, `0x2` getter, `0x8` addon, `0x10` removeon.
     pub fn add_method_semantics(&mut self, semantics: u16, method: Token, property: Token) {
         self.tables.add_row(
             table::METHOD_SEMANTICS,
@@ -534,6 +581,7 @@ impl ImageBuilder {
         codeview: Option<Vec<u8>>,
     ) -> Vec<u8> {
         align4(&mut self.bodies);
+        self.tables.sort_by_coded_parent(table::CUSTOM_ATTRIBUTE);
         let tables = self.tables.serialize(HeapSizes::default());
         let strings = self.strings.into_bytes();
         let guids = self.guids.into_bytes();
@@ -631,5 +679,28 @@ mod tests {
         let pdb = builder.build_pdb("App.cs", main);
         assert_eq!(&pdb[0..4], b"BSJB");
         assert!(pdb.windows(20).any(|window| window == builder.pdb_id()));
+    }
+
+    #[test]
+    fn exception_base_chain_attribute_round_trips() {
+        let mut builder = ImageBuilder::new("test.dll", "test");
+        let marker = builder.type_ref("", "<ExceptionBaseChain>");
+        let ctor_sig = method_signature(true, &[], &TypeSig::Void);
+        let marker_ctor = builder.member_ref(marker, ".ctor", &ctor_sig);
+        let exception = builder.type_ref("System", "DivideByZeroException");
+        let chain = [0xAAAA_AAAAu32, 0xBBBB_BBBB, 0xCCCC_CCCC];
+        builder.add_custom_attribute(
+            exception,
+            marker_ctor,
+            &lamella_metadata::encode_exception_base_chain(&chain),
+        );
+        let pe = builder.finish(Token::new(0, 0), true);
+
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+        assert_eq!(
+            assembly.exception_base_chain(exception),
+            Some(chain.to_vec())
+        );
+        assert_eq!(assembly.exception_base_chain(marker), None);
     }
 }

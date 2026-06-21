@@ -65,6 +65,22 @@ pub enum ExceptionHandlerKind {
     Fault,
 }
 
+/// The exception tag for a type's `namespace` + `name`: FNV-1a 32-bit over the full name
+/// (`"System" + "." + "DivideByZeroException"`), the high bit forced so every tag is a
+/// nonzero failure value. The AOT computes a catch/throw tag from a token via
+/// [`Assembly::exception_tag`]; the compiler computes a base-chain vector's tags by name
+/// with this same function -- both agree because the formula is one.
+#[must_use]
+pub fn exception_tag_for_name(namespace: &str, name: &str) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    if !namespace.is_empty() {
+        hash = fnv1a32(hash, namespace.as_bytes());
+        hash = fnv1a32(hash, b".");
+    }
+    hash = fnv1a32(hash, name.as_bytes());
+    hash | 0x8000_0000
+}
+
 /// FNV-1a 32-bit, folding `bytes` into the running `hash` (seed with the FNV offset basis).
 fn fnv1a32(hash: u32, bytes: &[u8]) -> u32 {
     let mut hash = hash;
@@ -73,6 +89,40 @@ fn fnv1a32(hash: u32, bytes: &[u8]) -> u32 {
         hash = hash.wrapping_mul(0x0100_0193);
     }
     hash
+}
+
+/// Encodes an exception base-chain tag vector as the `<ExceptionBaseChain>` attribute value
+/// blob the compiler emits: a standard custom-attribute blob (II.23.3) for a single `uint[]`
+/// positional argument -- a `0x0001` prolog, the array length, the little-endian `u32` tags,
+/// then a zero named-argument count. The inverse of [`Assembly::exception_base_chain`]'s
+/// decode, kept here so the emit and read sides share one format.
+#[must_use]
+pub fn encode_exception_base_chain(tags: &[u32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(8 + tags.len() * 4);
+    blob.extend_from_slice(&0x0001u16.to_le_bytes());
+    blob.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+    for tag in tags {
+        blob.extend_from_slice(&tag.to_le_bytes());
+    }
+    blob.extend_from_slice(&0x0000u16.to_le_bytes());
+    blob
+}
+
+/// Decodes a `<ExceptionBaseChain>` attribute value blob produced by
+/// [`encode_exception_base_chain`]. `None` if the blob is malformed.
+fn decode_exception_base_chain(blob: &[u8]) -> Option<Vec<u32>> {
+    if blob.len() < 6 || blob[0] != 0x01 || blob[1] != 0x00 {
+        return None;
+    }
+    let count = u32::from_le_bytes(blob[2..6].try_into().ok()?) as usize;
+    let mut tags = Vec::with_capacity(count);
+    let mut offset = 6;
+    for _ in 0..count {
+        let bytes = blob.get(offset..offset + 4)?;
+        tags.push(u32::from_le_bytes(bytes.try_into().ok()?));
+        offset += 4;
+    }
+    Some(tags)
 }
 
 /// A method a call token resolves to ([`Assembly::resolve_method`]): its name,
@@ -500,13 +550,31 @@ impl<'a> Assembly<'a> {
         let Some(name) = self.type_token_name(type_token) else {
             return 0;
         };
-        let mut hash = 0x811c_9dc5u32;
-        if !name.namespace.is_empty() {
-            hash = fnv1a32(hash, name.namespace.as_bytes());
-            hash = fnv1a32(hash, b".");
+        exception_tag_for_name(name.namespace, name.name)
+    }
+
+    /// The AOT exception base-chain tag vector for `type_token` -- `[tag(T), tag(base(T)),
+    /// ..., tag(System.Exception)]`, leaf first -- read from the `<ExceptionBaseChain>`
+    /// custom attribute the compiler emits on a referenced (BCL) exception type. The tags
+    /// use the same formula as [`Assembly::exception_tag`].
+    ///
+    /// `None` for a type with no such attribute -- an in-program exception, whose chain the
+    /// AOT walks itself via `extends()`. The middle-base `catch (BaseType)` subtype test is
+    /// `catch_tag`'s membership in this vector (exact-match and catch-all need only the tag).
+    #[must_use]
+    pub fn exception_base_chain(&self, type_token: Token) -> Option<Vec<u32>> {
+        for attribute in self.custom_attributes(type_token) {
+            let is_chain = self
+                .resolve_method(attribute.constructor)
+                .and_then(|method| method.declaring_type)
+                .is_some_and(|name| {
+                    name.namespace.is_empty() && name.name == "<ExceptionBaseChain>"
+                });
+            if is_chain {
+                return decode_exception_base_chain(attribute.value);
+            }
         }
-        hash = fnv1a32(hash, name.name.as_bytes());
-        hash | 0x8000_0000
+        None
     }
 
     /// The custom attributes applied to `parent`, from the `CustomAttribute`
@@ -1159,6 +1227,12 @@ impl<'a> TypeRef<'a> {
             .tables
             .row(table::TYPE_REF, self.index)
             .map_or(Token::new(0, 0), |row| row.token(0))
+    }
+
+    /// This referenced type's `TypeRef` metadata token.
+    #[must_use]
+    pub fn token(&self) -> Token {
+        Token::new(table::TYPE_REF, self.index)
     }
 }
 
