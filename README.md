@@ -16,9 +16,11 @@ To be notified when releases are available, click **Watch** at the top of this r
 
 ## About the name
 
-**A lamella** is a thin layer of bone matrix--the composable building block that gives bone its extraordinary strength. The Lamella project brings the same approach to C#: decomposing the ECMA-335 Common Language Infrastructure into composable pieces that can be assembled to compile, interpret, and AOT-compile C# for resource-constrained targets.
+A **lamella** is a thin layer of bone matrix--the composable building block that gives bone its extraordinary strength. The Lamella project brings the same approach to C#: decomposing the ECMA-335 Common Language Infrastructure into composable pieces that can be assembled to run C# programs on resource-constrained targets, either interpreted or native-compiled (AOT).
 
-**LAMELLA** also works as a sufficiently-nerdy acronym: Layered Architecture for Managed Embedded Low-Level Applications. No, nobody should actually try to memorize that; just call it Lamella.
+In Spanish, *la mella* means "the gap." Filling gaps is what Lamella is for: bringing C# to the places it couldn't run before, including the bare metal of sub-$1 microcontrollers. And *hacer mella* means "to make an impact," which is a goal for this project, in the classroom and on the workbench. Lamella gives students and adult hobbyists engineering-grade tools to explore electronics, with the power of C# behind them.
+
+**LAMELLA** also works as a sufficiently nerdy acronym: Layered Architecture for Managed Embedded Low-Level Applications. Nobody should actually try to memorize that; just call it Lamella.
 
 ## License
 
