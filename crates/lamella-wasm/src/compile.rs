@@ -148,6 +148,7 @@ fn complete_json(source: &[u8], offset: usize, refs: &[u8]) -> Vec<u8> {
                 "label": &*item.label,
                 "kind": kind_label(item.kind),
                 "detail": &*item.detail,
+                "insertText": &*item.insert_text,
             })
         })
         .collect();
@@ -161,6 +162,7 @@ fn kind_label(kind: lamella_binder::CompletionKind) -> &'static str {
         CompletionKind::Property => "property",
         CompletionKind::Method => "method",
         CompletionKind::Type => "type",
+        CompletionKind::Namespace => "namespace",
         CompletionKind::Local => "local",
         CompletionKind::Parameter => "parameter",
         CompletionKind::Keyword => "keyword",
@@ -190,6 +192,105 @@ pub unsafe extern "C" fn lamella_complete(
         unsafe { core::slice::from_raw_parts(refs_ptr, refs_len) }
     };
     result_buffer(complete_json(source, offset, refs))
+}
+
+/// Builds hover JSON (`{ kind, signature }`, or `{}` for no symbol) for the caret at byte
+/// `offset` in `source`, against `refs` -- the same parse/model build as `complete_json`.
+fn hover_json(source: &[u8], offset: usize, refs: &[u8]) -> Vec<u8> {
+    let source = core::str::from_utf8(source).unwrap_or("");
+    let unit = lamella_syntax::parser::parse_compilation_unit(source).unit;
+    let mut model = lamella_binder::Model::new();
+    for blob in split_refs(refs) {
+        if let Ok(assembly) = Assembly::read(blob) {
+            lamella_binder::load_assembly(&mut model, &assembly);
+        }
+    }
+    lamella_binder::collect_into(&mut model, &unit);
+    model.link_bases();
+    let json = match lamella_binder::hover(source, &unit, &model, offset) {
+        Some(info) => serde_json::json!({
+            "kind": kind_label(info.kind),
+            "signature": &*info.signature,
+        }),
+        None => serde_json::json!({}),
+    };
+    serde_json::to_vec(&json).unwrap_or_default()
+}
+
+/// Builds signature-help JSON (`{ signatures, activeParameter }`, or `{}` when not inside
+/// a call) for the caret at byte `offset` in `source`, against `refs`.
+fn signature_help_json(source: &[u8], offset: usize, refs: &[u8]) -> Vec<u8> {
+    let source = core::str::from_utf8(source).unwrap_or("");
+    let unit = lamella_syntax::parser::parse_compilation_unit(source).unit;
+    let mut model = lamella_binder::Model::new();
+    for blob in split_refs(refs) {
+        if let Ok(assembly) = Assembly::read(blob) {
+            lamella_binder::load_assembly(&mut model, &assembly);
+        }
+    }
+    lamella_binder::collect_into(&mut model, &unit);
+    model.link_bases();
+    let json = match lamella_binder::signature_help(source, &unit, &model, offset) {
+        Some(help) => {
+            let signatures: Vec<&str> = help.signatures.iter().map(|sig| &**sig).collect();
+            serde_json::json!({
+                "signatures": signatures,
+                "activeParameter": help.active_parameter,
+            })
+        }
+        None => serde_json::json!({}),
+    };
+    serde_json::to_vec(&json).unwrap_or_default()
+}
+
+/// Hover information for the caret at byte `offset` in the C# at `src_ptr..src_ptr +
+/// src_len`, against the references packed at `refs_ptr..+refs_len`. Returns a
+/// `[u32 len][JSON]` buffer (free with `lamella_dealloc(result, 4 + len)`); the JSON is
+/// `{ kind, signature }`, or `{}` when the caret is not on a resolvable symbol.
+///
+/// # Safety
+/// Both pointer/length pairs must be buffers the host filled via prior `lamella_alloc`
+/// (a zero-length `refs` is allowed and means no references).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_hover(
+    src_ptr: *const u8,
+    src_len: usize,
+    offset: usize,
+    refs_ptr: *const u8,
+    refs_len: usize,
+) -> *mut u8 {
+    let source = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    let refs: &[u8] = if refs_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(refs_ptr, refs_len) }
+    };
+    result_buffer(hover_json(source, offset, refs))
+}
+
+/// Signature help for the caret at byte `offset` in the C# at `src_ptr..src_ptr +
+/// src_len`, against the references packed at `refs_ptr..+refs_len`. Returns a
+/// `[u32 len][JSON]` buffer (free with `lamella_dealloc(result, 4 + len)`); the JSON is
+/// `{ signatures, activeParameter }`, or `{}` when the caret is not inside a call.
+///
+/// # Safety
+/// Both pointer/length pairs must be buffers the host filled via prior `lamella_alloc`
+/// (a zero-length `refs` is allowed and means no references).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_signature_help(
+    src_ptr: *const u8,
+    src_len: usize,
+    offset: usize,
+    refs_ptr: *const u8,
+    refs_len: usize,
+) -> *mut u8 {
+    let source = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    let refs: &[u8] = if refs_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(refs_ptr, refs_len) }
+    };
+    result_buffer(signature_help_json(source, offset, refs))
 }
 
 #[cfg(test)]

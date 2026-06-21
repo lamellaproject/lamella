@@ -21,7 +21,9 @@ pub mod symbols;
 pub mod types;
 
 pub use bind::bind_type;
-pub use complete::{Completion, CompletionKind, complete};
+pub use complete::{
+    Completion, CompletionKind, Hover, SignatureHelp, complete, hover, signature_help,
+};
 pub use bound::{
     Binder, BoundExpr, BoundExprKind, ConversionKind, FieldReference, MethodReference,
     bind_expression,

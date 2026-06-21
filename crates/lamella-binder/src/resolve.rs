@@ -72,6 +72,14 @@ pub fn resolve_type(
                 resolved.into_array(*rank)
             }
         }
+        TypeSymbol::Pointer(element) => {
+            let resolved = resolve_type(table, element, diagnostics, span);
+            if resolved.is_error() {
+                TypeSymbol::Error
+            } else {
+                TypeSymbol::Pointer(alloc::boxed::Box::new(resolved))
+            }
+        }
     }
 }
 

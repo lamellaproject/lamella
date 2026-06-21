@@ -19,6 +19,8 @@ pub enum TypeSymbol {
         /// The number of dimensions (at least 1).
         rank: u8,
     },
+    /// An unsafe pointer type `T*` (III.1.1.5): a raw managed pointer to `element`.
+    Pointer(Box<TypeSymbol>),
     /// A type that could not be resolved; emitted with a diagnostic so binding
     /// continues.
     Error,
@@ -73,6 +75,7 @@ impl fmt::Display for TypeSymbol {
                 }
                 f.write_str("]")
             }
+            TypeSymbol::Pointer(element) => write!(f, "{element}*"),
             TypeSymbol::Error => f.write_str("<error>"),
         }
     }

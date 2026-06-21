@@ -5,15 +5,17 @@
 
 use crate::bind::bind_type;
 use crate::special::SpecialType;
-use crate::symbols::Model;
+use crate::symbols::{MethodSymbol, Model};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
     CompilationUnit, Member, NamespaceMember, Stmt, StmtKind, TypeDecl, TypeRef,
 };
+use lamella_syntax::version::{Feature, LanguageVersion};
 
 /// What a completion item names, so the IDE can pick an icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +28,8 @@ pub enum CompletionKind {
     Method,
     /// A type.
     Type,
+    /// A namespace (offered after a namespace qualifier, e.g. `System.` -> `Collections`).
+    Namespace,
     /// A local variable.
     Local,
     /// A method parameter.
@@ -37,17 +41,40 @@ pub enum CompletionKind {
 /// One completion suggestion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
-    /// The text shown/inserted (the member name).
+    /// The text shown in the list (the member name).
     pub label: Box<str>,
     /// The member category.
     pub kind: CompletionKind,
-    /// A short type/signature hint (the member's type or return type).
+    /// A short type/signature hint (the member's type, or a method's signature with an
+    /// overload count).
     pub detail: Box<str>,
+    /// The text to insert when the item is chosen. The bare name for most items; a
+    /// method inserts `name(` so the editor can offer signature help for the arguments.
+    pub insert_text: Box<str>,
+}
+
+impl Completion {
+    /// An item whose inserted text is just its label (a field, type, local, keyword,
+    /// namespace -- everything but a method).
+    fn simple(
+        label: impl Into<Box<str>>,
+        kind: CompletionKind,
+        detail: impl Into<Box<str>>,
+    ) -> Completion {
+        let label = label.into();
+        Completion {
+            insert_text: label.clone(),
+            label,
+            kind,
+            detail: detail.into(),
+        }
+    }
 }
 
 /// Completions for the caret at byte `offset` in `source`, given the parsed `unit` and
-/// the bound `model`. The first cut returns member completions at `receiver.`; other
-/// positions return an empty list (identifier-scope completion is a follow-up).
+/// the bound `model`. After a `.`, the receiver's members (a value/type) or the members
+/// of a namespace (`System.` -> its types and child namespaces); otherwise the names in
+/// scope. Generics (a C# 2.0 feature) are never offered for the 1.0 target.
 #[must_use]
 pub fn complete(
     source: &str,
@@ -55,12 +82,118 @@ pub fn complete(
     model: &Model,
     offset: usize,
 ) -> Vec<Completion> {
-    if let Some(receiver) = member_receiver(source, offset) {
-        return receiver_type(unit, model, offset, receiver)
-            .map(|ty| type_members(model, &ty))
-            .unwrap_or_default();
+    let mut items = if let Some(receiver) = receiver_expression(source, offset) {
+        qualified_completions(unit, model, offset, receiver)
+    } else {
+        scope_completions(source, unit, model, offset)
+    };
+    if !LanguageVersion::DEFAULT.supports(Feature::Generics) {
+        items.retain(|item| !item.label.contains('`'));
     }
-    scope_completions(source, unit, model, offset)
+    items
+}
+
+/// Completions after `<receiver>.`: the members of the receiver expression when it
+/// resolves to a typed value/type (a name `a`, a member chain `a.b.c`, or a call
+/// `Foo().Bar`), otherwise the members (types and child namespaces) of the namespace the
+/// text names.
+fn qualified_completions(
+    unit: &CompilationUnit,
+    model: &Model,
+    offset: usize,
+    receiver: &str,
+) -> Vec<Completion> {
+    if let Some(ty) = expression_type(unit, model, offset, receiver) {
+        return type_members(model, &ty);
+    }
+    namespace_members(model, receiver)
+}
+
+/// The type a dotted receiver expression resolves to. It splits on top-level dots (those
+/// outside any parentheses) into segments; each segment is a name or a call `name(...)`.
+/// The first segment is a local/parameter/field/type, or -- if a call -- a method of the
+/// enclosing type; each later segment is a member (field/property/method) of the type so
+/// far, a method or a call contributing its return type. `None` if any segment does not
+/// resolve. Covers `a`, `a.b.c`, `Foo()`, and `Foo().Bar` style receivers (20.x).
+fn expression_type(
+    unit: &CompilationUnit,
+    model: &Model,
+    offset: usize,
+    expression: &str,
+) -> Option<TypeSymbol> {
+    let mut segments = top_level_segments(expression).into_iter();
+    let (first, first_is_call) = segment_name(segments.next()?);
+    let mut ty = if first_is_call {
+        let (namespace, type_decl, _) = enclosing_method(unit, offset)?;
+        member_type(model, &type_symbol(&namespace, &type_decl.name), first)?
+    } else {
+        receiver_type(unit, model, offset, first)?
+    };
+    for segment in segments {
+        ty = member_type(model, &ty, segment_name(segment).0)?;
+    }
+    Some(ty)
+}
+
+/// Splits a receiver expression on dots that are not inside parentheses, so a call's
+/// argument list does not break the chain (`a.Foo(x.y).b` -> `a`, `Foo(x.y)`, `b`).
+fn top_level_segments(expression: &str) -> Vec<&str> {
+    let mut segments = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0;
+    for (index, byte) in expression.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'.' if depth == 0 => {
+                segments.push(&expression[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&expression[start..]);
+    segments
+}
+
+/// A segment's member name and whether it is a call: `Foo(args)` -> (`Foo`, true), a
+/// plain `Foo` -> (`Foo`, false).
+fn segment_name(segment: &str) -> (&str, bool) {
+    match segment.find('(') {
+        Some(paren) => (segment[..paren].trim(), true),
+        None => (segment.trim(), false),
+    }
+}
+
+/// The type of the member named `name` on `ty` or any base in its chain: a field's or
+/// property's type, or a method's return type (a method group resolves to its return
+/// type for the purpose of continuing a `.` chain). `None` if no such member exists.
+fn member_type(model: &Model, ty: &TypeSymbol, name: &str) -> Option<TypeSymbol> {
+    let mut current = model.get_by_symbol(&member_lookup_type(ty));
+    while let Some(info) = current {
+        if let Some(field) = info.find_field(name) {
+            return Some(field.ty.clone());
+        }
+        if let Some(property) = info.find_property(name) {
+            return Some(property.ty.clone());
+        }
+        if let Some(method) = info.methods_named(name).next() {
+            return Some(method.return_type.clone());
+        }
+        current = info.base.as_ref().and_then(|base| model.get_by_symbol(base));
+    }
+    None
+}
+
+/// The model type to look members up on: an array exposes `System.Array`; every other
+/// type is looked up as itself (a predefined type resolves to its `System.<Name>`).
+fn member_lookup_type(ty: &TypeSymbol) -> TypeSymbol {
+    match ty {
+        TypeSymbol::Array { .. } => {
+            TypeSymbol::Named([Box::from("System"), Box::from("Array")].into())
+        }
+        other => other.clone(),
+    }
 }
 
 /// Completions for an identifier position (not after `.`): the locals and parameters in
@@ -80,19 +213,19 @@ fn scope_completions(
         } = method
         {
             for parameter in parameters {
-                out.push(Completion {
-                    label: parameter.name.clone(),
-                    kind: CompletionKind::Parameter,
-                    detail: type_label(&bind_type(&parameter.ty)),
-                });
+                out.push(Completion::simple(
+                    parameter.name.clone(),
+                    CompletionKind::Parameter,
+                    type_label(&bind_type(&parameter.ty)),
+                ));
             }
             if let Some(body) = body {
                 walk_locals(body, &mut |ty, name| {
-                    out.push(Completion {
-                        label: name.into(),
-                        kind: CompletionKind::Local,
-                        detail: type_label(&bind_type(ty)),
-                    });
+                    out.push(Completion::simple(
+                        name,
+                        CompletionKind::Local,
+                        type_label(&bind_type(ty)),
+                    ));
                 });
             }
         }
@@ -103,20 +236,16 @@ fn scope_completions(
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for name in model.type_names() {
             if name.starts_with(prefix) && seen.insert(name.to_string()) {
-                out.push(Completion {
-                    label: name.into(),
-                    kind: CompletionKind::Type,
-                    detail: "type".into(),
-                });
+                out.push(Completion::simple(name, CompletionKind::Type, "type"));
             }
         }
     }
     for keyword in KEYWORDS {
-        out.push(Completion {
-            label: (*keyword).into(),
-            kind: CompletionKind::Keyword,
-            detail: "keyword".into(),
-        });
+        out.push(Completion::simple(
+            *keyword,
+            CompletionKind::Keyword,
+            "keyword",
+        ));
     }
     if !prefix.is_empty() {
         out.retain(|item| item.label.starts_with(prefix));
@@ -148,10 +277,12 @@ const KEYWORDS: &[&str] = &[
     "ulong", "unchecked", "unsafe", "ushort", "using", "virtual", "void", "volatile", "while",
 ];
 
-/// If the caret sits just after `<receiver>.<partial>`, the receiver identifier. Reads
-/// backwards over the partial member name, a `.`, then the receiver name. `None` when the
-/// caret is not in member-access position. Only a simple-identifier receiver for now.
-fn member_receiver(source: &str, offset: usize) -> Option<&str> {
+/// If the caret sits just after `<receiver>.<partial>`, the receiver expression text.
+/// Reads backwards over the partial member name, the `.`, then the receiver: a run of
+/// identifiers, dots, and balanced `(...)` call lists (`a`, `System.Collections`,
+/// `Foo()`, `a.Foo(x).b`). `None` when the caret is not in member-access position or the
+/// parentheses are unbalanced.
+fn receiver_expression(source: &str, offset: usize) -> Option<&str> {
     let bytes = source.as_bytes();
     let mut index = offset.min(bytes.len());
     while index > 0 && is_ident_byte(bytes[index - 1]) {
@@ -160,15 +291,79 @@ fn member_receiver(source: &str, offset: usize) -> Option<&str> {
     if index == 0 || bytes[index - 1] != b'.' {
         return None;
     }
-    let dot = index - 1;
-    let mut start = dot;
-    while start > 0 && is_ident_byte(bytes[start - 1]) {
-        start -= 1;
+    let end = index - 1;
+    let mut start = end;
+    while start > 0 {
+        let byte = bytes[start - 1];
+        if is_ident_byte(byte) || byte == b'.' {
+            start -= 1;
+        } else if byte == b')' {
+            let mut depth = 0;
+            loop {
+                if start == 0 {
+                    return None;
+                }
+                start -= 1;
+                match bytes[start] {
+                    b')' => depth += 1,
+                    b'(' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            break;
+        }
     }
-    if start == dot {
+    let receiver = source.get(start..end)?.trim();
+    if receiver.is_empty() || receiver.starts_with('.') {
         return None;
     }
-    source.get(start..dot)
+    Some(receiver)
+}
+
+/// The members of the namespace `namespace`: the simple names of the types declared
+/// directly in it, plus its immediate child namespace segments (`System` -> `Console`,
+/// `String`, ..., and `Collections`, `IO`, ...). Deduplicated.
+fn namespace_members(model: &Model, namespace: &str) -> Vec<Completion> {
+    let mut out = Vec::new();
+    let mut seen_types: BTreeSet<&str> = BTreeSet::new();
+    let mut seen_namespaces: BTreeSet<&str> = BTreeSet::new();
+    for (type_namespace, name) in model.type_keys() {
+        if type_namespace == namespace {
+            if seen_types.insert(name) {
+                out.push(Completion::simple(name, CompletionKind::Type, "type"));
+            }
+        } else if let Some(child) = child_namespace_segment(namespace, type_namespace) {
+            if seen_namespaces.insert(child) {
+                out.push(Completion::simple(
+                    child,
+                    CompletionKind::Namespace,
+                    "namespace",
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The immediate child segment of `namespace` along `candidate`, or `None` if
+/// `candidate` is not a strict descendant. `("System", "System.Collections.Generic")`
+/// -> `"Collections"`; an empty `namespace` takes the first segment of `candidate`.
+fn child_namespace_segment<'a>(namespace: &str, candidate: &'a str) -> Option<&'a str> {
+    let rest = if namespace.is_empty() {
+        candidate
+    } else {
+        candidate.strip_prefix(namespace)?.strip_prefix('.')?
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.split('.').next().unwrap_or(rest))
 }
 
 fn is_ident_byte(byte: u8) -> bool {
@@ -375,54 +570,319 @@ fn special_keyword(name: &str) -> Option<SpecialType> {
     })
 }
 
-/// The accessible members of `ty` and every base in its chain, de-duplicated by name
-/// (a derived member hides a base one of the same name). Arrays expose `System.Array`.
+/// A method group accumulated across a type's base chain: the most-derived overload's
+/// signature for display, the set of distinct overload signatures (so an override across
+/// levels counts once), and the overload count.
+struct MethodGroup {
+    signature: String,
+    seen_signatures: BTreeSet<String>,
+    count: usize,
+}
+
+/// The accessible members of `ty` and every base in its chain. Fields and properties
+/// dedup by name (a derived member hides a base one); methods of the same name collapse
+/// to one entry that reports its overload count, and a value member shadows a method
+/// group of the same name. Arrays expose `System.Array`. Each method inserts `name(`.
 fn type_members(model: &Model, ty: &TypeSymbol) -> Vec<Completion> {
     let mut out = Vec::new();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-    let lookup = match ty {
-        TypeSymbol::Array { .. } => {
-            TypeSymbol::Named([Box::from("System"), Box::from("Array")].into())
-        }
-        other => other.clone(),
-    };
-    let mut current = model.get_by_symbol(&lookup);
+    let mut values: BTreeSet<String> = BTreeSet::new();
+    let mut method_order: Vec<Box<str>> = Vec::new();
+    let mut method_groups: BTreeMap<String, MethodGroup> = BTreeMap::new();
+
+    let mut current = model.get_by_symbol(&member_lookup_type(ty));
     while let Some(info) = current {
         for field in &info.fields {
-            if seen.insert(field.name.to_string()) {
-                out.push(Completion {
-                    label: field.name.clone(),
-                    kind: CompletionKind::Field,
-                    detail: type_label(&field.ty),
-                });
+            if values.insert(field.name.to_string()) && !method_groups.contains_key(&*field.name) {
+                out.push(Completion::simple(
+                    field.name.clone(),
+                    CompletionKind::Field,
+                    type_label(&field.ty),
+                ));
             }
         }
         for property in &info.properties {
-            if seen.insert(property.name.to_string()) {
-                out.push(Completion {
-                    label: property.name.clone(),
-                    kind: CompletionKind::Property,
-                    detail: type_label(&property.ty),
-                });
+            if values.insert(property.name.to_string())
+                && !method_groups.contains_key(&*property.name)
+            {
+                out.push(Completion::simple(
+                    property.name.clone(),
+                    CompletionKind::Property,
+                    type_label(&property.ty),
+                ));
             }
         }
         for method in &info.methods {
-            if seen.insert(method.name.to_string()) {
-                out.push(Completion {
-                    label: method.name.clone(),
-                    kind: CompletionKind::Method,
-                    detail: type_label(&method.return_type),
+            if values.contains(&*method.name) {
+                continue;
+            }
+            let signature = method_signature_label(method);
+            let group = method_groups
+                .entry(method.name.to_string())
+                .or_insert_with(|| {
+                    method_order.push(method.name.clone());
+                    MethodGroup {
+                        signature: signature.clone(),
+                        seen_signatures: BTreeSet::new(),
+                        count: 0,
+                    }
                 });
+            if group.seen_signatures.insert(signature) {
+                group.count += 1;
             }
         }
         current = info.base.as_ref().and_then(|base| model.get_by_symbol(base));
     }
+
+    for name in &method_order {
+        let group = &method_groups[&**name];
+        let detail = if group.count > 1 {
+            format!("{} (+{} overloads)", group.signature, group.count - 1)
+        } else {
+            group.signature.clone()
+        };
+        out.push(Completion {
+            label: name.clone(),
+            kind: CompletionKind::Method,
+            detail: detail.into(),
+            insert_text: format!("{name}(").into(),
+        });
+    }
     out
+}
+
+/// A method's display signature, `ReturnType Name(ParamType, ...)` -- parameter types
+/// only (the model does not keep parameter names for overload display).
+fn method_signature_label(method: &MethodSymbol) -> String {
+    let mut label = String::new();
+    label.push_str(&type_label(&method.return_type));
+    label.push(' ');
+    label.push_str(&method.name);
+    label.push('(');
+    for (index, parameter) in method.parameters.iter().enumerate() {
+        if index > 0 {
+            label.push_str(", ");
+        }
+        label.push_str(&type_label(parameter));
+    }
+    label.push(')');
+    label
 }
 
 /// A short display label for a type (its simple name).
 fn type_label(ty: &TypeSymbol) -> Box<str> {
     ty.to_string().into()
+}
+
+/// Hover information for the symbol at a caret offset: its category and a one-line
+/// signature (a value's `Type name`, a method's `ReturnType Name(types)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hover {
+    /// The symbol category.
+    pub kind: CompletionKind,
+    /// A one-line description: a typed name, a method signature, or a type/keyword note.
+    pub signature: Box<str>,
+}
+
+/// Describes the symbol at byte `offset`: a member access `recv.Name`, a local or
+/// parameter, a member of the enclosing type, a type name, or a keyword. `None` when the
+/// caret is not on a resolvable identifier.
+#[must_use]
+pub fn hover(source: &str, unit: &CompilationUnit, model: &Model, offset: usize) -> Option<Hover> {
+    let (start, end) = identifier_span(source, offset)?;
+    let name = source.get(start..end)?;
+    let bytes = source.as_bytes();
+    if start > 0 && bytes[start - 1] == b'.' {
+        let receiver = receiver_expression(source, start)?;
+        let ty = expression_type(unit, model, offset, receiver)?;
+        return describe_member(model, &ty, name);
+    }
+    if let Some((namespace, type_decl, method)) = enclosing_method(unit, offset) {
+        if let Member::Method {
+            parameters, body, ..
+        } = method
+        {
+            for parameter in parameters {
+                if &*parameter.name == name {
+                    return Some(Hover {
+                        kind: CompletionKind::Parameter,
+                        signature: typed_name(&bind_type(&parameter.ty), name),
+                    });
+                }
+            }
+            if let Some(body) = body {
+                if let Some(ty) = local_type(body, name) {
+                    return Some(Hover {
+                        kind: CompletionKind::Local,
+                        signature: typed_name(&bind_type(ty), name),
+                    });
+                }
+            }
+        }
+        if let Some(found) =
+            describe_member(model, &type_symbol(&namespace, &type_decl.name), name)
+        {
+            return Some(found);
+        }
+    }
+    if special_keyword(name).is_some() || model.type_with_simple_name(name).is_some() {
+        return Some(Hover {
+            kind: CompletionKind::Type,
+            signature: format!("type {name}").into(),
+        });
+    }
+    if KEYWORDS.contains(&name) {
+        return Some(Hover {
+            kind: CompletionKind::Keyword,
+            signature: format!("keyword {name}").into(),
+        });
+    }
+    None
+}
+
+/// A `Type name` description (a field, property, local, or parameter on hover).
+fn typed_name(ty: &TypeSymbol, name: &str) -> Box<str> {
+    format!("{} {name}", type_label(ty)).into()
+}
+
+/// Describes the member `name` on `ty` or a base: a field/property's typed name, or a
+/// method's signature with its overload count.
+fn describe_member(model: &Model, ty: &TypeSymbol, name: &str) -> Option<Hover> {
+    let mut current = model.get_by_symbol(&member_lookup_type(ty));
+    while let Some(info) = current {
+        if let Some(field) = info.find_field(name) {
+            return Some(Hover {
+                kind: CompletionKind::Field,
+                signature: typed_name(&field.ty, name),
+            });
+        }
+        if let Some(property) = info.find_property(name) {
+            return Some(Hover {
+                kind: CompletionKind::Property,
+                signature: typed_name(&property.ty, name),
+            });
+        }
+        if let Some(method) = info.methods_named(name).next() {
+            let overloads = info.methods_named(name).count();
+            let signature = method_signature_label(method);
+            let signature = if overloads > 1 {
+                format!("{signature} (+{} overloads)", overloads - 1)
+            } else {
+                signature
+            };
+            return Some(Hover {
+                kind: CompletionKind::Method,
+                signature: signature.into(),
+            });
+        }
+        current = info.base.as_ref().and_then(|base| model.get_by_symbol(base));
+    }
+    None
+}
+
+/// The identifier covering byte `offset` (its byte range), reading back and forward over
+/// identifier characters. `None` when the caret is not on an identifier.
+fn identifier_span(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut start = offset.min(bytes.len());
+    let mut end = start;
+    while start > 0 && is_ident_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    while end < bytes.len() && is_ident_byte(bytes[end]) {
+        end += 1;
+    }
+    (start != end).then_some((start, end))
+}
+
+/// Signature help for a call whose argument list the caret is inside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureHelp {
+    /// The overload signatures of the called method, most-derived first.
+    pub signatures: Vec<Box<str>>,
+    /// The zero-based index of the parameter the caret is on (the top-level comma count).
+    pub active_parameter: usize,
+}
+
+/// Signature help for the caret at `offset`: when it sits inside `Method(...)` -- either
+/// `Method(` (a method of the enclosing type) or `recv.Method(` -- the overloads of that
+/// method and which parameter the caret is on. `None` when not inside a call argument
+/// list or the method does not resolve.
+#[must_use]
+pub fn signature_help(
+    source: &str,
+    unit: &CompilationUnit,
+    model: &Model,
+    offset: usize,
+) -> Option<SignatureHelp> {
+    let (open_paren, active_parameter) = enclosing_call(source, offset)?;
+    let bytes = source.as_bytes();
+    let mut name_start = open_paren;
+    while name_start > 0 && is_ident_byte(bytes[name_start - 1]) {
+        name_start -= 1;
+    }
+    let name = source.get(name_start..open_paren)?;
+    if name.is_empty() {
+        return None;
+    }
+    let signatures = if name_start > 0 && bytes[name_start - 1] == b'.' {
+        let receiver = receiver_expression(source, name_start)?;
+        let ty = expression_type(unit, model, offset, receiver)?;
+        method_overloads(model, &ty, name)
+    } else {
+        let (namespace, type_decl, _) = enclosing_method(unit, offset)?;
+        method_overloads(model, &type_symbol(&namespace, &type_decl.name), name)
+    };
+    if signatures.is_empty() {
+        return None;
+    }
+    Some(SignatureHelp {
+        signatures,
+        active_parameter,
+    })
+}
+
+/// The open parenthesis of the innermost call the caret is inside and the active
+/// parameter index (top-level commas before the caret). `None` when the caret is not
+/// within an unclosed `(` on the current statement (a `;`/`{`/`}` at depth 0 ends it).
+fn enclosing_call(source: &str, offset: usize) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut index = offset.min(bytes.len());
+    let mut depth = 0i32;
+    let mut commas = 0usize;
+    while index > 0 {
+        index -= 1;
+        match bytes[index] {
+            b')' => depth += 1,
+            b'(' => {
+                if depth == 0 {
+                    return Some((index, commas));
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => commas += 1,
+            b';' | b'{' | b'}' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The distinct overload signatures of methods named `name` on `ty` or any base, most-
+/// derived first (an override across levels appears once).
+fn method_overloads(model: &Model, ty: &TypeSymbol, name: &str) -> Vec<Box<str>> {
+    let mut signatures = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut current = model.get_by_symbol(&member_lookup_type(ty));
+    while let Some(info) = current {
+        for method in info.methods_named(name) {
+            let signature = method_signature_label(method);
+            if seen.insert(signature.clone()) {
+                signatures.push(signature.into());
+            }
+        }
+        current = info.base.as_ref().and_then(|base| model.get_by_symbol(base));
+    }
+    signatures
 }
 
 #[cfg(test)]
@@ -450,6 +910,95 @@ mod tests {
         let labels = labels_at(source, "w.");
         assert!(labels.contains(&"Count".to_string()), "got {labels:?}");
         assert!(labels.contains(&"Area".to_string()), "got {labels:?}");
+    }
+
+    #[test]
+    fn completes_a_qualified_member_chain() {
+        let source = "class Point { public int X; public int Y; } \
+                      class Line { public Point Origin; } \
+                      class P { static int M() { Line line; return line.Origin.; } }";
+        let labels = labels_at(source, "line.Origin.");
+        assert!(labels.contains(&"X".to_string()), "got {labels:?}");
+        assert!(labels.contains(&"Y".to_string()), "got {labels:?}");
+    }
+
+    #[test]
+    fn completes_a_call_result_receiver() {
+        let source = "class Point { public int X; public int Y; } \
+                      class P { Point Make() { return new Point(); } \
+                      int M() { return Make().; } }";
+        let labels = labels_at(source, "Make().");
+        assert!(labels.contains(&"X".to_string()), "got {labels:?}");
+        assert!(labels.contains(&"Y".to_string()), "got {labels:?}");
+    }
+
+    #[test]
+    fn methods_carry_signatures_overload_counts_and_insert_text() {
+        let source = "class Widget { \
+                      public int Area() { return 0; } \
+                      public int Add(int a) { return a; } \
+                      public int Add(int a, int b) { return a + b; } } \
+                      class P { static int M() { Widget w; return w.; } }";
+        let unit = parse_compilation_unit(source).unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        model.link_bases();
+        let offset = source.find("w.").unwrap() + 2;
+        let items = complete(source, &unit, &model, offset);
+
+        let add = items.iter().find(|item| &*item.label == "Add").expect("Add");
+        assert_eq!(add.kind, CompletionKind::Method);
+        assert_eq!(&*add.insert_text, "Add(");
+        assert!(add.detail.contains("Add("), "got {:?}", add.detail);
+        assert!(add.detail.contains("overloads"), "got {:?}", add.detail);
+
+        let area = items.iter().find(|item| &*item.label == "Area").expect("Area");
+        assert_eq!(&*area.insert_text, "Area(");
+        assert!(area.detail.contains("Area()"), "got {:?}", area.detail);
+        assert!(!area.detail.contains("overloads"), "got {:?}", area.detail);
+    }
+
+    fn built_model(source: &str) -> (CompilationUnit, Model) {
+        let unit = parse_compilation_unit(source).unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        model.link_bases();
+        (unit, model)
+    }
+
+    #[test]
+    fn hover_describes_a_member_access_and_a_local() {
+        let source = "class Widget { public int Count; public int Area(int s) { return s; } } \
+                      class P { static int M() { Widget w; return w.Count; } }";
+        let (unit, model) = built_model(source);
+
+        let count = source.find("w.Count").unwrap() + "w.C".len();
+        let on_count = hover(source, &unit, &model, count).expect("hover Count");
+        assert_eq!(on_count.kind, CompletionKind::Field);
+        assert!(on_count.signature.contains("Count"), "got {:?}", on_count.signature);
+
+        let local = source.find("return w.Count").unwrap() + "return ".len();
+        let on_w = hover(source, &unit, &model, local).expect("hover w");
+        assert_eq!(on_w.kind, CompletionKind::Local);
+        assert!(on_w.signature.contains("Widget"), "got {:?}", on_w.signature);
+    }
+
+    #[test]
+    fn signature_help_lists_overloads_and_the_active_parameter() {
+        let source = "class Widget { \
+                      public int Add(int a) { return a; } \
+                      public int Add(int a, int b) { return a + b; } \
+                      int M(Widget w) { return w.Add(1, ); } }";
+        let (unit, model) = built_model(source);
+        let offset = source.find("w.Add(1, ").unwrap() + "w.Add(1, ".len();
+        let help = signature_help(source, &unit, &model, offset).expect("signature help");
+        assert_eq!(help.active_parameter, 1);
+        assert_eq!(help.signatures.len(), 2, "got {:?}", help.signatures);
+        assert!(
+            help.signatures.iter().all(|sig| sig.contains("Add(")),
+            "got {:?}",
+            help.signatures
+        );
     }
 
     #[test]
@@ -501,5 +1050,56 @@ mod tests {
         let labels = labels_at_offset(source, offset);
         assert!(labels.contains(&"while".to_string()), "got {labels:?}");
         assert!(!labels.contains(&"return".to_string()));
+    }
+
+    /// A model holding just the given `(namespace, simple name)` types, for the
+    /// namespace/version-gating completion tests.
+    fn model_with_types(types: &[(&str, &str)]) -> Model {
+        use crate::symbols::{TypeInfo, TypeKind};
+        let mut model = Model::new();
+        for (namespace, name) in types {
+            model.insert(TypeInfo::new(namespace, name, TypeKind::Class));
+        }
+        model.link_bases();
+        model
+    }
+
+    fn namespace_labels(model: &Model, source: &str) -> Vec<String> {
+        let unit = parse_compilation_unit(source).unit;
+        complete(source, &unit, model, source.len())
+            .iter()
+            .map(|item| item.label.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn completes_types_and_child_namespaces_of_a_namespace() {
+        let model = model_with_types(&[
+            ("System", "Console"),
+            ("System", "String"),
+            ("System.IO", "Stream"),
+            ("System.Collections", "ArrayList"),
+        ]);
+        let labels = namespace_labels(&model, "System.");
+        assert!(labels.contains(&"Console".to_string()), "got {labels:?}");
+        assert!(labels.contains(&"String".to_string()), "got {labels:?}");
+        assert!(labels.contains(&"IO".to_string()), "got {labels:?}");
+        assert!(labels.contains(&"Collections".to_string()), "got {labels:?}");
+        assert!(!labels.contains(&"Stream".to_string()), "got {labels:?}");
+    }
+
+    #[test]
+    fn generic_types_are_not_offered_for_the_1_0_target() {
+        let model = model_with_types(&[
+            ("System.Collections.Generic", "List`1"),
+            ("System.Collections.Generic", "Dictionary`2"),
+            ("System.Collections.Generic", "Marker"),
+        ]);
+        let labels = namespace_labels(&model, "System.Collections.Generic.");
+        assert!(
+            !labels.iter().any(|label| label.contains('`')),
+            "a generic leaked: {labels:?}"
+        );
+        assert!(labels.contains(&"Marker".to_string()), "got {labels:?}");
     }
 }

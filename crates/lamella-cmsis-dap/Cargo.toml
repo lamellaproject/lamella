@@ -16,6 +16,9 @@ default = ["usbhid"]
 # where the embedder supplies its own `Transport` (e.g. the browser's WebHID via a JS shim); the
 # protocol / ADIv5 logic and `Dap<T: Transport>` stay target-independent either way.
 usbhid = ["dep:lamella-usbhid"]
+# Exposes the `testing` module (the probe-protocol mock) to the device-specific extension crates
+# (lamella-cmsis-dap-sam, lamella-cmsis-dap-nrf) for their tests. Off by default; not in the shipped API.
+test-util = []
 
 [dependencies]
 lamella-usbhid = { path = "../lamella-usbhid", optional = true }

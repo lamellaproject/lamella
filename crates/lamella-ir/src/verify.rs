@@ -158,10 +158,10 @@ fn check_inst(
         Inst::Load { address } => {
             use_value(func, defined, *address, errors);
         }
-        Inst::Convert { value, .. } => {
+        Inst::Convert { value, kind } => {
             use_value(func, defined, *value, errors);
             if let Some(r) = result_ty {
-                expect(MirType::I32, r, errors);
+                expect(kind.result_type(), r, errors);
             }
         }
         Inst::Widen { value, .. } => {
@@ -205,6 +205,19 @@ fn check_inst(
                 expect(MirType::I32, r, errors);
             }
         }
+        Inst::StringConcat { lhs, rhs } => {
+            use_value(func, defined, *lhs, errors);
+            use_value(func, defined, *rhs, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::ObjectRef, r, errors);
+            }
+        }
+        Inst::IntToString { value } => {
+            use_value(func, defined, *value, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::ObjectRef, r, errors);
+            }
+        }
         Inst::Alloc { .. } => {
             if let Some(r) = result_ty {
                 expect(MirType::ObjectRef, r, errors);
@@ -228,6 +241,35 @@ fn check_inst(
         } => {
             use_value(func, defined, *array, errors);
             use_value(func, defined, *index, errors);
+            use_value(func, defined, *value, errors);
+        }
+        Inst::AllocArray2D { dim0, dim1, .. } => {
+            use_value(func, defined, *dim0, errors);
+            use_value(func, defined, *dim1, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::ObjectRef, r, errors);
+            }
+        }
+        Inst::Array2DLoad {
+            array,
+            index0,
+            index1,
+            ..
+        } => {
+            use_value(func, defined, *array, errors);
+            use_value(func, defined, *index0, errors);
+            use_value(func, defined, *index1, errors);
+        }
+        Inst::Array2DStore {
+            array,
+            index0,
+            index1,
+            value,
+            ..
+        } => {
+            use_value(func, defined, *array, errors);
+            use_value(func, defined, *index0, errors);
+            use_value(func, defined, *index1, errors);
             use_value(func, defined, *value, errors);
         }
         Inst::StaticLoad { .. } => {

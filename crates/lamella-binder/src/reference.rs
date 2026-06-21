@@ -6,6 +6,7 @@ use crate::symbols::{
 };
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 use lamella_metadata::tables::table;
 use lamella_metadata::{Assembly, SigType, TypeName};
@@ -13,14 +14,19 @@ use lamella_token::Token;
 
 /// Adds every type defined in `assembly` to `model`.
 pub fn load_assembly(model: &mut Model, assembly: &Assembly) {
+    let param_array = assembly.param_array_params();
     for type_def in assembly.type_defs() {
-        if let Some(info) = type_info(assembly, &type_def) {
+        if let Some(info) = type_info(assembly, &type_def, &param_array) {
             model.insert(info);
         }
     }
 }
 
-fn type_info(assembly: &Assembly, type_def: &lamella_metadata::TypeDef) -> Option<TypeInfo> {
+fn type_info(
+    assembly: &Assembly,
+    type_def: &lamella_metadata::TypeDef,
+    param_array: &BTreeSet<u32>,
+) -> Option<TypeInfo> {
     let TypeName { namespace, name } = type_def.name()?;
     if name == "<Module>" {
         return None;
@@ -50,6 +56,7 @@ fn type_info(assembly: &Assembly, type_def: &lamella_metadata::TypeDef) -> Optio
                 name: field_name.into(),
                 ty: sigtype_to_symbol(assembly, &signature),
                 is_static: false,
+                is_readonly: false,
                 accessibility: Accessibility::Public,
                 constant: None,
             });
@@ -68,7 +75,9 @@ fn type_info(assembly: &Assembly, type_def: &lamella_metadata::TypeDef) -> Optio
                 .map(|parameter| sigtype_to_symbol(assembly, parameter))
                 .collect(),
             is_static: !signature.has_this,
-            is_params: false,
+            is_params: method
+                .params()
+                .any(|parameter| param_array.contains(&parameter.token().row())),
             accessibility: Accessibility::Public,
         };
         let property = method_name

@@ -1,0 +1,19 @@
+[package]
+name = "lamella-repl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A host-PC C# REPL that bootstrap-compiles each line with csc and runs it on the lamella interpreter."
+
+# The REPL driver is a host CLI, so std is allowed here. It writes a temp source
+# file, shells out to csc, then loads and runs the resulting assembly on the
+# interpreter -- the same load-and-run path as lamella-load's run-assembly example.
+[dependencies]
+lamella-load = { path = "../lamella-load" }
+lamella-metadata = { path = "../lamella-metadata" }
+lamella-ves = { path = "../lamella-ves" }
+
+[lints]
+workspace = true

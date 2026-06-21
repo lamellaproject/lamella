@@ -127,6 +127,18 @@ pub enum BoundStmtKind {
         /// The guarded statement.
         body: Box<BoundStmt>,
     },
+    /// A `fixed` statement (unsafe, 15.7): `name` is bound to a pointer to the first
+    /// element of the pinned `init` (an array/string of `element` type) for the body.
+    Fixed {
+        /// The pointer variable bound for the body.
+        name: Box<str>,
+        /// The pointed-to (and array element) type, for `ldelema` and the pointer width.
+        element: TypeSymbol,
+        /// The pinned source array/string.
+        init: BoundExpr,
+        /// The guarded statement.
+        body: Box<BoundStmt>,
+    },
     /// A `checked` block (15.11).
     Checked(Box<BoundStmt>),
     /// An `unchecked` block (15.11).
@@ -361,6 +373,12 @@ impl Binder {
                 body: Box::new(self.bind_statement(body)),
             },
             StmtKind::Using { resource, body } => self.bind_using(resource, body),
+            StmtKind::Fixed {
+                ty,
+                name,
+                init,
+                body,
+            } => self.bind_fixed(ty, name, init, body),
             StmtKind::Checked(inner) => {
                 BoundStmtKind::Checked(Box::new(self.bind_statement(inner)))
             }
@@ -468,6 +486,33 @@ impl Binder {
         BoundStmtKind::Using { resource, body }
     }
 
+    /// Binds a `fixed (T* name = init) body`: `init` (an array/string) is pinned, and `name`
+    /// is a `T*` bound (definitely assigned) in the body's scope.
+    fn bind_fixed(
+        &mut self,
+        ty: &lamella_syntax::ast::TypeRef,
+        name: &str,
+        init: &Expr,
+        body: &Stmt,
+    ) -> BoundStmtKind {
+        let pointer_ty = self.resolve_named_type(&bind_type(ty), ty.span);
+        let element = match &pointer_ty {
+            TypeSymbol::Pointer(inner) => (**inner).clone(),
+            _ => TypeSymbol::Error,
+        };
+        let init = self.bind_expression(init);
+        self.enter_scope();
+        self.declare_local(name, pointer_ty);
+        let body = Box::new(self.bind_statement(body));
+        self.exit_scope();
+        BoundStmtKind::Fixed {
+            name: name.into(),
+            element,
+            init,
+            body,
+        }
+    }
+
     fn bind_for(
         &mut self,
         initializer: Option<&ForInitializer>,
@@ -539,7 +584,7 @@ impl Binder {
                     };
                 }
                 let value = self.bind_expression(expr);
-                self.check_convertible(&value.ty, &declared, declarator.span);
+                self.check_assignable(&value, &declared, declarator.span);
                 self.convert(value, &declared)
             });
             self.declare_local(&declarator.name, declared.clone());

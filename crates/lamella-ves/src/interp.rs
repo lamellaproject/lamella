@@ -145,6 +145,10 @@ struct Frame {
     /// the caller's stack when the frame returns (a ctor returns `void`, but the
     /// object reference is `newobj`'s result).
     new_object: Option<ObjectRef>,
+    /// Set on a value-type constructor frame (`newobj` of a struct): the location of the
+    /// temporary the ctor built in place, whose struct VALUE -- not a heap reference -- is
+    /// left on the caller's stack when the frame returns.
+    new_value: Option<Location>,
     /// The exception currently being handled in a catch block of this frame, so
     /// `rethrow` can re-propagate it.
     current_exception: Option<ObjectRef>,
@@ -159,6 +163,11 @@ struct Frame {
     /// A `constrained.` prefix awaiting the next `callvirt`: the type to resolve the call
     /// against (the receiver stays a managed pointer to the value type).
     pending_constraint: Option<Token>,
+    /// The frame's `localloc` (`stackalloc`) buffers: flat zeroed byte blocks a managed
+    /// pointer (`Location::Stack`) indexes into. They live as long as the frame and are
+    /// dropped with it on return, giving `stackalloc`'s lifetime. Empty for the common
+    /// method that allocates none.
+    buffers: Vec<Vec<u8>>,
 }
 
 /// What executing one instruction decided.
@@ -186,6 +195,18 @@ enum Flow {
         ctor: MethodId,
         /// The freshly allocated, zero-initialized object.
         object: ObjectRef,
+        /// The constructor arguments (without `this`), from the caller's stack.
+        args: Vec<Value>,
+    },
+    /// `newobj` of a value type: run its constructor against a managed pointer to a
+    /// zero-initialized struct temporary, then leave that struct's VALUE (not a heap
+    /// reference) on the caller's stack when it returns.
+    NewValueObj {
+        /// The constructor to run.
+        ctor: MethodId,
+        /// The managed pointer the ctor receives as `this` -- a temporary holding the
+        /// zero struct, whose value is read back on return.
+        location: Location,
         /// The constructor arguments (without `this`), from the caller's stack.
         args: Vec<Value>,
     },
@@ -311,7 +332,9 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
             Flow::Next => {}
             Flow::Return(result) => return Ok(result),
             Flow::Call { .. } => return Err(Trap::Unsupported(Opcode::Call)),
-            Flow::NewObj { .. } => return Err(Trap::Unsupported(Opcode::Newobj)),
+            Flow::NewObj { .. } | Flow::NewValueObj { .. } => {
+                return Err(Trap::Unsupported(Opcode::Newobj));
+            }
             Flow::Throw(_) => return Err(Trap::Unsupported(Opcode::Throw)),
             Flow::Leave(_) => return Err(Trap::Unsupported(Opcode::Leave)),
             Flow::EndFinally => return Err(Trap::Unsupported(Opcode::Endfinally)),
@@ -547,11 +570,16 @@ impl Session {
                         return Ok(Status::Running);
                     }
                 }
-                let returned_object = returned.and_then(|frame| frame.new_object);
+                let returned_object = returned.as_ref().and_then(|frame| frame.new_object);
+                let returned_value_location = returned.and_then(|frame| frame.new_value);
+                let returned_struct = returned_value_location
+                    .map(|location| read_byref(frames, vm, location));
                 match frames.last_mut() {
                     Some(caller) => {
                         if let Some(object) = returned_object {
                             caller.stack.push(Value::Object(object));
+                        } else if let Some(structure) = returned_struct {
+                            caller.stack.push(structure);
                         } else if let Some(value) = value {
                             caller.stack.push(value);
                         }
@@ -627,6 +655,34 @@ impl Session {
                         .ok_or(Trap::CallStackOverflow)?
                         .stack
                         .push(Value::Object(object));
+                    Ok(Status::Running)
+                }
+                None => Err(Trap::NoSuchMethod(ctor)),
+            },
+            Flow::NewValueObj {
+                ctor,
+                location,
+                args,
+            } => match module.method(ctor) {
+                Some(Method::Managed { .. }) => {
+                    if frames.len() >= MAX_CALL_DEPTH {
+                        return Err(Trap::CallStackOverflow);
+                    }
+                    let mut full_args = Vec::with_capacity(args.len() + 1);
+                    full_args.push(Value::ByRef(location.clone()));
+                    full_args.extend(args);
+                    let mut frame = new_frame(module, ctor, full_args)?;
+                    frame.new_value = Some(location);
+                    frames.push(frame);
+                    Ok(Status::Running)
+                }
+                Some(Method::Intrinsic { .. }) => {
+                    let value = read_byref(frames, vm, location);
+                    frames
+                        .last_mut()
+                        .ok_or(Trap::CallStackOverflow)?
+                        .stack
+                        .push(value);
                     Ok(Status::Running)
                 }
                 None => Err(Trap::NoSuchMethod(ctor)),
@@ -786,6 +842,7 @@ fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<
             Some(Value::Struct(fields)) => fields.get(slot as usize).cloned(),
             _ => None,
         },
+        Location::Stack { .. } => None,
     }
 }
 
@@ -840,6 +897,7 @@ fn write_location_value(
             }
             write_location_value(frames, vm, *base, Value::Struct(fields))
         }
+        Location::Stack { .. } => Err(Trap::Unsupported(Opcode::Stobj)),
     }
 }
 
@@ -865,6 +923,21 @@ fn deref_byref_args(frames: &[Frame], vm: &Vm, args: Vec<Value>) -> Vec<Value> {
             other => other,
         })
         .collect()
+}
+
+/// Truncates an integer being stored by `stind.i1` / `stind.i2` to its low 8 / 16 bits
+/// (ECMA-335 1st ed III.3.62), sign-extended back to the `int32` the slot holds -- so a
+/// later `ldind.i1` / `ldind.i2` reads the same narrowed value. A non-integer (or any other
+/// opcode) is passed through unchanged. C# pre-narrows with `conv.u1`/`conv.u2`, so this
+/// only bites on hand-written IL.
+fn narrow_stored_int(value: Value, opcode: Opcode) -> Value {
+    match (opcode, value) {
+        (Opcode::StindI1, Value::Int32(n)) => Value::Int32(i32::from(n as i8)),
+        (Opcode::StindI1, Value::NativeInt(n)) => Value::Int32(i32::from(n as i8)),
+        (Opcode::StindI2, Value::Int32(n)) => Value::Int32(i32::from(n as i16)),
+        (Opcode::StindI2, Value::NativeInt(n)) => Value::Int32(i32::from(n as i16)),
+        (_, value) => value,
+    }
 }
 
 /// The value a managed pointer refers to (for `ldobj` and intrinsic-argument deref);
@@ -1293,7 +1366,11 @@ fn step(
         | Opcode::MulOvf
         | Opcode::MulOvfUn => {
             let (a, b) = frame.pop2()?;
-            frame.stack.push(binary_numeric(opcode, a, b)?);
+            let result = match stack_pointer_arithmetic(opcode, &a, &b)? {
+                Some(pointer) => pointer,
+                None => binary_numeric(opcode, a, b)?,
+            };
+            frame.stack.push(result);
         }
         Opcode::DivUn | Opcode::RemUn | Opcode::And | Opcode::Or | Opcode::Xor => {
             let (a, b) = frame.pop2()?;
@@ -1481,27 +1558,22 @@ fn step(
                         .arg_count()
                 }
             };
-            let args = frame.take_args(arg_count)?;
+            let mut args = frame.take_args(arg_count)?;
             let sig_key = target_info.map(|(key, _)| key);
             let constraint = frame.pending_constraint.take();
             let runtime_type = match constraint {
                 Some(constraint) => module.type_id_of(asm, constraint),
-                None => {
-                    let this = object_ref(
-                        args.first().ok_or(Trap::StackUnderflow)?.clone(),
-                        Opcode::Callvirt,
-                    )?;
-                    vm.heap().type_of(this).or_else(|| {
-                        if vm.heap().is_string(this) {
-                            module.string_type_id()
-                        } else {
-                            None
-                        }
-                    })
-                }
+                None => match args.first().ok_or(Trap::StackUnderflow)? {
+                    Value::Object(this) => receiver_type_id(module, vm, *this),
+                    Value::Null => return Err(Trap::NullReference),
+                    _ => None,
+                },
             };
-            let method = resolve_callvirt(module, static_method, sig_key, runtime_type)
-                .ok_or(Trap::UnresolvedCall(token))?;
+            let explicit_override =
+                runtime_type.and_then(|type_id| module.explicit_override(asm, type_id, token));
+            let method =
+                resolve_callvirt(module, static_method, sig_key, runtime_type, explicit_override)
+                    .ok_or(Trap::UnresolvedCall(token))?;
             #[cfg(feature = "bcl")]
             if let Some(constraint) = constraint {
                 if is_object_to_string(module, method) {
@@ -1516,6 +1588,19 @@ fn step(
                                 return Ok(Flow::Next);
                             }
                         }
+                    }
+                    if let Some(name) = module.type_name_by_handle(asm_key(asm, constraint.0)) {
+                        let chars: Vec<u16> = name.encode_utf16().collect();
+                        let string = vm.heap_mut().alloc_string(&chars);
+                        frame.stack.push(Value::Object(string));
+                        return Ok(Flow::Next);
+                    }
+                }
+            }
+            if module.method_declares_value_type(method) {
+                if let Some(&Value::Object(reference)) = args.first() {
+                    if vm.heap().boxed_type_token(reference).is_some() {
+                        args[0] = Value::ByRef(Location::Boxed { object: reference });
                     }
                 }
             }
@@ -1555,17 +1640,18 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldvirtftn))?;
             let token = token_operand(instruction)?;
             let this = object_ref(frame.pop()?, Opcode::Ldvirtftn)?;
-            let runtime_type = vm.heap().type_of(this).or_else(|| {
-                if vm.heap().is_string(this) {
-                    module.string_type_id()
-                } else {
-                    None
-                }
-            });
+            let runtime_type = receiver_type_id(module, vm, this);
             let sig_key = module.call_target(asm, token).map(|(key, _)| key);
-            let method =
-                resolve_callvirt(module, module.resolve(asm, token), sig_key, runtime_type)
-                    .ok_or(Trap::UnresolvedCall(token))?;
+            let explicit_override =
+                runtime_type.and_then(|type_id| module.explicit_override(asm, type_id, token));
+            let method = resolve_callvirt(
+                module,
+                module.resolve(asm, token),
+                sig_key,
+                runtime_type,
+                explicit_override,
+            )
+            .ok_or(Trap::UnresolvedCall(token))?;
             frame.stack.push(Value::NativeInt(i64::from(method)));
         }
 
@@ -1633,6 +1719,15 @@ fn step(
                 .arg_count()
                 .saturating_sub(1);
             let args = frame.take_args(param_count)?;
+            if module.is_value_type_ctor(asm, token) {
+                let zero = Value::Struct(defaults.into_boxed_slice());
+                let temporary = vm.heap_mut().alloc_boxed(asm_key(asm, token.0), zero);
+                return Ok(Flow::NewValueObj {
+                    ctor,
+                    location: Location::Boxed { object: temporary },
+                    args,
+                });
+            }
             let object = vm.heap_mut().alloc_instance(type_id, defaults);
             #[cfg(feature = "finalizers")]
             if module.finalizer_of(type_id).is_some() {
@@ -1794,13 +1889,39 @@ fn step(
         | Opcode::LdindR4
         | Opcode::LdindR8
         | Opcode::LdindRef => match frame.pop()? {
+            Value::ByRef(Location::Stack {
+                frame: owner,
+                buffer,
+                offset,
+            }) => {
+                let width = indirect_width(opcode).ok_or(Trap::TypeMismatch(opcode))?;
+                if owner != frame_index {
+                    return Err(Trap::Unsupported(opcode));
+                }
+                let raw = frame
+                    .read_stack(buffer, offset, width)
+                    .ok_or(Trap::NullReference)?;
+                frame.stack.push(stack_loaded_value(opcode, raw)?);
+            }
             Value::ByRef(location) => return Ok(Flow::LoadObj { location }),
             Value::Null => return Err(Trap::NullReference),
             _ => return Err(Trap::TypeMismatch(Opcode::LdindI4)),
         },
-        Opcode::StindI1
-        | Opcode::StindI2
-        | Opcode::StindI4
+        Opcode::StindI1 | Opcode::StindI2 => {
+            let value = frame.pop()?;
+            match frame.pop()? {
+                Value::ByRef(location @ Location::Stack { .. }) => {
+                    store_stack_indirect(frame, frame_index, opcode, location, value)?;
+                }
+                Value::ByRef(location) => {
+                    let value = narrow_stored_int(value, opcode);
+                    return Ok(Flow::StoreObj { location, value });
+                }
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::StindI4)),
+            }
+        }
+        Opcode::StindI4
         | Opcode::StindI8
         | Opcode::StindI
         | Opcode::StindR4
@@ -1808,6 +1929,9 @@ fn step(
         | Opcode::StindRef => {
             let value = frame.pop()?;
             match frame.pop()? {
+                Value::ByRef(location @ Location::Stack { .. }) => {
+                    store_stack_indirect(frame, frame_index, opcode, location, value)?;
+                }
                 Value::ByRef(location) => return Ok(Flow::StoreObj { location, value }),
                 Value::Null => return Err(Trap::NullReference),
                 _ => return Err(Trap::TypeMismatch(Opcode::StindI4)),
@@ -1957,7 +2081,71 @@ fn step(
             return Ok(Flow::EndFilter(accept));
         }
 
+        Opcode::Sizeof => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::Sizeof))?;
+            let token = token_operand(instruction)?;
+            let size = module
+                .type_size(asm, token)
+                .ok_or(Trap::Unsupported(Opcode::Sizeof))?;
+            frame.stack.push(Value::Int32(size as i32));
+        }
+
+        Opcode::Localloc => {
+            let size = match frame.pop()? {
+                Value::Int32(n) => n as u32 as usize,
+                Value::Int64(n) | Value::NativeInt(n) => n as usize,
+                _ => return Err(Trap::TypeMismatch(Opcode::Localloc)),
+            };
+            let pointer = frame.localloc(frame_index, size);
+            frame.stack.push(pointer);
+        }
+
         Opcode::Ret => return Ok(Flow::Return(frame.stack.pop())),
+
+        #[cfg(feature = "typed-references")]
+        Opcode::Mkrefany => {
+            let token = token_operand(instruction)?;
+            match frame.pop()? {
+                Value::ByRef(location) => frame.stack.push(Value::TypedRef {
+                    location,
+                    type_token: asm_key(asm, token.0),
+                }),
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::TypeMismatch(Opcode::Mkrefany)),
+            }
+        }
+        #[cfg(feature = "typed-references")]
+        Opcode::Refanyval => {
+            let token = token_operand(instruction)?;
+            match frame.pop()? {
+                Value::TypedRef {
+                    location,
+                    type_token,
+                } => {
+                    if type_token != asm_key(asm, token.0) {
+                        return Err(Trap::InvalidCast);
+                    }
+                    frame.stack.push(Value::ByRef(location));
+                }
+                _ => return Err(Trap::TypeMismatch(Opcode::Refanyval)),
+            }
+        }
+        #[cfg(feature = "typed-references")]
+        Opcode::Refanytype => match frame.pop()? {
+            Value::TypedRef { type_token, .. } => {
+                frame.stack.push(Value::NativeInt(i64::from(type_token)));
+            }
+            _ => return Err(Trap::TypeMismatch(Opcode::Refanytype)),
+        },
+        #[cfg(feature = "varargs")]
+        Opcode::Arglist => frame.stack.push(Value::NativeInt(0)),
+
+        #[cfg(not(feature = "typed-references"))]
+        op @ (Opcode::Mkrefany | Opcode::Refanyval | Opcode::Refanytype) => {
+            return Err(Trap::Unsupported(op));
+        }
+        #[cfg(not(feature = "varargs"))]
+        Opcode::Arglist => return Err(Trap::Unsupported(Opcode::Arglist)),
 
         other => return Err(Trap::Unsupported(other)),
     }
@@ -1973,11 +2161,13 @@ impl Frame {
             locals: Vec::new(),
             args,
             new_object: None,
+            new_value: None,
             current_exception: None,
             pending: None,
             pending_filter: None,
             multicast: None,
             pending_constraint: None,
+            buffers: Vec::new(),
         }
     }
 
@@ -2040,6 +2230,144 @@ impl Frame {
         *target = value;
         Ok(())
     }
+
+    /// `localloc` (III.3.47): allocate a zeroed buffer of `size` bytes in this frame and
+    /// return a managed pointer to its start. C# zero-initializes `stackalloc`, so the
+    /// block is zeroed; it is freed when the frame returns.
+    fn localloc(&mut self, frame_index: usize, size: usize) -> Value {
+        let buffer = self.buffers.len();
+        self.buffers.push(alloc::vec![0u8; size]);
+        Value::ByRef(Location::Stack {
+            frame: frame_index,
+            buffer,
+            offset: 0,
+        })
+    }
+
+    /// Reads `width` bytes (little-endian) at `offset` of localloc buffer `buffer`, or
+    /// `None` if the access is out of range or the buffer does not exist. Reads beyond the
+    /// last written byte see the zero-initialized fill.
+    fn read_stack(&self, buffer: usize, offset: u32, width: usize) -> Option<[u8; 8]> {
+        let bytes = self.buffers.get(buffer)?;
+        let start = offset as usize;
+        let end = start.checked_add(width)?;
+        let slice = bytes.get(start..end)?;
+        let mut out = [0u8; 8];
+        out[..width].copy_from_slice(slice);
+        Some(out)
+    }
+
+    /// Writes `width` little-endian bytes of `value` at `offset` of localloc buffer
+    /// `buffer`. Errors (a wild-pointer trap) if the access is out of range or the buffer
+    /// does not exist.
+    fn write_stack(
+        &mut self,
+        buffer: usize,
+        offset: u32,
+        value: [u8; 8],
+        width: usize,
+    ) -> Result<(), Trap> {
+        let bytes = self.buffers.get_mut(buffer).ok_or(Trap::NullReference)?;
+        let start = offset as usize;
+        let end = start.checked_add(width).ok_or(Trap::NullReference)?;
+        let slice = bytes.get_mut(start..end).ok_or(Trap::NullReference)?;
+        slice.copy_from_slice(&value[..width]);
+        Ok(())
+    }
+}
+
+/// The byte width an `ldind.*` / `stind.*` opcode transfers (III.3.42-43), or `None`
+/// for `ldind.ref` / `stind.ref`, which move an object reference rather than raw bytes
+/// (a `Location::Stack` pointer carries no object reference, so those do not apply to it).
+fn indirect_width(opcode: Opcode) -> Option<usize> {
+    match opcode {
+        Opcode::LdindI1 | Opcode::LdindU1 | Opcode::StindI1 => Some(1),
+        Opcode::LdindI2 | Opcode::LdindU2 | Opcode::StindI2 => Some(2),
+        Opcode::LdindI4 | Opcode::LdindU4 | Opcode::StindI4 => Some(4),
+        Opcode::LdindI8 | Opcode::StindI8 => Some(8),
+        Opcode::LdindI | Opcode::StindI => Some(8),
+        #[cfg(feature = "float")]
+        Opcode::LdindR4 | Opcode::StindR4 => Some(4),
+        #[cfg(feature = "float")]
+        Opcode::LdindR8 | Opcode::StindR8 => Some(8),
+        _ => None,
+    }
+}
+
+/// Decodes the little-endian bytes an `ldind.*` read from a `Location::Stack` into the
+/// stack value the typed opcode yields -- sign- or zero-extending a sub-`int32` integer
+/// to `int32` (III.1.6), and producing the wider integer / native / float types directly.
+fn stack_loaded_value(opcode: Opcode, raw: [u8; 8]) -> Result<Value, Trap> {
+    let low8 = u64::from_le_bytes(raw);
+    Ok(match opcode {
+        Opcode::LdindI1 => Value::Int32(i32::from(raw[0] as i8)),
+        Opcode::LdindU1 => Value::Int32(i32::from(raw[0])),
+        Opcode::LdindI2 => Value::Int32(i32::from(i16::from_le_bytes([raw[0], raw[1]]))),
+        Opcode::LdindU2 => Value::Int32(i32::from(u16::from_le_bytes([raw[0], raw[1]]))),
+        Opcode::LdindI4 => Value::Int32(i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
+        Opcode::LdindU4 => Value::Int32(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as i32),
+        Opcode::LdindI8 => Value::Int64(low8 as i64),
+        Opcode::LdindI => Value::NativeInt(low8 as i64),
+        #[cfg(feature = "float")]
+        Opcode::LdindR4 => Value::Float(f64::from(f32::from_le_bytes([
+            raw[0], raw[1], raw[2], raw[3],
+        ]))),
+        #[cfg(feature = "float")]
+        Opcode::LdindR8 => Value::Float(f64::from_le_bytes(raw)),
+        _ => return Err(Trap::TypeMismatch(opcode)),
+    })
+}
+
+/// Encodes the stack value a `stind.*` stores into its low `width` little-endian bytes
+/// (III.3.62) for a write into a `Location::Stack` buffer. The store opcode fixes the
+/// width; the value is taken at that width (a wider integer is truncated, matching how
+/// `stind.i1`/`i2` narrow).
+fn stack_stored_bytes(opcode: Opcode, value: Value) -> Result<[u8; 8], Trap> {
+    let raw = match opcode {
+        #[cfg(feature = "float")]
+        Opcode::StindR4 => match value {
+            Value::Float(f) => u64::from(f32::to_bits(f as f32)),
+            _ => return Err(Trap::TypeMismatch(opcode)),
+        },
+        #[cfg(feature = "float")]
+        Opcode::StindR8 => match value {
+            Value::Float(f) => f.to_bits(),
+            _ => return Err(Trap::TypeMismatch(opcode)),
+        },
+        _ => match value {
+            Value::Int32(n) => n as u32 as u64,
+            Value::Int64(n) | Value::NativeInt(n) => n as u64,
+            _ => return Err(Trap::TypeMismatch(opcode)),
+        },
+    };
+    Ok(raw.to_le_bytes())
+}
+
+/// Performs a `stind.*` through a `localloc` pointer: writes the value's low bytes into
+/// the owning frame's buffer at the opcode's width (little-endian). The pointer must name
+/// this frame's buffer (the common same-frame `stackalloc` case); a pointer that escaped
+/// to another frame is unsupported (it cannot reach that frame's storage from here).
+fn store_stack_indirect(
+    frame: &mut Frame,
+    frame_index: usize,
+    opcode: Opcode,
+    location: Location,
+    value: Value,
+) -> Result<(), Trap> {
+    let Location::Stack {
+        frame: owner,
+        buffer,
+        offset,
+    } = location
+    else {
+        return Err(Trap::TypeMismatch(opcode));
+    };
+    let width = indirect_width(opcode).ok_or(Trap::TypeMismatch(opcode))?;
+    if owner != frame_index {
+        return Err(Trap::Unsupported(opcode));
+    }
+    let bytes = stack_stored_bytes(opcode, value)?;
+    frame.write_stack(buffer, offset, bytes, width)
 }
 
 /// The unsigned index a `switch` pops, or `None` if the value is not an integer
@@ -2107,6 +2435,61 @@ fn binary_numeric(opcode: Opcode, a: Value, b: Value) -> Result<Value, Trap> {
         return Ok(Value::Float(result));
     }
     binary_integer(opcode, a, b)
+}
+
+/// The integer offset of an `add`/`sub` operand, if it is one (for stepping a localloc
+/// pointer). A managed pointer is not an offset.
+fn pointer_offset(value: &Value) -> Option<i64> {
+    match value {
+        Value::Int32(n) => Some(i64::from(*n)),
+        Value::Int64(n) | Value::NativeInt(n) => Some(*n),
+        _ => None,
+    }
+}
+
+/// `add`/`sub` of a `localloc` (`Location::Stack`) pointer and an integer byte offset,
+/// yielding the adjusted pointer -- the pointer walk behind C# `stackalloc` indexing.
+/// Returns `Ok(None)` when neither operand is such a pointer, so the caller falls back to
+/// ordinary numeric arithmetic; `add` accepts the offset on either side (it is
+/// commutative), `sub` only as `pointer - offset` (III.1.5). Pointer-minus-pointer to a
+/// byte count is left to the numeric path (a `Location` is not an integer there, so it
+/// traps): csc does not emit it for the stackalloc patterns, and it is noted as deferred.
+fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Option<Value>, Trap> {
+    let add = matches!(opcode, Opcode::Add | Opcode::AddOvf | Opcode::AddOvfUn);
+    let sub = matches!(opcode, Opcode::Sub | Opcode::SubOvf | Opcode::SubOvfUn);
+    if !add && !sub {
+        return Ok(None);
+    }
+    let (location, offset) = match (a, b) {
+        (Value::ByRef(location @ Location::Stack { .. }), other) => {
+            let Some(delta) = pointer_offset(other) else {
+                return Ok(None);
+            };
+            (location, delta)
+        }
+        (other, Value::ByRef(location @ Location::Stack { .. })) if add => {
+            let Some(delta) = pointer_offset(other) else {
+                return Ok(None);
+            };
+            (location, delta)
+        }
+        _ => return Ok(None),
+    };
+    let Location::Stack {
+        frame,
+        buffer,
+        offset: base,
+    } = location
+    else {
+        return Ok(None);
+    };
+    let signed = if sub { -offset } else { offset };
+    let walked = i64::from(*base).wrapping_add(signed) as u32;
+    Ok(Some(Value::ByRef(Location::Stack {
+        frame: *frame,
+        buffer: *buffer,
+        offset: walked,
+    })))
 }
 
 /// The integer-only binary operations, computed at the result category's width.
@@ -2219,6 +2602,8 @@ fn negate(value: Value) -> Result<Value, Trap> {
         Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
             Err(Trap::TypeMismatch(Opcode::Neg))
         }
+        #[cfg(feature = "typed-references")]
+        Value::TypedRef { .. } => Err(Trap::TypeMismatch(Opcode::Neg)),
     }
 }
 
@@ -2271,6 +2656,8 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
             return Err(Trap::TypeMismatch(opcode));
         }
+        #[cfg(feature = "typed-references")]
+        Value::TypedRef { .. } => return Err(Trap::TypeMismatch(opcode)),
     };
     let zero_extended = if from_32 {
         i64::from(source as u32)
@@ -2314,6 +2701,8 @@ fn convert_checked(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Value::Int32(x) => i128::from(x),
         Value::Int64(x) | Value::NativeInt(x) if unsigned_source => i128::from(x as u64),
         Value::Int64(x) | Value::NativeInt(x) => i128::from(x),
+        #[cfg(feature = "float")]
+        Value::Float(f) if f.is_nan() || f.is_infinite() => return Err(Trap::Overflow),
         #[cfg(feature = "float")]
         Value::Float(f) => f as i128,
         _ => return Err(Trap::TypeMismatch(opcode)),
@@ -2504,15 +2893,40 @@ fn function_pointer(value: Value) -> Result<MethodId, Trap> {
     }
 }
 
-/// Resolves a `callvirt` target on a `this` of `runtime_type`: a class virtual via the
-/// runtime type's vtable slot, else an interface/abstract method by signature key,
-/// else the static target (a non-virtual instance method, or a string/array `this`).
+/// The runtime [`crate::module::TypeId`] a `callvirt` / `ldvirtftn` dispatches on for an
+/// object receiver: a field-carrying instance's own type id; else `System.String`'s for a
+/// heap string (which has no per-object type id) so the call reaches String's overrides;
+/// else a boxed value type's declared type id (resolved from the box's tag) so an interface
+/// method `callvirt` on a boxed struct reaches the struct's implementation. `None` for any
+/// receiver with no resolvable declared type (an array / delegate / builder).
+fn receiver_type_id(module: &Module, vm: &Vm, this: ObjectRef) -> Option<u32> {
+    vm.heap().type_of(this).or_else(|| {
+        if vm.heap().is_string(this) {
+            module.string_type_id()
+        } else {
+            vm.heap()
+                .boxed_type_token(this)
+                .and_then(|token| module.type_id_by_handle(token))
+        }
+    })
+}
+
+/// Resolves a `callvirt` target on a `this` of `runtime_type`: an explicit interface
+/// implementation (`MethodImpl`) wins outright -- it is the only way to reach a private,
+/// interface-named body and to tell two same-signature interface methods apart -- then a
+/// class virtual via the runtime type's vtable slot, else an interface/abstract method by
+/// signature key, else the static target (a non-virtual instance method, or a string/array
+/// `this`).
 fn resolve_callvirt(
     module: &Module,
     static_method: Option<MethodId>,
     sig_key: Option<&str>,
     runtime_type: Option<u32>,
+    explicit_override: Option<MethodId>,
 ) -> Option<MethodId> {
+    if explicit_override.is_some() {
+        return explicit_override;
+    }
     if let Some(method) = static_method {
         if let Some(slot) = module.method_slot(method) {
             return Some(
@@ -2531,19 +2945,60 @@ fn resolve_callvirt(
 }
 
 /// Whether `value` can be `castclass`/`isinst` to `token`'s type: null matches; a
-/// reference matches when its runtime type is a subtype of the target. Cases this
-/// module cannot verify -- an external target type, or a string/array object with no
-/// declared type -- are treated as a match (unverified).
+/// reference matches when its runtime type is a subtype of the target OR implements the
+/// target interface.
+///
+/// The receiver's heap kind makes the test precise where the target is otherwise
+/// unverifiable (an external core type with no module [`crate::module::TypeId`]):
+/// - a declared **instance** matches via the subtype relation, or when its runtime type
+///   (or a base) implements the target interface; an unresolved non-core target is treated
+///   as a match (unverified -- an interface this module cannot see);
+/// - a **boxed** value type matches `System.Object`, its own exact value type, or an
+///   interface its value type declares -- so a boxed `int` is precisely *not* a `string` /
+///   an unrelated class, but IS castable to an interface it implements;
+/// - a heap **string** matches `System.String`, `System.Object`, or an interface the
+///   `System.String` type declares, and nothing else.
 fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) -> bool {
     let reference = match value {
         Value::Null => return true,
         Value::Object(reference) => *reference,
         _ => return false,
     };
-    match (module.type_id_of(asm, token), vm.heap().type_of(reference)) {
-        (Some(target), Some(runtime)) => module.is_subtype(runtime, target),
-        _ => true,
+    let target_type_id = module.type_id_of(asm, token);
+    if let Some(runtime) = vm.heap().type_of(reference) {
+        return match target_type_id {
+            Some(target) => {
+                module.is_subtype(runtime, target) || module.implements_interface(runtime, target)
+            }
+            None if module.is_object_type_token(asm, token) => true,
+            None if module.is_string_type_token(asm, token) => false,
+            None => true,
+        };
     }
+    if let Some(box_token) = vm.heap().boxed_type_token(reference) {
+        if module.is_object_type_token(asm, token) {
+            return true;
+        }
+        if box_token == asm_key(asm, token.0) {
+            return true;
+        }
+        if let (Some(box_type), Some(target)) =
+            (module.type_id_by_handle(box_token), target_type_id)
+        {
+            return module.implements_interface(box_type, target);
+        }
+        return false;
+    }
+    if vm.heap().is_string(reference) {
+        if module.is_string_type_token(asm, token) || module.is_object_type_token(asm, token) {
+            return true;
+        }
+        if let (Some(string_type), Some(target)) = (module.string_type_id(), target_type_id) {
+            return module.implements_interface(string_type, target);
+        }
+        return false;
+    }
+    true
 }
 
 /// Reference equality for `ceq` / `cgt.un`: two nulls are equal, two objects are
@@ -2769,6 +3224,70 @@ mod tests {
             Instruction::simple(Opcode::Ret),
         ]);
         assert_eq!(result, Ok(Some(Value::Int32(i32::MIN))));
+    }
+
+    #[test]
+    fn localloc_zero_inits_and_round_trips_an_int() {
+        let result = run(vec![
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::Dup),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0x1234_5678)),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::simple(Opcode::LdindI4),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(result, Ok(Some(Value::Int32(0x1234_5678))));
+    }
+
+    #[test]
+    fn localloc_unwritten_bytes_read_as_zero() {
+        let result = run(vec![
+            Instruction::new(Opcode::LdcI4S, Operand::Int8(8)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::LdindI4),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(result, Ok(Some(Value::Int32(0))));
+    }
+
+    #[test]
+    fn localloc_pointer_add_indexes_bytes_little_endian() {
+        let result = run(vec![
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0xCD)),
+            Instruction::simple(Opcode::StindI1),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::Add),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0xAB)),
+            Instruction::simple(Opcode::StindI1),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::simple(Opcode::LdindU2),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(result, Ok(Some(Value::Int32(0xABCD))));
+    }
+
+    #[test]
+    fn localloc_out_of_range_store_traps() {
+        let result = run(vec![
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(result, Err(Trap::NullReference));
     }
 
     #[test]
@@ -3467,6 +3986,102 @@ mod tests {
             super::run(&module, &mut Vm::new(), main, Vec::new()),
             Err(Trap::UnhandledException)
         );
+    }
+
+    #[cfg(feature = "typed-references")]
+    mod typed_references {
+        use super::*;
+
+        const INT_TOKEN: Token = Token(0x0100_0001);
+        const OTHER_TOKEN: Token = Token(0x0100_0002);
+
+        #[test]
+        fn refvalue_round_trips_the_value_through_a_typedref() {
+            let mut module = Module::new();
+            let main = module.add_method(
+                0,
+                method(vec![
+                    Instruction::simple(Opcode::LdcI45),
+                    Instruction::simple(Opcode::Stloc0),
+                    Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                    Instruction::new(Opcode::Mkrefany, Operand::Token(INT_TOKEN)),
+                    Instruction::new(Opcode::Refanyval, Operand::Token(INT_TOKEN)),
+                    Instruction::simple(Opcode::LdindI4),
+                    ret(),
+                ]),
+                0,
+            );
+            assert_eq!(
+                super::super::run(&module, &mut Vm::new(), main, Vec::new()),
+                Ok(Some(Value::Int32(5)))
+            );
+        }
+
+        #[test]
+        fn refvalue_with_a_mismatched_type_throws() {
+            let mut module = Module::new();
+            let main = module.add_method(
+                0,
+                method(vec![
+                    Instruction::simple(Opcode::LdcI45),
+                    Instruction::simple(Opcode::Stloc0),
+                    Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                    Instruction::new(Opcode::Mkrefany, Operand::Token(INT_TOKEN)),
+                    Instruction::new(Opcode::Refanyval, Operand::Token(OTHER_TOKEN)),
+                    Instruction::simple(Opcode::LdindI4),
+                    ret(),
+                ]),
+                0,
+            );
+            assert_eq!(
+                super::super::run(&module, &mut Vm::new(), main, Vec::new()),
+                Err(Trap::UnhandledException)
+            );
+        }
+
+        #[test]
+        fn reftype_yields_the_referent_type_handle() {
+            let mut module = Module::new();
+            let main = module.add_method(
+                0,
+                method(vec![
+                    Instruction::simple(Opcode::LdcI45),
+                    Instruction::simple(Opcode::Stloc0),
+                    Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                    Instruction::new(Opcode::Mkrefany, Operand::Token(INT_TOKEN)),
+                    Instruction::simple(Opcode::Refanytype),
+                    Instruction::simple(Opcode::ConvI4),
+                    ret(),
+                ]),
+                0,
+            );
+            let expected = asm_key(0, INT_TOKEN.0) as i32;
+            assert_eq!(
+                super::super::run(&module, &mut Vm::new(), main, Vec::new()),
+                Ok(Some(Value::Int32(expected)))
+            );
+        }
+
+        #[test]
+        fn mkrefany_on_a_non_pointer_is_a_type_mismatch() {
+            let result = run(vec![
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::new(Opcode::Mkrefany, Operand::Token(INT_TOKEN)),
+                ret(),
+            ]);
+            assert_eq!(result, Err(Trap::TypeMismatch(Opcode::Mkrefany)));
+        }
+    }
+
+    #[cfg(feature = "varargs")]
+    #[test]
+    fn arglist_pushes_a_placeholder_handle() {
+        let result = run(vec![
+            Instruction::simple(Opcode::Arglist),
+            Instruction::simple(Opcode::ConvI4),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(result, Ok(Some(Value::Int32(0))));
     }
 
     fn ret() -> Instruction {

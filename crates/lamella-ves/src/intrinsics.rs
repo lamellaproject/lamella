@@ -466,11 +466,11 @@ pub fn string_concat3(
     Ok(Some(Value::Object(reference)))
 }
 
-/// The additional .NET Micro Framework v4.4 BCL surface, beyond the ECMA-335 Kernel
+/// The additional NETMFv4_4-profile BCL surface, beyond the ECMA-335 Kernel
 /// Profile. Gated by `NETMFv4_4` so a Kernel-only build omits it entirely; its public
 /// intrinsics are re-exported below so `crate::intrinsics::*` paths are unchanged.
 #[cfg(feature = "NETMFv4_4")]
-mod netmf {
+mod extended {
     use super::{scalar_text, string_arg_chars};
     use crate::interp::Vm;
     use crate::module::Module;
@@ -2304,7 +2304,7 @@ mod netmf {
 }
 
 #[cfg(feature = "NETMFv4_4")]
-pub use netmf::*;
+pub use extended::*;
 
 /// `System.Object.ReferenceEquals(object, object)`: reference identity (two nulls are
 /// equal; a null and an object are not). Value-type arguments arrive boxed, so distinct
@@ -2712,6 +2712,39 @@ pub fn type_from_handle(
     Ok(Some(args.first().cloned().unwrap_or(Value::Null)))
 }
 
+/// `System.Object.GetType()`: the receiver's runtime `Type`, modeled (like `typeof`) as the
+/// type's asm-folded token so a following `.Name` resolves through the same path. csc lowers
+/// `i.GetType()` on a value type by `box`-ing the receiver first, so the `this` here is a
+/// boxed value whose tag already carries the value type's token (Int32, Boolean, ...); a
+/// heap string yields `System.String`'s handle, and a reference instance its own type's.
+///
+/// # Errors
+/// [`Trap::NullReference`] on a null receiver; [`Trap::TypeMismatch`] if the receiver is not
+/// an object or its type has no recorded handle.
+pub fn object_get_type(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let reference = match args.first() {
+        Some(Value::Object(reference)) => *reference,
+        Some(Value::Null) => return Err(Trap::NullReference),
+        _ => return Err(Trap::TypeMismatch(Opcode::Callvirt)),
+    };
+    let handle = vm
+        .heap()
+        .boxed_type_token(reference)
+        .or_else(|| {
+            vm.heap()
+                .type_of(reference)
+                .and_then(|type_id| module.type_handle_of(type_id))
+        })
+        .or_else(|| {
+            vm.heap()
+                .is_string(reference)
+                .then(|| module.string_type_id().and_then(|id| module.type_handle_of(id)))
+                .flatten()
+        })
+        .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
+    Ok(Some(Value::NativeInt(i64::from(handle))))
+}
+
 /// `System.Enum.Parse(Type, string)`: the enum constant named by the string, boxed.
 ///
 /// # Errors
@@ -2778,6 +2811,104 @@ fn type_handle_token(arg: Option<&Value>) -> u32 {
     }
 }
 
+/// `System.Array.Empty<T>()`: a fresh empty array -- what `params T[]` lowers a no-argument
+/// call to (a zero-length array literal). The element type is irrelevant for an empty array.
+///
+/// # Errors
+/// Never errors.
+pub fn array_empty(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+    let array = vm.heap_mut().alloc_array(Vec::new());
+    Ok(Some(Value::Object(array)))
+}
+
+/// `System.Type.get_Name` (the `Name` property): the type's simple (unqualified) name --
+/// "Int32", "String", "Program". The receiver `this` is the `Type`, modeled as the type's
+/// asm-folded token; the loader recorded each `typeof`'d type's name under that key.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle.
+pub fn type_get_name(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let name = module
+        .type_name_by_handle(handle as u32)
+        .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
+    Ok(Some(alloc_str(vm, name)))
+}
+
+/// `System.Runtime.CompilerServices.RuntimeHelpers.InitializeArray(Array, RuntimeFieldHandle)`:
+/// fills the array's elements from the field's raw little-endian RVA initializer bytes (a
+/// constant primitive array literal, `T[] a = {...}`). The field handle is the asm-folded
+/// field token; its data blob was recorded at load. Each element is read at its width.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the first argument is not an array; the field-handle / blob
+/// being absent is a no-op (the array keeps its zero elements) rather than a fault.
+pub fn initialize_array(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let array = match args.first() {
+        Some(&Value::Object(reference)) => reference,
+        Some(Value::Null) => return Err(Trap::NullReference),
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let handle = type_handle_token(args.get(1));
+    let Some(data) = module.field_rva(0, lamella_token::Token(handle)) else {
+        return Ok(None);
+    };
+    let Some(length) = vm.heap().array_len(array) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    if length == 0 {
+        return Ok(None);
+    }
+    let width_bytes = data.len() / length;
+    for index in 0..length {
+        let element = vm.heap().array_get(array, index).unwrap_or(Value::Int32(0));
+        let Some(filled) = element_from_bytes(&element, data, index, width_bytes) else {
+            break;
+        };
+        vm.heap_mut().array_set(array, index, filled);
+    }
+    Ok(None)
+}
+
+/// One array element read from the little-endian initializer blob at `index`, taking the
+/// width from `width_bytes` (the array's element type width). `None` once the blob is
+/// exhausted, so a too-short blob leaves the remaining elements at their zero value.
+fn element_from_bytes(zero: &Value, data: &[u8], index: usize, width_bytes: usize) -> Option<Value> {
+    let start = index.checked_mul(width_bytes)?;
+    let bytes = data.get(start..start.checked_add(width_bytes)?)?;
+    Some(match zero {
+        Value::Int32(_) => Value::Int32(read_le_int(bytes) as i32),
+        Value::Int64(_) => Value::Int64(read_le_int(bytes)),
+        Value::NativeInt(_) => Value::NativeInt(read_le_int(bytes)),
+        #[cfg(feature = "float")]
+        Value::Float(_) if width_bytes == 4 => {
+            Value::Float(f64::from(f32::from_le_bytes(bytes.try_into().ok()?)))
+        }
+        #[cfg(feature = "float")]
+        Value::Float(_) => Value::Float(f64::from_le_bytes(bytes.try_into().ok()?)),
+        _ => return None,
+    })
+}
+
+/// A little-endian integer of `bytes.len()` (1, 2, 4, or 8) bytes, sign-extended to i64.
+fn read_le_int(bytes: &[u8]) -> i64 {
+    let mut buf = [0u8; 8];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    let unsigned = u64::from_le_bytes(buf);
+    let bits = bytes.len() * 8;
+    if bits < 64 && unsigned & (1 << (bits - 1)) != 0 {
+        (unsigned | (!0u64 << bits)) as i64
+    } else {
+        unsigned as i64
+    }
+}
+
 /// The text of a string argument (None if absent or not a string).
 fn string_value(vm: &Vm, arg: Option<&Value>) -> Option<String> {
     match arg {
@@ -2822,6 +2953,34 @@ pub fn md_array_set(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opt
     } else {
         Err(Trap::IndexOutOfRange(indices.first().copied().unwrap_or(0)))
     }
+}
+
+/// `T[,]::Address(i0, i1, ...)`: a managed pointer to the element of a multi-dimensional
+/// array at the given indices (what C# emits for `ref a[i,j]`). The element lives at the
+/// row-major flat index into the array's storage -- computed exactly as `md_array_get`
+/// does -- and is addressed by a `Location::Element` carrying that flat index, the same
+/// element-pointer form `ldelema` yields for a single-dimensional array.
+///
+/// # Errors
+/// [`Trap::NullReference`] for a null array; [`Trap::IndexOutOfRange`] if an index is out of
+/// range (or the rank does not match).
+pub fn md_array_address(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(array)) = args.first() else {
+        return Err(Trap::NullReference);
+    };
+    let indices = int_indices(&args[1..]);
+    let flat = vm
+        .heap()
+        .md_array_flat_index(array, &indices)
+        .ok_or_else(|| Trap::IndexOutOfRange(indices.first().copied().unwrap_or(0)))?;
+    Ok(Some(Value::ByRef(crate::value::Location::Element {
+        array,
+        index: flat,
+    })))
 }
 
 /// The integer indices of a multi-dimensional array access (int32 / native-int values).
@@ -2882,7 +3041,7 @@ pub fn md_array_get_length(
 /// of range.
 pub fn array_get_value(
     vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let Some(&Value::Object(array)) = args.first() else {
@@ -2897,7 +3056,10 @@ pub fn array_get_value(
         .ok_or(Trap::IndexOutOfRange(index))?;
     let boxed = match element {
         reference @ (Value::Object(_) | Value::Null) => reference,
-        value => Value::Object(vm.heap_mut().alloc_boxed(0, value)),
+        value => {
+            let token = module.primitive_type_token(&value).unwrap_or(0);
+            Value::Object(vm.heap_mut().alloc_boxed(token, value))
+        }
     };
     Ok(Some(boxed))
 }

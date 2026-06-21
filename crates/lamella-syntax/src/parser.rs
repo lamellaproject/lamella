@@ -234,6 +234,7 @@ impl Parser {
                 Keyword::Try => return self.parse_try(start),
                 Keyword::Lock => return self.parse_lock(start),
                 Keyword::Using => return self.parse_using(start),
+                Keyword::Fixed => return self.parse_fixed(start),
                 Keyword::Switch => return self.parse_switch(start),
                 Keyword::Goto => return self.parse_goto(start),
                 Keyword::Checked | Keyword::Unchecked if self.next_is(Punctuator::OpenBrace) => {
@@ -601,6 +602,31 @@ impl Parser {
         let body = Box::new(self.parse_statement());
         let end = body.span.end;
         Stmt::new(StmtKind::Lock { expression, body }, Span::new(start, end))
+    }
+
+    /// Parses a `fixed ( T* id = expr ) statement` (unsafe, 15.7).
+    fn parse_fixed(&mut self, start: u32) -> Stmt {
+        self.bump();
+        self.expect(
+            Punctuator::OpenParen,
+            DiagnosticKind::TokenExpected { expected: "(" },
+        );
+        let ty = self.parse_type();
+        let (name, _) = self.expect_identifier();
+        self.expect(Punctuator::Equals, DiagnosticKind::TokenExpected { expected: "=" });
+        let init = self.parse_expression();
+        self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        let body = Box::new(self.parse_statement());
+        let end = body.span.end;
+        Stmt::new(
+            StmtKind::Fixed {
+                ty,
+                name,
+                init,
+                body,
+            },
+            Span::new(start, end),
+        )
     }
 
     /// Parses a `using ( resource ) statement` (15.13).
@@ -1206,6 +1232,44 @@ impl Parser {
                 name,
                 parameters,
                 body,
+                explicit_interface: None,
+                span: Span::new(start, end),
+            };
+        }
+        if matches!(self.current().kind, TokenKind::Identifier(_)) && self.next_is(Punctuator::Dot) {
+            let name_start = self.current().span.start;
+            let (first, mut prev_end) = self.expect_identifier();
+            let mut parts = Vec::new();
+            parts.push(first);
+            let mut interface_end = prev_end;
+            while self.current_punctuator() == Some(Punctuator::Dot) {
+                self.bump();
+                interface_end = prev_end;
+                let (part, part_end) = self.expect_identifier();
+                parts.push(part);
+                prev_end = part_end;
+            }
+            let member = parts.pop().expect("a qualified member name has >= 2 parts");
+            let explicit_interface = TypeRef::new(
+                TypeRefKind::Name(parts),
+                Span::new(name_start, interface_end),
+            );
+            let parameters = self.parse_parameter_list();
+            let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                let block = self.parse_block();
+                let end = block.span.end;
+                (Some(block), end)
+            } else {
+                let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+                (None, end)
+            };
+            return Member::Method {
+                modifiers,
+                return_type: ty,
+                name: member,
+                parameters,
+                body,
+                explicit_interface: Some(explicit_interface),
                 span: Span::new(start, end),
             };
         }
@@ -1678,6 +1742,13 @@ impl Parser {
 
     /// Unary expressions (14.6): a prefix operator, a cast, or a postfix chain.
     fn parse_unary(&mut self) -> Expr {
+        if self.current_punctuator() == Some(Punctuator::Asterisk) {
+            let start = self.current().span.start;
+            self.bump();
+            let operand = self.parse_unary();
+            let span = Span::new(start, operand.span.end);
+            return Expr::new(ExprKind::Dereference(Box::new(operand)), span);
+        }
         if let Some(operator) = self.current_punctuator().and_then(prefix_operator) {
             let start = self.current().span.start;
             self.bump();
@@ -1881,6 +1952,36 @@ impl Parser {
                 let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
                 Expr::new(ExprKind::TypeOf(target), Span::new(span.start, end))
             }
+            TokenKind::Keyword(Keyword::Sizeof) => {
+                self.bump();
+                self.expect(
+                    Punctuator::OpenParen,
+                    DiagnosticKind::TokenExpected { expected: "(" },
+                );
+                let target = self.parse_type();
+                let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                Expr::new(ExprKind::SizeOf(target), Span::new(span.start, end))
+            }
+            TokenKind::Keyword(Keyword::Stackalloc) => {
+                self.bump();
+                let element = self.parse_non_array_type();
+                self.expect(
+                    Punctuator::OpenBracket,
+                    DiagnosticKind::TokenExpected { expected: "[" },
+                );
+                let count = self.parse_expression();
+                let end = self.expect(
+                    Punctuator::CloseBracket,
+                    DiagnosticKind::TokenExpected { expected: "]" },
+                );
+                Expr::new(
+                    ExprKind::StackAlloc {
+                        element,
+                        count: Box::new(count),
+                    },
+                    Span::new(span.start, end),
+                )
+            }
             TokenKind::Keyword(Keyword::Checked) => {
                 self.bump();
                 let (inner, end) = self.parse_parenthesized_operand();
@@ -2021,8 +2122,13 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> TypeRef {
-        let base = self.parse_non_array_type();
+        let mut base = self.parse_non_array_type();
         let start = base.span.start;
+        while self.current_punctuator() == Some(Punctuator::Asterisk) {
+            let end = self.current().span.end;
+            self.bump();
+            base = TypeRef::new(TypeRefKind::Pointer(Box::new(base)), Span::new(start, end));
+        }
         let mut ranks = Vec::new();
         while let Some(rank) = self.try_rank_specifier() {
             ranks.push(rank);
@@ -2379,6 +2485,11 @@ mod tests {
                 dump(value)
             ),
             ExprKind::TypeOf(target) => format!("(typeof {})", dump_type(target)),
+            ExprKind::SizeOf(target) => format!("(sizeof {})", dump_type(target)),
+            ExprKind::StackAlloc { element, count } => {
+                format!("(stackalloc {} {})", dump_type(element), dump(count))
+            }
+            ExprKind::Dereference(operand) => format!("(deref {})", dump(operand)),
             ExprKind::Checked(inner) => format!("(checked {})", dump(inner)),
             ExprKind::Unchecked(inner) => format!("(unchecked {})", dump(inner)),
             ExprKind::TypeTest {
@@ -2468,6 +2579,7 @@ mod tests {
                 text.push(']');
                 text
             }
+            TypeRefKind::Pointer(element) => format!("{}*", dump_type(element)),
             TypeRefKind::Error => String::from("<error-type>"),
         }
     }
@@ -2686,6 +2798,18 @@ mod tests {
             StmtKind::Lock { expression, body } => {
                 format!("(lock {} {})", dump(expression), dump_stmt(body))
             }
+            StmtKind::Fixed {
+                ty,
+                name,
+                init,
+                body,
+            } => format!(
+                "(fixed {} {} {} {})",
+                dump_type(ty),
+                name,
+                dump(init),
+                dump_stmt(body)
+            ),
             StmtKind::Using { resource, body } => {
                 let res = match resource {
                     UsingResource::Declaration { ty, declarators } => {
@@ -3190,14 +3314,19 @@ mod tests {
                 name,
                 parameters,
                 body,
+                explicit_interface,
                 ..
             } => {
                 let mut text = String::from("(method");
                 for modifier in modifiers {
                     text.push_str(&format!(" {}", modifier_name(*modifier)));
                 }
+                let qualified = match explicit_interface {
+                    Some(interface) => format!("{}.{name}", dump_type(interface)),
+                    None => name.to_string(),
+                };
                 text.push_str(&format!(
-                    " {} {name} ({})",
+                    " {} {qualified} ({})",
                     dump_type(return_type),
                     dump_params(parameters)
                 ));
@@ -3623,6 +3752,14 @@ mod tests {
         assert_eq!(
             unit_tree("interface I { void M(); }"),
             "(interface I (method void M () ;))"
+        );
+        assert_eq!(
+            unit_tree("class C : I { int I.M() { return 1; } }"),
+            "(class C : I (method int I.M () (block (return 1))))"
+        );
+        assert_eq!(
+            unit_tree("class C : N.I { int N.I.M() { return 1; } }"),
+            "(class C : N.I (method int N.I.M () (block (return 1))))"
         );
     }
 

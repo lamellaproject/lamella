@@ -31,8 +31,8 @@ pub use layout::{LayoutError, TargetLayout, TypeLayout, layout_value_type};
 pub use pdb::{LocalVariable, PortablePdb, SequencePoint};
 pub use pe::{PeError, PeImage};
 pub use reader::{
-    Assembly, AssemblyRef, CustomAttribute, Event, Field, MemberRef, Method, MethodKind, Param,
-    Property, ResolvedMethod, TypeDef, TypeName, TypeRef,
+    Assembly, AssemblyRef, CustomAttribute, Event, ExceptionClause, ExceptionHandlerKind, Field,
+    MemberRef, Method, MethodKind, Param, Property, ResolvedMethod, TypeDef, TypeName, TypeRef,
 };
 pub use rows::{Col, Row, Tables, columns};
 pub use signature::{MethodSig, SigError, SigType, parse_field, parse_method, parse_type};

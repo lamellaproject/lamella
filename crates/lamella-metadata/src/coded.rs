@@ -33,7 +33,8 @@ pub enum CodedIndex {
     MemberForwarded,
     /// `Implementation`: File, AssemblyRef, ExportedType.
     Implementation,
-    /// `CustomAttributeType`: MethodDef, MemberRef (tags 2 and 3).
+    /// `CustomAttributeType`: MethodDef, MemberRef (tags 2 and 3); a 5-entry tag set
+    /// (tags 0, 1, 4 unused) so it encodes with 3 tag bits (II.24.2.6).
     CustomAttributeType,
     /// `ResolutionScope`: Module, ModuleRef, AssemblyRef, TypeRef.
     ResolutionScope,
@@ -111,7 +112,9 @@ impl CodedIndex {
             CodedIndex::MethodDefOrRef => &[table::METHOD_DEF, table::MEMBER_REF],
             CodedIndex::MemberForwarded => &[table::FIELD, table::METHOD_DEF],
             CodedIndex::Implementation => &[table::FILE, table::ASSEMBLY_REF, table::EXPORTED_TYPE],
-            CodedIndex::CustomAttributeType => &[NONE, NONE, table::METHOD_DEF, table::MEMBER_REF],
+            CodedIndex::CustomAttributeType => {
+                &[NONE, NONE, table::METHOD_DEF, table::MEMBER_REF, NONE]
+            }
             CodedIndex::ResolutionScope => &[
                 table::MODULE,
                 table::MODULE_REF,
@@ -129,10 +132,12 @@ impl CodedIndex {
         u32::BITS - (count - 1).leading_zeros()
     }
 
-    /// The column width in bytes (2 or 4) given the table row counts.
+    /// The column width in bytes (2 or 4) given the table row counts. Uses the header's
+    /// sizing counts, so a coded index into a type-system table seeded from a `#Pdb`
+    /// stream (absent from the stream itself) is still sized wide enough.
     #[must_use]
     pub fn size(self, header: &TablesHeader) -> usize {
-        self.width(|table| header.row_count(table))
+        self.width(|table| header.sizing_row_count(table))
     }
 
     /// The column width in bytes (2 or 4) given a `row_count` lookup over the
@@ -229,6 +234,7 @@ mod tests {
         assert_eq!(CodedIndex::TypeDefOrRef.tag_bits(), 2);
         assert_eq!(CodedIndex::MemberRefParent.tag_bits(), 3);
         assert_eq!(CodedIndex::HasCustomAttribute.tag_bits(), 5);
+        assert_eq!(CodedIndex::CustomAttributeType.tag_bits(), 3);
     }
 
     #[test]

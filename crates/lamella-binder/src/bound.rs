@@ -248,6 +248,21 @@ pub enum BoundExprKind {
     /// A `typeof` expression (14.5.11), naming the type it reflects; its type is
     /// `System.Type`.
     TypeOf(TypeSymbol),
+    /// A `sizeof(T)` (III.4.25): the byte size of `T` as an `int`.
+    SizeOf(TypeSymbol),
+    /// A `stackalloc T[count]` (unsafe): a `T*` to `count * sizeof(T)` stack bytes.
+    StackAlloc {
+        /// The element type.
+        element: TypeSymbol,
+        /// The element count.
+        count: Box<BoundExpr>,
+    },
+    /// A pointer indirection `*operand` (unsafe): reads/writes the element the pointer
+    /// addresses. An lvalue when it is an assignment target.
+    Dereference {
+        /// The pointer being dereferenced.
+        operand: Box<BoundExpr>,
+    },
     /// A `checked` expression (14.5.12); the type is the operand's.
     Checked(Box<BoundExpr>),
     /// An `unchecked` expression (14.5.12); the type is the operand's.
@@ -352,6 +367,25 @@ impl Binder {
             || self.user_conversion(from, to, "op_Implicit").is_some()
     }
 
+    /// Whether `value` is assignable to `target`: it implicitly converts by type, or it
+    /// is a constant whose value fits a narrower integral `target` (13.1.7). Use this at
+    /// an assignment context that has the value expression, not just its type.
+    pub(crate) fn assignable(&self, value: &BoundExpr, target: &TypeSymbol) -> bool {
+        self.converts(&value.ty, target) || implicit_constant_conversion(value, target)
+    }
+
+    /// Reports a failed conversion (`CS0266`/`CS0029`) at an assignment context unless
+    /// `value` is assignable to `target` (including the constant-expression rule). Error
+    /// types are skipped so a prior failure does not cascade.
+    pub(crate) fn check_assignable(&mut self, value: &BoundExpr, target: &TypeSymbol, span: Span) {
+        if value.ty.is_error() || target.is_error() {
+            return;
+        }
+        if !self.assignable(value, target) {
+            self.report_no_implicit_conversion(&value.ty, target, span);
+        }
+    }
+
     /// A user-defined conversion method (`op_Implicit`/`op_Explicit`) taking `from` and
     /// returning `to`, declared on either the source or target type (17.9.3). The static
     /// call a `from -> to` conversion lowers to.
@@ -410,6 +444,13 @@ impl Binder {
     /// boxes, or upcasts as needed (13.1). Returns `expr` unchanged when the types
     /// match or no implicit conversion applies (the site reports any error).
     pub(crate) fn convert(&self, expr: BoundExpr, target: &TypeSymbol) -> BoundExpr {
+        if matches!(expr.kind, BoundExprKind::MethodGroup { .. })
+            && self
+                .type_info_of(target)
+                .is_some_and(|info| info.kind == TypeKind::Delegate)
+        {
+            return self.bind_delegate_creation(target, &[expr], Span::empty_at(0));
+        }
         if expr.ty == *target || expr.ty.is_error() || target.is_error() {
             return expr;
         }
@@ -419,6 +460,15 @@ impl Binder {
                 kind: BoundExprKind::Conversion {
                     operand: Box::new(expr),
                     conversion,
+                },
+                ty: target.clone(),
+            };
+        }
+        if implicit_constant_conversion(&expr, target) {
+            return BoundExpr {
+                kind: BoundExprKind::Conversion {
+                    operand: Box::new(expr),
+                    conversion: ConversionKind::ImplicitNumeric,
                 },
                 ty: target.clone(),
             };
@@ -492,7 +542,7 @@ impl Binder {
                 self.type_info_of(ty).map(|info| info.kind),
                 Some(TypeKind::Struct | TypeKind::Enum)
             ),
-            TypeSymbol::Array { .. } | TypeSymbol::Error => false,
+            TypeSymbol::Array { .. } | TypeSymbol::Pointer(_) | TypeSymbol::Error => false,
         }
     }
 
@@ -551,6 +601,16 @@ impl Binder {
     /// a type with this name.
     fn type_namespaces_containing(&self, name: &str) -> Vec<Box<str>> {
         let mut search: Vec<Box<str>> = Vec::new();
+        if let Some(TypeSymbol::Named(parts)) = &self.current_type {
+            let mut enclosing = String::new();
+            for part in parts.iter() {
+                if !enclosing.is_empty() {
+                    enclosing.push('.');
+                }
+                enclosing.push_str(part);
+            }
+            search.push(enclosing.into());
+        }
         if let Some(current) = self.current_namespace() {
             search.push(current);
         }
@@ -612,6 +672,7 @@ impl Binder {
         ));
         self.diagnostics
             .extend(crate::flow::check_unreachable(&bound));
+        self.diagnostics.extend(crate::flow::check_labels(&bound));
         self.current_method = None;
         self.current_type = None;
         bound
@@ -675,9 +736,7 @@ impl Binder {
         self.current_type = Some(enclosing);
         self.enter_scope();
         let value = self.bind_expression(initializer);
-        if !value.ty.is_error() && !field_type.is_error() && !self.converts(&value.ty, field_type) {
-            self.report_no_implicit_conversion(&value.ty, field_type, initializer.span);
-        }
+        self.check_assignable(&value, field_type, initializer.span);
         self.exit_scope();
         self.current_type = None;
     }
@@ -706,12 +765,7 @@ impl Binder {
                     },
                     span,
                 )),
-                Some(expr)
-                    if !expr.ty.is_error() && !self.converts(&expr.ty, &method.return_type) =>
-                {
-                    self.report_no_implicit_conversion(&expr.ty, &method.return_type, span);
-                }
-                _ => {}
+                Some(expr) => self.check_assignable(expr, &method.return_type, span),
             }
         }
     }
@@ -888,6 +942,37 @@ impl Binder {
                     ty: system_type(),
                 }
             }
+            ExprKind::SizeOf(target) => {
+                let target_ty = self.resolve_named_type(&bind_type(target), target.span);
+                BoundExpr {
+                    kind: BoundExprKind::SizeOf(target_ty),
+                    ty: TypeSymbol::Special(SpecialType::Int32),
+                }
+            }
+            ExprKind::StackAlloc { element, count } => {
+                let element_ty = self.resolve_named_type(&bind_type(element), element.span);
+                let count = self.bind_expression(count);
+                BoundExpr {
+                    ty: TypeSymbol::Pointer(Box::new(element_ty.clone())),
+                    kind: BoundExprKind::StackAlloc {
+                        element: element_ty,
+                        count: Box::new(count),
+                    },
+                }
+            }
+            ExprKind::Dereference(operand) => {
+                let pointer = self.bind_expression(operand);
+                let ty = match &pointer.ty {
+                    TypeSymbol::Pointer(element) => (**element).clone(),
+                    _ => TypeSymbol::Error,
+                };
+                BoundExpr {
+                    kind: BoundExprKind::Dereference {
+                        operand: Box::new(pointer),
+                    },
+                    ty,
+                }
+            }
             ExprKind::Checked(inner) => {
                 let saved = self.checked_context;
                 self.checked_context = true;
@@ -964,6 +1049,13 @@ impl Binder {
             ));
             TypeSymbol::Error
         };
+        let (left, right) = if matches!(operator, BinaryOperator::Add)
+            && matches!(ty, TypeSymbol::Special(SpecialType::String))
+        {
+            (self.to_concat_operand(left), self.to_concat_operand(right))
+        } else {
+            (left, right)
+        };
         BoundExpr {
             kind: BoundExprKind::Binary {
                 operator,
@@ -972,6 +1064,17 @@ impl Binder {
                 checked: self.checked_context,
             },
             ty,
+        }
+    }
+
+    /// A string-concatenation operand in `String.Concat` argument form: a string stays a
+    /// string; any other type becomes `object` (a value type boxes), so concatenation
+    /// uses the `Concat(object, object)` overload and calls the operand's `ToString`.
+    fn to_concat_operand(&self, operand: BoundExpr) -> BoundExpr {
+        if matches!(operand.ty, TypeSymbol::Special(SpecialType::String)) {
+            operand
+        } else {
+            self.convert(operand, &TypeSymbol::Special(SpecialType::Object))
         }
     }
 
@@ -1224,16 +1327,126 @@ impl Binder {
         span: Span,
     ) -> BoundExpr {
         let target_span = target_expr.span;
+        if operator == AssignmentOperator::Assign {
+            if let ExprKind::ElementAccess {
+                receiver,
+                arguments,
+            } = &target_expr.kind
+            {
+                let bound_receiver = self.bind_expression(receiver);
+                let is_indexer = !bound_receiver.ty.is_error()
+                    && !matches!(
+                        bound_receiver.ty,
+                        TypeSymbol::Array { .. } | TypeSymbol::Special(SpecialType::String)
+                    )
+                    && !self
+                        .methods_in_chain(&bound_receiver.ty, "set_Item")
+                        .is_empty();
+                if is_indexer {
+                    let mut args: Vec<BoundExpr> = arguments
+                        .iter()
+                        .map(|argument| self.bind_expression(argument))
+                        .collect();
+                    args.push(self.bind_expression(value_expr));
+                    return self
+                        .bind_indexer_call(bound_receiver, "set_Item", args, span)
+                        .unwrap_or_else(error_expr);
+                }
+            }
+        }
         let target = self.bind_expression(target_expr);
+        if let BoundExprKind::FieldAccess {
+            field: Some(field), ..
+        } = &target.kind
+        {
+            let in_constructor = matches!(
+                self.current_method.as_ref(),
+                Some(context) if &*context.name == ".ctor" || &*context.name == ".cctor"
+            );
+            if !in_constructor && self.field_is_readonly(&field.declaring_type, &field.name) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::ReadonlyAssignment {
+                        field: field.name.clone(),
+                    },
+                    target_span,
+                ));
+            }
+        }
         let mut value = self.bind_expression(value_expr);
+        if matches!(
+            operator,
+            AssignmentOperator::Add | AssignmentOperator::Subtract
+        ) && self
+            .type_info_of(&target.ty)
+            .is_some_and(|info| info.kind == TypeKind::Delegate)
+            && (matches!(value.kind, BoundExprKind::MethodGroup { .. })
+                || self
+                    .type_info_of(&value.ty)
+                    .is_some_and(|info| info.kind == TypeKind::Delegate))
+        {
+            let delegate_ty = target.ty.clone();
+            let delegate_base =
+                TypeSymbol::Named([Box::from("System"), Box::from("Delegate")].into());
+            let accessor = if matches!(operator, AssignmentOperator::Add) {
+                "Combine"
+            } else {
+                "Remove"
+            };
+            let operand = self.convert(value, &delegate_ty);
+            let method = MethodReference {
+                declaring_type: delegate_base.clone(),
+                name: accessor.into(),
+                parameters: alloc::vec![delegate_base.clone(), delegate_base.clone()],
+                return_type: delegate_base.clone(),
+                is_static: true,
+            };
+            let callee = BoundExpr {
+                ty: TypeSymbol::Error,
+                kind: BoundExprKind::MethodGroup {
+                    receiver: Box::new(BoundExpr {
+                        ty: delegate_base.clone(),
+                        kind: BoundExprKind::TypeReference(delegate_base.clone()),
+                    }),
+                    name: accessor.into(),
+                },
+            };
+            let combine = BoundExpr {
+                kind: BoundExprKind::Call {
+                    callee: Box::new(callee),
+                    arguments: alloc::vec![target.clone(), operand],
+                    method: Some(method),
+                },
+                ty: delegate_base,
+            };
+            let cast = BoundExpr {
+                kind: BoundExprKind::Cast {
+                    operand: Box::new(combine),
+                    checked: false,
+                },
+                ty: delegate_ty.clone(),
+            };
+            return BoundExpr {
+                kind: BoundExprKind::Assignment {
+                    operator: AssignmentOperator::Assign,
+                    target: Box::new(target),
+                    value: Box::new(cast),
+                },
+                ty: delegate_ty,
+            };
+        }
         if !target.ty.is_error() && !is_lvalue(&target) {
             self.diagnostics
                 .push(Diagnostic::new(DiagnosticKind::NotAssignable, target_span));
         } else if !target.ty.is_error() && !value.ty.is_error() {
-            self.check_assignment(operator, &target.ty, &value.ty, span);
-            if matches!(operator, AssignmentOperator::Assign) {
-                value = self.convert(value, &target.ty);
+            self.check_assignment(operator, &target.ty, &value, span);
+            if matches!(operator, AssignmentOperator::Add)
+                && matches!(target.ty, TypeSymbol::Special(SpecialType::String))
+            {
+                value = self.to_concat_operand(value);
             }
+        }
+        if !target.ty.is_error() && matches!(operator, AssignmentOperator::Assign) {
+            value = self.convert(value, &target.ty);
         }
         let ty = target.ty.clone();
         BoundExpr {
@@ -1250,22 +1463,20 @@ impl Binder {
         &mut self,
         operator: AssignmentOperator,
         target: &TypeSymbol,
-        value: &TypeSymbol,
+        value: &BoundExpr,
         span: Span,
     ) {
         match compound_binary_operator(operator) {
             None => {
-                if !self.converts(value, target) {
-                    self.report_no_implicit_conversion(value, target, span);
-                }
+                self.check_assignable(value, target, span);
             }
             Some(binary) => {
-                if binary_result_type(binary, target, value).is_none() {
+                if binary_result_type(binary, target, &value.ty).is_none() {
                     self.diagnostics.push(Diagnostic::new(
                         DiagnosticKind::OperatorNotApplicable {
                             operator: assignment_symbol(operator).into(),
                             left: target.to_string().into(),
-                            right: value.to_string().into(),
+                            right: value.ty.to_string().into(),
                         },
                         span,
                     ));
@@ -1369,6 +1580,17 @@ impl Binder {
         span: Span,
     ) -> BoundExpr {
         let callee = self.bind_expression(receiver_expr);
+        let callee = if self.is_delegate_value(&callee) {
+            BoundExpr {
+                ty: TypeSymbol::Error,
+                kind: BoundExprKind::MethodGroup {
+                    receiver: Box::new(callee),
+                    name: "Invoke".into(),
+                },
+            }
+        } else {
+            callee
+        };
         let arguments: Vec<BoundExpr> = argument_exprs
             .iter()
             .map(|argument| self.bind_expression(argument))
@@ -1559,30 +1781,91 @@ impl Binder {
             .iter()
             .map(|argument| self.bind_expression(argument))
             .collect();
-        let ty = match &receiver.ty {
-            TypeSymbol::Error => TypeSymbol::Error,
-            TypeSymbol::Array { element, .. } => (**element).clone(),
+        let element = match &receiver.ty {
+            TypeSymbol::Array { element, .. } => Some((**element).clone()),
             TypeSymbol::Special(SpecialType::String) if indices.len() == 1 => {
-                TypeSymbol::Special(SpecialType::Char)
+                Some(TypeSymbol::Special(SpecialType::Char))
             }
-            other => {
-                let type_name = other.to_string();
-                self.diagnostics.push(Diagnostic::new(
-                    DiagnosticKind::CannotIndex {
-                        type_name: type_name.into(),
-                    },
-                    span,
-                ));
-                TypeSymbol::Error
-            }
+            TypeSymbol::Pointer(element) if indices.len() == 1 => Some((**element).clone()),
+            _ => None,
         };
-        BoundExpr {
-            kind: BoundExprKind::ElementAccess {
+        if let Some(ty) = element {
+            return BoundExpr {
+                kind: BoundExprKind::ElementAccess {
+                    receiver: Box::new(receiver),
+                    indices,
+                },
+                ty,
+            };
+        }
+        if receiver.ty.is_error() {
+            return error_expr();
+        }
+        if self.methods_in_chain(&receiver.ty, "get_Item").is_empty() {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::CannotIndex {
+                    type_name: receiver.ty.to_string().into(),
+                },
+                span,
+            ));
+            return error_expr();
+        }
+        self.bind_indexer_call(receiver, "get_Item", indices, span)
+            .unwrap_or_else(error_expr)
+    }
+
+    /// Binds an indexer access `obj[args]` as a call to its accessor: `get_Item` for a
+    /// read, `set_Item` for a write (with the value appended). Resolves the overload,
+    /// converts the arguments to the accessor's parameter types (boxing/upcasting), and
+    /// builds the call. `None` when no overload matches (the resolver reports the error).
+    fn bind_indexer_call(
+        &mut self,
+        receiver: BoundExpr,
+        accessor: &str,
+        arguments: Vec<BoundExpr>,
+        span: Span,
+    ) -> Option<BoundExpr> {
+        if receiver.ty.is_error() || arguments.iter().any(|argument| argument.ty.is_error()) {
+            return None;
+        }
+        let candidates = self.methods_in_chain(&receiver.ty, accessor);
+        let argument_types: Vec<TypeSymbol> =
+            arguments.iter().map(|argument| argument.ty.clone()).collect();
+        let method = self.resolve_call(accessor, &receiver.ty, &candidates, &argument_types, span)?;
+        let declaring_type =
+            self.declaring_type_in_chain(&receiver.ty, &method.name, &method.parameters);
+        let method_ref = MethodReference {
+            declaring_type,
+            name: method.name,
+            parameters: method.parameters,
+            return_type: method.return_type,
+            is_static: false,
+        };
+        let arguments = if method_ref.parameters.len() == arguments.len() {
+            arguments
+                .into_iter()
+                .zip(method_ref.parameters.iter())
+                .map(|(argument, parameter)| self.convert(argument, parameter))
+                .collect()
+        } else {
+            arguments
+        };
+        let ty = method_ref.return_type.clone();
+        let callee = BoundExpr {
+            ty: TypeSymbol::Error,
+            kind: BoundExprKind::MethodGroup {
                 receiver: Box::new(receiver),
-                indices,
+                name: accessor.into(),
+            },
+        };
+        Some(BoundExpr {
+            kind: BoundExprKind::Call {
+                callee: Box::new(callee),
+                arguments,
+                method: Some(method_ref),
             },
             ty,
-        }
+        })
     }
 
     fn bind_object_creation(
@@ -1641,7 +1924,7 @@ impl Binder {
     /// method named in it matches `D`'s `Invoke` signature (same parameters and return).
     /// A static target carries no receiver; an instance target keeps its receiver.
     fn bind_delegate_creation(
-        &mut self,
+        &self,
         delegate_ty: &TypeSymbol,
         arguments: &[BoundExpr],
         _span: Span,
@@ -1830,19 +2113,160 @@ impl Binder {
         self.model.get_by_symbol(ty)
     }
 
+    /// Whether `expr` is a delegate-typed VALUE (so `expr(args)` means `expr.Invoke(args)`)
+    /// rather than a method group, type, or namespace.
+    fn is_delegate_value(&self, expr: &BoundExpr) -> bool {
+        !matches!(
+            expr.kind,
+            BoundExprKind::MethodGroup { .. }
+                | BoundExprKind::TypeReference(_)
+                | BoundExprKind::NamespaceReference(_)
+        ) && self
+            .type_info_of(&expr.ty)
+            .is_some_and(|info| info.kind == TypeKind::Delegate)
+    }
+
+    /// Whether the field `name` declared by `declaring` is `readonly` (CS0191).
+    fn field_is_readonly(&self, declaring: &TypeSymbol, name: &str) -> bool {
+        self.type_info_of(declaring)
+            .and_then(|info| info.fields.iter().find(|field| &*field.name == name))
+            .is_some_and(|field| field.is_readonly)
+    }
+
+    /// Reports `CS0535` for each interface member a concrete class/struct does not
+    /// implement. An abstract class (or an interface/enum) is exempt.
+    pub(crate) fn check_interface_implementations(
+        &mut self,
+        class_ty: &TypeSymbol,
+        declaration: &lamella_syntax::ast::TypeDecl,
+    ) {
+        if declaration
+            .modifiers
+            .iter()
+            .any(|modifier| matches!(modifier, lamella_syntax::ast::Modifier::Abstract))
+        {
+            return;
+        }
+        let concrete = self
+            .model
+            .get_by_symbol(class_ty)
+            .is_some_and(|info| matches!(info.kind, TypeKind::Class | TypeKind::Struct));
+        if !concrete {
+            return;
+        }
+        for interface in self.transitive_interfaces(class_ty) {
+            let members = match self.model.get_by_symbol(&interface) {
+                Some(info) => info.methods.clone(),
+                None => continue,
+            };
+            let interface_name = dotted_type_name(&interface);
+            for member in &members {
+                if self.implements_interface_member(class_ty, member) {
+                    continue;
+                }
+                let mut member_name = interface_name.clone();
+                member_name.push('.');
+                member_name.push_str(&member.name);
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::InterfaceMemberNotImplemented {
+                        type_name: declaration.name.clone(),
+                        member: member_name.into(),
+                    },
+                    declaration.span,
+                ));
+            }
+        }
+    }
+
+    /// The interfaces a type transitively implements: its own interface bases, plus those
+    /// interfaces' base interfaces.
+    fn transitive_interfaces(&self, ty: &TypeSymbol) -> Vec<TypeSymbol> {
+        let mut result: Vec<TypeSymbol> = Vec::new();
+        let mut stack: Vec<TypeSymbol> = alloc::vec![ty.clone()];
+        while let Some(current) = stack.pop() {
+            let Some(info) = self.model.get_by_symbol(&current) else {
+                continue;
+            };
+            for base in &info.bases {
+                let is_interface = self
+                    .model
+                    .get_by_symbol(base)
+                    .is_some_and(|base_info| base_info.kind == TypeKind::Interface);
+                if is_interface && !result.contains(base) {
+                    result.push(base.clone());
+                    stack.push(base.clone());
+                }
+            }
+        }
+        result
+    }
+
+    /// Whether `class_ty` implements interface `member` -- implicitly (a method with the
+    /// same name + parameter types anywhere in the class chain) or explicitly (a method
+    /// registered under a mangled `<interface>.<member>` name). The explicit check is
+    /// lenient (any `.<member>` impl) so a real explicit impl is never falsely flagged.
+    fn implements_interface_member(&self, class_ty: &TypeSymbol, member: &MethodSymbol) -> bool {
+        if self
+            .methods_in_chain(class_ty, &member.name)
+            .iter()
+            .any(|candidate| candidate.parameters == member.parameters)
+        {
+            return true;
+        }
+        let mut suffix = String::from(".");
+        suffix.push_str(&member.name);
+        self.model
+            .get_by_symbol(class_ty)
+            .is_some_and(|info| info.methods.iter().any(|m| m.name.ends_with(&suffix)))
+    }
+
+    /// Reports `CS0146` if `class_ty`'s base-class chain is circular (A : B, B : A). The
+    /// chain walk is bounded by a visited set, so a cycle is detected, not looped on.
+    pub(crate) fn check_base_cycle(
+        &mut self,
+        class_ty: &TypeSymbol,
+        declaration: &lamella_syntax::ast::TypeDecl,
+    ) {
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut current = Some(class_ty.clone());
+        while let Some(ty) = current.take() {
+            if visited.contains(&ty) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::CircularBase {
+                        type_name: declaration.name.clone(),
+                    },
+                    declaration.span,
+                ));
+                return;
+            }
+            visited.push(ty.clone());
+            current = self
+                .model
+                .get_by_symbol(&ty)
+                .and_then(|info| info.base.clone());
+        }
+    }
+
     /// Every method named `name` on `ty` or any of its base classes -- the method
     /// group an invocation resolves over (most-derived first).
     fn methods_in_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
         let mut methods: Vec<MethodSymbol> = Vec::new();
-        let lookup = member_lookup_type(ty);
-        let mut current = self.type_info_of(&lookup);
-        while let Some(info) = current {
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut current = Some(member_lookup_type(ty));
+        while let Some(current_ty) = current.take() {
+            if visited.contains(&current_ty) {
+                break;
+            }
+            visited.push(current_ty.clone());
+            let Some(info) = self.type_info_of(&current_ty) else {
+                break;
+            };
             for method in info.methods_named(name) {
                 if !methods.iter().any(|kept| kept.parameters == method.parameters) {
                     methods.push(method.clone());
                 }
             }
-            current = info.base.as_ref().and_then(|base| self.type_info_of(base));
+            current = info.base.clone();
         }
         methods
     }
@@ -1858,15 +2282,23 @@ impl Binder {
         parameters: &[TypeSymbol],
     ) -> TypeSymbol {
         let lookup = member_lookup_type(ty);
-        let mut current = self.type_info_of(&lookup);
-        while let Some(info) = current {
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut current = Some(lookup.clone());
+        while let Some(current_ty) = current.take() {
+            if visited.contains(&current_ty) {
+                break;
+            }
+            visited.push(current_ty.clone());
+            let Some(info) = self.type_info_of(&current_ty) else {
+                break;
+            };
             if info
                 .methods_named(name)
                 .any(|method| method.parameters.as_slice() == parameters)
             {
                 return type_symbol_in(&info.namespace, &info.name);
             }
-            current = info.base.as_ref().and_then(|base| self.type_info_of(base));
+            current = info.base.clone();
         }
         lookup
     }
@@ -2022,8 +2454,10 @@ fn binary_result_type(
     let right_special = as_special(right);
     match operator {
         Op::Add
-            if left_special == Some(SpecialType::String)
-                && right_special == Some(SpecialType::String) =>
+            if (left_special == Some(SpecialType::String)
+                || right_special == Some(SpecialType::String))
+                && !left.is_void()
+                && !right.is_void() =>
         {
             Some(TypeSymbol::Special(SpecialType::String))
         }
@@ -2169,6 +2603,55 @@ fn predefined_constant(special: SpecialType, member: &str) -> Option<i64> {
     }
 }
 
+/// Whether `expr` is a constant of type `int`/`long` whose value fits the integral
+/// `target` -- the implicit constant expression conversion (13.1.7), which lets
+/// `byte b = 10` and `b[0] = 10` compile without a cast.
+fn implicit_constant_conversion(expr: &BoundExpr, target: &TypeSymbol) -> bool {
+    let (TypeSymbol::Special(source), TypeSymbol::Special(target)) = (&expr.ty, target) else {
+        return false;
+    };
+    if !matches!(source, SpecialType::Int32 | SpecialType::Int64) {
+        return false;
+    }
+    match constant_int_value(expr) {
+        Some(value) => constant_fits(value, *target),
+        None => false,
+    }
+}
+
+/// The compile-time value of a constant integer expression: an integer literal, or a
+/// member access that folded to a constant (a `const` field, an enum member, a
+/// predefined `MaxValue`/`MinValue`). `None` for a non-constant expression.
+fn constant_int_value(expr: &BoundExpr) -> Option<i64> {
+    match &expr.kind {
+        BoundExprKind::Literal(Literal::Integer { value, .. }) => i64::try_from(*value).ok(),
+        BoundExprKind::FieldAccess {
+            field: Some(field), ..
+        } => field.constant,
+        BoundExprKind::Unary { operator, operand } => match operator {
+            UnaryOperator::Plus => constant_int_value(operand),
+            UnaryOperator::Minus => constant_int_value(operand)?.checked_neg(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether the constant `value` is in range of the integral `target` (13.1.7). `char`
+/// is excluded: an int constant needs an explicit cast to `char`.
+fn constant_fits(value: i64, target: SpecialType) -> bool {
+    use SpecialType as S;
+    match target {
+        S::SByte => i8::try_from(value).is_ok(),
+        S::Byte => u8::try_from(value).is_ok(),
+        S::Int16 => i16::try_from(value).is_ok(),
+        S::UInt16 => u16::try_from(value).is_ok(),
+        S::UInt32 => u32::try_from(value).is_ok(),
+        S::UInt64 => value >= 0,
+        _ => false,
+    }
+}
+
 /// The outcome of overload resolution over a method group (14.4.2).
 enum OverloadResult {
     /// A unique best overload.
@@ -2230,15 +2713,18 @@ fn resolve_overload(
 /// and every argument converts to its parameter (14.4.2.1); a `params` method is also
 /// applicable in expanded form, where the trailing arguments fill its array.
 fn is_applicable(model: &Model, method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
-    if method.parameters.len() == arguments.len()
+    is_normal_applicable(model, method, arguments)
+        || (method.is_params && is_applicable_expanded(model, method, arguments))
+}
+
+/// Whether a method applies in NORMAL form: the counts match and every argument converts
+/// to its parameter (14.4.2.1). (Expanded `params` form is [`is_applicable_expanded`].)
+fn is_normal_applicable(model: &Model, method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
+    method.parameters.len() == arguments.len()
         && arguments
             .iter()
             .zip(&method.parameters)
             .all(|(argument, parameter)| converts(model, argument, parameter))
-    {
-        return true;
-    }
-    method.is_params && is_applicable_expanded(model, method, arguments)
 }
 
 /// Whether a `params` method applies in expanded form (14.4.2.1): the leading fixed
@@ -2286,8 +2772,17 @@ fn is_better(
     c2: &MethodSymbol,
     arguments: &[TypeSymbol],
 ) -> bool {
+    let c1_normal = is_normal_applicable(model, c1, arguments);
+    let c2_normal = is_normal_applicable(model, c2, arguments);
+    if c1_normal != c2_normal {
+        return c1_normal;
+    }
     let mut strictly_better_somewhere = false;
-    for index in 0..arguments.len() {
+    let compared = arguments
+        .len()
+        .min(c1.parameters.len())
+        .min(c2.parameters.len());
+    for index in 0..compared {
         let (p1, p2) = (&c1.parameters[index], &c2.parameters[index]);
         if p1 == p2 {
             continue;
@@ -2325,6 +2820,23 @@ fn as_special(ty: &TypeSymbol) -> Option<SpecialType> {
     match ty {
         TypeSymbol::Special(special) => Some(*special),
         _ => None,
+    }
+}
+
+/// A named type's dotted name (`["NS", "I"]` -> "NS.I"); empty for a non-named type.
+fn dotted_type_name(ty: &TypeSymbol) -> String {
+    match ty {
+        TypeSymbol::Named(parts) => {
+            let mut name = String::new();
+            for part in parts.iter() {
+                if !name.is_empty() {
+                    name.push('.');
+                }
+                name.push_str(part);
+            }
+            name
+        }
+        _ => String::new(),
     }
 }
 
@@ -2380,6 +2892,7 @@ fn is_lvalue(expr: &BoundExpr) -> bool {
             | BoundExprKind::FieldAccess { .. }
             | BoundExprKind::PropertyAccess { .. }
             | BoundExprKind::ElementAccess { .. }
+            | BoundExprKind::Dereference { .. }
     )
 }
 
@@ -2792,6 +3305,7 @@ mod tests {
             name: "count".into(),
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
+            is_readonly: false,
             accessibility: crate::symbols::Accessibility::Public,
             constant: None,
         });
@@ -2877,6 +3391,7 @@ mod tests {
             name: "count".into(),
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
+            is_readonly: false,
             accessibility: crate::symbols::Accessibility::Public,
             constant: None,
         });

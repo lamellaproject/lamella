@@ -50,6 +50,10 @@ pub struct Tokens {
     /// `ValueType` of the type's token, and a value-type local is addressed via
     /// `ldloca` for field access.
     structs: BTreeSet<String>,
+    /// The interface types declared in this module, by key. A cast to an interface is not
+    /// a plain `castclass` lowering yet (interface dispatch is an interpreter feature), so
+    /// emission distinguishes them.
+    interfaces: BTreeSet<String>,
 }
 
 impl Tokens {
@@ -90,6 +94,17 @@ impl Tokens {
     #[must_use]
     pub fn is_struct(&self, ty: &TypeSymbol) -> bool {
         self.structs.contains(&type_key(ty))
+    }
+
+    /// Records that this type is an interface declared in the module.
+    pub fn insert_interface(&mut self, ty: &TypeSymbol) {
+        self.interfaces.insert(type_key(ty));
+    }
+
+    /// Whether this type is an interface declared in the module.
+    #[must_use]
+    pub fn is_interface(&self, ty: &TypeSymbol) -> bool {
+        self.interfaces.contains(&type_key(ty))
     }
 
     /// Records `token` as the method named by this identity.

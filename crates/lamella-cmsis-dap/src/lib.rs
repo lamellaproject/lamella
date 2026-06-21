@@ -43,24 +43,6 @@ const S_REGRDY: u32 = 1 << 16;
 const S_HALT: u32 = 1 << 17;
 const DCRSR_WRITE: u32 = 1 << 16;
 
-const NVMC_READY: u32 = 0x4001_e400;
-const NVMC_CONFIG: u32 = 0x4001_e504;
-const NVMC_ERASEPAGE: u32 = 0x4001_e508;
-const NVMC_REN: u32 = 0;
-const NVMC_WEN: u32 = 1;
-const NVMC_EEN: u32 = 2;
-
-const SAMD21_CTRLA: u32 = 0x4100_4000;
-const SAMD21_CTRLB: u32 = 0x4100_4004;
-const SAMD21_INTFLAG: u32 = 0x4100_4014;
-const SAMD21_ADDR: u32 = 0x4100_401c;
-const SAMD21_CMDEX: u32 = 0xa500;
-const SAMD21_CMD_ER: u32 = 0x02;
-const SAMD21_CMD_WP: u32 = 0x04;
-const SAMD21_CMD_PBC: u32 = 0x44;
-const SAMD21_PAGE: usize = 64;
-const SAMD21_ROW: u32 = 256;
-const SAMD21_MANW: u32 = 1 << 7;
 
 const AIRCR: u32 = 0xe000_ed0c;
 const AIRCR_SYSRESETREQ: u32 = 0x05fa_0004;
@@ -142,6 +124,11 @@ impl<T: Transport> Dap<T> {
             transport,
             reply: [0; PACKET],
         }
+    }
+
+    /// The underlying transport, for inspection (e.g. a test mock's record of sent packets).
+    pub fn transport(&self) -> &T {
+        &self.transport
     }
 
     /// Sends a command and returns the reply slice, checking the command-id echo.
@@ -262,76 +249,6 @@ impl<T: Transport> Dap<T> {
         Err(DapError::Timeout(what))
     }
 
-    /// Erases the flash page containing `address` (nRF51 pages are 1 KB) via the NVMC.
-    /// Halt the core first so it is not executing from flash during the erase.
-    pub fn erase_flash_page(&mut self, address: u32) -> Result<(), DapError> {
-        self.write_word(NVMC_CONFIG, NVMC_EEN)?;
-        self.nvmc_wait()?;
-        self.write_word(NVMC_ERASEPAGE, address & !0x3ff)?;
-        self.nvmc_wait()?;
-        self.write_word(NVMC_CONFIG, NVMC_REN)
-    }
-
-    /// Programs consecutive 32-bit `words` to flash starting at `address`, via the NVMC.
-    /// The target pages must already be erased.
-    pub fn write_flash(&mut self, address: u32, words: &[u32]) -> Result<(), DapError> {
-        self.write_word(NVMC_CONFIG, NVMC_WEN)?;
-        self.nvmc_wait()?;
-        for (i, &word) in words.iter().enumerate() {
-            self.write_word(address + (i as u32) * 4, word)?;
-            self.nvmc_wait()?;
-        }
-        self.write_word(NVMC_CONFIG, NVMC_REN)
-    }
-
-    /// Polls the NVMC READY register until the controller is idle.
-    fn nvmc_wait(&mut self) -> Result<(), DapError> {
-        for _ in 0..1000 {
-            if self.read_word(NVMC_READY)? & 1 != 0 {
-                return Ok(());
-            }
-        }
-        Err(DapError::Timeout("flash controller"))
-    }
-
-    /// Erases the SAMD21 flash row (256 bytes) containing `address`, via the NVMCTRL. Halt the
-    /// core first so it is not fetching from flash during the erase.
-    pub fn erase_flash_row_samd21(&mut self, address: u32) -> Result<(), DapError> {
-        self.write_word(SAMD21_ADDR, (address & !(SAMD21_ROW - 1)) / 2)?;
-        self.samd21_command(SAMD21_CMD_ER)
-    }
-
-    /// Programs consecutive 32-bit `words` to SAMD21 flash from `address`, via the NVMCTRL, one
-    /// 64-byte page at a time (the rows must already be erased). Manual write, per datasheet
-    /// 22.6.4.3.1: clear the page buffer, fill it through the flash address space, issue a
-    /// read-memory barrier, set the page address, then Write-Page.
-    pub fn write_flash_samd21(&mut self, address: u32, words: &[u32]) -> Result<(), DapError> {
-        let ctrlb = self.read_word(SAMD21_CTRLB)?;
-        self.write_word(SAMD21_CTRLB, ctrlb | SAMD21_MANW)?;
-        for (page, chunk) in words.chunks(SAMD21_PAGE / 4).enumerate() {
-            let page_addr = address + (page as u32) * SAMD21_PAGE as u32;
-            self.samd21_command(SAMD21_CMD_PBC)?;
-            for (i, &word) in chunk.iter().enumerate() {
-                self.write_word(page_addr + (i as u32) * 4, word)?;
-            }
-            self.read_word(page_addr)?;
-            self.write_word(SAMD21_ADDR, page_addr / 2)?;
-            self.samd21_command(SAMD21_CMD_WP)?;
-        }
-        Ok(())
-    }
-
-    /// Issues an NVMCTRL command (CMDEX key + `cmd`) and waits for the controller to be ready.
-    fn samd21_command(&mut self, cmd: u32) -> Result<(), DapError> {
-        self.write_word(SAMD21_CTRLA, SAMD21_CMDEX | cmd)?;
-        for _ in 0..1000 {
-            if self.read_word(SAMD21_INTFLAG)? & 1 != 0 {
-                return Ok(());
-            }
-        }
-        Err(DapError::Timeout("SAMD21 flash controller"))
-    }
-
     /// Resets the core (SYSRESETREQ) and resumes it, so it restarts from the reset
     /// vector -- the run step after flashing a fresh image.
     pub fn reset_and_run(&mut self) -> Result<(), DapError> {
@@ -404,19 +321,26 @@ impl<T: Transport> Dap<T> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Test scaffolding for the probe protocol, shared by this crate's own tests and the device-specific
+/// extension crates (`lamella-cmsis-dap-sam`, `lamella-cmsis-dap-nrf`), to which it is exposed behind the
+/// `test-util` feature.
+#[cfg(any(test, feature = "test-util"))]
+pub mod testing {
+    use crate::{Transport, TransportError};
     use std::collections::VecDeque;
 
-    /// A transport that returns canned reply packets and records what was sent.
-    struct Mock {
+    /// A [`Transport`] that returns canned reply packets and records every packet sent, so a test
+    /// can drive a `Dap` against scripted probe replies and assert on the bytes it emitted. Read the
+    /// log of sent packets through `Dap::transport`.
+    pub struct Mock {
         replies: VecDeque<Vec<u8>>,
-        sent: Vec<Vec<u8>>,
+        /// Every packet written to the probe, in order.
+        pub sent: Vec<Vec<u8>>,
     }
 
     impl Mock {
-        fn new(replies: Vec<Vec<u8>>) -> Self {
+        /// Creates a mock that replies with `replies` in order.
+        pub fn new(replies: Vec<Vec<u8>>) -> Mock {
             Mock {
                 replies: replies.into(),
                 sent: Vec::new(),
@@ -439,11 +363,18 @@ mod tests {
         }
     }
 
-    fn echo(id: u8, rest: &[u8]) -> Vec<u8> {
+    /// Builds a reply packet: a command id `id` followed by `rest`.
+    pub fn echo(id: u8, rest: &[u8]) -> Vec<u8> {
         let mut v = vec![id];
         v.extend_from_slice(rest);
         v
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::{Mock, echo};
+    use super::*;
 
     #[test]
     fn connect_then_read_idcode() {
@@ -573,101 +504,6 @@ mod tests {
         dap.write_core_reg(0, 0xcafe_f00d).unwrap();
         assert_eq!(&dap.transport.sent[1][4..8], &0xcafe_f00du32.to_le_bytes());
         assert_eq!(&dap.transport.sent[3][4..8], &0x0001_0000u32.to_le_bytes());
-    }
-
-    #[test]
-    fn erase_flash_page_drives_nvmc() {
-        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
-        let ready = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00];
-        let replies = vec![
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ready.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ready,
-            ack.clone(),
-            ack,
-        ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.erase_flash_page(0x0003_f000).unwrap();
-        assert_eq!(&dap.transport.sent[1][4..8], &2u32.to_le_bytes());
-        assert_eq!(&dap.transport.sent[5][4..8], &0x0003_f000u32.to_le_bytes());
-    }
-
-    #[test]
-    fn write_flash_enables_then_writes_words() {
-        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
-        let ready = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00];
-        let replies = vec![
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ready.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ready,
-            ack.clone(),
-            ack,
-        ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.write_flash(0x0003_f000, &[0xcafe_babe]).unwrap();
-        assert_eq!(&dap.transport.sent[1][4..8], &1u32.to_le_bytes());
-        assert_eq!(&dap.transport.sent[5][4..8], &0xcafe_babeu32.to_le_bytes());
-    }
-
-    #[test]
-    fn samd21_erase_row_drives_nvmctrl() {
-        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
-        let ready = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00];
-        let replies = vec![
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ready,
-        ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.erase_flash_row_samd21(0x0000_0100).unwrap();
-        assert_eq!(&dap.transport.sent[1][4..8], &0x80u32.to_le_bytes());
-        assert_eq!(&dap.transport.sent[3][4..8], &0x0000_a502u32.to_le_bytes());
-    }
-
-    #[test]
-    fn samd21_write_flash_fills_buffer_then_writes_page() {
-        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
-        let ready = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00];
-        let ctrlb = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
-        let flash = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0xff, 0xff, 0xff, 0xff];
-        let replies = vec![
-            ack.clone(),
-            ctrlb,
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ready.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            flash,
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ack.clone(),
-            ready,
-        ];
-        let mut dap = Dap::new(Mock::new(replies));
-        dap.write_flash_samd21(0x0, &[0xcafe_babe]).unwrap();
-        assert_eq!(&dap.transport.sent[3][4..8], &0x80u32.to_le_bytes());
-        assert_eq!(&dap.transport.sent[9][4..8], &0xcafe_babeu32.to_le_bytes());
-        assert_eq!(&dap.transport.sent[15][4..8], &0x0000_a504u32.to_le_bytes());
     }
 
     #[test]

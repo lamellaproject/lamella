@@ -195,9 +195,12 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
                 Inst::StringLiteral { .. } => {}
-                Inst::StringEquals { lhs, rhs } => {
+                Inst::StringEquals { lhs, rhs } | Inst::StringConcat { lhs, rhs } => {
                     mark(&mut lo, &mut hi, &mut defined, *lhs, ip);
                     mark(&mut lo, &mut hi, &mut defined, *rhs, ip);
+                }
+                Inst::IntToString { value } => {
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
                 Inst::Alloc { .. } => {}
                 Inst::AllocArray { length, .. } => {
@@ -215,6 +218,32 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 } => {
                     mark(&mut lo, &mut hi, &mut defined, *array, ip);
                     mark(&mut lo, &mut hi, &mut defined, *index, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
+                Inst::AllocArray2D { dim0, dim1, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *dim0, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *dim1, ip);
+                }
+                Inst::Array2DLoad {
+                    array,
+                    index0,
+                    index1,
+                    ..
+                } => {
+                    mark(&mut lo, &mut hi, &mut defined, *array, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *index0, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *index1, ip);
+                }
+                Inst::Array2DStore {
+                    array,
+                    index0,
+                    index1,
+                    value,
+                    ..
+                } => {
+                    mark(&mut lo, &mut hi, &mut defined, *array, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *index0, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *index1, ip);
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
                 Inst::StaticLoad { .. } => {}
@@ -454,10 +483,11 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::SemihostWrite { .. } => {}
         Inst::WriteInt { value } => f(*value),
         Inst::StringLiteral { .. } => {}
-        Inst::StringEquals { lhs, rhs } => {
+        Inst::StringEquals { lhs, rhs } | Inst::StringConcat { lhs, rhs } => {
             f(*lhs);
             f(*rhs);
         }
+        Inst::IntToString { value } => f(*value),
         Inst::Alloc { .. } => {}
         Inst::AllocArray { length, .. } => f(*length),
         Inst::ArrayLoad { array, index, .. } => {
@@ -472,6 +502,32 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         } => {
             f(*array);
             f(*index);
+            f(*value);
+        }
+        Inst::AllocArray2D { dim0, dim1, .. } => {
+            f(*dim0);
+            f(*dim1);
+        }
+        Inst::Array2DLoad {
+            array,
+            index0,
+            index1,
+            ..
+        } => {
+            f(*array);
+            f(*index0);
+            f(*index1);
+        }
+        Inst::Array2DStore {
+            array,
+            index0,
+            index1,
+            value,
+            ..
+        } => {
+            f(*array);
+            f(*index0);
+            f(*index1);
             f(*value);
         }
         Inst::StaticLoad { .. } => {}

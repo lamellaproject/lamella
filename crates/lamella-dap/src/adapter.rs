@@ -276,6 +276,7 @@ impl Debugger {
                 Stop::Done => break Stop::Done,
                 Stop::Fault(message) => break Stop::Fault(message),
                 Stop::Running => break Stop::Running,
+                Stop::Breakpoint => break Stop::Breakpoint,
                 _ if reached(self.backend.depth(), start) => break Stop::Step,
                 _ => {}
             }
@@ -294,6 +295,7 @@ impl Debugger {
                 Stop::Done => break Stop::Done,
                 Stop::Fault(message) => break Stop::Fault(message),
                 Stop::Running => break Stop::Running,
+                Stop::Breakpoint => break Stop::Breakpoint,
                 _ => {
                     let reached = match action {
                         Action::StepIn | Action::Resume => true,

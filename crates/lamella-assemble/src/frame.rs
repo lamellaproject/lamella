@@ -1,7 +1,7 @@
 //! The argument and local-variable slots of a method (ECMA-335 1st ed, III.1.5).
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use lamella_binder::{BoundStmt, BoundStmtKind, SpecialType, TypeSymbol};
@@ -27,6 +27,9 @@ pub struct Frame {
     /// parameter's argument slot holds an address: a read derefs it (`ldind`), a write
     /// stores through it (`stind`).
     byref_types: BTreeMap<Box<str>, TypeSymbol>,
+    /// Local slots that must be PINNED in the signature -- a `fixed` statement's array
+    /// holder, so the GC does not move the array while a pointer into it is live.
+    pinned: RefCell<BTreeSet<u16>>,
 }
 
 impl Frame {
@@ -117,6 +120,20 @@ impl Frame {
         slot
     }
 
+    /// Reserves a PINNED local (a `fixed` array holder): the slot is reported by
+    /// [`Frame::pinned_slots`] so its signature carries the `pinned` modifier.
+    pub fn reserve_pinned_local(&self, ty: &TypeSymbol) -> u16 {
+        let slot = self.reserve_local(ty);
+        self.pinned.borrow_mut().insert(slot);
+        slot
+    }
+
+    /// The local slots that must be `pinned` in the local-variable signature.
+    #[must_use]
+    pub fn pinned_slots(&self) -> BTreeSet<u16> {
+        self.pinned.borrow().clone()
+    }
+
     fn collect_locals(&mut self, stmt: &BoundStmt) {
         match &stmt.kind {
             BoundStmtKind::Local { ty, declarators } => {
@@ -163,6 +180,15 @@ impl Frame {
             | BoundStmtKind::Unchecked(inner)
             | BoundStmtKind::Labeled { body: inner, .. } => self.collect_locals(inner),
             BoundStmtKind::Lock { body, .. } | BoundStmtKind::Using { body, .. } => {
+                self.collect_locals(body);
+            }
+            BoundStmtKind::Fixed {
+                name,
+                element,
+                body,
+                ..
+            } => {
+                self.declare_local(name, &TypeSymbol::Pointer(Box::new(element.clone())));
                 self.collect_locals(body);
             }
             BoundStmtKind::Try {

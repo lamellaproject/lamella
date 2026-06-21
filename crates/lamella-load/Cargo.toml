@@ -26,6 +26,10 @@ finalizers = ["gc", "lamella-ves/finalizers"]
 float = ["lamella-ves/float"]
 # String storage encoding (default off = UTF-16; on = UTF-8). See lamella-ves.
 string-utf8 = ["lamella-ves/string-utf8"]
+# Typed references (mkrefany / refanyval / refanytype). Off by default. See lamella-ves.
+typed-references = ["lamella-ves/typed-references"]
+# Varargs (the arglist opcode; shell only). Off by default. See lamella-ves.
+varargs = ["typed-references", "lamella-ves/varargs"]
 # The floating-point transcendentals (Math.Sqrt/Sin/Pow/...), via libm. See lamella-ves.
 math-transcendental = ["NETMFv4_4", "float", "lamella-ves/math-transcendental"]
 

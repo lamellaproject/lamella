@@ -209,6 +209,10 @@ impl DebugBackend for InterpreterBackend {
         *at_reported_breakpoint = false;
         match session.step(module, vm) {
             Ok(Status::Done(_)) => Stop::Done,
+            Ok(Status::Running | Status::Paused) if session.is_at_breakpoint() => {
+                *at_reported_breakpoint = true;
+                Stop::Breakpoint
+            }
             Ok(Status::Running | Status::Paused) => Stop::Step,
             Err(trap) => Stop::Fault(format!("{trap}")),
         }
@@ -247,7 +251,14 @@ impl DebugBackend for InterpreterBackend {
 
     fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
         let pdb = PortablePdb::read(self.pdb.as_ref()?).ok()?;
-        let (method_rid, il_offset) = pdb.resolve_breakpoint(document, line)?;
+        let basename: fn(&str) -> &str = |path| path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let (method_rid, il_offset) = pdb.resolve_breakpoint(document, line).or_else(|| {
+            let target = basename(document);
+            let document = (1..=pdb.method_count())
+                .filter_map(|rid| pdb.method_document(rid))
+                .find(|candidate| basename(candidate) == target)?;
+            pdb.resolve_breakpoint(&document, line)
+        })?;
         let method = self.module.resolve(0, Token::new(METHOD_DEF, method_rid))?;
         let index = self.il_offset_to_index(method, il_offset)?;
         Some(encode_address(method, index))

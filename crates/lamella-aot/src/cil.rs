@@ -4,11 +4,17 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, OperandKind};
+use lamella_cil::{EhClause, EhKind, Instruction, MethodBodyImage, Opcode, Operand, OperandKind};
 use lamella_ir::{
     BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, TypeHandle,
     ValueId,
 };
+
+/// The reserved static-region offset of `g_exception_tag`: the no-GC exception model's
+/// in-flight tag word. A `throw` stores the thrown type's tag here; a catch dispatch loads it
+/// and compares; zero means no exception is propagating. User statics start past it (the
+/// resolver shifts them), so a throw/dispatch and an `ldsfld`/`stsfld` never alias.
+const G_EXCEPTION_TAG_OFFSET: u32 = 0;
 
 /// Why a method body could not be lowered to MIR.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +57,13 @@ pub enum Intrinsic {
     /// `System.Object::.ctor()` -- the implicit base constructor a derived constructor chains to.
     /// A no-op: the object header is the runtime allocator's, and there is no managed base state.
     ObjectCtor,
+    /// `System.Array::GetLength(int)` -- a dimension's length, read from the array header
+    /// (`[array + dim*4]`: dim0 at +0, dim1 at +4; for a 1-D array dimension 0 is the length).
+    ArrayGetLength,
+    /// `System.String::Concat(string, string)` -- what `a + b` emits; allocates and fills a new blob.
+    StringConcat,
+    /// `System.Int32::ToString()` -- formats the receiver int as its decimal string.
+    IntToString,
 }
 
 /// What the lowering needs about a `call` target: how many arguments to pop, whether it
@@ -122,10 +135,36 @@ pub trait CallResolver {
         None
     }
 
+    /// The 2-D rectangular-array operation a `newobj`/`call` operand names -- the `int[,]::.ctor`,
+    /// `Get`, or `Set` pseudo-method on an array TypeSpec of rank 2 (rectangular arrays go through
+    /// `System.Array` calls, not the `szarray` opcodes), or `None` if the operand is not one. The
+    /// resolver recognizes it by decoding the operand's MemberRef parent (a TypeSpec) as an array
+    /// signature. Defaults to `None`.
+    fn array_2d_op(&self, _operand: &Operand) -> Option<Array2DOp> {
+        None
+    }
+
     /// The byte offset of a static field (an `ldsfld`/`stsfld` operand token) within the module's
     /// static storage region. Defaults to `None`.
     fn static_field_offset(&self, _operand: &Operand) -> Option<u32> {
         None
+    }
+
+    /// The exception TAG of the type a token names, for the no-GC tag-dispatch model: the
+    /// constructor token of a `newobj` (an exception built and thrown is lowered to its tag, not
+    /// a heap object) or a `catch` clause's type token. `Some(tag)` only for an exception type,
+    /// so a `newobj` of an ordinary class still allocates. The tag is identical wherever the same
+    /// type is named -- throw site, catch, and runtime -- so the tiers never diverge. Defaults to
+    /// `None`.
+    fn exception_tag(&self, _operand: &Operand) -> Option<u32> {
+        None
+    }
+
+    /// Whether a `catch` clause's type token is a universal catch -- `System.Exception` (or
+    /// `System.Object` for a typeless `catch {}`) -- which matches any in-flight exception, so the
+    /// dispatch tests the tag for nonzero rather than an exact value. Defaults to `false`.
+    fn is_catch_all_type(&self, _operand: &Operand) -> bool {
+        false
     }
 
     /// The heap layout for `box`/`unbox.any` of the value type named by the operand token: the
@@ -155,6 +194,32 @@ pub struct ArrayElement {
     pub handle: TypeHandle,
     /// The size in bytes of one element.
     pub element_size: u32,
+}
+
+/// A 2-D rectangular-array pseudo-method a `newobj`/`call` names (`int[,]::.ctor`/`Get`/`Set` on an
+/// array TypeSpec of rank 2). The lowering pops the operands and emits the matching 2-D MIR primitive.
+pub enum Array2DOp {
+    /// `newobj int[,]::.ctor(dim0, dim1)` -- allocate; carries the array identity + element size.
+    New {
+        /// The array type's identity, for the emitted TypeDesc.
+        handle: TypeHandle,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
+    /// `call int[,]::Get(i, j)` -- load; carries the element width/signedness and the loaded type.
+    Get {
+        /// The size in bytes of one element.
+        element_size: u32,
+        /// Whether a sub-word element is sign-extended (signed) or zero-extended.
+        signed: bool,
+        /// The MIR type of the loaded element (the `Get` result).
+        element_type: MirType,
+    },
+    /// `call int[,]::Set(i, j, value)` -- store (the value's width comes from its stacked type).
+    Set {
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
 }
 
 /// A [`CallResolver`] for call-free bodies: every resolution fails. The default for the
@@ -191,12 +256,48 @@ fn lower_with_source(
         };
         running = running.wrapping_add(opcode + operand);
     }
-    let blocks = control_flow::discover_blocks(code);
+    let blocks = control_flow::discover_blocks(code, &body.handlers);
     let preds = control_flow::predecessors(code, &blocks);
     let (arg_count, local_count) = scan_slots(code);
 
     let block_of = |instr: usize| blocks.iter().position(|&(s, e)| instr >= s && instr < e);
     let is_merge = |b: usize| preds.get(b).is_some_and(|p| p.len() > 1);
+
+    let catch_clauses: Vec<&EhClause> = body
+        .handlers
+        .iter()
+        .filter(|clause| matches!(clause.kind, EhKind::Catch(_)))
+        .collect();
+    let handler_block_of_clause: Vec<usize> = catch_clauses
+        .iter()
+        .map(|clause| {
+            blocks
+                .iter()
+                .position(|&(start, _)| start == clause.handler_range.start as usize)
+                .unwrap_or(0)
+        })
+        .collect();
+    let handler_clause: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|&(start, _)| {
+            catch_clauses
+                .iter()
+                .position(|clause| clause.handler_range.start as usize == start)
+        })
+        .collect();
+    let throw_clause: Vec<Option<usize>> = blocks
+        .iter()
+        .map(|&(start, end)| {
+            catch_clauses
+                .iter()
+                .enumerate()
+                .filter(|(_, clause)| {
+                    clause.try_range.start as usize <= start && end <= clause.try_range.end as usize
+                })
+                .min_by_key(|(_, clause)| clause.try_range.end - clause.try_range.start)
+                .map(|(index, _)| index)
+        })
+        .collect();
 
     if is_merge(0) {
         return Err(CilError::UnsupportedControlFlow);
@@ -214,9 +315,18 @@ fn lower_with_source(
         .collect();
 
     let mut block_params: Vec<Vec<ValueId>> = Vec::with_capacity(blocks.len());
-    for b in 0..blocks.len() {
+    for (b, handler) in handler_clause.iter().enumerate() {
         let params = if b == 0 {
             args.clone()
+        } else if handler.is_some() {
+            let mut params: Vec<ValueId> = (0..local_count)
+                .map(|i| {
+                    let ty = local_types.get(i).copied().unwrap_or(MirType::I32);
+                    new_value(&mut value_types, ty)
+                })
+                .collect();
+            params.push(new_value(&mut value_types, MirType::ObjectRef));
+            params
         } else if is_merge(b) {
             (0..local_count)
                 .map(|i| {
@@ -235,10 +345,17 @@ fn lower_with_source(
     let mut exit_locals: Vec<Vec<Option<ValueId>>> = vec![Vec::new(); blocks.len()];
     let original_block_count = blocks.len();
     let mut split_blocks: Vec<BasicBlock> = Vec::new();
+    let mut propagate_fixups: Vec<usize> = Vec::new();
 
     for (b, &(start, end)) in blocks.iter().enumerate() {
         let mut locals: Vec<Option<ValueId>> = if b == 0 {
             vec![None; local_count]
+        } else if handler_clause[b].is_some() {
+            block_params[b]
+                .iter()
+                .take(local_count)
+                .map(|&p| Some(p))
+                .collect()
         } else if is_merge(b) {
             block_params[b].iter().map(|&p| Some(p)).collect()
         } else {
@@ -254,6 +371,11 @@ fn lower_with_source(
         locals.resize(local_count, None);
 
         let mut stack: Vec<ValueId> = Vec::new();
+        if handler_clause[b].is_some() {
+            if let Some(&exception) = block_params[b].get(local_count) {
+                stack.push(exception);
+            }
+        }
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
         let mut il_index: Vec<u32> = Vec::new();
         let mut terminator: Option<Terminator> = None;
@@ -265,6 +387,47 @@ fn lower_with_source(
             let before = insts.len();
             if is_last && inst.opcode == Opcode::Ret {
                 terminator = Some(Terminator::Return(stack.pop()));
+            } else if is_last && inst.opcode == Opcode::Throw {
+                terminator = Some(build_eh_throw(
+                    throw_clause[b],
+                    &catch_clauses,
+                    &handler_block_of_clause,
+                    resolver,
+                    &mut stack,
+                    &locals,
+                    local_count,
+                    local_types,
+                    &mut value_types,
+                    &mut insts,
+                    &mut split_blocks,
+                    original_block_count,
+                    &mut propagate_fixups,
+                )?);
+            } else if is_last
+                && matches!(inst.opcode, Opcode::Leave | Opcode::LeaveS)
+                && throw_clause[b].is_some()
+            {
+                let Operand::Target(target_instr) = &inst.operand else {
+                    return Err(CilError::BadOperand);
+                };
+                let leave_target =
+                    block_of(*target_instr as usize).ok_or(CilError::UnsupportedControlFlow)?;
+                terminator = Some(build_eh_leave(
+                    leave_target,
+                    throw_clause[b].expect("checked is_some above"),
+                    &catch_clauses,
+                    &handler_block_of_clause,
+                    resolver,
+                    &is_merge,
+                    &locals,
+                    local_count,
+                    local_types,
+                    &mut value_types,
+                    &mut insts,
+                    &mut split_blocks,
+                    original_block_count,
+                    &mut propagate_fixups,
+                )?);
             } else if is_last && control_flow::branch_kind(inst.opcode).is_some() {
                 terminator = Some(build_branch(
                     inst,
@@ -363,6 +526,15 @@ fn lower_with_source(
         Some(Terminator::Return(Some(v))) => value_types.get(v.index()).copied(),
         _ => None,
     });
+
+    if let Some(ret_ty) = ret {
+        for &block_index in &propagate_fixups {
+            let value = new_value(&mut value_types, ret_ty);
+            let block = &mut mir_blocks[block_index];
+            block.insts.push((value, zero_inst(ret_ty)));
+            block.terminator = Some(Terminator::Return(Some(value)));
+        }
+    }
 
     let function = Function {
         params: (0..arg_count)
@@ -675,6 +847,20 @@ fn apply_value_op(
             ));
             stack.push(result);
         }
+        Opcode::LdcR4 => {
+            let Operand::Float32(v) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            let result = new_value(value_types, MirType::F32);
+            insts.push((
+                result,
+                Inst::ConstInt {
+                    ty: MirType::F32,
+                    value: i64::from(v.to_bits()),
+                },
+            ));
+            stack.push(result);
+        }
         Opcode::Add => binary(value_types, stack, insts, BinOp::Add)?,
         Opcode::Sub => binary(value_types, stack, insts, BinOp::Sub)?,
         Opcode::Mul => binary(value_types, stack, insts, BinOp::Mul)?,
@@ -684,6 +870,10 @@ fn apply_value_op(
         Opcode::Shl => binary(value_types, stack, insts, BinOp::Shl)?,
         Opcode::Shr => binary(value_types, stack, insts, BinOp::ShrSigned)?,
         Opcode::ShrUn => binary(value_types, stack, insts, BinOp::ShrUnsigned)?,
+        Opcode::Div => binary(value_types, stack, insts, BinOp::DivSigned)?,
+        Opcode::DivUn => binary(value_types, stack, insts, BinOp::DivUnsigned)?,
+        Opcode::Rem => binary(value_types, stack, insts, BinOp::RemSigned)?,
+        Opcode::RemUn => binary(value_types, stack, insts, BinOp::RemUnsigned)?,
         Opcode::Ceq => compare(value_types, stack, insts, CmpOp::Eq)?,
         Opcode::Cgt => compare(value_types, stack, insts, CmpOp::SignedGt)?,
         Opcode::CgtUn => compare(value_types, stack, insts, CmpOp::UnsignedGt)?,
@@ -737,7 +927,42 @@ fn apply_value_op(
         Opcode::ConvU2 => convert(value_types, stack, insts, ConvKind::ZeroExtend16)?,
         Opcode::ConvI8 => widen(value_types, stack, insts, true)?,
         Opcode::ConvU8 => widen(value_types, stack, insts, false)?,
-        Opcode::ConvI4 | Opcode::ConvU4 => narrow_to_i32(value_types, stack, insts)?,
+        Opcode::ConvI4 | Opcode::ConvU4 => {
+            let top = *stack.last().ok_or(CilError::StackUnderflow)?;
+            if value_types.get(top.index()) == Some(&MirType::F32) {
+                let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let result = new_value(value_types, MirType::I32);
+                insts.push((
+                    result,
+                    Inst::Convert {
+                        value,
+                        kind: ConvKind::Float32ToInt,
+                    },
+                ));
+                stack.push(result);
+            } else {
+                narrow_to_i32(value_types, stack, insts)?;
+            }
+        }
+        Opcode::ConvR4 => {
+            let top = *stack.last().ok_or(CilError::StackUnderflow)?;
+            match value_types.get(top.index()) {
+                Some(MirType::I32) => {
+                    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, MirType::F32);
+                    insts.push((
+                        result,
+                        Inst::Convert {
+                            value,
+                            kind: ConvKind::IntToFloat32,
+                        },
+                    ));
+                    stack.push(result);
+                }
+                Some(MirType::F32) => {}
+                _ => return Err(CilError::Unsupported(inst.opcode)),
+            }
+        }
         Opcode::Pop => {
             stack.pop().ok_or(CilError::StackUnderflow)?;
         }
@@ -773,9 +998,62 @@ fn apply_value_op(
             stack.push(value);
         }
         Opcode::Call | Opcode::Callvirt => {
+            match resolver.array_2d_op(&inst.operand) {
+                Some(Array2DOp::Get {
+                    element_size,
+                    signed,
+                    element_type,
+                }) => {
+                    let index1 = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let index0 = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, element_type);
+                    insts.push((
+                        result,
+                        Inst::Array2DLoad {
+                            array,
+                            index0,
+                            index1,
+                            element_size,
+                            signed,
+                        },
+                    ));
+                    stack.push(result);
+                    return Ok(());
+                }
+                Some(Array2DOp::Set { element_size }) => {
+                    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let index1 = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let index0 = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((
+                        result,
+                        Inst::Array2DStore {
+                            array,
+                            index0,
+                            index1,
+                            value,
+                            element_size,
+                        },
+                    ));
+                    return Ok(());
+                }
+                _ => {}
+            }
             let info = resolver
                 .resolve(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
+            if matches!(info.target, CallTarget::Intrinsic(Intrinsic::IntToString)) {
+                let (source, _) = last_local_addr
+                    .take()
+                    .ok_or(CilError::Unsupported(inst.opcode))?;
+                let value = addr_base(source, locals, local_types, args, value_types, insts)?;
+                let result = new_value(value_types, MirType::ObjectRef);
+                insts.push((result, Inst::IntToString { value }));
+                stack.push(result);
+                return Ok(());
+            }
             let this = last_local_addr
                 .take()
                 .map(|(source, off)| -> Result<ValueId, CilError> {
@@ -839,7 +1117,49 @@ fn apply_value_op(
                     insts.push((result, Inst::StringEquals { lhs, rhs }));
                     stack.push(result);
                 }
+                CallTarget::Intrinsic(Intrinsic::StringConcat) => {
+                    let mut acc = *call_args.first().ok_or(CilError::StackUnderflow)?;
+                    for &next in &call_args[1..] {
+                        let result = new_value(value_types, MirType::ObjectRef);
+                        insts.push((
+                            result,
+                            Inst::StringConcat {
+                                lhs: acc,
+                                rhs: next,
+                            },
+                        ));
+                        acc = result;
+                    }
+                    stack.push(acc);
+                }
+                CallTarget::Intrinsic(Intrinsic::IntToString) => {
+                    unreachable!(
+                        "Int32.ToString() is intercepted before the call-argument handling"
+                    );
+                }
                 CallTarget::Intrinsic(Intrinsic::ObjectCtor) => {
+                }
+                CallTarget::Intrinsic(Intrinsic::ArrayGetLength) => {
+                    let array = *call_args.first().ok_or(CilError::StackUnderflow)?;
+                    let dim = *call_args.get(1).ok_or(CilError::StackUnderflow)?;
+                    let dim_const = insts
+                        .iter()
+                        .rev()
+                        .find(|(v, _)| *v == dim)
+                        .and_then(|(_, i)| match i {
+                            Inst::ConstInt { value, .. } => u32::try_from(*value).ok(),
+                            _ => None,
+                        })
+                        .ok_or(CilError::Unsupported(inst.opcode))?;
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((
+                        result,
+                        Inst::FieldLoad {
+                            base: array,
+                            offset: dim_const * 4,
+                        },
+                    ));
+                    stack.push(result);
                 }
             }
         }
@@ -1070,6 +1390,30 @@ fn apply_value_op(
             insts.push((placeholder, Inst::StaticStore { offset, value }));
         }
         Opcode::Newobj => {
+            if let Some(tag) = resolver.exception_tag(&inst.operand) {
+                push_const(value_types, stack, insts, i64::from(tag));
+                return Ok(());
+            }
+            if let Some(Array2DOp::New {
+                handle,
+                element_size,
+            }) = resolver.array_2d_op(&inst.operand)
+            {
+                let dim1 = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let dim0 = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let array = new_value(value_types, MirType::ObjectRef);
+                insts.push((
+                    array,
+                    Inst::AllocArray2D {
+                        handle,
+                        dim0,
+                        dim1,
+                        element_size,
+                    },
+                ));
+                stack.push(array);
+                return Ok(());
+            }
             let info = resolver
                 .resolve(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
@@ -1207,6 +1551,308 @@ fn merge_args(
             }
         })
         .collect()
+}
+
+/// The instruction that zero-initializes a value of `ty`: a zeroed struct for a value type, a
+/// zero constant otherwise -- how an unwritten local or a propagation placeholder defaults.
+fn zero_inst(ty: MirType) -> Inst {
+    if matches!(ty, MirType::ValueType { .. }) {
+        Inst::InitStruct
+    } else {
+        Inst::ConstInt { ty, value: 0 }
+    }
+}
+
+/// How a synthesized dispatch decides a catch clause matches the in-flight exception.
+#[derive(Clone, Copy)]
+enum DispatchMatch {
+    /// `catch (System.Exception)` / `catch {}`: any in-flight exception (a nonzero tag) matches.
+    CatchAll,
+    /// `catch (T)`: only this exact type tag matches (subtyping is a later increment).
+    ExactTag(u32),
+}
+
+/// The match rule and handler block for the catch clause at `clause_index`.
+fn catch_dispatch(
+    resolver: &dyn CallResolver,
+    catch_clauses: &[&EhClause],
+    handler_block_of_clause: &[usize],
+    clause_index: usize,
+) -> Result<(DispatchMatch, usize), CilError> {
+    let EhKind::Catch(catch_token) = &catch_clauses[clause_index].kind else {
+        return Err(CilError::Unsupported(Opcode::Throw));
+    };
+    let operand = Operand::Token(*catch_token);
+    let match_kind = if resolver.is_catch_all_type(&operand) {
+        DispatchMatch::CatchAll
+    } else {
+        let tag = resolver
+            .exception_tag(&operand)
+            .ok_or(CilError::Unsupported(Opcode::Throw))?;
+        DispatchMatch::ExactTag(tag)
+    };
+    Ok((match_kind, handler_block_of_clause[clause_index]))
+}
+
+/// Synthesizes a per-try dispatch (and its clear/propagate blocks), appended after the originals
+/// with stable ids: `dispatch -> { clear -> handler, propagate }`. The dispatch loads
+/// `g_exception_tag` and tests it against `match_kind`; on a match `clear` resets the tag and jumps
+/// to the handler carrying the throw-point `locals` plus the caught exception (captured as an
+/// `ObjectRef` BEFORE clearing -- a catch variable is an exception reference, so it stays typed `O`
+/// through any later merge); on no match it propagates (returns with the tag still set, filled once
+/// the return type is known). Returns the dispatch block's id.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_dispatch(
+    match_kind: DispatchMatch,
+    handler_block: usize,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+    propagate_fixups: &mut Vec<usize>,
+) -> usize {
+    let dispatch = block_count + split_blocks.len();
+    let clear = dispatch + 1;
+    let propagate = dispatch + 2;
+
+    let mut dispatch_insts: Vec<(ValueId, Inst)> = Vec::new();
+    let loaded = new_value(value_types, MirType::I32);
+    dispatch_insts.push((
+        loaded,
+        Inst::StaticLoad {
+            offset: G_EXCEPTION_TAG_OFFSET,
+        },
+    ));
+    let cond = match match_kind {
+        DispatchMatch::CatchAll => loaded,
+        DispatchMatch::ExactTag(tag) => {
+            let expected = new_value(value_types, MirType::I32);
+            dispatch_insts.push((
+                expected,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: i64::from(tag),
+                },
+            ));
+            let matched = new_value(value_types, MirType::I32);
+            dispatch_insts.push((
+                matched,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: loaded,
+                    rhs: expected,
+                },
+            ));
+            matched
+        }
+    };
+
+    let mut clear_insts: Vec<(ValueId, Inst)> = Vec::new();
+    let exception = new_value(value_types, MirType::ObjectRef);
+    clear_insts.push((
+        exception,
+        Inst::StaticLoad {
+            offset: G_EXCEPTION_TAG_OFFSET,
+        },
+    ));
+    let zero = new_value(value_types, MirType::I32);
+    clear_insts.push((
+        zero,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: 0,
+        },
+    ));
+    let cleared = new_value(value_types, MirType::I32);
+    clear_insts.push((
+        cleared,
+        Inst::StaticStore {
+            offset: G_EXCEPTION_TAG_OFFSET,
+            value: zero,
+        },
+    ));
+    let mut handler_args = merge_args(
+        true,
+        local_count,
+        locals,
+        local_types,
+        value_types,
+        &mut clear_insts,
+    );
+    handler_args.push(exception);
+
+    split_blocks.push(BasicBlock {
+        params: Vec::new(),
+        insts: dispatch_insts,
+        terminator: Some(Terminator::Branch {
+            cond,
+            if_true: BlockId(clear as u32),
+            true_args: Vec::new(),
+            if_false: BlockId(propagate as u32),
+            false_args: Vec::new(),
+        }),
+    });
+    split_blocks.push(BasicBlock {
+        params: Vec::new(),
+        insts: clear_insts,
+        terminator: Some(Terminator::Jump {
+            target: BlockId(handler_block as u32),
+            args: handler_args,
+        }),
+    });
+    let propagate_actual = push_propagate(split_blocks, block_count, propagate_fixups);
+    debug_assert_eq!(propagate_actual, propagate);
+
+    dispatch
+}
+
+/// Builds the terminator for a block ending in `throw` (the no-GC tag model). The exception's
+/// tag -- the value `newobj E` produced -- is stored into `g_exception_tag`, then control goes to
+/// a synthesized dispatch ([`synthesize_dispatch`]) for the enclosing catch (`throw_clause`); an
+/// uncaught throw propagates directly (returns with the tag set, filled once the return type is
+/// known via `propagate_fixups`).
+#[allow(clippy::too_many_arguments)]
+fn build_eh_throw(
+    throw_clause: Option<usize>,
+    catch_clauses: &[&EhClause],
+    handler_block_of_clause: &[usize],
+    resolver: &dyn CallResolver,
+    stack: &mut Vec<ValueId>,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+    propagate_fixups: &mut Vec<usize>,
+) -> Result<Terminator, CilError> {
+    let tag = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let stored = new_value(value_types, MirType::I32);
+    insts.push((
+        stored,
+        Inst::StaticStore {
+            offset: G_EXCEPTION_TAG_OFFSET,
+            value: tag,
+        },
+    ));
+
+    let Some(clause_index) = throw_clause else {
+        let propagate = push_propagate(split_blocks, block_count, propagate_fixups);
+        return Ok(Terminator::Jump {
+            target: BlockId(propagate as u32),
+            args: Vec::new(),
+        });
+    };
+
+    let (match_kind, handler_block) = catch_dispatch(
+        resolver,
+        catch_clauses,
+        handler_block_of_clause,
+        clause_index,
+    )?;
+    let dispatch = synthesize_dispatch(
+        match_kind,
+        handler_block,
+        locals,
+        local_count,
+        local_types,
+        value_types,
+        split_blocks,
+        block_count,
+        propagate_fixups,
+    );
+    Ok(Terminator::Jump {
+        target: BlockId(dispatch as u32),
+        args: Vec::new(),
+    })
+}
+
+/// Builds the terminator for a try-body block ending in `leave` that exits a caught try
+/// (`throw_clause` names the catch): the cross-call propagation check. A may-throw call in the
+/// body left `g_exception_tag` set if it propagated, so the leave loads the tag and, when it is
+/// nonzero, branches to the catch's dispatch instead of leaving normally; when it is zero the try
+/// completed, so it leaves to `leave_target` (through a landing block when that is a merge, since a
+/// `Branch` edge carries no arguments). Scoped to one may-throw call per try body checked at the
+/// exit -- a side effect between a throwing call and the leave is a later increment.
+#[allow(clippy::too_many_arguments)]
+fn build_eh_leave(
+    leave_target: usize,
+    clause_index: usize,
+    catch_clauses: &[&EhClause],
+    handler_block_of_clause: &[usize],
+    resolver: &dyn CallResolver,
+    is_merge: &impl Fn(usize) -> bool,
+    locals: &[Option<ValueId>],
+    local_count: usize,
+    local_types: &[MirType],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+    propagate_fixups: &mut Vec<usize>,
+) -> Result<Terminator, CilError> {
+    let (match_kind, handler_block) = catch_dispatch(
+        resolver,
+        catch_clauses,
+        handler_block_of_clause,
+        clause_index,
+    )?;
+    let in_flight = new_value(value_types, MirType::I32);
+    insts.push((
+        in_flight,
+        Inst::StaticLoad {
+            offset: G_EXCEPTION_TAG_OFFSET,
+        },
+    ));
+    let dispatch = synthesize_dispatch(
+        match_kind,
+        handler_block,
+        locals,
+        local_count,
+        local_types,
+        value_types,
+        split_blocks,
+        block_count,
+        propagate_fixups,
+    );
+    let landing = split_edge_to_merge(
+        leave_target,
+        is_merge,
+        local_count,
+        locals,
+        local_types,
+        value_types,
+        split_blocks,
+        block_count,
+    );
+    Ok(Terminator::Branch {
+        cond: in_flight,
+        if_true: BlockId(dispatch as u32),
+        true_args: Vec::new(),
+        if_false: BlockId(landing as u32),
+        false_args: Vec::new(),
+    })
+}
+
+/// Pushes a propagation block -- an exit that returns, leaving `g_exception_tag` set -- and
+/// records it for return-value fill-in once the function's return type is known. Returns its
+/// block index.
+fn push_propagate(
+    split_blocks: &mut Vec<BasicBlock>,
+    block_count: usize,
+    propagate_fixups: &mut Vec<usize>,
+) -> usize {
+    let index = block_count + split_blocks.len();
+    split_blocks.push(BasicBlock {
+        params: Vec::new(),
+        insts: Vec::new(),
+        terminator: Some(Terminator::Return(None)),
+    });
+    propagate_fixups.push(index);
+    index
 }
 
 /// Builds the terminator for a block ending in a branch. `fallthrough` is the
@@ -1599,7 +2245,7 @@ mod control_flow {
     use alloc::vec::Vec;
 
     use alloc::collections::BTreeSet;
-    use lamella_cil::{Instruction, Opcode, Operand};
+    use lamella_cil::{EhClause, EhKind, Instruction, Opcode, Operand};
 
     #[test]
     fn lowers_unsigned_less_than() {
@@ -1772,9 +2418,10 @@ mod control_flow {
     }
 
     /// Partitions a method's CIL into basic blocks, as `[start, end)` index ranges.
-    /// Leaders are instruction 0, every branch target, and the instruction after a
-    /// branch or a return.
-    pub fn discover_blocks(code: &[Instruction]) -> Vec<(usize, usize)> {
+    /// Leaders are instruction 0, every branch target, the instruction after a branch or a
+    /// return, and every exception-region boundary (a try/handler/filter start or end), so a
+    /// protected region and its handler are clean block boundaries the EH lowering can map.
+    pub fn discover_blocks(code: &[Instruction], handlers: &[EhClause]) -> Vec<(usize, usize)> {
         let mut leaders: BTreeSet<usize> = BTreeSet::new();
         leaders.insert(0);
         for (i, inst) in code.iter().enumerate() {
@@ -1792,6 +2439,15 @@ mod control_flow {
                 leaders.insert(i + 1);
             } else if is_return(inst.opcode) {
                 leaders.insert(i + 1);
+            }
+        }
+        for clause in handlers {
+            leaders.insert(clause.try_range.start as usize);
+            leaders.insert(clause.try_range.end as usize);
+            leaders.insert(clause.handler_range.start as usize);
+            leaders.insert(clause.handler_range.end as usize);
+            if let EhKind::Filter { filter_start } = clause.kind {
+                leaders.insert(filter_start as usize);
             }
         }
         let starts: Vec<usize> = leaders.into_iter().filter(|&l| l < code.len()).collect();
@@ -2355,7 +3011,7 @@ mod tests {
             Instruction::simple(Opcode::LdcI41),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code);
+        let blocks = control_flow::discover_blocks(&code, &[]);
         assert_eq!(blocks, vec![(0, 3), (3, 5), (5, 7)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());
@@ -2435,7 +3091,7 @@ mod tests {
             Instruction::new(Opcode::LdcI4S, Operand::Int8(30)),
             Instruction::simple(Opcode::Ret),
         ];
-        let blocks = control_flow::discover_blocks(&code);
+        let blocks = control_flow::discover_blocks(&code, &[]);
         assert_eq!(blocks, vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]);
         let preds = control_flow::predecessors(&code, &blocks);
         assert!(preds[0].is_empty());
@@ -2605,6 +3261,79 @@ mod tests {
         assert_eq!(func.ret, Some(MirType::I32));
         #[cfg(feature = "arm32")]
         assert!(crate::arm32::lower_module_gc(&[func], 0x09).is_ok());
+    }
+
+    #[test]
+    fn lowers_float_to_int_conversion() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcR4, Operand::Float32(2.5)),
+                Instruction::simple(Opcode::ConvI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::ConstInt {
+                ty: MirType::F32,
+                ..
+            }
+        )));
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::Convert {
+                kind: ConvKind::Float32ToInt,
+                ..
+            }
+        )));
+        assert_eq!(func.ret, Some(MirType::I32));
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_int_to_float_conversion() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::simple(Opcode::ConvR4),
+                Instruction::simple(Opcode::ConvI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::Convert {
+                kind: ConvKind::IntToFloat32,
+                ..
+            }
+        )));
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::Convert {
+                kind: ConvKind::Float32ToInt,
+                ..
+            }
+        )));
+        assert_eq!(func.ret, Some(MirType::I32));
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
     }
 
     #[test]

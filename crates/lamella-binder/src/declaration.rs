@@ -11,7 +11,7 @@ use crate::types::TypeSymbol;
 use alloc::string::String;
 use lamella_syntax::ast::{
     CompilationUnit, Expr, ExprKind, Literal, Member, Modifier, NamespaceMember, QualifiedName,
-    TypeDecl, TypeKind as SyntaxTypeKind, UnaryOperator,
+    TypeDecl, TypeKind as SyntaxTypeKind, UnaryOperator, explicit_interface_member_name,
 };
 
 /// Builds the [`Model`] of every type and member declared in `unit`.
@@ -68,6 +68,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     name: member.name.clone(),
                     ty: enum_ty.clone(),
                     is_static: true,
+                    is_readonly: false,
                     accessibility: Accessibility::Public,
                     constant: Some(value),
                 });
@@ -181,8 +182,29 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         name: declarator.name.clone(),
                         ty: field_ty.clone(),
                         is_static,
+                        is_readonly: modifiers.iter().any(|m| matches!(m, Modifier::Readonly)),
                         accessibility,
                         constant,
+                    });
+                }
+            }
+            Member::EventField {
+                modifiers,
+                ty,
+                declarators,
+                ..
+            } => {
+                let field_ty = bind_type(ty);
+                let is_static = is_static(modifiers);
+                let accessibility = access(modifiers);
+                for declarator in declarators {
+                    info.fields.push(FieldSymbol {
+                        name: declarator.name.clone(),
+                        ty: field_ty.clone(),
+                        is_static,
+                        is_readonly: false,
+                        accessibility,
+                        constant: None,
                     });
                 }
             }
@@ -191,14 +213,21 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 return_type,
                 name,
                 parameters,
+                explicit_interface,
                 ..
             } => info.methods.push(MethodSymbol {
-                name: name.clone(),
+                name: match explicit_interface {
+                    Some(interface) => explicit_interface_member_name(interface, name).into(),
+                    None => name.clone(),
+                },
                 return_type: bind_type(return_type),
                 parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
-                is_static: is_static(modifiers),
+                is_static: explicit_interface.is_none() && is_static(modifiers),
                 is_params: has_params_array(parameters),
-                accessibility: access(modifiers),
+                accessibility: match explicit_interface {
+                    Some(_) => Accessibility::Private,
+                    None => access(modifiers),
+                },
             }),
             Member::Operator {
                 return_type,

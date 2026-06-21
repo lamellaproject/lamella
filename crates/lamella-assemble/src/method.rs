@@ -34,6 +34,8 @@ pub struct EmittedBody {
     pub sequence_points: Vec<SequencePoint>,
     /// The exception-handling clauses for the method body's try statements.
     pub handlers: Vec<EhClause>,
+    /// Local slots that must be `pinned` in the signature (a `fixed` array holder).
+    pub pinned_slots: alloc::collections::BTreeSet<u16>,
 }
 
 /// The enclosing loop's (or switch's) branch targets, for `break` and `continue`.
@@ -223,6 +225,7 @@ pub fn emit_body(
         local_names: frame.local_names(),
         sequence_points: lowered.1,
         handlers: lowered.2,
+        pinned_slots: frame.pinned_slots(),
     })
 }
 
@@ -436,6 +439,24 @@ fn emit_statement(
         }
         BoundStmtKind::Checked(inner) | BoundStmtKind::Unchecked(inner) => {
             emit_statement(inner, frame, tokens, labels, out)?;
+        }
+        BoundStmtKind::Fixed {
+            name,
+            element,
+            init,
+            body,
+        } => {
+            let array_slot = frame.reserve_pinned_local(&init.ty);
+            emit_expression(init, frame, tokens, out)?;
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(array_slot)));
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array_slot)));
+            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+            let element_token = tokens
+                .type_token(element)
+                .ok_or(EmitError::Unsupported("fixed element type has no token"))?;
+            out.push(Instruction::new(Opcode::Ldelema, Operand::Token(element_token)));
+            store_to(frame, name, out)?;
+            emit_statement(body, frame, tokens, labels, out)?;
         }
         BoundStmtKind::Throw(value) => match value {
             Some(expr) => {
@@ -1058,9 +1079,16 @@ fn emit_combine(
     if binary == BinaryOperator::Add
         && matches!(operand_ty, TypeSymbol::Special(SpecialType::String))
     {
+        let value_is_string =
+            rhs.is_some_and(|value| matches!(value.ty, TypeSymbol::Special(SpecialType::String)));
+        let arg = TypeSymbol::Special(if value_is_string {
+            SpecialType::String
+        } else {
+            SpecialType::Object
+        });
         let string = TypeSymbol::Special(SpecialType::String);
         let token = tokens
-            .method(&string, "Concat", &[string.clone(), string.clone()])
+            .method(&string, "Concat", &[arg.clone(), arg])
             .ok_or(EmitError::Unsupported("String.Concat was not minted"))?;
         out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
         return Ok(());

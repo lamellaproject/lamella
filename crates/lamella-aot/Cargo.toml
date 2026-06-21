@@ -12,14 +12,19 @@ lamella-ir = { path = "../lamella-ir" }
 lamella-cil = { path = "../lamella-cil" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32", optional = true }
 lamella-asm-riscv32 = { path = "../lamella-asm-riscv32", optional = true }
+lamella-asm-wasm = { path = "../lamella-asm-wasm", optional = true }
 # The AOT compiler reads an assembly's metadata to resolve call/ldstr tokens (the
 # MetadataResolver); the core IR->native lowering itself stays metadata-free.
 lamella-metadata = { path = "../lamella-metadata" }
+# Metadata tokens: the MetadataResolver names a constructor/catch type token's declaring
+# type (the exception-tag seam); tests also construct tokens directly.
+lamella-token = { path = "../lamella-token" }
 
 [dev-dependencies]
-# Tests construct metadata tokens directly (e.g. a mock field-offset resolver).
-lamella-token = { path = "../lamella-token" }
+# The deploy-samd21 examples flash AOT output to real hardware: the generic CMSIS-DAP probe plus
+# the SAM D21 NVMCTRL flash routines from lamella-cmsis-dap-sam.
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam" }
 lamella-usbhid = { path = "../lamella-usbhid" }
 
 [features]
@@ -29,6 +34,7 @@ default = ["arm32"]
 # paths, and vice versa.
 arm32 = ["dep:lamella-asm-arm32"]
 riscv32 = ["dep:lamella-asm-riscv32"]
+wasm = ["dep:lamella-asm-wasm"]
 # String storage encoding (runtime's seam): UTF-16 by default. These switch the AOT string blob
 # and the op_Equality compare to UTF-8 (drops lone-surrogate parity) or surrogate-preserving
 # WTF-8. String.Length stays the UTF-16 unit count in all three. Mutually exclusive in intent;

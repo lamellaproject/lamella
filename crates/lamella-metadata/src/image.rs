@@ -42,6 +42,7 @@ pub struct MetadataImage<'a> {
     blob: &'a [u8],
     guid: &'a [u8],
     tables: &'a [u8],
+    pdb: &'a [u8],
     flags: u32,
     entry_point_token: u32,
 }
@@ -86,6 +87,7 @@ impl<'a> MetadataImage<'a> {
             blob: &[],
             guid: &[],
             tables: &[],
+            pdb: &[],
             flags: 0,
             entry_point_token: 0,
         };
@@ -110,6 +112,7 @@ impl<'a> MetadataImage<'a> {
                 "#Blob" => image.blob = data,
                 "#GUID" => image.guid = data,
                 "#~" | "#-" => image.tables = data,
+                "#Pdb" => image.pdb = data,
                 _ => {}
             }
         }
@@ -150,6 +153,12 @@ impl<'a> MetadataImage<'a> {
     #[must_use]
     pub fn tables(&self) -> &'a [u8] {
         self.tables
+    }
+
+    /// The raw `#Pdb` stream bytes (a standalone Portable PDB only), empty otherwise.
+    #[must_use]
+    pub fn pdb(&self) -> &'a [u8] {
+        self.pdb
     }
 
     /// The CLI header flags (II.25.3.3.1), 0 if parsed from a bare root.

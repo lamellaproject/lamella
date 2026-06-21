@@ -109,7 +109,7 @@ fn column_width(column: Col, header: &TablesHeader) -> usize {
         Col::Guid => header.guid_index_size(),
         Col::Blob => header.blob_index_size(),
         Col::Idx(target) => {
-            if header.row_count(target) < (1 << 16) {
+            if header.sizing_row_count(target) < (1 << 16) {
                 2
             } else {
                 4

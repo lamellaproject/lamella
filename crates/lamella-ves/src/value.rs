@@ -34,6 +34,19 @@ pub enum Value {
     Struct(Box<[Value]>),
     /// A managed pointer (`&`): a reference to a [`Location`] (III.1.1.1).
     ByRef(Location),
+    /// A typed reference (`typedref`, III.1.8.1.1): a managed pointer paired with the
+    /// runtime type it points at -- the `System.TypedReference` an `__makeref` produces.
+    /// `mkrefany` builds it, `refanyval` recovers the pointer (type-checked), and
+    /// `refanytype` recovers the type. Gated by `typed-references`: the no-typedref tiers
+    /// omit it and the three opcodes that produce it. The `type_token` is the asm-folded
+    /// type handle (the same `RuntimeTypeHandle` representation `ldtoken` yields).
+    #[cfg(feature = "typed-references")]
+    TypedRef {
+        /// Where the typed reference points (the managed pointer it carries).
+        location: Location,
+        /// The asm-folded type handle of the referent (matches `ldtoken` / a `Type`).
+        type_token: u32,
+    },
 }
 
 /// Where a managed pointer ([`Value::ByRef`]) points. A pointer into a frame names the
@@ -54,6 +67,21 @@ pub enum Location {
         frame: usize,
         /// The argument slot within that frame.
         slot: usize,
+    },
+    /// A byte offset into a `localloc` (`stackalloc`) buffer of a frame -- a raw
+    /// managed pointer (`&`) into stack-allocated, unmanaged memory (III.3.47). The
+    /// buffer is a flat zeroed byte block owned by the frame and freed when the method
+    /// returns; a frame may `localloc` more than once, so `buffer` indexes them. Unlike
+    /// the other locations, this names raw bytes, not a typed slot, so `ldind`/`stind`
+    /// through it read/write at the opcode's width (little-endian) and pointer arithmetic
+    /// adjusts `offset`.
+    Stack {
+        /// The owning frame's index in the call stack.
+        frame: usize,
+        /// Which of the frame's `localloc` buffers this points into.
+        buffer: usize,
+        /// The byte offset within that buffer.
+        offset: u32,
     },
     /// An instance-field slot of a heap object.
     Field {
@@ -100,6 +128,8 @@ impl Value {
             #[cfg(feature = "float")]
             Value::Float(value) => *value != 0.0,
             Value::Object(_) | Value::ByRef(_) | Value::Struct(_) => true,
+            #[cfg(feature = "typed-references")]
+            Value::TypedRef { .. } => true,
             Value::Null => false,
         }
     }

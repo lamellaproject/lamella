@@ -135,6 +135,9 @@ fn lower_inst(
                 BinOp::Shl => shift(enc, d, a, b, Encoder::lsls_reg),
                 BinOp::ShrSigned => shift(enc, d, a, b, Encoder::asrs_reg),
                 BinOp::ShrUnsigned => shift(enc, d, a, b, Encoder::lsrs_reg),
+                BinOp::DivSigned | BinOp::DivUnsigned | BinOp::RemSigned | BinOp::RemUnsigned => {
+                    return Err(LowerError::CallUnsupported);
+                }
             };
             emitted.map_err(|_| LowerError::TooManyValues)?;
         }
@@ -151,6 +154,9 @@ fn lower_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::Convert { value, kind } => {
+            if matches!(kind, ConvKind::Float32ToInt | ConvKind::IntToFloat32) {
+                return Err(LowerError::CallUnsupported);
+            }
             extend_for(enc, assign(result), assign(*value), *kind)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
@@ -166,10 +172,15 @@ fn lower_inst(
         | Inst::WriteInt { .. }
         | Inst::StringLiteral { .. }
         | Inst::StringEquals { .. }
+        | Inst::StringConcat { .. }
+        | Inst::IntToString { .. }
         | Inst::Alloc { .. }
         | Inst::AllocArray { .. }
         | Inst::ArrayLoad { .. }
         | Inst::ArrayStore { .. }
+        | Inst::AllocArray2D { .. }
+        | Inst::Array2DLoad { .. }
+        | Inst::Array2DStore { .. }
         | Inst::StaticLoad { .. }
         | Inst::StaticStore { .. } => {
             return Err(LowerError::CallUnsupported);
@@ -227,6 +238,7 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
         ConvKind::ZeroExtend8 => enc.uxtb(rd, rm),
         ConvKind::SignExtend16 => enc.sxth(rd, rm),
         ConvKind::ZeroExtend16 => enc.uxth(rd, rm),
+        ConvKind::Float32ToInt | ConvKind::IntToFloat32 => Ok(()),
     }
 }
 
@@ -382,6 +394,9 @@ fn lower_spilled_inst(
                 BinOp::Shl => emit_shl64(enc)?,
                 BinOp::ShrSigned => emit_shr64(enc, true)?,
                 BinOp::ShrUnsigned => emit_shr64(enc, false)?,
+                BinOp::DivSigned | BinOp::DivUnsigned | BinOp::RemSigned | BinOp::RemUnsigned => {
+                    return Err(LowerError::CallUnsupported);
+                }
             }
         }
         Inst::Binary { op, lhs, rhs } => {
@@ -389,18 +404,27 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_sp(Reg::R1, slot(*rhs))
                 .map_err(|_| LowerError::TooManyValues)?;
-            let emitted = match op {
-                BinOp::Add => enc.adds(Reg::R0, Reg::R0, Reg::R1),
-                BinOp::Sub => enc.subs(Reg::R0, Reg::R0, Reg::R1),
-                BinOp::And => enc.ands(Reg::R0, Reg::R1),
-                BinOp::Or => enc.orrs(Reg::R0, Reg::R1),
-                BinOp::Xor => enc.eors(Reg::R0, Reg::R1),
-                BinOp::Mul => enc.muls(Reg::R0, Reg::R1),
-                BinOp::Shl => enc.lsls_reg(Reg::R0, Reg::R1),
-                BinOp::ShrSigned => enc.asrs_reg(Reg::R0, Reg::R1),
-                BinOp::ShrUnsigned => enc.lsrs_reg(Reg::R0, Reg::R1),
-            };
-            emitted.map_err(|_| LowerError::TooManyValues)?;
+            match op {
+                BinOp::DivSigned => emit_divmod32(enc, true, false)?,
+                BinOp::DivUnsigned => emit_divmod32(enc, false, false)?,
+                BinOp::RemSigned => emit_divmod32(enc, true, true)?,
+                BinOp::RemUnsigned => emit_divmod32(enc, false, true)?,
+                _ => {
+                    let emitted = match op {
+                        BinOp::Add => enc.adds(Reg::R0, Reg::R0, Reg::R1),
+                        BinOp::Sub => enc.subs(Reg::R0, Reg::R0, Reg::R1),
+                        BinOp::And => enc.ands(Reg::R0, Reg::R1),
+                        BinOp::Or => enc.orrs(Reg::R0, Reg::R1),
+                        BinOp::Xor => enc.eors(Reg::R0, Reg::R1),
+                        BinOp::Mul => enc.muls(Reg::R0, Reg::R1),
+                        BinOp::Shl => enc.lsls_reg(Reg::R0, Reg::R1),
+                        BinOp::ShrSigned => enc.asrs_reg(Reg::R0, Reg::R1),
+                        BinOp::ShrUnsigned => enc.lsrs_reg(Reg::R0, Reg::R1),
+                        _ => unreachable!("div/rem handled above"),
+                    };
+                    emitted.map_err(|_| LowerError::TooManyValues)?;
+                }
+            }
         }
         Inst::Compare { op, lhs, rhs }
             if value_types.get(lhs.0 as usize) == Some(&MirType::I64) =>
@@ -533,7 +557,13 @@ fn lower_spilled_inst(
         Inst::Convert { value, kind } => {
             enc.ldr_sp(Reg::R0, slot(*value))
                 .map_err(|_| LowerError::TooManyValues)?;
-            extend_for(enc, Reg::R0, Reg::R0, *kind).map_err(|_| LowerError::TooManyValues)?;
+            if matches!(kind, ConvKind::Float32ToInt) {
+                emit_f2i(enc)?;
+            } else if matches!(kind, ConvKind::IntToFloat32) {
+                emit_i2f(enc)?;
+            } else {
+                extend_for(enc, Reg::R0, Reg::R0, *kind).map_err(|_| LowerError::TooManyValues)?;
+            }
         }
         Inst::Widen { value, signed } => {
             enc.ldr_sp(Reg::R0, slot(*value))
@@ -576,6 +606,9 @@ fn lower_spilled_inst(
             enc.ldr_sp(Reg::R1, slot(*rhs))
                 .map_err(|_| LowerError::TooManyValues)?;
             emit_string_equals(enc)?;
+        }
+        Inst::StringConcat { .. } | Inst::IntToString { .. } => {
+            return Err(LowerError::CallUnsupported);
         }
         Inst::ArrayLoad {
             array,
@@ -657,7 +690,105 @@ fn lower_spilled_inst(
             enc.str_imm(Reg::R1, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::Alloc { .. } | Inst::AllocArray { .. } => return Err(LowerError::CallUnsupported),
+        Inst::Alloc { .. } | Inst::AllocArray { .. } | Inst::AllocArray2D { .. } => {
+            return Err(LowerError::CallUnsupported);
+        }
+        Inst::Array2DLoad {
+            array,
+            index0,
+            index1,
+            element_size,
+            signed,
+        } => {
+            enc.ldr_sp(Reg::R0, slot(*array))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*index0))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_dim_bounds_check(enc, 0)?;
+            enc.ldr_sp(Reg::R1, slot(*index1))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_dim_bounds_check(enc, 4)?;
+            enc.ldr_sp(Reg::R1, slot(*index0))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R2, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.muls(Reg::R1, Reg::R2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R2, slot(*index1))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R1, Reg::R2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            scale_index(enc, pool, *element_size)?;
+            enc.adds_imm8(Reg::R0, 8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            if *element_size == 8 {
+                enc.adds(Reg::R2, Reg::R0, Reg::R1)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R0, Reg::R2, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R1, Reg::R2, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                match (*element_size, *signed) {
+                    (1, true) => enc.ldrsb_reg(Reg::R0, Reg::R0, Reg::R1),
+                    (1, false) => enc.ldrb_reg(Reg::R0, Reg::R0, Reg::R1),
+                    (2, true) => enc.ldrsh_reg(Reg::R0, Reg::R0, Reg::R1),
+                    (2, false) => enc.ldrh_reg(Reg::R0, Reg::R0, Reg::R1),
+                    _ => enc.ldr_reg(Reg::R0, Reg::R0, Reg::R1),
+                }
+                .map_err(|_| LowerError::TooManyValues)?;
+            }
+        }
+        Inst::Array2DStore {
+            array,
+            index0,
+            index1,
+            value,
+            element_size,
+        } => {
+            enc.ldr_sp(Reg::R0, slot(*array))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*index0))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_dim_bounds_check(enc, 0)?;
+            enc.ldr_sp(Reg::R1, slot(*index1))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_dim_bounds_check(enc, 4)?;
+            enc.ldr_sp(Reg::R1, slot(*index0))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R2, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.muls(Reg::R1, Reg::R2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R2, slot(*index1))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R1, Reg::R2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            scale_index(enc, pool, *element_size)?;
+            enc.adds_imm8(Reg::R0, 8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            if *element_size == 8 {
+                enc.adds(Reg::R0, Reg::R0, Reg::R1)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R2, slot(*value))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R3, slot(*value) + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R2, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R3, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                enc.ldr_sp(Reg::R2, slot(*value))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                match *element_size {
+                    1 => enc.strb_reg(Reg::R2, Reg::R0, Reg::R1),
+                    2 => enc.strh_reg(Reg::R2, Reg::R0, Reg::R1),
+                    _ => enc.str_reg(Reg::R2, Reg::R0, Reg::R1),
+                }
+                .map_err(|_| LowerError::TooManyValues)?;
+            }
+        }
     }
     Ok(None)
 }
@@ -672,7 +803,14 @@ const STATIC_FIELD_BASE: u32 = 0x2000_1000;
 /// unsigned value -- traps too, matching `IndexOutOfRangeException`'s effect. Until the exception
 /// model lands, an out-of-range access aborts rather than throwing a catchable exception.
 fn emit_array_bounds_check(enc: &mut Encoder) -> Result<(), LowerError> {
-    enc.ldr_imm(Reg::R2, Reg::R0, 0)
+    emit_dim_bounds_check(enc, 0)
+}
+
+/// Bounds-checks the index in `r1` against the dimension word at `[r0 + dim_offset]` (an array's
+/// length at offset 0, or a 2-D array's second dimension at offset 4), trapping (`udf`) when out of
+/// range. The compare is unsigned, so a negative index (a huge unsigned value) traps too. Clobbers r2.
+fn emit_dim_bounds_check(enc: &mut Encoder, dim_offset: u16) -> Result<(), LowerError> {
+    enc.ldr_imm(Reg::R2, Reg::R0, dim_offset)
         .map_err(|_| LowerError::TooManyValues)?;
     enc.cmp_reg(Reg::R1, Reg::R2)
         .map_err(|_| LowerError::TooManyValues)?;
@@ -680,6 +818,158 @@ fn emit_array_bounds_check(enc: &mut Encoder) -> Result<(), LowerError> {
     enc.b_cond(Cond::CarryClear, ok);
     enc.udf(0);
     enc.bind_label(ok);
+    Ok(())
+}
+
+/// Emits the soft `conv.i4` from a float32: with the IEEE-754 bit pattern in r0, leaves the value
+/// truncated toward zero as a signed int32 in r0. ARMv6-M has no FPU, so this is done by hand from
+/// the fields: `value = (-1)^sign * (1.mantissa) * 2^(exp-127)`, so the integer part is the 24-bit
+/// significand `(1<<23)|mantissa` shifted by `exp-150` (right when exp <= 150, left above), then
+/// negated for a set sign bit; an exponent below 127 (magnitude < 1) gives 0. (Overflow past 2^31
+/// is left undefined, like the hardware convert.) r1-r3 are scratch.
+fn emit_f2i(enc: &mut Encoder) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    let to_zero = enc.new_label();
+    let shift_left = enc.new_label();
+    let apply_sign = enc.new_label();
+    let store = enc.new_label();
+    let end = enc.new_label();
+    enc.lsrs_imm(Reg::R1, Reg::R0, 23).map_err(oops)?;
+    enc.movs_imm(Reg::R2, 0xFF).map_err(oops)?;
+    enc.ands(Reg::R1, Reg::R2).map_err(oops)?;
+    enc.cmp_imm(Reg::R1, 127).map_err(oops)?;
+    enc.b_cond(Cond::LessThan, to_zero);
+    enc.lsls_imm(Reg::R2, Reg::R0, 9).map_err(oops)?;
+    enc.lsrs_imm(Reg::R2, Reg::R2, 9).map_err(oops)?;
+    enc.movs_imm(Reg::R3, 1).map_err(oops)?;
+    enc.lsls_imm(Reg::R3, Reg::R3, 23).map_err(oops)?;
+    enc.orrs(Reg::R2, Reg::R3).map_err(oops)?;
+    enc.movs_imm(Reg::R3, 150).map_err(oops)?;
+    enc.subs(Reg::R3, Reg::R3, Reg::R1).map_err(oops)?;
+    enc.cmp_imm(Reg::R3, 0).map_err(oops)?;
+    enc.b_cond(Cond::LessThan, shift_left);
+    enc.lsrs_reg(Reg::R2, Reg::R3).map_err(oops)?;
+    enc.b(apply_sign);
+    enc.bind_label(shift_left);
+    enc.rsbs(Reg::R3, Reg::R3).map_err(oops)?;
+    enc.lsls_reg(Reg::R2, Reg::R3).map_err(oops)?;
+    enc.bind_label(apply_sign);
+    enc.lsrs_imm(Reg::R1, Reg::R0, 31).map_err(oops)?;
+    enc.cmp_imm(Reg::R1, 0).map_err(oops)?;
+    enc.b_cond(Cond::Eq, store);
+    enc.rsbs(Reg::R2, Reg::R2).map_err(oops)?;
+    enc.bind_label(store);
+    enc.mov_reg(Reg::R0, Reg::R2);
+    enc.b(end);
+    enc.bind_label(to_zero);
+    enc.movs_imm(Reg::R0, 0).map_err(oops)?;
+    enc.bind_label(end);
+    Ok(())
+}
+
+/// Emits the soft `conv.r4` from a signed int32: with the value in r0, leaves its IEEE-754 float32
+/// bit pattern in r0. ARMv6-M has no FPU (and no `clz`), so the magnitude is normalized by a shift
+/// loop: sign and `|v|` are split out, `|v|` is shifted left until its top bit is the implicit 1,
+/// and the exponent (`158 - shifts`) and the 23-bit mantissa (the next bits) are assembled with the
+/// sign. Exact for magnitudes below 2^24; larger values truncate the low bits (round-to-nearest is
+/// a follow-on). r1-r3 are scratch.
+fn emit_i2f(enc: &mut Encoder) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    let done = enc.new_label();
+    let norm_loop = enc.new_label();
+    let norm_done = enc.new_label();
+    enc.cmp_imm(Reg::R0, 0).map_err(oops)?;
+    enc.b_cond(Cond::Eq, done);
+    enc.lsrs_imm(Reg::R2, Reg::R0, 31).map_err(oops)?;
+    enc.asrs_imm(Reg::R3, Reg::R0, 31).map_err(oops)?;
+    enc.eors(Reg::R0, Reg::R3).map_err(oops)?;
+    enc.subs(Reg::R1, Reg::R0, Reg::R3).map_err(oops)?;
+    enc.movs_imm(Reg::R3, 0).map_err(oops)?;
+    enc.bind_label(norm_loop);
+    enc.lsrs_imm(Reg::R0, Reg::R1, 31).map_err(oops)?;
+    enc.cmp_imm(Reg::R0, 0).map_err(oops)?;
+    enc.b_cond(Cond::Ne, norm_done);
+    enc.lsls_imm(Reg::R1, Reg::R1, 1).map_err(oops)?;
+    enc.adds_imm8(Reg::R3, 1).map_err(oops)?;
+    enc.b(norm_loop);
+    enc.bind_label(norm_done);
+    enc.movs_imm(Reg::R0, 158).map_err(oops)?;
+    enc.subs(Reg::R0, Reg::R0, Reg::R3).map_err(oops)?;
+    enc.lsrs_imm(Reg::R1, Reg::R1, 8).map_err(oops)?;
+    enc.movs_imm(Reg::R3, 1).map_err(oops)?;
+    enc.lsls_imm(Reg::R3, Reg::R3, 23).map_err(oops)?;
+    enc.subs_imm8(Reg::R3, 1).map_err(oops)?;
+    enc.ands(Reg::R1, Reg::R3).map_err(oops)?;
+    enc.lsls_imm(Reg::R0, Reg::R0, 23).map_err(oops)?;
+    enc.orrs(Reg::R1, Reg::R0).map_err(oops)?;
+    enc.lsls_imm(Reg::R2, Reg::R2, 31).map_err(oops)?;
+    enc.orrs(Reg::R1, Reg::R2).map_err(oops)?;
+    enc.mov_reg(Reg::R0, Reg::R1);
+    enc.bind_label(done);
+    Ok(())
+}
+
+/// Emits a 32-bit integer divide/remainder for the divide-less Cortex-M0: dividend in r0, divisor in
+/// r1, the quotient (or the remainder, when `remainder`) left in r0. `signed` divides the magnitudes
+/// and re-applies the sign (the quotient's is `sign(n) ^ sign(d)`, the remainder's is `sign(n)`). The
+/// core is a restoring binary long division: 32 iterations, each shifting one dividend bit (high to
+/// low) into a running remainder and subtracting the divisor when it fits, setting that quotient bit.
+/// r4-r7 are saved/restored. Division by zero is left undefined here (no trap) -- a checked-context
+/// DivideByZeroException is a follow-up.
+fn emit_divmod32(enc: &mut Encoder, signed: bool, remainder: bool) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    enc.push_registers(0xF0, false);
+    if signed {
+        enc.movs_imm(Reg::R4, 31).map_err(oops)?;
+        enc.mov_reg(Reg::R2, Reg::R0);
+        enc.asrs_reg(Reg::R2, Reg::R4).map_err(oops)?;
+        enc.mov_reg(Reg::R3, Reg::R1);
+        enc.asrs_reg(Reg::R3, Reg::R4).map_err(oops)?;
+        enc.mov_reg(Reg::R7, Reg::R2);
+        if !remainder {
+            enc.eors(Reg::R7, Reg::R3).map_err(oops)?;
+        }
+        enc.eors(Reg::R0, Reg::R2).map_err(oops)?;
+        enc.subs(Reg::R0, Reg::R0, Reg::R2).map_err(oops)?;
+        enc.eors(Reg::R1, Reg::R3).map_err(oops)?;
+        enc.subs(Reg::R1, Reg::R1, Reg::R3).map_err(oops)?;
+    }
+    enc.movs_imm(Reg::R3, 0).map_err(oops)?;
+    enc.movs_imm(Reg::R2, 0).map_err(oops)?;
+    enc.movs_imm(Reg::R4, 32).map_err(oops)?;
+    let loop_top = enc.new_label();
+    let skip = enc.new_label();
+    enc.bind_label(loop_top);
+    enc.subs_imm8(Reg::R4, 1).map_err(oops)?;
+    enc.lsls_imm(Reg::R2, Reg::R2, 1).map_err(oops)?;
+    enc.mov_reg(Reg::R5, Reg::R0);
+    enc.lsrs_reg(Reg::R5, Reg::R4).map_err(oops)?;
+    enc.movs_imm(Reg::R6, 1).map_err(oops)?;
+    enc.ands(Reg::R5, Reg::R6).map_err(oops)?;
+    enc.orrs(Reg::R2, Reg::R5).map_err(oops)?;
+    enc.cmp_reg(Reg::R2, Reg::R1).map_err(oops)?;
+    enc.b_cond(Cond::CarryClear, skip);
+    enc.subs(Reg::R2, Reg::R2, Reg::R1).map_err(oops)?;
+    enc.movs_imm(Reg::R5, 1).map_err(oops)?;
+    enc.lsls_reg(Reg::R5, Reg::R4).map_err(oops)?;
+    enc.orrs(Reg::R3, Reg::R5).map_err(oops)?;
+    enc.bind_label(skip);
+    enc.cmp_imm(Reg::R4, 0).map_err(oops)?;
+    enc.b_cond(Cond::Ne, loop_top);
+    if remainder {
+        enc.mov_reg(Reg::R0, Reg::R2);
+    } else {
+        enc.mov_reg(Reg::R0, Reg::R3);
+    }
+    if signed {
+        enc.cmp_imm(Reg::R7, 0).map_err(oops)?;
+        let nonneg = enc.new_label();
+        enc.b_cond(Cond::Eq, nonneg);
+        enc.movs_imm(Reg::R5, 0).map_err(oops)?;
+        enc.subs(Reg::R0, Reg::R5, Reg::R0).map_err(oops)?;
+        enc.bind_label(nonneg);
+    }
+    enc.pop_registers(0xF0, false);
     Ok(())
 }
 
@@ -1015,7 +1305,10 @@ fn lower_spilled_into(
         b.insts.iter().any(|(_, i)| {
             matches!(
                 i,
-                Inst::Call { .. } | Inst::Alloc { .. } | Inst::AllocArray { .. }
+                Inst::Call { .. }
+                    | Inst::Alloc { .. }
+                    | Inst::AllocArray { .. }
+                    | Inst::AllocArray2D { .. }
             )
         })
     });
@@ -1235,6 +1528,64 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 continue;
             }
+            if let Inst::AllocArray2D {
+                handle,
+                dim0,
+                dim1,
+                element_size,
+            } = inst
+            {
+                let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
+                let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
+                    Some((_, label)) => *label,
+                    None => {
+                        let label = enc.new_label();
+                        type_descs.push((label, alloc::vec![0u32, 0u32].into_boxed_slice()));
+                        type_desc_labels.push((*handle, label));
+                        label
+                    }
+                };
+                enc.ldr_sp(Reg::R0, slot(*dim0))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R1, slot(*dim1))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.muls(Reg::R0, Reg::R1)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                if *element_size != 1 {
+                    if element_size.is_power_of_two() {
+                        enc.lsls_imm(Reg::R0, Reg::R0, element_size.trailing_zeros() as u8)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    } else {
+                        load_const_word(enc, &mut pool, Reg::R1, *element_size)?;
+                        enc.muls(Reg::R0, Reg::R1)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
+                }
+                enc.adds_imm8(Reg::R0, 8)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.adr(Reg::R1, desc_label)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                load_const_word(enc, &mut pool, Reg::R2, alloc)?;
+                enc.blx(Reg::R2);
+                record_safepoint(stack_maps, index, inst_pos, enc.position());
+                let ok = enc.new_label();
+                enc.cmp_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.b_cond(Cond::Ne, ok);
+                enc.udf(0);
+                enc.bind_label(ok);
+                enc.ldr_sp(Reg::R1, slot(*dim0))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R1, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R1, slot(*dim1))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R1, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_sp(Reg::R0, slot(*result))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                continue;
+            }
             let call_pc = lower_spilled_inst(
                 enc,
                 &mut pool,
@@ -1413,7 +1764,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
         return Err(LowerError::NotWellFormed);
     }
     if func.value_types.iter().any(|ty| ty.is_float()) {
-        return Err(LowerError::NonIntegerValue);
+        return Ok(Assignment::Spilled);
     }
     if func.value_types.iter().any(|ty| {
         matches!(
@@ -1440,10 +1791,22 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::WriteInt { .. }
                     | Inst::StringLiteral { .. }
                     | Inst::StringEquals { .. }
+                    | Inst::StringConcat { .. }
+                    | Inst::IntToString { .. }
+                    | Inst::Binary {
+                        op: BinOp::DivSigned
+                            | BinOp::DivUnsigned
+                            | BinOp::RemSigned
+                            | BinOp::RemUnsigned,
+                        ..
+                    }
                     | Inst::Alloc { .. }
                     | Inst::AllocArray { .. }
                     | Inst::ArrayLoad { .. }
                     | Inst::ArrayStore { .. }
+                    | Inst::AllocArray2D { .. }
+                    | Inst::Array2DLoad { .. }
+                    | Inst::Array2DStore { .. }
                     | Inst::StaticLoad { .. }
                     | Inst::StaticStore { .. }
             )
@@ -2222,6 +2585,10 @@ fn lower_module_inner(
     funcs: &[Function],
     alloc_addr: Option<u32>,
 ) -> Result<(Vec<u8>, StackMaps), LowerError> {
+    let mut program = funcs.to_vec();
+    crate::stringgen::lower_string_concat(&mut program);
+    crate::stringgen::lower_int_to_string(&mut program);
+    let funcs = &program;
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     let mut _lines = Vec::new();

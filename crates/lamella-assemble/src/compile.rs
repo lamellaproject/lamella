@@ -23,8 +23,8 @@ use lamella_pe::{
 use lamella_syntax::ast::{
     AssignmentOperator, CompilationUnit, ConstructorInitializer, ConstructorInitializerKind,
     DelegateDecl, EnumDecl, Expr, ExprKind, Literal, Member, Modifier, NamespaceMember, Parameter,
-    ParameterModifier, QualifiedName, Stmt, StmtKind, TypeDecl, TypeKind, UsingDirective, UsingKind,
-    VariableDeclarator,
+    ParameterModifier, QualifiedName, Stmt, StmtKind, TypeDecl, TypeKind, TypeRef, UsingDirective,
+    UsingKind, VariableDeclarator, explicit_interface_member_name,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
 use lamella_syntax::parser::parse_compilation_unit;
@@ -37,6 +37,7 @@ const METHOD_DEF: u8 = 0x06;
 const PUBLIC_CLASS: u32 = 0x0000_0001;
 const PUBLIC_STRUCT: u32 = 0x0000_0001 | 0x0000_0008 | 0x0000_0100;
 const METHOD_PUBLIC: u16 = 0x0006;
+const METHOD_PRIVATE: u16 = 0x0001;
 const METHOD_STATIC: u16 = 0x0010;
 const METHOD_VIRTUAL: u16 = 0x0040;
 const METHOD_HIDEBYSIG: u16 = 0x0080;
@@ -327,7 +328,12 @@ fn emit_namespace(
                 let enclosing_full = qualified_dotted(namespace, &declaration.name);
                 for member in &declaration.members {
                     if let Member::NestedType(nested) = member {
-                        if matches!(nested.as_ref(), NamespaceMember::Type(_)) {
+                        if matches!(
+                            nested.as_ref(),
+                            NamespaceMember::Type(_)
+                                | NamespaceMember::Enum(_)
+                                | NamespaceMember::Delegate(_)
+                        ) {
                             emit_namespace(
                                 image,
                                 binder,
@@ -453,7 +459,20 @@ fn emit_enum(
     let (constant_element, constant_width) = enum_constant_encoding(&underlying)?;
 
     let base = image.type_ref("System", "Enum");
-    image.add_type(namespace, &declaration.name, base, ENUM_TYPE_FLAGS);
+    let enclosing = binder
+        .model()
+        .get_by_symbol(&enum_ty)
+        .and_then(|info| info.enclosing.clone());
+    let (metadata_namespace, flags) = match &enclosing {
+        Some(_) => ("", (ENUM_TYPE_FLAGS & !0x0000_0007) | 0x0000_0002),
+        None => (namespace, ENUM_TYPE_FLAGS),
+    };
+    let enum_type_token = image.add_type(metadata_namespace, &declaration.name, base, flags);
+    if let Some(enclosing_full) = &enclosing {
+        if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
+            image.add_nested_class(enum_type_token, enclosing_token);
+        }
+    }
     let value_field_sig = field_signature(&type_sig(tokens, &underlying)?);
     image.add_field("value__", &value_field_sig, ENUM_VALUE_FIELD_FLAGS);
     let member_field_sig = field_signature(&TypeSig::ValueType(enum_token));
@@ -582,6 +601,15 @@ fn emit_type(
         {
             emit_field(image, tokens, modifiers, ty, declarators)?;
         }
+        if let Member::EventField {
+            modifiers,
+            ty,
+            declarators,
+            ..
+        } = member
+        {
+            emit_field(image, tokens, modifiers, ty, declarators)?;
+        }
     }
     if !is_struct && !declares_instance_constructor(declaration) {
         let base_ctor = base_class
@@ -632,6 +660,7 @@ fn emit_type(
                 name,
                 parameters,
                 body: Some(body),
+                explicit_interface,
                 ..
             } => {
                 let token = emit_one_method(
@@ -645,6 +674,7 @@ fn emit_type(
                     parameters,
                     body,
                     implements_interface,
+                    explicit_interface.as_ref(),
                     debug,
                 )?;
                 if entry_point.is_none()
@@ -673,6 +703,7 @@ fn emit_type(
                     parameters,
                     body,
                     implements_interface,
+                    None,
                     debug,
                 )?;
             }
@@ -695,6 +726,7 @@ fn emit_type(
                     parameters,
                     body,
                     implements_interface,
+                    None,
                     debug,
                 )?;
             }
@@ -774,10 +806,11 @@ fn emit_one_method(
     tokens: &mut Tokens,
     modifiers: &[Modifier],
     name: &str,
-    return_type: &lamella_syntax::ast::TypeRef,
+    return_type: &TypeRef,
     parameters: &[Parameter],
-    body: &lamella_syntax::ast::Stmt,
+    body: &Stmt,
     interface_impl: bool,
+    explicit_interface: Option<&TypeRef>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let return_symbol = bind_type(return_type);
@@ -786,6 +819,37 @@ fn emit_one_method(
         .map(|parameter| (parameter.name.clone(), bind_type(&parameter.ty)))
         .collect();
     let byref_flags = byref_flags(parameters);
+    if let Some(interface) = explicit_interface {
+        let method_name = explicit_interface_member_name(interface, name);
+        let flags =
+            METHOD_PRIVATE | METHOD_VIRTUAL | METHOD_FINAL | METHOD_NEWSLOT | METHOD_HIDEBYSIG;
+        let body_token = emit_method_body(
+            image,
+            binder,
+            tokens,
+            enclosing,
+            &method_name,
+            &return_symbol,
+            &params,
+            &byref_flags,
+            body,
+            false,
+            flags,
+            None,
+            debug,
+        )?;
+        emit_explicit_interface_impl(
+            image,
+            tokens,
+            enclosing,
+            interface,
+            name,
+            &params,
+            &return_symbol,
+            body_token,
+        )?;
+        return Ok(body_token);
+    }
     let is_static = modifiers.contains(&Modifier::Static);
     let is_virtual = modifiers.contains(&Modifier::Virtual);
     let is_override = modifiers.contains(&Modifier::Override);
@@ -816,6 +880,51 @@ fn emit_one_method(
         None,
         debug,
     )
+}
+
+/// Emits the `MethodImpl` row that wires an explicit interface implementation: it
+/// links `body` (the class's own private `MethodDef`) to the interface method it
+/// overrides. The interface method is a this-module `MethodDef` when the interface is
+/// declared here, otherwise a minted `MemberRef` to the BCL interface method.
+#[allow(clippy::too_many_arguments)]
+fn emit_explicit_interface_impl(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    interface: &TypeRef,
+    member: &str,
+    params: &[(Box<str>, TypeSymbol)],
+    return_symbol: &TypeSymbol,
+    body: Token,
+) -> Result<(), crate::EmitError> {
+    let class = tokens
+        .type_token(enclosing)
+        .ok_or(crate::EmitError::Unsupported(
+            "an explicit interface impl on a type with no metadata token",
+        ))?;
+    let interface_symbol = bind_type(interface);
+    let parameter_types: Vec<TypeSymbol> = params.iter().map(|(_, ty)| ty.clone()).collect();
+    let declaration = match tokens.method(&interface_symbol, member, &parameter_types) {
+        Some(token) => token,
+        None => {
+            let (namespace, name) =
+                split_type_name(&interface_symbol).ok_or(crate::EmitError::Unsupported(
+                    "an explicit interface impl of an unresolvable interface",
+                ))?;
+            let parameter_sigs: Vec<TypeSig> = parameter_types
+                .iter()
+                .map(|ty| type_sig(tokens, ty))
+                .collect::<Result<_, _>>()?;
+            let signature =
+                method_signature(true, &parameter_sigs, &type_sig(tokens, return_symbol)?);
+            let type_ref = image.type_ref(&namespace, &name);
+            let member_token = image.member_ref(type_ref, member, &signature);
+            tokens.insert_method(&interface_symbol, member, &parameter_types, member_token);
+            member_token
+        }
+    };
+    image.add_method_impl(class, body, declaration);
+    Ok(())
 }
 
 /// The `ref`/`out` (byref) flag of each parameter, in order -- parallel to the bound
@@ -973,6 +1082,7 @@ fn emit_method_body(
         local_names,
         sequence_points,
         handlers,
+        pinned_slots,
     } = emit_body(
         &parameter_names,
         &byref_params,
@@ -987,8 +1097,16 @@ fn emit_method_body(
     } else {
         let locals: Vec<TypeSig> = local_types
             .iter()
-            .map(|ty| type_sig(tokens, ty))
-            .collect::<Result<_, _>>()?;
+            .enumerate()
+            .map(|(slot, ty)| {
+                let sig = type_sig(tokens, ty)?;
+                Ok(if pinned_slots.contains(&(slot as u16)) {
+                    TypeSig::Pinned(Box::new(sig))
+                } else {
+                    sig
+                })
+            })
+            .collect::<Result<_, crate::EmitError>>()?;
         Some(image.add_standalone_sig(&local_signature(&locals)))
     };
     let local_signature_rid = local_var_sig.map_or(0, Token::row);
@@ -1194,7 +1312,8 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
                 mint_references(statement, image, tokens);
             }
         }
-        BoundStmtKind::Local { declarators, .. } => {
+        BoundStmtKind::Local { ty, declarators } => {
+            mint_named_type_token(ty, image, tokens);
             for declarator in declarators {
                 if let Some(initializer) = &declarator.initializer {
                     mint_in_expr(initializer, image, tokens);
@@ -1285,6 +1404,16 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
             mint_in_expr(collection, image, tokens);
             mint_references(body, image, tokens);
         }
+        BoundStmtKind::Fixed {
+            element,
+            init,
+            body,
+            ..
+        } => {
+            mint_in_expr(init, image, tokens);
+            mint_type_token(image, tokens, element);
+            mint_references(body, image, tokens);
+        }
         _ => {}
     }
 }
@@ -1305,12 +1434,14 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             mint_in_expr(left, image, tokens);
             mint_in_expr(right, image, tokens);
             use lamella_syntax::ast::BinaryOperator as Op;
-            if is_string(&left.ty) && is_string(&right.ty) {
-                if matches!(operator, Op::Add) {
-                    mint_member_ref(&string_concat_reference(), image, tokens);
-                } else if matches!(operator, Op::Equal | Op::NotEqual) {
-                    mint_member_ref(&string_equality_reference(), image, tokens);
-                }
+            if matches!(operator, Op::Add) && is_string(&expr.ty) {
+                let both = is_string(&left.ty) && is_string(&right.ty);
+                mint_member_ref(&string_concat_reference(both), image, tokens);
+            } else if matches!(operator, Op::Equal | Op::NotEqual)
+                && is_string(&left.ty)
+                && is_string(&right.ty)
+            {
+                mint_member_ref(&string_equality_reference(), image, tokens);
             }
         }
         BoundExprKind::Unary { operand, .. }
@@ -1347,11 +1478,17 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             for argument in arguments {
                 mint_in_expr(argument, image, tokens);
             }
+            if let (BoundExprKind::MethodGroup { receiver, .. }, Some(method)) =
+                (&callee.kind, method)
+            {
+                if is_value_type(&receiver.ty, tokens) && method.declaring_type != receiver.ty {
+                    mint_value_type_token(&receiver.ty, image, tokens);
+                }
+            }
             if let Some(method) = method {
-                if tokens.type_token(&method.declaring_type).is_none()
-                    && tokens
-                        .method(&method.declaring_type, &method.name, &method.parameters)
-                        .is_none()
+                if tokens
+                    .method(&method.declaring_type, &method.name, &method.parameters)
+                    .is_none()
                 {
                     mint_member_ref(method, image, tokens);
                 }
@@ -1365,14 +1502,13 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 mint_in_expr(argument, image, tokens);
             }
             if let Some(constructor) = constructor {
-                if tokens.type_token(&constructor.declaring_type).is_none()
-                    && tokens
-                        .method(
-                            &constructor.declaring_type,
-                            &constructor.name,
-                            &constructor.parameters,
-                        )
-                        .is_none()
+                if tokens
+                    .method(
+                        &constructor.declaring_type,
+                        &constructor.name,
+                        &constructor.parameters,
+                    )
+                    .is_none()
                 {
                     mint_member_ref(constructor, image, tokens);
                 }
@@ -1444,7 +1580,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             if matches!(operator, lamella_syntax::ast::AssignmentOperator::Add)
                 && is_string(&target.ty)
             {
-                mint_member_ref(&string_concat_reference(), image, tokens);
+                mint_member_ref(&string_concat_reference(is_string(&value.ty)), image, tokens);
             }
         }
         BoundExprKind::Conditional {
@@ -1492,13 +1628,20 @@ fn get_type_from_handle_reference() -> lamella_binder::MethodReference {
     }
 }
 
-/// The reference `string + string` lowers to: `System.String::Concat(string, string)`.
-fn string_concat_reference() -> lamella_binder::MethodReference {
+/// The `String.Concat` overload a concatenation lowers to: `Concat(string, string)` when
+/// both operands are strings, otherwise `Concat(object, object)` (a non-string operand was
+/// boxed/typed to object by the binder).
+fn string_concat_reference(both_strings: bool) -> lamella_binder::MethodReference {
     let string = TypeSymbol::Special(SpecialType::String);
+    let arg = TypeSymbol::Special(if both_strings {
+        SpecialType::String
+    } else {
+        SpecialType::Object
+    });
     lamella_binder::MethodReference {
         declaring_type: string.clone(),
         name: "Concat".into(),
-        parameters: alloc::vec![string.clone(), string.clone()],
+        parameters: alloc::vec![arg.clone(), arg],
         return_type: string,
         is_static: true,
     }
@@ -1525,6 +1668,11 @@ fn mint_member_ref(
     let Some((namespace, name)) = split_type_name(&method.declaring_type) else {
         return;
     };
+    mint_named_type_token(&method.declaring_type, image, tokens);
+    for parameter in &method.parameters {
+        mint_named_type_token(parameter, image, tokens);
+    }
+    mint_named_type_token(&method.return_type, image, tokens);
     let parameter_sigs: Result<Vec<TypeSig>, _> = method
         .parameters
         .iter()
@@ -1606,6 +1754,10 @@ fn mint_type_token(image: &mut ImageBuilder, tokens: &mut Tokens, ty: &TypeSymbo
                 .ok()
                 .map(|sig| image.type_spec(&type_signature(&sig)))
         }
+        TypeSymbol::Pointer(element) => {
+            mint_type_token(image, tokens, element);
+            None
+        }
         TypeSymbol::Error => None,
     };
     if let Some(token) = reference {
@@ -1633,6 +1785,21 @@ fn system_type_name(special: SpecialType) -> Option<(&'static str, &'static str)
         SpecialType::Decimal => ("System", "Decimal"),
         SpecialType::Void => return None,
     })
+}
+
+/// Mints + records a `TypeRef` for a named type used in a signature -- a BCL reference
+/// type (StringBuilder, ArrayList, ...) or any named type not yet tokenized -- so
+/// `type_sig` can encode it (a `Class`, or `ValueType` for a value type). A no-op for a
+/// predefined type, an array, the error type, or a type already tokenized (a this-module
+/// `TypeDef` or a previously minted ref).
+fn mint_named_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut Tokens) {
+    if !matches!(ty, TypeSymbol::Named(_)) || tokens.type_token(ty).is_some() {
+        return;
+    }
+    if let Some((namespace, name)) = split_type_name(ty) {
+        let token = image.type_ref(&namespace, &name);
+        tokens.insert_type(ty, token);
+    }
 }
 
 /// Mints the metadata token a `box`/`unbox.any` names for the value type `ty`. A
@@ -1817,6 +1984,9 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
         TypeSymbol::Array { element, .. } => {
             return Ok(TypeSig::SzArray(Box::new(type_sig(tokens, element)?)));
         }
+        TypeSymbol::Pointer(element) => {
+            return Ok(TypeSig::Pointer(Box::new(type_sig(tokens, element)?)));
+        }
         TypeSymbol::Error => {
             return Err(crate::EmitError::Unsupported(
                 "the error type has no signature",
@@ -1885,8 +2055,21 @@ fn collect_tokens(
                 if is_struct {
                     tokens.insert_struct(&declaring);
                 }
+                if is_interface {
+                    tokens.insert_interface(&declaring);
+                }
                 for member in &declaration.members {
                     if let Member::Field { declarators, .. } = member {
+                        for declarator in declarators {
+                            *next_field += 1;
+                            tokens.insert_field(
+                                &declaring,
+                                &declarator.name,
+                                Token::new(FIELD, *next_field),
+                            );
+                        }
+                    }
+                    if let Member::EventField { declarators, .. } = member {
                         for declarator in declarators {
                             *next_field += 1;
                             tokens.insert_field(
@@ -1921,17 +2104,22 @@ fn collect_tokens(
                             name,
                             parameters,
                             body,
+                            explicit_interface,
                             ..
                         } if body.is_some() || is_interface => {
                             *next_method += 1;
                             let params: Vec<TypeSymbol> =
                                 parameters.iter().map(|p| bind_type(&p.ty)).collect();
-                            tokens.insert_method(
-                                &declaring,
-                                name,
-                                &params,
-                                Token::new(METHOD_DEF, *next_method),
-                            );
+                            let token = Token::new(METHOD_DEF, *next_method);
+                            match explicit_interface {
+                                Some(interface) => tokens.insert_method(
+                                    &declaring,
+                                    &explicit_interface_member_name(interface, name),
+                                    &params,
+                                    token,
+                                ),
+                                None => tokens.insert_method(&declaring, name, &params, token),
+                            }
                         }
                         Member::Operator {
                             operator,
@@ -2023,7 +2211,12 @@ fn collect_tokens(
                 let enclosing_full = qualified_dotted(namespace, &declaration.name);
                 for member in &declaration.members {
                     if let Member::NestedType(nested) = member {
-                        if matches!(nested.as_ref(), NamespaceMember::Type(_)) {
+                        if matches!(
+                            nested.as_ref(),
+                            NamespaceMember::Type(_)
+                                | NamespaceMember::Enum(_)
+                                | NamespaceMember::Delegate(_)
+                        ) {
                             collect_tokens(
                                 tokens,
                                 next_type,
@@ -2143,6 +2336,38 @@ mod tests {
         let pe = lamella_metadata::pe::PeImage::parse(&image).expect("valid PE");
         assert_eq!(pe.cli_header_rva(), lamella_pe::pe::TEXT_RVA);
         assert!(lamella_metadata::image::MetadataImage::read(&image).is_ok());
+    }
+
+    #[test]
+    fn type_spec_signature_decodes_a_2d_array() {
+        let unit = parse_compilation_unit(
+            "class Program { static int Main() { int[,] m = new int[2, 3]; \
+                m[0, 0] = 42; return m[0, 0]; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "arr2d.dll", "arr2d");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+
+        let get = assembly
+            .member_refs()
+            .find(|member| member.name() == Some("Get"))
+            .expect("a Get member reference");
+        let spec = get.parent();
+        let sig = assembly
+            .type_spec_signature(spec)
+            .expect("the TypeSpec signature decodes");
+        match sig {
+            lamella_metadata::signature::SigType::Array { element, rank } => {
+                assert_eq!(rank, 2);
+                assert!(
+                    matches!(*element, lamella_metadata::signature::SigType::I4),
+                    "element was {element:?}"
+                );
+            }
+            other => panic!("expected SigType::Array, got {other:?}"),
+        }
     }
 
     #[test]

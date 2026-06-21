@@ -11,19 +11,22 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use lamella_cil::{Opcode, Operand};
-use lamella_metadata::{Assembly, ConstantValue, Method, MethodSig, SigType};
+use lamella_metadata::{
+    Assembly, ConstantValue, Method, MethodSig, SigType, TargetLayout, TypeName,
+};
 use lamella_token::Token;
 use lamella_ves::intrinsics::{
-    array_get_value, array_set_value, boolean_to_string, char_to_string, console_write,
+    array_empty, array_get_value, array_set_value, boolean_to_string, char_to_string, console_write,
     console_write_bool, console_write_char, console_write_int32, console_write_int64,
     console_write_line, console_write_line_bool, console_write_line_char, console_write_line_empty,
     console_write_line_int32, console_write_line_int64, console_write_line_object,
     delegate_combine, delegate_remove, enum_is_defined, enum_parse, exception_ctor,
-    exception_get_message, int32_to_string, int64_to_string, md_array_get, md_array_get_length,
-    md_array_length, md_array_set, object_ctor, object_reference_equals, object_to_string,
-    string_concat, string_concat_object2, string_concat_object3, string_concat3, string_equals,
-    string_get_chars, string_get_length, string_is_null_or_empty, string_not_equals,
-    string_substring, string_substring_len, type_from_handle,
+    exception_get_message, int32_to_string, int64_to_string, md_array_address, md_array_get,
+    md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
+    object_reference_equals, object_to_string,
+    initialize_array, string_concat, string_concat_object2, string_concat_object3, string_concat3,
+    string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
+    string_not_equals, string_substring, string_substring_len, type_from_handle, type_get_name,
 };
 #[cfg(feature = "gc")]
 use lamella_ves::intrinsics::gc_collect;
@@ -59,7 +62,7 @@ use lamella_ves::intrinsics::{
     math_cos_f64, math_exp_f64, math_log_f64, math_log10_f64, math_pow_f64, math_sin_f64,
     math_sqrt_f64, math_tan_f64,
 };
-use lamella_ves::{IntrinsicFn, MethodId, Module, Value};
+use lamella_ves::{IntrinsicFn, MethodId, Module, TypeId, Value};
 
 const TYPE_REF: u8 = 0x01;
 const TYPE_DEF: u8 = 0x02;
@@ -67,6 +70,7 @@ const FIELD: u8 = 0x04;
 const METHOD_DEF: u8 = 0x06;
 const MEMBER_REF: u8 = 0x0A;
 const TYPE_SPEC: u8 = 0x1B;
+const METHOD_SPEC: u8 = 0x2B;
 
 const METHOD_VIRTUAL: u32 = 0x0040;
 const METHOD_NEWSLOT: u32 = 0x0100;
@@ -102,6 +106,35 @@ impl fmt::Display for LoadError {
 /// assembly, it lets a later assembly resolve a cross-assembly call to the defining
 /// assembly's method by name (the metadata `MemberRef` carries the name, not a `MethodId`).
 type NameIndex = BTreeMap<String, MethodId>;
+
+/// A type index mapping a type's qualified name (`namespace.name`) to its global
+/// [`crate::TypeId`]. Built while loading each assembly, it lets a cross-assembly interface
+/// reference -- a `TypeRef` an implementing type names (e.g. a program class implementing
+/// `[corlib]System.IComparable`) -- resolve to the defining assembly's `TypeId` by name.
+type TypeNameIndex = BTreeMap<String, TypeId>;
+
+/// A static-field index mapping a field's qualified name (`namespace.type.field`) to the
+/// module storage slot [`Module::bind_static_field`] assigned it. Built while loading each
+/// assembly (the corlib first), it lets a cross-assembly `ldsfld`/`stsfld` -- a `MemberRef`
+/// a program names (e.g. `[corlib]System.BitConverter::IsLittleEndian`) -- resolve to the
+/// defining assembly's storage slot by name, so the program's token and the corlib's own
+/// `FieldDef` token share one slot (the corlib `.cctor` writes it, the program reads it).
+/// Mirrors [`TypeNameIndex`], keyed by `namespace.type.field` instead of `namespace.type`.
+type FieldNameIndex = BTreeMap<String, usize>;
+
+/// The qualified key (`namespace.name`) for a type, matching across assemblies: a program's
+/// `TypeRef` to a corlib interface computes the same key the corlib's `TypeDef` did.
+fn type_name_key(name: TypeName<'_>) -> String {
+    alloc::format!("{}.{}", name.namespace, name.name)
+}
+
+/// The qualified key (`namespace.type.field`) for a static field, matching across assemblies:
+/// a program's `ldsfld`/`stsfld` `MemberRef` (whose parent `TypeRef` gives the declaring type's
+/// name, and whose member name gives the field name) computes the same key the corlib's own
+/// `FieldDef` did. Keys [`FieldNameIndex`].
+fn field_name_key(declaring: TypeName<'_>, field: &str) -> String {
+    alloc::format!("{}.{}.{}", declaring.namespace, declaring.name, field)
+}
 
 /// A stable key for a method's identity across assemblies: its namespace, declaring type
 /// name, method name, and parameter types. A program's `MemberRef` to a corlib method
@@ -205,9 +238,40 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
     }
     let mut module = Module::new();
     let mut index = NameIndex::new();
-    let entry = load_assembly(&mut module, assembly, 0, &mut index, false);
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    let entry = load_assembly(
+        &mut module,
+        assembly,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        false,
+    );
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     Ok(Program { module, entry })
+}
+
+/// Loads an assembly that declares no entry point (a library) into a [`Module`], binding its
+/// types + methods exactly as [`load`] does but WITHOUT requiring -- or running -- an entry point.
+/// The REPL emits a `/target:library` session class and invokes a named method by id (never an
+/// entry), so this lets it load that image directly instead of carrying an unused dummy `Main`.
+pub fn load_library(assembly: &Assembly) -> Result<Module, LoadError> {
+    let mut module = Module::new();
+    let mut index = NameIndex::new();
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    let _ = load_assembly(
+        &mut module,
+        assembly,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        false,
+    );
+    Ok(module)
 }
 
 /// Loads a managed corlib (assembly 0) and a program (assembly 1) into one [`Module`],
@@ -228,8 +292,26 @@ pub fn load_with_corlib(corlib: &Assembly, program: &Assembly) -> Result<Program
     }
     let mut module = Module::new();
     let mut index = NameIndex::new();
-    load_assembly(&mut module, corlib, 0, &mut index, true);
-    let entry = load_assembly(&mut module, program, 1, &mut index, true);
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    load_assembly(
+        &mut module,
+        corlib,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    let entry = load_assembly(
+        &mut module,
+        program,
+        1,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     Ok(Program { module, entry })
 }
@@ -251,6 +333,8 @@ fn load_assembly(
     assembly: &Assembly,
     asm: u8,
     index: &mut NameIndex,
+    type_index: &mut TypeNameIndex,
+    field_index: &mut FieldNameIndex,
     resolve_external: bool,
 ) -> Option<MethodId> {
     let type_offset = module.type_count();
@@ -261,9 +345,22 @@ fn load_assembly(
     let mut bcl_call_tokens = BTreeSet::new();
     let mut newarr_tokens = BTreeSet::new();
     let mut callvirt_tokens = BTreeSet::new();
+    let mut newobj_tokens = BTreeSet::new();
+    let mut ldtoken_field_tokens = BTreeSet::new();
+    let mut static_field_ref_tokens = BTreeSet::new();
+    let mut ldtoken_type_tokens = BTreeSet::new();
+    let mut type_test_tokens = BTreeSet::new();
+    let mut generic_call_tokens = BTreeSet::new();
+    let mut value_type_method_rows: BTreeSet<u32> = BTreeSet::new();
+    let mut string_builder_ctor_rows: BTreeMap<u32, u16> = BTreeMap::new();
+    let mut list_ctor_rows: BTreeMap<u32, u16> = BTreeMap::new();
+    let mut sizeof_tokens: BTreeSet<Token> = BTreeSet::new();
+    let mut value_type_tokens: Vec<Token> = Vec::new();
     let mut methoddef_sigs: BTreeMap<u32, (String, Vec<SigType>)> = BTreeMap::new();
     let mut type_extends: Vec<Token> = Vec::new();
+    let mut type_interfaces: Vec<Vec<Token>> = Vec::new();
     let mut type_virtuals: Vec<Vec<VirtualMethod>> = Vec::new();
+    let mut type_is_value_type: Vec<bool> = Vec::new();
     let mut own_fields: Vec<Vec<(Token, Value)>> = Vec::new();
     let mut method_row: u32 = 0;
     let mut field_row: u32 = 0;
@@ -278,6 +375,13 @@ fn load_assembly(
             if field.is_static() {
                 if !field.is_literal() {
                     module.bind_static_field(asm, token, default_field_value(field.signature()));
+                    if let (Some(declaring), Some(field_name), Some(slot)) = (
+                        type_def.name(),
+                        field.name(),
+                        module.static_field_slot(asm, token),
+                    ) {
+                        field_index.insert(field_name_key(declaring, field_name), slot);
+                    }
                 } else if is_enum {
                     if let (Some(name), Some(constant)) = (field.name(), field.constant()) {
                         let type_token = Token::new(TYPE_DEF, type_row).0;
@@ -294,11 +398,15 @@ fn load_assembly(
             own.push((token, default_field_value(field.signature())));
         }
         let type_id = module.add_type(Vec::new());
-        if module.string_type_id().is_none() {
-            if let Some(name) = type_def.name() {
-                if name.namespace == "System" && name.name == "String" {
-                    module.set_string_type_id(type_id);
-                }
+        if let Some(name) = type_def.name() {
+            if module.string_type_id().is_none() && name.namespace == "System" && name.name == "String"
+            {
+                module.set_string_type_id(type_id);
+            }
+            type_index.insert(type_name_key(name), type_id);
+            module.bind_type_name(asm, Token::new(TYPE_DEF, type_row), name.name.into());
+            if let Some(kind) = primitive_value_kind(name.namespace, name.name) {
+                module.set_primitive_type_token(asm, Token::new(TYPE_DEF, type_row), &kind);
             }
         }
         for (token, _) in &own {
@@ -306,11 +414,21 @@ fn load_assembly(
         }
         own_fields.push(own);
         type_extends.push(type_def.extends());
+        type_interfaces.push(type_def.interfaces().collect());
 
         let mut virtuals = Vec::new();
+        let type_name = type_def.name();
         let is_delegate = is_delegate_type(assembly, type_def.extends());
+        let is_value_type = type_def.is_value_type();
+        type_is_value_type.push(is_value_type);
+        if is_value_type {
+            value_type_tokens.push(Token::new(TYPE_DEF, type_row));
+        }
         for method in type_def.methods() {
             method_row += 1;
+            if is_value_type {
+                value_type_method_rows.insert(method_row);
+            }
             let token = Token::new(METHOD_DEF, method_row);
             let name: String = method.name().unwrap_or("").into();
             let params: Vec<SigType> = method
@@ -324,6 +442,16 @@ fn load_assembly(
                 } else if name == "Invoke" {
                     let count = u16::try_from(params.len()).unwrap_or(u16::MAX);
                     module.mark_delegate_invoke(asm, token, count);
+                }
+            }
+            if name == ".ctor" {
+                if let Some(name_parts) = type_name {
+                    let count = u16::try_from(params.len()).unwrap_or(0);
+                    if same_assembly_string_builder_ctor(name_parts.namespace, name_parts.name) {
+                        string_builder_ctor_rows.insert(method_row, count);
+                    } else if same_assembly_list_ctor(name_parts.namespace, name_parts.name) {
+                        list_ctor_rows.insert(method_row, count);
+                    }
                 }
             }
             let Some(body) = method.body() else {
@@ -353,6 +481,14 @@ fn load_assembly(
                                 id,
                             );
                         }
+                        if method.flags() & METHOD_VIRTUAL != 0 {
+                            virtuals.push(VirtualMethod {
+                                id,
+                                name: name.clone(),
+                                params: params.clone(),
+                                newslot: method.flags() & METHOD_NEWSLOT != 0,
+                            });
+                        }
                         if token.0 == entry_token {
                             entry = Some(id);
                         }
@@ -372,11 +508,42 @@ fn load_assembly(
                                 bcl_call_tokens.insert(*operand);
                             }
                         }
-                        Opcode::Call | Opcode::Newobj if operand.table() == MEMBER_REF => {
+                        Opcode::Call if operand.table() == METHOD_SPEC => {
+                            generic_call_tokens.insert(*operand);
+                        }
+                        Opcode::Call if operand.table() == MEMBER_REF => {
                             bcl_call_tokens.insert(*operand);
+                        }
+                        Opcode::Newobj => {
+                            if operand.table() == MEMBER_REF {
+                                bcl_call_tokens.insert(*operand);
+                            }
+                            newobj_tokens.insert(*operand);
                         }
                         Opcode::Newarr => {
                             newarr_tokens.insert(*operand);
+                        }
+                        Opcode::Ldtoken if operand.table() == FIELD => {
+                            ldtoken_field_tokens.insert(*operand);
+                        }
+                        Opcode::Ldsfld | Opcode::Stsfld | Opcode::Ldsflda
+                            if operand.table() == MEMBER_REF =>
+                        {
+                            static_field_ref_tokens.insert(*operand);
+                        }
+                        Opcode::Ldtoken | Opcode::Constrained | Opcode::Box
+                            if matches!(operand.table(), TYPE_DEF | TYPE_REF | TYPE_SPEC) =>
+                        {
+                            ldtoken_type_tokens.insert(*operand);
+                            if matches!(instruction.opcode, Opcode::Box) {
+                                type_test_tokens.insert(*operand);
+                            }
+                        }
+                        Opcode::Castclass | Opcode::Isinst | Opcode::Box => {
+                            type_test_tokens.insert(*operand);
+                        }
+                        Opcode::Sizeof => {
+                            sizeof_tokens.insert(*operand);
                         }
                         _ => {}
                     }
@@ -450,11 +617,41 @@ fn load_assembly(
         &bcl_call_tokens,
     );
     bind_array_defaults(assembly, module, asm, &newarr_tokens);
+    bind_generic_calls(assembly, module, asm, &generic_call_tokens);
+    mark_value_type_ctors(module, asm, &newobj_tokens, &value_type_method_rows);
+    mark_same_assembly_ctors(
+        module,
+        asm,
+        &newobj_tokens,
+        &string_builder_ctor_rows,
+        &list_ctor_rows,
+    );
+    bind_field_rva_data(assembly, module, asm, &ldtoken_field_tokens);
+    bind_static_field_refs(assembly, module, asm, field_index, &static_field_ref_tokens);
+    bind_type_names(assembly, module, asm, &ldtoken_type_tokens);
+    classify_type_test_tokens(assembly, module, asm, type_index, &type_test_tokens);
+    bind_type_sizes(assembly, module, asm, &value_type_tokens, &sizeof_tokens);
     build_field_layouts(module, asm, type_offset, &type_extends, &own_fields);
-    build_vtables(module, asm, type_offset, &type_extends, &type_virtuals);
+    build_vtables(
+        module,
+        assembly,
+        type_offset,
+        type_index,
+        &type_extends,
+        &type_virtuals,
+    );
     build_sig_methods(module, asm, type_offset, &type_extends, &type_virtuals);
     bind_call_targets(module, assembly, asm, &callvirt_tokens, &methoddef_sigs);
-    bind_types(module, asm, type_offset, &type_extends);
+    bind_explicit_overrides(module, assembly, asm, type_offset);
+    bind_types(module, asm, type_offset, &type_extends, &type_is_value_type);
+    bind_interfaces(
+        module,
+        assembly,
+        asm,
+        type_offset,
+        type_index,
+        &type_interfaces,
+    );
     entry
 }
 
@@ -509,6 +706,7 @@ fn bind_bcl_calls(
                 }
                 "Get" => Some(md_array_get as IntrinsicFn),
                 "Set" => Some(md_array_set as IntrinsicFn),
+                "Address" => Some(md_array_address as IntrinsicFn),
                 _ => continue,
             }
         } else if parent.table() == TYPE_REF {
@@ -573,8 +771,47 @@ fn bind_bcl_calls(
     }
 }
 
+/// Binds recognized instantiated BCL generic-method calls (a `MethodSpec` operand) to their
+/// intrinsics. Resolves the `MethodSpec` to its generic definition (a `MemberRef`), and binds
+/// the recognized ones -- today `System.Array.Empty<T>()` (a `params T[]` no-argument call).
+fn bind_generic_calls(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    tokens: &BTreeSet<Token>,
+) {
+    for token in tokens {
+        let Some(method_token) = assembly.method_spec_method(*token) else {
+            continue;
+        };
+        if method_token.table() != MEMBER_REF {
+            continue;
+        }
+        let Some(member) = assembly.member_ref(method_token.row()) else {
+            continue;
+        };
+        let parent = member.parent();
+        if parent.table() != TYPE_REF {
+            continue;
+        }
+        let Some(parent_type) = assembly
+            .type_ref(parent.row())
+            .and_then(|type_ref| type_ref.name())
+        else {
+            continue;
+        };
+        if parent_type.namespace == "System"
+            && parent_type.name == "Array"
+            && member.name() == Some("Empty")
+        {
+            let id = module.add_intrinsic(asm, array_empty as IntrinsicFn, 0);
+            module.bind_token(asm, *token, id);
+        }
+    }
+}
+
 /// The parameter count of a `System.Text.StringBuilder` constructor, if this member is one,
-/// so `newobj` can allocate a builder. Always `None` without the NETMF surface that defines it.
+/// so `newobj` can allocate a builder. Always `None` without the NETMFv4_4-profile surface that defines it.
 #[cfg(feature = "NETMFv4_4")]
 fn string_builder_ctor(
     namespace: &str,
@@ -599,8 +836,21 @@ fn string_builder_ctor(
     None
 }
 
+/// Whether a type declared in THIS assembly is `System.Text.StringBuilder`, so a same-assembly
+/// (corlib-internal) `newobj` of its `.ctor` allocates a builder. Mirrors the type recognition in
+/// [`string_builder_ctor`]; the caller supplies the `.ctor` arity. `false` without the surface.
+#[cfg(feature = "NETMFv4_4")]
+fn same_assembly_string_builder_ctor(namespace: &str, type_name: &str) -> bool {
+    namespace == "System.Text" && type_name == "StringBuilder"
+}
+
+#[cfg(not(feature = "NETMFv4_4"))]
+fn same_assembly_string_builder_ctor(_namespace: &str, _type_name: &str) -> bool {
+    false
+}
+
 /// The parameter count of a `System.Collections.ArrayList` constructor, if this member is one,
-/// so `newobj` can allocate an empty list. Always `None` without the NETMF surface.
+/// so `newobj` can allocate an empty list. Always `None` without the NETMFv4_4-profile surface.
 #[cfg(feature = "NETMFv4_4")]
 fn list_ctor(
     namespace: &str,
@@ -628,6 +878,21 @@ fn list_ctor(
     None
 }
 
+/// Whether a type declared in THIS assembly is a `System.Collections` list type, so a
+/// same-assembly (corlib-internal) `newobj` of its `.ctor` allocates an empty list. Mirrors the
+/// type recognition in [`list_ctor`]; the caller supplies the `.ctor` arity. `false` without the
+/// surface.
+#[cfg(feature = "NETMFv4_4")]
+fn same_assembly_list_ctor(namespace: &str, type_name: &str) -> bool {
+    namespace == "System.Collections"
+        && matches!(type_name, "ArrayList" | "Hashtable" | "Stack" | "Queue")
+}
+
+#[cfg(not(feature = "NETMFv4_4"))]
+fn same_assembly_list_ctor(_namespace: &str, _type_name: &str) -> bool {
+    false
+}
+
 /// Maps a recognized BCL member -- by declaring type, method name, and signature --
 /// to a runtime intrinsic and its argument count. Returns `None` for anything not
 /// implemented yet; that call stays unbound and only traps if executed.
@@ -639,11 +904,20 @@ fn bcl_intrinsic(
 ) -> Option<IntrinsicFn> {
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Text" {
-        return netmf::text_intrinsic(type_name, method, signature);
+        return extended::text_intrinsic(type_name, method, signature);
     }
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Collections" {
-        return netmf::collections_intrinsic(type_name, method, signature);
+        return extended::collections_intrinsic(type_name, method, signature);
+    }
+    if namespace == "System.Runtime.CompilerServices"
+        && type_name == "RuntimeHelpers"
+        && method == "InitializeArray"
+    {
+        return Some(initialize_array);
+    }
+    if namespace == "System.Reflection" && type_name == "MemberInfo" && method == "get_Name" {
+        return Some(type_get_name);
     }
     if namespace != "System" {
         return None;
@@ -664,6 +938,10 @@ fn bcl_intrinsic(
             _ => None,
         },
         ("Object", "Finalize") => Some(object_ctor),
+        ("Object", "GetType") => match parameters_of(signature) {
+            [] => Some(object_get_type),
+            _ => None,
+        },
         ("Exception", ".ctor") => Some(exception_ctor),
         ("Exception", "get_Message") => Some(exception_get_message),
         #[cfg(feature = "finalizers")]
@@ -675,6 +953,7 @@ fn bcl_intrinsic(
         #[cfg(feature = "finalizers")]
         ("GC", "WaitForPendingFinalizers") => Some(wait_for_pending_finalizers),
         ("Type", "GetTypeFromHandle") => Some(type_from_handle),
+        ("Type", "get_Name") => Some(type_get_name),
         ("Enum", "Parse") => Some(enum_parse),
         ("Enum", "IsDefined") => Some(enum_is_defined),
         ("Array", "get_Length") => Some(md_array_length),
@@ -703,7 +982,7 @@ fn bcl_intrinsic(
     }
     #[cfg(feature = "NETMFv4_4")]
     {
-        netmf::netmf_intrinsic(type_name, method, signature)
+        extended::extended_intrinsic(type_name, method, signature)
     }
     #[cfg(not(feature = "NETMFv4_4"))]
     {
@@ -755,6 +1034,201 @@ fn bind_array_defaults(
     }
 }
 
+/// Marks each `newobj` token whose constructor is declared by a value type, so the
+/// interpreter builds a struct value in place rather than a heap instance. Only a
+/// same-assembly `MethodDef` token can name a value type defined here; a `MemberRef`
+/// newobj (a delegate / external type) is not a struct construction we model.
+fn mark_value_type_ctors(
+    module: &mut Module,
+    asm: u8,
+    newobj_tokens: &BTreeSet<Token>,
+    value_type_method_rows: &BTreeSet<u32>,
+) {
+    for token in newobj_tokens {
+        if token.table() == METHOD_DEF && value_type_method_rows.contains(&token.row()) {
+            module.mark_value_type_ctor(asm, *token);
+        }
+    }
+}
+
+/// Marks a same-assembly (`MethodDef`) `newobj` of a `System.Text.StringBuilder` /
+/// `System.Collections` list `.ctor` declared in this assembly, so a corlib-INTERNAL
+/// `new StringBuilder()` allocates a builder/list at construction. `bind_bcl_calls` already
+/// covers the cross-assembly (`MemberRef`) form for a program's `newobj`; this is the
+/// same-assembly analog (modelled on [`mark_value_type_ctors`]). The per-row arity was
+/// captured as the type's methods were walked.
+fn mark_same_assembly_ctors(
+    module: &mut Module,
+    asm: u8,
+    newobj_tokens: &BTreeSet<Token>,
+    string_builder_ctor_rows: &BTreeMap<u32, u16>,
+    list_ctor_rows: &BTreeMap<u32, u16>,
+) {
+    for token in newobj_tokens {
+        if token.table() != METHOD_DEF {
+            continue;
+        }
+        if let Some(&params) = string_builder_ctor_rows.get(&token.row()) {
+            module.mark_string_builder_ctor(asm, *token, params);
+        } else if let Some(&params) = list_ctor_rows.get(&token.row()) {
+            module.mark_list_ctor(asm, *token, params);
+        }
+    }
+}
+
+/// Binds each `ldtoken`'d field's RVA initializer bytes into the module, so
+/// `RuntimeHelpers.InitializeArray` can fill a constant array literal from them.
+fn bind_field_rva_data(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    field_tokens: &BTreeSet<Token>,
+) {
+    for token in field_tokens {
+        if let Some(data) = assembly.field_rva_data(*token) {
+            module.bind_field_rva(asm, *token, data);
+        }
+    }
+}
+
+/// Binds each cross-assembly static-field reference (an `ldsfld`/`stsfld`/`ldsflda` whose
+/// operand is a `MemberRef` to a static field defined in another loaded assembly) to that
+/// assembly's storage slot, resolved by qualified name through `field_index`.
+///
+/// The declaring type comes from the `MemberRef` parent (a `TypeRef`/`TypeDef`, named via
+/// [`lamella_metadata::Assembly::type_token_name`]) and the field from the member name; the
+/// pair keys `field_index` (which [`bind_static_field`] populated as the corlib loaded). The
+/// program's token then shares the corlib's slot, so a `ldsfld
+/// [corlib]System.BitConverter::IsLittleEndian` reads the cell the corlib `.cctor` set. A
+/// const corlib field is inlined by csc (never `ldsfld`'d) and so is absent from the index;
+/// an already-bound token (a same-assembly `MemberRef`, if one ever arises) is left alone.
+/// Only a field `MemberRef` is considered -- a method one would not be a static-field operand.
+fn bind_static_field_refs(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    field_index: &FieldNameIndex,
+    tokens: &BTreeSet<Token>,
+) {
+    for token in tokens {
+        if module.static_field_slot(asm, *token).is_some() {
+            continue;
+        }
+        let Some(member) = assembly.member_ref(token.row()) else {
+            continue;
+        };
+        if !member.is_field() {
+            continue;
+        }
+        let (Some(declaring), Some(field_name)) =
+            (assembly.type_token_name(member.parent()), member.name())
+        else {
+            continue;
+        };
+        if let Some(&slot) = field_index.get(&field_name_key(declaring, field_name)) {
+            module.bind_static_field_ref(asm, *token, slot);
+        }
+    }
+}
+
+/// Records the simple (unqualified) name of each `ldtoken`'d type, so
+/// `System.Type.get_Name` can render it (`typeof(int).Name` -> "Int32"). The handle the
+/// intrinsic receives is the asm-folded token, matching the module's name key.
+fn bind_type_names(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    type_tokens: &BTreeSet<Token>,
+) {
+    for token in type_tokens {
+        if let Some(name) = assembly.type_token_name(*token) {
+            module.bind_type_name(asm, *token, name.name.into());
+        }
+    }
+}
+
+/// Classifies each `castclass` / `isinst` / `box` type-test operand by its external
+/// identity -- `System.Object` (a universal match target) or `System.String` -- so the
+/// interpreter's type test on a boxed value or a heap string is precise. A same-assembly
+/// declared type already resolves to a `TypeId`; only these unresolvable core targets need
+/// recording.
+fn classify_type_test_tokens(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    type_index: &TypeNameIndex,
+    tokens: &BTreeSet<Token>,
+) {
+    for token in tokens {
+        if let Some(name) = assembly.type_token_name(*token) {
+            if name.namespace == "System" {
+                match name.name {
+                    "Object" => module.mark_object_type_token(asm, *token),
+                    "String" => module.mark_string_type_token(asm, *token),
+                    _ => {}
+                }
+            }
+            if module.type_id_of(asm, *token).is_none() {
+                if let Some(id) = type_index.get(&type_name_key(name)).copied() {
+                    module.bind_type_token(asm, *token, id);
+                }
+            }
+        }
+    }
+}
+
+/// Records the byte size of every type a `sizeof` operand names (III.4.25), and of every
+/// value type this assembly declares, so the interpreter's `sizeof` resolves the operand.
+///
+/// A value type's size is its shared [`lamella_metadata::Assembly::value_type_layout`]
+/// (the one computation the AOT stack maps and the GC ref-map also consume) at the
+/// 32-bit target ([`TargetLayout::ilp32`] -- our targets use a 4-byte pointer). A `sizeof`
+/// operand that names a primitive (a `TypeRef`/`TypeDef` to `System.Int32` etc., which csc
+/// emits only in hand-written IL since it constant-folds `sizeof(primitive)`) gets its fixed
+/// width; a struct operand is already covered by the value-type pass.
+fn bind_type_sizes(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    value_type_tokens: &[Token],
+    sizeof_tokens: &BTreeSet<Token>,
+) {
+    let target = TargetLayout::ilp32();
+    for token in value_type_tokens {
+        if let Ok(layout) = assembly.value_type_layout(*token, &target) {
+            module.set_type_size(asm, *token, layout.size);
+        }
+    }
+    for token in sizeof_tokens {
+        if module.type_size(asm, *token).is_some() {
+            continue;
+        }
+        if let Some(size) = assembly
+            .type_token_name(*token)
+            .and_then(|name| primitive_type_size(name.namespace, name.name, target.pointer_size))
+        {
+            module.set_type_size(asm, *token, size);
+        }
+    }
+}
+
+/// The fixed byte width of a primitive `System` type named by `sizeof`, or `None` if the
+/// name is not a primitive. Mirrors the field widths the shared layout uses, so a
+/// `sizeof(int)`-style token (hand-written IL; csc folds the C# form) agrees with .NET.
+fn primitive_type_size(namespace: &str, name: &str, pointer_size: u32) -> Option<u32> {
+    if namespace != "System" {
+        return None;
+    }
+    Some(match name {
+        "Boolean" | "SByte" | "Byte" => 1,
+        "Int16" | "UInt16" | "Char" => 2,
+        "Int32" | "UInt32" | "Single" => 4,
+        "Int64" | "UInt64" | "Double" => 8,
+        "IntPtr" | "UIntPtr" => pointer_size,
+        _ => return None,
+    })
+}
+
 /// The zero value an array's elements take (ECMA-335 III.4.20): the numeric zero of a
 /// primitive element, or null for a reference element. The `newarr` operand names the
 /// element type; a `System` primitive -- whether a program's `TypeRef` or the corlib's own
@@ -778,6 +1252,27 @@ fn array_element_default(assembly: &Assembly, element_type: Token) -> Value {
         "IntPtr" | "UIntPtr" => Value::NativeInt(0),
         _ => Value::Null,
     }
+}
+
+/// The representative evaluation-stack [`Value`] kind a `System` primitive value type loads
+/// as (a zero of that kind), or `None` for a non-primitive name. Mirrors the widening in
+/// [`array_element_default`] (`bool`/`char`/`int16`/... share `Value::Int32`), so the kind a
+/// primitive's elements take maps back to the one primitive whose canonical token represents
+/// it -- `System.Int32` for the `Int32`-kind family, etc. This keys
+/// [`Module::set_primitive_type_token`] so `System.Array.GetValue` can stamp a boxed element
+/// with a real value-type identity.
+fn primitive_value_kind(namespace: &str, name: &str) -> Option<Value> {
+    if namespace != "System" {
+        return None;
+    }
+    Some(match name {
+        "Int32" => Value::Int32(0),
+        "Int64" => Value::Int64(0),
+        #[cfg(feature = "float")]
+        "Single" | "Double" => Value::Float(0.0),
+        "IntPtr" | "UIntPtr" => Value::NativeInt(0),
+        _ => return None,
+    })
 }
 
 /// Computes each type's full instance-field layout (base fields first, then own) and
@@ -833,13 +1328,14 @@ struct VirtualMethod {
     newslot: bool,
 }
 
-/// One slot of a vtable under construction: the virtual method's identity (name +
-/// parameter types, to match an override to the slot it overrides) and the current
-/// most-derived implementation.
+/// One slot of a vtable under construction: the virtual method's signature key
+/// ([`sig_encode`] of name + parameter types, to match an override to the slot it overrides)
+/// and the current most-derived implementation. The key (rather than name + params) is what a
+/// cross-assembly base seeds into a derived vtable, so both same-assembly and cross-assembly
+/// override matching compare the one stable key.
 #[derive(Clone)]
 struct VtableSlot {
-    name: String,
-    params: Vec<SigType>,
+    key: String,
     method: MethodId,
 }
 
@@ -967,27 +1463,70 @@ fn bind_call_targets(
     }
 }
 
+/// Records each type's explicit interface implementations (II.22.27 `MethodImpl` / the
+/// `.override` directive): the `MethodDeclaration` (an interface/virtual method) maps to the
+/// `MethodBody` defined in this type. An explicit body (`int IA.Value()`) is private and
+/// named after the interface, so a `callvirt` through the interface reference -- which names
+/// the interface method -- cannot reach it by signature; this map provides the dispatch.
+/// `type_defs()` yields rows in order, so the local index `i` is the global `type_offset + i`.
+fn bind_explicit_overrides(module: &mut Module, assembly: &Assembly, asm: u8, type_offset: usize) {
+    for (local, type_def) in assembly.type_defs().enumerate() {
+        let type_id = (type_offset + local) as TypeId;
+        for (body_token, declaration_token) in type_def.method_impls() {
+            if let Some(body) = module.resolve(asm, body_token) {
+                module.add_explicit_override(asm, type_id, declaration_token, body);
+            }
+        }
+    }
+}
+
+/// How a type's base resolves for vtable construction: a same-assembly base (a local index
+/// into this load's `extends`/`virtuals`, recursed through `memo`), a cross-assembly base
+/// already loaded (its vtable slots inherited directly), or no base.
+enum BaseVtable {
+    /// A same-assembly base at this local index -- its vtable is computed in this same pass.
+    Local(usize),
+    /// A previously loaded (cross-assembly) base's vtable slots, to seed this type's table so
+    /// its layout is inherited and this type's own newslot virtuals append after it.
+    Extern(Vec<VtableSlot>),
+    /// No (or an unresolvable) base: the table starts empty.
+    None,
+}
+
 /// Builds each type's virtual method table and records each virtual method's slot,
 /// following single inheritance (II.12.2): a type's table extends its base's, a
-/// `newslot` method appends a slot, and an override (matched by name + parameter
-/// types) replaces the inherited slot. (Abstract / interface dispatch goes through the
-/// signature-keyed map instead; see [`build_sig_methods`].)
+/// `newslot` method appends a slot, and an override (matched by signature key) replaces the
+/// inherited slot. A base reached by a cross-assembly `TypeRef` (e.g. a corlib type extending
+/// a previously loaded `[mscorlib]System.Object`, or a program class extending a corlib class)
+/// has its already-built vtable layout inherited, so the derived type's own virtuals start
+/// AFTER the base's slots (Object's Equals=0 / GetHashCode=1 / ToString=2). (Abstract /
+/// interface dispatch goes through the signature-keyed map instead; see [`build_sig_methods`].)
 fn build_vtables(
     module: &mut Module,
-    _asm: u8,
+    assembly: &Assembly,
     type_offset: usize,
+    type_index: &TypeNameIndex,
     extends: &[Token],
     virtuals: &[Vec<VirtualMethod>],
 ) {
+    let bases: Vec<BaseVtable> = (0..extends.len())
+        .map(|local| resolve_base_vtable(module, assembly, type_offset, type_index, extends, local))
+        .collect();
     let mut memo: Vec<Option<Vec<VtableSlot>>> = alloc::vec![None; extends.len()];
+    let mut visiting: Vec<bool> = alloc::vec![false; extends.len()];
     let mut method_slots: BTreeMap<MethodId, u32> = BTreeMap::new();
     for local in 0..extends.len() {
-        let table = compute_vtable(local, extends, virtuals, &mut memo, &mut method_slots);
+        let table = compute_vtable(local, &bases, virtuals, &mut memo, &mut visiting, &mut method_slots);
+        let type_id = (type_offset + local) as u32;
+        module.set_vtable_slot_keys(
+            type_id,
+            table
+                .iter()
+                .map(|slot| (slot.key.clone(), slot.method))
+                .collect(),
+        );
         if !table.is_empty() {
-            module.set_vtable(
-                (type_offset + local) as u32,
-                table.iter().map(|slot| slot.method).collect(),
-            );
+            module.set_vtable(type_id, table.iter().map(|slot| slot.method).collect());
         }
     }
     for (method, slot) in method_slots {
@@ -995,29 +1534,82 @@ fn build_vtables(
     }
 }
 
-/// The memoized vtable of `type_id`, recursing into the base type so a derived table
-/// extends its base's. Records each of this type's own virtual methods' slots.
+/// Resolves type `local`'s base for vtable seeding (see [`BaseVtable`]). A same-assembly
+/// `TypeDef` base is a local index. A `TypeRef` base resolves by qualified name through
+/// `type_index` (the same cross-assembly resolution interfaces / `castclass` use): if it lands
+/// inside this load's own type range it is a local index (a same-assembly base encoded as a
+/// TypeRef), otherwise it is a previously loaded type whose stored vtable slots seed this one.
+fn resolve_base_vtable(
+    module: &Module,
+    assembly: &Assembly,
+    type_offset: usize,
+    type_index: &TypeNameIndex,
+    extends: &[Token],
+    local: usize,
+) -> BaseVtable {
+    if let Some(base) = base_type_id(extends[local], extends.len()) {
+        return BaseVtable::Local(base);
+    }
+    let extends_token = extends[local];
+    if extends_token.table() != TYPE_REF {
+        return BaseVtable::None;
+    }
+    let Some(global) = assembly
+        .type_token_name(extends_token)
+        .and_then(|name| type_index.get(&type_name_key(name)).copied())
+    else {
+        return BaseVtable::None;
+    };
+    let local_count = extends.len();
+    if let Some(base_local) = (global as usize)
+        .checked_sub(type_offset)
+        .filter(|&i| i < local_count && i != local)
+    {
+        return BaseVtable::Local(base_local);
+    }
+    match module.vtable_slot_keys(global) {
+        Some(slots) => BaseVtable::Extern(
+            slots
+                .iter()
+                .map(|(key, method)| VtableSlot {
+                    key: key.clone(),
+                    method: *method,
+                })
+                .collect(),
+        ),
+        None => BaseVtable::None,
+    }
+}
+
+/// The memoized vtable of `type_id`, seeding from the base type (a same-assembly base recursed
+/// here, a cross-assembly base's stored slots inherited) so a derived table extends its base's.
+/// Records each of this type's own virtual methods' slots.
 fn compute_vtable(
     type_id: usize,
-    extends: &[Token],
+    bases: &[BaseVtable],
     virtuals: &[Vec<VirtualMethod>],
     memo: &mut [Option<Vec<VtableSlot>>],
+    visiting: &mut [bool],
     method_slots: &mut BTreeMap<MethodId, u32>,
 ) -> Vec<VtableSlot> {
     if let Some(table) = &memo[type_id] {
         return table.clone();
     }
-    let mut table = match base_type_id(extends[type_id], extends.len()) {
-        Some(base) => compute_vtable(base, extends, virtuals, memo, method_slots),
-        None => Vec::new(),
+    if visiting[type_id] {
+        return Vec::new();
+    }
+    visiting[type_id] = true;
+    let mut table = match &bases[type_id] {
+        BaseVtable::Local(base) => {
+            compute_vtable(*base, bases, virtuals, memo, visiting, method_slots)
+        }
+        BaseVtable::Extern(slots) => slots.clone(),
+        BaseVtable::None => Vec::new(),
     };
     for method in &virtuals[type_id] {
+        let key = sig_encode(&method.name, &method.params);
         let overridden = (!method.newslot)
-            .then(|| {
-                table
-                    .iter()
-                    .position(|slot| slot.name == method.name && slot.params == method.params)
-            })
+            .then(|| table.iter().position(|slot| slot.key == key))
             .flatten();
         let slot = match overridden {
             Some(slot) => {
@@ -1026,8 +1618,7 @@ fn compute_vtable(
             }
             None => {
                 table.push(VtableSlot {
-                    name: method.name.clone(),
-                    params: method.params.clone(),
+                    key,
                     method: method.id,
                 });
                 (table.len() - 1) as u32
@@ -1035,6 +1626,7 @@ fn compute_vtable(
         };
         method_slots.insert(method.id, slot);
     }
+    visiting[type_id] = false;
     memo[type_id] = Some(table.clone());
     table
 }
@@ -1050,15 +1642,57 @@ fn base_type_id(extends: Token, count: usize) -> Option<usize> {
     (index < count).then_some(index)
 }
 
-/// Binds each type's `TypeDef` token to its id and records its base, so `castclass`
-/// and `isinst` can resolve a target type and test the subtype relation at run time.
-fn bind_types(module: &mut Module, asm: u8, type_offset: usize, extends: &[Token]) {
+/// Binds each type's `TypeDef` token to its id and records its base and value-type-ness, so
+/// `castclass` / `isinst` can resolve a target type and test the subtype relation at run
+/// time, and a `callvirt` to a value type's own method on a box can auto-unbox `this`.
+fn bind_types(
+    module: &mut Module,
+    asm: u8,
+    type_offset: usize,
+    extends: &[Token],
+    is_value_type: &[bool],
+) {
     for local in 0..extends.len() {
         let token = Token::new(TYPE_DEF, (local + 1) as u32);
-        module.bind_type_token(asm, token, (type_offset + local) as u32);
+        let type_id = (type_offset + local) as u32;
+        module.bind_type_token(asm, token, type_id);
         let base =
             base_type_id(extends[local], extends.len()).map(|base| (type_offset + base) as u32);
-        module.set_type_base((type_offset + local) as u32, base);
+        module.set_type_base(type_id, base);
+        module.set_type_is_value_type(type_id, is_value_type[local]);
+    }
+}
+
+/// Resolves each type's implemented-interface tokens to global [`TypeId`]s and records them
+/// on the module, so `castclass` / `isinst` to an interface can test the implements relation.
+///
+/// An interface token is a `TypeDefOrRef`: a same-assembly `TypeDef` resolves directly through
+/// the module's token map; a `TypeRef` (a cross-assembly interface such as a program class's
+/// `[corlib]System.IComparable`, or a same-assembly forward reference) resolves by qualified name
+/// through `type_index`. A `TypeSpec` (a generic interface) has no name and is skipped.
+fn bind_interfaces(
+    module: &mut Module,
+    assembly: &Assembly,
+    asm: u8,
+    type_offset: usize,
+    type_index: &TypeNameIndex,
+    type_interfaces: &[Vec<Token>],
+) {
+    for (local, interface_tokens) in type_interfaces.iter().enumerate() {
+        let mut resolved = Vec::new();
+        for token in interface_tokens {
+            let interface_id = module.type_id_of(asm, *token).or_else(|| {
+                assembly
+                    .type_token_name(*token)
+                    .and_then(|name| type_index.get(&type_name_key(name)).copied())
+            });
+            if let Some(interface_id) = interface_id {
+                resolved.push(interface_id);
+            }
+        }
+        if !resolved.is_empty() {
+            module.set_type_interfaces((type_offset + local) as TypeId, resolved);
+        }
     }
 }
 
@@ -1176,11 +1810,11 @@ fn string_get_chars_overload(signature: Option<&MethodSig>) -> Option<IntrinsicF
     }
 }
 
-/// The .NET Micro Framework v4.4 BCL bindings beyond the Kernel Profile, gated by
-/// `NETMFv4_4`: the overload pickers plus the `netmf_intrinsic` dispatch `bcl_intrinsic`
+/// The NETMFv4_4-profile BCL bindings beyond the Kernel Profile, gated by
+/// `NETMFv4_4`: the overload pickers plus the `extended_intrinsic` dispatch `bcl_intrinsic`
 /// delegates to.
 #[cfg(feature = "NETMFv4_4")]
-mod netmf {
+mod extended {
     use super::*;
 
     /// `String.IndexOf(char)` / `IndexOf(string)` -- the ordinal-search overloads.
@@ -1505,9 +2139,9 @@ mod netmf {
         }
     }
 
-    /// Resolves a NETMF v4.4 BCL member (beyond the Kernel set) to its intrinsic. Reached
+    /// Resolves a NETMFv4_4-profile BCL member (beyond the Kernel set) to its intrinsic. Reached
     /// from `bcl_intrinsic` when the Kernel set has no match.
-    pub(super) fn netmf_intrinsic(
+    pub(super) fn extended_intrinsic(
         type_name: &str,
         method: &str,
         signature: Option<&MethodSig>,

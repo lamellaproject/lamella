@@ -18,8 +18,10 @@ version = "0.0.0"
 dependencies = [
  "lamella-asm-arm32",
  "lamella-asm-riscv32",
+ "lamella-asm-wasm",
  "lamella-cil",
  "lamella-cmsis-dap",
+ "lamella-cmsis-dap-sam",
  "lamella-ir",
  "lamella-metadata",
  "lamella-token",
@@ -32,6 +34,10 @@ version = "0.0.0"
 
 [[package]]
 name = "lamella-asm-riscv32"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-asm-wasm"
 version = "0.0.0"
 
 [[package]]
@@ -67,6 +73,21 @@ name = "lamella-cmsis-dap"
 version = "0.0.0"
 dependencies = [
  "lamella-usbhid",
+]
+
+[[package]]
+name = "lamella-cmsis-dap-nrf"
+version = "0.0.0"
+dependencies = [
+ "lamella-cmsis-dap",
+ "lamella-usbhid",
+]
+
+[[package]]
+name = "lamella-cmsis-dap-sam"
+version = "0.0.0"
+dependencies = [
+ "lamella-cmsis-dap",
 ]
 
 [[package]]
@@ -132,6 +153,15 @@ version = "0.0.0"
 dependencies = [
  "lamella-metadata",
  "lamella-token",
+]
+
+[[package]]
+name = "lamella-repl"
+version = "0.0.0"
+dependencies = [
+ "lamella-load",
+ "lamella-metadata",
+ "lamella-ves",
 ]
 
 [[package]]

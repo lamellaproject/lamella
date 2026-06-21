@@ -1,0 +1,11 @@
+[package]
+name = "lamella-asm-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WebAssembly 1.0 binary-module encoder for the Lamella backend (the WASM target)."
+
+[lints]
+workspace = true

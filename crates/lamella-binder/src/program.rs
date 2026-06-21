@@ -94,6 +94,59 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             }
         }
     }
+    let mut seen_methods: alloc::vec::Vec<(Box<str>, alloc::vec::Vec<TypeSymbol>)> =
+        alloc::vec::Vec::new();
+    for member in &declaration.members {
+        if let Member::Method {
+            name,
+            parameters,
+            explicit_interface: None,
+            span,
+            ..
+        } = member
+        {
+            let key = (
+                name.clone(),
+                bound_parameters(parameters)
+                    .into_iter()
+                    .map(|(_, ty)| ty)
+                    .collect::<alloc::vec::Vec<_>>(),
+            );
+            if seen_methods.contains(&key) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::DuplicateMethod {
+                        type_name: declaration.name.clone(),
+                        member: name.clone(),
+                    },
+                    *span,
+                ));
+            } else {
+                seen_methods.push(key);
+            }
+        }
+    }
+    for member in &declaration.members {
+        if let Member::Method {
+            modifiers,
+            name,
+            body: Some(_),
+            span,
+            ..
+        } = member
+        {
+            if modifiers
+                .iter()
+                .any(|modifier| matches!(modifier, lamella_syntax::ast::Modifier::Abstract))
+            {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::AbstractMethodWithBody {
+                        member: name.clone(),
+                    },
+                    *span,
+                ));
+            }
+        }
+    }
     for member in &declaration.members {
         match member {
             Member::Method {
@@ -215,6 +268,8 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             _ => {}
         }
     }
+    binder.check_base_cycle(&enclosing, declaration);
+    binder.check_interface_implementations(&enclosing, declaration);
 }
 
 /// The accessor method name (`get_Name` / `set_Name`), for diagnostics.

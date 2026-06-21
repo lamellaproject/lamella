@@ -24,6 +24,15 @@ pub fn can_cast(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
         || is_object(from)
         || is_object(to)
         || enum_cast(model, from, to)
+        || pointer_cast(from, to)
+}
+
+/// Explicit conversions involving pointers (unsafe): any pointer to/from any other pointer,
+/// and a pointer to/from an integer.
+fn pointer_cast(from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    let from_ptr = matches!(from, TypeSymbol::Pointer(_));
+    let to_ptr = matches!(to, TypeSymbol::Pointer(_));
+    (from_ptr && (to_ptr || is_numeric_type(to))) || (to_ptr && (from_ptr || is_numeric_type(from)))
 }
 
 /// The explicit conversions involving enums (13.2.2): an enum to and from any

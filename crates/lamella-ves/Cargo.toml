@@ -21,7 +21,7 @@ default = ["bcl", "NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-
 # control flow, the object model) with no BCL surface -- the smallest build for a
 # constrained target. The runtime side of a capability-profile surface knob.
 bcl = []
-# The additional .NET Micro Framework v4.4 BCL surface beyond the Kernel Profile
+# The additional NETMFv4_4-profile BCL surface beyond the Kernel Profile
 # (richer String, Math, Char, parsing). Off => the Kernel-only floor. A surface knob.
 NETMFv4_4 = ["bcl"]
 # Structured exception handling (throw / try-catch / finally). Off => those opcodes
@@ -46,6 +46,18 @@ float = []
 # Default (feature off) = UTF-16 (O(1) indexing). On = UTF-8 (~half the ASCII-text memory,
 # O(n) UTF-16 indexing; the well-formed tier -- WTF-8 surrogate parity is a future feature).
 string-utf8 = []
+# Typed references (System.TypedReference): the mkrefany / refanyval / refanytype opcodes
+# (__makeref / __refvalue / __reftype) and the Value::TypedRef they pass. Off (the default,
+# the tiny-target floor) => those three opcodes trap cleanly; they are vanishingly rare in
+# C# 1.0 (low-level reflection / C variadic interop). A capability-profile knob.
+typed-references = []
+# Varargs (the arglist opcode / __arglist): pushes a RuntimeArgumentHandle for the current
+# method's vararg arguments. Off (the default) => arglist traps. SHELL ONLY: the full vararg
+# ecosystem -- the vararg calling convention (extra args beyond the fixed params at a call
+# site) and the System.ArgIterator BCL type that walks the handle via TypedReference -- is a
+# follow-up, so the handle this pushes is a placeholder no ArgIterator yet consumes. Implies
+# typed-references (an ArgIterator iterates the handle as TypedReferences). A capability knob.
+varargs = ["typed-references"]
 # The floating-point transcendentals (Math.Sqrt/Sin/Cos/Tan/Pow/Log/Log10/Exp), backed by the
 # `libm` crate. A floating-point knob: off => they bind nothing and libm is not compiled (the
 # rounding + arithmetic float ops stay). FUTURE (for discussion): a fast/approximate backend

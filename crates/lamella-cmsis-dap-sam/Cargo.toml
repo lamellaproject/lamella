@@ -1,0 +1,18 @@
+[package]
+name = "lamella-cmsis-dap-sam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Microchip SAM (ATSAMD21, ...) flash programming over the Lamella CMSIS-DAP debug stack -- a device-specific extension of lamella-cmsis-dap."
+
+[lints]
+workspace = true
+
+[dependencies]
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+
+[dev-dependencies]
+# Tests drive a Dap against the shared probe-protocol mock.
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }

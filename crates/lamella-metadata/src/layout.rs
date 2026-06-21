@@ -146,6 +146,22 @@ mod tests {
     }
 
     #[test]
+    fn two_int_struct_is_eight_bytes() {
+        let layout = layout(&[SigType::I4, SigType::I4]);
+        assert_eq!(layout.field_offsets, [0, 4]);
+        assert_eq!(layout.size, 8);
+        assert_eq!(layout.alignment, 4);
+    }
+
+    #[test]
+    fn byte_then_int_pads_to_eight_bytes() {
+        let layout = layout(&[SigType::U1, SigType::I4]);
+        assert_eq!(layout.field_offsets, [0, 4]);
+        assert_eq!(layout.size, 8);
+        assert_eq!(layout.alignment, 4);
+    }
+
+    #[test]
     fn packs_primitives_with_natural_alignment_and_padding() {
         let layout = layout(&[SigType::I1, SigType::I4, SigType::I8]);
         assert_eq!(layout.field_offsets, [0, 4, 8]);

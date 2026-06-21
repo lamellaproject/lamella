@@ -144,6 +144,46 @@ pub enum DiagnosticKind {
         /// The duplicated member name.
         member: Box<str>,
     },
+    /// `CS0111`: the type already defines a method with the same name and parameter
+    /// types (a duplicate, not a valid overload).
+    DuplicateMethod {
+        /// The type that declares it twice.
+        type_name: Box<str>,
+        /// The duplicated method name.
+        member: Box<str>,
+    },
+    /// `CS0140`: two labels in the same method body share a name.
+    DuplicateLabel {
+        /// The duplicated label.
+        label: Box<str>,
+    },
+    /// `CS0159`: a `goto` targets a label that does not exist in scope.
+    UndefinedLabel {
+        /// The label the `goto` named.
+        label: Box<str>,
+    },
+    /// `CS0500`: an `abstract` method declares a body.
+    AbstractMethodWithBody {
+        /// The method name.
+        member: Box<str>,
+    },
+    /// `CS0191`: a `readonly` field is assigned outside a constructor.
+    ReadonlyAssignment {
+        /// The field name.
+        field: Box<str>,
+    },
+    /// `CS0535`: a class does not implement an inherited interface member.
+    InterfaceMemberNotImplemented {
+        /// The class that is missing the implementation.
+        type_name: Box<str>,
+        /// The interface member it must implement (`I.M`).
+        member: Box<str>,
+    },
+    /// `CS0146`: a circular base-class dependency (A : B, B : A).
+    CircularBase {
+        /// The type whose base chain is circular.
+        type_name: Box<str>,
+    },
     /// `CS0266`: no implicit conversion exists, but an explicit one (a cast) does.
     ExplicitConversionExists {
         /// The source type.
@@ -254,6 +294,13 @@ impl DiagnosticKind {
             DiagnosticKind::LocalShadowsEnclosing { .. } => 136,
             DiagnosticKind::IllegalStatementExpression => 201,
             DiagnosticKind::DuplicateMember { .. } => 102,
+            DiagnosticKind::DuplicateMethod { .. } => 111,
+            DiagnosticKind::DuplicateLabel { .. } => 140,
+            DiagnosticKind::UndefinedLabel { .. } => 159,
+            DiagnosticKind::AbstractMethodWithBody { .. } => 500,
+            DiagnosticKind::ReadonlyAssignment { .. } => 191,
+            DiagnosticKind::InterfaceMemberNotImplemented { .. } => 535,
+            DiagnosticKind::CircularBase { .. } => 146,
             DiagnosticKind::ExplicitConversionExists { .. } => 266,
             DiagnosticKind::UnusedLocal { .. } => 168,
             DiagnosticKind::UnusedLocalValue { .. } => 219,
@@ -366,6 +413,33 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::DuplicateMember { type_name, member } => write!(
                 f,
                 "The type '{type_name}' already contains a definition for '{member}'"
+            ),
+            DiagnosticKind::DuplicateMethod { type_name, member } => write!(
+                f,
+                "Type '{type_name}' already defines a member called '{member}' \
+                 with the same parameter types"
+            ),
+            DiagnosticKind::DuplicateLabel { label } => {
+                write!(f, "The label '{label}' is a duplicate")
+            }
+            DiagnosticKind::UndefinedLabel { label } => {
+                write!(f, "No such label '{label}' within the scope of the goto statement")
+            }
+            DiagnosticKind::AbstractMethodWithBody { member } => write!(
+                f,
+                "'{member}' cannot declare a body because it is marked abstract"
+            ),
+            DiagnosticKind::ReadonlyAssignment { field } => write!(
+                f,
+                "A readonly field '{field}' cannot be assigned to (except in a constructor)"
+            ),
+            DiagnosticKind::InterfaceMemberNotImplemented { type_name, member } => write!(
+                f,
+                "'{type_name}' does not implement interface member '{member}'"
+            ),
+            DiagnosticKind::CircularBase { type_name } => write!(
+                f,
+                "Circular base class dependency involving '{type_name}'"
             ),
             DiagnosticKind::ExplicitConversionExists { from, to } => write!(
                 f,

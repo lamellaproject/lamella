@@ -45,18 +45,22 @@ pub fn emit_expression(
                 emit_expression(right, frame, tokens, out)?;
                 let is_string =
                     |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(SpecialType::String));
-                let strings = is_string(&left.ty) && is_string(&right.ty);
-                if matches!(operator, BinaryOperator::Add) && strings {
+                if matches!(operator, BinaryOperator::Add) && is_string(&expr.ty) {
+                    let arg = if is_string(&left.ty) && is_string(&right.ty) {
+                        SpecialType::String
+                    } else {
+                        SpecialType::Object
+                    };
+                    let arg = TypeSymbol::Special(arg);
                     let string = TypeSymbol::Special(SpecialType::String);
                     let token = tokens
-                        .method(&string, "Concat", &[string.clone(), string.clone()])
+                        .method(&string, "Concat", &[arg.clone(), arg])
                         .ok_or(EmitError::Unsupported("String.Concat was not minted"))?;
                     out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
                     Ok(())
-                } else if matches!(
-                    operator,
-                    BinaryOperator::Equal | BinaryOperator::NotEqual
-                ) && strings
+                } else if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
+                    && is_string(&left.ty)
+                    && is_string(&right.ty)
                 {
                     emit_string_equality(*operator == BinaryOperator::NotEqual, tokens, out)
                 } else {
@@ -156,6 +160,22 @@ pub fn emit_expression(
             when_false,
         } => emit_conditional(condition, when_true, when_false, frame, tokens, out),
         BoundExprKind::TypeOf(target) => emit_typeof(target, tokens, out),
+        BoundExprKind::SizeOf(target) => emit_sizeof(target, tokens, out),
+        BoundExprKind::StackAlloc { element, count } => {
+            emit_expression(count, frame, tokens, out)?;
+            emit_sizeof(element, tokens, out)?;
+            out.push(Instruction::simple(Opcode::Mul));
+            out.push(Instruction::simple(Opcode::Localloc));
+            Ok(())
+        }
+        BoundExprKind::Dereference { operand } => {
+            emit_expression(operand, frame, tokens, out)?;
+            let TypeSymbol::Pointer(element) = &operand.ty else {
+                return Err(EmitError::Unsupported("dereference of a non-pointer"));
+            };
+            out.push(Instruction::simple(ldind_opcode(element)));
+            Ok(())
+        }
         BoundExprKind::TypeTest {
             operation,
             operand,
@@ -312,6 +332,15 @@ fn emit_element_load(
     if indices.len() != 1 {
         return Err(EmitError::Unsupported("element access needs an index"));
     }
+    if matches!(receiver.ty, TypeSymbol::Pointer(_)) {
+        emit_expression(receiver, frame, tokens, out)?;
+        emit_expression(&indices[0], frame, tokens, out)?;
+        emit_sizeof(element_ty, tokens, out)?;
+        out.push(Instruction::simple(Opcode::Mul));
+        out.push(Instruction::simple(Opcode::Add));
+        out.push(Instruction::simple(ldind_opcode(element_ty)));
+        return Ok(());
+    }
     emit_expression(receiver, frame, tokens, out)?;
     emit_expression(&indices[0], frame, tokens, out)?;
     if matches!(receiver.ty, TypeSymbol::Special(SpecialType::String)) {
@@ -357,6 +386,16 @@ pub(crate) fn emit_element_store(
     if indices.len() != 1 {
         return Err(EmitError::Unsupported("element access needs an index"));
     }
+    if matches!(receiver.ty, TypeSymbol::Pointer(_)) {
+        emit_expression(receiver, frame, tokens, out)?;
+        emit_expression(&indices[0], frame, tokens, out)?;
+        emit_sizeof(element_ty, tokens, out)?;
+        out.push(Instruction::simple(Opcode::Mul));
+        out.push(Instruction::simple(Opcode::Add));
+        emit_expression(value, frame, tokens, out)?;
+        out.push(Instruction::simple(stind_opcode(element_ty)));
+        return Ok(());
+    }
     emit_expression(receiver, frame, tokens, out)?;
     emit_expression(&indices[0], frame, tokens, out)?;
     emit_expression(value, frame, tokens, out)?;
@@ -385,6 +424,7 @@ pub(crate) fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError
             }
         },
         TypeSymbol::Named(_) | TypeSymbol::Array { .. } => Opcode::LdelemRef,
+        TypeSymbol::Pointer(_) => return Err(EmitError::Unsupported("ldelem on a pointer")),
         TypeSymbol::Error => return Err(EmitError::Unsupported("element access of an error type")),
     })
 }
@@ -407,6 +447,7 @@ pub(crate) fn stelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError
             }
         },
         TypeSymbol::Named(_) | TypeSymbol::Array { .. } => Opcode::StelemRef,
+        TypeSymbol::Pointer(_) => return Err(EmitError::Unsupported("stelem on a pointer")),
         TypeSymbol::Error => return Err(EmitError::Unsupported("element store of an error type")),
     })
 }
@@ -490,12 +531,12 @@ fn emit_call(
         _ => None,
     };
     let value_type_receiver = match receiver {
-        Some(r) if tokens.is_struct(&r.ty) || tokens.is_enum(&r.ty) => Some(&r.ty),
+        Some(r) if is_value_type(&r.ty, tokens) => Some(&r.ty),
         _ => None,
     };
     let is_base_call = matches!(receiver, Some(r) if matches!(r.kind, BoundExprKind::Base));
     let inherited_value_call =
-        matches!(value_type_receiver, Some(ty) if method.declaring_type != *ty);
+        matches!(value_type_receiver, Some(ty) if !same_type(&method.declaring_type, ty));
     if !method.is_static {
         match &callee.kind {
             BoundExprKind::MethodGroup { receiver, .. } => {
@@ -698,6 +739,9 @@ fn emit_cast(
     if from == to {
         return Ok(());
     }
+    if matches!(to, TypeSymbol::Pointer(_)) {
+        return Ok(());
+    }
     if matches!(from, TypeSymbol::Special(SpecialType::Object)) && is_value_type(to, tokens) {
         let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
             "unboxing to a value type with no metadata token",
@@ -719,6 +763,14 @@ fn emit_cast(
         out.push(Instruction::simple(opcode));
         return Ok(());
     }
+    if matches!(to, TypeSymbol::Named(_)) && !is_value_type(to, tokens) && !tokens.is_interface(to)
+    {
+        let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
+            "a cast to a reference type with no metadata token",
+        ))?;
+        out.push(Instruction::new(Opcode::Castclass, Operand::Token(token)));
+        return Ok(());
+    }
     Err(EmitError::Unsupported("this cast is not lowered yet"))
 }
 
@@ -732,6 +784,44 @@ pub(crate) fn is_value_type(ty: &TypeSymbol, tokens: &Tokens) -> bool {
             SpecialType::Object | SpecialType::String | SpecialType::Void
         ),
         _ => tokens.is_struct(ty) || tokens.is_enum(ty),
+    }
+}
+
+/// Whether two type symbols denote the same type, treating a predefined `Special`
+/// type and its `System.<Name>` spelling as equal. The binder names a method's
+/// declaring type by its model identity (`System.Int32`) while a value's static type
+/// is a `Special` (`Int32`); a value-type call must see those as one type to pick a
+/// direct `call` on the value's address over a needless box.
+fn same_type(a: &TypeSymbol, b: &TypeSymbol) -> bool {
+    if a == b {
+        return true;
+    }
+    match (canonical_name(a), canonical_name(b)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// A type's `(namespace, name)`, mapping a `Special` to its `System.<Name>` identity
+/// and a simple `Named` to its parts. `None` for arrays, byrefs, and the error type.
+fn canonical_name(ty: &TypeSymbol) -> Option<(String, String)> {
+    match ty {
+        TypeSymbol::Special(special) => {
+            let (namespace, name) = special.full_name();
+            Some((namespace.into(), name.into()))
+        }
+        TypeSymbol::Named(parts) => {
+            let (name, namespace_parts) = parts.split_last()?;
+            let mut namespace = String::new();
+            for part in namespace_parts {
+                if !namespace.is_empty() {
+                    namespace.push('.');
+                }
+                namespace.push_str(part);
+            }
+            Some((namespace, String::from(&**name)))
+        }
+        _ => None,
     }
 }
 
@@ -1083,6 +1173,40 @@ fn emit_typeof(
         .ok_or(EmitError::Unsupported("Type::GetTypeFromHandle was not minted"))?;
     out.push(Instruction::new(Opcode::Call, Operand::Token(method)));
     Ok(())
+}
+
+/// Lowers `sizeof(T)`: a struct/enum emits the `sizeof` opcode over its token (the runtime
+/// computes the size from the shared value-type layout); a primitive is its constant byte
+/// size (csc likewise folds `sizeof(primitive)`).
+fn emit_sizeof(
+    target: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if let TypeSymbol::Special(special) = target {
+        let size = primitive_byte_size(*special)
+            .ok_or(EmitError::Unsupported("sizeof of this primitive type"))?;
+        out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(size)));
+        return Ok(());
+    }
+    let token = tokens
+        .type_token(target)
+        .ok_or(EmitError::Unsupported("sizeof of a type with no token"))?;
+    out.push(Instruction::new(Opcode::Sizeof, Operand::Token(token)));
+    Ok(())
+}
+
+/// The constant byte size of a fixed-width primitive, or `None` for one whose size is not a
+/// compile-time constant here (`IntPtr`/`UIntPtr`, `object`/`string`/`void`, `decimal`).
+fn primitive_byte_size(special: SpecialType) -> Option<i32> {
+    use SpecialType as S;
+    Some(match special {
+        S::Boolean | S::SByte | S::Byte => 1,
+        S::Int16 | S::UInt16 | S::Char => 2,
+        S::Int32 | S::UInt32 | S::Single => 4,
+        S::Int64 | S::UInt64 | S::Double => 8,
+        _ => return None,
+    })
 }
 
 /// `System.Type` -- the result of `typeof` and the receiver of `GetTypeFromHandle`.

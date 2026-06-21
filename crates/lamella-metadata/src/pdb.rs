@@ -1,11 +1,13 @@
 //! Reading a standalone Portable PDB: sequence points and local-variable names.
 
+use crate::bytes::Reader;
 use crate::heaps::{read_compressed_i32, read_compressed_u32};
 use crate::image::{MetadataError, MetadataImage};
 use crate::rows::Tables;
 use crate::tables::{TablesHeader, table};
 use alloc::string::String;
 use alloc::vec::Vec;
+use lamella_token::Token;
 
 /// A sequence point: a CIL byte offset mapped to a 1-based source line/column
 /// range. A hidden point marks compiler-generated IL and carries no position.
@@ -38,6 +40,8 @@ pub struct LocalVariable<'a> {
 pub struct PortablePdb<'a> {
     image: MetadataImage<'a>,
     tables: Tables<'a>,
+    entry_point: u32,
+    pdb_id: Option<&'a [u8]>,
 }
 
 impl<'a> PortablePdb<'a> {
@@ -47,9 +51,40 @@ impl<'a> PortablePdb<'a> {
     /// Returns [`MetadataError`] if the metadata root or `#~` stream is malformed.
     pub fn read(bytes: &'a [u8]) -> Result<PortablePdb<'a>, MetadataError> {
         let image = MetadataImage::parse_metadata_root(bytes)?;
-        let header = TablesHeader::parse(image.tables())?;
+        let mut header = TablesHeader::parse(image.tables())?;
+        let pdb_stream = PdbStream::parse(image.pdb());
+        if let Some(stream) = &pdb_stream {
+            header.apply_external_rows(stream.referenced_tables, &stream.type_system_rows);
+        }
         let tables = Tables::new(header)?;
-        Ok(PortablePdb { image, tables })
+        let (entry_point, pdb_id) = match pdb_stream {
+            Some(stream) => (stream.entry_point, Some(stream.id)),
+            None => (0, None),
+        };
+        Ok(PortablePdb {
+            image,
+            tables,
+            entry_point,
+            pdb_id,
+        })
+    }
+
+    /// The entry-point method (a `MethodDef`) recorded in the `#Pdb` stream, or `None`
+    /// for a nil token or a PDB with no `#Pdb` stream. A debugger uses it to find a
+    /// program's `Main` for "stop at entry".
+    #[must_use]
+    pub fn entry_point(&self) -> Option<Token> {
+        (self.entry_point != 0).then(|| {
+            Token::new((self.entry_point >> 24) as u8, self.entry_point & 0x00FF_FFFF)
+        })
+    }
+
+    /// The 20-byte PDB id (a GUID plus a stamp) that matches this PDB to its PE's debug
+    /// directory entry, or `None` for a PDB with no `#Pdb` stream. A debugger checks it
+    /// so a stale PDB is not applied to a freshly built image.
+    #[must_use]
+    pub fn pdb_id(&self) -> Option<&'a [u8]> {
+        self.pdb_id
     }
 
     /// The number of source documents.
@@ -199,6 +234,44 @@ impl<'a> PortablePdb<'a> {
             }
         }
         name
+    }
+}
+
+/// The parsed `#Pdb` stream of a standalone Portable PDB (Portable PDB spec, "Standalone
+/// Debugging Metadata"): the PDB id, the entry-point token, and the row counts of the
+/// type-system tables that the debug tables index into the associated module.
+struct PdbStream<'a> {
+    /// The 20-byte PDB id (a GUID plus a stamp).
+    id: &'a [u8],
+    /// The entry-point `MethodDef` token, or 0 for none.
+    entry_point: u32,
+    /// A bit vector of the referenced type-system tables.
+    referenced_tables: u64,
+    /// Each referenced table's row count, in ascending table order.
+    type_system_rows: Vec<u32>,
+}
+
+impl<'a> PdbStream<'a> {
+    /// Parses the `#Pdb` stream, or `None` when it is absent or truncated (then the
+    /// reader falls back to sizing external indices narrow).
+    fn parse(stream: &'a [u8]) -> Option<PdbStream<'a>> {
+        if stream.is_empty() {
+            return None;
+        }
+        let mut reader = Reader::new(stream);
+        let id = reader.read_bytes(20).ok()?;
+        let entry_point = reader.read_u32().ok()?;
+        let referenced_tables = reader.read_u64().ok()?;
+        let mut type_system_rows = Vec::new();
+        for _ in 0..referenced_tables.count_ones() {
+            type_system_rows.push(reader.read_u32().ok()?);
+        }
+        Some(PdbStream {
+            id,
+            entry_point,
+            referenced_tables,
+            type_system_rows,
+        })
     }
 }
 

@@ -10,10 +10,11 @@ use lamella_metadata::tables::table;
 use lamella_metadata::{
     Assembly, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef,
 };
+use lamella_token::Token;
 
 use crate::cil::{
-    ArrayElement, CallInfo, CallResolver, CallTarget, CilError, Intrinsic, ReferenceLayout,
-    lower_method_typed,
+    Array2DOp, ArrayElement, CallInfo, CallResolver, CallTarget, CilError, Intrinsic,
+    ReferenceLayout, lower_method_typed,
 };
 
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
@@ -74,6 +75,52 @@ impl<'a> MetadataResolver<'a> {
         let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
         self.assembly.find_type(declaring.namespace, declaring.name)
     }
+
+    /// The type token a metadata token names: a type token as-is (`TypeRef`/`TypeDef`/
+    /// `TypeSpec`), or the declaring type of a constructor token -- a `MemberRef`'s parent (an
+    /// external type like `System.Exception`), or a `MethodDef`'s owning type resolved by name
+    /// (a this-module exception). `None` for any other token.
+    fn type_token_of(&self, token: Token) -> Option<Token> {
+        match token.table() {
+            table::TYPE_REF | table::TYPE_DEF | table::TYPE_SPEC => Some(token),
+            table::MEMBER_REF => Some(self.assembly.member_ref(token.row())?.parent()),
+            table::METHOD_DEF => {
+                let name = self.assembly.resolve_method(token)?.declaring_type?;
+                Some(self.assembly.find_type(name.namespace, name.name)?.token())
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `type_token` names an exception type, for the no-GC tag model's `newobj`/`catch`
+    /// recognition: a `System.*Exception` (the BCL exceptions live in another assembly the tag
+    /// model never needs to walk into, so they are matched by name), or a this-module type whose
+    /// `extends` chain reaches one. The walk is bounded so a malformed cyclic base cannot loop.
+    fn is_exception_type(&self, type_token: Token) -> bool {
+        let mut current = type_token;
+        for _ in 0..64 {
+            let Some(name) = self.assembly.type_token_name(current) else {
+                return false;
+            };
+            if name.namespace == "System"
+                && (name.name == "Exception" || name.name.ends_with("Exception"))
+            {
+                return true;
+            }
+            if current.table() != table::TYPE_DEF {
+                return false;
+            }
+            let Some(type_def) = self.assembly.type_def(current.row()) else {
+                return false;
+            };
+            let base = type_def.extends();
+            if base.row() == 0 {
+                return false;
+            }
+            current = base;
+        }
+        false
+    }
 }
 
 impl CallResolver for MetadataResolver<'_> {
@@ -105,8 +152,17 @@ impl CallResolver for MetadataResolver<'_> {
             MethodKind::Reference if is_string_op_equality(&method) => {
                 CallTarget::Intrinsic(Intrinsic::StringEquals)
             }
+            MethodKind::Reference if is_string_concat(&method) => {
+                CallTarget::Intrinsic(Intrinsic::StringConcat)
+            }
+            MethodKind::Reference if is_int32_tostring(&method) => {
+                CallTarget::Intrinsic(Intrinsic::IntToString)
+            }
             MethodKind::Reference if is_object_ctor(&method) => {
                 CallTarget::Intrinsic(Intrinsic::ObjectCtor)
+            }
+            MethodKind::Reference if is_array_getlength(&method) => {
+                CallTarget::Intrinsic(Intrinsic::ArrayGetLength)
             }
             MethodKind::Reference => return None,
         };
@@ -208,11 +264,66 @@ impl CallResolver for MetadataResolver<'_> {
         })
     }
 
+    fn array_2d_op(&self, operand: &Operand) -> Option<Array2DOp> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        if token.table() != table::MEMBER_REF {
+            return None;
+        }
+        let member = self.assembly.member_ref(token.row())?;
+        let parent = member.parent();
+        let SigType::Array { element, rank } = self.assembly.type_spec_signature(parent)? else {
+            return None;
+        };
+        if rank != 2 {
+            return None;
+        }
+        let (element_size, signed) = array_element_size(&element);
+        match member.name()? {
+            ".ctor" => Some(Array2DOp::New {
+                handle: TypeHandle(parent.0),
+                element_size,
+            }),
+            "Get" => Some(Array2DOp::Get {
+                element_size,
+                signed,
+                element_type: mir_type(&element, self.assembly, &TargetLayout::ilp32())
+                    .unwrap_or(MirType::I32),
+            }),
+            "Set" => Some(Array2DOp::Set { element_size }),
+            _ => None,
+        }
+    }
+
     fn static_field_offset(&self, operand: &Operand) -> Option<u32> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        (token.table() == table::FIELD).then(|| (token.row() - 1) * 4)
+        (token.table() == table::FIELD).then(|| token.row() * 4)
+    }
+
+    fn exception_tag(&self, operand: &Operand) -> Option<u32> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let type_token = self.type_token_of(*token)?;
+        if !self.is_exception_type(type_token) {
+            return None;
+        }
+        let tag = self.assembly.exception_tag(type_token);
+        (tag != 0).then_some(tag)
+    }
+
+    fn is_catch_all_type(&self, operand: &Operand) -> bool {
+        let Operand::Token(token) = operand else {
+            return false;
+        };
+        self.type_token_of(*token)
+            .and_then(|type_token| self.assembly.type_token_name(type_token))
+            .is_some_and(|name| {
+                name.namespace == "System" && matches!(name.name, "Exception" | "Object")
+            })
     }
 
     fn boxed_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
@@ -247,6 +358,21 @@ impl CallResolver for MetadataResolver<'_> {
             size: layout.size,
             reference_offsets: layout.reference_offsets,
         })
+    }
+}
+
+/// The byte width and signedness of a primitive 2-D array element (a sub-word `Get` sign- or
+/// zero-extends per the flag); references and unhandled element types fall back to a 4-byte slot.
+fn array_element_size(element: &SigType) -> (u32, bool) {
+    match element {
+        SigType::I1 => (1, true),
+        SigType::Boolean | SigType::U1 => (1, false),
+        SigType::I2 => (2, true),
+        SigType::Char | SigType::U2 => (2, false),
+        SigType::I4 => (4, true),
+        SigType::U4 | SigType::R4 => (4, false),
+        SigType::I8 | SigType::U8 | SigType::R8 => (8, false),
+        _ => (4, false),
     }
 }
 
@@ -350,6 +476,15 @@ fn is_object_ctor(method: &ResolvedMethod) -> bool {
             .is_some_and(|t| t.namespace == "System" && t.name == "Object")
 }
 
+/// Whether a resolved method is `System.Array::GetLength(int)` -- the per-dimension length accessor
+/// (used to loop over an array, including `int[,]`); the lowering reads it from the array header.
+fn is_array_getlength(method: &ResolvedMethod) -> bool {
+    method.name == Some("GetLength")
+        && method
+            .declaring_type
+            .is_some_and(|t| t.namespace == "System" && t.name == "Array")
+}
+
 /// Whether a resolved method is `System.String::op_Equality(string, string)` (the `==` operator).
 fn is_string_op_equality(method: &ResolvedMethod) -> bool {
     method.name == Some("op_Equality")
@@ -362,6 +497,34 @@ fn is_string_op_equality(method: &ResolvedMethod) -> bool {
                 [SigType::String, SigType::String]
             )
         })
+}
+
+/// Whether a resolved method is a fixed-arity `System.String::Concat(string, ...)` -- the 2-, 3-, or
+/// 4-string overloads `a + b`, `a + b + c`, `a + b + c + d` emit. The front end chains it pairwise.
+/// (The `Concat(string[])` params-array and `Concat(object...)` overloads are not yet recognized.)
+fn is_string_concat(method: &ResolvedMethod) -> bool {
+    method.name == Some("Concat")
+        && method
+            .declaring_type
+            .is_some_and(|t| t.namespace == "System" && t.name == "String")
+        && method.signature.as_ref().is_some_and(|sig| {
+            (2..=4).contains(&sig.parameters.len())
+                && sig.parameters.iter().all(|p| matches!(p, SigType::String))
+        })
+}
+
+/// Whether a resolved method is `System.Int32::ToString()` -- the no-argument decimal formatter
+/// (`i.ToString()`). The receiver is a managed pointer to the int. (The format-string and
+/// `IFormatProvider` overloads are not recognized.)
+fn is_int32_tostring(method: &ResolvedMethod) -> bool {
+    method.name == Some("ToString")
+        && method
+            .declaring_type
+            .is_some_and(|t| t.namespace == "System" && t.name == "Int32")
+        && method
+            .signature
+            .as_ref()
+            .is_some_and(|sig| sig.parameters.is_empty())
 }
 
 /// Decodes a `#US` entry (UTF-16 code units plus a trailing flag byte) to a [`String`].

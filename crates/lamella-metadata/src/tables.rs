@@ -111,6 +111,11 @@ impl From<ReadError> for TableError {
 #[derive(Debug, Clone, Copy)]
 pub struct TablesHeader<'a> {
     rows: [u32; 64],
+    /// Row counts of type-system tables that live in another module, seeded from a
+    /// standalone Portable PDB's `#Pdb` stream. These tables are NOT present in this
+    /// stream's row data, so they affect column WIDTHS (an `Idx`/coded index into them
+    /// is 2 vs 4 bytes) but never the row layout -- see [`TablesHeader::sizing_row_count`].
+    external_rows: [u32; 64],
     string_index_size: u8,
     guid_index_size: u8,
     blob_index_size: u8,
@@ -138,6 +143,7 @@ impl<'a> TablesHeader<'a> {
             .ok_or(TableError::Truncated)?;
         Ok(TablesHeader {
             rows,
+            external_rows: [0u32; 64],
             string_index_size: if heap_sizes & 0x01 != 0 { 4 } else { 2 },
             guid_index_size: if heap_sizes & 0x02 != 0 { 4 } else { 2 },
             blob_index_size: if heap_sizes & 0x04 != 0 { 4 } else { 2 },
@@ -145,10 +151,37 @@ impl<'a> TablesHeader<'a> {
         })
     }
 
-    /// The number of rows in `table` (a `table::*` number), 0 if absent.
+    /// Seeds the row counts of type-system tables that live in another module, from a
+    /// Portable PDB's `#Pdb` stream: `referenced` is the bit vector of referenced tables
+    /// and `counts` their row counts in ascending table order. Used for column sizing
+    /// only -- it does not make those tables present in this stream's row data.
+    pub fn apply_external_rows(&mut self, referenced: u64, counts: &[u32]) {
+        let mut counts = counts.iter();
+        for table in 0..64 {
+            if referenced & (1u64 << table) != 0 {
+                if let Some(&count) = counts.next() {
+                    self.external_rows[table] = count;
+                }
+            }
+        }
+    }
+
+    /// The number of rows of `table` physically present in this stream's row data
+    /// (a `table::*` number), 0 if absent. Drives row layout and row access.
     #[must_use]
     pub fn row_count(&self, table: u8) -> u32 {
         self.rows.get(table as usize).copied().unwrap_or(0)
+    }
+
+    /// The row count used to size a column that indexes `table`: the larger of the
+    /// rows present here and any external count seeded from a `#Pdb` stream. A
+    /// standalone PDB indexes type-system tables that live in another module, so an
+    /// `Idx`/coded width must account for their size even though they are absent here.
+    #[must_use]
+    pub fn sizing_row_count(&self, table: u8) -> u32 {
+        let present = self.rows.get(table as usize).copied().unwrap_or(0);
+        let external = self.external_rows.get(table as usize).copied().unwrap_or(0);
+        present.max(external)
     }
 
     /// The `#Strings` index width in bytes (2 or 4).

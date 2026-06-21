@@ -274,6 +274,16 @@ impl Heap {
         }
     }
 
+    /// The value type's token a box is tagged with (the asm-folded token from the `box`
+    /// site), if `reference` is a box -- the basis for a precise type test on a boxed value.
+    #[must_use]
+    pub fn boxed_type_token(&self, reference: ObjectRef) -> Option<u32> {
+        match self.get(reference)? {
+            Object::Boxed { type_token, .. } => Some(*type_token),
+            _ => None,
+        }
+    }
+
     /// Stores `value` into the box at `reference` (for `unbox` + `stobj`/`stind`); returns
     /// `false` if `reference` is not a box.
     pub fn set_boxed_value(&mut self, reference: ObjectRef, value: Value) -> bool {
@@ -351,20 +361,30 @@ impl Heap {
     }
 
     /// The element at `index` of the array at `reference`, if it is an array with
-    /// that index in bounds.
+    /// that index in bounds. For a multi-dimensional array `index` is the row-major flat
+    /// index (the form a `Location::Element` carries for a rectangular-array element pointer).
     #[must_use]
     pub fn array_get(&self, reference: ObjectRef, index: usize) -> Option<Value> {
         match self.get(reference)? {
             Object::Array { elements } => elements.get(index).cloned(),
+            Object::MdArray { elements, .. } => elements.get(index).cloned(),
             _ => None,
         }
     }
 
     /// Stores `value` at `index` of the array at `reference`. Returns `false` if
-    /// `reference` is not an array or `index` is out of range.
+    /// `reference` is not an array or `index` is out of range. For a multi-dimensional array
+    /// `index` is the row-major flat index (matching `array_get`).
     pub fn array_set(&mut self, reference: ObjectRef, index: usize, value: Value) -> bool {
         match self.objects.get_mut(reference.0 as usize) {
             Some(Object::Array { elements }) => match elements.get_mut(index) {
+                Some(slot) => {
+                    *slot = value;
+                    true
+                }
+                None => false,
+            },
+            Some(Object::MdArray { elements, .. }) => match elements.get_mut(index) {
                 Some(slot) => {
                     *slot = value;
                     true
@@ -461,6 +481,19 @@ impl Heap {
             }
             None => false,
         }
+    }
+
+    /// The row-major flat index of `indices` into the multi-dimensional array at `reference`
+    /// (the index a `Location::Element` carries to address a rectangular-array element in
+    /// place, for `Address`/`ref a[i,j]`), or `None` if `reference` is not such an array or
+    /// an index is out of range. The same indices-to-flat computation `md_array_get` uses, so
+    /// a read through the element pointer and a `Get` cannot disagree.
+    #[must_use]
+    pub fn md_array_flat_index(&self, reference: ObjectRef, indices: &[i32]) -> Option<usize> {
+        let Object::MdArray { dims, .. } = self.get(reference)? else {
+            return None;
+        };
+        md_flat_index(dims, indices)
     }
 }
 
@@ -621,7 +654,10 @@ fn location_refs<F: FnMut(ObjectRef)>(location: &Location, visit: &mut F) {
         Location::Field { object, .. } | Location::Boxed { object } => visit(*object),
         Location::Element { array, .. } => visit(*array),
         Location::Nested { base, .. } => location_refs(base, visit),
-        Location::Local { .. } | Location::Arg { .. } | Location::Static { .. } => {}
+        Location::Local { .. }
+        | Location::Arg { .. }
+        | Location::Static { .. }
+        | Location::Stack { .. } => {}
     }
 }
 
@@ -632,6 +668,8 @@ fn collect_refs<F: FnMut(ObjectRef)>(value: &Value, visit: &mut F) {
     match value {
         Value::Object(reference) => visit(*reference),
         Value::ByRef(location) => location_refs(location, visit),
+        #[cfg(feature = "typed-references")]
+        Value::TypedRef { location, .. } => location_refs(location, visit),
         Value::Struct(fields) => fields.iter().for_each(|field| collect_refs(field, visit)),
         _ => {}
     }
@@ -660,7 +698,10 @@ fn remap_location(location: &mut Location, remap: &[Option<u32>]) {
         Location::Field { object, .. } | Location::Boxed { object } => remap_ref(object, remap),
         Location::Element { array, .. } => remap_ref(array, remap),
         Location::Nested { base, .. } => remap_location(base, remap),
-        Location::Local { .. } | Location::Arg { .. } | Location::Static { .. } => {}
+        Location::Local { .. }
+        | Location::Arg { .. }
+        | Location::Static { .. }
+        | Location::Stack { .. } => {}
     }
 }
 
@@ -670,6 +711,8 @@ fn remap_value(value: &mut Value, remap: &[Option<u32>]) {
     match value {
         Value::Object(reference) => remap_ref(reference, remap),
         Value::ByRef(location) => remap_location(location, remap),
+        #[cfg(feature = "typed-references")]
+        Value::TypedRef { location, .. } => remap_location(location, remap),
         Value::Struct(fields) => fields.iter_mut().for_each(|f| remap_value(f, remap)),
         _ => {}
     }

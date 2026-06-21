@@ -29,6 +29,15 @@ pub enum BinOp {
     ShrSigned,
     /// Logical (zero-filling) shift right.
     ShrUnsigned,
+    /// Signed truncating division (the CLI's `div`). Division by zero / overflow are the
+    /// hardware's (a target without a divide instruction lowers it to a soft routine).
+    DivSigned,
+    /// Unsigned division (the CLI's `div.un`).
+    DivUnsigned,
+    /// Signed remainder (the CLI's `rem`), with the sign of the dividend.
+    RemSigned,
+    /// Unsigned remainder (the CLI's `rem.un`).
+    RemUnsigned,
 }
 
 /// An integer comparison operator. The result is an `int32` equal to 1 when the
@@ -70,6 +79,28 @@ pub enum ConvKind {
     SignExtend16,
     /// Zero-extend the low 16 bits (`conv.u2`).
     ZeroExtend16,
+    /// Truncate a 32-bit float toward zero to a signed `int32` (`conv.i4` from an `R4`). A
+    /// no-FPU target lowers this with a soft routine rather than a hardware convert.
+    Float32ToInt,
+    /// Convert a signed `int32` to a 32-bit float (`conv.r4` from an integer), exact for
+    /// magnitudes below 2^24. The soft form on a no-FPU target.
+    IntToFloat32,
+}
+
+impl ConvKind {
+    /// The [`MirType`] this conversion produces: `F32` for the int-to-float case, `int32` for the
+    /// narrowing/extending and float-to-int cases.
+    #[must_use]
+    pub fn result_type(self) -> MirType {
+        match self {
+            ConvKind::IntToFloat32 => MirType::F32,
+            ConvKind::SignExtend8
+            | ConvKind::ZeroExtend8
+            | ConvKind::SignExtend16
+            | ConvKind::ZeroExtend16
+            | ConvKind::Float32ToInt => MirType::I32,
+        }
+    }
 }
 
 /// One MIR instruction: an operation defining a single typed result value.
@@ -213,6 +244,24 @@ pub enum Inst {
         /// The right string.
         rhs: ValueId,
     },
+    /// Concatenates two strings -- the CLI's `System.String::Concat(string, string)` (what `a + b`
+    /// emits). Allocates a new `[u32 unit_count][UTF-16LE]` blob of `lhs.length + rhs.length` units
+    /// and copies both in; the result is an `ObjectRef` to it. A backend may lower it inline or
+    /// rewrite it to a generated helper.
+    StringConcat {
+        /// The left string.
+        lhs: ValueId,
+        /// The right string.
+        rhs: ValueId,
+    },
+    /// Formats a signed 32-bit integer as its decimal string -- the CLI's `System.Int32::ToString()`.
+    /// Allocates a `[u32 unit_count][UTF-16LE]` blob of the decimal digits (a leading `-` for a
+    /// negative value); the result is an `ObjectRef` to it. A backend may lower it inline or rewrite
+    /// it to a generated helper.
+    IntToString {
+        /// The integer value to format.
+        value: ValueId,
+    },
     /// Allocates a garbage-collected object of a reference type on the managed heap -- the
     /// reference-type `newobj` (and, later, `box`). The result is an `ObjectRef` to the
     /// zero-initialized payload. The target lowers it to a `lamella_gc_alloc(payload_size,
@@ -260,6 +309,51 @@ pub enum Inst {
         array: ValueId,
         /// The element index.
         index: ValueId,
+        /// The value to store (its width comes from its type).
+        value: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
+    /// Allocates a 2-D rectangular array of `dim0 * dim1` elements -- the CLI's `newobj int[,]::.ctor`
+    /// (rectangular arrays go through `System.Array` calls, not the `szarray` opcodes). The payload is
+    /// `[u32 dim0][u32 dim1][elements...]` in row-major order; the result is an `ObjectRef` to it.
+    /// Lowers to `lamella_gc_alloc(8 + dim0*dim1*element_size, &TypeDesc)` (a safepoint), storing the
+    /// two dimensions at offsets 0 and 4.
+    AllocArray2D {
+        /// The array type's identity, for the emitted TypeDesc.
+        handle: TypeHandle,
+        /// The number of rows (the first dimension's length).
+        dim0: ValueId,
+        /// The number of columns (the second dimension's length).
+        dim1: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
+    /// Loads element `(index0, index1)` of a 2-D `array` -- the CLI's `int[,]::Get`. The element sits
+    /// at `array + 8 + (index0*dim1 + index1)*element_size` (row-major; `dim1` is read from
+    /// `[array+4]`), with a per-dimension bounds check (`index0 < dim0`, `index1 < dim1`). A sub-word
+    /// element is sign- or zero-extended to the 32-bit result per `signed`.
+    Array2DLoad {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The first (row) index.
+        index0: ValueId,
+        /// The second (column) index.
+        index1: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+        /// Whether a sub-word element is sign-extended (signed) or zero-extended (unsigned).
+        signed: bool,
+    },
+    /// Stores `value` into element `(index0, index1)` of a 2-D `array` -- the CLI's `int[,]::Set`. A
+    /// side effect; the instruction's result is a placeholder callers ignore.
+    Array2DStore {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The first (row) index.
+        index0: ValueId,
+        /// The second (column) index.
+        index1: ValueId,
         /// The value to store (its width comes from its type).
         value: ValueId,
         /// The size in bytes of one element.

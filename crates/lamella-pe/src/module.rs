@@ -465,6 +465,22 @@ impl ImageBuilder {
         );
     }
 
+    /// Records that `class` (a `TypeDef`) provides `body` (one of its own `MethodDef`s)
+    /// as the implementation of the interface method `declaration` (a `MethodDef` for a
+    /// this-module interface, else a `MemberRef`), via a `MethodImpl` row (II.22.27).
+    /// This is how an explicit interface member implementation (`int I.M() {...}`) is
+    /// wired: `body` is private, so the override is reached only through `declaration`.
+    pub fn add_method_impl(&mut self, class: Token, body: Token, declaration: Token) {
+        self.tables.add_row(
+            table::METHOD_IMPL,
+            alloc::vec![
+                Column::Index(table::TYPE_DEF, class.row()),
+                Column::Coded(CodedIndex::MethodDefOrRef, body),
+                Column::Coded(CodedIndex::MethodDefOrRef, declaration),
+            ],
+        );
+    }
+
     /// Records that `nested` is a type nested in `enclosing` (II.22.32), via a
     /// `NestedClass` row. The nested type's own `TypeDef` carries an empty namespace.
     pub fn add_nested_class(&mut self, nested: Token, enclosing: Token) {

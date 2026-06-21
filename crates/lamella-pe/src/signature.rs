@@ -58,6 +58,11 @@ pub enum TypeSig {
     SzArray(Box<TypeSig>),
     /// A managed reference (`&`) to the referent type -- a `ref`/`out` parameter.
     ByRef(Box<TypeSig>),
+    /// An unmanaged pointer (`*`) to the pointee type -- an unsafe `T*` (II.23.2.12).
+    Pointer(Box<TypeSig>),
+    /// A `pinned` local (II.23.2.9): the GC must not move its referent. Only valid as a
+    /// local-variable type (a `fixed` array holder).
+    Pinned(Box<TypeSig>),
     /// A multi-dimensional (rectangular) array of the element type with the given
     /// rank, zero-based with no fixed sizes -- the form a `T[,]` TypeSpec takes.
     Array {
@@ -100,6 +105,14 @@ fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
         }
         TypeSig::ByRef(referent) => {
             out.push(element::BYREF);
+            encode_type(referent, out);
+        }
+        TypeSig::Pointer(pointee) => {
+            out.push(element::PTR);
+            encode_type(pointee, out);
+        }
+        TypeSig::Pinned(referent) => {
+            out.push(element::PINNED);
             encode_type(referent, out);
         }
         TypeSig::Array { element: elem, rank } => {

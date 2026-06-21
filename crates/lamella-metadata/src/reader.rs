@@ -2,6 +2,7 @@
 
 use crate::constant::{ConstantValue, decode_constant};
 use crate::flags;
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 use crate::heaps::StringsHeap;
@@ -10,10 +11,10 @@ use crate::layout::{LayoutError, TargetLayout, TypeLayout, layout_value_type};
 use crate::pe::PeImage;
 use crate::rows::Tables;
 use crate::signature::{
-    MethodSig, SigType, calling, parse_field, parse_local_var_sig, parse_method,
+    MethodSig, SigType, calling, parse_field, parse_local_var_sig, parse_method, parse_type,
 };
 use crate::tables::{TableError, TablesHeader, table};
-use lamella_cil::{MethodBodyImage, read_method_body};
+use lamella_cil::{EhKind, MethodBodyImage, instruction_offsets, read_method_body};
 use lamella_token::Token;
 
 impl From<TableError> for MetadataError {
@@ -29,6 +30,49 @@ pub struct TypeName<'a> {
     pub namespace: &'a str,
     /// The unqualified type name.
     pub name: &'a str,
+}
+
+/// One exception-handling clause of a method ([`Method::exception_clauses`]), with its
+/// protected and handler regions as IL BYTE offsets (II.25.4.6) -- the form an AOT/CFG
+/// lowering maps onto its basic blocks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExceptionClause {
+    /// What the handler is, and any caught type or filter it carries.
+    pub kind: ExceptionHandlerKind,
+    /// IL byte offset where the protected (try) region begins.
+    pub try_offset: u32,
+    /// Byte length of the protected region.
+    pub try_length: u32,
+    /// IL byte offset where the handler region begins.
+    pub handler_offset: u32,
+    /// Byte length of the handler region.
+    pub handler_length: u32,
+}
+
+/// What an [`ExceptionClause`] handler does (II.25.4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExceptionHandlerKind {
+    /// A typed `catch`, carrying the caught type's metadata token.
+    Catch(Token),
+    /// A filtered handler; the filter expression begins at this IL byte offset.
+    Filter {
+        /// The IL byte offset where the filter expression starts.
+        filter_offset: u32,
+    },
+    /// A `finally` handler, run on both normal exit and exception.
+    Finally,
+    /// A `fault` handler, run only when an exception leaves the try region.
+    Fault,
+}
+
+/// FNV-1a 32-bit, folding `bytes` into the running `hash` (seed with the FNV offset basis).
+fn fnv1a32(hash: u32, bytes: &[u8]) -> u32 {
+    let mut hash = hash;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 /// A method a call token resolves to ([`Assembly::resolve_method`]): its name,
@@ -225,6 +269,21 @@ impl<'a> Assembly<'a> {
             .filter_map(move |index| self.member_ref(index))
     }
 
+    /// The decoded signature of the `TypeSpec` named by `token` (II.23.2.14): the type a
+    /// `TypeSpec` row stands for, e.g. `SigType::Array { element, rank }` for `int[,]`.
+    /// `None` when `token` is not a `TypeSpec` or its blob does not decode. This is the
+    /// seam an AOT lowering uses to recover an array's element type and rank from the
+    /// `TypeSpec` that a `newobj`/`Get`/`Set` `MemberRef` points at.
+    #[must_use]
+    pub fn type_spec_signature(&self, token: Token) -> Option<SigType> {
+        if token.table() != table::TYPE_SPEC {
+            return None;
+        }
+        let row = self.tables.row(table::TYPE_SPEC, token.row())?;
+        let blob = self.image.blob().get(row.raw(0)).ok()?;
+        parse_type(blob).ok()
+    }
+
     /// The `MethodDef` at 1-based `index`, or `None` if out of range.
     #[must_use]
     pub fn method(&self, index: u32) -> Option<Method<'a>> {
@@ -235,6 +294,61 @@ impl<'a> Assembly<'a> {
             assembly: *self,
             index,
         })
+    }
+
+    /// The underlying method a `MethodSpec` token (II.22.29) instantiates: its
+    /// `MethodDefOrRef` (a `MethodDef` or `MemberRef`), so a generic-method call (e.g.
+    /// `Array.Empty<int>()`) can be resolved through the generic definition. `None` if the
+    /// token is not a `MethodSpec` or is out of range.
+    #[must_use]
+    pub fn method_spec_method(&self, token: Token) -> Option<Token> {
+        if token.table() != table::METHOD_SPEC {
+            return None;
+        }
+        self.tables
+            .row(table::METHOD_SPEC, token.row())
+            .map(|row| row.token(0))
+    }
+
+    /// The raw initializer bytes a `Field` token's RVA points at (II.22.18 `FieldRVA`) --
+    /// the data backing a `RuntimeHelpers.InitializeArray` (a constant array literal). The
+    /// slice is sized exactly to the field's value-type byte size (its `ClassLayout`
+    /// `ClassSize`, the compiler-synthesized `__StaticArrayInitTypeSize=N`), so the caller
+    /// reads a precise blob. `None` if the field has no `FieldRVA` row, no resolvable size,
+    /// or the RVA is unmapped (e.g. a bare metadata image with no backing PE).
+    #[must_use]
+    pub fn field_rva_data(&self, field_token: Token) -> Option<&'a [u8]> {
+        if field_token.table() != table::FIELD {
+            return None;
+        }
+        let field_index = field_token.row();
+        let rva = (1..=self.tables.row_count(table::FIELD_RVA))
+            .filter_map(|index| self.tables.row(table::FIELD_RVA, index))
+            .find(|row| row.raw(1) == field_index)
+            .map(|row| row.raw(0))
+            .filter(|&rva| rva != 0)?;
+        let size = self.field_rva_blob_size(field_index)? as usize;
+        let file = self.file?;
+        PeImage::parse(file).ok()?.slice_at_rva(rva, size).ok()
+    }
+
+    /// The byte size of an RVA-backed field's initializer blob: the `ClassSize` of the
+    /// field's value type (the synthesized `__StaticArrayInitTypeSize=N`), from `ClassLayout`.
+    fn field_rva_blob_size(&self, field_index: u32) -> Option<u32> {
+        let blob = self
+            .tables
+            .row(table::FIELD, field_index)
+            .and_then(|row| self.image.blob().get(row.raw(2)).ok())?;
+        let SigType::ValueType(type_token) = parse_field(blob).ok()? else {
+            return None;
+        };
+        if type_token.table() != table::TYPE_DEF {
+            return None;
+        }
+        (1..=self.tables.row_count(table::CLASS_LAYOUT))
+            .filter_map(|index| self.tables.row(table::CLASS_LAYOUT, index))
+            .find(|row| row.raw(2) == type_token.row())
+            .map(|row| row.raw(1))
     }
 
     /// Resolves a `call`/`callvirt` method token to its target: the name, declaring
@@ -369,6 +483,32 @@ impl<'a> Assembly<'a> {
         }
     }
 
+    /// The exception TAG for a type, for the no-GC tag-dispatch exception model: one `u32`
+    /// identifying the exception type identically wherever it is named -- the throw site,
+    /// every catch, and the runtime -- so the compiler, interpreter, and AOT backend never
+    /// diverge. It is a deterministic FNV-1a hash of the type's full name with the high bit
+    /// set, so it needs no shared table and is always a nonzero "failure" value (0 = no
+    /// exception in flight). `0` if the token names no type.
+    ///
+    /// A per-name hash (not .NET's canonical HResults) is used because a tag-DISPATCH model
+    /// needs tags UNIQUE per type, and the canonical HResults collide (e.g.
+    /// ArgumentNullException and NullReferenceException are both 0x80004003). A future
+    /// `[HResult(N)]` attribute will pin a chosen value; a well-known-BCL-HResult table is a
+    /// later refinement layered on top.
+    #[must_use]
+    pub fn exception_tag(&self, type_token: Token) -> u32 {
+        let Some(name) = self.type_token_name(type_token) else {
+            return 0;
+        };
+        let mut hash = 0x811c_9dc5u32;
+        if !name.namespace.is_empty() {
+            hash = fnv1a32(hash, name.namespace.as_bytes());
+            hash = fnv1a32(hash, b".");
+        }
+        hash = fnv1a32(hash, name.name.as_bytes());
+        hash | 0x8000_0000
+    }
+
     /// The custom attributes applied to `parent`, from the `CustomAttribute`
     /// table (II.22.10): each yields the constructor token and the raw value blob.
     pub fn custom_attributes(
@@ -388,6 +528,35 @@ impl<'a> Assembly<'a> {
                 None
             }
         })
+    }
+
+    /// The `Param` row indices that carry `[System.ParamArrayAttribute]` -- a C# `params`
+    /// array. Computed in ONE pass over the CustomAttribute table (II.22.10), so a caller
+    /// can mark every `params` method at load without an O(rows)-per-parameter scan (which
+    /// is catastrophic across a large reference assembly). `resolve_method` returns `None`
+    /// for an unresolvable attribute ctor, so a foreign attribute is skipped.
+    #[must_use]
+    pub fn param_array_params(&self) -> BTreeSet<u32> {
+        let mut params = BTreeSet::new();
+        for index in 1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE) {
+            let Some(row) = self.tables.row(table::CUSTOM_ATTRIBUTE, index) else {
+                continue;
+            };
+            let parent = row.token(0);
+            if parent.table() != table::PARAM {
+                continue;
+            }
+            let is_param_array = self
+                .resolve_method(row.token(1))
+                .and_then(|target| target.declaring_type)
+                .is_some_and(|name| {
+                    name.namespace == "System" && name.name == "ParamArrayAttribute"
+                });
+            if is_param_array {
+                params.insert(parent.row());
+            }
+        }
+        params
     }
 
     /// The constant value attached to `parent` (a Field/Param/Property token),
@@ -552,6 +721,21 @@ impl<'a> TypeDef<'a> {
         (1..=self.assembly.tables.row_count(table::INTERFACE_IMPL)).filter_map(move |row_index| {
             let row = self.assembly.tables.row(table::INTERFACE_IMPL, row_index)?;
             (row.raw(0) == index).then(|| row.token(1))
+        })
+    }
+
+    /// This type's explicit method overrides (II.22.27 `MethodImpl`), each as a
+    /// `(body, declaration)` pair of `MethodDefOrRef` tokens: `body` is the method
+    /// in this type that implements `declaration` (the overridden virtual/interface
+    /// method). `MethodImpl` is a side table keyed by the implementing type's `Class`
+    /// column, so this scans it for rows whose `Class` is this type -- the wiring an
+    /// explicit interface member implementation (`int IA.Value()`) needs, since it is
+    /// reachable only through the interface slot, never by its own (mangled) name.
+    pub fn method_impls(&self) -> impl Iterator<Item = (Token, Token)> + '_ {
+        let index = self.index;
+        (1..=self.assembly.tables.row_count(table::METHOD_IMPL)).filter_map(move |row_index| {
+            let row = self.assembly.tables.row(table::METHOD_IMPL, row_index)?;
+            (row.raw(0) == index).then(|| (row.token(1), row.token(2)))
         })
     }
 
@@ -803,6 +987,52 @@ impl<'a> Method<'a> {
             .and_then(|row| self.assembly.image.blob().get(row.raw(0)).ok())
             .and_then(|blob| parse_local_var_sig(blob).ok())
             .unwrap_or_default()
+    }
+
+    /// The method's exception-handling clauses (II.25.4.6) with regions as IL BYTE offsets
+    /// -- what an AOT/CFG lowering maps to its basic blocks. (`lamella-cil` decodes the EH
+    /// table into instruction-index ranges; these are mapped back to byte offsets via the
+    /// instruction layout, the same round-trip the body writer uses.) Empty when the method
+    /// has no body or no handlers.
+    #[must_use]
+    pub fn exception_clauses(&self) -> Vec<ExceptionClause> {
+        let Some(body) = self.body() else {
+            return Vec::new();
+        };
+        if body.handlers.is_empty() {
+            return Vec::new();
+        }
+        let Some(offsets) = instruction_offsets(&body.code) else {
+            return Vec::new();
+        };
+        let byte_at = |index: u32| {
+            offsets
+                .get(index as usize)
+                .copied()
+                .unwrap_or_else(|| offsets.last().copied().unwrap_or(0))
+        };
+        body.handlers
+            .iter()
+            .map(|handler| {
+                let try_offset = byte_at(handler.try_range.start);
+                let handler_offset = byte_at(handler.handler_range.start);
+                ExceptionClause {
+                    kind: match handler.kind {
+                        EhKind::Catch(token) => ExceptionHandlerKind::Catch(token),
+                        EhKind::Filter { filter_start } => ExceptionHandlerKind::Filter {
+                            filter_offset: byte_at(filter_start),
+                        },
+                        EhKind::Finally => ExceptionHandlerKind::Finally,
+                        EhKind::Fault => ExceptionHandlerKind::Fault,
+                    },
+                    try_offset,
+                    try_length: byte_at(handler.try_range.end).saturating_sub(try_offset),
+                    handler_offset,
+                    handler_length: byte_at(handler.handler_range.end)
+                        .saturating_sub(handler_offset),
+                }
+            })
+            .collect()
     }
 
     /// Whether the method is static.

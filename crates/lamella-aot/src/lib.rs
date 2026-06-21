@@ -12,8 +12,17 @@ pub mod target;
 
 mod regalloc;
 
+#[cfg(any(feature = "arm32", feature = "wasm"))]
+mod stringgen;
+
 #[cfg(feature = "arm32")]
 pub mod arm32;
 
 #[cfg(feature = "riscv32")]
 pub mod riscv32;
+
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
+#[cfg(feature = "wasm")]
+pub mod build;

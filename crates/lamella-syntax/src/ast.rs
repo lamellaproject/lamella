@@ -3,6 +3,7 @@
 use crate::span::Span;
 use crate::token::{IntegerSuffix, RealSuffix};
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// An expression: a [`ExprKind`] together with the source [`Span`] it covers.
@@ -112,6 +113,20 @@ pub enum ExprKind {
     },
     /// A `typeof` expression (14.5.11): `typeof ( type )`.
     TypeOf(TypeRef),
+    /// A `sizeof` expression (unsafe, III.4.25): `sizeof ( type )`. Its value is the type's
+    /// byte size; for a struct it is the `sizeof` opcode over the shared layout.
+    SizeOf(TypeRef),
+    /// A `stackalloc` expression (unsafe): `stackalloc T [ count ]`. Allocates
+    /// `count * sizeof(T)` bytes on the call stack and yields a `T*` to the start.
+    StackAlloc {
+        /// The element type.
+        element: TypeRef,
+        /// The element count.
+        count: Box<Expr>,
+    },
+    /// A pointer indirection (unsafe): the prefix `* operand`, reading or writing the value
+    /// the pointer addresses (its element type). An lvalue when assigned.
+    Dereference(Box<Expr>),
     /// A `checked ( expression )` (14.5.12), forcing overflow checking on.
     Checked(Box<Expr>),
     /// An `unchecked ( expression )` (14.5.12), forcing overflow checking off.
@@ -207,6 +222,9 @@ pub enum TypeRefKind {
         /// The number of dimensions, so `T[]` is 1 and `T[,]` is 2.
         rank: u8,
     },
+    /// An unsafe pointer type (III.1.1.5): `T*`. `int**` nests a `Pointer` whose element is
+    /// another `Pointer`. The pointed-to type is the element.
+    Pointer(Box<TypeRef>),
     /// A placeholder for a type that could not be parsed, emitted with a
     /// diagnostic for recovery.
     Error,
@@ -357,6 +375,18 @@ pub enum StmtKind {
     Using {
         /// The resource acquired for the duration of the body.
         resource: UsingResource,
+        /// The guarded statement.
+        body: Box<Stmt>,
+    },
+    /// A `fixed ( T* id = expr ) statement` (unsafe, 15.7): pins `expr` (an array/string)
+    /// for the body and binds `id` to a pointer to its first element.
+    Fixed {
+        /// The pointer-variable type (`T*`).
+        ty: TypeRef,
+        /// The pointer variable bound for the body.
+        name: Box<str>,
+        /// The pinned source (an array or string).
+        init: Expr,
         /// The guarded statement.
         body: Box<Stmt>,
     },
@@ -659,6 +689,11 @@ pub enum Member {
         parameters: Vec<Parameter>,
         /// The method body, or `None` if it was a bare `;`.
         body: Option<Stmt>,
+        /// For an explicit interface member implementation (20.4.1), the interface
+        /// the method implements -- the part before the final dot of a qualified
+        /// name like `I.M`. `None` for an ordinary method. Such a method is callable
+        /// only through the interface, never by its simple name.
+        explicit_interface: Option<TypeRef>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -784,6 +819,25 @@ pub enum Member {
     NestedType(Box<NamespaceMember>),
     /// A placeholder for a member that could not be parsed, for recovery.
     Error,
+}
+
+/// The name an explicit interface member implementation carries in metadata and in
+/// the symbol model: the interface's source spelling, a dot, then the member -- e.g.
+/// `I.M` or `System.IComparable.CompareTo`. csc names the `MethodDef` this way, and
+/// registering it under this mangled name keeps ordinary simple-name lookup of the
+/// member from finding it (so it is reachable only through the interface). `member`
+/// is the bare member name; `interface_ref` is the qualifying interface type.
+#[must_use]
+pub fn explicit_interface_member_name(interface_ref: &TypeRef, member: &str) -> String {
+    let mut name = String::new();
+    if let TypeRefKind::Name(parts) = &interface_ref.kind {
+        for part in parts {
+            name.push_str(part);
+            name.push('.');
+        }
+    }
+    name.push_str(member);
+    name
 }
 
 /// Whether a conversion operator is implicit or explicit (17.9.3).

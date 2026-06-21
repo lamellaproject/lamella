@@ -1,7 +1,21 @@
 #![cfg_attr(not(test), no_std)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 //! The shared garbage-collection contract.
+
+pub mod heap;
+
+#[allow(unsafe_code)]
+pub mod device;
+#[allow(unsafe_code)]
+pub mod device_heap;
+
+pub use device::{
+    lamella_gc_alloc, lamella_gc_alloc_impl, lamella_gc_collect, lamella_gc_collect_device,
+    lamella_gc_init, lamella_gc_init_region, lamella_gc_teardown, set_oom_roots_hook, OomRootsHook,
+};
+pub use device_heap::{DeviceHeap, DeviceTypeDesc};
+pub use heap::{Heap, Ref, StackMapEntry, StackMapTable, TypeDesc};
 
 /// An opaque reference to a managed object on our collector's heap.
 ///

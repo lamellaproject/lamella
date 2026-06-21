@@ -47,6 +47,8 @@ pub struct FieldSymbol {
     pub ty: TypeSymbol,
     /// Whether the field is `static`.
     pub is_static: bool,
+    /// Whether the field is `readonly` (assignable only in a constructor or initializer).
+    pub is_readonly: bool,
     /// The field's accessibility.
     pub accessibility: Accessibility,
     /// The compile-time constant value for an enum member (its underlying value);
@@ -195,7 +197,7 @@ impl Model {
                 let (namespace, name) = special.full_name();
                 self.get(namespace, name)
             }
-            TypeSymbol::Array { .. } | TypeSymbol::Error => None,
+            TypeSymbol::Array { .. } | TypeSymbol::Pointer(_) | TypeSymbol::Error => None,
         }
     }
 
@@ -281,6 +283,15 @@ impl Model {
         self.types.keys().map(|(_, name)| name.as_ref())
     }
 
+    /// Every declared type's `(namespace, simple name)`, for namespace-aware completion
+    /// (`System.` -> the types and child namespaces under `System`). The caller filters
+    /// and dedups.
+    pub fn type_keys(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.types
+            .keys()
+            .map(|(namespace, name)| (namespace.as_ref(), name.as_ref()))
+    }
+
     /// Marks the type `(namespace, name)` as nested in `enclosing` (its full name).
     pub fn set_enclosing(&mut self, namespace: &str, name: &str, enclosing: &str) {
         if let Some(info) = self
@@ -349,6 +360,7 @@ mod tests {
             name: "count".into(),
             ty: TypeSymbol::Special(SpecialType::Int32),
             is_static: false,
+            is_readonly: false,
             accessibility: Accessibility::Public,
             constant: None,
         });

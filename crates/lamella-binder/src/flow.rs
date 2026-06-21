@@ -28,7 +28,9 @@ pub fn always_exits(stmt: &BoundStmt) -> bool {
         Kind::While { condition, .. } => is_const_true(condition),
         Kind::For { condition, .. } => condition.as_ref().is_none_or(is_const_true),
         Kind::DoWhile { body, condition } => always_exits(body) || is_const_true(condition),
-        Kind::Lock { body, .. } | Kind::Using { body, .. } => always_exits(body),
+        Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
+            always_exits(body)
+        }
         Kind::Checked(inner) | Kind::Unchecked(inner) => always_exits(inner),
         Kind::Labeled { body, .. } => always_exits(body),
         Kind::Try {
@@ -205,6 +207,10 @@ fn collect_locals(
             collect_uses(expression, used);
             collect_locals(body, used, declared);
         }
+        BoundStmtKind::Fixed { init, body, .. } => {
+            collect_uses(init, used);
+            collect_locals(body, used, declared);
+        }
         BoundStmtKind::Using { resource, body } => {
             for statement in resource {
                 collect_locals(statement, used, declared);
@@ -231,11 +237,14 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
         | BoundExprKind::TypeReference(_)
         | BoundExprKind::NamespaceReference(_)
         | BoundExprKind::TypeOf(_)
+        | BoundExprKind::SizeOf(_)
         | BoundExprKind::Error => {}
         BoundExprKind::FieldAccess { receiver, .. }
         | BoundExprKind::PropertyAccess { receiver, .. }
         | BoundExprKind::MethodGroup { receiver, .. } => collect_uses(receiver, used),
-        BoundExprKind::Ref { operand, .. } => collect_uses(operand, used),
+        BoundExprKind::Ref { operand, .. }
+        | BoundExprKind::Dereference { operand } => collect_uses(operand, used),
+        BoundExprKind::StackAlloc { count, .. } => collect_uses(count, used),
         BoundExprKind::Call {
             callee, arguments, ..
         } => {
@@ -396,7 +405,9 @@ impl Unreachable {
                 }
                 true
             }
-            Kind::Lock { body, .. } | Kind::Using { body, .. } => self.statement(body),
+            Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
+                self.statement(body)
+            }
             Kind::Checked(inner) | Kind::Unchecked(inner) | Kind::Labeled { body: inner, .. } => {
                 self.statement(inner)
             }
@@ -438,7 +449,9 @@ fn loop_breaks(stmt: &BoundStmt) -> bool {
                 || catches.iter().any(|catch| loop_breaks(&catch.body))
                 || finally.as_ref().is_some_and(|finally| loop_breaks(finally))
         }
-        Kind::Lock { body, .. } | Kind::Using { body, .. } => loop_breaks(body),
+        Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
+            loop_breaks(body)
+        }
         Kind::Checked(inner) | Kind::Unchecked(inner) | Kind::Labeled { body: inner, .. } => {
             loop_breaks(inner)
         }
@@ -456,6 +469,90 @@ fn loop_breaks(stmt: &BoundStmt) -> bool {
     }
 }
 
+/// Visits `stmt` and every statement nested within it, depth-first.
+fn visit_statements<'a>(stmt: &'a BoundStmt, visit: &mut impl FnMut(&'a BoundStmt)) {
+    use BoundStmtKind as K;
+    visit(stmt);
+    match &stmt.kind {
+        K::Block(statements) => statements.iter().for_each(|s| visit_statements(s, visit)),
+        K::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            visit_statements(then_branch, visit);
+            if let Some(else_branch) = else_branch {
+                visit_statements(else_branch, visit);
+            }
+        }
+        K::While { body, .. } | K::DoWhile { body, .. } | K::ForEach { body, .. } => {
+            visit_statements(body, visit);
+        }
+        K::For {
+            initializer, body, ..
+        } => {
+            initializer.iter().for_each(|s| visit_statements(s, visit));
+            visit_statements(body, visit);
+        }
+        K::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            visit_statements(body, visit);
+            catches.iter().for_each(|c| visit_statements(&c.body, visit));
+            if let Some(finally) = finally {
+                visit_statements(finally, visit);
+            }
+        }
+        K::Switch { sections, .. } => sections
+            .iter()
+            .for_each(|s| s.statements.iter().for_each(|s| visit_statements(s, visit))),
+        K::Lock { body, .. } | K::Fixed { body, .. } => visit_statements(body, visit),
+        K::Using { resource, body } => {
+            resource.iter().for_each(|s| visit_statements(s, visit));
+            visit_statements(body, visit);
+        }
+        K::Checked(inner) | K::Unchecked(inner) | K::Labeled { body: inner, .. } => {
+            visit_statements(inner, visit);
+        }
+        _ => {}
+    }
+}
+
+/// Reports `CS0140` (a label declared twice) and `CS0159` (a `goto` to a label that does
+/// not exist) within one method body -- labels share a single method-wide scope (8.7.1).
+#[must_use]
+pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut labels: BTreeSet<Box<str>> = BTreeSet::new();
+    visit_statements(body, &mut |stmt| {
+        if let BoundStmtKind::Labeled { label, .. } = &stmt.kind {
+            if !labels.insert(label.clone()) {
+                diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::DuplicateLabel {
+                        label: label.clone(),
+                    },
+                    stmt.span,
+                ));
+            }
+        }
+    });
+    visit_statements(body, &mut |stmt| {
+        if let BoundStmtKind::Goto(label) = &stmt.kind {
+            if !labels.contains(label) {
+                diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::UndefinedLabel {
+                        label: label.clone(),
+                    },
+                    stmt.span,
+                ));
+            }
+        }
+    });
+    diagnostics
+}
+
 /// Reports `CS0165` for every read of a local that is not definitely assigned on
 /// all paths to it (clause 12, Annex A). `parameters` start definitely assigned.
 /// `model` distinguishes a struct (whose field assignment assigns the local) from a
@@ -469,6 +566,7 @@ pub fn check_definite_assignment(
     let mut analyzer = Analyzer {
         diagnostics: Vec::new(),
         model,
+        break_frames: Vec::new(),
     };
     let assigned: Assigned = parameters.iter().cloned().collect();
     analyzer.statement(body, assigned);
@@ -478,6 +576,10 @@ pub fn check_definite_assignment(
 struct Analyzer<'a> {
     diagnostics: Vec<Diagnostic>,
     model: &'a Model,
+    /// A stack of break-target frames, one per enclosing `switch`/loop. A `break`
+    /// records the definitely-assigned set at that point into the top frame; a `switch`
+    /// then intersects its breaks (and fall-throughs) to know what is assigned after it.
+    break_frames: Vec<Vec<Assigned>>,
 }
 
 impl Analyzer<'_> {
@@ -531,14 +633,14 @@ impl Analyzer<'_> {
             BoundStmtKind::While { condition, body } => {
                 let mut assigned = assigned;
                 self.expression(condition, &mut assigned, span);
-                self.statement(body, assigned.clone());
+                self.statement_in_loop(body, assigned.clone());
                 if is_const_true(condition) {
                     Flow::Exits
                 } else {
                     Flow::Reaches(assigned)
                 }
             }
-            BoundStmtKind::DoWhile { body, condition } => match self.statement(body, assigned) {
+            BoundStmtKind::DoWhile { body, condition } => match self.statement_in_loop(body, assigned) {
                 Flow::Exits => Flow::Exits,
                 Flow::Reaches(mut assigned) => {
                     self.expression(condition, &mut assigned, span);
@@ -569,7 +671,7 @@ impl Analyzer<'_> {
                     }
                     None => true,
                 };
-                self.statement(body, assigned.clone());
+                self.statement_in_loop(body, assigned.clone());
                 for iterator in iterators {
                     let mut iterator_set = assigned.clone();
                     self.expression(iterator, &mut iterator_set, span);
@@ -590,7 +692,7 @@ impl Analyzer<'_> {
                 self.expression(collection, &mut assigned, span);
                 let mut body_set = assigned.clone();
                 body_set.insert(name.clone());
-                self.statement(body, body_set);
+                self.statement_in_loop(body, body_set);
                 Flow::Reaches(assigned)
             }
             BoundStmtKind::Return(value) | BoundStmtKind::Throw(value) => {
@@ -600,8 +702,13 @@ impl Analyzer<'_> {
                 }
                 Flow::Exits
             }
-            BoundStmtKind::Break
-            | BoundStmtKind::Continue
+            BoundStmtKind::Break => {
+                if let Some(frame) = self.break_frames.last_mut() {
+                    frame.push(assigned);
+                }
+                Flow::Exits
+            }
+            BoundStmtKind::Continue
             | BoundStmtKind::Goto(_)
             | BoundStmtKind::GotoCase(_)
             | BoundStmtKind::GotoCaseString(_)
@@ -612,10 +719,24 @@ impl Analyzer<'_> {
             } => {
                 let mut assigned = assigned;
                 self.expression(expression, &mut assigned, span);
+                self.break_frames.push(Vec::new());
+                let mut after = Flow::Exits;
                 for section in sections {
-                    self.block(&section.statements, assigned.clone());
+                    if let Flow::Reaches(set) = self.block(&section.statements, assigned.clone()) {
+                        after = merge(after, Flow::Reaches(set));
+                    }
                 }
-                Flow::Reaches(assigned)
+                for set in self.break_frames.pop().unwrap_or_default() {
+                    after = merge(after, Flow::Reaches(set));
+                }
+                let has_default = sections
+                    .iter()
+                    .any(|section| section.labels.contains(&BoundSwitchLabel::Default));
+                if has_default {
+                    after
+                } else {
+                    merge(after, Flow::Reaches(assigned))
+                }
             }
             BoundStmtKind::Try {
                 body,
@@ -640,6 +761,14 @@ impl Analyzer<'_> {
                 self.expression(expression, &mut assigned, span);
                 self.statement(body, assigned)
             }
+            BoundStmtKind::Fixed {
+                name, init, body, ..
+            } => {
+                let mut assigned = assigned;
+                self.expression(init, &mut assigned, span);
+                assigned.insert(name.clone());
+                self.statement(body, assigned)
+            }
             BoundStmtKind::Using { resource, body } => {
                 let mut assigned = assigned;
                 for statement in resource {
@@ -655,6 +784,17 @@ impl Analyzer<'_> {
             }
             BoundStmtKind::Labeled { body, .. } => self.statement(body, assigned),
         }
+    }
+
+    /// Analyzes a loop body inside its own break frame, so a `break` targeting this
+    /// loop is captured here and does not leak into an enclosing switch's exit paths.
+    /// The captured breaks are discarded -- a loop's endpoint reachability is decided by
+    /// its condition, not its breaks (an over-approximation that never rejects).
+    fn statement_in_loop(&mut self, body: &BoundStmt, assigned: Assigned) -> Flow {
+        self.break_frames.push(Vec::new());
+        let flow = self.statement(body, assigned);
+        self.break_frames.pop();
+        flow
     }
 
     fn block(&mut self, statements: &[BoundStmt], assigned: Assigned) -> Flow {
@@ -686,11 +826,18 @@ impl Analyzer<'_> {
             | BoundExprKind::TypeReference(_)
             | BoundExprKind::NamespaceReference(_)
             | BoundExprKind::TypeOf(_)
+            | BoundExprKind::SizeOf(_)
             | BoundExprKind::Error => {}
             BoundExprKind::FieldAccess { receiver, .. }
             | BoundExprKind::PropertyAccess { receiver, .. }
             | BoundExprKind::MethodGroup { receiver, .. } => {
                 self.expression(receiver, assigned, span);
+            }
+            BoundExprKind::Dereference { operand } => {
+                self.expression(operand, assigned, span);
+            }
+            BoundExprKind::StackAlloc { count, .. } => {
+                self.expression(count, assigned, span);
             }
             BoundExprKind::Call {
                 callee, arguments, ..
