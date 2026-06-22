@@ -9,10 +9,13 @@ use crate::symbols::{
     TypeKind,
 };
 use crate::types::TypeSymbol;
+use alloc::boxed::Box;
 use alloc::string::String;
+use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    CompilationUnit, Expr, ExprKind, Literal, Member, Modifier, NamespaceMember, QualifiedName,
-    TypeDecl, TypeKind as SyntaxTypeKind, UnaryOperator, explicit_interface_member_name,
+    AttributeArgument, AttributeSection, CompilationUnit, Expr, ExprKind, Literal, Member,
+    Modifier, NamespaceMember, QualifiedName, TypeDecl, TypeKind as SyntaxTypeKind, UnaryOperator,
+    explicit_interface_member_name,
 };
 
 /// Builds the [`Model`] of every type and member declared in `unit`.
@@ -89,6 +92,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 is_static: false,
                 is_params: has_params_array(&declaration.parameters),
                 accessibility: Accessibility::Public,
+                conditional: Vec::new(),
             });
             model.insert(info);
         }
@@ -233,6 +237,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 name,
                 parameters,
                 explicit_interface,
+                attributes,
                 ..
             } => info.methods.push(MethodSymbol {
                 name: match explicit_interface {
@@ -247,6 +252,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     Some(_) => Accessibility::Private,
                     None => access(modifiers),
                 },
+                conditional: conditional_symbols_from_attributes(attributes),
             }),
             Member::Operator {
                 return_type,
@@ -260,6 +266,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_static: true,
                 is_params: false,
                 accessibility: Accessibility::Public,
+                conditional: Vec::new(),
             }),
             Member::ConversionOperator {
                 direction,
@@ -273,6 +280,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_static: true,
                 is_params: false,
                 accessibility: Accessibility::Public,
+                conditional: Vec::new(),
             }),
             Member::Property {
                 modifiers,
@@ -312,7 +320,35 @@ fn constructor(parameters: &[lamella_syntax::ast::Parameter]) -> MethodSymbol {
         is_static: false,
         is_params: has_params_array(parameters),
         accessibility: Accessibility::Public,
+        conditional: Vec::new(),
     }
+}
+
+/// The `[Conditional("X")]` symbols declared on a source member (24.4.2): the attribute name is
+/// matched as written (`Conditional` or the `Attribute`-suffixed form) and the symbol is its
+/// first positional string-literal argument. A call to a source method marked this way is
+/// omitted unless `X` is defined at the call site, like a BCL `Debug`/`Trace` method.
+fn conditional_symbols_from_attributes(sections: &[AttributeSection]) -> Vec<Box<str>> {
+    let mut symbols = Vec::new();
+    for section in sections {
+        if section.target.is_some() {
+            continue;
+        }
+        for attribute in &section.attributes {
+            let last = attribute.name.parts.last().map(|part| &**part);
+            if last != Some("Conditional") && last != Some("ConditionalAttribute") {
+                continue;
+            }
+            if let Some(AttributeArgument::Positional(expr)) = attribute.arguments.first() {
+                if let ExprKind::Literal(Literal::String(units)) = &expr.kind {
+                    if let Ok(symbol) = String::from_utf16(units) {
+                        symbols.push(symbol.into_boxed_str());
+                    }
+                }
+            }
+        }
+    }
+    symbols
 }
 
 /// Whether a parameter list ends in a `params` array.

@@ -20,11 +20,20 @@ pub enum Value {
     /// A native-sized integer (and unmanaged pointers). Held as 64-bit on the
     /// host; the width becomes target-configurable with the device tiers.
     NativeInt(i64),
-    /// A floating-point value. The CLI tracks one native float type `F`; it is
-    /// held as `f64` (III permits carrying higher internal precision). Gated by `float`:
-    /// the no-float tier omits it and the floating-point opcodes that produce it.
+    /// A 64-bit floating-point value (`System.Double`). The CLI tracks one native float
+    /// type `F`; this is `F` carried at full `f64` precision (III permits higher internal
+    /// precision). Gated by `float`: the no-float tier omits it and the floating-point
+    /// opcodes that produce it.
     #[cfg(feature = "float")]
     Float(f64),
+    /// A 32-bit floating-point value (`System.Single`), carried at true `f32` precision.
+    /// ECMA-335 III tracks both `float32` and `float64` as the one stack type `F`, but a
+    /// `float32`-typed value rounds every operation to single precision, so a `float op
+    /// float` must compute at `f32` to match .NET; keeping `Single` distinct from [`Value::Float`]
+    /// preserves that precision (and the exhaustive match forces every site to choose a width).
+    /// Gated by `float`, alongside [`Value::Float`].
+    #[cfg(feature = "float")]
+    Single(f32),
     /// An object reference (`O`): a handle to a heap object.
     Object(ObjectRef),
     /// The null object reference.
@@ -136,6 +145,8 @@ impl Value {
             Value::Int64(value) | Value::NativeInt(value) => *value != 0,
             #[cfg(feature = "float")]
             Value::Float(value) => *value != 0.0,
+            #[cfg(feature = "float")]
+            Value::Single(value) => *value != 0.0,
             Value::Object(_) | Value::ByRef(_) | Value::Struct(_) => true,
             #[cfg(feature = "typed-references")]
             Value::TypedRef { .. } => true,

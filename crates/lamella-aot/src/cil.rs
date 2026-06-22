@@ -193,6 +193,13 @@ pub trait CallResolver {
         Vec::new()
     }
 
+    /// For a `castclass T` where T is an in-program TypeDef, T's handle -- the cast lowers to a base-
+    /// pointer chain scan of the object's TypeDesc instead of per-subtype compares. `None` for a BCL
+    /// TypeRef target (which uses [`cast_subtype_handles`]). `None` by default; the metadata resolver fills it.
+    fn cast_target_chain(&self, _operand: &Operand) -> Option<TypeHandle> {
+        None
+    }
+
     /// The exception tag of a BUILTIN throwable named directly (no token), so a synthesized check
     /// can raise it -- e.g. `System.IndexOutOfRangeException` from an array bounds check. The tag
     /// matches a `catch` that names the same type. Defaults to `None`.
@@ -221,6 +228,13 @@ pub trait CallResolver {
     /// cannot place (an interface/abstract method, or a cross-module ref) -- dispatched directly.
     /// Defaults to None (direct dispatch everywhere).
     fn virtual_slot(&self, _operand: &Operand) -> Option<usize> {
+        None
+    }
+
+    /// The interface-method identity tag a `callvirt` on an INTERFACE method dispatches through (the
+    /// receiver type's itable is searched for it). `None` for a non-interface target -- which then
+    /// falls to [`virtual_slot`](Self::virtual_slot) or a direct call. Defaults to None.
+    fn interface_call_tag(&self, _operand: &Operand) -> Option<u32> {
         None
     }
 }
@@ -291,6 +305,7 @@ fn lower_with_source(
     local_types: &[MirType],
 ) -> Result<(Function, CilSourceMap), CilError> {
     let code = &body.code;
+    let widths = eval_stack_widths(code, arg_types, local_types, resolver);
     let mut byte_offsets: Vec<u32> = Vec::with_capacity(code.len());
     let mut running = 0u32;
     for instr in code.iter() {
@@ -435,7 +450,12 @@ fn lower_with_source(
         .map(|(b, &(start, _))| {
             let kind = trap_kind_at(&code[start], resolver);
             if throw_clauses[b].is_empty()
-                && !matches!(kind, Some(TrapKind::Cast(_)) | Some(TrapKind::CastClass(_)))
+                && !matches!(
+                    kind,
+                    Some(TrapKind::Cast(_))
+                        | Some(TrapKind::CastClass(_))
+                        | Some(TrapKind::CastClassChain(_))
+                )
             {
                 return None;
             }
@@ -478,7 +498,7 @@ fn lower_with_source(
                     new_value(&mut value_types, ty)
                 })
                 .collect();
-            for ty in trap_operand_types(&code[blocks[b].0], resolver) {
+            for ty in trap_operand_types(&code[blocks[b].0], widths[blocks[b].0], resolver) {
                 params.push(new_value(&mut value_types, ty));
             }
             params
@@ -537,7 +557,7 @@ fn lower_with_source(
             stack.push(exception);
         }
         if trap_access[b].is_some() {
-            let operand_count = trap_operand_types(&code[start], resolver).len();
+            let operand_count = trap_operand_types(&code[start], widths[start], resolver).len();
             for k in 0..operand_count {
                 stack.push(block_params[b][local_count + k]);
             }
@@ -685,7 +705,9 @@ fn lower_with_source(
                     return Err(CilError::UnsupportedControlFlow);
                 }
                 if let Some(kind) = trap_access[next].clone() {
-                    let operand_count = trap_operand_types(&code[blocks[next].0], resolver).len();
+                    let operand_count =
+                        trap_operand_types(&code[blocks[next].0], widths[blocks[next].0], resolver)
+                            .len();
                     let mut operands = Vec::with_capacity(operand_count);
                     for _ in 0..operand_count {
                         operands.push(stack.pop().ok_or(CilError::StackUnderflow)?);
@@ -1089,9 +1111,15 @@ fn apply_value_op(
             ));
             stack.push(result);
         }
-        Opcode::Add => binary(value_types, stack, insts, BinOp::Add)?,
-        Opcode::Sub => binary(value_types, stack, insts, BinOp::Sub)?,
-        Opcode::Mul => binary(value_types, stack, insts, BinOp::Mul)?,
+        Opcode::Add | Opcode::AddOvf | Opcode::AddOvfUn => {
+            binary(value_types, stack, insts, BinOp::Add)?
+        }
+        Opcode::Sub | Opcode::SubOvf | Opcode::SubOvfUn => {
+            binary(value_types, stack, insts, BinOp::Sub)?
+        }
+        Opcode::Mul | Opcode::MulOvf | Opcode::MulOvfUn => {
+            binary(value_types, stack, insts, BinOp::Mul)?
+        }
         Opcode::And => binary(value_types, stack, insts, BinOp::And)?,
         Opcode::Or => binary(value_types, stack, insts, BinOp::Or)?,
         Opcode::Xor => binary(value_types, stack, insts, BinOp::Xor)?,
@@ -1153,9 +1181,13 @@ fn apply_value_op(
         Opcode::ConvU1 => convert(value_types, stack, insts, ConvKind::ZeroExtend8)?,
         Opcode::ConvI2 => convert(value_types, stack, insts, ConvKind::SignExtend16)?,
         Opcode::ConvU2 => convert(value_types, stack, insts, ConvKind::ZeroExtend16)?,
-        Opcode::ConvI8 => widen(value_types, stack, insts, true)?,
-        Opcode::ConvU8 => widen(value_types, stack, insts, false)?,
-        Opcode::ConvI4 | Opcode::ConvU4 => {
+        Opcode::ConvOvfI1 => convert(value_types, stack, insts, ConvKind::SignExtend8)?,
+        Opcode::ConvOvfU1 => convert(value_types, stack, insts, ConvKind::ZeroExtend8)?,
+        Opcode::ConvOvfI2 => convert(value_types, stack, insts, ConvKind::SignExtend16)?,
+        Opcode::ConvOvfU2 => convert(value_types, stack, insts, ConvKind::ZeroExtend16)?,
+        Opcode::ConvI8 | Opcode::ConvOvfI8 => widen(value_types, stack, insts, true)?,
+        Opcode::ConvU8 | Opcode::ConvOvfU8 => widen(value_types, stack, insts, false)?,
+        Opcode::ConvI4 | Opcode::ConvU4 | Opcode::ConvOvfI4 | Opcode::ConvOvfU4 => {
             let top = *stack.last().ok_or(CilError::StackUnderflow)?;
             if value_types.get(top.index()) == Some(&MirType::F32) {
                 let value = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -1303,15 +1335,23 @@ fn apply_value_op(
             match info.target {
                 CallTarget::Internal(callee) => {
                     let result = new_value(value_types, info.result_type.unwrap_or(MirType::I32));
-                    let slot = (inst.opcode == Opcode::Callvirt)
+                    let is_callvirt = inst.opcode == Opcode::Callvirt;
+                    let interface_tag = is_callvirt
+                        .then(|| resolver.interface_call_tag(&inst.operand))
+                        .flatten();
+                    let slot = is_callvirt
                         .then(|| resolver.virtual_slot(&inst.operand))
                         .flatten();
-                    let call_inst = match slot {
-                        Some(slot) => Inst::CallVirtual {
+                    let call_inst = match (interface_tag, slot) {
+                        (Some(tag), _) => Inst::CallInterface {
+                            tag,
+                            args: call_args,
+                        },
+                        (_, Some(slot)) => Inst::CallVirtual {
                             slot: slot as u32,
                             args: call_args,
                         },
-                        None => Inst::Call {
+                        (None, None) => Inst::Call {
                             callee,
                             args: call_args,
                         },
@@ -1709,12 +1749,6 @@ fn apply_value_op(
                 .boxed_layout(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
-            if matches!(
-                value_types.get(value.0 as usize),
-                Some(MirType::ValueType { .. })
-            ) {
-                return Err(CilError::Unsupported(inst.opcode));
-            }
             let obj = new_value(value_types, MirType::ObjectRef);
             insts.push((
                 obj,
@@ -1739,9 +1773,6 @@ fn apply_value_op(
             let result_ty = resolver
                 .boxed_value_type(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
-            if matches!(result_ty, MirType::ValueType { .. }) {
-                return Err(CilError::Unsupported(inst.opcode));
-            }
             let obj = stack.pop().ok_or(CilError::StackUnderflow)?;
             let result = new_value(value_types, result_ty);
             insts.push((
@@ -2172,7 +2203,35 @@ enum TrapKind {
     /// `castclass T`: the object's runtime TypeDesc must be one of the target's accepted handles
     /// (`T` plus its in-program subtypes); if none match -> `InvalidCastException`.
     CastClass(Vec<TypeHandle>),
+    /// `castclass T` for an in-program TypeDef T: walk the object's TypeDesc base_ptr chain for T's
+    /// descriptor (the exact base-pointer scan). O(depth), no per-subtype compares -> `InvalidCastException`.
+    CastClassChain(TypeHandle),
+    /// An integer `div`/`rem`: the divisor (the second operand) being zero -> `DivideByZeroException`.
+    DivByZero,
+    /// A checked `add.ovf`/`sub.ovf` (and `.un`) whose result overflows -> `OverflowException`.
+    Overflow(OverflowKind),
+    /// A checked `conv.ovf.*` whose value lies outside the target type's range -> `OverflowException`.
+    /// `lo` is the inclusive lower bound; `hi` the inclusive upper, or `None` for a `u64` target (no
+    /// upper). Bounds + the value's compares run at the value's own width (i64 when narrowing a `long`);
+    /// a `u32`/`u64` upper bound past i32::MAX is unreachable from an i32 source, so that compare is skipped.
+    ConvOverflow { lo: i64, hi: Option<i64> },
 }
+
+/// Which checked arithmetic an [`TrapKind::Overflow`] guards, selecting the overflow test.
+#[derive(Clone, Copy)]
+enum OverflowKind {
+    AddSigned,
+    AddUnsigned,
+    SubSigned,
+    SubUnsigned,
+    MulSigned,
+    MulUnsigned,
+}
+
+/// Above this many accepted handles (the cast target plus its in-program subtypes), a `castclass` to an
+/// in-program base switches from per-subtype TypeDesc compares to the base-pointer chain scan. A narrow
+/// base stays on compares -- cheaper than the runtime walk, and needs no emitted base-pointer chain.
+const CAST_CHAIN_THRESHOLD: usize = 4;
 
 /// The trap a block's FIRST instruction needs, or `None` if it is not a trap-leader: a bounds check
 /// for an array access, or a null check for a field access (`ldfld`/`stfld`) whose field is declared
@@ -2195,9 +2254,45 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
     }
     if opcode == Opcode::Castclass {
         let handles = resolver.cast_subtype_handles(&inst.operand);
+        if handles.len() > CAST_CHAIN_THRESHOLD {
+            if let Some(target) = resolver.cast_target_chain(&inst.operand) {
+                return Some(TrapKind::CastClassChain(target));
+            }
+        }
         if !handles.is_empty() {
             return Some(TrapKind::CastClass(handles));
         }
+    }
+    if matches!(
+        opcode,
+        Opcode::Div | Opcode::DivUn | Opcode::Rem | Opcode::RemUn
+    ) {
+        return Some(TrapKind::DivByZero);
+    }
+    let overflow = match opcode {
+        Opcode::AddOvf => Some(OverflowKind::AddSigned),
+        Opcode::AddOvfUn => Some(OverflowKind::AddUnsigned),
+        Opcode::SubOvf => Some(OverflowKind::SubSigned),
+        Opcode::SubOvfUn => Some(OverflowKind::SubUnsigned),
+        Opcode::MulOvf => Some(OverflowKind::MulSigned),
+        Opcode::MulOvfUn => Some(OverflowKind::MulUnsigned),
+        _ => None,
+    };
+    if let Some(kind) = overflow {
+        return Some(TrapKind::Overflow(kind));
+    }
+    let conv_range: Option<(i64, Option<i64>)> = match opcode {
+        Opcode::ConvOvfI1 => Some((-128, Some(127))),
+        Opcode::ConvOvfU1 => Some((0, Some(255))),
+        Opcode::ConvOvfI2 => Some((-32768, Some(32767))),
+        Opcode::ConvOvfU2 => Some((0, Some(65535))),
+        Opcode::ConvOvfI4 => Some((i64::from(i32::MIN), Some(i64::from(i32::MAX)))),
+        Opcode::ConvOvfU4 => Some((0, Some(i64::from(u32::MAX)))),
+        Opcode::ConvOvfU8 => Some((0, None)),
+        _ => None,
+    };
+    if let Some((lo, hi)) = conv_range {
+        return Some(TrapKind::ConvOverflow { lo, hi });
     }
     None
 }
@@ -2207,7 +2302,167 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
 /// store (the value's width follows the element -- `i8` -> I64, `ref` -> O, else I32), `[object]` for
 /// a field load, `[object, value]` for a field store (the value typed by the field). Empty for a
 /// non-access opcode.
-fn trap_operand_types(inst: &Instruction, resolver: &dyn CallResolver) -> Vec<MirType> {
+/// Per-instruction i64-WIDTH of the top eval-stack slot just before that instruction, by a linear sim.
+/// A trap-leader types its integer operands at the STRUCTURAL block-params pass -- before any value
+/// flows -- so it can't read the real types; this re-derives the width (i32 vs i64) so a checked op on
+/// a 64-bit operand (a `long` divide/remainder or a `conv.ovf` from `long`) is checked at i64 width.
+///
+/// SAFE BY DESIGN: every produced slot defaults to NARROW; only the specific i64 PRODUCERS push WIDE
+/// (ldc.i8, conv.i8/u8(.ovf), an i64 local/arg/field, ldelem.i8, an i64 binary result or call return),
+/// and any opcode NOT modeled CLEARS the stack. So an i32 operand is never falsely widened (no regression
+/// to the working i32 trap-leaders); at worst a 64-bit operand reached through an unmodeled op reads
+/// narrow -- the prior behavior. The deeper stack may drift, but a checked op's operands are pushed
+/// immediately before it, so the recorded TOP is correct.
+fn eval_stack_widths(
+    code: &[Instruction],
+    arg_types: &[MirType],
+    local_types: &[MirType],
+    resolver: &dyn CallResolver,
+) -> Vec<bool> {
+    let i64w = |t: Option<MirType>| t == Some(MirType::I64);
+    let mut stack: Vec<bool> = Vec::new();
+    let mut widths = alloc::vec![false; code.len()];
+    for (i, inst) in code.iter().enumerate() {
+        widths[i] = stack.last().copied().unwrap_or(false);
+        match inst.opcode {
+            Opcode::LdcI8 => stack.push(true),
+            Opcode::LdcI4M1
+            | Opcode::LdcI40
+            | Opcode::LdcI41
+            | Opcode::LdcI42
+            | Opcode::LdcI43
+            | Opcode::LdcI44
+            | Opcode::LdcI45
+            | Opcode::LdcI46
+            | Opcode::LdcI47
+            | Opcode::LdcI48
+            | Opcode::LdcI4S
+            | Opcode::LdcI4
+            | Opcode::LdcR4
+            | Opcode::LdcR8
+            | Opcode::Ldstr
+            | Opcode::Ldnull => stack.push(false),
+            Opcode::Ldarg0 => stack.push(i64w(arg_types.first().copied())),
+            Opcode::Ldarg1 => stack.push(i64w(arg_types.get(1).copied())),
+            Opcode::Ldarg2 => stack.push(i64w(arg_types.get(2).copied())),
+            Opcode::Ldarg3 => stack.push(i64w(arg_types.get(3).copied())),
+            Opcode::LdargS | Opcode::Ldarg => {
+                let n = match inst.operand {
+                    Operand::Variable(n) => n as usize,
+                    _ => 0,
+                };
+                stack.push(i64w(arg_types.get(n).copied()));
+            }
+            Opcode::Ldloc0 => stack.push(i64w(local_types.first().copied())),
+            Opcode::Ldloc1 => stack.push(i64w(local_types.get(1).copied())),
+            Opcode::Ldloc2 => stack.push(i64w(local_types.get(2).copied())),
+            Opcode::Ldloc3 => stack.push(i64w(local_types.get(3).copied())),
+            Opcode::LdlocS | Opcode::Ldloc => {
+                let n = match inst.operand {
+                    Operand::Variable(n) => n as usize,
+                    _ => 0,
+                };
+                stack.push(i64w(local_types.get(n).copied()));
+            }
+            Opcode::Ldsfld => stack.push(i64w(resolver.field_type(&inst.operand))),
+            Opcode::Ldfld => {
+                stack.pop();
+                stack.push(i64w(resolver.field_type(&inst.operand)));
+            }
+            Opcode::LdelemI8 => {
+                stack.pop();
+                stack.pop();
+                stack.push(true);
+            }
+            Opcode::LdelemI1
+            | Opcode::LdelemU1
+            | Opcode::LdelemI2
+            | Opcode::LdelemU2
+            | Opcode::LdelemI4
+            | Opcode::LdelemU4
+            | Opcode::LdelemRef => {
+                stack.pop();
+                stack.pop();
+                stack.push(false);
+            }
+            Opcode::ConvI8 | Opcode::ConvU8 | Opcode::ConvOvfI8 | Opcode::ConvOvfU8 => {
+                stack.pop();
+                stack.push(true);
+            }
+            Opcode::ConvI1
+            | Opcode::ConvU1
+            | Opcode::ConvI2
+            | Opcode::ConvU2
+            | Opcode::ConvI4
+            | Opcode::ConvU4
+            | Opcode::ConvOvfI1
+            | Opcode::ConvOvfU1
+            | Opcode::ConvOvfI2
+            | Opcode::ConvOvfU2
+            | Opcode::ConvOvfI4
+            | Opcode::ConvOvfU4
+            | Opcode::ConvR4
+            | Opcode::ConvR8 => {
+                stack.pop();
+                stack.push(false);
+            }
+            Opcode::Add
+            | Opcode::AddOvf
+            | Opcode::AddOvfUn
+            | Opcode::Sub
+            | Opcode::SubOvf
+            | Opcode::SubOvfUn
+            | Opcode::Mul
+            | Opcode::MulOvf
+            | Opcode::MulOvfUn
+            | Opcode::And
+            | Opcode::Or
+            | Opcode::Xor
+            | Opcode::Div
+            | Opcode::DivUn
+            | Opcode::Rem
+            | Opcode::RemUn => {
+                let w = stack.pop().unwrap_or(false);
+                stack.pop();
+                stack.push(w);
+            }
+            Opcode::Shl | Opcode::Shr | Opcode::ShrUn => {
+                stack.pop();
+                let w = stack.pop().unwrap_or(false);
+                stack.push(w);
+            }
+            Opcode::Neg | Opcode::Not => {
+                let w = stack.pop().unwrap_or(false);
+                stack.push(w);
+            }
+            Opcode::Ceq | Opcode::Cgt | Opcode::CgtUn | Opcode::Clt | Opcode::CltUn => {
+                stack.pop();
+                stack.pop();
+                stack.push(false);
+            }
+            Opcode::Dup => stack.push(stack.last().copied().unwrap_or(false)),
+            Opcode::Pop => {
+                stack.pop();
+            }
+            Opcode::Call | Opcode::Callvirt => match resolver.resolve(&inst.operand) {
+                Some(info) => {
+                    for _ in 0..info.args {
+                        stack.pop();
+                    }
+                    if info.has_result {
+                        stack.push(i64w(info.result_type));
+                    }
+                }
+                None => stack.clear(),
+            },
+            Opcode::Nop => {}
+            _ => stack.clear(),
+        }
+    }
+    widths
+}
+
+fn trap_operand_types(inst: &Instruction, wide: bool, resolver: &dyn CallResolver) -> Vec<MirType> {
     let opcode = inst.opcode;
     if matches!(opcode, Opcode::Ldfld | Opcode::UnboxAny | Opcode::Castclass) {
         return vec![MirType::ObjectRef];
@@ -2219,6 +2474,34 @@ fn trap_operand_types(inst: &Instruction, resolver: &dyn CallResolver) -> Vec<Mi
     if control_flow::is_may_trap_load(opcode) {
         return vec![MirType::ObjectRef, MirType::I32];
     }
+    if matches!(
+        opcode,
+        Opcode::ConvOvfI1
+            | Opcode::ConvOvfU1
+            | Opcode::ConvOvfI2
+            | Opcode::ConvOvfU2
+            | Opcode::ConvOvfI4
+            | Opcode::ConvOvfU4
+            | Opcode::ConvOvfU8
+    ) {
+        return vec![if wide { MirType::I64 } else { MirType::I32 }];
+    }
+    if matches!(
+        opcode,
+        Opcode::Div
+            | Opcode::DivUn
+            | Opcode::Rem
+            | Opcode::RemUn
+            | Opcode::AddOvf
+            | Opcode::AddOvfUn
+            | Opcode::SubOvf
+            | Opcode::SubOvfUn
+            | Opcode::MulOvf
+            | Opcode::MulOvfUn
+    ) {
+        let w = if wide { MirType::I64 } else { MirType::I32 };
+        return vec![w, w];
+    }
     let value = match opcode {
         Opcode::StelemI8 => MirType::I64,
         Opcode::StelemRef => MirType::ObjectRef,
@@ -2226,6 +2509,156 @@ fn trap_operand_types(inst: &Instruction, resolver: &dyn CallResolver) -> Vec<Mi
         _ => return Vec::new(),
     };
     vec![MirType::ObjectRef, MirType::I32, value]
+}
+
+/// Emits the overflow test for a checked add/sub into `insts`, returning the value that is nonzero on
+/// overflow (a trap-leader's failure condition). Signed add/sub use the sign-bit identity; unsigned use
+/// the carry/borrow. The op itself (a plain Add/Sub) runs after, recomputing the result -- a redundant
+/// add a later MIR pass can fold.
+fn emit_overflow_check(
+    kind: OverflowKind,
+    a: ValueId,
+    b: ValueId,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let bin = |op: BinOp, lhs, rhs, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
+        let v = new_value(vts, MirType::I32);
+        is.push((v, Inst::Binary { op, lhs, rhs }));
+        v
+    };
+    let cmp = |op: CmpOp, lhs, rhs, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
+        let v = new_value(vts, MirType::I32);
+        is.push((v, Inst::Compare { op, lhs, rhs }));
+        v
+    };
+    let neg = |value, vts: &mut Vec<MirType>, is: &mut Vec<(ValueId, Inst)>| {
+        let zero = new_value(vts, MirType::I32);
+        is.push((
+            zero,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: 0,
+            },
+        ));
+        cmp_value(CmpOp::SignedLt, value, zero, vts, is)
+    };
+    match kind {
+        OverflowKind::AddUnsigned => {
+            let sum = bin(BinOp::Add, a, b, value_types, insts);
+            cmp(CmpOp::UnsignedLt, sum, a, value_types, insts)
+        }
+        OverflowKind::SubUnsigned => cmp(CmpOp::UnsignedLt, a, b, value_types, insts),
+        OverflowKind::AddSigned => {
+            let sum = bin(BinOp::Add, a, b, value_types, insts);
+            let ax = bin(BinOp::Xor, a, sum, value_types, insts);
+            let bx = bin(BinOp::Xor, b, sum, value_types, insts);
+            let and = bin(BinOp::And, ax, bx, value_types, insts);
+            neg(and, value_types, insts)
+        }
+        OverflowKind::SubSigned => {
+            let diff = bin(BinOp::Sub, a, b, value_types, insts);
+            let ab = bin(BinOp::Xor, a, b, value_types, insts);
+            let ad = bin(BinOp::Xor, a, diff, value_types, insts);
+            let and = bin(BinOp::And, ab, ad, value_types, insts);
+            neg(and, value_types, insts)
+        }
+        OverflowKind::MulSigned => {
+            let a64 = new_value(value_types, MirType::I64);
+            insts.push((
+                a64,
+                Inst::Widen {
+                    value: a,
+                    signed: true,
+                },
+            ));
+            let b64 = new_value(value_types, MirType::I64);
+            insts.push((
+                b64,
+                Inst::Widen {
+                    value: b,
+                    signed: true,
+                },
+            ));
+            let prod = new_value(value_types, MirType::I64);
+            insts.push((
+                prod,
+                Inst::Binary {
+                    op: BinOp::Mul,
+                    lhs: a64,
+                    rhs: b64,
+                },
+            ));
+            let min = new_value(value_types, MirType::I64);
+            insts.push((
+                min,
+                Inst::ConstInt {
+                    ty: MirType::I64,
+                    value: i32::MIN as i64,
+                },
+            ));
+            let max = new_value(value_types, MirType::I64);
+            insts.push((
+                max,
+                Inst::ConstInt {
+                    ty: MirType::I64,
+                    value: i32::MAX as i64,
+                },
+            ));
+            let below = cmp(CmpOp::SignedLt, prod, min, value_types, insts);
+            let above = cmp(CmpOp::SignedGt, prod, max, value_types, insts);
+            bin(BinOp::Or, below, above, value_types, insts)
+        }
+        OverflowKind::MulUnsigned => {
+            let a64 = new_value(value_types, MirType::I64);
+            insts.push((
+                a64,
+                Inst::Widen {
+                    value: a,
+                    signed: false,
+                },
+            ));
+            let b64 = new_value(value_types, MirType::I64);
+            insts.push((
+                b64,
+                Inst::Widen {
+                    value: b,
+                    signed: false,
+                },
+            ));
+            let prod = new_value(value_types, MirType::I64);
+            insts.push((
+                prod,
+                Inst::Binary {
+                    op: BinOp::Mul,
+                    lhs: a64,
+                    rhs: b64,
+                },
+            ));
+            let max = new_value(value_types, MirType::I64);
+            insts.push((
+                max,
+                Inst::ConstInt {
+                    ty: MirType::I64,
+                    value: u32::MAX as i64,
+                },
+            ));
+            cmp(CmpOp::UnsignedGt, prod, max, value_types, insts)
+        }
+    }
+}
+
+/// Pushes a `Compare` of `lhs`/`rhs` and returns its boolean value.
+fn cmp_value(
+    op: CmpOp,
+    lhs: ValueId,
+    rhs: ValueId,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    let v = new_value(value_types, MirType::I32);
+    insts.push((v, Inst::Compare { op, lhs, rhs }));
+    v
 }
 
 /// Builds the terminator for a block that flows into a may-trap access (the next block): the
@@ -2370,6 +2803,100 @@ fn build_trap_access_check(
                 },
             ));
             (mismatch, "InvalidCastException")
+        }
+        TrapKind::CastClassChain(target) => {
+            let object = operands[0];
+            let object_desc = new_value(value_types, MirType::I32);
+            insts.push((object_desc, Inst::LoadTypeDesc { object }));
+            let target_desc = new_value(value_types, MirType::I32);
+            insts.push((target_desc, Inst::TypeDescAddr { handle: target }));
+            let matched = new_value(value_types, MirType::I32);
+            insts.push((
+                matched,
+                Inst::CastClassScan {
+                    args: alloc::vec![object_desc, target_desc],
+                },
+            ));
+            let zero = new_value(value_types, MirType::I32);
+            insts.push((
+                zero,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ));
+            let mismatch = new_value(value_types, MirType::I32);
+            insts.push((
+                mismatch,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: matched,
+                    rhs: zero,
+                },
+            ));
+            (mismatch, "InvalidCastException")
+        }
+        TrapKind::DivByZero => {
+            let divisor = operands[1];
+            let divisor_ty = value_types
+                .get(divisor.0 as usize)
+                .copied()
+                .unwrap_or(MirType::I32);
+            let zero = new_value(value_types, divisor_ty);
+            insts.push((
+                zero,
+                Inst::ConstInt {
+                    ty: divisor_ty,
+                    value: 0,
+                },
+            ));
+            let is_zero = new_value(value_types, MirType::I32);
+            insts.push((
+                is_zero,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: divisor,
+                    rhs: zero,
+                },
+            ));
+            (is_zero, "DivideByZeroException")
+        }
+        TrapKind::Overflow(kind) => {
+            let ovf = emit_overflow_check(kind, operands[0], operands[1], value_types, insts);
+            (ovf, "OverflowException")
+        }
+        TrapKind::ConvOverflow { lo, hi } => {
+            let value = operands[0];
+            let ty = value_types
+                .get(value.0 as usize)
+                .copied()
+                .unwrap_or(MirType::I32);
+            let lo_c = new_value(value_types, ty);
+            insts.push((lo_c, Inst::ConstInt { ty, value: lo }));
+            let below = cmp_value(CmpOp::SignedLt, value, lo_c, value_types, insts);
+            let source_max = if ty == MirType::I64 {
+                i64::MAX
+            } else {
+                i64::from(i32::MAX)
+            };
+            match hi {
+                Some(hi) if hi <= source_max => {
+                    let hi_c = new_value(value_types, ty);
+                    insts.push((hi_c, Inst::ConstInt { ty, value: hi }));
+                    let above = cmp_value(CmpOp::SignedGt, value, hi_c, value_types, insts);
+                    let ovf = new_value(value_types, MirType::I32);
+                    insts.push((
+                        ovf,
+                        Inst::Binary {
+                            op: BinOp::Or,
+                            lhs: below,
+                            rhs: above,
+                        },
+                    ));
+                    (ovf, "OverflowException")
+                }
+                _ => (below, "OverflowException"),
+            }
         }
     };
 
@@ -3182,11 +3709,40 @@ mod control_flow {
             let is_field_null_deref = matches!(inst.opcode, Opcode::Ldfld | Opcode::Stfld)
                 && is_reference_field(&inst.operand);
             let is_cast = matches!(inst.opcode, Opcode::UnboxAny | Opcode::Castclass);
+            let is_div_rem = matches!(
+                inst.opcode,
+                Opcode::Div | Opcode::DivUn | Opcode::Rem | Opcode::RemUn
+            );
+            let is_overflow = matches!(
+                inst.opcode,
+                Opcode::AddOvf
+                    | Opcode::AddOvfUn
+                    | Opcode::SubOvf
+                    | Opcode::SubOvfUn
+                    | Opcode::MulOvf
+                    | Opcode::MulOvfUn
+            );
+            let is_conv_ovf = matches!(
+                inst.opcode,
+                Opcode::ConvOvfI1
+                    | Opcode::ConvOvfU1
+                    | Opcode::ConvOvfI2
+                    | Opcode::ConvOvfU2
+                    | Opcode::ConvOvfI4
+                    | Opcode::ConvOvfU4
+                    | Opcode::ConvOvfU8
+            );
             let in_catch_try = handlers.iter().any(|clause| {
                 matches!(clause.kind, EhKind::Catch(_))
                     && (clause.try_range.start as usize..clause.try_range.end as usize).contains(&i)
             });
-            if ((is_may_trap_access(inst.opcode) || is_field_null_deref) && in_catch_try) || is_cast
+            if ((is_may_trap_access(inst.opcode)
+                || is_field_null_deref
+                || is_div_rem
+                || is_overflow
+                || is_conv_ovf)
+                && in_catch_try)
+                || is_cast
             {
                 leaders.insert(i);
             }

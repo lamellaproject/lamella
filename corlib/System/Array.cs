@@ -1,11 +1,13 @@
 // Lamella managed corlib (from scratch). -- System.Array
 namespace System
 {
-    public abstract class Array
+    public abstract class Array : ICloneable
     {
         public int Length { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
         [Lamella.Runtime.RuntimeProvided] public object GetValue(int index) { return null; }
         [Lamella.Runtime.RuntimeProvided] public void SetValue(object value, int index) { }
+
+        [Lamella.Runtime.RuntimeProvided] public object Clone() { return null; }
 
         public static int IndexOf(Array array, object value)
         {
@@ -71,6 +73,28 @@ namespace System
                 }
                 array.SetValue(key, j + 1);
             }
+        }
+
+        public static int BinarySearch(Array array, object value)
+        {
+            return BinarySearch(array, value, System.Collections.Comparer.Default);
+        }
+
+        public static int BinarySearch(Array array, object value, System.Collections.IComparer comparer)
+        {
+            if (array == null) throw new ArgumentNullException("array");
+            if (comparer == null) comparer = System.Collections.Comparer.Default;
+            int lo = 0;
+            int hi = array.Length - 1;
+            while (lo <= hi)
+            {
+                int mid = lo + ((hi - lo) >> 1);
+                int order = comparer.Compare(array.GetValue(mid), value);
+                if (order == 0) return mid;
+                if (order < 0) lo = mid + 1;
+                else hi = mid - 1;
+            }
+            return ~lo;
         }
     }
 }

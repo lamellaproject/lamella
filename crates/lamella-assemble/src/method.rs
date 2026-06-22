@@ -1016,12 +1016,9 @@ fn emit_compound(
             declaring_type,
             name,
         } => {
-            if tokens.is_struct(&receiver.ty) || tokens.is_enum(&receiver.ty) {
-                return Err(EmitError::Unsupported(
-                    "compound assignment to a value-type property",
-                ));
-            }
             let is_static = matches!(receiver.kind, BoundExprKind::TypeReference(_));
+            let value_type_receiver =
+                !is_static && (tokens.is_struct(&receiver.ty) || tokens.is_enum(&receiver.ty));
             let getter = tokens
                 .method(declaring_type, &crate::expr::accessor_name("get_", name), &[])
                 .ok_or(EmitError::Unsupported("property getter outside this module"))?;
@@ -1032,13 +1029,17 @@ fn emit_compound(
                     core::slice::from_ref(&target.ty),
                 )
                 .ok_or(EmitError::Unsupported("property setter outside this module"))?;
-            let opcode = if is_static {
+            let opcode = if is_static || value_type_receiver {
                 Opcode::Call
             } else {
                 Opcode::Callvirt
             };
             if !is_static {
-                emit_expression(receiver, frame, tokens, out)?;
+                if value_type_receiver {
+                    crate::expr::emit_value_type_receiver(receiver, frame, tokens, out)?;
+                } else {
+                    emit_expression(receiver, frame, tokens, out)?;
+                }
                 out.push(Instruction::simple(Opcode::Dup));
             }
             out.push(Instruction::new(opcode, Operand::Token(getter)));

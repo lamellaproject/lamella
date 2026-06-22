@@ -9,6 +9,8 @@ use crate::root::metadata_root;
 use crate::signature::{TypeSig, method_signature};
 use crate::tables::{Column, HeapSizes, TableStream};
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_metadata::CodedIndex;
 use lamella_metadata::tables::table;
@@ -48,6 +50,12 @@ pub struct ImageBuilder {
     tables: TableStream,
     bodies: Vec<u8>,
     mscorlib: Option<u32>,
+    /// `AssemblyRef` rows by assembly name, so each external type is referenced through the
+    /// assembly that actually defines it (not just mscorlib).
+    assembly_refs: BTreeMap<String, u32>,
+    /// The defining assembly of an external type, by `namespace.name`, recorded before emission
+    /// so [`ImageBuilder::type_ref`] scopes the `TypeRef` to the right `AssemblyRef`.
+    type_assemblies: BTreeMap<String, String>,
     object: Option<Token>,
     object_ctor: Option<Token>,
     /// Per-method debug info, parallel to `MethodDef`: a placeholder is appended for
@@ -69,6 +77,8 @@ impl ImageBuilder {
             tables: TableStream::new(),
             bodies: Vec::new(),
             mscorlib: None,
+            assembly_refs: BTreeMap::new(),
+            type_assemblies: BTreeMap::new(),
             object: None,
             object_ctor: None,
             method_debug: Vec::new(),
@@ -142,6 +152,39 @@ impl ImageBuilder {
         );
         self.mscorlib = Some(row);
         row
+    }
+
+    /// The `AssemblyRef` row for a named assembly (other than mscorlib), added on first use --
+    /// the same identity shape as mscorlib (a versioned, tokenless reference the host resolves
+    /// by name), so a non-CoreLib BCL type (System.Diagnostics.Trace, ...) names its assembly.
+    fn assembly_ref(&mut self, name: &str) -> u32 {
+        if let Some(row) = self.assembly_refs.get(name) {
+            return *row;
+        }
+        let interned = self.strings.intern(name);
+        let row = self.tables.add_row(
+            table::ASSEMBLY_REF,
+            alloc::vec![
+                Column::U16(4),
+                Column::U16(0),
+                Column::U16(0),
+                Column::U16(0),
+                Column::U32(0),
+                Column::BlobRef(0),
+                Column::StringRef(interned),
+                Column::StringRef(0),
+                Column::BlobRef(0),
+            ],
+        );
+        self.assembly_refs.insert(name.to_string(), row);
+        row
+    }
+
+    /// Records that the external type `qualified_name` (`namespace.name`) is defined by
+    /// `assembly`, so its `TypeRef` scopes there rather than defaulting to mscorlib.
+    pub fn set_type_assembly(&mut self, qualified_name: &str, assembly: &str) {
+        self.type_assemblies
+            .insert(qualified_name.to_string(), assembly.to_string());
     }
 
     /// The `TypeRef` token for `System.Object`, added on first use.
@@ -248,7 +291,15 @@ impl ImageBuilder {
 
     /// A `TypeRef` to `namespace.name` in `mscorlib`, for naming an external type.
     pub fn type_ref(&mut self, namespace: &str, name: &str) -> Token {
-        let scope = self.mscorlib();
+        let qualified = if namespace.is_empty() {
+            name.to_string()
+        } else {
+            alloc::format!("{namespace}.{name}")
+        };
+        let scope = match self.type_assemblies.get(&qualified).cloned() {
+            Some(assembly) if assembly != "mscorlib" => self.assembly_ref(&assembly),
+            _ => self.mscorlib(),
+        };
         let namespace = self.strings.intern(namespace);
         let name = self.strings.intern(name);
         let row = self.tables.add_row(

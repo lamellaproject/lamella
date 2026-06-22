@@ -85,6 +85,14 @@ pub enum Object {
     Array {
         /// The elements, indexed 0..len.
         elements: Vec<Value>,
+        /// The element type's true byte width (`Byte` = 1, `Int16`/`Char` = 2, `Int32` = 4,
+        /// `Int64`/`Double` = 8, ...), captured from the `newarr` element type at allocation.
+        /// This is the .NET element-type size `System.Buffer` measures byte ranges in -- distinct
+        /// from the element's *storage* width on the stack (a `byte[]` and an `int[]` both store
+        /// `Value::Int32`, but their `Buffer` widths are 1 and 4). `0` means "unknown": an array
+        /// allocated without `newarr` element-type info (e.g. `String.Split`'s result, an
+        /// `ArrayList` backing store), for which the storage width is the only available size.
+        element_size: u8,
     },
     /// A multi-dimensional (rectangular) array (II.14.2): its per-dimension lengths and
     /// its elements in row-major order. Accessed via `Get`/`Set`/`.ctor` calls on the
@@ -286,9 +294,52 @@ impl Heap {
     }
 
     /// Allocates an array with the given `elements` (already filled with the element
-    /// type's zero value) and returns a reference.
+    /// type's zero value) and returns a reference. The element type's byte width is left
+    /// "unknown" (`0`) -- for an array minted without `newarr` element-type info (e.g. a
+    /// `String.Split` result or an `ArrayList` backing store), where the element storage width
+    /// is the only size available. A `newarr`'d primitive array instead uses
+    /// [`Heap::alloc_array_sized`] so `System.Buffer` can measure its true byte length.
     pub fn alloc_array(&mut self, elements: Vec<Value>) -> ObjectRef {
-        self.alloc(Object::Array { elements })
+        self.alloc(Object::Array {
+            elements,
+            element_size: 0,
+        })
+    }
+
+    /// Allocates an array tagged with its element type's true byte width (`element_size`), the
+    /// `newarr` path: a `byte[]` is 1, a `short[]`/`char[]` 2, an `int[]` 4, a `long[]`/`double[]`
+    /// 8. `System.Buffer.BlockCopy` / `ByteLength` measure byte ranges in this width -- which a
+    /// `byte[]` and an `int[]` (both storing `Value::Int32`) cannot share. `element_size == 0`
+    /// means the element type is not a sized primitive (a reference / value-type array), recorded
+    /// as such so `Buffer` rejects it.
+    pub fn alloc_array_sized(&mut self, elements: Vec<Value>, element_size: u8) -> ObjectRef {
+        self.alloc(Object::Array {
+            elements,
+            element_size,
+        })
+    }
+
+    /// Shallow-clones an array (single- or multi-dimensional) and returns a reference to
+    /// the new array (`System.Array.Clone`). The copy is a fresh array of the same shape
+    /// holding the SAME element values: a reference element is shared (the two arrays point
+    /// at one object), a value-type element is copied bitwise -- exactly .NET's shallow
+    /// `Array.Clone`. Returns `None` if `reference` is not an array.
+    pub fn clone_array(&mut self, reference: ObjectRef) -> Option<ObjectRef> {
+        let copy = match self.get(reference)? {
+            Object::Array {
+                elements,
+                element_size,
+            } => Object::Array {
+                elements: elements.clone(),
+                element_size: *element_size,
+            },
+            Object::MdArray { dims, elements } => Object::MdArray {
+                dims: dims.clone(),
+                elements: elements.clone(),
+            },
+            _ => return None,
+        };
+        Some(self.alloc(copy))
     }
 
     /// Allocates a boxed value type tagged with the asm-folded `type_token` and returns a
@@ -405,7 +456,7 @@ impl Heap {
     #[must_use]
     pub fn array_len(&self, reference: ObjectRef) -> Option<usize> {
         match self.get(reference)? {
-            Object::Array { elements } => Some(elements.len()),
+            Object::Array { elements, .. } => Some(elements.len()),
             Object::MdArray { elements, .. } => Some(elements.len()),
             _ => None,
         }
@@ -417,7 +468,7 @@ impl Heap {
     pub fn array_dimension(&self, reference: ObjectRef, dim: i32) -> Option<i32> {
         match self.get(reference)? {
             Object::MdArray { dims, .. } => dims.get(usize::try_from(dim).ok()?).copied(),
-            Object::Array { elements } if dim == 0 => i32::try_from(elements.len()).ok(),
+            Object::Array { elements, .. } if dim == 0 => i32::try_from(elements.len()).ok(),
             _ => None,
         }
     }
@@ -431,11 +482,28 @@ impl Heap {
     #[must_use]
     pub fn array_element_width(&self, reference: ObjectRef) -> Option<usize> {
         let first = match self.get(reference)? {
-            Object::Array { elements } => elements.first(),
+            Object::Array { elements, .. } => elements.first(),
             Object::MdArray { elements, .. } => elements.first(),
             _ => return None,
         };
         first.map(value_storage_width)
+    }
+
+    /// The element type's true byte width of the array at `reference` -- the .NET element size
+    /// `System.Buffer` measures byte offsets and lengths in: a `byte[]` is 1, a `short[]`/`char[]`
+    /// 2, an `int[]` 4, a `long[]`/`double[]` 8. Recorded from the `newarr` element type at
+    /// allocation (a value the element's stack storage cannot recover, since a `byte[]` and an
+    /// `int[]` both store `Value::Int32`). `None` if `reference` is not an array, or is one whose
+    /// element type is not a sized primitive (a reference / value-type array, `element_size == 0`)
+    /// -- the case `System.Buffer.BlockCopy` rejects with `ArgumentException`.
+    #[must_use]
+    pub fn array_element_byte_size(&self, reference: ObjectRef) -> Option<usize> {
+        match self.get(reference)? {
+            Object::Array { element_size, .. } if *element_size != 0 => {
+                Some(usize::from(*element_size))
+            }
+            _ => None,
+        }
     }
 
     /// The element at `index` of the array at `reference`, if it is an array with
@@ -444,7 +512,7 @@ impl Heap {
     #[must_use]
     pub fn array_get(&self, reference: ObjectRef, index: usize) -> Option<Value> {
         match self.get(reference)? {
-            Object::Array { elements } => elements.get(index).cloned(),
+            Object::Array { elements, .. } => elements.get(index).cloned(),
             Object::MdArray { elements, .. } => elements.get(index).cloned(),
             _ => None,
         }
@@ -455,7 +523,7 @@ impl Heap {
     /// `index` is the row-major flat index (matching `array_get`).
     pub fn array_set(&mut self, reference: ObjectRef, index: usize, value: Value) -> bool {
         match self.objects.get_mut(reference.0 as usize) {
-            Some(Object::Array { elements }) => match elements.get_mut(index) {
+            Some(Object::Array { elements, .. }) => match elements.get_mut(index) {
                 Some(slot) => {
                     *slot = value;
                     true
@@ -477,7 +545,7 @@ impl Heap {
     /// the new element's index, or `None` if `reference` is not array-backed.
     pub fn array_push(&mut self, reference: ObjectRef, value: Value) -> Option<usize> {
         match self.objects.get_mut(reference.0 as usize)? {
-            Object::Array { elements } => {
+            Object::Array { elements, .. } => {
                 elements.push(value);
                 Some(elements.len() - 1)
             }
@@ -489,7 +557,7 @@ impl Heap {
     /// if `reference` is not array-backed.
     pub fn array_clear(&mut self, reference: ObjectRef) -> bool {
         match self.objects.get_mut(reference.0 as usize) {
-            Some(Object::Array { elements }) => {
+            Some(Object::Array { elements, .. }) => {
                 elements.clear();
                 true
             }
@@ -501,7 +569,7 @@ impl Heap {
     /// Returns `false` if not array-backed or `index` is out of range.
     pub fn array_remove_at(&mut self, reference: ObjectRef, index: usize) -> bool {
         match self.objects.get_mut(reference.0 as usize) {
-            Some(Object::Array { elements }) if index < elements.len() => {
+            Some(Object::Array { elements, .. }) if index < elements.len() => {
                 elements.remove(index);
                 true
             }
@@ -513,7 +581,7 @@ impl Heap {
     /// Returns `false` if not array-backed or `index` is past the end.
     pub fn array_insert(&mut self, reference: ObjectRef, index: usize, value: Value) -> bool {
         match self.objects.get_mut(reference.0 as usize) {
-            Some(Object::Array { elements }) if index <= elements.len() => {
+            Some(Object::Array { elements, .. }) if index <= elements.len() => {
                 elements.insert(index, value);
                 true
             }
@@ -572,6 +640,170 @@ impl Heap {
             return None;
         };
         md_flat_index(dims, indices)
+    }
+
+    /// The total byte length of the primitive array at `reference` (`System.Buffer.ByteLength`):
+    /// element count times the element type's byte width. `None` if `reference` is not a
+    /// single-dimensional primitive array (a reference / value-type array, the case the managed
+    /// `Buffer` rejects with `ArgumentException`).
+    #[must_use]
+    pub fn buffer_byte_length(&self, reference: ObjectRef) -> Option<usize> {
+        let width = self.array_element_byte_size(reference)?;
+        let len = match self.get(reference)? {
+            Object::Array { elements, .. } => elements.len(),
+            _ => return None,
+        };
+        len.checked_mul(width)
+    }
+
+    /// `System.Buffer.BlockCopy`: copies `count` bytes from the `src` primitive array's flat
+    /// little-endian byte image (starting at byte `src_offset`) into the `dst` primitive array's
+    /// flat little-endian byte image (starting at byte `dst_offset`). Each array is viewed as a
+    /// contiguous byte buffer in which element `i` occupies bytes `i*width .. i*width + width`,
+    /// the element value encoded little-endian -- exactly .NET's layout on a little-endian host.
+    /// Copying spans and splits elements as the byte ranges require (e.g. one `int` source element
+    /// becomes four consecutive `byte` destination elements, least-significant byte first).
+    ///
+    /// Returns `false` -- the managed wrapper's `ArgumentException` / `ArgumentNullException` /
+    /// `ArgumentOutOfRangeException` cases -- if either reference is not a sized primitive array,
+    /// an offset/count is negative-derived (the caller passes already-validated `usize`s, so this
+    /// is the bounds half), or a byte range runs past its array's byte length. On success the
+    /// destination elements are re-decoded from their modified bytes and `true` is returned.
+    pub fn buffer_block_copy(
+        &mut self,
+        src: ObjectRef,
+        src_offset: usize,
+        dst: ObjectRef,
+        dst_offset: usize,
+        count: usize,
+    ) -> bool {
+        let (Some(src_len), Some(dst_len)) = (
+            self.buffer_byte_length(src),
+            self.buffer_byte_length(dst),
+        ) else {
+            return false;
+        };
+        let (Some(src_end), Some(dst_end)) =
+            (src_offset.checked_add(count), dst_offset.checked_add(count))
+        else {
+            return false;
+        };
+        if src_end > src_len || dst_end > dst_len {
+            return false;
+        }
+        if count == 0 {
+            return true;
+        }
+        let src_bytes = self.array_to_le_bytes(src);
+        let mut dst_bytes = self.array_to_le_bytes(dst);
+        dst_bytes[dst_offset..dst_end].copy_from_slice(&src_bytes[src_offset..src_end]);
+        self.array_from_le_bytes(dst, &dst_bytes)
+    }
+
+    /// The flat little-endian byte image of the primitive array at `reference`: each element
+    /// encoded at the element type's byte width, concatenated. The inverse of
+    /// [`Heap::array_from_le_bytes`]. Assumes `reference` is a sized primitive array (the caller
+    /// checked via [`Heap::buffer_byte_length`]); a non-array yields an empty image.
+    fn array_to_le_bytes(&self, reference: ObjectRef) -> Vec<u8> {
+        let Some(width) = self.array_element_byte_size(reference) else {
+            return Vec::new();
+        };
+        let Some(Object::Array { elements, .. }) = self.get(reference) else {
+            return Vec::new();
+        };
+        let mut bytes = Vec::with_capacity(elements.len() * width);
+        for element in elements {
+            encode_element_le(element, width, &mut bytes);
+        }
+        bytes
+    }
+
+    /// Rewrites the primitive array at `reference` from a flat little-endian byte image (the form
+    /// [`Heap::array_to_le_bytes`] produces): each `width`-byte group decodes back to an element
+    /// value of the array's element kind. Returns `false` if `reference` is not a sized primitive
+    /// array, or `bytes` is not exactly the array's byte length.
+    fn array_from_le_bytes(&mut self, reference: ObjectRef, bytes: &[u8]) -> bool {
+        let Some(width) = self.array_element_byte_size(reference) else {
+            return false;
+        };
+        let Some(Object::Array { elements, .. }) = self.objects.get_mut(reference.0 as usize) else {
+            return false;
+        };
+        if bytes.len() != elements.len() * width {
+            return false;
+        }
+        for (index, element) in elements.iter_mut().enumerate() {
+            let chunk = &bytes[index * width..index * width + width];
+            *element = decode_element_le(element, chunk);
+        }
+        true
+    }
+}
+
+/// Appends the little-endian byte encoding of one primitive array element (`value`) at the
+/// element type's byte `width` to `out`. The integer kinds emit their low `width` bytes; a
+/// `width == 4` float emits the IEEE-754 single bits, a `width == 8` float the double bits --
+/// matching how `System.Buffer` views a `float[]` (4-byte elements) versus a `double[]` (8).
+fn encode_element_le(value: &Value, width: usize, out: &mut Vec<u8>) {
+    match value {
+        Value::Int32(n) => out.extend_from_slice(&(*n as u32).to_le_bytes()[..width.min(4)]),
+        Value::Int64(n) | Value::NativeInt(n) => {
+            out.extend_from_slice(&(*n as u64).to_le_bytes()[..width.min(8)]);
+        }
+        #[cfg(feature = "float")]
+        Value::Single(f) => out.extend_from_slice(&f.to_le_bytes()[..width.min(4)]),
+        #[cfg(feature = "float")]
+        Value::Float(f) if width == 4 => out.extend_from_slice(&(*f as f32).to_le_bytes()),
+        #[cfg(feature = "float")]
+        Value::Float(f) => out.extend_from_slice(&f.to_le_bytes()[..width.min(8)]),
+        _ => {}
+    }
+}
+
+/// Decodes one element from its little-endian bytes back to the kind of the existing `current`
+/// element (so the array's element kind is preserved). Integer kinds sign-extend from the byte
+/// width -- matching the RVA array initializer (`read_le_int`), so the canonicalizing `ldelem.i1`
+/// /`u1` read yields the same value either way; float kinds reinterpret the IEEE bits (4-byte
+/// single widened to the stored `f64`, 8-byte double directly).
+fn decode_element_le(current: &Value, bytes: &[u8]) -> Value {
+    match current {
+        Value::Int32(_) => Value::Int32(read_signed_le(bytes) as i32),
+        Value::Int64(_) => Value::Int64(read_signed_le(bytes)),
+        Value::NativeInt(_) => Value::NativeInt(read_signed_le(bytes)),
+        #[cfg(feature = "float")]
+        Value::Single(_) => {
+            let mut buf = [0u8; 4];
+            buf[..bytes.len().min(4)].copy_from_slice(&bytes[..bytes.len().min(4)]);
+            Value::Single(f32::from_le_bytes(buf))
+        }
+        #[cfg(feature = "float")]
+        Value::Float(_) if bytes.len() == 4 => {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(bytes);
+            Value::Float(f64::from(f32::from_le_bytes(buf)))
+        }
+        #[cfg(feature = "float")]
+        Value::Float(_) => {
+            let mut buf = [0u8; 8];
+            buf[..bytes.len().min(8)].copy_from_slice(&bytes[..bytes.len().min(8)]);
+            Value::Float(f64::from_le_bytes(buf))
+        }
+        other => other.clone(),
+    }
+}
+
+/// A little-endian integer of `bytes.len()` (1, 2, 4, or 8) bytes, sign-extended to `i64` -- the
+/// same convention the RVA initializer uses, so a negative sub-`int32` encoding round-trips.
+fn read_signed_le(bytes: &[u8]) -> i64 {
+    let mut buf = [0u8; 8];
+    let take = bytes.len().min(8);
+    buf[..take].copy_from_slice(&bytes[..take]);
+    let unsigned = u64::from_le_bytes(buf);
+    let bits = take * 8;
+    if bits < 64 && unsigned & (1 << (bits - 1)) != 0 {
+        (unsigned | (!0u64 << bits)) as i64
+    } else {
+        unsigned as i64
     }
 }
 
@@ -758,7 +990,7 @@ fn collect_refs<F: FnMut(ObjectRef)>(value: &Value, visit: &mut F) {
 fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
     match object {
         Object::Instance { fields, .. } => fields.iter().for_each(|f| collect_refs(f, visit)),
-        Object::Array { elements } => elements.iter().for_each(|e| collect_refs(e, visit)),
+        Object::Array { elements, .. } => elements.iter().for_each(|e| collect_refs(e, visit)),
         Object::MdArray { elements, .. } => elements.iter().for_each(|e| collect_refs(e, visit)),
         Object::Boxed { value, .. } => collect_refs(value, visit),
         Object::Delegate { invocations } => invocations
@@ -801,7 +1033,7 @@ fn remap_value(value: &mut Value, remap: &[Option<u32>]) {
 fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
     match object {
         Object::Instance { fields, .. } => fields.iter_mut().for_each(|f| remap_value(f, remap)),
-        Object::Array { elements } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
+        Object::Array { elements, .. } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
         Object::MdArray { elements, .. } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
         Object::Boxed { value, .. } => remap_value(value, remap),
         Object::Delegate { invocations } => invocations
@@ -833,6 +1065,8 @@ fn value_storage_width(value: &Value) -> usize {
         Value::NativeInt(_) => 8,
         #[cfg(feature = "float")]
         Value::Float(_) => 8,
+        #[cfg(feature = "float")]
+        Value::Single(_) => 4,
         _ => core::mem::size_of::<usize>(),
     }
 }

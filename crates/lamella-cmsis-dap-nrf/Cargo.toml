@@ -17,3 +17,5 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 # Tests drive a Dap against the shared probe-protocol mock; examples open a real probe.
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }
 lamella-usbhid = { path = "../lamella-usbhid" }
+# The deploy-cs example builds a C# assembly to a chip image (build_cortex_m) before flashing.
+lamella-aot = { path = "../lamella-aot", features = ["arm32"] }

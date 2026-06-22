@@ -1,0 +1,25 @@
+[package]
+name = "lamella-usbbulk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Cross-platform USB bulk transport for CMSIS-DAP v2 probes -- the v2 sibling of lamella-usbhid: WinUSB on Windows, IOKit IOUSBLib on macOS, usbfs on Linux. No 3rd-party USB crates."
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Usb",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

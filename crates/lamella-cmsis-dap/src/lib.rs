@@ -212,10 +212,12 @@ impl<T: Transport> Dap<T> {
     /// clears `C_HALT`) from having to change `C_MASKINTS` in the same write, which would itself
     /// be UNPREDICTABLE.
     pub fn step(&mut self) -> Result<(), DapError> {
+        self.write_word(FP_CTRL, 0b10)?;
         self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_HALT | C_MASKINTS)?;
         self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_STEP | C_MASKINTS)?;
         self.poll_dhcsr(S_HALT, "core halt")?;
-        self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_HALT)
+        self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_HALT)?;
+        self.write_word(FP_CTRL, 0b11)
     }
 
     /// Returns whether the core is currently halted.
@@ -460,15 +462,19 @@ mod tests {
             ack.clone(),
             ack.clone(),
             ack.clone(),
+            ack.clone(),
+            ack.clone(),
             halted,
+            ack.clone(),
+            ack.clone(),
             ack.clone(),
             ack.clone(),
         ];
         let mut dap = Dap::new(Mock::new(replies));
         dap.step().unwrap();
-        assert_eq!(&dap.transport.sent[1][4..8], &0xa05f_000bu32.to_le_bytes());
-        assert_eq!(&dap.transport.sent[3][4..8], &0xa05f_000du32.to_le_bytes());
-        assert_eq!(&dap.transport.sent[7][4..8], &0xa05f_0003u32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[3][4..8], &0xa05f_000bu32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[5][4..8], &0xa05f_000du32.to_le_bytes());
+        assert_eq!(&dap.transport.sent[9][4..8], &0xa05f_0003u32.to_le_bytes());
     }
 
     #[test]

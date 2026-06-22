@@ -1,17 +1,20 @@
 //! A navigable reader over an assembly's metadata.
 
+use crate::bytes::Reader;
 use crate::constant::{ConstantValue, decode_constant};
 use crate::flags;
-use alloc::collections::BTreeSet;
+use alloc::boxed::Box;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use crate::heaps::StringsHeap;
+use crate::heaps::{StringsHeap, read_compressed_u32};
 use crate::image::{MetadataError, MetadataImage};
 use crate::layout::{LayoutError, TargetLayout, TypeLayout, layout_value_type};
 use crate::pe::PeImage;
 use crate::rows::Tables;
 use crate::signature::{
-    MethodSig, SigType, calling, parse_field, parse_local_var_sig, parse_method, parse_type,
+    MethodSig, SigType, calling, element, parse_field, parse_local_var_sig, parse_method,
+    parse_type,
 };
 use crate::tables::{TableError, TablesHeader, table};
 use lamella_cil::{EhKind, MethodBodyImage, instruction_offsets, read_method_body};
@@ -81,8 +84,11 @@ pub fn exception_tag_for_name(namespace: &str, name: &str) -> u32 {
     hash | 0x8000_0000
 }
 
-/// FNV-1a 32-bit, folding `bytes` into the running `hash` (seed with the FNV offset basis).
-fn fnv1a32(hash: u32, bytes: &[u8]) -> u32 {
+/// FNV-1a 32-bit, folding `bytes` into the running `hash` (seed with the FNV offset basis
+/// `0x811c_9dc5`). The shared hash primitive behind every decentralized name tag -- exception tags,
+/// type tags, and the AOT's interface-method tags -- so all engines derive identical tags from
+/// metadata with no shared registry.
+pub fn fnv1a32(hash: u32, bytes: &[u8]) -> u32 {
     let mut hash = hash;
     for byte in bytes {
         hash ^= u32::from(*byte);
@@ -125,6 +131,20 @@ fn decode_exception_base_chain(blob: &[u8]) -> Option<Vec<u32>> {
     Some(tags)
 }
 
+/// The byte width of a primitive [`SigType`], when csc reuses such a type as a constant array
+/// literal's RVA holder (a blob of exactly 1/2/4/8 bytes is typed `int8`/`int16`/`int32`/`int64`
+/// rather than a synthesized `__StaticArrayInitTypeSize=N` struct). `None` for any non-primitive
+/// type (a reference, pointer, native int, or value type), which is not a size-optimized holder.
+fn primitive_field_size(sig: &SigType) -> Option<u32> {
+    Some(match sig {
+        SigType::Boolean | SigType::I1 | SigType::U1 => 1,
+        SigType::Char | SigType::I2 | SigType::U2 => 2,
+        SigType::I4 | SigType::U4 | SigType::R4 => 4,
+        SigType::I8 | SigType::U8 | SigType::R8 => 8,
+        _ => return None,
+    })
+}
+
 /// A method a call token resolves to ([`Assembly::resolve_method`]): its name,
 /// declaring type, and signature, plus where it is defined.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +178,253 @@ pub struct CustomAttribute<'a> {
     pub constructor: Token,
     /// The raw argument blob.
     pub value: &'a [u8],
+}
+
+/// One decoded argument value of a custom attribute (II.23.3): a positional (fixed)
+/// constructor argument, or a named field/property value. The set covers the elem-types
+/// a `Elem` / `FieldOrPropType` can carry for the attribute surface the interpreter
+/// instantiates -- the primitives, `string`, a `System.Type` (`typeof(X)`), and an enum
+/// value (its underlying integer). Strings and the `typeof` type name are borrowed from the
+/// blob so the decoder allocates nothing; the caller materializes them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttrArg<'a> {
+    /// A boolean.
+    Bool(bool),
+    /// A character (a UTF-16 code unit).
+    Char(u16),
+    /// A signed integer of 8/16/32/64 bits, sign-extended to `i64` (the value an enum
+    /// argument also takes -- its underlying integer).
+    Int(i64),
+    /// An unsigned integer of 8/16/32/64 bits, zero-extended to `u64`.
+    UInt(u64),
+    /// A single-precision float.
+    R4(f32),
+    /// A double-precision float.
+    R8(f64),
+    /// A `string` argument, as the borrowed UTF-8 bytes of the blob's SerString (the blob
+    /// stores attribute strings as UTF-8, II.23.3, not UTF-16 like the `Constant` heap).
+    Str(&'a str),
+    /// A null reference (a null `string` / `Type` / `object` argument: SerString length `0xFF`).
+    Null,
+    /// A `System.Type` argument (`typeof(X)`): the borrowed type NAME the blob serializes
+    /// (its reflection name, e.g. `"Program"`). The caller resolves it to a type handle.
+    Type(&'a str),
+}
+
+/// One decoded named argument of a custom attribute (II.23.3): which member it sets and
+/// its value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttrNamed<'a> {
+    /// Whether the named member is a field (`true`, sentinel `0x53`) or a property
+    /// (`false`, sentinel `0x54`).
+    pub is_field: bool,
+    /// The member's name.
+    pub name: &'a str,
+    /// The value to assign.
+    pub value: AttrArg<'a>,
+}
+
+/// The decoded positional and named arguments of a custom-attribute value blob.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DecodedAttribute<'a> {
+    /// The fixed (constructor) arguments, in declaration order.
+    pub fixed: Vec<AttrArg<'a>>,
+    /// The named field/property arguments.
+    pub named: Vec<AttrNamed<'a>>,
+}
+
+const SERIALIZATION_TYPE: u8 = 0x50;
+const SERIALIZATION_TAGGED_OBJECT: u8 = 0x51;
+const SERIALIZATION_ENUM: u8 = 0x55;
+
+/// Reads a SerString (II.23.3): a `PackedLen`-prefixed UTF-8 string, or the single byte
+/// `0xFF` for a null string. Returns `Some(None)` for the null case, `Some(Some(s))` for a
+/// present string, and `None` on a malformed/truncated blob.
+fn read_ser_string<'a>(reader: &mut Reader<'a>) -> Option<Option<&'a str>> {
+    if reader.peek_u8().ok()? == 0xFF {
+        reader.read_u8().ok()?;
+        return Some(None);
+    }
+    let len = reader.read_compressed_u32().ok()? as usize;
+    let bytes = reader.read_bytes(len).ok()?;
+    Some(Some(core::str::from_utf8(bytes).ok()?))
+}
+
+/// Reads one fixed-argument value of the given element-type signature from a custom-attribute
+/// blob (II.23.3). `enum_width` resolves an enum type NAME to its underlying integer
+/// element-type byte (e.g. `I4`), needed because an enum value is serialized at its
+/// underlying width with no inline tag. `None` on a malformed blob or an element type outside
+/// the supported attribute surface.
+fn read_attr_value<'a>(
+    reader: &mut Reader<'a>,
+    sig: &SigType,
+    enum_width: &dyn Fn(&str) -> u8,
+) -> Option<AttrArg<'a>> {
+    Some(match sig {
+        SigType::Boolean => AttrArg::Bool(reader.read_u8().ok()? != 0),
+        SigType::Char => AttrArg::Char(reader.read_u16().ok()?),
+        SigType::I1 => AttrArg::Int(i64::from(reader.read_u8().ok()? as i8)),
+        SigType::U1 => AttrArg::UInt(u64::from(reader.read_u8().ok()?)),
+        SigType::I2 => AttrArg::Int(i64::from(reader.read_u16().ok()? as i16)),
+        SigType::U2 => AttrArg::UInt(u64::from(reader.read_u16().ok()?)),
+        SigType::I4 => AttrArg::Int(i64::from(reader.read_u32().ok()? as i32)),
+        SigType::U4 => AttrArg::UInt(u64::from(reader.read_u32().ok()?)),
+        SigType::I8 => AttrArg::Int(reader.read_u64().ok()? as i64),
+        SigType::U8 => AttrArg::UInt(reader.read_u64().ok()?),
+        SigType::R4 => AttrArg::R4(f32::from_bits(reader.read_u32().ok()?)),
+        SigType::R8 => AttrArg::R8(f64::from_bits(reader.read_u64().ok()?)),
+        SigType::String => match read_ser_string(reader)? {
+            Some(text) => AttrArg::Str(text),
+            None => AttrArg::Null,
+        },
+        SigType::ValueType(_) => read_attr_value(reader, &SigType::I4, enum_width)?,
+        SigType::Class(_) | SigType::Object => return read_tagged_value(reader, enum_width),
+        _ => return None,
+    })
+}
+
+/// Reads a tagged value (a `System.Type`/`object` fixed argument, a named-argument value, or a
+/// boxed `object` element): a one-byte `FieldOrPropType` describing the value's type, then the
+/// value (II.23.3).
+fn read_tagged_value<'a>(
+    reader: &mut Reader<'a>,
+    enum_width: &dyn Fn(&str) -> u8,
+) -> Option<AttrArg<'a>> {
+    let tag = reader.read_u8().ok()?;
+    match tag {
+        SERIALIZATION_TYPE => match read_ser_string(reader)? {
+            Some(name) => Some(AttrArg::Type(name)),
+            None => Some(AttrArg::Null),
+        },
+        SERIALIZATION_ENUM => {
+            let enum_name = read_ser_string(reader)??;
+            let width_sig = match enum_width(enum_name) {
+                element::I1 => SigType::I1,
+                element::U1 => SigType::U1,
+                element::I2 => SigType::I2,
+                element::U2 => SigType::U2,
+                element::U4 => SigType::U4,
+                element::I8 => SigType::I8,
+                element::U8 => SigType::U8,
+                _ => SigType::I4,
+            };
+            read_attr_value(reader, &width_sig, enum_width)
+        }
+        SERIALIZATION_TAGGED_OBJECT => read_tagged_value(reader, enum_width),
+        element::BOOLEAN => read_attr_value(reader, &SigType::Boolean, enum_width),
+        element::CHAR => read_attr_value(reader, &SigType::Char, enum_width),
+        element::I1 => read_attr_value(reader, &SigType::I1, enum_width),
+        element::U1 => read_attr_value(reader, &SigType::U1, enum_width),
+        element::I2 => read_attr_value(reader, &SigType::I2, enum_width),
+        element::U2 => read_attr_value(reader, &SigType::U2, enum_width),
+        element::I4 => read_attr_value(reader, &SigType::I4, enum_width),
+        element::U4 => read_attr_value(reader, &SigType::U4, enum_width),
+        element::I8 => read_attr_value(reader, &SigType::I8, enum_width),
+        element::U8 => read_attr_value(reader, &SigType::U8, enum_width),
+        element::R4 => read_attr_value(reader, &SigType::R4, enum_width),
+        element::R8 => read_attr_value(reader, &SigType::R8, enum_width),
+        element::STRING => read_attr_value(reader, &SigType::String, enum_width),
+        _ => None,
+    }
+}
+
+/// Decodes a custom-attribute value blob (II.23.3) against its constructor's parameter
+/// signature: the `0x0001` prolog, one fixed argument per `ctor_params` entry (each read at
+/// that parameter's type), then the named-argument count and that many `(FIELD|PROPERTY,
+/// type, name, value)` records. `enum_width` maps an enum type NAME (as the blob serializes
+/// it) to its underlying integer element-type byte, so an enum-typed argument is read at the
+/// right width; return [`element::I4`] when the enum is unknown (the C# default). Returns the
+/// decoded fixed and named arguments, or `None` if the blob is malformed (e.g. a wrong prolog
+/// or a truncated value).
+#[must_use]
+pub fn decode_custom_attribute<'a>(
+    blob: &'a [u8],
+    ctor_params: &[SigType],
+    enum_width: &dyn Fn(&str) -> u8,
+) -> Option<DecodedAttribute<'a>> {
+    let mut reader = Reader::new(blob);
+    if reader.read_u16().ok()? != 0x0001 {
+        return None;
+    }
+    let mut fixed = Vec::with_capacity(ctor_params.len());
+    for param in ctor_params {
+        fixed.push(read_attr_value(&mut reader, param, enum_width)?);
+    }
+    let named_count = reader.read_u16().unwrap_or(0);
+    let mut named = Vec::with_capacity(named_count as usize);
+    for _ in 0..named_count {
+        let is_field = match reader.read_u8().ok()? {
+            0x53 => true,
+            0x54 => false,
+            _ => return None,
+        };
+        let field_or_prop = reader.read_u8().ok()?;
+        let enum_name = if field_or_prop == SERIALIZATION_ENUM {
+            Some(read_ser_string(&mut reader)??)
+        } else {
+            None
+        };
+        let name = read_ser_string(&mut reader)??;
+        let value = match field_or_prop {
+            SERIALIZATION_TYPE => match read_ser_string(&mut reader)? {
+                Some(type_name) => AttrArg::Type(type_name),
+                None => AttrArg::Null,
+            },
+            SERIALIZATION_ENUM => read_enum_value(&mut reader, enum_name?, enum_width)?,
+            SERIALIZATION_TAGGED_OBJECT | element::OBJECT => {
+                read_tagged_value(&mut reader, enum_width)?
+            }
+            elem => read_attr_value(&mut reader, &elem_to_sig(elem)?, enum_width)?,
+        };
+        named.push(AttrNamed {
+            is_field,
+            name,
+            value,
+        });
+    }
+    Some(DecodedAttribute { fixed, named })
+}
+
+/// Maps a named-argument `FieldOrPropType` element-type byte to the signature type its value
+/// is read as (the subset a custom attribute may carry, II.23.3). `None` for an unsupported
+/// element type.
+fn elem_to_sig(elem: u8) -> Option<SigType> {
+    Some(match elem {
+        element::BOOLEAN => SigType::Boolean,
+        element::CHAR => SigType::Char,
+        element::I1 => SigType::I1,
+        element::U1 => SigType::U1,
+        element::I2 => SigType::I2,
+        element::U2 => SigType::U2,
+        element::I4 => SigType::I4,
+        element::U4 => SigType::U4,
+        element::I8 => SigType::I8,
+        element::U8 => SigType::U8,
+        element::R4 => SigType::R4,
+        element::R8 => SigType::R8,
+        element::STRING => SigType::String,
+        element::OBJECT => SigType::Object,
+        _ => return None,
+    })
+}
+
+/// Reads an enum-typed value at the enum's underlying width, resolved through `enum_width`.
+fn read_enum_value<'a>(
+    reader: &mut Reader<'a>,
+    enum_name: &str,
+    enum_width: &dyn Fn(&str) -> u8,
+) -> Option<AttrArg<'a>> {
+    let sig = match enum_width(enum_name) {
+        element::I1 => SigType::I1,
+        element::U1 => SigType::U1,
+        element::I2 => SigType::I2,
+        element::U2 => SigType::U2,
+        element::U4 => SigType::U4,
+        element::I8 => SigType::I8,
+        element::U8 => SigType::U8,
+        _ => SigType::I4,
+    };
+    read_attr_value(reader, &sig, enum_width)
 }
 
 /// A read-only, navigable view of one assembly's metadata.
@@ -382,23 +649,33 @@ impl<'a> Assembly<'a> {
         PeImage::parse(file).ok()?.slice_at_rva(rva, size).ok()
     }
 
-    /// The byte size of an RVA-backed field's initializer blob: the `ClassSize` of the
-    /// field's value type (the synthesized `__StaticArrayInitTypeSize=N`), from `ClassLayout`.
+    /// The byte size of an RVA-backed field's initializer blob. Two shapes occur, both emitted
+    /// by csc for a constant array literal `T[] a = {...}`:
+    ///   * a synthesized value type (`__StaticArrayInitTypeSize=N`) -- the size is its
+    ///     `ClassLayout` `ClassSize` (any blob length);
+    ///   * a PRIMITIVE field reused as the holder when the blob is exactly 1/2/4/8 bytes (csc's
+    ///     size optimization types it `int8`/`int16`/`int32`/`int64` rather than minting a struct)
+    ///     -- the size is the primitive's width. Without this case a power-of-two-sized literal
+    ///     (e.g. `byte[]{1,2,3,4}` in an `int32` field, or `int[]{42}`) had no resolvable size, so
+    ///     `field_rva_data` returned `None` and `InitializeArray` silently left the array zeroed.
+    /// `None` if the field's type is neither (or its value type has no `ClassLayout`).
     fn field_rva_blob_size(&self, field_index: u32) -> Option<u32> {
         let blob = self
             .tables
             .row(table::FIELD, field_index)
             .and_then(|row| self.image.blob().get(row.raw(2)).ok())?;
-        let SigType::ValueType(type_token) = parse_field(blob).ok()? else {
-            return None;
-        };
-        if type_token.table() != table::TYPE_DEF {
-            return None;
+        match parse_field(blob).ok()? {
+            SigType::ValueType(type_token) => {
+                if type_token.table() != table::TYPE_DEF {
+                    return None;
+                }
+                (1..=self.tables.row_count(table::CLASS_LAYOUT))
+                    .filter_map(|index| self.tables.row(table::CLASS_LAYOUT, index))
+                    .find(|row| row.raw(2) == type_token.row())
+                    .map(|row| row.raw(1))
+            }
+            primitive => primitive_field_size(&primitive),
         }
-        (1..=self.tables.row_count(table::CLASS_LAYOUT))
-            .filter_map(|index| self.tables.row(table::CLASS_LAYOUT, index))
-            .find(|row| row.raw(2) == type_token.row())
-            .map(|row| row.raw(1))
     }
 
     /// Resolves a `call`/`callvirt` method token to its target: the name, declaring
@@ -627,6 +904,38 @@ impl<'a> Assembly<'a> {
         params
     }
 
+    /// Methods marked `[System.Diagnostics.Conditional("SYMBOL")]` (24.4.2), as a map from the
+    /// `MethodDef` row to its symbols. A call to such a method is omitted unless one of the
+    /// symbols is defined at the call site. One pass over `CustomAttribute` (like
+    /// [`Assembly::param_array_params`]) to avoid an O(rows)-per-method scan of the BCL.
+    #[must_use]
+    pub fn conditional_symbols(&self) -> BTreeMap<u32, Vec<Box<str>>> {
+        let mut map: BTreeMap<u32, Vec<Box<str>>> = BTreeMap::new();
+        for index in 1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE) {
+            let Some(row) = self.tables.row(table::CUSTOM_ATTRIBUTE, index) else {
+                continue;
+            };
+            let parent = row.token(0);
+            if parent.table() != table::METHOD_DEF {
+                continue;
+            }
+            let is_conditional = self
+                .resolve_method(row.token(1))
+                .and_then(|target| target.declaring_type)
+                .is_some_and(|name| {
+                    name.namespace == "System.Diagnostics" && name.name == "ConditionalAttribute"
+                });
+            if !is_conditional {
+                continue;
+            }
+            let blob = self.image.blob().get(row.raw(2)).unwrap_or(&[]);
+            if let Some(symbol) = conditional_attribute_symbol(blob) {
+                map.entry(parent.row()).or_default().push(symbol);
+            }
+        }
+        map
+    }
+
     /// The constant value attached to `parent` (a Field/Param/Property token),
     /// from the `Constant` table (II.22.9), or `None` if it has no constant.
     #[must_use]
@@ -683,6 +992,15 @@ impl<'a> Assembly<'a> {
         };
         (first, last)
     }
+}
+
+/// The single string argument of a `[Conditional("X")]` value blob (II.23.3): the `0x0001`
+/// prolog, then a `SerString` (a compressed length, then UTF-8 bytes). `None` if malformed.
+fn conditional_attribute_symbol(blob: &[u8]) -> Option<Box<str>> {
+    let rest = blob.get(2..)?;
+    let (length, consumed) = read_compressed_u32(rest).ok()?;
+    let bytes = rest.get(consumed..consumed + length as usize)?;
+    core::str::from_utf8(bytes).ok().map(Box::from)
 }
 
 /// A navigable type definition (II.22.37).
@@ -870,6 +1188,12 @@ impl<'a> Property<'a> {
     pub fn name(&self) -> Option<&'a str> {
         let row = self.assembly.tables.row(table::PROPERTY, self.index)?;
         self.assembly.strings().get(row.raw(1)).ok()
+    }
+
+    /// This property's `Property` metadata token (e.g. for its custom attributes).
+    #[must_use]
+    pub fn token(&self) -> Token {
+        Token::new(table::PROPERTY, self.index)
     }
 
     /// The property attribute flags (II.23.1.14).
@@ -1339,6 +1663,71 @@ mod tests {
     use alloc::vec::Vec;
 
     const METADATA_SIGNATURE: u32 = 0x424A_5342;
+
+    #[test]
+    fn decodes_positional_int_and_string_arguments() {
+        let blob = [
+            0x01, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x06, b'a', b'n', b's', b'w', b'e', b'r', 0x00, 0x00,
+        ];
+        let decoded =
+            decode_custom_attribute(&blob, &[SigType::I4, SigType::String], &|_| element::I4)
+                .unwrap();
+        assert_eq!(decoded.fixed, [AttrArg::Int(42), AttrArg::Str("answer")]);
+        assert!(decoded.named.is_empty());
+    }
+
+    #[test]
+    fn decodes_named_string_and_enum_arguments() {
+        let blob = [
+            0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x53, 0x0e, 0x04, b'N', b'o', b't', b'e',
+            0x02, b'h', b'i', 0x53, 0x55, 0x05, b'C', b'o', b'l', b'o', b'r', 0x05, b'S', b'h', b'a',
+            b'd', b'e', 0x28, 0x00, 0x00, 0x00,
+        ];
+        let decoded = decode_custom_attribute(&blob, &[SigType::I4], &|name| {
+            assert_eq!(name, "Color");
+            element::I4
+        })
+        .unwrap();
+        assert_eq!(decoded.fixed, [AttrArg::Int(2)]);
+        assert_eq!(
+            decoded.named,
+            [
+                AttrNamed {
+                    is_field: true,
+                    name: "Note",
+                    value: AttrArg::Str("hi"),
+                },
+                AttrNamed {
+                    is_field: true,
+                    name: "Shade",
+                    value: AttrArg::Int(40),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_named_typeof_argument() {
+        let blob = [
+            0x01, 0x00, 0x01, 0x00, 0x53, 0x50, 0x04, b'K', b'i', b'n', b'd', 0x07, b'P', b'r', b'o',
+            b'g', b'r', b'a', b'm',
+        ];
+        let decoded = decode_custom_attribute(&blob, &[], &|_| element::I4).unwrap();
+        assert!(decoded.fixed.is_empty());
+        assert_eq!(
+            decoded.named,
+            [AttrNamed {
+                is_field: true,
+                name: "Kind",
+                value: AttrArg::Type("Program"),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_wrong_prolog_is_rejected() {
+        assert!(decode_custom_attribute(&[0x02, 0x00], &[], &|_| element::I4).is_none());
+    }
 
     /// Builds a metadata root with a `#Strings` heap and a `#~` stream holding one
     /// Module row and two TypeDef rows (`<Module>` and `Foo.Bar`).

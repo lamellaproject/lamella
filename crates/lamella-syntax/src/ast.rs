@@ -3,6 +3,7 @@
 use crate::span::Span;
 use crate::token::{IntegerSuffix, RealSuffix};
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -490,6 +491,9 @@ pub struct CompilationUnit {
     pub members: Vec<NamespaceMember>,
     /// The byte range the unit covers.
     pub span: Span,
+    /// The `#define`d preprocessor symbols (9.5.3) -- the set a `[Conditional]` call is checked
+    /// against to decide inclusion (24.4.2). Empty when none are defined.
+    pub defined_symbols: BTreeSet<Box<str>>,
 }
 
 /// A dotted name such as `System.Collections` (10.8).

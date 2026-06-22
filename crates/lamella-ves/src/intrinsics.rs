@@ -1,10 +1,12 @@
 //! Runtime-native intrinsics: the Rust implementations a few BCL methods bind to.
 
-use crate::interp::Vm;
-use crate::module::Module;
-use crate::object::{Object, decode_string};
+use crate::interp::{Session, Vm};
+use crate::module::{AttrValue, Module};
+use crate::object::{Object, ObjectRef, decode_string};
 use crate::trap::Trap;
 use crate::value::Value;
+#[cfg(feature = "float")]
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_cil::Opcode;
@@ -96,6 +98,41 @@ pub fn console_write_line_int64(
     Ok(None)
 }
 
+/// `System.Console.WriteLine(uint)`: write a `uint32` in decimal -- UNSIGNED, the full
+/// magnitude with no sign. A `uint` rides the evaluation stack as an `int32` whose bits ARE
+/// the unsigned value, so it is reinterpreted (`as u32`) before formatting.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int32`.
+pub fn console_write_line_uint32(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_line_text(vm, &(value as u32).to_string());
+    Ok(None)
+}
+
+/// `System.Console.WriteLine(ulong)`: write a `uint64` in decimal -- UNSIGNED. A `ulong` rides
+/// the stack as an `int64` whose bits ARE the unsigned value (reinterpreted `as u64`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int64`.
+pub fn console_write_line_uint64(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int64(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_line_text(vm, &(value as u64).to_string());
+    Ok(None)
+}
+
 /// `System.Console.WriteLine(bool)`: write `True` or `False`. A `bool` is an
 /// `int32` on the evaluation stack.
 ///
@@ -144,6 +181,31 @@ pub fn console_write(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Op
                 .ok_or(Trap::TypeMismatch(Opcode::Call))?
                 .to_vec();
             vm.write(&chars);
+        }
+        Some(Value::Null) | None => {}
+        Some(_) => return Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+    Ok(None)
+}
+
+/// `System.Diagnostics.DefaultTraceListener` debug sink: write a string's characters to
+/// the runtime DEBUG channel (the host renders it to STDERR), no terminator. The single
+/// argument is a string or null reference; null writes nothing. This is the
+/// `[RuntimeProvided]` primitive the managed `DefaultTraceListener` calls -- the
+/// "debug channel" a developer sees from a bare `Debug.WriteLine` with no listener config,
+/// conceptually distinct from `Console.Out`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a string or null reference.
+pub fn debug_write(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    match args.first() {
+        Some(Value::Object(reference)) => {
+            let chars: Vec<u16> = vm
+                .heap()
+                .as_string(*reference)
+                .ok_or(Trap::TypeMismatch(Opcode::Call))?
+                .to_vec();
+            vm.debug_write(&chars);
         }
         Some(Value::Null) | None => {}
         Some(_) => return Err(Trap::TypeMismatch(Opcode::Call)),
@@ -227,6 +289,19 @@ fn format_double(value: f64) -> String {
     value.to_string()
 }
 
+/// Formats an `f32` as .NET's `Single.ToString()` does: the shortest round-trippable text for a
+/// finite value (Rust's `f32` formatter chooses the same fewest digits .NET does), and
+/// `Infinity` / `-Infinity` / `NaN` for the specials. The f32 path is what makes a Single render
+/// to its own (shorter) digits rather than the f64-widened decimal -- e.g. `0.1f` is "0.1", and a
+/// single-precision sum like `0.1f + 0.2f` is "0.3", where the double is "0.30000000000000004".
+#[cfg(feature = "float")]
+fn format_single(value: f32) -> String {
+    if value.is_infinite() {
+        return String::from(if value < 0.0 { "-Infinity" } else { "Infinity" });
+    }
+    value.to_string()
+}
+
 /// `System.Console.WriteLine(double)`: write a double, then a line terminator.
 ///
 /// # Errors
@@ -258,6 +333,40 @@ pub fn console_write_double(
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
     write_text(vm, &format_double(value));
+    Ok(None)
+}
+
+/// `System.Console.WriteLine(float)`: write a single, then a line terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a single-precision value.
+#[cfg(feature = "float")]
+pub fn console_write_line_single(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Single(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_line_text(vm, &format_single(value));
+    Ok(None)
+}
+
+/// `System.Console.Write(float)`: write a single, no terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a single-precision value.
+#[cfg(feature = "float")]
+pub fn console_write_single(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Single(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_text(vm, &format_single(value));
     Ok(None)
 }
 
@@ -403,8 +512,10 @@ pub fn string_is_null_or_empty(
 /// length, giving the empty string). The string is `this`.
 ///
 /// # Errors
-/// [`Trap::TypeMismatch`] for bad argument types; [`Trap::IndexOutOfRange`] if
-/// `startIndex` is negative or past the end.
+/// [`Trap::TypeMismatch`] for bad argument types; [`Trap::ArgumentOutOfRange`] if
+/// `startIndex` is negative or past the end -- the `ArgumentOutOfRangeException` site, matching
+/// .NET's `String.Substring` (its out-of-range exception is `ArgumentOutOfRangeException`, not
+/// the array indexer's `IndexOutOfRangeException`).
 pub fn string_substring(
     vm: &mut Vm,
     _module: &Module,
@@ -417,7 +528,7 @@ pub fn string_substring(
     let start = usize::try_from(start)
         .ok()
         .filter(|&start| start <= chars.len())
-        .ok_or(Trap::IndexOutOfRange(start))?;
+        .ok_or(Trap::ArgumentOutOfRange(0))?;
     let reference = vm.heap_mut().alloc_string(&chars[start..]);
     Ok(Some(Value::Object(reference)))
 }
@@ -425,8 +536,8 @@ pub fn string_substring(
 /// `System.String.Substring(int, int)`: `length` units from `startIndex`.
 ///
 /// # Errors
-/// [`Trap::TypeMismatch`] for bad argument types; [`Trap::IndexOutOfRange`] if the
-/// range falls outside the string.
+/// [`Trap::TypeMismatch`] for bad argument types; [`Trap::ArgumentOutOfRange`] if the range
+/// falls outside the string (the `ArgumentOutOfRangeException` site, as in .NET).
 pub fn string_substring_len(
     vm: &mut Vm,
     _module: &Module,
@@ -439,12 +550,12 @@ pub fn string_substring_len(
     let Some(&Value::Int32(length)) = args.get(2) else {
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
-    let start = usize::try_from(start).map_err(|_| Trap::IndexOutOfRange(start))?;
-    let count = usize::try_from(length).map_err(|_| Trap::IndexOutOfRange(length))?;
+    let start = usize::try_from(start).map_err(|_| Trap::ArgumentOutOfRange(0))?;
+    let count = usize::try_from(length).map_err(|_| Trap::ArgumentOutOfRange(1))?;
     let end = start
         .checked_add(count)
         .filter(|&end| end <= chars.len())
-        .ok_or(Trap::IndexOutOfRange(length))?;
+        .ok_or(Trap::ArgumentOutOfRange(1))?;
     let reference = vm.heap_mut().alloc_string(&chars[start..end]);
     Ok(Some(Value::Object(reference)))
 }
@@ -2063,12 +2174,11 @@ mod extended {
     }
 
     /// `System.BitConverter.SingleToInt32Bits(float)`: the IEEE-754 bit pattern of the value
-    /// as a single-precision `Int32`. The VM holds a `float` as an `f64`, so it is narrowed
-    /// to `f32` first (it already carries a single-rounded value), matching .NET's 4-byte
-    /// `GetBytes(float)`.
+    /// as a single-precision `Int32`. The VM holds a `float` as a true `f32`, so the bits are
+    /// read directly -- matching .NET's 4-byte `GetBytes(float)`.
     ///
     /// # Errors
-    /// [`Trap::TypeMismatch`] for a non-floating argument.
+    /// [`Trap::TypeMismatch`] for a non-single argument.
     #[cfg(feature = "float")]
     pub fn bitconverter_single_to_int32_bits(
         _vm: &mut Vm,
@@ -2076,15 +2186,14 @@ mod extended {
         args: &[Value],
     ) -> Result<Option<Value>, Trap> {
         let value = match args.first() {
-            Some(&Value::Float(value)) => value,
+            Some(&Value::Single(value)) => value,
             _ => return Err(Trap::TypeMismatch(Opcode::Call)),
         };
-        Ok(Some(Value::Int32((value as f32).to_bits() as i32)))
+        Ok(Some(Value::Int32(value.to_bits() as i32)))
     }
 
     /// `System.BitConverter.Int32BitsToSingle(int)`: the `float` whose single-precision
-    /// IEEE-754 bit pattern is `value` (widened to the VM's `f64` float). The inverse of
-    /// [`bitconverter_single_to_int32_bits`].
+    /// IEEE-754 bit pattern is `value`. The inverse of [`bitconverter_single_to_int32_bits`].
     ///
     /// # Errors
     /// [`Trap::TypeMismatch`] for a non-int argument.
@@ -2098,7 +2207,7 @@ mod extended {
             Some(&Value::Int32(bits)) => bits,
             _ => return Err(Trap::TypeMismatch(Opcode::Call)),
         };
-        Ok(Some(Value::Float(f64::from(f32::from_bits(bits as u32)))))
+        Ok(Some(Value::Single(f32::from_bits(bits as u32))))
     }
 
     /// An `i32` index argument as a `usize` (a negative index is out of range).
@@ -2680,6 +2789,127 @@ pub fn double_to_string(
     Ok(Some(alloc_str(vm, &format_double(value))))
 }
 
+/// `System.Single.ToString()`: the value's shortest round-trippable text (Infinity / NaN spelled
+/// out), rendered at f32 precision so a Single prints its own digits, not the f64-widened decimal.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `this` is not a `Single`.
+#[cfg(feature = "float")]
+pub fn single_to_string(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = match args.first() {
+        Some(Value::Single(value)) => *value,
+        Some(Value::Object(reference)) => match vm.heap().boxed_value(*reference) {
+            Some(Value::Single(value)) => value,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        },
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    Ok(Some(alloc_str(vm, &format_single(value))))
+}
+
+/// `System.Single.ToFixed(float, int)`: the value rendered with EXACTLY `decimals` fractional
+/// digits (.NET's "F" formatter for a Single), rounding the exact decimal value of the IEEE-754
+/// single half-to-even. The Single is widened to `f64` only AFTER it already carries the
+/// single-rounded value, so the fixed-point digits are those of the f32 -- matching .NET.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the value is not a single or the precision is not an `Int32`.
+#[cfg(feature = "float")]
+pub fn single_to_fixed(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = match args.first() {
+        Some(&Value::Single(value)) => value,
+        Some(&Value::Object(reference)) => match vm.heap().boxed_value(reference) {
+            Some(Value::Single(value)) => value,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        },
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let decimals = match args.get(1) {
+        Some(&Value::Int32(decimals)) => decimals.max(0) as usize,
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let text = if value.is_nan() {
+        String::from("NaN")
+    } else if value.is_infinite() {
+        String::from(if value < 0.0 { "-Infinity" } else { "Infinity" })
+    } else {
+        format!("{:.*}", decimals, f64::from(value))
+    };
+    Ok(Some(alloc_str(vm, &text)))
+}
+
+/// `System.Double.ToFixed(double, int)`: the value rendered with EXACTLY `decimals`
+/// fractional digits (.NET's "F" / "N"-without-grouping body). Rust's core float
+/// formatter (`{:.*}`) rounds the EXACT decimal value of the IEEE-754 double
+/// half-to-even, byte-for-byte the way .NET's fixed-point formatter does -- so
+/// `(2.005).ToString("F2")` is "2.00" (not "2.01") and `(9.995).ToString("F2")` is
+/// "9.99", matching .NET. The specials carry .NET's spelling (`{:.*}` would print
+/// "inf"/"NaN" without a sign on -inf), so they are handled here rather than delegated.
+/// Negative precision is treated as zero. The managed `Double.ToString` calls this for
+/// the digits, then does any thousands grouping ("N") in managed code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the value is not a double or the precision is not an `Int32`.
+#[cfg(feature = "float")]
+pub fn double_to_fixed(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = match args.first() {
+        Some(&Value::Float(value)) => value,
+        Some(&Value::Object(reference)) => match vm.heap().boxed_value(reference) {
+            Some(Value::Float(value)) => value,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        },
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let decimals = match args.get(1) {
+        Some(&Value::Int32(decimals)) => decimals.max(0) as usize,
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let text = if value.is_nan() {
+        String::from("NaN")
+    } else if value.is_infinite() {
+        String::from(if value < 0.0 { "-Infinity" } else { "Infinity" })
+    } else {
+        format!("{value:.decimals$}")
+    };
+    Ok(Some(alloc_str(vm, &text)))
+}
+
+/// `System.Single::ParseValid(string)`: the numeric conversion behind the managed `Single.Parse` /
+/// `TryParse`, which have ALREADY validated the format (so the only work left is the
+/// decimal-to-nearest-single rounding managed C# cannot do without `unsafe`). Recognizes the .NET
+/// specials (`NaN` / `[+-]Infinity`, case-insensitively, after trimming) and otherwise rounds the
+/// decimal with Rust's `f32` parser -- matching .NET's invariant rounding. Malformed input cannot
+/// reach here (the managed validator gates it), but a stray case still traps rather than guessing.
+///
+/// # Errors
+/// [`Trap::InvalidArgument`] if the (already-validated) text somehow does not parse;
+/// [`Trap::TypeMismatch`] for a non-string argument.
+#[cfg(feature = "float")]
+pub fn single_parse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let text = String::from_utf16(&chars).map_err(|_| Trap::InvalidArgument)?;
+    let trimmed = text.trim();
+    let value = match trimmed.to_ascii_lowercase().as_str() {
+        "nan" => f32::NAN,
+        "infinity" | "+infinity" => f32::INFINITY,
+        "-infinity" => f32::NEG_INFINITY,
+        _ => trimmed.parse::<f32>().map_err(|_| Trap::InvalidArgument)?,
+    };
+    Ok(Some(Value::Single(value)))
+}
+
 /// `System.Object.ToString()`: a value's display text -- a boxed value type by its
 /// representation, a string verbatim, anything else as "object".
 ///
@@ -2764,8 +2994,8 @@ pub fn string_concat_object3(
 /// queried by that handle directly.
 fn boxed_text(module: &Module, type_token: u64, value: &Value) -> String {
     if let Some(integer) = enum_underlying(value) {
-        if let Some(name) = module.enum_value_name_by_handle(type_token, integer) {
-            return String::from(name);
+        if let Some(text) = module.enum_name_or_flags(type_token, integer, false) {
+            return text;
         }
     }
     scalar_text(value)
@@ -2787,6 +3017,8 @@ fn scalar_text(value: &Value) -> String {
         Value::Int64(value) | Value::NativeInt(value) => value.to_string(),
         #[cfg(feature = "float")]
         Value::Float(value) => format_double(*value),
+        #[cfg(feature = "float")]
+        Value::Single(value) => format_single(*value),
         _ => String::from("object"),
     }
 }
@@ -3077,6 +3309,130 @@ pub fn enum_is_defined(
     Ok(Some(Value::Int32(i32::from(defined))))
 }
 
+/// The underlying integer carried by an `Enum` argument -- a boxed enum value (the common
+/// `(object)value` / value passed where an `object` is expected) or a bare numeric value.
+fn enum_arg_value(vm: &Vm, arg: Option<&Value>) -> Option<i64> {
+    match arg {
+        Some(Value::Object(reference)) => match vm.heap().get(*reference) {
+            Some(Object::Boxed { value, .. }) => enum_underlying(value),
+            _ => None,
+        },
+        other => enum_underlying(other?),
+    }
+}
+
+/// `System.Enum.GetName(Type, object)`: the name of the member whose underlying value equals
+/// `object`, or null. Not flags-aware -- only an exactly-named member yields a name (matching
+/// .NET's `GetName`, which never decomposes).
+///
+/// # Errors
+/// Never errors (an unrecognized value or type yields null).
+pub fn enum_get_name(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let token = type_handle_token(args.first());
+    let name = enum_arg_value(vm, args.get(1))
+        .and_then(|value| module.enum_value_name_resolved(token, value));
+    match name {
+        Some(name) => {
+            let chars: Vec<u16> = name.encode_utf16().collect();
+            Ok(Some(Value::Object(vm.heap_mut().alloc_string(&chars))))
+        }
+        None => Ok(Some(Value::Null)),
+    }
+}
+
+/// `System.Enum.GetNames(Type)`: a `string[]` of the member names, ascending by underlying
+/// value (the order .NET reports).
+///
+/// # Errors
+/// Never errors (an unknown type yields an empty array).
+pub fn enum_get_names(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let token = type_handle_token(args.first());
+    let members = module.enum_members_by_handle(token).unwrap_or_default();
+    let mut elements: Vec<Value> = Vec::with_capacity(members.len());
+    for (_, name) in members {
+        let chars: Vec<u16> = name.encode_utf16().collect();
+        elements.push(Value::Object(vm.heap_mut().alloc_string(&chars)));
+    }
+    let array = vm.heap_mut().alloc_array(elements);
+    Ok(Some(Value::Object(array)))
+}
+
+/// `System.Enum.GetValues(Type)`: an array of the enum's underlying values, ascending by value
+/// (the order .NET reports). Each element is a boxed enum value tagged with the enum's type, so
+/// an `Enum.GetValues(t)` element unboxes to its declared enum type (and casts to its underlying
+/// integer) -- matching the `Array` of the enum type .NET returns.
+///
+/// # Errors
+/// Never errors (an unknown type yields an empty array).
+pub fn enum_get_values(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let token = type_handle_token(args.first());
+    let wide = module.enum_is_wide_by_handle(token);
+    let members = module.enum_members_by_handle(token).unwrap_or_default();
+    let mut elements: Vec<Value> = Vec::with_capacity(members.len());
+    for (value, _) in members {
+        let boxed_value = if wide {
+            Value::Int64(value)
+        } else {
+            Value::Int32(value as i32)
+        };
+        let boxed = vm.heap_mut().alloc_boxed(token, boxed_value);
+        elements.push(Value::Object(boxed));
+    }
+    let array = vm.heap_mut().alloc_array(elements);
+    Ok(Some(Value::Object(array)))
+}
+
+/// `System.Enum.Format(Type, object, string)`: renders the enum value per the format string
+/// ("G"/"D"/"X"/"F"), matching .NET byte-for-byte. "G" = the member name (flags-decomposed for a
+/// `[Flags]` enum) or the decimal number; "D" = the decimal underlying value; "X" = the
+/// underlying value in UPPERCASE hex, zero-padded to the underlying width; "F" = flags-style
+/// decomposition regardless of `[Flags]`, else the number.
+///
+/// # Errors
+/// Never errors (an unrecognized format renders as "G"; an unknown value falls back to the number).
+pub fn enum_format(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let token = type_handle_token(args.first());
+    let value = enum_arg_value(vm, args.get(1)).unwrap_or(0);
+    let format = string_value(vm, args.get(2)).unwrap_or_default();
+    let text = format_enum(module, token, value, &format);
+    let chars: Vec<u16> = text.encode_utf16().collect();
+    Ok(Some(Value::Object(vm.heap_mut().alloc_string(&chars))))
+}
+
+/// Renders `value` of the enum named by `token` per a single-letter `format` ("G"/"D"/"X"/"F",
+/// case-insensitive), defaulting to "G" for anything else -- the shared engine behind
+/// `Enum.Format` and `Enum.ToString(string)`.
+fn format_enum(module: &Module, token: u64, value: i64, format: &str) -> String {
+    let kind = format.chars().next().unwrap_or('G').to_ascii_uppercase();
+    match kind {
+        'D' => value.to_string(),
+        'X' => format_enum_hex(module.enum_width_by_handle(token), value),
+        'F' => module
+            .enum_name_or_flags(token, value, true)
+            .unwrap_or_else(|| value.to_string()),
+        _ => module
+            .enum_name_or_flags(token, value, false)
+            .unwrap_or_else(|| value.to_string()),
+    }
+}
+
+/// The "X" enum format: `value`'s low `width` bytes as UPPERCASE hex, zero-padded to `width * 2`
+/// digits (.NET pads to the underlying type's width and uppercases even for the lowercase "x").
+fn format_enum_hex(width: u8, value: i64) -> String {
+    let digits = (width as usize) * 2;
+    let mask = if width >= 8 {
+        u64::MAX
+    } else {
+        (1u64 << (width as u32 * 8)) - 1
+    };
+    let bits = (value as u64) & mask;
+    alloc::format!("{bits:0digits$X}")
+}
+
 /// The asm-folded type handle a `RuntimeTypeHandle` / `Type` argument carries (it is modeled as
 /// a native-int holding the folded token: the assembly in the high 32 bits, the token in the
 /// low 32). Read back bit-for-bit as a u64 so the asm id survives.
@@ -3111,6 +3467,173 @@ pub fn type_get_name(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
         .type_name_by_handle(handle as u64)
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
     Ok(Some(alloc_str(vm, name)))
+}
+
+/// Materializes a decoded custom-attribute argument ([`AttrValue`]) into a runtime [`Value`]:
+/// an integer at its width, a heap string, a `Type` handle (the asm-folded token in a native
+/// int, the representation `typeof` yields), or null. The float arms are present only with the
+/// `float` feature; an `R4`/`R8` argument on a no-float build materializes as null (no corpus
+/// uses one).
+fn materialize_attr_value(vm: &mut Vm, value: &AttrValue) -> Value {
+    match value {
+        AttrValue::Int { value, wide } => {
+            if *wide {
+                Value::Int64(*value)
+            } else {
+                Value::Int32(*value as i32)
+            }
+        }
+        #[cfg(feature = "float")]
+        AttrValue::R4(number) => Value::Single(*number),
+        #[cfg(feature = "float")]
+        AttrValue::R8(number) => Value::Float(*number),
+        #[cfg(not(feature = "float"))]
+        AttrValue::R4(_) | AttrValue::R8(_) => Value::Null,
+        AttrValue::Str(units) => Value::Object(vm.heap_mut().alloc_string(units)),
+        AttrValue::Type(handle) => Value::NativeInt(*handle as i64),
+        AttrValue::Null => Value::Null,
+    }
+}
+
+/// Instantiates one custom attribute: allocates the attribute type's instance, runs its
+/// constructor with the decoded positional arguments (a nested interpreter run, so a non-trivial
+/// ctor body executes exactly as it would normally), then assigns each decoded named field. The
+/// resulting object reference is what `GetCustomAttributes` returns to the array. Collection is
+/// assumed suspended by the caller for the lifetime of the returned reference.
+fn instantiate_attribute(
+    vm: &mut Vm,
+    module: &Module,
+    attribute: &crate::module::LoadedAttribute,
+) -> Result<ObjectRef, Trap> {
+    let defaults = module
+        .type_field_defaults(attribute.type_id)
+        .ok_or(Trap::NoSuchMethod(attribute.ctor))?
+        .to_vec();
+    let instance = vm.heap_mut().alloc_instance(attribute.type_id, defaults);
+    let mut ctor_args = Vec::with_capacity(attribute.positional.len() + 1);
+    ctor_args.push(Value::Object(instance));
+    for argument in &attribute.positional {
+        ctor_args.push(materialize_attr_value(vm, argument));
+    }
+    Session::new(module, attribute.ctor, ctor_args)?.run(module, vm)?;
+    for (slot, value) in &attribute.named_fields {
+        let materialized = materialize_attr_value(vm, value);
+        vm.heap_mut()
+            .set_instance_field(instance, *slot, materialized);
+    }
+    Ok(instance)
+}
+
+/// `System.Reflection.MemberInfo.GetCustomAttributes(bool)` (the base method `Type`,
+/// `FieldInfo`, `MethodInfo`, and `PropertyInfo` all inherit, which is what csc emits the call
+/// against): an `object[]` of the attribute INSTANCES applied to the receiver. The receiver
+/// `this` is the asm-folded handle of the target (a `Type`'s `TypeDef` token, or the `Field` /
+/// `MethodDef` / `Property` token a `Type.GetField`/`GetMethod`/`GetProperty` returned); the
+/// loader decoded each applied attribute's constructor + argument values under that handle. Each
+/// attribute is instantiated (its ctor run, its named fields set); the `inherit` flag is accepted
+/// and ignored (the attribute surface here is the directly-applied set -- the corpus does not
+/// rely on inherited attributes). An array of length 0 when the target has no recorded attributes.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a handle; propagates a [`Trap`] from running an
+/// attribute's constructor.
+pub fn get_custom_attributes(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let attributes = module.custom_attributes_of(handle as u64);
+    #[cfg(feature = "gc")]
+    vm.suspend_collection();
+    let mut elements: Vec<Value> = Vec::with_capacity(attributes.len());
+    let mut outcome = Ok(());
+    for attribute in attributes {
+        match instantiate_attribute(vm, module, attribute) {
+            Ok(instance) => elements.push(Value::Object(instance)),
+            Err(trap) => {
+                outcome = Err(trap);
+                break;
+            }
+        }
+    }
+    let result = outcome.map(|()| {
+        let array = vm.heap_mut().alloc_array(elements);
+        Some(Value::Object(array))
+    });
+    #[cfg(feature = "gc")]
+    vm.resume_collection();
+    result
+}
+
+/// `System.Type.GetField(string)`: the `FieldInfo` for the named field of the type the receiver
+/// handle identifies, modeled (like `Type`) as the field's asm-folded `Field` token in a native
+/// int -- the handle its `GetCustomAttributes` then reads. The loader recorded each declared
+/// field's name under its declaring type's handle. `null` if the type has no such field.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle.
+pub fn type_get_field(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    member_lookup(vm, args, |module, handle, name| {
+        module.type_field_handle(handle, name)
+    })(module)
+}
+
+/// `System.Type.GetMethod(string)`: the `MethodInfo` for the named method, modeled as the
+/// method's asm-folded `MethodDef` token in a native int. `null` if the type has no such method.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle.
+pub fn type_get_method(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    member_lookup(vm, args, |module, handle, name| {
+        module.type_method_handle(handle, name)
+    })(module)
+}
+
+/// `System.Type.GetProperty(string)`: the `PropertyInfo` for the named property, modeled as the
+/// property's asm-folded `Property` token in a native int. `null` if the type has no such
+/// property.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle.
+pub fn type_get_property(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    member_lookup(vm, args, |module, handle, name| {
+        module.type_property_handle(handle, name)
+    })(module)
+}
+
+/// The shared body of `Type.GetField`/`GetMethod`/`GetProperty`: read the type handle (the
+/// receiver) and the member-name string argument, then resolve the member through `resolve` to
+/// its asm-folded token, returned as a native-int handle (or null if absent). Returns a closure
+/// taking the module so each public entry point reads as a one-liner; `vm` and `args` are
+/// captured for the string lookup.
+fn member_lookup<'a>(
+    vm: &'a mut Vm,
+    args: &'a [Value],
+    resolve: impl Fn(&Module, u64, &str) -> Option<u64> + 'a,
+) -> impl FnOnce(&Module) -> Result<Option<Value>, Trap> + 'a {
+    move |module| {
+        let Some(&Value::NativeInt(handle)) = args.first() else {
+            return Err(Trap::TypeMismatch(Opcode::Callvirt));
+        };
+        let Some(name) = string_value(vm, args.get(1)) else {
+            return Ok(Some(Value::Null));
+        };
+        Ok(Some(match resolve(module, handle as u64, &name) {
+            Some(member_handle) => Value::NativeInt(member_handle as i64),
+            None => Value::Null,
+        }))
+    }
 }
 
 /// `System.Runtime.CompilerServices.RuntimeHelpers.InitializeArray(Array, RuntimeFieldHandle)`:
@@ -3163,9 +3686,7 @@ fn element_from_bytes(zero: &Value, data: &[u8], index: usize, width_bytes: usiz
         Value::Int64(_) => Value::Int64(read_le_int(bytes)),
         Value::NativeInt(_) => Value::NativeInt(read_le_int(bytes)),
         #[cfg(feature = "float")]
-        Value::Float(_) if width_bytes == 4 => {
-            Value::Float(f64::from(f32::from_le_bytes(bytes.try_into().ok()?)))
-        }
+        Value::Single(_) => Value::Single(f32::from_le_bytes(bytes.try_into().ok()?)),
         #[cfg(feature = "float")]
         Value::Float(_) => Value::Float(f64::from_le_bytes(bytes.try_into().ok()?)),
         _ => return None,
@@ -3382,6 +3903,808 @@ pub fn array_set_value(
     }
 }
 
+/// `System.Array.Clone()` (the `ICloneable.Clone` implementation): a SHALLOW copy -- a new
+/// array of the same shape whose elements are the same values. Reference elements are
+/// shared, value-type elements copied, matching .NET. The element-type/dimension info is
+/// carried by the heap array itself, so the managed `Array` base (which cannot name its
+/// element type) crosses to this runtime primitive, the same way `GetValue`/`SetValue` do.
+///
+/// # Errors
+/// [`Trap::NullReference`] if `this` is null or not an array.
+pub fn array_clone(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(array)) = args.first() else {
+        return Err(Trap::NullReference);
+    };
+    let clone = vm.heap_mut().clone_array(array).ok_or(Trap::NullReference)?;
+    Ok(Some(Value::Object(clone)))
+}
+
+/// `System.Buffer.ByteLength(Array)`: the array's total byte length (element count times the
+/// element type's byte width). Returns `-1` -- the sentinel the managed `Buffer.ByteLength`
+/// wrapper turns into `ArgumentException` -- for an array whose element type is NOT a primitive
+/// (a reference / value-type array), which `System.Buffer` does not accept. A null receiver is
+/// rejected by the managed wrapper before this is reached.
+///
+/// # Errors
+/// [`Trap::NullReference`] if the argument is null; [`Trap::TypeMismatch`] if it is not an object.
+pub fn buffer_byte_length(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let array = match args.first() {
+        Some(&Value::Object(reference)) => reference,
+        Some(Value::Null) => return Err(Trap::NullReference),
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let length = match vm.heap().buffer_byte_length(array) {
+        Some(bytes) => i32::try_from(bytes).unwrap_or(i32::MAX),
+        None => -1,
+    };
+    Ok(Some(Value::Int32(length)))
+}
+
+/// `System.Buffer.BlockCopy(Array src, int srcOffset, Array dst, int dstOffset, int count)`:
+/// copies `count` bytes from `src`'s flat little-endian byte image (at byte `srcOffset`) into
+/// `dst`'s (at byte `dstOffset`). The managed wrapper has already validated the arguments (null,
+/// negative offset/count, non-primitive arrays, and ranges within `ByteLength`), so a `false`
+/// result from the heap here is a logic error rather than a user-facing exception.
+///
+/// # Errors
+/// [`Trap::NullReference`] if `src` or `dst` is null; [`Trap::TypeMismatch`] for a non-object
+/// reference or non-`int` offset/count; [`Trap::InvalidArgument`] if the (pre-validated) copy is
+/// somehow out of range or over a non-primitive array.
+pub fn buffer_block_copy(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let src = buffer_array_arg(args.first())?;
+    let src_offset = buffer_count_arg(args.get(1))?;
+    let dst = buffer_array_arg(args.get(2))?;
+    let dst_offset = buffer_count_arg(args.get(3))?;
+    let count = buffer_count_arg(args.get(4))?;
+    if vm
+        .heap_mut()
+        .buffer_block_copy(src, src_offset, dst, dst_offset, count)
+    {
+        Ok(None)
+    } else {
+        Err(Trap::InvalidArgument)
+    }
+}
+
+/// An array-reference argument of a `Buffer` intrinsic.
+fn buffer_array_arg(arg: Option<&Value>) -> Result<crate::object::ObjectRef, Trap> {
+    match arg {
+        Some(&Value::Object(reference)) => Ok(reference),
+        Some(Value::Null) => Err(Trap::NullReference),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// A non-negative `int` byte offset / count argument of a `Buffer` intrinsic, as a `usize`. A
+/// negative value cannot occur (the managed wrapper rejects it first) but maps to a type mismatch
+/// rather than silently wrapping.
+fn buffer_count_arg(arg: Option<&Value>) -> Result<usize, Trap> {
+    match arg {
+        Some(&Value::Int32(value)) => {
+            usize::try_from(value).map_err(|_| Trap::TypeMismatch(Opcode::Call))
+        }
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// The 128-bit `System.Decimal` value type, implemented over the same `lo`/`mid`/`hi`/`flags`
+/// layout .NET uses: a 96-bit unsigned mantissa (the three 32-bit words) scaled by a power of
+/// ten in `[0, 28]` (the scale lives in `flags` bits 16..23) with a sign in `flags` bit 31.
+/// The decimal value is `(-1)^sign * mantissa * 10^-scale`.
+///
+/// The managed corlib (`corlib/System/Decimal.cs`) owns everything that only needs 64-bit
+/// integer math -- the constructors, `ToString`, `Parse`, the integer conversions, hashing --
+/// and reaches HERE for the operations whose intermediates can exceed 96 bits (and so cannot
+/// be done with the C# corlib's `long`/`ulong`): the five arithmetic operators, comparison,
+/// and the floating-point conversions. Each works on a fixed-width `[u32]` magnitude so a
+/// 96x96 product (up to 192 bits) and a scale alignment (multiplying a 96-bit mantissa by a
+/// power of ten) are exact, then rescales the result half-to-even into the 96-bit/scale<=28
+/// range the way .NET's `DecCalc` does -- so `0.1m + 0.2m == 0.3m`, `1m / 3m` carries 28
+/// significant digits, and an out-of-range result raises `OverflowException`.
+mod decimal_ops {
+    use crate::value::Value;
+    use alloc::boxed::Box;
+
+    /// The maximum scale (number of fractional decimal digits) a `Decimal` can carry.
+    const MAX_SCALE: u32 = 28;
+    /// The number of 32-bit limbs in the working magnitude: enough for a 96x96 product (192
+    /// bits = 6 limbs) plus headroom for a rounding carry and intermediate scale-up shifts.
+    const LIMBS: usize = 8;
+
+    /// A `Decimal` decoded into its parts: a 96-bit magnitude (held in the low three limbs of a
+    /// wider buffer), the base-ten scale, and the sign.
+    #[derive(Clone, Copy)]
+    pub struct Dec {
+        /// The mantissa magnitude, little-endian 32-bit limbs (only the low three are the value;
+        /// the rest are working headroom, zero on a decoded value).
+        mag: [u32; LIMBS],
+        /// The base-ten scale (`0..=28`): the value is `mag * 10^-scale`.
+        scale: u32,
+        /// The sign: true for negative.
+        negative: bool,
+    }
+
+    impl Dec {
+        /// Flips the sign (used to turn subtraction into addition).
+        pub fn negate(&mut self) {
+            if !is_zero(&self.mag) {
+                self.negative = !self.negative;
+            }
+        }
+
+        /// Whether the value is zero (a zero divisor check, before the sign matters).
+        pub fn is_zero_value(&self) -> bool {
+            is_zero(&self.mag)
+        }
+    }
+
+    /// Decodes `(lo, mid, hi, flags)` into a [`Dec`]. The scale and sign come from `flags`
+    /// (bits 16..23 and bit 31). An out-of-spec scale (> 28) is clamped defensively, though
+    /// a well-formed `Decimal` never carries one.
+    fn decode(lo: i32, mid: i32, hi: i32, flags: i32) -> Dec {
+        let mut mag = [0u32; LIMBS];
+        mag[0] = lo as u32;
+        mag[1] = mid as u32;
+        mag[2] = hi as u32;
+        let scale = ((flags as u32) >> 16) & 0xFF;
+        let negative = (flags as u32) & 0x8000_0000 != 0;
+        Dec {
+            mag,
+            scale: scale.min(MAX_SCALE),
+            negative,
+        }
+    }
+
+    /// Reads a [`Dec`] from a `Value::Struct` argument (the inline value-type form a `Decimal`
+    /// takes on the stack): its four field slots are `lo, mid, hi, flags`, matching the field
+    /// declaration order in the managed `corlib/System/Decimal.cs`. The four-field width is
+    /// exactly what a `Decimal` instance carries, so any other shape is rejected.
+    fn dec_arg(args: &[Value], index: usize) -> Option<Dec> {
+        let fields = match args.get(index) {
+            Some(Value::Struct(fields)) if fields.len() == 4 => fields,
+            _ => return None,
+        };
+        let word = |i: usize| match fields[i] {
+            Value::Int32(value) => Some(value),
+            _ => None,
+        };
+        Some(decode(word(0)?, word(1)?, word(2)?, word(3)?))
+    }
+
+    /// Whether the magnitude is zero.
+    fn is_zero(mag: &[u32; LIMBS]) -> bool {
+        mag.iter().all(|&w| w == 0)
+    }
+
+    /// Whether the magnitude exceeds 96 bits (any limb above the low three is set).
+    fn exceeds_96(mag: &[u32; LIMBS]) -> bool {
+        mag[3..].iter().any(|&w| w != 0)
+    }
+
+    /// `mag += other` (limb-wise with carry). Returns the carry out of the top limb (nonzero
+    /// only on a true overflow past the buffer width, which the callers size against).
+    fn add_into(mag: &mut [u32; LIMBS], other: &[u32; LIMBS]) -> u32 {
+        let mut carry = 0u64;
+        for i in 0..LIMBS {
+            let sum = u64::from(mag[i]) + u64::from(other[i]) + carry;
+            mag[i] = sum as u32;
+            carry = sum >> 32;
+        }
+        carry as u32
+    }
+
+    /// `mag -= other`, assuming `mag >= other` (the caller orders the operands by magnitude).
+    fn sub_into(mag: &mut [u32; LIMBS], other: &[u32; LIMBS]) {
+        let mut borrow = 0i64;
+        for i in 0..LIMBS {
+            let diff = i64::from(mag[i]) - i64::from(other[i]) - borrow;
+            if diff < 0 {
+                mag[i] = (diff + (1i64 << 32)) as u32;
+                borrow = 1;
+            } else {
+                mag[i] = diff as u32;
+                borrow = 0;
+            }
+        }
+    }
+
+    /// Compares two magnitudes (`-1`/`0`/`1`), high limb first.
+    fn cmp_mag(a: &[u32; LIMBS], b: &[u32; LIMBS]) -> i32 {
+        for i in (0..LIMBS).rev() {
+            if a[i] != b[i] {
+                return if a[i] > b[i] { 1 } else { -1 };
+            }
+        }
+        0
+    }
+
+    /// `mag *= factor` (a single 32-bit multiplier). Returns the carry out of the top limb.
+    fn mul_small(mag: &mut [u32; LIMBS], factor: u32) -> u32 {
+        let mut carry = 0u64;
+        for limb in mag.iter_mut() {
+            let product = u64::from(*limb) * u64::from(factor) + carry;
+            *limb = product as u32;
+            carry = product >> 32;
+        }
+        carry as u32
+    }
+
+    /// `mag /= 10`, returning the remainder (`0..=9`). High limb first so the running remainder
+    /// threads down through the limbs.
+    fn div10(mag: &mut [u32; LIMBS]) -> u32 {
+        let mut remainder = 0u64;
+        for i in (0..LIMBS).rev() {
+            let cur = (remainder << 32) | u64::from(mag[i]);
+            mag[i] = (cur / 10) as u32;
+            remainder = cur % 10;
+        }
+        remainder as u32
+    }
+
+    /// Powers of ten that fit one 32-bit limb (`10^0 .. 10^9`), for scaling a magnitude up by a
+    /// known number of decimal places in chunks.
+    const POW10_U32: [u32; 10] = [
+        1,
+        10,
+        100,
+        1000,
+        10000,
+        100_000,
+        1_000_000,
+        10_000_000,
+        100_000_000,
+        1_000_000_000,
+    ];
+
+    /// Multiplies `mag` by `10^power` in single-limb chunks. Returns false if the product
+    /// overflows the working buffer (the caller treats that as out of range).
+    fn scale_up(mag: &mut [u32; LIMBS], mut power: u32) -> bool {
+        while power > 0 {
+            let chunk = power.min(9);
+            if mul_small(mag, POW10_U32[chunk as usize]) != 0 {
+                return false;
+            }
+            power -= chunk;
+        }
+        true
+    }
+
+    /// Rounds a magnitude down by `drop` decimal places, half-to-even (banker's rounding, what
+    /// .NET's `DecCalc` uses): divide by ten `drop` times, tracking whether anything below the
+    /// final digit was nonzero so a tie is broken to even. Returns the carry of a round-up that
+    /// could grow the magnitude (e.g. 9.5 -> 10).
+    fn round_off(mag: &mut [u32; LIMBS], drop: u32) {
+        if drop == 0 {
+            return;
+        }
+        let mut sticky = false;
+        let mut last = 0u32;
+        for _ in 0..drop {
+            sticky |= last != 0;
+            last = div10(mag);
+        }
+        let round_up = last > 5 || (last == 5 && (sticky || mag[0] & 1 == 1));
+        if round_up {
+            let mut one = [0u32; LIMBS];
+            one[0] = 1;
+            add_into(mag, &one);
+        }
+    }
+
+    /// Builds the result `Value::Struct([lo, mid, hi, flags])` from a magnitude, scale, and sign,
+    /// after rescaling it into the 96-bit / `scale<=28` range half-to-even. A magnitude that
+    /// still will not fit, or a scale that cannot be reduced enough, is an overflow (`None`).
+    /// A zero magnitude normalizes to a clean positive zero at the requested scale (matching
+    /// .NET, which keeps a zero's scale but not its sign).
+    fn finish(mut mag: [u32; LIMBS], mut scale: u32, negative: bool) -> Option<Value> {
+        while exceeds_96(&mag) || scale > MAX_SCALE {
+            if scale == 0 {
+                return None;
+            }
+            let drop = if scale > MAX_SCALE { scale - MAX_SCALE } else { 1 };
+            round_off(&mut mag, drop);
+            scale -= drop;
+        }
+        if is_zero(&mag) {
+            return Some(encode(&mag, scale, false));
+        }
+        Some(encode(&mag, scale, negative))
+    }
+
+    /// Packs a fit magnitude (low three limbs) + scale + sign into the `Value::Struct` form.
+    fn encode(mag: &[u32; LIMBS], scale: u32, negative: bool) -> Value {
+        let flags = (scale << 16) | if negative { 0x8000_0000 } else { 0 };
+        Value::Struct(Box::new([
+            Value::Int32(mag[0] as i32),
+            Value::Int32(mag[1] as i32),
+            Value::Int32(mag[2] as i32),
+            Value::Int32(flags as i32),
+        ]))
+    }
+
+    /// Aligns two decoded decimals to a common scale by scaling the lower-scale magnitude up.
+    /// Returns the common scale, or `None` if scaling up overflowed the working buffer (the
+    /// callers map that to `OverflowException`).
+    fn align(a: &mut Dec, b: &mut Dec) -> Option<u32> {
+        if a.scale < b.scale {
+            if !scale_up(&mut a.mag, b.scale - a.scale) {
+                return None;
+            }
+            a.scale = b.scale;
+        } else if b.scale < a.scale {
+            if !scale_up(&mut b.mag, a.scale - b.scale) {
+                return None;
+            }
+            b.scale = a.scale;
+        }
+        Some(a.scale)
+    }
+
+    /// The signed sum `a + b` (used for both addition and subtraction; the caller flips `b`'s
+    /// sign for subtraction). Aligns scales, then adds same-sign magnitudes or subtracts the
+    /// smaller from the larger for opposite signs, and finishes (rescaling/rounding) the result.
+    pub fn add(mut a: Dec, mut b: Dec) -> Option<Value> {
+        let scale = align(&mut a, &mut b)?;
+        if a.negative == b.negative {
+            let mut mag = a.mag;
+            add_into(&mut mag, &b.mag);
+            finish(mag, scale, a.negative)
+        } else {
+            match cmp_mag(&a.mag, &b.mag) {
+                0 => finish([0u32; LIMBS], scale, false),
+                1 => {
+                    let mut mag = a.mag;
+                    sub_into(&mut mag, &b.mag);
+                    finish(mag, scale, a.negative)
+                }
+                _ => {
+                    let mut mag = b.mag;
+                    sub_into(&mut mag, &a.mag);
+                    finish(mag, scale, b.negative)
+                }
+            }
+        }
+    }
+
+    /// The product `a * b`: the magnitudes multiply (a full 192-bit schoolbook product over the
+    /// working buffer) and the scales add; `finish` then rescales/rounds into range. .NET caps
+    /// the product scale at 28, rounding away extra fractional digits, which `finish` does.
+    pub fn mul(a: Dec, b: Dec) -> Option<Value> {
+        let mut product = [0u32; LIMBS];
+        for i in 0..3 {
+            if a.mag[i] == 0 {
+                continue;
+            }
+            let mut carry = 0u64;
+            for j in 0..3 {
+                let pos = i + j;
+                let cur = u64::from(a.mag[i]) * u64::from(b.mag[j])
+                    + u64::from(product[pos])
+                    + carry;
+                product[pos] = cur as u32;
+                carry = cur >> 32;
+            }
+            let mut pos = i + 3;
+            while carry != 0 && pos < LIMBS {
+                let cur = u64::from(product[pos]) + carry;
+                product[pos] = cur as u32;
+                carry = cur >> 32;
+                pos += 1;
+            }
+            if carry != 0 {
+                return None;
+            }
+        }
+        let negative = a.negative != b.negative;
+        finish(product, a.scale + b.scale, negative)
+    }
+
+    /// The quotient `a / b`: align both to the same scale (so the quotient is the integer ratio
+    /// of the magnitudes), then long-divide, extending the dividend by extra factors of ten to
+    /// generate fractional digits up to .NET's 28-29 significant-digit limit, rounding the last
+    /// digit half-to-even. Division by zero is `None` (the managed wrapper raises
+    /// `DivideByZeroException`); the algorithm matches .NET's `VarDecDiv` results.
+    pub fn div(mut a: Dec, mut b: Dec) -> Option<Value> {
+        if is_zero(&b.mag) {
+            return None;
+        }
+        if is_zero(&a.mag) {
+            return finish([0u32; LIMBS], 0, false);
+        }
+        let common = a.scale.max(b.scale);
+        if !scale_up(&mut a.mag, common - a.scale) {
+            return None;
+        }
+        if !scale_up(&mut b.mag, common - b.scale) {
+            return None;
+        }
+        let divisor = b.mag;
+        let (mut quotient, mut remainder) = divmod(&a.mag, &divisor);
+        if exceeds_96(&quotient) {
+            return None;
+        }
+        let mut result_scale = 0u32;
+        while !is_zero(&remainder) && result_scale < MAX_SCALE {
+            if mul_small(&mut remainder, 10) != 0 {
+                break;
+            }
+            let (digit, r) = divmod(&remainder, &divisor);
+            let mut shifted = quotient;
+            if mul_small(&mut shifted, 10) != 0 {
+                break;
+            }
+            add_into(&mut shifted, &digit);
+            if exceeds_96(&shifted) {
+                break;
+            }
+            quotient = shifted;
+            remainder = r;
+            result_scale += 1;
+        }
+        if !is_zero(&remainder) {
+            let mut twice = remainder;
+            let overflow = mul_small(&mut twice, 2) != 0;
+            let round_up = if overflow {
+                true
+            } else {
+                let cmp = cmp_mag(&twice, &divisor);
+                cmp > 0 || (cmp == 0 && quotient[0] & 1 == 1)
+            };
+            if round_up {
+                let mut one = [0u32; LIMBS];
+                one[0] = 1;
+                add_into(&mut quotient, &one);
+                if exceeds_96(&quotient) {
+                    return None;
+                }
+            }
+        }
+        let negative = a.negative != b.negative;
+        finish(quotient, result_scale, negative)
+    }
+
+    /// The remainder `a % b` (.NET's `Decimal.Remainder`): the result has the sign of the
+    /// dividend and `|a % b| < |b|`. Computed by aligning scales and taking the magnitude
+    /// remainder of the integer division. `None` on a zero divisor.
+    pub fn rem(mut a: Dec, mut b: Dec) -> Option<Value> {
+        if is_zero(&b.mag) {
+            return None;
+        }
+        let scale = align(&mut a, &mut b)?;
+        let (_, r) = divmod(&a.mag, &b.mag);
+        finish(r, scale, a.negative)
+    }
+
+    /// Compares two decimals by value (`-1`/`0`/`1`), scale-independent: a zero is equal
+    /// regardless of sign, opposite signs order by sign, and same signs align scales then
+    /// compare magnitudes (the sign flips the order for negatives). Returns `None` only if a
+    /// scale alignment overflows the working buffer, which the caller surfaces as a fault.
+    pub fn compare(mut a: Dec, mut b: Dec) -> Option<i32> {
+        let a_zero = is_zero(&a.mag);
+        let b_zero = is_zero(&b.mag);
+        if a_zero && b_zero {
+            return Some(0);
+        }
+        if a_zero {
+            return Some(if b.negative { 1 } else { -1 });
+        }
+        if b_zero {
+            return Some(if a.negative { -1 } else { 1 });
+        }
+        if a.negative != b.negative {
+            return Some(if a.negative { -1 } else { 1 });
+        }
+        align(&mut a, &mut b)?;
+        let mag_cmp = cmp_mag(&a.mag, &b.mag);
+        Some(if a.negative { -mag_cmp } else { mag_cmp })
+    }
+
+    /// Integer division of magnitudes: returns `(quotient, remainder)` with
+    /// `dividend = quotient*divisor + remainder` and `remainder < divisor`. A restoring
+    /// bit-at-a-time long division over the working buffer -- exact and simple (the operands are
+    /// small enough that performance is a non-issue for the differential corpus).
+    fn divmod(dividend: &[u32; LIMBS], divisor: &[u32; LIMBS]) -> ([u32; LIMBS], [u32; LIMBS]) {
+        let mut quotient = [0u32; LIMBS];
+        let mut remainder = [0u32; LIMBS];
+        let total_bits = LIMBS * 32;
+        for bit in (0..total_bits).rev() {
+            shl1(&mut remainder);
+            let word = bit / 32;
+            let off = bit % 32;
+            if (dividend[word] >> off) & 1 == 1 {
+                remainder[0] |= 1;
+            }
+            if cmp_mag(&remainder, divisor) >= 0 {
+                sub_into(&mut remainder, divisor);
+                quotient[word] |= 1 << off;
+            }
+        }
+        (quotient, remainder)
+    }
+
+    /// `mag <<= 1`.
+    fn shl1(mag: &mut [u32; LIMBS]) {
+        let mut carry = 0u32;
+        for limb in mag.iter_mut() {
+            let new_carry = *limb >> 31;
+            *limb = (*limb << 1) | carry;
+            carry = new_carry;
+        }
+    }
+
+    /// Converts an `f64` to a [`Dec`] the way .NET's `Decimal(double)` ctor does: round the
+    /// value to 15 significant decimal digits (double's reliable precision), then express that as
+    /// a 96-bit mantissa with the matching scale. Returns `None` for NaN / infinity / a
+    /// magnitude outside the Decimal range (the managed ctor raises `OverflowException`).
+    #[cfg(feature = "float")]
+    pub fn from_double(value: f64) -> Option<Value> {
+        if !value.is_finite() {
+            return None;
+        }
+        if value == 0.0 {
+            return finish([0u32; LIMBS], 0, false);
+        }
+        let negative = value < 0.0;
+        let magnitude = value.abs();
+        let mut exp = floor_log10(magnitude);
+        let mut digits15 = magnitude / pow10_f64(exp - 14);
+        if digits15 >= 1e15 {
+            exp += 1;
+            digits15 = magnitude / pow10_f64(exp - 14);
+        } else if digits15 < 1e14 {
+            exp -= 1;
+            digits15 = magnitude / pow10_f64(exp - 14);
+        }
+        let rounded = round_half_even_f64(digits15);
+        let mut int_digits = rounded as u128;
+        if int_digits == 0 {
+            return finish([0u32; LIMBS], 0, false);
+        }
+        let mut scale_pow = exp - 14;
+        while int_digits % 10 == 0 {
+            int_digits /= 10;
+            scale_pow += 1;
+        }
+        let mut mag = [0u32; LIMBS];
+        mag[0] = int_digits as u32;
+        mag[1] = (int_digits >> 32) as u32;
+        mag[2] = (int_digits >> 64) as u32;
+        if scale_pow >= 0 {
+            if !scale_up(&mut mag, scale_pow as u32) {
+                return None;
+            }
+            finish(mag, 0, negative)
+        } else {
+            finish(mag, (-scale_pow) as u32, negative)
+        }
+    }
+
+    /// `floor(log10(x))` for a finite positive `x`, without a math library: bracket the value
+    /// between consecutive integer powers of ten (the range of magnitudes is small).
+    #[cfg(feature = "float")]
+    fn floor_log10(x: f64) -> i32 {
+        let mut exp = 0i32;
+        let mut v = x;
+        while v >= 10.0 {
+            v /= 10.0;
+            exp += 1;
+        }
+        while v < 1.0 {
+            v *= 10.0;
+            exp -= 1;
+        }
+        exp
+    }
+
+    /// `10^n` as an `f64` for a small signed exponent, by repeated multiply/divide (exact for the
+    /// |n| <= ~22 range where 10^n is representable exactly in a double; good enough beyond).
+    #[cfg(feature = "float")]
+    fn pow10_f64(n: i32) -> f64 {
+        let mut result = 1.0f64;
+        let mut k = n.abs();
+        while k > 0 {
+            result *= 10.0;
+            k -= 1;
+        }
+        if n < 0 { 1.0 / result } else { result }
+    }
+
+    /// Rounds an `f64` to the nearest integer, ties to even.
+    #[cfg(feature = "float")]
+    fn round_half_even_f64(x: f64) -> f64 {
+        let floor = floor_f64(x);
+        let frac = x - floor;
+        if frac < 0.5 {
+            floor
+        } else if frac > 0.5 {
+            floor + 1.0
+        } else if (floor as i64) & 1 == 0 {
+            floor
+        } else {
+            floor + 1.0
+        }
+    }
+
+    /// `floor(x)` for a non-negative `x` within the i64 range (the 15-digit integers here),
+    /// without a math library.
+    #[cfg(feature = "float")]
+    fn floor_f64(x: f64) -> f64 {
+        let truncated = x as i64 as f64;
+        if truncated > x { truncated - 1.0 } else { truncated }
+    }
+
+    /// Converts a decoded decimal to the nearest `f64` (.NET's `(double)dec` operator): the
+    /// 96-bit mantissa as a float divided by `10^scale`. Double's rounding gives the same
+    /// result as .NET here for the values the corpus exercises.
+    #[cfg(feature = "float")]
+    pub fn to_double(a: Dec) -> f64 {
+        let mantissa =
+            u128::from(a.mag[0]) | (u128::from(a.mag[1]) << 32) | (u128::from(a.mag[2]) << 64);
+        let mut value = mantissa as f64;
+        value /= pow10_f64(a.scale as i32);
+        if a.negative {
+            -value
+        } else {
+            value
+        }
+    }
+
+    /// Decodes the two-`Decimal` argument form (two `Value::Struct`s): `op_Addition(a, b)` etc.
+    pub fn two(args: &[Value]) -> Option<(Dec, Dec)> {
+        Some((dec_arg(args, 0)?, dec_arg(args, 1)?))
+    }
+
+    /// Decodes the single-`Decimal` argument form (one `Value::Struct`): the `this` of a unary
+    /// conversion like `op_Explicit(decimal) -> double`.
+    pub fn one(args: &[Value]) -> Option<Dec> {
+        dec_arg(args, 0)
+    }
+}
+
+/// `System.Decimal::DecAdd(lo1,mid1,hi1,flags1, lo2,mid2,hi2,flags2)`: the exact sum, returned
+/// as the four `Decimal` words (`Value::Struct`). Backs the managed `op_Addition`. See
+/// [`decimal_ops`] for the algorithm.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the eight arguments are not `Int32`; [`Trap::Overflow`] if the
+/// sum is outside the `Decimal` range.
+pub fn decimal_add(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    decimal_ops::add(a, b)
+        .ok_or(Trap::Overflow)
+        .map(Some)
+}
+
+/// `System.Decimal::DecSub(...)`: the exact difference (backs `op_Subtraction`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-`Int32` arguments; [`Trap::Overflow`] on range overflow.
+pub fn decimal_subtract(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (a, mut b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    b.negate();
+    decimal_ops::add(a, b)
+        .ok_or(Trap::Overflow)
+        .map(Some)
+}
+
+/// `System.Decimal::DecMul(...)`: the exact product (backs `op_Multiply`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-`Int32` arguments; [`Trap::Overflow`] on range overflow.
+pub fn decimal_multiply(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    decimal_ops::mul(a, b)
+        .ok_or(Trap::Overflow)
+        .map(Some)
+}
+
+/// `System.Decimal::DecDiv(...)`: the quotient at full Decimal precision (backs `op_Division`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-`Int32` arguments; [`Trap::DivideByZero`] if the divisor is
+/// zero; [`Trap::Overflow`] on range overflow.
+pub fn decimal_divide(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    if b.is_zero_value() {
+        return Err(Trap::DivideByZero);
+    }
+    decimal_ops::div(a, b)
+        .ok_or(Trap::Overflow)
+        .map(Some)
+}
+
+/// `System.Decimal::DecRem(...)`: the remainder with the dividend's sign (backs `op_Modulus`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-`Int32` arguments; [`Trap::DivideByZero`] for a zero divisor;
+/// [`Trap::Overflow`] on range overflow.
+pub fn decimal_remainder(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    if b.is_zero_value() {
+        return Err(Trap::DivideByZero);
+    }
+    decimal_ops::rem(a, b)
+        .ok_or(Trap::Overflow)
+        .map(Some)
+}
+
+/// `System.Decimal::DecCompare(...)`: `-1`/`0`/`1` by value (scale-independent). Backs
+/// `CompareTo`, `Equals`, and every relational operator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-`Int32` arguments.
+pub fn decimal_compare(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (a, b) = decimal_ops::two(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let ordering = decimal_ops::compare(a, b).ok_or(Trap::Overflow)?;
+    Ok(Some(Value::Int32(ordering)))
+}
+
+/// `System.Decimal::FromDouble(double)`: the `Decimal(double)` ctor result as the four words.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-`double` argument; [`Trap::Overflow`] for NaN / infinity /
+/// out-of-range.
+#[cfg(feature = "float")]
+pub fn decimal_from_double(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = match args.first() {
+        Some(&Value::Float(value)) => value,
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    decimal_ops::from_double(value)
+        .ok_or(Trap::Overflow)
+        .map(Some)
+}
+
+/// `System.Decimal::ToDouble(lo,mid,hi,flags)`: the `(double)dec` operator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for non-`Int32` arguments.
+#[cfg(feature = "float")]
+pub fn decimal_to_double(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let a = decimal_ops::one(args).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    Ok(Some(Value::Float(decimal_ops::to_double(a))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3445,5 +4768,245 @@ mod tests {
             console_write_line(&mut vm, &Module::new(), &[Value::Int32(7)]),
             Err(Trap::TypeMismatch(Opcode::Call))
         );
+    }
+
+    /// Encodes a `Decimal` value (`mantissa * 10^-scale`, mantissa <= 2^96-1) as the inline
+    /// `Value::Struct` an operand arrives as: four field slots `lo, mid, hi, flags`.
+    #[cfg(test)]
+    fn dec_words(mantissa: u128, scale: u32, negative: bool) -> Vec<Value> {
+        let flags = (scale << 16) | if negative { 0x8000_0000 } else { 0 };
+        alloc::vec![Value::Struct(Box::new([
+            Value::Int32(mantissa as u32 as i32),
+            Value::Int32((mantissa >> 32) as u32 as i32),
+            Value::Int32((mantissa >> 64) as u32 as i32),
+            Value::Int32(flags as i32),
+        ]))]
+    }
+
+    /// Decodes a result `Value::Struct` back into `(mantissa, scale, negative)` for assertions.
+    #[cfg(test)]
+    fn dec_parts(value: &Value) -> (u128, u32, bool) {
+        let Value::Struct(fields) = value else {
+            panic!("expected a Decimal struct, got {value:?}");
+        };
+        let word = |i: usize| match fields[i] {
+            Value::Int32(v) => v as u32 as u128,
+            _ => panic!("non-int field"),
+        };
+        let mant = word(0) | (word(1) << 32) | (word(2) << 64);
+        let flags = match fields[3] {
+            Value::Int32(v) => v as u32,
+            _ => panic!("non-int flags"),
+        };
+        (mant, (flags >> 16) & 0xFF, flags & 0x8000_0000 != 0)
+    }
+
+    /// Builds the eight-argument vector for a two-operand decimal intrinsic.
+    #[cfg(test)]
+    fn two_args(a: (u128, u32, bool), b: (u128, u32, bool)) -> Vec<Value> {
+        let mut args = Vec::new();
+        args.extend(dec_words(a.0, a.1, a.2));
+        args.extend(dec_words(b.0, b.1, b.2));
+        args
+    }
+
+    #[test]
+    fn decimal_add_aligns_scales_exactly() {
+        let mut vm = Vm::new();
+        let r = decimal_add(&mut vm, &Module::new(), &two_args((1, 1, false), (2, 1, false)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(dec_parts(&r), (3, 1, false));
+    }
+
+    #[test]
+    fn decimal_add_keeps_larger_scale() {
+        let mut vm = Vm::new();
+        let r = decimal_add(
+            &mut vm,
+            &Module::new(),
+            &two_args((10000, 2, false), (1, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r), (10100, 2, false));
+    }
+
+    #[test]
+    fn decimal_subtract_opposite_magnitudes() {
+        let mut vm = Vm::new();
+        let r = decimal_subtract(
+            &mut vm,
+            &Module::new(),
+            &two_args((1, 0, false), (9, 1, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r), (1, 1, false));
+    }
+
+    #[test]
+    fn decimal_multiply_adds_scales() {
+        let mut vm = Vm::new();
+        let r = decimal_multiply(
+            &mut vm,
+            &Module::new(),
+            &two_args((15, 1, false), (2, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r), (30, 1, false));
+        let r = decimal_multiply(
+            &mut vm,
+            &Module::new(),
+            &two_args((12345678, 4, false), (1000, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r), (12_345_678_000, 4, false));
+    }
+
+    #[test]
+    fn decimal_divide_full_precision_half_even() {
+        let mut vm = Vm::new();
+        let r = decimal_divide(
+            &mut vm,
+            &Module::new(),
+            &two_args((1, 0, false), (3, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        let (mant, scale, neg) = dec_parts(&r);
+        assert_eq!((scale, neg), (28, false));
+        assert_eq!(mant, 3_333_333_333_333_333_333_333_333_333u128);
+        let r = decimal_divide(
+            &mut vm,
+            &Module::new(),
+            &two_args((1, 0, false), (7, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r).0, 1_428_571_428_571_428_571_428_571_429u128);
+        let r = decimal_divide(
+            &mut vm,
+            &Module::new(),
+            &two_args((1, 0, false), (8, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r), (125, 3, false));
+        let r = decimal_divide(
+            &mut vm,
+            &Module::new(),
+            &two_args((6, 0, false), (2, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r), (3, 0, false));
+    }
+
+    #[test]
+    fn decimal_remainder_keeps_dividend_sign() {
+        let mut vm = Vm::new();
+        let r = decimal_remainder(
+            &mut vm,
+            &Module::new(),
+            &two_args((10, 0, false), (3, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r), (1, 0, false));
+        let r = decimal_remainder(
+            &mut vm,
+            &Module::new(),
+            &two_args((10, 0, true), (3, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dec_parts(&r), (1, 0, true));
+    }
+
+    #[test]
+    fn decimal_compare_is_scale_independent() {
+        let mut vm = Vm::new();
+        let r = decimal_compare(
+            &mut vm,
+            &Module::new(),
+            &two_args((250, 2, false), (25, 1, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r, Value::Int32(0));
+        let r = decimal_compare(
+            &mut vm,
+            &Module::new(),
+            &two_args((5, 0, false), (3, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r, Value::Int32(1));
+        let r = decimal_compare(
+            &mut vm,
+            &Module::new(),
+            &two_args((1, 0, true), (0, 0, false)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r, Value::Int32(-1));
+    }
+
+    #[test]
+    fn decimal_add_overflow_is_a_trap() {
+        let mut vm = Vm::new();
+        let max = (1u128 << 96) - 1;
+        let r = decimal_add(
+            &mut vm,
+            &Module::new(),
+            &two_args((max, 0, false), (1, 0, false)),
+        );
+        assert_eq!(r, Err(Trap::Overflow));
+    }
+
+    #[test]
+    fn decimal_divide_by_zero_traps() {
+        let mut vm = Vm::new();
+        let r = decimal_divide(
+            &mut vm,
+            &Module::new(),
+            &two_args((5, 0, false), (0, 0, false)),
+        );
+        assert_eq!(r, Err(Trap::DivideByZero));
+    }
+
+    #[cfg(feature = "float")]
+    #[test]
+    fn decimal_from_double_rounds_to_fifteen_digits() {
+        let mut vm = Vm::new();
+        let r = decimal_from_double(&mut vm, &Module::new(), &[Value::Float(0.1)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(dec_parts(&r), (1, 1, false));
+        let r = decimal_from_double(&mut vm, &Module::new(), &[Value::Float(1.5)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(dec_parts(&r), (15, 1, false));
+        let r = decimal_from_double(&mut vm, &Module::new(), &[Value::Float(1_000_000.0)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(dec_parts(&r), (1_000_000, 0, false));
+        let r = decimal_from_double(&mut vm, &Module::new(), &[Value::Float(1.0 / 3.0)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(dec_parts(&r), (333_333_333_333_333, 15, false));
+    }
+
+    #[cfg(feature = "float")]
+    #[test]
+    fn decimal_to_double_round_trips_simple_values() {
+        let mut vm = Vm::new();
+        let r = decimal_to_double(&mut vm, &Module::new(), &dec_words(15, 1, false))
+            .unwrap()
+            .unwrap();
+        assert_eq!(r, Value::Float(1.5));
     }
 }

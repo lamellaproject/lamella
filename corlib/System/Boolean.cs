@@ -3,8 +3,8 @@ namespace System
 {
     public struct Boolean : IComparable
     {
-        public const string TrueString = "True";
-        public const string FalseString = "False";
+        public static readonly string TrueString = "True";
+        public static readonly string FalseString = "False";
 
         public override string ToString() { return this ? TrueString : FalseString; }
 

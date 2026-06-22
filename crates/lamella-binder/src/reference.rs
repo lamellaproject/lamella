@@ -6,7 +6,7 @@ use crate::symbols::{
 };
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use lamella_metadata::tables::table;
 use lamella_metadata::{Assembly, SigType, TypeName};
@@ -15,8 +15,9 @@ use lamella_token::Token;
 /// Adds every type defined in `assembly` to `model`.
 pub fn load_assembly(model: &mut Model, assembly: &Assembly) {
     let param_array = assembly.param_array_params();
+    let conditional = assembly.conditional_symbols();
     for type_def in assembly.type_defs() {
-        if let Some(info) = type_info(assembly, &type_def, &param_array) {
+        if let Some(info) = type_info(assembly, &type_def, &param_array, &conditional) {
             model.insert(info);
         }
     }
@@ -26,6 +27,7 @@ fn type_info(
     assembly: &Assembly,
     type_def: &lamella_metadata::TypeDef,
     param_array: &BTreeSet<u32>,
+    conditional: &BTreeMap<u32, Vec<Box<str>>>,
 ) -> Option<TypeInfo> {
     let TypeName { namespace, name } = type_def.name()?;
     if name == "<Module>" {
@@ -47,9 +49,16 @@ fn type_info(
 
     let mut info = TypeInfo::new(namespace, name, kind);
     info.is_external = true;
+    info.assembly = assembly.assembly_name().map(Box::from);
     if let Some(base) = base {
         info.bases.push(base.clone());
         info.base = Some(base);
+    }
+    for interface in type_def.interfaces() {
+        let symbol = token_type_symbol(assembly, interface);
+        if !symbol.is_error() {
+            info.bases.push(symbol);
+        }
     }
     for field in type_def.fields() {
         if let (Some(field_name), Some(signature)) = (field.name(), field.signature()) {
@@ -80,6 +89,7 @@ fn type_info(
                 .params()
                 .any(|parameter| param_array.contains(&parameter.token().row())),
             accessibility: member_accessibility(method.flags()),
+            conditional: conditional.get(&method.rid()).cloned().unwrap_or_default(),
         };
         let property = method_name
             .strip_prefix("get_")

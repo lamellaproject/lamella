@@ -8,8 +8,8 @@ use lamella_cil::Operand;
 use lamella_ir::{Function, MirType, TypeHandle};
 use lamella_metadata::tables::table;
 use lamella_metadata::{
-    Assembly, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef,
-    exception_tag_for_name,
+    Assembly, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef, TypeName,
+    exception_tag_for_name, fnv1a32,
 };
 use lamella_token::Token;
 
@@ -214,6 +214,179 @@ impl<'a> MetadataResolver<'a> {
             })
             .collect()
     }
+
+    /// The per-type emission metadata the backend's GC module path takes: `(handle, type_tag, vtable)`
+    /// for every this-module type -- [`type_tags`](Self::type_tags) joined with
+    /// [`vtables`](Self::vtables), and [`itables`](Self::itables), joined per type into a [`TypeMeta`].
+    /// The backend appends the tag to each TypeDesc, lays the vtable before it, and the itable after.
+    #[must_use]
+    pub fn type_descriptors(&self) -> Vec<TypeMeta> {
+        let vtables = self.vtables();
+        let itables = self.itables();
+        let bases = self.base_handles();
+        self.type_tags()
+            .into_iter()
+            .map(|(handle, type_tag)| {
+                let vtable = vtables
+                    .iter()
+                    .find(|(h, _)| *h == handle)
+                    .map(|(_, slots)| slots.clone())
+                    .unwrap_or_default();
+                let itable = itables
+                    .iter()
+                    .find(|(h, _)| *h == handle)
+                    .map(|(_, entries)| entries.clone())
+                    .unwrap_or_default();
+                let base = bases
+                    .iter()
+                    .find(|(h, _)| *h == handle)
+                    .and_then(|(_, b)| *b);
+                TypeMeta {
+                    handle,
+                    type_tag,
+                    vtable,
+                    itable,
+                    base,
+                }
+            })
+            .collect()
+    }
+
+    /// Each this-module type's immediate IN-PROGRAM base, as `(handle, base_handle)` -- the `extends`
+    /// target when it is a this-module TypeDef, else `None` (a BCL TypeRef base or System.Object, where
+    /// the AOT base-pointer chain terminates). The backend walks this to lay the TypeDesc base_ptr chain
+    /// a `castclass` scans. Keyed by `TypeHandle(token.0)`, like [`type_tags`](Self::type_tags).
+    #[must_use]
+    pub fn base_handles(&self) -> Vec<(TypeHandle, Option<TypeHandle>)> {
+        self.assembly
+            .type_defs()
+            .map(|type_def| {
+                let base = type_def.extends();
+                let base_handle = (base.table() == table::TYPE_DEF && base.row() != 0)
+                    .then_some(TypeHandle(base.0));
+                (TypeHandle(type_def.token().0), base_handle)
+            })
+            .collect()
+    }
+
+    /// The per-type INTERFACE dispatch map: for each this-module type, the `(interface_method_tag,
+    /// implementation function index)` pairs for every interface method it implements. The backend emits
+    /// these as the type's itable; a `callvirt` on an interface method matches the tag in the receiver's
+    /// itable to find the implementation. Implicit implementations only -- the implementing method is
+    /// found by name + signature through the base chain ([`vtable_methods`](Self::vtable_methods), which
+    /// already collects the virtual methods overrides included). Explicit (MethodImpl) and
+    /// external-interface dispatch are follow-ons.
+    #[must_use]
+    pub fn itables(&self) -> Vec<(TypeHandle, Vec<(u32, u32)>)> {
+        let mut result = Vec::new();
+        for type_def in self.assembly.type_defs() {
+            let impls = self.vtable_methods(type_def);
+            let mut entries: Vec<(u32, u32)> = Vec::new();
+            for iface_token in type_def.interfaces() {
+                if iface_token.table() != table::TYPE_DEF {
+                    continue;
+                }
+                let Some(iface) = self.assembly.type_def(iface_token.row()) else {
+                    continue;
+                };
+                let Some(iface_name) = self.assembly.type_token_name(iface.token()) else {
+                    continue;
+                };
+                for method in iface.methods() {
+                    let Some(name) = method.name() else { continue };
+                    let params = method
+                        .signature()
+                        .map(|sig| sig.parameters)
+                        .unwrap_or_default();
+                    let tag = interface_method_tag(&iface_name, name, &params);
+                    let Some((_, _, rid)) = impls
+                        .iter()
+                        .find(|(n, p, _)| *n == Some(name) && *p == params)
+                    else {
+                        continue;
+                    };
+                    if let Some(func_index) = self.function_index(*rid) {
+                        entries.push((tag, func_index));
+                    }
+                }
+            }
+            if !entries.is_empty() {
+                result.push((TypeHandle(type_def.token().0), entries));
+            }
+        }
+        result
+    }
+}
+
+/// Per-type emission metadata the backend's GC module path consumes: the type's identity tag (appended
+/// to its TypeDesc for mixed mode), its vtable (function indices in slot order, laid BEFORE the TypeDesc),
+/// and its itable (interface-method tag -> function index, laid AFTER). Produced by
+/// [`MetadataResolver::type_descriptors`].
+#[derive(Debug, Clone)]
+pub struct TypeMeta {
+    /// The type's handle, `TypeHandle(token.0)`.
+    pub handle: TypeHandle,
+    /// The FNV identity tag, appended to the TypeDesc.
+    pub type_tag: u32,
+    /// Virtual-method function indices in slot order (empty if the type has no virtuals).
+    pub vtable: Vec<u32>,
+    /// Interface dispatch entries -- `(interface_method_tag, implementation function index)`.
+    pub itable: Vec<(u32, u32)>,
+    /// The immediate in-program base type's handle, or `None` at the chain's end (a BCL base or
+    /// System.Object). The backend lays this as the TypeDesc base_ptr@12 a `castclass` scan walks.
+    pub base: Option<TypeHandle>,
+}
+
+/// The AOT's interface-method identity tag: FNV-1a32 of the interface's full name, the method name, and
+/// a byte per parameter type, with the high bit set (the shared type/exception tag space). A
+/// `callvirt IFoo::Bar(args)` and every implementing type's itable entry for it derive the SAME tag, so
+/// dispatch needs no shared registry; the interpreter computes it identically to make its signature-key
+/// interface dispatch tag-equivalent.
+#[must_use]
+pub fn interface_method_tag(interface: &TypeName, method: &str, params: &[SigType]) -> u32 {
+    let mut hash = 0x811c_9dc5u32;
+    if !interface.namespace.is_empty() {
+        hash = fnv1a32(hash, interface.namespace.as_bytes());
+        hash = fnv1a32(hash, b".");
+    }
+    hash = fnv1a32(hash, interface.name.as_bytes());
+    hash = fnv1a32(hash, b".");
+    hash = fnv1a32(hash, method.as_bytes());
+    for param in params {
+        hash = fnv1a32(hash, &[sig_element_byte(param)]);
+    }
+    hash | 0x8000_0000
+}
+
+/// The ECMA-335 element-type byte for a parameter type, folded into an interface-method tag to
+/// distinguish overloads. Reference/value types contribute their kind byte (not yet their name -- a
+/// follow-on for overloads differing only by user-defined parameter type).
+fn sig_element_byte(ty: &SigType) -> u8 {
+    match ty {
+        SigType::Void => 0x01,
+        SigType::Boolean => 0x02,
+        SigType::Char => 0x03,
+        SigType::I1 => 0x04,
+        SigType::U1 => 0x05,
+        SigType::I2 => 0x06,
+        SigType::U2 => 0x07,
+        SigType::I4 => 0x08,
+        SigType::U4 => 0x09,
+        SigType::I8 => 0x0a,
+        SigType::U8 => 0x0b,
+        SigType::R4 => 0x0c,
+        SigType::R8 => 0x0d,
+        SigType::String => 0x0e,
+        SigType::ValueType(_) => 0x11,
+        SigType::Class(_) => 0x12,
+        SigType::Array { .. } => 0x14,
+        SigType::TypedByRef => 0x16,
+        SigType::IntPtr => 0x18,
+        SigType::UIntPtr => 0x19,
+        SigType::Object => 0x1c,
+        SigType::SzArray(_) => 0x1d,
+        _ => 0x00,
+    }
 }
 
 impl CallResolver for MetadataResolver<'_> {
@@ -235,7 +408,9 @@ impl CallResolver for MetadataResolver<'_> {
             })
             .flatten();
         let target = match method.kind {
-            MethodKind::Definition(rid) => CallTarget::Internal(self.function_index(rid)?),
+            MethodKind::Definition(rid) => {
+                CallTarget::Internal(self.function_index(rid).unwrap_or(rid))
+            }
             MethodKind::Reference if is_debug_writeline(&method) => {
                 CallTarget::Intrinsic(Intrinsic::DebugWriteLine)
             }
@@ -556,6 +731,14 @@ impl CallResolver for MetadataResolver<'_> {
         handles
     }
 
+    fn cast_target_chain(&self, operand: &Operand) -> Option<TypeHandle> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let target = self.type_token_of(*token)?;
+        (target.table() == table::TYPE_DEF).then_some(TypeHandle(target.0))
+    }
+
     fn boxed_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
         let Operand::Token(token) = operand else {
             return None;
@@ -628,10 +811,38 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         }
         let type_def = self.assembly.type_def(type_token.row())?;
+        if type_def.is_interface() {
+            return None;
+        }
         let rid = token.row();
         self.vtable_methods(type_def)
             .iter()
             .position(|(_, _, method_rid)| *method_rid == rid)
+    }
+
+    fn interface_call_tag(&self, operand: &Operand) -> Option<u32> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        if token.table() != table::METHOD_DEF {
+            return None;
+        }
+        let type_token = self.type_token_of(*token)?;
+        if type_token.table() != table::TYPE_DEF {
+            return None;
+        }
+        let type_def = self.assembly.type_def(type_token.row())?;
+        if !type_def.is_interface() {
+            return None;
+        }
+        let method = type_def.methods().find(|m| m.rid() == token.row())?;
+        let name = method.name()?;
+        let params = method
+            .signature()
+            .map(|sig| sig.parameters)
+            .unwrap_or_default();
+        let iface_name = self.assembly.type_token_name(type_token)?;
+        Some(interface_method_tag(&iface_name, name, &params))
     }
 }
 

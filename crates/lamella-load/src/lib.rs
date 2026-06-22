@@ -10,24 +10,32 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use lamella_cil::{Opcode, Operand};
+use lamella_cil::{EhKind, Opcode, Operand};
 use lamella_metadata::{
-    Assembly, ConstantValue, Method, MethodSig, SigType, TargetLayout, TypeName,
+    Assembly, AttrArg, ConstantValue, Method, MethodSig, SigType, TargetLayout, TypeName,
+    decode_custom_attribute, exception_tag_for_name,
 };
 use lamella_token::Token;
 use lamella_ves::intrinsics::{
-    array_empty, array_get_value, array_set_value, boolean_to_string, char_to_string, console_write,
+    array_clone, array_empty, array_get_value, array_set_value, boolean_to_string,
+    buffer_block_copy, buffer_byte_length, char_to_string, console_write,
+    decimal_add, decimal_compare, decimal_divide, decimal_multiply, decimal_remainder,
+    decimal_subtract,
     console_write_bool, console_write_char, console_write_int32, console_write_int64,
     console_write_line, console_write_line_bool, console_write_line_char, console_write_line_empty,
     console_write_line_int32, console_write_line_int64, console_write_line_object,
-    datetime_now_ticks, delegate_combine, delegate_remove, enum_is_defined, enum_parse, exception_ctor,
+    console_write_line_uint32, console_write_line_uint64, debug_write,
+    datetime_now_ticks, delegate_combine, delegate_remove, enum_format, enum_get_name,
+    enum_get_names, enum_get_values, enum_is_defined, enum_parse, exception_ctor,
     exception_get_message, int32_to_string, int64_to_string, interlocked_compare_exchange,
     md_array_address, md_array_get,
     md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
     object_reference_equals, object_to_string,
-    initialize_array, string_concat, string_concat_object2, string_concat_object3, string_concat3,
+    initialize_array, get_custom_attributes, string_concat, string_concat_object2,
+    string_concat_object3, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
-    string_not_equals, string_substring, string_substring_len, type_from_handle, type_get_name,
+    string_not_equals, string_substring, string_substring_len, type_from_handle, type_get_field,
+    type_get_method, type_get_name, type_get_property,
 };
 #[cfg(feature = "gc")]
 use lamella_ves::intrinsics::gc_collect;
@@ -56,9 +64,11 @@ use lamella_ves::intrinsics::{
 };
 #[cfg(feature = "float")]
 use lamella_ves::intrinsics::{
-    console_write_double, console_write_line_double, convert_to_int32_double, double_to_string,
-    math_abs_f64, math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64, math_round_f64,
-    math_sign_f64, math_truncate_f64,
+    console_write_double, console_write_line_double, console_write_line_single, console_write_single,
+    convert_to_int32_double, decimal_from_double, decimal_to_double, double_to_fixed,
+    double_to_string, math_abs_f64, math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64,
+    math_round_f64, math_sign_f64, math_truncate_f64, single_parse, single_to_fixed,
+    single_to_string,
 };
 #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
 use lamella_ves::intrinsics::{
@@ -70,6 +80,7 @@ use lamella_ves::intrinsics::{
     math_cos_f64, math_exp_f64, math_log_f64, math_log10_f64, math_pow_f64, math_sin_f64,
     math_sqrt_f64, math_tan_f64,
 };
+use lamella_ves::module::{AttrValue, LoadedAttribute, asm_key};
 use lamella_ves::{IntrinsicFn, MethodId, Module, TypeId, Value};
 
 const TYPE_REF: u8 = 0x01;
@@ -136,6 +147,19 @@ fn type_name_key(name: TypeName<'_>) -> String {
     alloc::format!("{}.{}", name.namespace, name.name)
 }
 
+/// A type's canonical FULL name -- `namespace.name`, or the BARE `name` in the global namespace
+/// (no leading `.`). This is the form the exception TAG model hashes
+/// (`lamella_metadata::exception_tag_for_name` omits the `.` when the namespace is empty), so a
+/// type's recorded full-name tag agrees with the tag a `catch` of it computes from the same name.
+/// Distinct from [`type_name_key`], which always prefixes the `.` for its self-consistent index.
+fn full_type_name(name: TypeName<'_>) -> String {
+    if name.namespace.is_empty() {
+        name.name.into()
+    } else {
+        alloc::format!("{}.{}", name.namespace, name.name)
+    }
+}
+
 /// The qualified key (`namespace.type.field`) for a static field, matching across assemblies:
 /// a program's `ldsfld`/`stsfld` `MemberRef` (whose parent `TypeRef` gives the declaring type's
 /// name, and whose member name gives the field name) computes the same key the corlib's own
@@ -158,11 +182,18 @@ fn name_key(
     type_name: &str,
     method: &str,
     params: &[SigType],
+    return_type: Option<&SigType>,
 ) -> String {
     let mut key = alloc::format!("{namespace}.{type_name}.{method}|");
     for param in params {
         key.push_str(&encode_sig_type(assembly, param));
         key.push(',');
+    }
+    if method == "op_Explicit" || method == "op_Implicit" {
+        if let Some(ret) = return_type {
+            key.push_str("->");
+            key.push_str(&encode_sig_type(assembly, ret));
+        }
     }
     key
 }
@@ -696,6 +727,9 @@ fn load_assembly(
     for type_def in assembly.type_defs() {
         type_row += 1;
         let is_enum = is_enum_type(assembly, type_def.extends());
+        if is_enum && has_flags_attribute(assembly, Token::new(TYPE_DEF, type_row)) {
+            module.set_enum_flags(asm, Token::new(TYPE_DEF, type_row).0);
+        }
         let mut own = Vec::new();
         for field in type_def.fields() {
             field_row += 1;
@@ -716,6 +750,7 @@ fn load_assembly(
                         if matches!(constant, ConstantValue::I8(_) | ConstantValue::U8(_)) {
                             module.set_enum_wide(asm, type_token);
                         }
+                        module.set_enum_width(asm, type_token, enum_constant_width(&constant));
                         if let Some(value) = constant_as_i64(constant) {
                             module.set_enum_constant(asm, type_token, value, name.into());
                         }
@@ -733,7 +768,7 @@ fn load_assembly(
             }
             type_index.insert(type_name_key(name), type_id);
             module.bind_type_name(asm, Token::new(TYPE_DEF, type_row), name.name.into());
-            module.bind_type_full_name(type_id, type_name_key(name));
+            module.bind_type_full_name(type_id, full_type_name(name));
             if let Some(kind) = primitive_value_kind(name.namespace, name.name) {
                 module.set_primitive_type_token(asm, Token::new(TYPE_DEF, type_row), &kind);
             }
@@ -760,10 +795,12 @@ fn load_assembly(
             }
             let token = Token::new(METHOD_DEF, method_row);
             let name: String = method.name().unwrap_or("").into();
-            let params: Vec<SigType> = method
-                .signature()
-                .map(|sig| sig.parameters)
+            let method_sig = method.signature();
+            let params: Vec<SigType> = method_sig
+                .as_ref()
+                .map(|sig| sig.parameters.clone())
                 .unwrap_or_default();
+            let return_type: Option<SigType> = method_sig.as_ref().map(|sig| sig.return_type.clone());
             methoddef_sigs.insert(method_row, (name.clone(), params.clone()));
             if is_delegate {
                 if name == ".ctor" {
@@ -806,6 +843,7 @@ fn load_assembly(
                                     declaring.name,
                                     &name,
                                     &params,
+                                    return_type.as_ref(),
                                 ),
                                 id,
                             );
@@ -860,7 +898,7 @@ fn load_assembly(
                         {
                             static_field_ref_tokens.insert(*operand);
                         }
-                        Opcode::Ldtoken | Opcode::Constrained | Opcode::Box
+                        Opcode::Ldtoken | Opcode::Constrained | Opcode::Box | Opcode::Initobj
                             if matches!(operand.table(), TYPE_DEF | TYPE_REF | TYPE_SPEC) =>
                         {
                             ldtoken_type_tokens.insert(*operand);
@@ -878,6 +916,16 @@ fn load_assembly(
                     }
                 }
             }
+            #[cfg(feature = "exceptions")]
+            for clause in body.handlers.iter() {
+                if let EhKind::Catch(catch_token) = clause.kind {
+                    if let Some(catch_name) = assembly.type_token_name(catch_token) {
+                        let tag =
+                            exception_tag_for_name(catch_name.namespace, catch_name.name);
+                        module.bind_catch_type_tag(asm, catch_token, tag);
+                    }
+                }
+            }
             let id = module.add_method(asm, body, arg_count(&method));
             module.bind_token(asm, token, id);
             module.set_method_type(id, type_id);
@@ -889,6 +937,7 @@ fn load_assembly(
                         declaring.name,
                         &name,
                         &params,
+                        return_type.as_ref(),
                     ),
                     id,
                 );
@@ -945,7 +994,7 @@ fn load_assembly(
         resolve_external,
         &bcl_call_tokens,
     );
-    bind_array_defaults(assembly, module, asm, &newarr_tokens);
+    bind_array_defaults(assembly, module, asm, type_index, &newarr_tokens);
     bind_generic_calls(assembly, module, asm, &generic_call_tokens);
     mark_value_type_ctors(module, asm, &newobj_tokens, &value_type_method_rows);
     mark_same_assembly_ctors(
@@ -977,7 +1026,7 @@ fn load_assembly(
         &type_extends,
         &type_virtuals,
     );
-    build_sig_methods(module, asm, type_offset, &type_extends, &type_virtuals);
+    build_sig_methods(module, assembly, asm, type_offset, &type_extends, &type_virtuals);
     bind_call_targets(module, assembly, asm, &callvirt_tokens, &methoddef_sigs);
     bind_explicit_overrides(module, assembly, asm, type_offset);
     bind_types(module, asm, type_offset, &type_extends, &type_is_value_type);
@@ -989,6 +1038,7 @@ fn load_assembly(
         type_index,
         &type_interfaces,
     );
+    record_custom_attributes(assembly, module, asm);
     entry
 }
 
@@ -1060,6 +1110,7 @@ fn bind_bcl_calls(
                     parent_type.name,
                     method_name,
                     params,
+                    signature.as_ref().map(|sig| &sig.return_type),
                 );
                 if let Some(&target) = index.get(&key) {
                     module.bind_token(asm, *token, target);
@@ -1264,6 +1315,24 @@ fn bcl_intrinsic(
     if namespace == "System.Reflection" && type_name == "MemberInfo" && method == "get_Name" {
         return Some(type_get_name);
     }
+    if namespace == "System.Reflection"
+        && type_name == "MemberInfo"
+        && method == "GetCustomAttributes"
+    {
+        return match parameters_of(signature) {
+            [SigType::Boolean] => Some(get_custom_attributes),
+            _ => None,
+        };
+    }
+    if namespace == "System.Diagnostics"
+        && type_name == "DefaultTraceListener"
+        && method == "DebugWrite"
+    {
+        return match parameters_of(signature) {
+            [SigType::String] => Some(debug_write),
+            _ => None,
+        };
+    }
     if namespace != "System" {
         return None;
     }
@@ -1299,8 +1368,24 @@ fn bcl_intrinsic(
         ("GC", "WaitForPendingFinalizers") => Some(wait_for_pending_finalizers),
         ("Type", "GetTypeFromHandle") => Some(type_from_handle),
         ("Type", "get_Name") => Some(type_get_name),
+        ("Type", "GetField") => match parameters_of(signature) {
+            [SigType::String] => Some(type_get_field),
+            _ => None,
+        },
+        ("Type", "GetMethod") => match parameters_of(signature) {
+            [SigType::String] => Some(type_get_method),
+            _ => None,
+        },
+        ("Type", "GetProperty") => match parameters_of(signature) {
+            [SigType::String] => Some(type_get_property),
+            _ => None,
+        },
         ("Enum", "Parse") => Some(enum_parse),
         ("Enum", "IsDefined") => Some(enum_is_defined),
+        ("Enum", "GetName") => Some(enum_get_name),
+        ("Enum", "GetNames") => Some(enum_get_names),
+        ("Enum", "GetValues") => Some(enum_get_values),
+        ("Enum", "Format") => Some(enum_format),
         ("Array", "get_Length") => Some(md_array_length),
         ("Array", "GetLength") => Some(md_array_get_length),
         ("Array", "GetValue") => match parameters_of(signature) {
@@ -1311,12 +1396,43 @@ fn bcl_intrinsic(
             [SigType::Object, SigType::I4] => Some(array_set_value),
             _ => None,
         },
+        ("Array", "Clone") => match parameters_of(signature) {
+            [] => Some(array_clone),
+            _ => None,
+        },
+        ("Buffer", "BlockCopyInternal") => match parameters_of(signature) {
+            [SigType::Class(_), SigType::I4, SigType::Class(_), SigType::I4, SigType::I4] => {
+                Some(buffer_block_copy)
+            }
+            _ => None,
+        },
+        ("Buffer", "ByteLengthInternal") => match parameters_of(signature) {
+            [SigType::Class(_)] => Some(buffer_byte_length),
+            _ => None,
+        },
         ("Int32", "ToString") => to_string_overload(int32_to_string, signature),
         ("Boolean", "ToString") => to_string_overload(boolean_to_string, signature),
         ("Char", "ToString") => to_string_overload(char_to_string, signature),
         ("Int64", "ToString") => to_string_overload(int64_to_string, signature),
         #[cfg(feature = "float")]
         ("Double", "ToString") => to_string_overload(double_to_string, signature),
+        #[cfg(feature = "float")]
+        ("Double", "ToFixed") => match parameters_of(signature) {
+            [SigType::R8, SigType::I4] => Some(double_to_fixed),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("Single", "ToString") => to_string_overload(single_to_string, signature),
+        #[cfg(feature = "float")]
+        ("Single", "ToFixed") => match parameters_of(signature) {
+            [SigType::R4, SigType::I4] => Some(single_to_fixed),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("Single", "ParseValid") => match parameters_of(signature) {
+            [SigType::String] => Some(single_parse),
+            _ => None,
+        },
         ("Object", "ToString") => to_string_overload(object_to_string, signature),
         ("Delegate", "Combine") => Some(delegate_combine),
         ("Delegate", "Remove") => Some(delegate_remove),
@@ -1342,6 +1458,22 @@ fn bcl_intrinsic(
         #[cfg(feature = "float")]
         ("BitConverter", "Int32BitsToSingle") => match parameters_of(signature) {
             [SigType::I4] => Some(bitconverter_int32_bits_to_single),
+            _ => None,
+        },
+        ("Decimal", "op_Addition") => decimal_binary_op(decimal_add, signature),
+        ("Decimal", "op_Subtraction") => decimal_binary_op(decimal_subtract, signature),
+        ("Decimal", "op_Multiply") => decimal_binary_op(decimal_multiply, signature),
+        ("Decimal", "op_Division") => decimal_binary_op(decimal_divide, signature),
+        ("Decimal", "op_Modulus") => decimal_binary_op(decimal_remainder, signature),
+        ("Decimal", "Compare") => decimal_binary_op(decimal_compare, signature),
+        #[cfg(feature = "float")]
+        ("Decimal", "FromDouble") => match parameters_of(signature) {
+            [SigType::R8] => Some(decimal_from_double),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("Decimal", "ToDouble") => match parameters_of(signature) {
+            [SigType::ValueType(_)] => Some(decimal_to_double),
             _ => None,
         },
         _ => None,
@@ -1376,7 +1508,9 @@ fn default_field_value(signature: Option<SigType>) -> Value {
     match signature {
         Some(SigType::I8 | SigType::U8) => Value::Int64(0),
         #[cfg(feature = "float")]
-        Some(SigType::R4 | SigType::R8) => Value::Float(0.0),
+        Some(SigType::R4) => Value::Single(0.0),
+        #[cfg(feature = "float")]
+        Some(SigType::R8) => Value::Float(0.0),
         Some(
             SigType::Boolean
             | SigType::Char
@@ -1391,16 +1525,52 @@ fn default_field_value(signature: Option<SigType>) -> Value {
     }
 }
 
-/// Binds each `newarr` element-type token to its elements' zero value.
+/// Binds each `newarr` element-type token to its elements' zero value, and -- for a primitive
+/// element type `System.Buffer` accepts -- the element type's byte width, so an array stamps its
+/// `Buffer` size at allocation (a `byte[]` and an `int[]` are otherwise indistinguishable, both
+/// storing `Value::Int32`).
 fn bind_array_defaults(
     assembly: &Assembly,
     module: &mut Module,
     asm: u8,
+    type_index: &TypeNameIndex,
     tokens: &BTreeSet<Token>,
 ) {
     for token in tokens {
         module.bind_array_default(asm, *token, array_element_default(assembly, *token));
+        if let Some(size) = assembly
+            .type_token_name(*token)
+            .and_then(|name| buffer_element_size(name.namespace, name.name))
+        {
+            module.bind_array_element_size(asm, *token, size);
+        }
+        if module.type_id_of(asm, *token).is_none() {
+            if let Some(name) = assembly.type_token_name(*token) {
+                if let Some(id) = type_index.get(&type_name_key(name)).copied() {
+                    module.bind_type_token(asm, *token, id);
+                }
+            }
+        }
     }
+}
+
+/// The byte width of a primitive element type `System.Buffer.BlockCopy` / `ByteLength` accept --
+/// the .NET "primitive of fixed size" set (the integer types, `Char`, `Boolean`, `Single`,
+/// `Double`). `None` for anything else, including `IntPtr`/`UIntPtr` (whose size is not fixed and
+/// which `System.Buffer` rejects), references, and value types -- so a `Buffer` call over such an
+/// array raises `ArgumentException`. Mirrors `array_element_default`'s widening (so the byte width
+/// agrees with the `Value` kind the element stores).
+fn buffer_element_size(namespace: &str, name: &str) -> Option<u8> {
+    if namespace != "System" {
+        return None;
+    }
+    Some(match name {
+        "Boolean" | "SByte" | "Byte" => 1,
+        "Int16" | "UInt16" | "Char" => 2,
+        "Int32" | "UInt32" | "Single" => 4,
+        "Int64" | "UInt64" | "Double" => 8,
+        _ => return None,
+    })
 }
 
 /// Marks each `newobj` token whose constructor is declared by a value type, so the
@@ -1537,11 +1707,209 @@ fn bind_type_names(
     }
 }
 
-/// Classifies each `castclass` / `isinst` / `box` type-test operand by its external
-/// identity -- `System.Object` (a universal match target) or `System.String` -- so the
-/// interpreter's type test on a boxed value or a heap string is precise. A same-assembly
-/// declared type already resolves to a `TypeId`; only these unresolvable core targets need
-/// recording.
+/// Records, for every target in this assembly, the custom attributes applied to it (decoded
+/// and resolved to a runtime form) and the member-name maps `Type.GetField`/`GetMethod`/
+/// `GetProperty` resolve through. For a type and each of its fields, methods, and properties,
+/// each applied attribute whose constructor is an instantiable same-module method becomes a
+/// [`LoadedAttribute`] keyed by the target's asm-folded token (the `Type` / `MemberInfo` handle a
+/// `GetCustomAttributes` receiver carries). Framework/compiler attributes (whose ctor is a
+/// cross-assembly `MemberRef` that resolves to no `MethodId`) are skipped. The member-name maps
+/// let an accessor map a name to the member handle whose attributes then read here.
+fn record_custom_attributes(assembly: &Assembly, module: &mut Module, asm: u8) {
+    for (local_index, type_def) in assembly.type_defs().enumerate() {
+        let type_token = Token::new(TYPE_DEF, (local_index + 1) as u32);
+        let type_handle = asm_key(asm, type_token.0);
+        record_target_attributes(assembly, module, asm, type_handle, type_token);
+        for field in type_def.fields() {
+            if let Some(name) = field.name() {
+                let handle = asm_key(asm, field.token().0);
+                module.bind_type_field_name(type_handle, name, handle);
+                record_target_attributes(assembly, module, asm, handle, field.token());
+            }
+        }
+        for method in type_def.methods() {
+            if let Some(name) = method.name() {
+                let token = Token::new(METHOD_DEF, method.rid());
+                let handle = asm_key(asm, token.0);
+                module.bind_type_method_name(type_handle, name, handle);
+                record_target_attributes(assembly, module, asm, handle, token);
+            }
+        }
+        for property in type_def.properties() {
+            if let Some(name) = property.name() {
+                let handle = asm_key(asm, property.token().0);
+                module.bind_type_property_name(type_handle, name, handle);
+                record_target_attributes(assembly, module, asm, handle, property.token());
+            }
+        }
+    }
+}
+
+/// Decodes and records the custom attributes applied to one target (`target_token`), keyed by
+/// its asm-folded `target_handle`. Each attribute's value blob is decoded against its
+/// constructor's parameter signature; an attribute whose ctor does not resolve to a same-module
+/// [`MethodId`] (a framework attribute) is skipped, as is one whose attribute type has no declared
+/// `TypeId` (so it cannot be instantiated).
+fn record_target_attributes(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    target_handle: u64,
+    target_token: Token,
+) {
+    for attribute in assembly.custom_attributes(target_token) {
+        let ctor_token = attribute.constructor;
+        let Some(ctor) = module.resolve(asm, ctor_token) else {
+            continue;
+        };
+        let Some(type_id) = module.method_type(ctor) else {
+            continue;
+        };
+        let ctor_params = assembly
+            .resolve_method(ctor_token)
+            .and_then(|method| method.signature)
+            .map(|signature| signature.parameters)
+            .unwrap_or_default();
+        let Some(decoded) = decode_custom_attribute(attribute.value, &ctor_params, &|enum_name| {
+            enum_underlying_element_type(assembly, enum_name)
+        }) else {
+            continue;
+        };
+        let positional = decoded
+            .fixed
+            .iter()
+            .map(|argument| attr_arg_to_value(argument, assembly, asm))
+            .collect();
+        let mut named_fields = Vec::new();
+        for named in &decoded.named {
+            if !named.is_field {
+                continue;
+            }
+            if let Some(slot) = attribute_field_slot(assembly, module, asm, type_id, named.name) {
+                named_fields.push((slot, attr_arg_to_value(&named.value, assembly, asm)));
+            }
+        }
+        module.add_custom_attribute(
+            target_handle,
+            LoadedAttribute {
+                ctor,
+                type_id,
+                positional,
+                named_fields,
+            },
+        );
+    }
+}
+
+/// The instance-field slot of the field named `name` on the attribute type `type_id` (a
+/// same-module type): its position among the type's instance fields, the slot a `stfld` /
+/// `set_instance_field` addresses. `None` if the type declares no such instance field.
+fn attribute_field_slot(
+    assembly: &Assembly,
+    module: &Module,
+    asm: u8,
+    type_id: TypeId,
+    name: &str,
+) -> Option<u32> {
+    for type_def in assembly.type_defs() {
+        if module.type_id_of(asm, type_def.token()) != Some(type_id) {
+            continue;
+        }
+        for field in type_def.fields() {
+            if field.is_static() {
+                continue;
+            }
+            if field.name() == Some(name) {
+                return module.field_slot(asm, field.token());
+            }
+        }
+    }
+    None
+}
+
+/// The underlying integer element-type byte of the enum named (by its reflection name) in this
+/// assembly -- what a custom-attribute blob's enum argument is serialized at. Resolves the enum's
+/// `TypeDef` and reads the underlying type of its first constant (II.22.9). Defaults to
+/// [`SigType`]-`I4` (the C# default `int`) for an unknown enum or one with no constants.
+fn enum_underlying_element_type(assembly: &Assembly, reflection_name: &str) -> u8 {
+    const I1: u8 = 0x04;
+    const U1: u8 = 0x05;
+    const I2: u8 = 0x06;
+    const U2: u8 = 0x07;
+    const I4: u8 = 0x08;
+    const U4: u8 = 0x09;
+    const I8: u8 = 0x0A;
+    const U8: u8 = 0x0B;
+    let (namespace, name) = split_reflection_name(reflection_name);
+    let Some(type_def) = assembly.find_type(namespace, name) else {
+        return I4;
+    };
+    for field in type_def.fields() {
+        if let Some(constant) = field.constant() {
+            return match constant {
+                ConstantValue::I1(_) => I1,
+                ConstantValue::U1(_) => U1,
+                ConstantValue::I2(_) => I2,
+                ConstantValue::U2(_) => U2,
+                ConstantValue::U4(_) => U4,
+                ConstantValue::I8(_) => I8,
+                ConstantValue::U8(_) => U8,
+                _ => I4,
+            };
+        }
+    }
+    I4
+}
+
+/// Splits an attribute blob's reflection type name into `(namespace, name)` for resolution: a
+/// `typeof(X)` / enum argument serializes the type's reflection name (e.g. `"Color"`,
+/// `"Foo.Bar"`). The namespace is everything before the LAST `.`; a name with no `.` is in the
+/// global namespace. (Assembly-qualified names and nested-type `+` separators are not produced by
+/// the reflection corpus and are left to a follow-on.)
+fn split_reflection_name(reflection_name: &str) -> (&str, &str) {
+    match reflection_name.rfind('.') {
+        Some(dot) => (&reflection_name[..dot], &reflection_name[dot + 1..]),
+        None => ("", reflection_name),
+    }
+}
+
+/// Materializes a decoded custom-attribute argument into the load-time [`AttrValue`] the module
+/// stores: an integer at its width, a string's UTF-16 units, a resolved `Type` handle for a
+/// `typeof(X)` argument (the asm-folded `TypeDef` token of a same-assembly `X`, which is exactly
+/// the handle `typeof(X)` pushes at runtime; `0` for a type this assembly does not define -- a
+/// cross-assembly `typeof`, a follow-on), or null. The interpreter turns these into runtime
+/// values when it instantiates the attribute.
+fn attr_arg_to_value(argument: &AttrArg, assembly: &Assembly, asm: u8) -> AttrValue {
+    match argument {
+        AttrArg::Bool(value) => AttrValue::Int {
+            value: i64::from(*value),
+            wide: false,
+        },
+        AttrArg::Char(value) => AttrValue::Int {
+            value: i64::from(*value),
+            wide: false,
+        },
+        AttrArg::Int(value) => AttrValue::Int {
+            value: *value,
+            wide: !(i32::MIN as i64..=i32::MAX as i64).contains(value),
+        },
+        AttrArg::UInt(value) => AttrValue::Int {
+            value: *value as i64,
+            wide: *value > u32::MAX as u64,
+        },
+        AttrArg::R4(value) => AttrValue::R4(*value),
+        AttrArg::R8(value) => AttrValue::R8(*value),
+        AttrArg::Str(text) => AttrValue::Str(text.encode_utf16().collect()),
+        AttrArg::Null => AttrValue::Null,
+        AttrArg::Type(name) => {
+            let (namespace, simple) = split_reflection_name(name);
+            let handle = assembly
+                .find_type(namespace, simple)
+                .map_or(0, |type_def| asm_key(asm, type_def.token().0));
+            AttrValue::Type(handle)
+        }
+    }
+}
 fn classify_type_test_tokens(
     assembly: &Assembly,
     module: &mut Module,
@@ -1638,7 +2006,9 @@ fn array_element_default(assembly: &Assembly, element_type: Token) -> Value {
         }
         "Int64" | "UInt64" => Value::Int64(0),
         #[cfg(feature = "float")]
-        "Single" | "Double" => Value::Float(0.0),
+        "Single" => Value::Single(0.0),
+        #[cfg(feature = "float")]
+        "Double" => Value::Float(0.0),
         "IntPtr" | "UIntPtr" => Value::NativeInt(0),
         _ => Value::Null,
     }
@@ -1659,7 +2029,9 @@ fn primitive_value_kind(namespace: &str, name: &str) -> Option<Value> {
         "Int32" => Value::Int32(0),
         "Int64" => Value::Int64(0),
         #[cfg(feature = "float")]
-        "Single" | "Double" => Value::Float(0.0),
+        "Single" => Value::Single(0.0),
+        #[cfg(feature = "float")]
+        "Double" => Value::Float(0.0),
         "IntPtr" | "UIntPtr" => Value::NativeInt(0),
         _ => return None,
     })
@@ -1811,6 +2183,32 @@ fn is_enum_type(assembly: &Assembly, extends: Token) -> bool {
         .is_some_and(|name| name.name == "Enum")
 }
 
+/// Whether the type `type_token` (a `TypeDef`) carries `[System.FlagsAttribute]`, by scanning its
+/// custom attributes (II.22.10) for one whose constructor's declaring type is named
+/// `FlagsAttribute`. The attribute type lives in another assembly (the program references
+/// `[ref]System.FlagsAttribute`), so the match is on the resolved declaring-type NAME, exactly as
+/// [`Assembly::param_array_params`] matches `ParamArrayAttribute`.
+fn has_flags_attribute(assembly: &Assembly, type_token: Token) -> bool {
+    assembly.custom_attributes(type_token).any(|attribute| {
+        assembly
+            .resolve_method(attribute.constructor)
+            .and_then(|ctor| ctor.declaring_type)
+            .is_some_and(|name| name.namespace == "System" && name.name == "FlagsAttribute")
+    })
+}
+
+/// The underlying byte width an enum constant's kind implies (`sbyte`/`byte` = 1,
+/// `short`/`ushort`/`char` = 2, `int`/`uint` = 4, `long`/`ulong` = 8) -- the enum's underlying
+/// type, which every member shares. `Enum.Format`'s "X" zero-pads to `width * 2` hex digits.
+fn enum_constant_width(value: &ConstantValue) -> u8 {
+    match value {
+        ConstantValue::I1(_) | ConstantValue::U1(_) => 1,
+        ConstantValue::I2(_) | ConstantValue::U2(_) | ConstantValue::Char(_) => 2,
+        ConstantValue::I8(_) | ConstantValue::U8(_) => 8,
+        _ => 4,
+    }
+}
+
 /// An integer constant's value as `i64` (an enum's underlying type is an integer kind).
 fn constant_as_i64(value: ConstantValue) -> Option<i64> {
     match value {
@@ -1829,9 +2227,22 @@ fn constant_as_i64(value: ConstantValue) -> Option<i64> {
 
 /// A signature key (method name + parameter types) for interface / abstract dispatch.
 /// The same key is computed for a `callvirt` target and for the implementing method,
-/// so they match; the `{:?}` of the parameter list is a stable, distinct encoding.
-fn sig_encode(name: &str, params: &[SigType]) -> String {
-    alloc::format!("{name}|{params:?}")
+/// so they match. Each parameter is encoded portably via [`encode_sig_type`] (resolving a
+/// token-bearing `Class` / `ValueType` -- e.g. an enum parameter like `System.IO.SeekOrigin`
+/// -- to its qualified name): a program's `callvirt` MemberRef names that type through a
+/// `TypeRef` token while the corlib's abstract MethodDef names it through a `TypeDef` token, so
+/// the raw `{:?}` of the two `SigType`s would differ and the dispatch would resolve to no method.
+/// Resolving to the name makes both sides encode identically (the same fix `name_key` applies to
+/// BCL-call resolution). A token-free parameter (a primitive, `string`, `object`, or an
+/// array/pointer/byref thereof) keeps its stable short form, so primitive-only signatures encode
+/// exactly as before.
+fn sig_encode(assembly: &Assembly, name: &str, params: &[SigType]) -> String {
+    let mut key = alloc::format!("{name}|");
+    for param in params {
+        key.push_str(&encode_sig_type(assembly, param));
+        key.push(',');
+    }
+    key
 }
 
 /// Builds each type's signature-keyed method map (its virtual / interface-implementing
@@ -1839,6 +2250,7 @@ fn sig_encode(name: &str, params: &[SigType]) -> String {
 /// to an interface or abstract method on a value of that runtime type.
 fn build_sig_methods(
     module: &mut Module,
+    assembly: &Assembly,
     _asm: u8,
     type_offset: usize,
     extends: &[Token],
@@ -1846,7 +2258,7 @@ fn build_sig_methods(
 ) {
     let mut memo: Vec<Option<BTreeMap<String, MethodId>>> = alloc::vec![None; extends.len()];
     for local in 0..extends.len() {
-        let methods = compute_sig_methods(local, extends, virtuals, &mut memo);
+        let methods = compute_sig_methods(assembly, local, extends, virtuals, &mut memo);
         if !methods.is_empty() {
             module.set_sig_methods((type_offset + local) as u32, methods);
         }
@@ -1856,6 +2268,7 @@ fn build_sig_methods(
 /// The memoized signature-keyed method map of `type_id`: its base's map plus its own
 /// virtual methods (a derived method's key replaces the inherited one).
 fn compute_sig_methods(
+    assembly: &Assembly,
     type_id: usize,
     extends: &[Token],
     virtuals: &[Vec<VirtualMethod>],
@@ -1865,11 +2278,11 @@ fn compute_sig_methods(
         return methods.clone();
     }
     let mut methods = match base_type_id(extends[type_id], extends.len()) {
-        Some(base) => compute_sig_methods(base, extends, virtuals, memo),
+        Some(base) => compute_sig_methods(assembly, base, extends, virtuals, memo),
         None => BTreeMap::new(),
     };
     for method in &virtuals[type_id] {
-        methods.insert(sig_encode(&method.name, &method.params), method.id);
+        methods.insert(sig_encode(assembly, &method.name, &method.params), method.id);
     }
     memo[type_id] = Some(methods.clone());
     methods
@@ -1890,7 +2303,7 @@ fn bind_call_targets(
     for token in tokens {
         let (key, param_count) = match token.table() {
             METHOD_DEF => match methoddef_sigs.get(&token.row()) {
-                Some((name, params)) => (sig_encode(name, params), params.len()),
+                Some((name, params)) => (sig_encode(assembly, name, params), params.len()),
                 None => continue,
             },
             MEMBER_REF => {
@@ -1902,7 +2315,7 @@ fn bind_call_targets(
                     .method_signature()
                     .map(|sig| sig.parameters)
                     .unwrap_or_default();
-                (sig_encode(name, &params), params.len())
+                (sig_encode(assembly, name, &params), params.len())
             }
             _ => continue,
         };
@@ -1964,7 +2377,7 @@ fn build_vtables(
     let mut visiting: Vec<bool> = alloc::vec![false; extends.len()];
     let mut method_slots: BTreeMap<MethodId, u32> = BTreeMap::new();
     for local in 0..extends.len() {
-        let table = compute_vtable(local, &bases, virtuals, &mut memo, &mut visiting, &mut method_slots);
+        let table = compute_vtable(assembly, local, &bases, virtuals, &mut memo, &mut visiting, &mut method_slots);
         let type_id = (type_offset + local) as u32;
         module.set_vtable_slot_keys(
             type_id,
@@ -2033,6 +2446,7 @@ fn resolve_base_vtable(
 /// here, a cross-assembly base's stored slots inherited) so a derived table extends its base's.
 /// Records each of this type's own virtual methods' slots.
 fn compute_vtable(
+    assembly: &Assembly,
     type_id: usize,
     bases: &[BaseVtable],
     virtuals: &[Vec<VirtualMethod>],
@@ -2049,13 +2463,13 @@ fn compute_vtable(
     visiting[type_id] = true;
     let mut table = match &bases[type_id] {
         BaseVtable::Local(base) => {
-            compute_vtable(*base, bases, virtuals, memo, visiting, method_slots)
+            compute_vtable(assembly, *base, bases, virtuals, memo, visiting, method_slots)
         }
         BaseVtable::Extern(slots) => slots.clone(),
         BaseVtable::None => Vec::new(),
     };
     for method in &virtuals[type_id] {
-        let key = sig_encode(&method.name, &method.params);
+        let key = sig_encode(assembly, &method.name, &method.params);
         let overridden = (!method.newslot)
             .then(|| table.iter().position(|slot| slot.key == key))
             .flatten();
@@ -2159,14 +2573,30 @@ fn console_write_line_overload(signature: Option<&MethodSig>) -> Option<Intrinsi
         [SigType::String] => console_write_line,
         [SigType::I4] => console_write_line_int32,
         [SigType::I8] => console_write_line_int64,
+        [SigType::U4] => console_write_line_uint32,
+        [SigType::U8] => console_write_line_uint64,
         [SigType::Boolean] => console_write_line_bool,
         [SigType::Char] => console_write_line_char,
         #[cfg(feature = "float")]
         [SigType::R8] => console_write_line_double,
+        #[cfg(feature = "float")]
+        [SigType::R4] => console_write_line_single,
         [SigType::Object] => console_write_line_object,
         _ => return None,
     };
     Some(intrinsic)
+}
+
+/// A two-`Decimal` operator/comparison: both parameters are the `Decimal` value type (each
+/// arriving as the inline value-type struct). Binds only that two-operand form.
+fn decimal_binary_op(
+    intrinsic: IntrinsicFn,
+    signature: Option<&MethodSig>,
+) -> Option<IntrinsicFn> {
+    match parameters_of(signature) {
+        [SigType::ValueType(_), SigType::ValueType(_)] => Some(intrinsic),
+        _ => None,
+    }
 }
 
 /// The parameterless `ToString()` overload binds to `intrinsic`; the formatting
@@ -2191,6 +2621,8 @@ fn console_write_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> 
         [SigType::Char] => console_write_char,
         #[cfg(feature = "float")]
         [SigType::R8] => console_write_double,
+        #[cfg(feature = "float")]
+        [SigType::R4] => console_write_single,
         _ => return None,
     };
     Some(intrinsic)
@@ -2405,6 +2837,8 @@ mod extended {
             [SigType::Boolean] => Some(boolean_to_string),
             #[cfg(feature = "float")]
             [SigType::R8] => Some(double_to_string),
+            #[cfg(feature = "float")]
+            [SigType::R4] => Some(single_to_string),
             [SigType::Char] => Some(char_to_string),
             _ => None,
         }

@@ -350,6 +350,9 @@ pub struct Binder {
     /// How many enclosing `switch` statements the binder is inside (a `break` is also valid
     /// in a switch). Reset per method.
     switch_depth: u32,
+    /// The preprocessor symbols defined for this compilation (from `#define`), so a call to a
+    /// `[Conditional("X")]` method with no `X` here is omitted (24.4.2). Empty by default.
+    defined_symbols: alloc::collections::BTreeSet<Box<str>>,
 }
 
 impl Binder {
@@ -383,6 +386,12 @@ impl Binder {
     #[must_use]
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// Sets the `#define`d preprocessor symbols for this compilation, so a call to a
+    /// `[Conditional("X")]` method with no `X` here is omitted (24.4.2).
+    pub fn set_defined_symbols(&mut self, symbols: alloc::collections::BTreeSet<Box<str>>) {
+        self.defined_symbols = symbols;
     }
 
     /// Records a diagnostic.
@@ -2346,7 +2355,7 @@ impl Binder {
                         self.check_constructor(&target_ty, &constructors, &argument_types, span)
                     };
                     if let Some(chosen) = chosen {
-                        if has_method_group && chosen.parameters.len() == arguments.len() {
+                        if chosen.parameters.len() == arguments.len() {
                             arguments = core::mem::take(&mut arguments)
                                 .into_iter()
                                 .zip(chosen.parameters.iter())
@@ -2470,6 +2479,12 @@ impl Binder {
         None
     }
 
+    /// Whether a member of `declaring` with this accessibility is reachable from the current
+    /// context (10.5.1). `private` is the declaring type and any type nested in it;
+    /// `protected` adds the types derived from the declaring type. `internal` and
+    /// `protected internal` are treated as accessible: a same-assembly access IS allowed,
+    /// and lcsc does not distinguish a reference assembly's internal members (rarely named)
+    /// -- cross-assembly internal enforcement is a known gap.
     fn is_accessible(&self, declaring: &TypeSymbol, accessibility: Accessibility) -> bool {
         match accessibility {
             Accessibility::Public => true,
@@ -2596,11 +2611,19 @@ impl Binder {
 
     fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
         let lookup = member_lookup_type(ty);
-        let mut current = self.type_info_of(&lookup);
-        if current.is_none() {
+        if self.type_info_of(&lookup).is_none() {
             return MemberResolution::Unknown;
         }
-        while let Some(info) = current {
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut pending = alloc::vec![lookup.clone()];
+        while let Some(current_ty) = pending.pop() {
+            if visited.contains(&current_ty) {
+                continue;
+            }
+            visited.push(current_ty.clone());
+            let Some(info) = self.type_info_of(&current_ty) else {
+                continue;
+            };
             if let Some(field) = info.find_field(name) {
                 return MemberResolution::Field(FieldReference {
                     declaring_type: type_symbol_in(&info.namespace, &info.name),
@@ -2622,7 +2645,12 @@ impl Binder {
             if info.methods_named(name).next().is_some() {
                 return MemberResolution::MethodGroup;
             }
-            current = info.base.as_ref().and_then(|base| self.type_info_of(base));
+            for base in &info.bases {
+                pending.push(base.clone());
+            }
+            if let Some(base) = &info.base {
+                pending.push(base.clone());
+            }
         }
         MemberResolution::NoSuchMember(ty.to_string())
     }
@@ -2768,24 +2796,78 @@ impl Binder {
 
     /// Every method named `name` on `ty` or any of its base classes -- the method
     /// group an invocation resolves over (most-derived first).
+    /// Resolves a no-argument instance method `name` on `receiver_ty` to a reference -- for
+    /// the compiler-synthesized calls of a `foreach` enumerator pattern (GetEnumerator on the
+    /// collection, MoveNext/get_Current on the enumerator). `None` when the type has no such
+    /// method (so the collection is not enumerable), without reporting a diagnostic.
+    pub(crate) fn resolve_instance_method(
+        &mut self,
+        receiver_ty: &TypeSymbol,
+        name: &str,
+        span: Span,
+    ) -> Option<MethodReference> {
+        let candidates = self.methods_in_chain(receiver_ty, name);
+        if candidates.is_empty() {
+            return None;
+        }
+        let chosen = self.resolve_call(name, receiver_ty, &candidates, &[], span)?;
+        let declaring_type =
+            self.declaring_type_in_chain(receiver_ty, &chosen.name, &chosen.parameters);
+        Some(MethodReference {
+            declaring_type,
+            name: chosen.name,
+            parameters: chosen.parameters,
+            return_type: chosen.return_type,
+            is_static: chosen.is_static,
+        })
+    }
+
+    /// Whether a bound call is to a `[Conditional("X")]` method none of whose symbols are
+    /// defined here -- so the call statement is omitted whole (24.4.2), arguments and all. The
+    /// method's `conditional` is recovered from the model by the resolved overload.
+    pub(crate) fn conditional_call_omitted(&self, expr: &BoundExpr) -> bool {
+        let BoundExprKind::Call {
+            method: Some(method),
+            ..
+        } = &expr.kind
+        else {
+            return false;
+        };
+        let conditional = self
+            .methods_in_chain(&method.declaring_type, &method.name)
+            .into_iter()
+            .find(|candidate| candidate.parameters == method.parameters)
+            .map(|candidate| candidate.conditional)
+            .unwrap_or_default();
+        !conditional.is_empty()
+            && !conditional
+                .iter()
+                .any(|symbol| self.defined_symbols.contains(symbol))
+    }
+
     fn methods_in_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
         let mut methods: Vec<MethodSymbol> = Vec::new();
         let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(member_lookup_type(ty));
-        while let Some(current_ty) = current.take() {
+        let mut pending = alloc::vec![member_lookup_type(ty)];
+        while let Some(current_ty) = pending.pop() {
             if visited.contains(&current_ty) {
-                break;
+                continue;
             }
             visited.push(current_ty.clone());
             let Some(info) = self.type_info_of(&current_ty) else {
-                break;
+                continue;
             };
             for method in info.methods_named(name) {
                 if !methods.iter().any(|kept| kept.parameters == method.parameters) {
                     methods.push(method.clone());
                 }
             }
-            current = info.base.clone();
+            for base in &info.bases {
+                pending.push(base.clone());
+            }
+            if let Some(base) = &info.base {
+                pending.push(base.clone());
+            }
         }
         methods
     }
@@ -2802,14 +2884,14 @@ impl Binder {
     ) -> TypeSymbol {
         let lookup = member_lookup_type(ty);
         let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(lookup.clone());
-        while let Some(current_ty) = current.take() {
+        let mut pending = alloc::vec![lookup.clone()];
+        while let Some(current_ty) = pending.pop() {
             if visited.contains(&current_ty) {
-                break;
+                continue;
             }
             visited.push(current_ty.clone());
             let Some(info) = self.type_info_of(&current_ty) else {
-                break;
+                continue;
             };
             if info
                 .methods_named(name)
@@ -2817,7 +2899,12 @@ impl Binder {
             {
                 return type_symbol_in(&info.namespace, &info.name);
             }
-            current = info.base.clone();
+            for base in &info.bases {
+                pending.push(base.clone());
+            }
+            if let Some(base) = &info.base {
+                pending.push(base.clone());
+            }
         }
         lookup
     }
@@ -3897,6 +3984,7 @@ mod tests {
             is_static: false,
             is_params: false,
             accessibility: crate::symbols::Accessibility::Public,
+            conditional: Vec::new(),
         });
         model.insert(widget);
 
@@ -4016,6 +4104,7 @@ mod tests {
             is_static: false,
             is_params: false,
             accessibility: crate::symbols::Accessibility::Public,
+            conditional: Vec::new(),
         });
         let mut model = Model::new();
         model.insert(widget);
@@ -4370,6 +4459,7 @@ mod tests {
                 is_static: false,
                 is_params: false,
                 accessibility: crate::symbols::Accessibility::Public,
+                conditional: Vec::new(),
             }
         }
         let int = TypeSymbol::Special(SpecialType::Int32);
@@ -4705,6 +4795,7 @@ mod tests {
             is_static: false,
             is_params: false,
             accessibility: crate::symbols::Accessibility::Public,
+            conditional: Vec::new(),
         });
         let mut model = Model::new();
         model.insert(calc);

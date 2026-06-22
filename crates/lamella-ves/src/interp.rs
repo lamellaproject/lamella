@@ -29,11 +29,26 @@ const MAX_CALL_DEPTH: usize = 4096;
 pub struct Vm {
     heap: Heap,
     output: Vec<u16>,
+    /// The DEBUG channel -- the bytes `System.Diagnostics.Debug`'s `DefaultTraceListener`
+    /// emits, kept separate from `output` (the Console). Conceptually the developer's debug
+    /// sink: a host renders it to STDERR, distinct from Console.Out's STDOUT, so a bare
+    /// `Debug.WriteLine` (no listener config) is seen without polluting program output. Empty
+    /// unless `debug_write` is called.
+    debug_output: Vec<u16>,
     statics: Vec<Value>,
     /// The message string of each exception object, kept as runtime side-state so
     /// `Exception.Message` works without modeling mscorlib's field layout (and so the
     /// message-stripping knob has one place to act). Keyed by the exception object.
     exception_messages: BTreeMap<ObjectRef, ObjectRef>,
+    /// The base-chain TAG vector of a runtime-fault exception object -- one whose managed
+    /// type is external to the loaded module (`EXTERNAL_TYPE_ID`), so it has no live base
+    /// chain to walk. A catchable fault (`catchable_fault`) records the vector of its .NET
+    /// exception type here (leaf-first up to `System.Object`), so the handler search tests a
+    /// `catch`'s tag against it exactly as it does a managed exception's
+    /// [`Module::exception_base_chain`]. Keyed by the fault object; empty/absent without the
+    /// `exceptions` feature.
+    #[cfg(feature = "exceptions")]
+    exception_chains: BTreeMap<ObjectRef, Vec<u32>>,
     /// Whether a finalizer is currently running: the collector is paused (a GC triggered
     /// from within a finalizer is a no-op) so the in-flight f-reachable list stays valid.
     #[cfg(feature = "finalizers")]
@@ -41,6 +56,15 @@ pub struct Vm {
     /// Set by `GC.Collect`: the next safepoint collects regardless of the heap threshold.
     #[cfg(feature = "gc")]
     force_collect: bool,
+    /// A nesting depth that suspends collection while non-zero. A reflective intrinsic that
+    /// builds objects across a nested interpreter run (`GetCustomAttributes` instantiates each
+    /// attribute by running its constructor) raises this for the duration: the moving collector
+    /// remaps only roots it can reach through the running session's frames, so an instance the
+    /// intrinsic holds in a Rust local -- or the result array it accumulates into -- would
+    /// otherwise dangle if a nested constructor crossed a GC safepoint. Balanced by
+    /// [`Vm::suspend_collection`] / [`Vm::resume_collection`].
+    #[cfg(feature = "gc")]
+    collect_suspend: u32,
     /// The exception currently propagating without (yet) a handler: set the moment a
     /// `throw`/`rethrow` begins its search and cleared the instant a `catch`/`filter`
     /// accepts it, so if the search exhausts the call stack this still holds the culprit.
@@ -77,6 +101,28 @@ impl Vm {
         core::mem::take(&mut self.force_collect)
     }
 
+    /// Suspends collection until the matching [`Vm::resume_collection`] (nestable). A
+    /// reflective intrinsic that constructs objects across a nested interpreter run holds this
+    /// so an in-progress instance it roots only in a Rust local cannot be relocated/reclaimed by
+    /// a GC the nested run triggers.
+    #[cfg(feature = "gc")]
+    pub fn suspend_collection(&mut self) {
+        self.collect_suspend = self.collect_suspend.saturating_add(1);
+    }
+
+    /// Ends one [`Vm::suspend_collection`]. Collection resumes once every suspension is lifted.
+    #[cfg(feature = "gc")]
+    pub fn resume_collection(&mut self) {
+        self.collect_suspend = self.collect_suspend.saturating_sub(1);
+    }
+
+    /// Whether collection is currently suspended (a non-zero suspension depth).
+    #[cfg(feature = "gc")]
+    #[must_use]
+    pub fn collection_suspended(&self) -> bool {
+        self.collect_suspend != 0
+    }
+
     /// The managed heap.
     #[must_use]
     pub fn heap(&self) -> &Heap {
@@ -97,6 +143,26 @@ impl Vm {
     #[must_use]
     pub fn output(&self) -> &[u16] {
         &self.output
+    }
+
+    /// Appends UTF-16 code units to the DEBUG channel (the `Debug.WriteLine` sink). Kept
+    /// separate from [`Vm::write`] so the host can route it to STDERR, distinct from the
+    /// Console's STDOUT.
+    pub fn debug_write(&mut self, chars: &[u16]) {
+        self.debug_output.extend_from_slice(chars);
+    }
+
+    /// The DEBUG-channel output so far, as UTF-16 code units.
+    #[must_use]
+    pub fn debug_output(&self) -> &[u16] {
+        &self.debug_output
+    }
+
+    /// The DEBUG-channel output so far, decoded to a `String` (lossily, for display
+    /// and tests).
+    #[must_use]
+    pub fn debug_output_string(&self) -> String {
+        String::from_utf16_lossy(&self.debug_output)
     }
 
     /// The console output so far, decoded to a `String` (lossily, for display
@@ -154,6 +220,21 @@ impl Vm {
     #[must_use]
     pub fn exception_message(&self, exception: ObjectRef) -> Option<ObjectRef> {
         self.exception_messages.get(&exception).copied()
+    }
+
+    /// Records the base-chain TAG vector of a runtime-fault `exception` (a type external to the
+    /// loaded module), so the handler search can match a `catch` against it. The `chain` is
+    /// leaf-first up to `System.Object`.
+    #[cfg(feature = "exceptions")]
+    fn set_exception_chain(&mut self, exception: ObjectRef, chain: Vec<u32>) {
+        self.exception_chains.insert(exception, chain);
+    }
+
+    /// The recorded base-chain tag vector of a runtime-fault `exception`, if one was set.
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    fn exception_chain(&self, exception: ObjectRef) -> Option<&[u32]> {
+        self.exception_chains.get(&exception).map(Vec::as_slice)
     }
 
     /// Records `exception` as the one currently propagating (set as a throw/fault begins its
@@ -937,7 +1018,11 @@ impl Session {
         #[cfg(feature = "gc")]
         {
             let forced = vm.take_force_collect();
-            if forced || vm.heap().should_collect() {
+            if vm.collection_suspended() {
+                if forced {
+                    vm.request_collect();
+                }
+            } else if forced || vm.heap().should_collect() {
                 self.collect_garbage(module, vm);
             }
         }
@@ -1519,29 +1604,101 @@ fn method_handlers(module: &Module, id: MethodId) -> Result<&[EhClause], Trap> {
 /// A reserved type id for objects whose type is external to this module: a runtime-fault
 /// exception (divide-by-zero, etc.) or a `new` of an external BCL type whose constructor
 /// is an intrinsic (e.g. `System.Exception`). No loaded type has this id, so it has no
-/// field layout or vtable, `sig_dispatch` finds nothing for it (callvirt falls back to the
-/// bound intrinsic), and `catch (SomeUserType)` will not match it while `catch (Exception)`
-/// / a catch-all (unresolvable catch types) will.
+/// field layout or vtable, and `sig_dispatch` finds nothing for it (callvirt falls back to
+/// the bound intrinsic). A runtime-fault exception records its base-chain tag vector
+/// separately (`Vm::set_exception_chain`) so `catch` still matches it by type.
 const EXTERNAL_TYPE_ID: u32 = u32::MAX;
 
-/// Converts a catchable runtime fault into a thrown exception object (carrying a
-/// default message), or returns `None` for traps that should still abort execution
-/// (a stack overflow, an unresolved token, malformed CIL, ...).
+/// The .NET exception type a catchable runtime fault surfaces as: a default message and the
+/// type's base-chain full names leaf-first up to `System.Object`. The handler search needs the
+/// WHOLE chain (not just the leaf) so that, e.g., a div-by-zero is caught by
+/// `catch (DivideByZeroException)`, `catch (ArithmeticException)`, `catch (Exception)`, or a
+/// typeless `catch {}` (== Object) alike. `None` for traps that should still abort (a stack
+/// overflow, an unresolved token, malformed CIL, ...). The chains mirror .NET's hierarchy so
+/// the tags equal those a managed `throw` of the same type produces.
 #[cfg(feature = "exceptions")]
-fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
-    let text = match trap {
-        Trap::DivideByZero => "Attempted to divide by zero.",
-        Trap::NullReference => "Object reference not set to an instance of an object.",
-        Trap::IndexOutOfRange(_) => "Index was outside the bounds of the array.",
-        Trap::InvalidCast => "Unable to cast object to the target type.",
-        Trap::InvalidArgument => "Requested value was not found.",
-        Trap::Overflow => "Arithmetic operation resulted in an overflow.",
+fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str])> {
+    const ARITHMETIC: &[&str] = &[
+        "System.DivideByZeroException",
+        "System.ArithmeticException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
+    const OVERFLOW: &[&str] = &[
+        "System.OverflowException",
+        "System.ArithmeticException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
+    const NULL_REF: &[&str] = &[
+        "System.NullReferenceException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
+    const INDEX_OOB: &[&str] = &[
+        "System.IndexOutOfRangeException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
+    const ARG_OOR: &[&str] = &[
+        "System.ArgumentOutOfRangeException",
+        "System.ArgumentException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
+    const INVALID_CAST: &[&str] = &[
+        "System.InvalidCastException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
+    const ARGUMENT: &[&str] = &[
+        "System.ArgumentException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
+    let (text, chain): (&str, &[&str]) = match trap {
+        Trap::DivideByZero => ("Attempted to divide by zero.", ARITHMETIC),
+        Trap::NullReference => (
+            "Object reference not set to an instance of an object.",
+            NULL_REF,
+        ),
+        Trap::IndexOutOfRange(_) => ("Index was outside the bounds of the array.", INDEX_OOB),
+        Trap::ArgumentOutOfRange(_) => (
+            "Specified argument was out of the range of valid values.",
+            ARG_OOR,
+        ),
+        Trap::InvalidCast => ("Unable to cast object to the target type.", INVALID_CAST),
+        Trap::InvalidArgument => ("Requested value was not found.", ARGUMENT),
+        Trap::Overflow => ("Arithmetic operation resulted in an overflow.", OVERFLOW),
         _ => return None,
     };
+    Some((text, chain))
+}
+
+/// Converts a catchable runtime fault into a thrown exception object (carrying a default
+/// message and its base-chain tag vector so `catch` matches it by type), or returns `None`
+/// for traps that should still abort execution (a stack overflow, an unresolved token,
+/// malformed CIL, ...).
+#[cfg(feature = "exceptions")]
+fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
+    let (text, chain_names) = fault_exception(trap)?;
+    let chain: Vec<u32> = chain_names
+        .iter()
+        .copied()
+        .map(crate::exception::exception_tag)
+        .collect();
     let exception = vm.heap_mut().alloc_instance(EXTERNAL_TYPE_ID, Vec::new());
     let chars: Vec<u16> = text.bytes().map(u16::from).collect();
     let message = vm.heap_mut().alloc_string(&chars);
     vm.set_exception_message(exception, message);
+    vm.set_exception_chain(exception, chain);
     Some(exception)
 }
 
@@ -1738,9 +1895,17 @@ fn finally_handlers(
         .collect()
 }
 
-/// Whether a `catch` of `type_token` catches `exception`: a same-module type matches
-/// when the exception's runtime type is a subtype; a catch type this module cannot
-/// resolve (`System.Exception` / `System.Object`) is treated as catch-all.
+/// Whether a `catch` of `type_token` catches `exception` -- a TYPE test: the catch matches
+/// only when the thrown exception's runtime type IS-A the catch's declared type. It compares
+/// the catch type's exception TAG against the thrown exception's base-chain tag VECTOR
+/// (`exception::tag_is_subtype`, the membership the AOT tag contract relies on): a managed
+/// exception's vector is its live base chain ([`Module::exception_base_chain`]); a runtime-fault
+/// exception's was recorded when the fault was raised ([`Vm::set_exception_chain`]).
+///
+/// Two cases stay catch-all (matching any in-flight exception), exactly as before: a typeless
+/// `catch {}` whose clause carries no catch-type tag, and an exception whose runtime type cannot
+/// be identified (no base-chain vector -- e.g. a legacy intrinsic-seam `new Exception()` with no
+/// live type), which there is no way to discriminate by type.
 fn catch_matches(
     module: &Module,
     asm: u8,
@@ -1748,12 +1913,31 @@ fn catch_matches(
     type_token: Token,
     exception: ObjectRef,
 ) -> bool {
-    match module.type_id_of(asm, type_token) {
-        Some(catch_type) => vm
-            .heap()
-            .type_of(exception)
-            .is_some_and(|exception_type| module.is_subtype(exception_type, catch_type)),
-        None => true,
+    #[cfg(feature = "exceptions")]
+    {
+        let Some(catch_tag) = module.catch_type_tag(asm, type_token) else {
+            return true;
+        };
+        if crate::exception::is_universal_catch(catch_tag) {
+            return true;
+        }
+        let managed_chain;
+        let thrown_chain: &[u32] = match vm.heap().type_of(exception) {
+            Some(EXTERNAL_TYPE_ID) | None => vm.exception_chain(exception).unwrap_or(&[]),
+            Some(type_id) => {
+                managed_chain = module.exception_base_chain(type_id);
+                &managed_chain
+            }
+        };
+        if thrown_chain.is_empty() {
+            return true;
+        }
+        crate::exception::tag_is_subtype(catch_tag, thrown_chain)
+    }
+    #[cfg(not(feature = "exceptions"))]
+    {
+        let _ = (module, asm, vm, type_token, exception);
+        true
     }
 }
 
@@ -1795,7 +1979,7 @@ fn step(
         #[cfg(feature = "float")]
         Opcode::LdcR4 => frame
             .stack
-            .push(Value::Float(f64::from(float32_operand(instruction)?))),
+            .push(Value::Single(float32_operand(instruction)?)),
         #[cfg(feature = "float")]
         Opcode::LdcR8 => frame
             .stack
@@ -1866,7 +2050,8 @@ fn step(
             let value = frame.pop()?;
             match value {
                 Value::Float(x) if x.is_finite() => frame.stack.push(value),
-                Value::Float(_) => return Err(Trap::Overflow),
+                Value::Single(x) if x.is_finite() => frame.stack.push(value),
+                Value::Float(_) | Value::Single(_) => return Err(Trap::Overflow),
                 _ => return Err(Trap::TypeMismatch(Opcode::Ckfinite)),
             }
         }
@@ -2061,19 +2246,28 @@ fn step(
             #[cfg(feature = "bcl")]
             if let Some(constraint) = constraint {
                 if is_object_to_string(module, method) {
-                    if let Some(Value::ByRef(location)) = args.first() {
-                        if let Some(value) =
+                    let handle = asm_key(asm, constraint.0);
+                    let enum_value = match args.first() {
+                        Some(Value::ByRef(location)) => {
                             read_enum_value(frame, frame_index, vm, location.clone())
-                        {
-                            if let Some(name) = module.enum_value_name(asm, constraint.0, value) {
-                                let chars: Vec<u16> = name.encode_utf16().collect();
-                                let string = vm.heap_mut().alloc_string(&chars);
-                                frame.stack.push(Value::Object(string));
-                                return Ok(Flow::Next);
-                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(value) = enum_value {
+                        if let Some(name) = module.enum_name_or_flags(handle, value, false) {
+                            let chars: Vec<u16> = name.encode_utf16().collect();
+                            let string = vm.heap_mut().alloc_string(&chars);
+                            frame.stack.push(Value::Object(string));
+                            return Ok(Flow::Next);
+                        }
+                        if module.is_enum_by_handle(handle) {
+                            let chars: Vec<u16> = value.to_string().encode_utf16().collect();
+                            let string = vm.heap_mut().alloc_string(&chars);
+                            frame.stack.push(Value::Object(string));
+                            return Ok(Flow::Next);
                         }
                     }
-                    if let Some(name) = module.type_name_by_handle(asm_key(asm, constraint.0)) {
+                    if let Some(name) = module.type_name_by_handle(handle) {
                         let chars: Vec<u16> = name.encode_utf16().collect();
                         let string = vm.heap_mut().alloc_string(&chars);
                         frame.stack.push(Value::Object(string));
@@ -2503,9 +2697,20 @@ fn step(
         Opcode::Newarr => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Newarr))?;
             let token = token_operand(instruction)?;
-            let default = module.array_default(asm, token).unwrap_or(Value::Null);
+            let default = match module.array_default(asm, token) {
+                Some(default) => default,
+                None => module
+                    .type_id_of(asm, token)
+                    .and_then(|type_id| module.type_field_defaults(type_id))
+                    .map_or(Value::Null, |fields| {
+                        Value::Struct(fields.to_vec().into_boxed_slice())
+                    }),
+            };
+            let element_size = module.array_element_size(asm, token);
             let length = array_length(frame.pop()?)?;
-            let object = vm.heap_mut().alloc_array(alloc::vec![default; length]);
+            let object = vm
+                .heap_mut()
+                .alloc_array_sized(alloc::vec![default; length], element_size);
             frame.stack.push(Value::Object(object));
         }
 
@@ -2525,7 +2730,8 @@ fn step(
         | Opcode::LdelemI
         | Opcode::LdelemR4
         | Opcode::LdelemR8
-        | Opcode::LdelemRef => {
+        | Opcode::LdelemRef
+        | Opcode::Ldelem => {
             let index = array_index(frame.pop()?, instruction.opcode)?;
             let array = object_ref(frame.pop()?, instruction.opcode)?;
             let len = vm.heap().array_len(array).ok_or(Trap::NullReference)?;
@@ -2551,7 +2757,8 @@ fn step(
         | Opcode::StelemI
         | Opcode::StelemR4
         | Opcode::StelemR8
-        | Opcode::StelemRef => {
+        | Opcode::StelemRef
+        | Opcode::Stelem => {
             let value = frame.pop()?;
             let index = array_index(frame.pop()?, instruction.opcode)?;
             let array = object_ref(frame.pop()?, instruction.opcode)?;
@@ -2814,9 +3021,7 @@ fn stack_loaded_value(opcode: Opcode, raw: [u8; 8]) -> Result<Value, Trap> {
         Opcode::LdindI8 => Value::Int64(low8 as i64),
         Opcode::LdindI => Value::NativeInt(low8 as i64),
         #[cfg(feature = "float")]
-        Opcode::LdindR4 => Value::Float(f64::from(f32::from_le_bytes([
-            raw[0], raw[1], raw[2], raw[3],
-        ]))),
+        Opcode::LdindR4 => Value::Single(f32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]])),
         #[cfg(feature = "float")]
         Opcode::LdindR8 => Value::Float(f64::from_le_bytes(raw)),
         _ => return Err(Trap::TypeMismatch(opcode)),
@@ -2831,11 +3036,13 @@ fn stack_stored_bytes(opcode: Opcode, value: Value) -> Result<[u8; 8], Trap> {
     let raw = match opcode {
         #[cfg(feature = "float")]
         Opcode::StindR4 => match value {
+            Value::Single(f) => u64::from(f.to_bits()),
             Value::Float(f) => u64::from(f32::to_bits(f as f32)),
             _ => return Err(Trap::TypeMismatch(opcode)),
         },
         #[cfg(feature = "float")]
         Opcode::StindR8 => match value {
+            Value::Single(f) => f64::from(f).to_bits(),
             Value::Float(f) => f.to_bits(),
             _ => return Err(Trap::TypeMismatch(opcode)),
         },
@@ -2925,10 +3132,27 @@ fn wrap_int(kind: IntKind, value: i64) -> Value {
 
 /// `add`, `sub`, `mul`, `div`, `rem`: floating point when both operands are
 /// floats, otherwise integer.
+///
+/// `float32 op float32` computes at `f32` precision (so the rounded single-precision result
+/// matches .NET); any operand of double precision lifts the other to `f64` and computes there
+/// (ECMA-335 III.1.5: the F type carries implementation-defined precision, and C# inserts the
+/// `conv.r8` for a mixed `float`/`double` expression, so widening here yields the same value).
 fn binary_numeric(opcode: Opcode, a: Value, b: Value) -> Result<Value, Trap> {
     #[cfg(feature = "float")]
-    if let (Value::Float(x), Value::Float(y)) = (&a, &b) {
+    if let (Value::Single(x), Value::Single(y)) = (&a, &b) {
         let (x, y) = (*x, *y);
+        let result = match opcode {
+            Opcode::Add => x + y,
+            Opcode::Sub => x - y,
+            Opcode::Mul => x * y,
+            Opcode::Div => x / y,
+            Opcode::Rem => x % y,
+            _ => return Err(Trap::Unsupported(opcode)),
+        };
+        return Ok(Value::Single(result));
+    }
+    #[cfg(feature = "float")]
+    if let (Some(x), Some(y)) = (as_double(&a), as_double(&b)) {
         let result = match opcode {
             Opcode::Add => x + y,
             Opcode::Sub => x - y,
@@ -2940,6 +3164,17 @@ fn binary_numeric(opcode: Opcode, a: Value, b: Value) -> Result<Value, Trap> {
         return Ok(Value::Float(result));
     }
     binary_integer(opcode, a, b)
+}
+
+/// The `f64` value of a floating-point stack value (a `Single` widened, a `Float` directly), or
+/// `None` for a non-float -- the seam mixed-precision float arithmetic and comparison share.
+#[cfg(feature = "float")]
+fn as_double(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(x) => Some(*x),
+        Value::Single(x) => Some(f64::from(*x)),
+        _ => None,
+    }
 }
 
 /// The integer offset of an `add`/`sub` operand, if it is one (for stepping a localloc
@@ -2958,14 +3193,21 @@ fn pointer_offset(value: &Value) -> Option<i64> {
 /// pointer into a pinned array, whose byte offset an eventual `ldind`/`stind` divides by the
 /// element width). Returns `Ok(None)` when neither operand is such a pointer, so the caller
 /// falls back to ordinary numeric arithmetic; `add` accepts the offset on either side (it is
-/// commutative), `sub` only as `pointer - offset` (III.1.5). Pointer-minus-pointer to a byte
-/// count is left to the numeric path (a `Location` is not an integer there, so it traps): csc
-/// does not emit it for these patterns, and it is noted as deferred.
+/// commutative), `sub` as `pointer - offset` and as `pointer - pointer` (III.1.5). The latter
+/// yields the signed BYTE difference as a native int (C# then divides by `sizeof(T)` for the
+/// element count), defined only for two pointers into the same buffer/array.
 fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Option<Value>, Trap> {
     let add = matches!(opcode, Opcode::Add | Opcode::AddOvf | Opcode::AddOvfUn);
     let sub = matches!(opcode, Opcode::Sub | Opcode::SubOvf | Opcode::SubOvfUn);
     if !add && !sub {
         return Ok(None);
+    }
+    if sub {
+        if let (Value::ByRef(la), Value::ByRef(lb)) = (a, b) {
+            if is_raw_pointer(la) && is_raw_pointer(lb) {
+                return Ok(raw_pointer_byte_difference(la, lb).map(Value::NativeInt));
+            }
+        }
     }
     let (location, offset) = match (a, b) {
         (Value::ByRef(location), other) if is_raw_pointer(location) => {
@@ -3013,6 +3255,40 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
 /// typed-slot kinds (a frame local/arg, a field, a static, a box) are not byte-addressed.
 fn is_raw_pointer(location: &Location) -> bool {
     matches!(location, Location::Stack { .. } | Location::Element { .. })
+}
+
+/// The signed BYTE difference `a - b` of two raw pointers into the SAME buffer/array, for
+/// `pointer - pointer` (III.1.5). `None` for pointers into different allocations (or different
+/// element bases) -- subtracting those is undefined, and returning `None` lets the op trap, as
+/// in .NET.
+fn raw_pointer_byte_difference(a: &Location, b: &Location) -> Option<i64> {
+    match (a, b) {
+        (
+            Location::Stack {
+                frame: fa,
+                buffer: ba,
+                offset: oa,
+            },
+            Location::Stack {
+                frame: fb,
+                buffer: bb,
+                offset: ob,
+            },
+        ) if fa == fb && ba == bb => Some(i64::from(*oa) - i64::from(*ob)),
+        (
+            Location::Element {
+                array: aa,
+                index: ia,
+                byte_offset: oa,
+            },
+            Location::Element {
+                array: ab,
+                index: ib,
+                byte_offset: ob,
+            },
+        ) if aa == ab && ia == ib => Some(i64::from(*oa) - i64::from(*ob)),
+        _ => None,
+    }
 }
 
 /// The integer-only binary operations, computed at the result category's width.
@@ -3122,6 +3398,8 @@ fn negate(value: Value) -> Result<Value, Trap> {
         Value::NativeInt(x) => Ok(Value::NativeInt(x.wrapping_neg())),
         #[cfg(feature = "float")]
         Value::Float(x) => Ok(Value::Float(-x)),
+        #[cfg(feature = "float")]
+        Value::Single(x) => Ok(Value::Single(-x)),
         Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
             Err(Trap::TypeMismatch(Opcode::Neg))
         }
@@ -3160,14 +3438,14 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
             Value::Int32(x) => f64::from(x),
             Value::Int64(x) | Value::NativeInt(x) => x as f64,
             Value::Float(f) => f,
+            Value::Single(f) => f64::from(f),
             _ => return Err(Trap::TypeMismatch(opcode)),
         };
-        let float = if opcode == Opcode::ConvR4 {
-            f64::from(float as f32)
+        return Ok(if opcode == Opcode::ConvR4 {
+            Value::Single(float as f32)
         } else {
-            float
-        };
-        return Ok(Value::Float(float));
+            Value::Float(float)
+        });
     }
 
     let (source, from_32) = match value {
@@ -3176,6 +3454,8 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Value::NativeInt(x) => (x, false),
         #[cfg(feature = "float")]
         Value::Float(f) => (f as i64, false),
+        #[cfg(feature = "float")]
+        Value::Single(f) => (f as i64, false),
         Value::Object(_) | Value::Null | Value::Struct(_) | Value::ByRef(_) => {
             return Err(Trap::TypeMismatch(opcode));
         }
@@ -3228,6 +3508,10 @@ fn convert_checked(opcode: Opcode, value: Value) -> Result<Value, Trap> {
         Value::Float(f) if f.is_nan() || f.is_infinite() => return Err(Trap::Overflow),
         #[cfg(feature = "float")]
         Value::Float(f) => f as i128,
+        #[cfg(feature = "float")]
+        Value::Single(f) if f.is_nan() || f.is_infinite() => return Err(Trap::Overflow),
+        #[cfg(feature = "float")]
+        Value::Single(f) => f as i128,
         _ => return Err(Trap::TypeMismatch(opcode)),
     };
     let (min, max): (i128, i128) = match opcode {
@@ -3294,8 +3578,7 @@ fn relation_of(opcode: Opcode) -> Option<(Relation, bool)> {
 fn compare(opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
     let (relation, unordered_or_unsigned) = relation_of(opcode).ok_or(Trap::Unsupported(opcode))?;
     #[cfg(feature = "float")]
-    if let (Value::Float(x), Value::Float(y)) = (&a, &b) {
-        let (x, y) = (*x, *y);
+    if let (Some(x), Some(y)) = (as_double(&a), as_double(&b)) {
         if x.is_nan() || y.is_nan() {
             return Ok(unordered_or_unsigned && !matches!(relation, Relation::Equal));
         }

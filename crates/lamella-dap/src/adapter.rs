@@ -25,6 +25,13 @@ pub struct Debugger {
     /// Whether a resume-now backend left the target running, so the serve loop polls for
     /// the async stop. Always false for the synchronous interpreter backend.
     running: bool,
+    /// Source and instruction breakpoints, kept apart so each `setBreakpoints` /
+    /// `setInstructionBreakpoints` updates only its own kind. The backend has a single
+    /// breakpoint set, so the *union* is what gets programmed -- otherwise an empty
+    /// `setInstructionBreakpoints` (which VS Code sends right after `setBreakpoints`) would
+    /// wipe the source breakpoints.
+    source_breakpoints: Vec<u64>,
+    instruction_breakpoints: Vec<u64>,
     out_seq: i64,
 }
 
@@ -56,6 +63,8 @@ impl Debugger {
             launched: false,
             stop_on_entry: false,
             running: false,
+            source_breakpoints: Vec::new(),
+            instruction_breakpoints: Vec::new(),
             out_seq: 0,
         }
     }
@@ -100,11 +109,12 @@ impl Debugger {
     pub fn handle(&mut self, request: &Request) -> Vec<Message> {
         let mut events: Vec<(&str, Option<Json>)> = Vec::new();
         let (success, body) = match request.command.as_str() {
-            "initialize" => {
+            "initialize" => (true, Some(capabilities())),
+            "launch" => {
+                let launched = self.launch(request);
                 events.push(("initialized", None));
-                (true, Some(capabilities()))
+                (launched, None)
             }
-            "launch" => (self.launch(request), None),
             "configurationDone" => {
                 if self.stop_on_entry {
                     events.push(("stopped", Some(stopped("entry"))));
@@ -140,6 +150,10 @@ impl Debugger {
                 (true, None)
             }
             "pause" => {
+                if self.running {
+                    self.backend.pause();
+                    self.running = false;
+                }
                 if self.launched {
                     events.push(("stopped", Some(stopped("pause"))));
                 }
@@ -171,6 +185,16 @@ impl Debugger {
         self.launched
     }
 
+    /// Programs the backend with the union of source and instruction breakpoints. They share
+    /// the backend's single comparator set, so both kinds must be re-applied together;
+    /// applying only one would erase the other (VS Code sends an empty
+    /// `setInstructionBreakpoints` right after `setBreakpoints`, which otherwise wipes them).
+    fn apply_breakpoints(&mut self) {
+        let mut all = self.source_breakpoints.clone();
+        all.extend_from_slice(&self.instruction_breakpoints);
+        self.backend.set_breakpoints(&all);
+    }
+
     /// Replaces the instruction breakpoints. Each is an opaque code address carried in
     /// the `instructionReference` (the backend interprets it); no source mapping needed.
     fn set_instruction_breakpoints(&mut self, request: &Request) -> Json {
@@ -200,7 +224,8 @@ impl Debugger {
                 None => results.push(json!({ "verified": false })),
             }
         }
-        self.backend.set_breakpoints(&addresses);
+        self.instruction_breakpoints = addresses;
+        self.apply_breakpoints();
         json!({ "breakpoints": results })
     }
 
@@ -242,7 +267,8 @@ impl Debugger {
                 None => results.push(json!({ "verified": false })),
             }
         }
-        self.backend.set_breakpoints(&addresses);
+        self.source_breakpoints = addresses;
+        self.apply_breakpoints();
         json!({ "breakpoints": results })
     }
 
@@ -289,6 +315,11 @@ impl Debugger {
     /// method to completion), `stepOut` at the next boundary after the current method
     /// returns. Used when the backend has source info; otherwise stepping is per-CIL-op.
     fn source_step(&mut self, action: Action) -> Stop {
+        if matches!(action, Action::StepOut) {
+            if let Some(stop) = self.backend.step_out() {
+                return stop;
+            }
+        }
         let start = self.backend.depth();
         loop {
             match self.backend.step() {
@@ -297,6 +328,14 @@ impl Debugger {
                 Stop::Running => break Stop::Running,
                 Stop::Breakpoint => break Stop::Breakpoint,
                 _ => {
+                    if matches!(action, Action::StepOver | Action::StepOut)
+                        && self.backend.depth() > start
+                    {
+                        match self.backend.run_to_return() {
+                            Stop::Step => {}
+                            other => break other,
+                        }
+                    }
                     let reached = match action {
                         Action::StepIn | Action::Resume => true,
                         Action::StepOver => self.backend.depth() <= start,
@@ -531,11 +570,11 @@ mod tests {
     }
 
     #[test]
-    fn initialize_reports_capabilities_and_the_initialized_event() {
+    fn initialize_reports_capabilities_then_launch_emits_initialized() {
         let (module, main) = add_program();
         let mut dbg = Debugger::new(module, main);
         let out = dbg.handle(&request(1, "initialize", None));
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.len(), 1);
         match &out[0] {
             Message::Response(r) => {
                 assert!(r.success);
@@ -547,7 +586,12 @@ mod tests {
             }
             other => panic!("expected response, got {other:?}"),
         }
-        assert!(matches!(&out[1], Message::Event(e) if e.event == "initialized"));
+        let launched = dbg.handle(&request(2, "launch", None));
+        assert!(
+            launched
+                .iter()
+                .any(|m| matches!(m, Message::Event(e) if e.event == "initialized"))
+        );
     }
 
     #[test]

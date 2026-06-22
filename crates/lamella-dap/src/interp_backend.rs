@@ -408,6 +408,7 @@ fn format_value(vm: &Vm, value: Value) -> (String, String) {
         Value::Int64(n) => (n.to_string(), "long".to_owned()),
         Value::NativeInt(n) => (n.to_string(), "native int".to_owned()),
         Value::Float(f) => (f.to_string(), "double".to_owned()),
+        Value::Single(f) => (f.to_string(), "float".to_owned()),
         Value::Object(reference) => match vm.heap().as_string(reference) {
             Some(chars) => (
                 format!("\"{}\"", String::from_utf16_lossy(&chars)),

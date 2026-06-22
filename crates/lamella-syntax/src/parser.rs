@@ -14,6 +14,7 @@ use crate::lexer::{Tokenized, tokenize};
 use crate::span::Span;
 use crate::token::{Keyword, Punctuator, Token, TokenKind};
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
 
 /// The result of parsing: the syntax tree and every diagnostic gathered, both
@@ -133,6 +134,9 @@ struct Parser {
     position: usize,
     /// Diagnostics gathered so far, beginning with the lexer's.
     diagnostics: Vec<Diagnostic>,
+    /// The `#define`d preprocessor symbols (9.5.3), carried onto the parsed
+    /// [`CompilationUnit`] so the binder can resolve `[Conditional]` inclusion (24.4.2).
+    defined_symbols: BTreeSet<Box<str>>,
 }
 
 impl Parser {
@@ -148,6 +152,7 @@ impl Parser {
             tokens,
             position: 0,
             diagnostics: tokenized.diagnostics,
+            defined_symbols: tokenized.defined_symbols,
         }
     }
 
@@ -912,6 +917,7 @@ impl Parser {
             usings,
             members,
             span: Span::new(start, end),
+            defined_symbols: core::mem::take(&mut self.defined_symbols),
         }
     }
 

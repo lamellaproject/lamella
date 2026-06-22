@@ -100,6 +100,9 @@ pub struct MethodSymbol {
     pub is_params: bool,
     /// The method's accessibility.
     pub accessibility: Accessibility,
+    /// The `[Conditional("SYMBOL")]` symbols (24.4.2): a call to this method is omitted unless
+    /// one of these is defined at the call site. Empty for an unconditional method.
+    pub conditional: Vec<Box<str>>,
 }
 
 /// A named type with its members.
@@ -134,6 +137,9 @@ pub struct TypeInfo {
     /// Whether this type comes from a referenced assembly (not the unit being compiled), so
     /// an `internal` member of it is `CS0122` from here (cross-assembly internal).
     pub is_external: bool,
+    /// For an external type, the simple name of the assembly that defines it (so its `TypeRef`
+    /// is scoped to the right `AssemblyRef`, not just mscorlib). `None` for a this-module type.
+    pub assembly: Option<Box<str>>,
 }
 
 impl TypeInfo {
@@ -153,6 +159,7 @@ impl TypeInfo {
             constructors: Vec::new(),
             enclosing: None,
             is_external: false,
+            assembly: None,
         }
     }
 
@@ -400,6 +407,7 @@ mod tests {
             is_static: false,
             is_params: false,
             accessibility: Accessibility::Public,
+            conditional: Vec::new(),
         });
         info.methods.push(MethodSymbol {
             name: "Scale".into(),
@@ -408,6 +416,7 @@ mod tests {
             is_static: false,
             is_params: false,
             accessibility: Accessibility::Public,
+            conditional: Vec::new(),
         });
         info.methods.push(MethodSymbol {
             name: "Scale".into(),
@@ -416,6 +425,7 @@ mod tests {
             is_static: false,
             is_params: false,
             accessibility: Accessibility::Public,
+            conditional: Vec::new(),
         });
         info
     }

@@ -84,6 +84,50 @@ pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     Ok(image)
 }
 
+/// The per-method debug info [`build_debug`] returns: `(MethodDef rid, the function's image offset, its
+/// LineTable)`. A native PC maps to a method by the offset bracket, then via the LineTable to a CIL byte
+/// offset, then via the method's source/PDB to source.
+#[cfg(feature = "arm32")]
+pub type MethodDebug = alloc::vec::Vec<(u32, u32, arm32::LineTable)>;
+
+/// As [`build_cortex_m`], but also returns per-method debug line tables -- so a device debugger steps the
+/// flashed image. It is build()'s EXACT chip path (the trampoline at code offset 0, rid-indexed methods,
+/// stub gaps), so the SAME bytes are produced and the line tables match the layout BY CONSTRUCTION.
+/// Offsets are IMAGE-relative (the code sits at image offset 8, after the vector table); cross-method
+/// calls resolve (the rid-indexed layout). `device-dap-server` uses this instead of single-method debug.
+#[cfg(feature = "arm32")]
+pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), BuildError> {
+    let initial_sp: u32 = match target {
+        "microbit" => 0x2000_4000,
+        _ => return Err(BuildError::UnsupportedTarget),
+    };
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let entry = find_main(&assembly);
+    let (funcs, maps) = lower_assembly_debug(&assembly, entry);
+    let (code, method_lines) =
+        arm32::lower_module_debug(&funcs, None, &maps).map_err(BuildError::LowerArm)?;
+    let mut image = Vec::with_capacity(8 + code.len());
+    image.extend_from_slice(&initial_sp.to_le_bytes());
+    image.extend_from_slice(&0x0000_0009u32.to_le_bytes());
+    image.extend_from_slice(&code);
+    const PREFIX: u32 = 8;
+    let debug = method_lines
+        .into_iter()
+        .enumerate()
+        .map(|(rid, (func_offset, line_table))| {
+            let shifted = arm32::LineTable(
+                line_table
+                    .0
+                    .into_iter()
+                    .map(|(pos, cil_off)| (pos + PREFIX, cil_off))
+                    .collect(),
+            );
+            (rid as u32, func_offset + PREFIX, shifted)
+        })
+        .collect();
+    Ok((image, debug))
+}
+
 /// The MethodDef row of a static `Main` (the run-once widget entry), if the assembly has one.
 fn find_main(assembly: &Assembly) -> Option<u32> {
     for type_def in assembly.type_defs() {
@@ -160,6 +204,16 @@ fn trampoline(entry_rid: u32) -> Function {
 /// Lowers an assembly's methods to a `Vec<Function>` keyed by MethodDef row. Index 0 is a trampoline
 /// to `entry` (if any) -- the `main` export -- or a stub. A method that does not lower stays a stub.
 fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Vec<Function> {
+    lower_assembly_debug(assembly, entry).0
+}
+
+/// As [`lower_assembly`], but also returns each function's [`cil::CilSourceMap`] (rid-indexed, empty for
+/// the trampoline and the stub gaps) -- so the SAME image build()'s chip path produces also carries debug
+/// info, and a debugger's line tables match the flashed layout by construction.
+fn lower_assembly_debug(
+    assembly: &Assembly,
+    entry: Option<u32>,
+) -> (Vec<Function>, Vec<cil::CilSourceMap>) {
     let mut methods = Vec::new();
     let mut max_rid = entry.unwrap_or(0);
     for type_def in assembly.type_defs() {
@@ -170,6 +224,9 @@ fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Vec<Function> {
         }
     }
     let mut funcs: Vec<Function> = (0..=max_rid).map(|_| stub()).collect();
+    let mut maps: Vec<cil::CilSourceMap> = (0..=max_rid)
+        .map(|_| cil::CilSourceMap(Vec::new()))
+        .collect();
     if let Some(entry_rid) = entry {
         funcs[0] = trampoline(entry_rid);
     }
@@ -191,11 +248,13 @@ fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Vec<Function> {
             .iter()
             .map(|sig| mir_type(sig, assembly))
             .collect();
-        if let Ok((func, _)) = cil::lower_method_typed(&body, &resolver, &arg_types, &local_types) {
+        if let Ok((func, map)) = cil::lower_method_typed(&body, &resolver, &arg_types, &local_types)
+        {
             funcs[*rid as usize] = func;
+            maps[*rid as usize] = map;
         }
     }
-    funcs
+    (funcs, maps)
 }
 
 /// The embedding ABI's export list: `main` (the entry trampoline at index 0, if there is an entry)

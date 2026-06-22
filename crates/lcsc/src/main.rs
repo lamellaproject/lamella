@@ -50,7 +50,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         } else if matches!(arg.as_str(), "/debug-" | "/debug:none" | "--no-debug") {
             emit_debug = false;
         } else if arg.starts_with("/target:") || arg == "/nologo" {
-        } else if arg.starts_with('/') || arg.starts_with('-') {
+        } else if arg.starts_with('-') || (arg.starts_with('/') && !arg[1..].contains('/')) {
             return Err(format!("unknown option '{arg}'\n{USAGE}"));
         } else if source.replace(arg.to_owned()).is_some() {
             return Err(format!("more than one source file given\n{USAGE}"));
@@ -203,5 +203,12 @@ mod tests {
         assert_eq!(file_name("a/b/App.dll"), "App.dll");
         assert_eq!(file_name("a\\b\\App.dll"), "App.dll");
         assert_eq!(stem("App.dll"), "App");
+    }
+
+    #[test]
+    fn an_absolute_unix_path_is_a_source_file_not_an_option() {
+        let options = parse_args(&[String::from("/home/me/Program.cs")]).unwrap();
+        assert_eq!(options.source, "/home/me/Program.cs");
+        assert!(parse_args(&[String::from("/unsafe")]).is_err());
     }
 }

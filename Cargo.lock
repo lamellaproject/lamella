@@ -79,6 +79,7 @@ dependencies = [
 name = "lamella-cmsis-dap-nrf"
 version = "0.0.0"
 dependencies = [
+ "lamella-aot",
  "lamella-cmsis-dap",
  "lamella-usbhid",
 ]
@@ -115,6 +116,7 @@ version = "0.0.0"
 dependencies = [
  "lamella-aot",
  "lamella-cmsis-dap",
+ "lamella-cmsis-dap-nrf",
  "lamella-dap",
  "lamella-debug-backend",
  "lamella-metadata",
@@ -174,6 +176,14 @@ name = "lamella-token"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-usbbulk"
+version = "0.0.0"
+dependencies = [
+ "libc",
+ "windows-sys",
+]
+
+[[package]]
 name = "lamella-usbhid"
 version = "0.0.0"
 dependencies = [
@@ -212,6 +222,12 @@ dependencies = [
  "lamella-metadata",
  "lamella-syntax",
 ]
+
+[[package]]
+name = "libc"
+version = "0.2.186"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libm"

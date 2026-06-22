@@ -15,6 +15,9 @@ pub struct Tokenized {
     pub tokens: Vec<Token>,
     /// Lexical diagnostics, in source order.
     pub diagnostics: Vec<Diagnostic>,
+    /// The preprocessor symbols defined by `#define` and not later `#undef`'d (9.5.3) -- the
+    /// set a `[Conditional("X")]` call is checked against to decide inclusion (24.4.2).
+    pub defined_symbols: BTreeSet<Box<str>>,
 }
 
 /// Scans `source` into a complete [`Tokenized`] stream.
@@ -34,8 +37,10 @@ pub fn tokenize(source: &str) -> Tokenized {
             break;
         }
     }
+    let defined_symbols = core::mem::take(&mut lexer.defined_symbols);
     Tokenized {
         tokens,
+        defined_symbols,
         diagnostics: lexer.into_diagnostics(),
     }
 }

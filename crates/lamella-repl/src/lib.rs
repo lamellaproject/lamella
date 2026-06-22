@@ -229,6 +229,12 @@ impl TempProgram {
 /// A persistent-state REPL session: ONE interpreter, ONE heap, and ONE `__Repl`
 /// instance kept alive across submissions, so declared state survives line to line.
 ///
+/// This is the runtime half of REPL increment 2 (the persistent-state model). Where
+/// [`eval`] runs each submission against a fresh [`Vm`] -- so nothing carries over --
+/// a `Session` holds a single [`Vm`] (heap + statics) and a single `__Repl` instance,
+/// and runs each submission as an *instance method of that one object*. A field the
+/// first submission writes is still set when the next submission reads it, because the
+/// instance (and the heap it lives on) is reused rather than rebuilt.
 pub struct Session {
     vm: Vm,
     module: Module,
@@ -330,6 +336,17 @@ const REPL_CTOR_NAME: &str = "<repl>.__Repl..ctor";
 /// instance that GROWS as submissions are loaded -- the successor to [`Session`]'s
 /// re-emit+migrate that lets REFERENCE-typed state (a `string`/array/object) survive across
 /// submissions.
+///
+/// This is the runtime half of the incremental REPL model (`docs/repl-incremental-model.md`),
+/// prototyped against hand-authored IL deltas while the compiler builds the matching emit. The
+/// session loads an empty `__Repl` bootstrap ONCE and creates one instance of it; each
+/// [`IncrementalSession::submit`] loads a SEPARATE delta assembly that references `__Repl` and
+/// its prior fields by name (a TypeRef + FieldRefs, no `__Repl` TypeDef) and carries one
+/// `Submit$N(__Repl s)` method. A FieldRef the loader cannot resolve to an existing `__Repl`
+/// field is a NEW field: it grows the type and the single live instance in place, on the SAME
+/// heap. Running `Submit$N` against that one instance is what persists state -- and because the
+/// heap is never rebuilt, a reference field's `ObjectRef` set by one submission still points at
+/// a live object when a later submission reads it.
 ///
 pub struct IncrementalSession {
     vm: Vm,

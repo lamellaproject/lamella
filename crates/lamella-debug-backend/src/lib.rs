@@ -37,6 +37,34 @@ pub trait DebugBackend {
         Stop::Done
     }
 
+    /// Halts a free-running target for a `pause` request, so the next reported stop
+    /// reflects where it actually is. The default suits a synchronous backend (already
+    /// stopped between requests); a free-running device overrides this to halt the core.
+    /// Returns `false` if the halt failed.
+    fn pause(&mut self) -> bool {
+        true
+    }
+
+    /// Runs a callee the current step descended into to its return, instead of the adapter
+    /// single-stepping through it -- so `next`/`stepOut` skip a call at full speed rather than
+    /// instruction by instruction (which is slow on a device, and hangs on a long loop). The
+    /// adapter calls this only when execution is in a frame deeper than the step started in.
+    /// Returns `Step` at the return (keep stepping), or `Breakpoint`/`Done`/`Fault` if one
+    /// intervened inside the call. The default single-steps -- right for the in-memory
+    /// interpreter, where stepping through a call is already cheap.
+    fn run_to_return(&mut self) -> Stop {
+        Stop::Step
+    }
+
+    /// Steps out of the current frame in one shot, when the backend can do better than the
+    /// adapter's single-step-until-shallower loop -- which never terminates at the top frame on
+    /// a target without a full unwinder. Returns `Some(stop)` if handled, or `None` to let the
+    /// adapter single-step. The default (`None`) suits the interpreter, which tracks call depth
+    /// exactly.
+    fn step_out(&mut self) -> Option<Stop> {
+        None
+    }
+
     /// The current call depth, so the adapter can express depth-relative stepping
     /// (`next` stays at or above the start depth, `stepOut` runs until below it). A
     /// backend without unwinding may report `1` (then `next`/`stepOut` degrade to step).

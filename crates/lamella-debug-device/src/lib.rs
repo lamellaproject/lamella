@@ -19,25 +19,42 @@ pub struct DeviceBackend<T: Transport> {
     lines: Vec<(u32, u32)>,
     /// The loaded method's flash base, subtracted from a PC to index `lines`.
     base: u32,
-    /// The method's display name.
-    name: String,
+    /// Per-method `(image offset, Type.Method name)`, ascending by offset -- the frame name at a PC.
+    names: Vec<(u32, String)>,
     /// The source file the method came from (for source locations), empty if unknown.
     file: String,
     /// Semihosting output captured from the target, drained by `take_output`.
     output: String,
+    /// The user's hardware breakpoints (the code addresses last set), kept so a step-over can
+    /// re-arm them around its temporary return-address breakpoint.
+    breakpoints: Vec<u32>,
+    /// The entry method's `Type.Method` name. Stepping out of it means "continue" -- the entry
+    /// has no caller within the program (its return is the startup trampoline), so there is no
+    /// frame to return to.
+    entry: String,
 }
 
 impl<T: Transport> DeviceBackend<T> {
     /// Wraps a probe with the loaded method's line table (native offset -> source line),
-    /// its flash `base`, a display `name`, and the source `file` it came from.
-    pub fn new(dap: Dap<T>, lines: Vec<(u32, u32)>, base: u32, name: String, file: String) -> Self {
+    /// its flash `base`, per-method `names`, the source `file` it came from, and the `entry`
+    /// method's name (stepping out of which continues, having no in-program caller).
+    pub fn new(
+        dap: Dap<T>,
+        lines: Vec<(u32, u32)>,
+        base: u32,
+        names: Vec<(u32, String)>,
+        file: String,
+        entry: String,
+    ) -> Self {
         DeviceBackend {
             dap: RefCell::new(dap),
             lines,
             base,
-            name,
+            names,
             file,
             output: String::new(),
+            breakpoints: Vec::new(),
+            entry,
         }
     }
 
@@ -49,6 +66,15 @@ impl<T: Transport> DeviceBackend<T> {
             .rev()
             .find(|&&(start, _)| start <= offset)
             .map_or(0, |&(_, line)| line)
+    }
+
+    /// The `Type.Method` name whose code contains `offset` (the last entry at or before it).
+    fn method_name_at(&self, offset: u32) -> String {
+        self.names
+            .iter()
+            .rev()
+            .find(|&&(start, _)| start <= offset)
+            .map_or_else(|| String::from("?"), |(_, name)| name.clone())
     }
 
     /// Services a halt: if the core stopped at a semihosting `BKPT 0xAB`, captures a
@@ -105,10 +131,78 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn resume(&mut self) -> Stop {
-        match self.dap.get_mut().resume() {
+        let bps = self.breakpoints.clone();
+        let dap = self.dap.get_mut();
+        let _ = dap.set_breakpoints(&bps);
+        match dap.resume() {
             Ok(()) => Stop::Running,
             Err(_) => Stop::Fault("resume failed".into()),
         }
+    }
+
+    fn pause(&mut self) -> bool {
+        self.dap.get_mut().halt().is_ok()
+    }
+
+    fn run_to_return(&mut self) -> Stop {
+        let dap = self.dap.get_mut();
+        let lr = match dap.read_core_reg(14) {
+            Ok(lr) => lr & !1,
+            Err(_) => return Stop::Fault("read LR".into()),
+        };
+        if self.breakpoints.len() >= 4 && !self.breakpoints.contains(&lr) {
+            return Stop::Step;
+        }
+        let mut armed = self.breakpoints.clone();
+        if !armed.contains(&lr) {
+            armed.push(lr);
+        }
+        if dap.set_breakpoints(&armed).is_err() {
+            return Stop::Fault("arm return breakpoint".into());
+        }
+        if dap.resume().is_err() {
+            return Stop::Fault("resume into call".into());
+        }
+        let mut halted = false;
+        for _ in 0..1_000_000u32 {
+            match dap.is_halted() {
+                Ok(true) => {
+                    halted = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(_) => return Stop::Fault("poll halt".into()),
+            }
+        }
+        let _ = dap.set_breakpoints(&self.breakpoints);
+        if !halted {
+            let _ = dap.halt();
+            return Stop::Fault("call did not return".into());
+        }
+        let pc = dap.read_core_reg(15).unwrap_or(0) & !1;
+        if self.breakpoints.contains(&pc) {
+            Stop::Breakpoint
+        } else {
+            Stop::Step
+        }
+    }
+
+    fn step_out(&mut self) -> Option<Stop> {
+        let (pc, lr) = {
+            let dap = self.dap.get_mut();
+            (
+                dap.read_core_reg(15).unwrap_or(0) & !1,
+                dap.read_core_reg(14).unwrap_or(0) & !1,
+            )
+        };
+        let here = self.method_name_at(pc.saturating_sub(self.base));
+        if here == self.entry {
+            return Some(self.resume());
+        }
+        if self.method_name_at(lr.saturating_sub(self.base)) == here {
+            return Some(Stop::Step);
+        }
+        Some(self.run_to_return())
     }
 
     fn poll(&mut self) -> Stop {
@@ -131,11 +225,15 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn depth(&self) -> usize {
-        1
+        self.dap
+            .borrow_mut()
+            .read_core_reg(13)
+            .map_or(0, |sp| sp.wrapping_neg() as usize)
     }
 
     fn set_breakpoints(&mut self, addresses: &[u64]) {
         let words: Vec<u32> = addresses.iter().map(|&a| a as u32).collect();
+        self.breakpoints = words.clone();
         let _ = self.dap.get_mut().set_breakpoints(&words);
     }
 
@@ -144,7 +242,7 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
         let line = self.source_line_at(pc.saturating_sub(self.base));
         vec![Frame {
             address: u64::from(pc),
-            name: self.name.clone(),
+            name: self.method_name_at(pc.saturating_sub(self.base)),
             line,
         }]
     }
@@ -171,6 +269,20 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
             end_line: line,
             end_column: 1,
         })
+    }
+
+    fn has_source(&self) -> bool {
+        !self.lines.is_empty()
+    }
+
+    fn at_source_boundary(&self) -> bool {
+        let pc = self.dap.borrow_mut().read_core_reg(15).unwrap_or(0);
+        let offset = pc.saturating_sub(self.base);
+        match self.lines.iter().position(|&(native, _)| native == offset) {
+            Some(0) => true,
+            Some(i) => self.lines[i].1 != self.lines[i - 1].1,
+            None => false,
+        }
     }
 
     fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {

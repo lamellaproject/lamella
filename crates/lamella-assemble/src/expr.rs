@@ -469,6 +469,18 @@ fn emit_new(
             "an object creation that did not resolve",
         ));
     };
+    if arguments.is_empty() && tokens.is_struct(&constructor.declaring_type) {
+        let type_token = tokens
+            .type_token(&constructor.declaring_type)
+            .ok_or(EmitError::Unsupported(
+                "a value type with no metadata token for initobj",
+            ))?;
+        let slot = frame.reserve_local(&constructor.declaring_type);
+        out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+        out.push(Instruction::new(Opcode::Initobj, Operand::Token(type_token)));
+        out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+        return Ok(());
+    }
     for argument in arguments {
         emit_expression(argument, frame, tokens, out)?;
     }
@@ -767,6 +779,22 @@ fn emit_cast(
         out.push(Instruction::simple(Opcode::ConvI4));
         return Ok(());
     }
+    if matches!(to, TypeSymbol::Special(SpecialType::String)) {
+        let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
+            "a cast to string with no metadata token",
+        ))?;
+        out.push(Instruction::new(Opcode::Castclass, Operand::Token(token)));
+        return Ok(());
+    }
+    if matches!(to, TypeSymbol::Special(SpecialType::Object)) {
+        if is_value_type(from, tokens) {
+            let token = tokens.type_token(from).ok_or(EmitError::Unsupported(
+                "boxing to object with no metadata token",
+            ))?;
+            out.push(Instruction::new(Opcode::Box, Operand::Token(token)));
+        }
+        return Ok(());
+    }
     if let TypeSymbol::Special(target) = to {
         let unsigned_source = matches!(from, TypeSymbol::Special(source) if source.is_unsigned());
         let opcode = match (checked, checked_overflow_conversion(*target, unsigned_source)) {
@@ -776,8 +804,7 @@ fn emit_cast(
         out.push(Instruction::simple(opcode));
         return Ok(());
     }
-    if matches!(to, TypeSymbol::Named(_)) && !is_value_type(to, tokens) && !tokens.is_interface(to)
-    {
+    if matches!(to, TypeSymbol::Named(_)) && !is_value_type(to, tokens) {
         let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
             "a cast to a reference type with no metadata token",
         ))?;
@@ -927,7 +954,7 @@ pub(crate) fn emit_field_receiver(
 /// local or parameter is taken by `ldloca`/`ldarga`; a nested value-type field is the
 /// address of its container then `ldflda`, so a write stores in place; `this`/`base`
 /// is already a managed pointer (`ldarg.0`), so it is emitted as a value.
-fn emit_value_type_receiver(
+pub(crate) fn emit_value_type_receiver(
     receiver: &BoundExpr,
     frame: &Frame,
     tokens: &Tokens,

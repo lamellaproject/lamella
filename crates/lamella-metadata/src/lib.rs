@@ -31,9 +31,10 @@ pub use layout::{LayoutError, TargetLayout, TypeLayout, layout_value_type};
 pub use pdb::{LocalVariable, PortablePdb, SequencePoint};
 pub use pe::{PeError, PeImage};
 pub use reader::{
-    Assembly, AssemblyRef, CustomAttribute, Event, ExceptionClause, ExceptionHandlerKind, Field,
-    MemberRef, Method, MethodKind, Param, Property, ResolvedMethod, TypeDef, TypeName, TypeRef,
-    encode_exception_base_chain, exception_tag_for_name,
+    Assembly, AssemblyRef, AttrArg, AttrNamed, CustomAttribute, DecodedAttribute, Event,
+    ExceptionClause, ExceptionHandlerKind, Field, MemberRef, Method, MethodKind, Param, Property,
+    ResolvedMethod, TypeDef, TypeName, TypeRef, decode_custom_attribute,
+    encode_exception_base_chain, exception_tag_for_name, fnv1a32,
 };
 pub use rows::{Col, Row, Tables, columns};
 pub use signature::{MethodSig, SigError, SigType, parse_field, parse_method, parse_type};

@@ -71,6 +71,21 @@ fn is_numeric_type(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Special(special) if special.is_numeric())
 }
 
+/// The named types an array implicitly converts to (13.1.4): System.Array, ICloneable, and
+/// the non-generic IList / ICollection / IEnumerable.
+fn is_array_base_type(to: &TypeSymbol) -> bool {
+    let TypeSymbol::Named(parts) = to else {
+        return false;
+    };
+    let joined: Vec<&str> = parts.iter().map(|part| &**part).collect();
+    matches!(
+        joined.as_slice(),
+        ["System", "Array"]
+            | ["System", "ICloneable"]
+            | ["System", "Collections", "IList" | "ICollection" | "IEnumerable"]
+    )
+}
+
 fn is_object(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Special(SpecialType::Object))
 }
@@ -78,6 +93,9 @@ fn is_object(ty: &TypeSymbol) -> bool {
 /// An implicit reference conversion from `from` to a base class or implemented
 /// interface, transitively (13.1.4).
 fn reference_conversion(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    if matches!(from, TypeSymbol::Array { .. }) {
+        return is_array_base_type(to);
+    }
     let mut stack: Vec<TypeSymbol> = match model.get_by_symbol(from) {
         Some(info) => info.bases.to_vec(),
         None => return false,

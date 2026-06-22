@@ -252,8 +252,10 @@ fn build_image(
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let mut tokens = assign_tokens(unit);
     let mut binder = Binder::with_model(reference_model(unit, references));
+    binder.set_defined_symbols(unit.defined_symbols.clone());
     mark_external_value_types(binder.model(), &mut tokens);
     let mut image = ImageBuilder::new(module_name, assembly_name);
+    register_external_assemblies(binder.model(), &mut image);
     let object = image.object_type();
     let mut entry_point = None;
     let context = debug.map(|(source, _)| DebugContext {
@@ -339,7 +341,7 @@ fn exception_base_chain_tags(model: &Model, symbol: &TypeSymbol) -> Option<Vec<u
 fn emit_attributes(
     image: &mut ImageBuilder,
     binder: &Binder,
-    tokens: &Tokens,
+    tokens: &mut Tokens,
     parent: Token,
     sections: &[AttributeSection],
 ) {
@@ -356,7 +358,7 @@ fn emit_attributes(
 fn emit_one_attribute(
     image: &mut ImageBuilder,
     binder: &Binder,
-    tokens: &Tokens,
+    tokens: &mut Tokens,
     parent: Token,
     attribute: &lamella_syntax::ast::Attribute,
 ) {
@@ -370,7 +372,7 @@ fn emit_one_attribute(
         }
     }
     let Some((attribute_ty, parameters)) =
-        resolve_attribute(model, &attribute.name, positional.len())
+        resolve_attribute(binder, &attribute.name, positional.len())
     else {
         return;
     };
@@ -389,6 +391,16 @@ fn emit_one_attribute(
             return;
         }
     }
+    if tokens.method(&attribute_ty, ".ctor", &parameters).is_none() {
+        let constructor_ref = lamella_binder::MethodReference {
+            declaring_type: attribute_ty.clone(),
+            name: ".ctor".into(),
+            parameters: parameters.clone(),
+            return_type: TypeSymbol::Special(SpecialType::Void),
+            is_static: false,
+        };
+        mint_member_ref(&constructor_ref, image, tokens);
+    }
     let Some(constructor) = tokens.method(&attribute_ty, ".ctor", &parameters) else {
         return;
     };
@@ -399,18 +411,20 @@ fn emit_one_attribute(
 /// `arg_count` positional arguments, trying the name as written and with an `Attribute`
 /// suffix (24.2). `None` if neither resolves to a type with such a constructor.
 fn resolve_attribute(
-    model: &Model,
+    binder: &Binder,
     name: &QualifiedName,
     arg_count: usize,
 ) -> Option<(TypeSymbol, Vec<TypeSymbol>)> {
+    let model = binder.model();
     for candidate in attribute_candidates(name) {
-        if let Some(info) = model.get_by_symbol(&candidate) {
+        let resolved = binder.resolve_type(&candidate);
+        if let Some(info) = model.get_by_symbol(&resolved) {
             if let Some(constructor) = info
                 .constructors
                 .iter()
                 .find(|constructor| constructor.parameters.len() == arg_count)
             {
-                return Some((candidate, constructor.parameters.clone()));
+                return Some((resolved, constructor.parameters.clone()));
             }
         }
     }
@@ -1027,7 +1041,7 @@ fn emit_delegate(
 fn emit_enum(
     image: &mut ImageBuilder,
     binder: &Binder,
-    tokens: &Tokens,
+    tokens: &mut Tokens,
     namespace: &str,
     declaration: &EnumDecl,
 ) -> Result<(), crate::EmitError> {
@@ -1057,6 +1071,7 @@ fn emit_enum(
             image.add_nested_class(enum_type_token, enclosing_token);
         }
     }
+    emit_attributes(image, binder, tokens, enum_type_token, &declaration.attributes);
     let value_field_sig = field_signature(&type_sig(tokens, &underlying)?);
     image.add_field("value__", &value_field_sig, ENUM_VALUE_FIELD_FLAGS);
     let member_field_sig = field_signature(&TypeSig::ValueType(enum_token));
@@ -2304,8 +2319,14 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             mint_in_expr(operand, image, tokens);
             if matches!(operand.ty, TypeSymbol::Special(SpecialType::Object))
                 && is_value_type(&expr.ty, tokens)
+                || matches!(expr.ty, TypeSymbol::Special(SpecialType::String))
             {
                 mint_value_type_token(&expr.ty, image, tokens);
+            }
+            if matches!(expr.ty, TypeSymbol::Special(SpecialType::Object))
+                && is_value_type(&operand.ty, tokens)
+            {
+                mint_value_type_token(&operand.ty, image, tokens);
             }
         }
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
@@ -2430,6 +2451,26 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
         } => {
             mint_in_expr(target, image, tokens);
             mint_in_expr(value, image, tokens);
+            if let BoundExprKind::PropertyAccess {
+                receiver,
+                declaring_type,
+                name,
+            } = &target.kind
+            {
+                let setter = lamella_binder::MethodReference {
+                    declaring_type: declaring_type.clone(),
+                    name: accessor_name("set_", name).into(),
+                    parameters: alloc::vec![target.ty.clone()],
+                    return_type: TypeSymbol::Special(SpecialType::Void),
+                    is_static: matches!(receiver.kind, BoundExprKind::TypeReference(_)),
+                };
+                if tokens
+                    .method(&setter.declaring_type, &setter.name, &setter.parameters)
+                    .is_none()
+                {
+                    mint_member_ref(&setter, image, tokens);
+                }
+            }
             if matches!(operator, lamella_syntax::ast::AssignmentOperator::Add)
                 && is_string(&target.ty)
             {
@@ -2666,6 +2707,28 @@ fn system_type_name(special: SpecialType) -> Option<(&'static str, &'static str)
 /// `type_sig` can encode it (a `Class`, or `ValueType` for a value type). A no-op for a
 /// predefined type, an array, the error type, or a type already tokenized (a this-module
 /// `TypeDef` or a previously minted ref).
+/// Records every external type's defining assembly in the image, so a non-CoreLib BCL type's
+/// `TypeRef` is scoped to its real assembly (System.Diagnostics for Trace) rather than to
+/// mscorlib (which resolves only what CoreLib defines or forwards).
+fn register_external_assemblies(model: &Model, image: &mut ImageBuilder) {
+    let entries: Vec<(String, Box<str>)> = model
+        .type_keys()
+        .filter_map(|(namespace, name)| {
+            let info = model.get_by_symbol(&named_symbol(namespace, name))?;
+            let assembly = info.assembly.clone()?;
+            let qualified = if namespace.is_empty() {
+                String::from(name)
+            } else {
+                alloc::format!("{namespace}.{name}")
+            };
+            Some((qualified, assembly))
+        })
+        .collect();
+    for (qualified, assembly) in entries {
+        image.set_type_assembly(&qualified, &assembly);
+    }
+}
+
 /// Marks every referenced struct/enum as a value type in `tokens`, so `type_sig` emits it as
 /// `ValueType` rather than `Class` (a class reference to a value type is a load-time mismatch).
 /// This-module structs/enums are already marked by the token pre-pass.

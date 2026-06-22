@@ -6,7 +6,7 @@ use crate::trap::Trap;
 use crate::value::Value;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_cil::MethodBodyImage;
 use lamella_token::Token;
@@ -16,6 +16,51 @@ pub type MethodId = u32;
 
 /// An index identifying a declared reference type within a [`Module`].
 pub type TypeId = u32;
+
+/// A custom-attribute argument value, decoded from the attribute's value blob at load and
+/// materialized into a runtime [`Value`] when the attribute is instantiated (`GetCustomAttributes`).
+/// The blob is decoded with no heap, so a string keeps its UTF-16 units and a `typeof(X)` argument
+/// its already-resolved type handle until the intrinsic (which has the [`Vm`]) turns them into a
+/// heap string / a `Type` handle [`Value`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum AttrValue {
+    /// A signed integer, widened to `i64` (a `bool`/`char`/`sbyte`/.../`int`/`long`, or an enum's
+    /// underlying value). The `wide` flag distinguishes a 64-bit-backed value (boxed as `int64`).
+    Int {
+        /// The integer value, sign-extended from its source width.
+        value: i64,
+        /// Whether the source type is 64-bit (`long`/`ulong`), so it materializes as `Int64`.
+        wide: bool,
+    },
+    /// A single-precision float.
+    R4(f32),
+    /// A double-precision float.
+    R8(f64),
+    /// A `string`, as UTF-16 code units.
+    Str(Box<[u16]>),
+    /// A `System.Type` (`typeof(X)`): the resolved asm-folded type handle, or `0` if unresolved.
+    Type(u64),
+    /// A null reference (a null `string` / `Type` / `object` argument).
+    Null,
+}
+
+/// One custom attribute applied to a target, decoded and resolved at load: the constructor to
+/// run, its positional arguments, and the named field assignments to apply after. The
+/// interpreter instantiates it by allocating the attribute type, running `ctor` with `positional`,
+/// then storing each `named` value into its field slot ([`crate::intrinsics`]). Only same-module
+/// attribute types (with an instantiable [`MethodId`] ctor) are recorded; a named PROPERTY is not
+/// modeled (the corpus uses only named fields).
+#[derive(Clone, Debug)]
+pub struct LoadedAttribute {
+    /// The attribute's constructor.
+    pub ctor: MethodId,
+    /// The [`TypeId`] of the attribute, for allocating its instance.
+    pub type_id: TypeId,
+    /// The positional (constructor) argument values, in declaration order.
+    pub positional: Vec<AttrValue>,
+    /// The named field assignments: `(field slot, value)`, applied after the ctor.
+    pub named_fields: Vec<(u32, AttrValue)>,
+}
 
 /// A declared reference type's runtime shape: the zero value of each instance field
 /// (one per declaration-order slot, copied when allocating an instance) and its
@@ -103,6 +148,12 @@ pub struct Module {
     field_types: BTreeMap<u64, TypeId>,
     /// A `newarr` element-type token mapped to its elements' zero value.
     array_defaults: BTreeMap<u64, Value>,
+    /// A `newarr` element-type token mapped to the element type's true byte width (`Byte` = 1,
+    /// `Int16`/`Char` = 2, `Int32` = 4, `Int64`/`Double` = 8). Only sized primitive element types
+    /// appear; a reference / value-type element array is absent (its `Buffer` width is undefined).
+    /// Stamped onto each array at `newarr` so `System.Buffer` can size its byte image -- a width a
+    /// `byte[]` and an `int[]` (both `Value::Int32` elements) cannot otherwise be told apart by.
+    array_element_sizes: BTreeMap<u64, u8>,
     /// A virtual method's vtable slot (only virtual methods appear).
     method_slots: BTreeMap<MethodId, u32>,
     /// A static field token mapped to its storage slot in the [`crate::interp::Vm`].
@@ -145,6 +196,15 @@ pub struct Module {
     /// Tokens of enum types whose underlying type is 64-bit (long / ulong), so `Enum.Parse`
     /// boxes their values as int64 to match the declared type.
     enum_wide: BTreeSet<u64>,
+    /// Tokens of enum types carrying `[System.FlagsAttribute]`, so `Enum.ToString` / `Format`
+    /// renders a value as the comma-joined member names it decomposes into (rather than a single
+    /// member name or the bare number). Recorded by the loader from the type's custom attributes.
+    enum_flags: BTreeSet<u64>,
+    /// Each enum type's underlying byte width (`sbyte`/`byte` = 1, `short`/`ushort` = 2,
+    /// `int`/`uint` = 4, `long`/`ulong` = 8), keyed by its `TypeDef` handle -- the field width
+    /// `Enum.Format`'s "X" zero-pads to (`width * 2` hex digits). Absent for an enum whose width
+    /// the loader could not determine; the formatter then defaults to 4 (the `int` default).
+    enum_widths: BTreeMap<u64, u8>,
     /// `newobj` tokens that construct a multi-dimensional array (an array TypeSpec's
     /// `.ctor`), mapped to the array's rank -- newobj allocates from that many lengths.
     md_array_ctors: BTreeMap<u64, u16>,
@@ -220,6 +280,29 @@ pub struct Module {
     /// fact `sizeof` (III.4.25) pushes; struct sizes come from the shared
     /// `lamella_metadata::value_type_layout`, so the interpreter, AOT, and GC agree.
     type_sizes: BTreeMap<u64, u32>,
+    /// The exception TAG of each `catch` clause's declared type, keyed by the clause's
+    /// asm-folded catch-type token. The loader computes it from the catch token's metadata
+    /// name (`exception_tag_for_name`), so it is available even for a BCL exception type the
+    /// program references but no loaded assembly defines (e.g. `System.DivideByZeroException`,
+    /// absent from corlib) -- the handler search ([`crate::interp`]) tests this tag for
+    /// membership in the thrown exception's base-chain vector, so a `catch` matches ONLY a
+    /// subtype of its declared type. A typeless `catch {}` whose token names no type records
+    /// nothing and is treated as catch-all.
+    catch_type_tags: BTreeMap<u64, u32>,
+    /// The custom attributes applied to a target (a type or a member), keyed by the target's
+    /// asm-folded metadata token -- the `Type` / `MemberInfo` handle a `GetCustomAttributes`
+    /// receiver carries. Each is decoded + resolved at load (its ctor, positional, and named
+    /// field values); the interpreter instantiates them on demand. A target with no recorded
+    /// (instantiable) attributes is absent.
+    custom_attributes: BTreeMap<u64, Vec<LoadedAttribute>>,
+    /// A type's member by simple name, keyed by `(type handle, member name)` -> the member's
+    /// asm-folded token (a `Field` / `MethodDef` / `Property` token). This is what
+    /// `Type.GetField` / `GetMethod` / `GetProperty` resolve a name to: the handle of the
+    /// `MemberInfo` whose `GetCustomAttributes` then reads `custom_attributes`. Three separate
+    /// maps so a field, a method, and a property of the same name do not collide.
+    type_fields_by_name: BTreeMap<(u64, String), u64>,
+    type_methods_by_name: BTreeMap<(u64, String), u64>,
+    type_properties_by_name: BTreeMap<(u64, String), u64>,
 }
 
 /// Folds the assembly id into a token key: the assembly in the HIGH 32 bits, the metadata token
@@ -228,8 +311,48 @@ pub struct Module {
 /// id) can be resolved simultaneously -- the incremental REPL needs three at once (corlib + the
 /// persistent `__Repl` + a running delta). The earlier single-bit `token | (asm << 31)` scheme
 /// capped this at two assemblies and would have collided a third's tokens with the first's.
-pub(crate) fn asm_key(asm: u8, token: u32) -> u64 {
+#[must_use]
+pub fn asm_key(asm: u8, token: u32) -> u64 {
     ((asm as u64) << 32) | (token as u64)
+}
+
+/// Decomposes `value` into the comma-joined member names of a `[Flags]` enum, exactly as
+/// .NET's `Enum.FormatFlags` does (verified against the .NET 8 oracle):
+///
+/// - `value == 0` renders the member named for 0 if one exists, else `"0"`.
+/// - Otherwise the members are walked from HIGHEST value to lowest; a member whose bits are all
+///   still set in the remaining value is consumed (its bits cleared) and its name recorded. Walking
+///   high-first makes a composite member (e.g. `RW = Read | Write`) win over its parts, and recording
+///   front-to-back yields the names in INCREASING value order (`RW, Exec`).
+/// - A member of value 0 is never used as a flag part (only as the zero name above).
+/// - If any bit is left over with no covering member -- or no member matched at all -- the whole
+///   value renders as its underlying DECIMAL number, matching .NET.
+///
+/// `constants` is the enum's `value -> name` map (ascending by value, a `BTreeMap`).
+fn format_flag_names(constants: &BTreeMap<i64, String>, value: i64) -> String {
+    if value == 0 {
+        return match constants.get(&0) {
+            Some(name) => name.clone(),
+            None => String::from("0"),
+        };
+    }
+    let mut remaining = value;
+    let mut names: Vec<&str> = Vec::new();
+    for (member_value, name) in constants.iter().rev() {
+        let bits = *member_value;
+        if bits != 0 && (remaining & bits) == bits {
+            names.push(name.as_str());
+            remaining &= !bits;
+            if remaining == 0 {
+                break;
+            }
+        }
+    }
+    if remaining != 0 || names.is_empty() {
+        return value.to_string();
+    }
+    names.reverse();
+    names.join(", ")
 }
 
 /// Debug display names for one method: its qualified name and its argument names in CIL
@@ -425,6 +548,25 @@ impl Module {
         self.array_defaults.get(&asm_key(asm, token.0)).cloned()
     }
 
+    /// Binds a `newarr` element-type token in assembly `asm` to the element type's byte width
+    /// (`Byte` = 1, `Int16`/`Char` = 2, `Int32` = 4, `Int64`/`Double` = 8) -- the size
+    /// `System.Buffer` measures the array's byte image in. Only sized primitive element types are
+    /// bound; a reference / value-type element array is left unbound.
+    pub fn bind_array_element_size(&mut self, asm: u8, token: Token, size: u8) {
+        self.array_element_sizes.insert(asm_key(asm, token.0), size);
+    }
+
+    /// The element type's byte width of a `newarr` element-type token in assembly `asm`, or `0`
+    /// when none was bound (a reference / value-type element array). `newarr` stamps this onto the
+    /// array so `System.Buffer.BlockCopy` / `ByteLength` can size it.
+    #[must_use]
+    pub fn array_element_size(&self, asm: u8, token: Token) -> u8 {
+        self.array_element_sizes
+            .get(&asm_key(asm, token.0))
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// Sets `type_id`'s virtual method table (slot -> implementation).
     pub fn set_vtable(&mut self, type_id: TypeId, vtable: Vec<MethodId>) {
         if let Some(info) = self.types.get_mut(type_id as usize) {
@@ -542,6 +684,24 @@ impl Module {
             .map(String::as_str)
     }
 
+    /// The name of the constant with underlying `value` in the enum named by `handle`, resolving
+    /// ACROSS assemblies: first the direct handle (the same-assembly case, where the box tag /
+    /// constraint token equals the enum's own folded `TypeDef` token), then -- on a miss -- the
+    /// enum's CANONICAL handle reached through the shared [`TypeId`]. A program boxing or calling
+    /// `.ToString()` on a CORLIB enum (e.g. `DayOfWeek`) carries that enum's `TypeRef` in the
+    /// program's token space, which keys nothing in `enum_constants` (the constants were recorded
+    /// under the corlib's `TypeDef`); mapping `handle -> TypeId -> canonical handle` lands on the
+    /// corlib entry, so the member name resolves like .NET rather than falling back to the number.
+    #[must_use]
+    pub fn enum_value_name_resolved(&self, handle: u64, value: i64) -> Option<&str> {
+        if let Some(name) = self.enum_value_name_by_handle(handle, value) {
+            return Some(name);
+        }
+        let type_id = self.type_id_by_handle(handle)?;
+        let canonical = self.type_handle_of(type_id)?;
+        self.enum_value_name_by_handle(canonical, value)
+    }
+
     /// The underlying value of the constant named `name` in the enum type `token` of
     /// assembly `asm`, if any -- the reverse of [`Self::enum_value_name`], for `Enum.Parse`.
     #[must_use]
@@ -575,6 +735,98 @@ impl Module {
                 };
                 matched.then_some(*value)
             })
+    }
+
+    /// Whether the type named by `handle` is an enum -- it has at least one recorded constant --
+    /// resolving ACROSS assemblies like [`Self::enum_value_name_resolved`] (the program's
+    /// `TypeRef` to a corlib enum maps through the shared [`TypeId`] to the corlib's entry). The
+    /// constrained-`ToString` path needs this to tell an enum (whose `ToString` renders the
+    /// underlying NUMBER when no member matches) from a plain value type (whose inherited
+    /// `ValueType.ToString` renders the type NAME).
+    #[must_use]
+    pub fn is_enum_by_handle(&self, handle: u64) -> bool {
+        if self.enum_constants.contains_key(&handle) {
+            return true;
+        }
+        self.type_id_by_handle(handle)
+            .and_then(|type_id| self.type_handle_of(type_id))
+            .is_some_and(|canonical| self.enum_constants.contains_key(&canonical))
+    }
+
+    /// The constant map of the enum named by `handle`, resolving ACROSS assemblies the same way
+    /// [`Self::enum_value_name_resolved`] does: the direct handle (same-assembly), then -- on a
+    /// miss -- the enum's CANONICAL handle via the shared [`TypeId`] (a program naming a corlib
+    /// enum by `TypeRef`). The map is `value -> name`, ordered ascending by value (a `BTreeMap`),
+    /// which is the order `Enum.GetNames` / `GetValues` report and the flags formatter walks.
+    fn enum_map_resolved(&self, handle: u64) -> Option<&BTreeMap<i64, String>> {
+        if let Some(constants) = self.enum_constants.get(&handle) {
+            return Some(constants);
+        }
+        let canonical = self.type_handle_of(self.type_id_by_handle(handle)?)?;
+        self.enum_constants.get(&canonical)
+    }
+
+    /// Records that the enum type `token` in assembly `asm` carries `[FlagsAttribute]`.
+    pub fn set_enum_flags(&mut self, asm: u8, token: u32) {
+        self.enum_flags.insert(asm_key(asm, token));
+    }
+
+    /// Whether the enum named by `handle` carries `[FlagsAttribute]`, resolving across assemblies
+    /// (direct handle, then the canonical handle via the shared [`TypeId`]) like the name lookups.
+    #[must_use]
+    pub fn enum_is_flags_by_handle(&self, handle: u64) -> bool {
+        if self.enum_flags.contains(&handle) {
+            return true;
+        }
+        self.type_id_by_handle(handle)
+            .and_then(|type_id| self.type_handle_of(type_id))
+            .is_some_and(|canonical| self.enum_flags.contains(&canonical))
+    }
+
+    /// Records the underlying byte `width` (1/2/4/8) of the enum type `token` in assembly `asm`.
+    pub fn set_enum_width(&mut self, asm: u8, token: u32, width: u8) {
+        self.enum_widths.insert(asm_key(asm, token), width);
+    }
+
+    /// The underlying byte width of the enum named by `handle` (resolving across assemblies),
+    /// defaulting to 4 (`int`) when unknown -- the width `Enum.Format`'s "X" zero-pads to.
+    #[must_use]
+    pub fn enum_width_by_handle(&self, handle: u64) -> u8 {
+        if let Some(&width) = self.enum_widths.get(&handle) {
+            return width;
+        }
+        self.type_id_by_handle(handle)
+            .and_then(|type_id| self.type_handle_of(type_id))
+            .and_then(|canonical| self.enum_widths.get(&canonical).copied())
+            .unwrap_or(4)
+    }
+
+    /// The enum's members as `(value, name)` pairs ordered ascending by value -- the order
+    /// `Enum.GetNames` and `Enum.GetValues` report. Resolves across assemblies; `None` if the
+    /// handle names no known enum.
+    #[must_use]
+    pub fn enum_members_by_handle(&self, handle: u64) -> Option<Vec<(i64, String)>> {
+        self.enum_map_resolved(handle).map(|constants| {
+            constants
+                .iter()
+                .map(|(value, name)| (*value, name.clone()))
+                .collect()
+        })
+    }
+
+    /// Renders `value` as `Enum.ToString` / the "G" format does: for a `[Flags]` enum, the
+    /// comma-joined member names the value decomposes into (`Enum.FormatFlags`); otherwise the
+    /// single member name. `None` when no name applies (the caller renders the underlying number,
+    /// matching .NET's fallback). Resolves across assemblies. `flags` forces the flags algorithm
+    /// regardless of the attribute (the "F" format).
+    #[must_use]
+    pub fn enum_name_or_flags(&self, handle: u64, value: i64, flags: bool) -> Option<String> {
+        let constants = self.enum_map_resolved(handle)?;
+        if flags || self.enum_is_flags_by_handle(handle) {
+            Some(format_flag_names(constants, value))
+        } else {
+            constants.get(&value).cloned()
+        }
     }
 
     /// Records that the enum type `token` in assembly `asm` has a 64-bit underlying type
@@ -952,11 +1204,97 @@ impl Module {
         self.type_names.insert(asm_key(asm, token.0), name);
     }
 
+    /// Records the exception TAG of a `catch` clause's declared type, keyed by the catch-type
+    /// `token` in assembly `asm`. The loader supplies the tag computed from the token's
+    /// metadata name, so the handler search can match a catch by type without the catch type
+    /// having to resolve to a loaded [`TypeId`] (a referenced-but-undefined BCL exception type
+    /// still gets a tag from its name).
+    #[cfg(feature = "exceptions")]
+    pub fn bind_catch_type_tag(&mut self, asm: u8, token: Token, tag: u32) {
+        self.catch_type_tags.insert(asm_key(asm, token.0), tag);
+    }
+
+    /// The exception TAG recorded for a `catch` clause's declared type token in assembly `asm`,
+    /// if one was bound. `None` for a typeless `catch {}` (whose token names no type), which the
+    /// handler search treats as a catch-all.
+    #[cfg(feature = "exceptions")]
+    #[must_use]
+    pub fn catch_type_tag(&self, asm: u8, token: Token) -> Option<u32> {
+        self.catch_type_tags.get(&asm_key(asm, token.0)).copied()
+    }
+
     /// The simple name of a type token, keyed by its asm-folded value (the handle a
     /// `Type` intrinsic receives), if recorded.
     #[must_use]
     pub fn type_name_by_handle(&self, handle: u64) -> Option<&str> {
         self.type_names.get(&handle).map(String::as_str)
+    }
+
+    /// Records one custom attribute (decoded + resolved at load) applied to the target whose
+    /// asm-folded token is `target_handle` -- the `Type` / `MemberInfo` handle a
+    /// `GetCustomAttributes` receiver carries. Attributes accumulate in application order.
+    pub fn add_custom_attribute(&mut self, target_handle: u64, attribute: LoadedAttribute) {
+        self.custom_attributes
+            .entry(target_handle)
+            .or_default()
+            .push(attribute);
+    }
+
+    /// The custom attributes recorded for the target whose asm-folded token is `target_handle`
+    /// (a type or member), in application order. Empty if none.
+    #[must_use]
+    pub fn custom_attributes_of(&self, target_handle: u64) -> &[LoadedAttribute] {
+        self.custom_attributes
+            .get(&target_handle)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Records that the type whose handle is `type_handle` has a field named `name` whose
+    /// asm-folded `Field` token is `field_handle` -- what `Type.GetField(name)` returns.
+    pub fn bind_type_field_name(&mut self, type_handle: u64, name: &str, field_handle: u64) {
+        self.type_fields_by_name
+            .insert((type_handle, name.to_string()), field_handle);
+    }
+
+    /// Records that the type whose handle is `type_handle` has a method named `name` whose
+    /// asm-folded `MethodDef` token is `method_handle` -- what `Type.GetMethod(name)` returns.
+    pub fn bind_type_method_name(&mut self, type_handle: u64, name: &str, method_handle: u64) {
+        self.type_methods_by_name
+            .insert((type_handle, name.to_string()), method_handle);
+    }
+
+    /// Records that the type whose handle is `type_handle` has a property named `name` whose
+    /// asm-folded `Property` token is `property_handle` -- what `Type.GetProperty(name)` returns.
+    pub fn bind_type_property_name(&mut self, type_handle: u64, name: &str, property_handle: u64) {
+        self.type_properties_by_name
+            .insert((type_handle, name.to_string()), property_handle);
+    }
+
+    /// The asm-folded `Field` token of the field named `name` on the type whose handle is
+    /// `type_handle` (the `FieldInfo` handle `Type.GetField` returns), or `None`.
+    #[must_use]
+    pub fn type_field_handle(&self, type_handle: u64, name: &str) -> Option<u64> {
+        self.type_fields_by_name
+            .get(&(type_handle, name.to_string()))
+            .copied()
+    }
+
+    /// The asm-folded `MethodDef` token of the method named `name` on the type whose handle is
+    /// `type_handle` (the `MethodInfo` handle `Type.GetMethod` returns), or `None`.
+    #[must_use]
+    pub fn type_method_handle(&self, type_handle: u64, name: &str) -> Option<u64> {
+        self.type_methods_by_name
+            .get(&(type_handle, name.to_string()))
+            .copied()
+    }
+
+    /// The asm-folded `Property` token of the property named `name` on the type whose handle is
+    /// `type_handle` (the `PropertyInfo` handle `Type.GetProperty` returns), or `None`.
+    #[must_use]
+    pub fn type_property_handle(&self, type_handle: u64, name: &str) -> Option<u64> {
+        self.type_properties_by_name
+            .get(&(type_handle, name.to_string()))
+            .copied()
     }
 
     /// Records `type_id`'s FULL name (`namespace.name`, or the bare `name` in the global

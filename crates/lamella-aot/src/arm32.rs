@@ -167,7 +167,12 @@ fn lower_inst(
         | Inst::FieldStore { .. }
         | Inst::FieldAddr { .. }
         | Inst::CopyStruct { .. } => return Err(LowerError::CallUnsupported),
-        Inst::Call { .. } | Inst::CallVirtual { .. } => return Err(LowerError::CallUnsupported),
+        Inst::Call { .. }
+        | Inst::CallVirtual { .. }
+        | Inst::CallInterface { .. }
+        | Inst::CastClassScan { .. } => {
+            return Err(LowerError::CallUnsupported);
+        }
         Inst::SemihostWrite { .. }
         | Inst::WriteInt { .. }
         | Inst::StringLiteral { .. }
@@ -397,9 +402,10 @@ fn lower_spilled_inst(
                 BinOp::Shl => emit_shl64(enc)?,
                 BinOp::ShrSigned => emit_shr64(enc, true)?,
                 BinOp::ShrUnsigned => emit_shr64(enc, false)?,
-                BinOp::DivSigned | BinOp::DivUnsigned | BinOp::RemSigned | BinOp::RemUnsigned => {
-                    return Err(LowerError::CallUnsupported);
-                }
+                BinOp::DivSigned => emit_divmod64(enc, true, false)?,
+                BinOp::DivUnsigned => emit_divmod64(enc, false, false)?,
+                BinOp::RemSigned => emit_divmod64(enc, true, true)?,
+                BinOp::RemUnsigned => emit_divmod64(enc, false, true)?,
             }
         }
         Inst::Binary { op, lhs, rhs } => {
@@ -535,6 +541,96 @@ fn lower_spilled_inst(
                     .map_err(|_| LowerError::TooManyValues)?;
             }
             return Ok(Some(return_pc));
+        }
+        Inst::CallInterface { tag, args } => {
+            let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
+            enc.ldr_sp(Reg::R0, slot(receiver))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.subs_imm8(Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R0, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R1, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsls_imm(Reg::R1, Reg::R1, 2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R1, 16)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R2, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R1, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            load_const_word(enc, pool, Reg::R3, *tag)?;
+            let search = enc.new_label();
+            let found = enc.new_label();
+            enc.bind_label(search);
+            enc.ldr_imm(Reg::R0, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_reg(Reg::R0, Reg::R3)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, found);
+            enc.adds_imm8(Reg::R1, 8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.subs_imm8(Reg::R2, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Ne, search);
+            enc.udf(0);
+            enc.bind_label(found);
+            enc.ldr_imm(Reg::R0, Reg::R1, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R3, slot(receiver))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.subs_imm8(Reg::R3, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R3, Reg::R3, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R0, Reg::R3, Reg::R0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R0, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.mov_reg(Reg::R12, Reg::R0);
+            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            enc.blx(Reg::R12);
+            let return_pc = enc.position();
+            if stack_bytes > 0 {
+                enc.add_sp(stack_bytes)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+            return Ok(Some(return_pc));
+        }
+        Inst::CastClassScan { args } => {
+            let start = *args.first().ok_or(LowerError::CallUnsupported)?;
+            let target = *args.get(1).ok_or(LowerError::CallUnsupported)?;
+            enc.ldr_sp(Reg::R0, slot(start))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R2, slot(target))
+                .map_err(|_| LowerError::TooManyValues)?;
+            let search = enc.new_label();
+            let found = enc.new_label();
+            let miss = enc.new_label();
+            let done = enc.new_label();
+            enc.bind_label(search);
+            enc.cmp_reg(Reg::R0, Reg::R2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, found);
+            enc.ldr_imm(Reg::R1, Reg::R0, 12)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_imm(Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, miss);
+            enc.adds(Reg::R0, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b(search);
+            enc.bind_label(found);
+            enc.movs_imm(Reg::R0, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b(done);
+            enc.bind_label(miss);
+            enc.movs_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(done);
         }
         Inst::Store { address, value } => {
             enc.ldr_sp(Reg::R0, slot(*address))
@@ -987,6 +1083,11 @@ fn emit_i2f(enc: &mut Encoder) -> Result<(), LowerError> {
 /// DivideByZeroException is a follow-up.
 fn emit_divmod32(enc: &mut Encoder, signed: bool, remainder: bool) -> Result<(), LowerError> {
     let oops = |_| LowerError::TooManyValues;
+    let div_ok = enc.new_label();
+    enc.cmp_imm(Reg::R1, 0).map_err(oops)?;
+    enc.b_cond(Cond::Ne, div_ok);
+    enc.udf(0);
+    enc.bind_label(div_ok);
     enc.push_registers(0xF0, false);
     if signed {
         enc.movs_imm(Reg::R4, 31).map_err(oops)?;
@@ -1036,6 +1137,81 @@ fn emit_divmod32(enc: &mut Encoder, signed: bool, remainder: bool) -> Result<(),
         enc.b_cond(Cond::Eq, nonneg);
         enc.movs_imm(Reg::R5, 0).map_err(oops)?;
         enc.subs(Reg::R0, Reg::R5, Reg::R0).map_err(oops)?;
+        enc.bind_label(nonneg);
+    }
+    enc.pop_registers(0xF0, false);
+    Ok(())
+}
+
+/// 64-bit soft div/rem (there is no 64-bit hardware divide on M-profile). The dividend `a` is in r0:r1, the
+/// divisor `b` in r2:r3; the result (quotient or remainder) is left in r0:r1. A restoring long division: the
+/// {rem:a} 128-bit value shifts left 1 per step, the dividend's MSB entering `rem` while the quotient bit
+/// enters `a`'s LSB -- so `a` becomes the quotient IN PLACE, keeping the working set within r0-r7. `signed`
+/// divides magnitudes (branchless 64-bit abs) and re-applies the sign. Divide-by-zero traps (inline UDF),
+/// like [`emit_divmod32`].
+fn emit_divmod64(enc: &mut Encoder, signed: bool, remainder: bool) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    let div_ok = enc.new_label();
+    enc.cmp_imm(Reg::R2, 0).map_err(oops)?;
+    enc.b_cond(Cond::Ne, div_ok);
+    enc.cmp_imm(Reg::R3, 0).map_err(oops)?;
+    enc.b_cond(Cond::Ne, div_ok);
+    enc.udf(0);
+    enc.bind_label(div_ok);
+    enc.push_registers(0xF0, false);
+    if signed {
+        enc.movs_imm(Reg::R4, 31).map_err(oops)?;
+        enc.mov_reg(Reg::R5, Reg::R1);
+        enc.asrs_reg(Reg::R5, Reg::R4).map_err(oops)?;
+        enc.mov_reg(Reg::R6, Reg::R3);
+        enc.asrs_reg(Reg::R6, Reg::R4).map_err(oops)?;
+        enc.mov_reg(Reg::R7, Reg::R5);
+        if !remainder {
+            enc.eors(Reg::R7, Reg::R6).map_err(oops)?;
+        }
+        enc.eors(Reg::R0, Reg::R5).map_err(oops)?;
+        enc.eors(Reg::R1, Reg::R5).map_err(oops)?;
+        enc.subs(Reg::R0, Reg::R0, Reg::R5).map_err(oops)?;
+        enc.sbcs(Reg::R1, Reg::R5).map_err(oops)?;
+        enc.eors(Reg::R2, Reg::R6).map_err(oops)?;
+        enc.eors(Reg::R3, Reg::R6).map_err(oops)?;
+        enc.subs(Reg::R2, Reg::R2, Reg::R6).map_err(oops)?;
+        enc.sbcs(Reg::R3, Reg::R6).map_err(oops)?;
+    }
+    enc.movs_imm(Reg::R4, 0).map_err(oops)?;
+    enc.movs_imm(Reg::R5, 0).map_err(oops)?;
+    enc.movs_imm(Reg::R6, 64).map_err(oops)?;
+    let loop_top = enc.new_label();
+    let set_bit = enc.new_label();
+    let after = enc.new_label();
+    enc.bind_label(loop_top);
+    enc.lsls_imm(Reg::R0, Reg::R0, 1).map_err(oops)?;
+    enc.adcs(Reg::R1, Reg::R1).map_err(oops)?;
+    enc.adcs(Reg::R4, Reg::R4).map_err(oops)?;
+    enc.adcs(Reg::R5, Reg::R5).map_err(oops)?;
+    enc.subs(Reg::R4, Reg::R4, Reg::R2).map_err(oops)?;
+    enc.sbcs(Reg::R5, Reg::R3).map_err(oops)?;
+    enc.b_cond(Cond::CarrySet, set_bit);
+    enc.adds(Reg::R4, Reg::R4, Reg::R2).map_err(oops)?;
+    enc.adcs(Reg::R5, Reg::R3).map_err(oops)?;
+    enc.b(after);
+    enc.bind_label(set_bit);
+    enc.adds_imm8(Reg::R0, 1).map_err(oops)?;
+    enc.bind_label(after);
+    enc.subs_imm8(Reg::R6, 1).map_err(oops)?;
+    enc.b_cond(Cond::Ne, loop_top);
+    if remainder {
+        enc.mov_reg(Reg::R0, Reg::R4);
+        enc.mov_reg(Reg::R1, Reg::R5);
+    }
+    if signed {
+        enc.cmp_imm(Reg::R7, 0).map_err(oops)?;
+        let nonneg = enc.new_label();
+        enc.b_cond(Cond::Eq, nonneg);
+        enc.movs_imm(Reg::R4, 0).map_err(oops)?;
+        enc.subs(Reg::R0, Reg::R4, Reg::R0).map_err(oops)?;
+        enc.sbcs(Reg::R4, Reg::R1).map_err(oops)?;
+        enc.mov_reg(Reg::R1, Reg::R4);
         enc.bind_label(nonneg);
     }
     enc.pop_registers(0xF0, false);
@@ -1369,7 +1545,7 @@ fn lower_spilled_into(
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
     stack_maps: &mut Vec<StackMapEntry>,
-    vtables: &[(lamella_ir::TypeHandle, Vec<u32>)],
+    vtables: &[TypeMeta],
 ) -> Result<(), LowerError> {
     let has_calls = func.blocks.iter().any(|b| {
         b.insts.iter().any(|(_, i)| {
@@ -1377,6 +1553,8 @@ fn lower_spilled_into(
                 i,
                 Inst::Call { .. }
                     | Inst::CallVirtual { .. }
+                    | Inst::CallInterface { .. }
+                    | Inst::CastClassScan { .. }
                     | Inst::Alloc { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
@@ -1500,6 +1678,55 @@ fn lower_spilled_into(
                 }
                 continue;
             }
+            if let Inst::FieldStore {
+                base,
+                offset,
+                value,
+            } = inst
+            {
+                if let Some(MirType::ValueType { size, .. }) = func.value_type(*value) {
+                    let words = (size / 4) as u16;
+                    let ptr = is_pointer_base(&func.value_types, *base);
+                    if ptr {
+                        enc.ldr_sp(Reg::R1, slot(*base))
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
+                    for w in 0..words {
+                        enc.ldr_sp(Reg::R0, slot(*value) + w * 4)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        if ptr {
+                            enc.str_imm(Reg::R0, Reg::R1, *offset as u16 + w * 4)
+                                .map_err(|_| LowerError::TooManyValues)?;
+                        } else {
+                            enc.str_sp(Reg::R0, slot(*base) + *offset as u16 + w * 4)
+                                .map_err(|_| LowerError::TooManyValues)?;
+                        }
+                    }
+                    continue;
+                }
+            }
+            if let Inst::FieldLoad { base, offset } = inst {
+                if let Some(MirType::ValueType { size, .. }) = func.value_type(*result) {
+                    let words = (size / 4) as u16;
+                    let ptr = is_pointer_base(&func.value_types, *base);
+                    if ptr {
+                        enc.ldr_sp(Reg::R1, slot(*base))
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
+                    for w in 0..words {
+                        if ptr {
+                            enc.ldr_imm(Reg::R0, Reg::R1, *offset as u16 + w * 4)
+                                .map_err(|_| LowerError::TooManyValues)?;
+                        } else {
+                            enc.ldr_sp(Reg::R0, slot(*base) + *offset as u16 + w * 4)
+                                .map_err(|_| LowerError::TooManyValues)?;
+                        }
+                        enc.str_sp(Reg::R0, slot(*result) + w * 4)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
+                    continue;
+                }
+            }
             if let Inst::Call { callee, args } = inst {
                 if matches!(func.value_type(*result), Some(MirType::ValueType { size, .. }) if size > 4)
                 {
@@ -1525,9 +1752,14 @@ fn lower_spilled_into(
                     Some((_, label)) => *label,
                     None => {
                         let label = enc.new_label();
-                        let mut words: Vec<u32> = Vec::with_capacity(2 + ref_offsets.len());
+                        let mut words: Vec<u32> = Vec::with_capacity(3 + ref_offsets.len());
                         words.push(*payload_size);
                         words.push(ref_offsets.len() as u32);
+                        let type_tag = vtables
+                            .iter()
+                            .find(|m| m.handle == *handle)
+                            .map_or(0, |m| m.type_tag);
+                        words.push(type_tag);
                         words.extend_from_slice(ref_offsets);
                         type_descs.push((label, words.into_boxed_slice()));
                         type_desc_labels.push((*handle, label));
@@ -1555,7 +1787,7 @@ fn lower_spilled_into(
                     Some((_, label)) => *label,
                     None => {
                         let label = enc.new_label();
-                        type_descs.push((label, alloc::vec![0u32, 0u32].into_boxed_slice()));
+                        type_descs.push((label, alloc::vec![0u32, 0u32, 0u32].into_boxed_slice()));
                         type_desc_labels.push((*handle, label));
                         label
                     }
@@ -1588,7 +1820,7 @@ fn lower_spilled_into(
                     Some((_, label)) => *label,
                     None => {
                         let label = enc.new_label();
-                        type_descs.push((label, alloc::vec![0u32, 0u32].into_boxed_slice()));
+                        type_descs.push((label, alloc::vec![0u32, 0u32, 0u32].into_boxed_slice()));
                         type_desc_labels.push((*handle, label));
                         label
                     }
@@ -1638,7 +1870,7 @@ fn lower_spilled_into(
                     Some((_, label)) => *label,
                     None => {
                         let label = enc.new_label();
-                        type_descs.push((label, alloc::vec![0u32, 0u32].into_boxed_slice()));
+                        type_descs.push((label, alloc::vec![0u32, 0u32, 0u32].into_boxed_slice()));
                         type_desc_labels.push((*handle, label));
                         label
                     }
@@ -1819,24 +2051,66 @@ fn lower_spilled_into(
             enc.emit_bytes(&bytes);
         }
     }
+    let mut ancestor_i = 0;
+    while ancestor_i < type_desc_labels.len() {
+        let handle = type_desc_labels[ancestor_i].0;
+        if let Some(base) = vtables
+            .iter()
+            .find(|m| m.handle == handle)
+            .and_then(|m| m.base)
+        {
+            if !type_desc_labels.iter().any(|(h, _)| *h == base) {
+                let label = enc.new_label();
+                let type_tag = vtables
+                    .iter()
+                    .find(|m| m.handle == base)
+                    .map_or(0, |m| m.type_tag);
+                type_descs.push((label, alloc::vec![0u32, 0u32, type_tag].into_boxed_slice()));
+                type_desc_labels.push((base, label));
+            }
+        }
+        ancestor_i += 1;
+    }
     for (entry, words) in type_descs {
         enc.align_to_word();
-        if let Some(handle) = type_desc_labels
+        let meta = type_desc_labels
             .iter()
             .find(|(_, label)| *label == entry)
             .map(|(handle, _)| *handle)
-        {
-            if let Some((_, indices)) = vtables.iter().find(|(h, _)| *h == handle) {
-                for &func_index in indices.iter().rev() {
+            .and_then(|handle| vtables.iter().find(|m| m.handle == handle));
+        if let Some(meta) = meta {
+            for &func_index in meta.vtable.iter().rev() {
+                if let Some(&label) = func_labels.get(func_index as usize) {
+                    enc.data_word_diff(entry, label);
+                }
+            }
+        }
+        enc.bind_label(entry);
+        for &word in words.iter().take(3) {
+            enc.emit_word(word);
+        }
+        match meta.and_then(|m| m.base).and_then(|base| {
+            type_desc_labels
+                .iter()
+                .find(|(h, _)| *h == base)
+                .map(|(_, l)| *l)
+        }) {
+            Some(base_label) => enc.data_word_diff(entry, base_label),
+            None => enc.emit_word(0),
+        }
+        for &word in words.iter().skip(3) {
+            enc.emit_word(word);
+        }
+        if let Some(meta) = meta {
+            if !meta.itable.is_empty() {
+                enc.emit_word(meta.itable.len() as u32);
+                for &(tag, func_index) in &meta.itable {
+                    enc.emit_word(tag);
                     if let Some(&label) = func_labels.get(func_index as usize) {
                         enc.data_word_diff(entry, label);
                     }
                 }
             }
-        }
-        enc.bind_label(entry);
-        for &word in words.iter() {
-            enc.emit_word(word);
         }
     }
     Ok(())
@@ -1924,6 +2198,8 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::LoadTypeDesc { .. }
                     | Inst::TypeDescAddr { .. }
                     | Inst::CallVirtual { .. }
+                    | Inst::CallInterface { .. }
+                    | Inst::CastClassScan { .. }
             )
         })
     }) {
@@ -2557,6 +2833,8 @@ pub struct LineTable(pub Vec<(u32, u32)>);
 /// paired with its [`LineTable`], so a native PC maps to a method, then a CIL offset, then source.
 pub type MethodLineTables = Vec<(u32, LineTable)>;
 
+pub use crate::resolver::TypeMeta;
+
 impl LineTable {
     /// The CIL byte offset whose native code contains `offset` -- the last entry at or
     /// before it, or `None` if `offset` precedes all code.
@@ -2705,7 +2983,7 @@ pub fn lower_module_gc(funcs: &[Function], alloc_addr: u32) -> Result<Vec<u8>, L
 pub fn lower_module_gc_vtables(
     funcs: &[Function],
     alloc_addr: u32,
-    vtables: &[(lamella_ir::TypeHandle, Vec<u32>)],
+    vtables: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
     lower_module_inner(funcs, Some(alloc_addr), vtables, &[]).map(|(bytes, _, _)| bytes)
 }
@@ -2736,7 +3014,7 @@ pub fn lower_module_debug(
 fn lower_module_inner(
     funcs: &[Function],
     alloc_addr: Option<u32>,
-    vtables: &[(lamella_ir::TypeHandle, Vec<u32>)],
+    vtables: &[TypeMeta],
     source_maps: &[crate::cil::CilSourceMap],
 ) -> Result<(Vec<u8>, StackMaps, MethodLineTables), LowerError> {
     let original_count = funcs.len();
@@ -4407,13 +4685,41 @@ mod tests {
             }],
         };
         let module = [allocator, method];
+        let tag: u32 = 0xDEAD_BEEF;
+        let iface_tag: u32 = 0x0CAF_E001;
         let plain = lower_module_gc(&module, 0x09).expect("plain module lowers");
-        let with_vtable =
-            lower_module_gc_vtables(&module, 0x09, &[(lamella_ir::TypeHandle(1), vec![1])])
-                .expect("vtable module lowers");
+        let with_meta = lower_module_gc_vtables(
+            &module,
+            0x09,
+            &[TypeMeta {
+                handle: lamella_ir::TypeHandle(1),
+                type_tag: tag,
+                vtable: vec![1],
+                itable: vec![(iface_tag, 1)],
+                base: None,
+            }],
+        )
+        .expect("metadata module lowers");
         assert!(
-            with_vtable.len() > plain.len(),
-            "the vtable word is emitted before the descriptor"
+            with_meta.len() > plain.len(),
+            "the vtable word, the appended type_tag, and the itable grow the image"
+        );
+        let present = |image: &[u8], v: u32| image.windows(4).any(|w| w == v.to_le_bytes());
+        assert!(
+            present(&with_meta, tag),
+            "type_tag emitted into the descriptor"
+        );
+        assert!(
+            present(&with_meta, iface_tag),
+            "itable interface-method tag emitted"
+        );
+        assert!(
+            !present(&plain, tag),
+            "no type_tag without per-type metadata"
+        );
+        assert!(
+            !present(&plain, iface_tag),
+            "no itable without per-type metadata"
         );
     }
 

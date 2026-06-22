@@ -146,7 +146,10 @@ fn check_inst(
                 expect(MirType::I32, r, errors);
             }
         }
-        Inst::Call { args, .. } | Inst::CallVirtual { args, .. } => {
+        Inst::Call { args, .. }
+        | Inst::CallVirtual { args, .. }
+        | Inst::CallInterface { args, .. }
+        | Inst::CastClassScan { args, .. } => {
             for &arg in args {
                 use_value(func, defined, arg, errors);
             }

@@ -171,6 +171,24 @@ pub enum Inst {
         /// The argument values, in order; `args[0]` is the receiver (`this`).
         args: Vec<ValueId>,
     },
+    /// A `callvirt` on an INTERFACE method, dispatched through the receiver's interface table. The
+    /// implementation is found by matching `tag` (the interface-method identity) in the receiver
+    /// type's itable, which the backend lays after the TypeDesc.
+    CallInterface {
+        /// The called interface method's identity tag (`resolver::interface_method_tag`).
+        tag: u32,
+        /// The argument values, in order; `args[0]` is the receiver (`this`).
+        args: Vec<ValueId>,
+    },
+    /// A `castclass` base-pointer chain scan: walks `args[0]` (the object's TypeDesc address) up the
+    /// base_ptr@12 chain looking for `args[1]` (the target type's TypeDesc address). The result is 1 if
+    /// the target is found (the cast holds) or 0 if the chain ends first; the front end feeds it into the
+    /// cast's trap leader (a 0 raises InvalidCastException). Exact -- no FNV-collision risk a tag compare
+    /// would carry, and O(depth) rather than O(subtype count) at the call site.
+    CastClassScan {
+        /// `[object_typedesc, target_typedesc]` -- the scan's start descriptor and the sought ancestor.
+        args: Vec<ValueId>,
+    },
     /// Stores `value` to the 32-bit memory address held in `address` -- the
     /// memory-mapped-I/O write primitive. The write is a side effect; the
     /// instruction's own result value is a placeholder that callers ignore.

@@ -1,7 +1,7 @@
 //! Statement binding (ECMA-334 1st ed, clause 15).
 
 use crate::bind::bind_type;
-use crate::bound::{Binder, BoundExpr, BoundExprKind};
+use crate::bound::{Binder, BoundExpr, BoundExprKind, MethodReference};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
@@ -223,7 +223,11 @@ impl Binder {
                         expr.span,
                     ));
                 }
-                BoundStmtKind::Expression(bound)
+                if self.conditional_call_omitted(&bound) {
+                    BoundStmtKind::Empty
+                } else {
+                    BoundStmtKind::Expression(bound)
+                }
             }
             StmtKind::LocalDeclaration { ty, declarators } => self.bind_local(ty, declarators),
             StmtKind::If {
@@ -276,17 +280,26 @@ impl Binder {
             } => {
                 let collection = self.bind_expression(collection);
                 let element_type = self.resolve_named_type(&bind_type(ty), ty.span);
-                self.enter_scope();
-                self.declare_local(name, element_type.clone());
-                self.enter_loop();
-                let body = Box::new(self.bind_statement(body));
-                self.exit_loop();
-                self.exit_scope();
-                BoundStmtKind::ForEach {
-                    name: name.clone(),
-                    element_type,
-                    collection,
-                    body,
+                let enumerable = if matches!(collection.ty, TypeSymbol::Array { .. }) {
+                    None
+                } else {
+                    self.bind_for_each_enumerable(ty.span, &element_type, name, collection.clone(), body)
+                };
+                if let Some(desugared) = enumerable {
+                    desugared
+                } else {
+                    self.enter_scope();
+                    self.declare_local(name, element_type.clone());
+                    self.enter_loop();
+                    let body = Box::new(self.bind_statement(body));
+                    self.exit_loop();
+                    self.exit_scope();
+                    BoundStmtKind::ForEach {
+                        name: name.clone(),
+                        element_type,
+                        collection,
+                        body,
+                    }
                 }
             }
             StmtKind::Break => {
@@ -482,6 +495,100 @@ impl Binder {
             name: catch.name.clone(),
             body,
         }
+    }
+
+    /// Desugars `foreach (V name in collection)` over a non-array collection into the
+    /// enumerator pattern (15.8.4): a block that declares the enumerator, then
+    /// `while (e.MoveNext())` whose body binds `name = (V)e.Current` ahead of the original
+    /// body. `None` when the collection has no `GetEnumerator` (the array/error path is kept).
+    fn bind_for_each_enumerable(
+        &mut self,
+        span: Span,
+        element_type: &TypeSymbol,
+        name: &str,
+        collection: BoundExpr,
+        body: &Stmt,
+    ) -> Option<BoundStmtKind> {
+        let get_enumerator = self.resolve_instance_method(&collection.ty, "GetEnumerator", span)?;
+        let enumerator_type = get_enumerator.return_type.clone();
+        let ienumerator: TypeSymbol = {
+            let parts: alloc::vec::Vec<Box<str>> =
+                alloc::vec!["System".into(), "Collections".into(), "IEnumerator".into()];
+            TypeSymbol::Named(parts.into_boxed_slice())
+        };
+        let move_next = self.resolve_instance_method(&ienumerator, "MoveNext", span)?;
+        let get_current = self.resolve_instance_method(&ienumerator, "get_Current", span)?;
+
+        let enumerator: Box<str> = format!("<enumerator>{}", span.start).into();
+        let call = |receiver: BoundExpr, method: MethodReference| -> BoundExpr {
+            let return_type = method.return_type.clone();
+            BoundExpr {
+                kind: BoundExprKind::Call {
+                    callee: Box::new(BoundExpr {
+                        kind: BoundExprKind::MethodGroup {
+                            receiver: Box::new(receiver),
+                            name: method.name.clone(),
+                        },
+                        ty: TypeSymbol::Error,
+                    }),
+                    arguments: Vec::new(),
+                    method: Some(method),
+                },
+                ty: return_type,
+            }
+        };
+        let enumerator_ref = || BoundExpr {
+            kind: BoundExprKind::Local(enumerator.clone()),
+            ty: enumerator_type.clone(),
+        };
+
+        let enumerator_decl = BoundStmt {
+            kind: BoundStmtKind::Local {
+                ty: enumerator_type.clone(),
+                declarators: alloc::vec![BoundDeclarator {
+                    name: enumerator.clone(),
+                    initializer: Some(call(collection, get_enumerator)),
+                }],
+            },
+            span,
+        };
+        let condition = call(enumerator_ref(), move_next);
+        let element_value = BoundExpr {
+            kind: BoundExprKind::Cast {
+                operand: Box::new(call(enumerator_ref(), get_current)),
+                checked: false,
+            },
+            ty: element_type.clone(),
+        };
+
+        self.enter_scope();
+        self.declare_local(name, element_type.clone());
+        self.enter_loop();
+        let bound_body = self.bind_statement(body);
+        self.exit_loop();
+        self.exit_scope();
+
+        let element_decl = BoundStmt {
+            kind: BoundStmtKind::Local {
+                ty: element_type.clone(),
+                declarators: alloc::vec![BoundDeclarator {
+                    name: name.into(),
+                    initializer: Some(element_value),
+                }],
+            },
+            span,
+        };
+        let while_stmt = BoundStmt {
+            kind: BoundStmtKind::While {
+                condition,
+                body: Box::new(BoundStmt {
+                    kind: BoundStmtKind::Block(alloc::vec![element_decl, bound_body]),
+                    span,
+                }),
+            },
+            span,
+        };
+        Some(BoundStmtKind::Block(alloc::vec![enumerator_decl, while_stmt]))
     }
 
     fn bind_using(&mut self, resource: &UsingResource, body: &Stmt) -> BoundStmtKind {

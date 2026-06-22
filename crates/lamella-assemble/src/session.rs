@@ -3,7 +3,7 @@
 use crate::EmitError;
 use crate::compile::{Diagnostic, build_bootstrap_delta, build_submission_delta};
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -123,6 +123,7 @@ impl Session {
                 usings: Vec::new(),
                 members: parsed.types.clone(),
                 span: Span::empty_at(0),
+                defined_symbols: BTreeSet::new(),
             };
             diagnostics.extend(
                 bind_compilation_unit_with_model(&types_unit, model.clone())
@@ -203,6 +204,7 @@ impl Session {
                 usings: Vec::new(),
                 members,
                 span: Span::empty_at(0),
+                defined_symbols: BTreeSet::new(),
             };
             collect_into(&mut model, &unit);
             model.link_bases();

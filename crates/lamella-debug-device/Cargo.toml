@@ -21,3 +21,5 @@ lamella-dap = { path = "../lamella-dap", default-features = false }
 lamella-usbhid = { path = "../lamella-usbhid" }
 lamella-aot = { path = "../lamella-aot" }
 lamella-metadata = { path = "../lamella-metadata" }
+# device-dap-server flashes the built image on launch (F5 = deploy + debug).
+lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }

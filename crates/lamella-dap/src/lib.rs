@@ -15,4 +15,4 @@ pub use lamella_debug_backend::{
     DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
 };
 pub use protocol::{Event, Message, Request, Response, read_message, write_message};
-pub use serve::serve;
+pub use serve::{serve, serve_polled};

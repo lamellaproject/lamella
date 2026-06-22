@@ -1,8 +1,10 @@
 // Lamella managed corlib (from scratch). -- System.String
 namespace System
 {
-    public sealed class String : IComparable
+    public sealed class String : IComparable, ICloneable
     {
+        public static readonly string Empty = "";
+
         public int Length { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
         [System.Runtime.CompilerServices.IndexerName("Chars")]
         public char this[int index] { [Lamella.Runtime.RuntimeProvided] get { return '\0'; } }
@@ -12,6 +14,15 @@ namespace System
 
         [Lamella.Runtime.RuntimeProvided] public static string Concat(string a, string b) { return null; }
 
+        public static string Concat(string a, string b, string c)
+        {
+            System.Text.StringBuilder result = new System.Text.StringBuilder();
+            if ((object)a != null) result.Append(a);
+            if ((object)b != null) result.Append(b);
+            if ((object)c != null) result.Append(c);
+            return result.ToString();
+        }
+
         public static string Concat(string a, string b, string c, string d)
         {
             System.Text.StringBuilder result = new System.Text.StringBuilder();
@@ -20,6 +31,27 @@ namespace System
             if ((object)c != null) result.Append(c);
             if ((object)d != null) result.Append(d);
             return result.ToString();
+        }
+
+        private static string ObjectText(object value)
+        {
+            if (value == null) return "";
+            return value.ToString();
+        }
+
+        public static string Concat(object arg0)
+        {
+            return ObjectText(arg0);
+        }
+
+        public static string Concat(object arg0, object arg1)
+        {
+            return Concat(ObjectText(arg0), ObjectText(arg1));
+        }
+
+        public static string Concat(object arg0, object arg1, object arg2)
+        {
+            return Concat(ObjectText(arg0), ObjectText(arg1), ObjectText(arg2));
         }
 
         public static string Concat(string[] values)
@@ -44,6 +76,135 @@ namespace System
                 if (arg != null) result.Append(arg.ToString());
             }
             return result.ToString();
+        }
+
+        public static string Format(string format, object arg0)
+        {
+            return Format(format, new object[] { arg0 });
+        }
+
+        public static string Format(string format, object arg0, object arg1)
+        {
+            return Format(format, new object[] { arg0, arg1 });
+        }
+
+        public static string Format(string format, object arg0, object arg1, object arg2)
+        {
+            return Format(format, new object[] { arg0, arg1, arg2 });
+        }
+
+        public static string Format(string format, object[] args)
+        {
+            if ((object)format == null) throw new ArgumentNullException("format");
+            if ((object)args == null) throw new ArgumentNullException("args");
+            System.Text.StringBuilder result = new System.Text.StringBuilder();
+            int n = format.Length;
+            int pos = 0;
+            while (pos < n)
+            {
+                char c = format[pos];
+                if (c == '}')
+                {
+                    if (pos + 1 < n && format[pos + 1] == '}')
+                    {
+                        result.Append('}');
+                        pos += 2;
+                    }
+                    else
+                    {
+                        throw new FormatException("Input string was not in a correct format.");
+                    }
+                }
+                else if (c == '{')
+                {
+                    if (pos + 1 < n && format[pos + 1] == '{')
+                    {
+                        result.Append('{');
+                        pos += 2;
+                    }
+                    else
+                    {
+                        pos = AppendFormatItem(result, format, pos, args);
+                    }
+                }
+                else
+                {
+                    result.Append(c);
+                    pos++;
+                }
+            }
+            return result.ToString();
+        }
+
+        private static int AppendFormatItem(System.Text.StringBuilder result, string format, int start, object[] args)
+        {
+            int n = format.Length;
+            int pos = start + 1;
+            if (pos >= n || format[pos] < '0' || format[pos] > '9')
+            {
+                throw new FormatException("Input string was not in a correct format.");
+            }
+            int index = 0;
+            while (pos < n && format[pos] >= '0' && format[pos] <= '9')
+            {
+                index = index * 10 + (format[pos] - '0');
+                pos++;
+            }
+            int alignment = 0;
+            if (pos < n && format[pos] == ',')
+            {
+                pos++;
+                bool negative = false;
+                if (pos < n && format[pos] == '-') { negative = true; pos++; }
+                if (pos >= n || format[pos] < '0' || format[pos] > '9')
+                {
+                    throw new FormatException("Input string was not in a correct format.");
+                }
+                int width = 0;
+                while (pos < n && format[pos] >= '0' && format[pos] <= '9')
+                {
+                    width = width * 10 + (format[pos] - '0');
+                    pos++;
+                }
+                alignment = negative ? -width : width;
+            }
+            string itemFormat = null;
+            if (pos < n && format[pos] == ':')
+            {
+                pos++;
+                int specStart = pos;
+                while (pos < n && format[pos] != '}') pos++;
+                itemFormat = format.Substring(specStart, pos - specStart);
+            }
+            if (pos >= n || format[pos] != '}')
+            {
+                throw new FormatException("Input string was not in a correct format.");
+            }
+            pos++;
+            if (index >= args.Length)
+            {
+                throw new FormatException("Index (zero based) must be greater than or equal to zero and less than the size of the argument list.");
+            }
+            object arg = args[index];
+            string text;
+            if (arg == null)
+            {
+                text = "";
+            }
+            else if ((object)itemFormat != null)
+            {
+                IFormattable formattable = arg as IFormattable;
+                if ((object)formattable != null) text = formattable.ToString(itemFormat, null);
+                else text = arg.ToString();
+            }
+            else
+            {
+                text = arg.ToString();
+            }
+            if (alignment > 0) text = text.PadLeft(alignment);
+            else if (alignment < 0) text = text.PadRight(-alignment);
+            result.Append(text);
+            return pos;
         }
 
         public static bool operator ==(string a, string b)
@@ -376,5 +537,7 @@ namespace System
         }
 
         public override string ToString() { return this; }
+
+        public object Clone() { return this; }
     }
 }

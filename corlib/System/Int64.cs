@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.Int64
 namespace System
 {
-    public struct Int64 : IComparable
+    public struct Int64 : IComparable, IFormattable
     {
         public const long MaxValue = 9223372036854775807;
         public const long MinValue = -9223372036854775808;
@@ -52,6 +52,16 @@ namespace System
             if (negative) result.Append('-');
             for (int i = pos; i < buffer.Length; i++) result.Append(buffer[i]);
             return result.ToString();
+        }
+
+        public string ToString(string format)
+        {
+            return NumberFormatter.Format(this, 16, format);
+        }
+
+        public string ToString(string format, IFormatProvider formatProvider)
+        {
+            return NumberFormatter.Format(this, 16, format);
         }
 
         public static long Parse(string s)

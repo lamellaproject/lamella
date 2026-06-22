@@ -78,11 +78,13 @@ impl Liveness {
             let mut live = self.live_out[b].clone();
             each_terminator_use(&block.terminator, |u| set(&mut live, u));
             for (result, inst) in block.insts.iter().rev() {
-                if matches!(inst, Inst::Call { .. } | Inst::CallVirtual { .. })
-                    && live
-                        .iter()
-                        .enumerate()
-                        .any(|(v, &alive)| alive && v != result.index())
+                if matches!(
+                    inst,
+                    Inst::Call { .. } | Inst::CallVirtual { .. } | Inst::CallInterface { .. }
+                ) && live
+                    .iter()
+                    .enumerate()
+                    .any(|(v, &alive)| alive && v != result.index())
                 {
                     return true;
                 }
@@ -155,7 +157,10 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *lhs, ip);
                     mark(&mut lo, &mut hi, &mut defined, *rhs, ip);
                 }
-                Inst::Call { args, .. } | Inst::CallVirtual { args, .. } => {
+                Inst::Call { args, .. }
+                | Inst::CallVirtual { args, .. }
+                | Inst::CallInterface { args, .. }
+                | Inst::CastClassScan { args, .. } => {
                     for arg in args {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
@@ -412,6 +417,7 @@ pub(crate) fn safepoint_roots(
                     inst,
                     Inst::Call { .. }
                         | Inst::CallVirtual { .. }
+                        | Inst::CallInterface { .. }
                         | Inst::Alloc { .. }
                         | Inst::AllocArray { .. }
                 ) {
@@ -470,7 +476,10 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*lhs);
             f(*rhs);
         }
-        Inst::Call { args, .. } | Inst::CallVirtual { args, .. } => {
+        Inst::Call { args, .. }
+        | Inst::CallVirtual { args, .. }
+        | Inst::CallInterface { args, .. }
+        | Inst::CastClassScan { args, .. } => {
             args.iter().for_each(|a| f(*a));
         }
         Inst::Store { address, value } => {

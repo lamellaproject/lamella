@@ -4,6 +4,9 @@
 use crate::adapter::Debugger;
 use crate::protocol::{Message, read_message, write_message};
 use std::io::{self, BufRead, Write};
+use std::sync::mpsc::TryRecvError;
+use std::thread;
+use std::time::Duration;
 
 /// Reads requests from `reader`, dispatches each to `debugger`, and writes the
 /// resulting responses and events to `writer`, until a `disconnect` request or
@@ -33,6 +36,70 @@ pub fn serve<R: BufRead, W: Write>(
             for reply in polled {
                 write_message(writer, &reply)?;
             }
+        }
+        if disconnecting {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Like [`serve`], but polls a free-running ("resume-now") backend concurrently with reading
+/// client requests, so an asynchronous stop -- a breakpoint the device hits while running --
+/// surfaces on its own, without waiting for the next request. A reader thread feeds requests
+/// over a channel; the main loop blocks on it while the target is stopped, but while the
+/// target runs it polls the backend (emitting any stop events) and only takes a request if
+/// one is already waiting (so a pause still interrupts a run, and a breakpoint hit with no
+/// pending request is never missed).
+///
+/// [`serve`] suffices for the synchronous interpreter (which never leaves the target
+/// running); this is for the device backend.
+///
+/// # Errors
+/// Returns an [`io::Error`] if writing a reply fails.
+pub fn serve_polled<R: BufRead + Send + 'static, W: Write>(
+    debugger: &mut Debugger,
+    reader: R,
+    writer: &mut W,
+) -> io::Result<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = reader;
+        while let Ok(Some(message)) = read_message(&mut reader) {
+            if tx.send(message).is_err() {
+                break;
+            }
+        }
+    });
+
+    loop {
+        let message = if debugger.is_running() {
+            match rx.try_recv() {
+                Ok(message) => message,
+                Err(TryRecvError::Empty) => {
+                    for reply in debugger.poll() {
+                        write_message(writer, &reply)?;
+                    }
+                    if debugger.is_running() {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => break,
+            }
+        } else {
+            match rx.recv() {
+                Ok(message) => message,
+                Err(_) => break,
+            }
+        };
+
+        let Message::Request(request) = message else {
+            continue;
+        };
+        let disconnecting = request.command == "disconnect";
+        for reply in debugger.handle(&request) {
+            write_message(writer, &reply)?;
         }
         if disconnecting {
             break;

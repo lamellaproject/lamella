@@ -400,6 +400,7 @@ mod tests {
             is_static: true,
             is_params: false,
             accessibility: crate::symbols::Accessibility::Public,
+            conditional: Vec::new(),
         });
         bcl.insert(console);
 

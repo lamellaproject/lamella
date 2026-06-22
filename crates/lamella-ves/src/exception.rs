@@ -37,6 +37,19 @@ pub fn exception_tag(full_name: &str) -> u32 {
     fnv1a32(FNV_OFFSET_BASIS, full_name.as_bytes()) | TAG_HIGH_BIT
 }
 
+/// Whether `catch_tag` is a UNIVERSAL catch -- `catch (System.Exception)` or
+/// `catch (System.Object)`, each of which catches every in-flight exception regardless of type.
+/// Membership in the thrown vector already yields this WHEN the vector is complete (it ends in
+/// `tag(System.Exception)`, whose base is `tag(System.Object)`); this predicate makes the
+/// universal catch hold even when the thrown type's base chain is INCOMPLETE -- e.g. a program
+/// exception extending `[mscorlib]System.Exception` loaded WITHOUT corlib, whose cross-assembly
+/// base cannot be walked, so its vector is just `[tag(self)]`. The two tags are constant (a pure
+/// function of the well-known full names), so this needs no type info.
+#[must_use]
+pub fn is_universal_catch(catch_tag: u32) -> bool {
+    catch_tag == exception_tag("System.Exception") || catch_tag == exception_tag("System.Object")
+}
+
 /// Whether a `catch` whose type has tag `catch_tag` catches an exception whose base-chain tag
 /// vector is `thrown_chain` (leaf-first, up to and including `System.Exception`). The catch matches
 /// when `catch_tag` is a MEMBER of the vector -- the cold-path scan the compiler specified, which
