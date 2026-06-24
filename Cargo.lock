@@ -69,6 +69,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-cil-runtime"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil",
+ "lamella-token",
+ "libm",
+]
+
+[[package]]
 name = "lamella-cmsis-dap"
 version = "0.0.0"
 dependencies = [
@@ -97,11 +106,11 @@ version = "0.0.0"
 dependencies = [
  "lamella-assemble",
  "lamella-cil",
+ "lamella-cil-runtime",
  "lamella-debug-backend",
  "lamella-load",
  "lamella-metadata",
  "lamella-token",
- "lamella-ves",
  "serde",
  "serde_json",
 ]
@@ -136,9 +145,9 @@ name = "lamella-load"
 version = "0.0.0"
 dependencies = [
  "lamella-cil",
+ "lamella-cil-runtime",
  "lamella-metadata",
  "lamella-token",
- "lamella-ves",
 ]
 
 [[package]]
@@ -158,13 +167,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-py-bytecode"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-py-frontend"
+version = "0.0.0"
+dependencies = [
+ "lamella-aot",
+ "lamella-asm-arm32",
+ "lamella-ir",
+ "lamella-py-bytecode",
+]
+
+[[package]]
+name = "lamella-py-runtime"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-repl"
 version = "0.0.0"
 dependencies = [
  "lamella-assemble",
+ "lamella-cil-runtime",
  "lamella-load",
  "lamella-metadata",
- "lamella-ves",
 ]
 
 [[package]]
@@ -191,26 +218,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "lamella-ves"
-version = "0.0.0"
-dependencies = [
- "lamella-cil",
- "lamella-token",
- "libm",
-]
-
-[[package]]
 name = "lamella-wasm"
 version = "0.0.0"
 dependencies = [
  "lamella-aot",
  "lamella-assemble",
  "lamella-binder",
+ "lamella-cil-runtime",
  "lamella-dap",
  "lamella-load",
  "lamella-metadata",
  "lamella-syntax",
- "lamella-ves",
  "serde_json",
 ]
 

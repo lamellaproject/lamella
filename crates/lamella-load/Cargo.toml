@@ -5,33 +5,33 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Loads an ECMA-335 assembly into a runnable lamella-ves module."
+description = "Loads an ECMA-335 assembly into a runnable lamella-cil-runtime module."
 
 [dependencies]
 lamella-cil = { path = "../lamella-cil" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-token = { path = "../lamella-token" }
-lamella-ves = { path = "../lamella-ves", default-features = false }
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
 
 [features]
-# Mirror lamella-ves's BCL surface tiers + capability knobs, so a minimal loader build
+# Mirror lamella-cil-runtime's BCL surface tiers + capability knobs, so a minimal loader build
 # gates out the same bindings the interpreter does.
 default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental"]
-bcl = ["lamella-ves/bcl"]
-NETMFv4_4 = ["bcl", "lamella-ves/NETMFv4_4"]
-exceptions = ["lamella-ves/exceptions"]
-gc = ["lamella-ves/gc"]
-finalizers = ["gc", "lamella-ves/finalizers"]
-# Floating-point support (Value::Float, float opcodes, float BCL). See lamella-ves.
-float = ["lamella-ves/float"]
-# String storage encoding (default off = UTF-16; on = UTF-8). See lamella-ves.
-string-utf8 = ["lamella-ves/string-utf8"]
-# Typed references (mkrefany / refanyval / refanytype). Off by default. See lamella-ves.
-typed-references = ["lamella-ves/typed-references"]
-# Varargs (the arglist opcode; shell only). Off by default. See lamella-ves.
-varargs = ["typed-references", "lamella-ves/varargs"]
-# The floating-point transcendentals (Math.Sqrt/Sin/Pow/...), via libm. See lamella-ves.
-math-transcendental = ["NETMFv4_4", "float", "lamella-ves/math-transcendental"]
+bcl = ["lamella-cil-runtime/bcl"]
+NETMFv4_4 = ["bcl", "lamella-cil-runtime/NETMFv4_4"]
+exceptions = ["lamella-cil-runtime/exceptions"]
+gc = ["lamella-cil-runtime/gc"]
+finalizers = ["gc", "lamella-cil-runtime/finalizers"]
+# Floating-point support (Value::Float, float opcodes, float BCL). See lamella-cil-runtime.
+float = ["lamella-cil-runtime/float"]
+# String storage encoding (default off = UTF-16; on = UTF-8). See lamella-cil-runtime.
+string-utf8 = ["lamella-cil-runtime/string-utf8"]
+# Typed references (mkrefany / refanyval / refanytype). Off by default. See lamella-cil-runtime.
+typed-references = ["lamella-cil-runtime/typed-references"]
+# Varargs (the arglist opcode; shell only). Off by default. See lamella-cil-runtime.
+varargs = ["typed-references", "lamella-cil-runtime/varargs"]
+# The floating-point transcendentals (Math.Sqrt/Sin/Pow/...), via libm. See lamella-cil-runtime.
+math-transcendental = ["NETMFv4_4", "float", "lamella-cil-runtime/math-transcendental"]
 
 [lints]
 workspace = true

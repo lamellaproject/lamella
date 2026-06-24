@@ -292,7 +292,7 @@ impl Heap {
     /// the survivor's new address. Stop-the-world, non-generational, no finalizers.
     ///
     /// `enumerate_roots` mirrors the interpreter's collector signature
-    /// (`lamella_ves::object::Heap::collect`): it visits each root slot mutably and
+    /// (`lamella_cil_runtime::object::Heap::collect`): it visits each root slot mutably and
     /// is called **twice** -- once to seed the mark, once to relocate. The caller
     /// exposes whatever holds roots (frames decoded via a stack map, statics, ...);
     /// see [`Heap::collect_frame`] for the single-frame stack-map driver.

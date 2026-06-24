@@ -7,7 +7,7 @@ license.workspace = true
 authors.workspace = true
 description = "The shared garbage-collection contract: root reporting, the trace and allocator seams."
 
-# A leaf: the GC contract both the interpreter (lamella-ves) and the AOT backend
+# A leaf: the GC contract both the interpreter (lamella-cil-runtime) and the AOT backend
 # (lamella-aot) implement against. No dependencies -- it only defines the shapes.
 [dependencies]
 

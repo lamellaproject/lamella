@@ -1,5 +1,5 @@
 [package]
-name = "lamella-ves"
+name = "lamella-cil-runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

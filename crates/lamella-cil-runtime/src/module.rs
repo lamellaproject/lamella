@@ -62,6 +62,40 @@ pub struct LoadedAttribute {
     pub named_fields: Vec<(u32, AttrValue)>,
 }
 
+/// Reflection metadata for a type, keyed by its asm-folded handle (the `System.Type` a `typeof`
+/// or `GetType` yields). The `System.Type` introspection members (`Namespace`, `FullName`, the
+/// `Is*` kind predicates) read it. Recorded at load for every type in each loaded assembly: the
+/// names come from metadata, the kind bits are derived from the type's `flags` and base class.
+#[derive(Clone, Default)]
+pub struct ReflectType {
+    /// The type's namespace (`""` for the global namespace; `Type.Namespace` renders that null).
+    pub namespace: String,
+    /// The type's full name (`namespace.name`, or the bare `name` in the global namespace).
+    pub full_name: String,
+    /// `Type.IsEnum`: the type extends `System.Enum`.
+    pub is_enum: bool,
+    /// `Type.IsValueType`: the type extends `System.ValueType` or `System.Enum`.
+    pub is_value_type: bool,
+    /// `Type.IsInterface`: the type is an interface.
+    pub is_interface: bool,
+    /// `Type.IsAbstract`: the type is abstract.
+    pub is_abstract: bool,
+    /// `Type.IsPublic`: the type has public visibility.
+    pub is_public: bool,
+}
+
+/// One field of a type, for `Type.GetFields` enumeration: the field's asm-folded handle plus the
+/// visibility / static bits `BindingFlags` filters on.
+#[derive(Clone, Copy)]
+pub struct ReflectField {
+    /// The field's asm-folded `Field` token (the `FieldInfo` handle).
+    pub handle: u64,
+    /// Whether the field is static (`FieldAttributes.Static`).
+    pub is_static: bool,
+    /// Whether the field is public (`FieldAttributes` access == `Public`).
+    pub is_public: bool,
+}
+
 /// A declared reference type's runtime shape: the zero value of each instance field
 /// (one per declaration-order slot, copied when allocating an instance) and its
 /// virtual method table.
@@ -303,6 +337,16 @@ pub struct Module {
     type_fields_by_name: BTreeMap<(u64, String), u64>,
     type_methods_by_name: BTreeMap<(u64, String), u64>,
     type_properties_by_name: BTreeMap<(u64, String), u64>,
+    /// Reflection introspection metadata per type (the `System.Type` `Namespace`/`FullName`/`Is*`
+    /// surface), keyed by the type's asm-folded handle. Empty on a Kernel-only build (the loader
+    /// records it only under the `NETMFv4_4` reflection tier).
+    reflect_types: BTreeMap<u64, ReflectType>,
+    /// Each type's fields in declaration order (the `Type.GetFields` enumeration), keyed by the
+    /// type's asm-folded handle. Recorded only under the `NETMFv4_4` reflection tier.
+    type_fields: BTreeMap<u64, Vec<ReflectField>>,
+    /// Each type's parameterless instance `.ctor` (what `Activator.CreateInstance(Type)` runs),
+    /// keyed by the type's asm-folded handle. Recorded only under the `NETMFv4_4` reflection tier.
+    type_ctors: BTreeMap<u64, MethodId>,
 }
 
 /// Folds the assembly id into a token key: the assembly in the HIGH 32 bits, the metadata token
@@ -412,6 +456,13 @@ impl Module {
         self.by_token.get(&asm_key(asm, token.0)).copied()
     }
 
+    /// The method whose asm-folded handle is `handle` (the `MethodInfo` handle reflection carries
+    /// -- a `MethodDef` token folded with its assembly), if bound.
+    #[must_use]
+    pub fn resolve_by_handle(&self, handle: u64) -> Option<MethodId> {
+        self.by_token.get(&handle).copied()
+    }
+
     /// The string an `ldstr` token in assembly `asm` loads, if any.
     #[must_use]
     pub fn resolve_string(&self, asm: u8, token: Token) -> Option<&[u16]> {
@@ -502,6 +553,20 @@ impl Module {
     #[must_use]
     pub fn field_slot(&self, asm: u8, token: Token) -> Option<u32> {
         self.field_slots.get(&asm_key(asm, token.0)).copied()
+    }
+
+    /// The instance-field slot of the field whose asm-folded handle is `handle` (a `FieldInfo`
+    /// handle that reflection carries), if it names an instance field.
+    #[must_use]
+    pub fn field_slot_by_handle(&self, handle: u64) -> Option<u32> {
+        self.field_slots.get(&handle).copied()
+    }
+
+    /// The static storage slot of the field whose asm-folded handle is `handle` (a `FieldInfo`
+    /// handle), if it names a static field.
+    #[must_use]
+    pub fn static_field_slot_by_handle(&self, handle: u64) -> Option<usize> {
+        self.static_fields.get(&handle).copied()
     }
 
     /// The zero values of `type_id`'s instance fields, for allocating an instance.
@@ -1295,6 +1360,45 @@ impl Module {
         self.type_properties_by_name
             .get(&(type_handle, name.to_string()))
             .copied()
+    }
+
+    /// Records the reflection introspection metadata for the type whose asm-folded handle is
+    /// `handle` -- the `System.Type` `Namespace`/`FullName`/`Is*` surface.
+    pub fn bind_reflect_type(&mut self, handle: u64, info: ReflectType) {
+        self.reflect_types.insert(handle, info);
+    }
+
+    /// The reflection introspection metadata recorded for the type whose asm-folded handle is
+    /// `handle`, or `None` if the handle names no recorded type.
+    #[must_use]
+    pub fn reflect_type(&self, handle: u64) -> Option<&ReflectType> {
+        self.reflect_types.get(&handle)
+    }
+
+    /// Records the field list (for `Type.GetFields`) of the type whose asm-folded handle is
+    /// `type_handle`, in declaration order.
+    pub fn bind_type_fields(&mut self, type_handle: u64, fields: Vec<ReflectField>) {
+        self.type_fields.insert(type_handle, fields);
+    }
+
+    /// The fields (declaration order) of the type whose asm-folded handle is `type_handle`, for
+    /// `Type.GetFields` enumeration; empty if none recorded.
+    #[must_use]
+    pub fn type_fields(&self, type_handle: u64) -> &[ReflectField] {
+        self.type_fields.get(&type_handle).map_or(&[], Vec::as_slice)
+    }
+
+    /// Records the parameterless instance constructor of the type whose asm-folded handle is
+    /// `type_handle` (what `Activator.CreateInstance(Type)` runs).
+    pub fn bind_type_ctor(&mut self, type_handle: u64, ctor: MethodId) {
+        self.type_ctors.insert(type_handle, ctor);
+    }
+
+    /// The parameterless instance constructor recorded for the type whose asm-folded handle is
+    /// `type_handle`, or `None`.
+    #[must_use]
+    pub fn type_ctor(&self, type_handle: u64) -> Option<MethodId> {
+        self.type_ctors.get(&type_handle).copied()
     }
 
     /// Records `type_id`'s FULL name (`namespace.name`, or the bare `name` in the global

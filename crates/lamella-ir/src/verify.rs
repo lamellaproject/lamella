@@ -154,6 +154,14 @@ fn check_inst(
                 use_value(func, defined, arg, errors);
             }
         }
+        Inst::PyIntrinsic { op, args, .. } => {
+            for &arg in args {
+                use_value(func, defined, arg, errors);
+            }
+            if let (Some(expected), Some(r)) = (op.result_type(), result_ty) {
+                expect(expected, r, errors);
+            }
+        }
         Inst::Store { address, value } => {
             use_value(func, defined, *address, errors);
             use_value(func, defined, *value, errors);
@@ -445,6 +453,37 @@ mod tests {
     #[test]
     fn well_formed_add_verifies() {
         assert_eq!(verify(&add_function()), Ok(()));
+    }
+
+    #[test]
+    fn py_intrinsic_getattr_yields_a_py_value() {
+        let mut f = Function {
+            params: vec![MirType::PyValue, MirType::PyValue],
+            ret: Some(MirType::PyValue),
+            value_types: vec![MirType::PyValue, MirType::PyValue, MirType::PyValue],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1)],
+                insts: vec![(
+                    ValueId(2),
+                    Inst::PyIntrinsic {
+                        op: crate::inst::PyOp::Getattr,
+                        args: vec![ValueId(0), ValueId(1)],
+                        cache: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert_eq!(verify(&f), Ok(()));
+        f.value_types[2] = MirType::I32;
+        f.ret = Some(MirType::I32);
+        assert!(
+            verify(&f)
+                .unwrap_err()
+                .iter()
+                .any(|e| matches!(e, VerifyError::TypeMismatch { .. }))
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! The interpreter debug backend: drives a [`lamella_ves::Session`] behind the
+//! The interpreter debug backend: drives a [`lamella_cil_runtime::Session`] behind the
 //! [`DebugBackend`] seam, so the adapter debugs interpreted code through the same
 //! interface an on-device target uses.
 
@@ -8,7 +8,7 @@ use lamella_debug_backend::{
 };
 use lamella_metadata::PortablePdb;
 use lamella_token::Token;
-use lamella_ves::{Method, MethodId, Module, Session, Status, Value, Vm};
+use lamella_cil_runtime::{Method, MethodId, Module, Session, Status, Value, Vm};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The `MethodDef` metadata table tag, for rebuilding a method token to map a PDB

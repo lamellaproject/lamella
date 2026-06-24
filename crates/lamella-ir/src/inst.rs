@@ -103,6 +103,122 @@ impl ConvKind {
     }
 }
 
+/// A Python binary operator for [`PyOp::Binop`] -- the abstract `PyNumber_*` operations.
+/// The runtime-support entry resolves the operand types, reflected forms (`__radd__`), and
+/// in-place variants; the operator selects which protocol slot it consults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PyBinOp {
+    /// `+` (`__add__`).
+    Add,
+    /// `-` (`__sub__`).
+    Sub,
+    /// `*` (`__mul__`).
+    Mul,
+    /// `/` (`__truediv__`).
+    TrueDiv,
+    /// `//` (`__floordiv__`).
+    FloorDiv,
+    /// `%` (`__mod__`).
+    Mod,
+    /// `**` (`__pow__`).
+    Pow,
+    /// `<<` (`__lshift__`).
+    LShift,
+    /// `>>` (`__rshift__`).
+    RShift,
+    /// `&` (`__and__`).
+    And,
+    /// `|` (`__or__`).
+    Or,
+    /// `^` (`__xor__`).
+    Xor,
+    /// `@` (`__matmul__`, PEP 465).
+    MatMul,
+}
+
+/// A Python rich-comparison or identity operator for [`PyOp::Compare`]. The result reduces a
+/// Python bool to a branchable `int32` 0 or 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PyCmpOp {
+    /// `<` (`__lt__`).
+    Lt,
+    /// `<=` (`__le__`).
+    Le,
+    /// `==` (`__eq__`).
+    Eq,
+    /// `!=` (`__ne__`).
+    Ne,
+    /// `>` (`__gt__`).
+    Gt,
+    /// `>=` (`__ge__`).
+    Ge,
+    /// `is` -- object identity.
+    Is,
+    /// `is not` -- object non-identity.
+    IsNot,
+}
+
+/// A dynamic-object operation for [`Inst::PyIntrinsic`] -- one entry of Python's abstract
+/// object protocol (CPython's `PyObject_*`/`PyNumber_*`/`tp_*` layer). Each names a single
+/// Python runtime-support entry point the backend calls. The set grows with the protocol;
+/// see `docs/python-mir-seams.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PyOp {
+    /// Attribute load `obj.name` -- `args = [obj, name]`, the name an interned-string `PyValue`.
+    Getattr,
+    /// Attribute store `obj.name = value` -- `args = [obj, name, value]`. Side-effecting.
+    Setattr,
+    /// A binary operator `a <op> b` -- `args = [a, b]`, the operator in the payload.
+    Binop(PyBinOp),
+    /// A call `f(*args)` -- `args[0]` is the callable, `args[1..]` the positional arguments.
+    Call,
+    /// Subscript load `obj[key]` -- `args = [obj, key]`.
+    Getitem,
+    /// Subscript store `obj[key] = value` -- `args = [obj, key, value]`. Side-effecting.
+    Setitem,
+    /// `iter(obj)` -- get an iterator. `args = [obj]`.
+    Iter,
+    /// `next(it)` -- advance an iterator. `args = [it]`.
+    Next,
+    /// `len(obj)` -- the result is an `int32` length. `args = [obj]`.
+    Len,
+    /// Truthiness `bool(obj)` for a condition -- the result is an `int32` 0 or 1. `args = [obj]`.
+    Truthy,
+    /// A rich comparison `a <cmp> b` -- the result is an `int32` 0 or 1. `args = [a, b]`.
+    Compare(PyCmpOp),
+    /// Membership `x in obj` -- the result is an `int32` 0 or 1. `args = [x, obj]`.
+    Contains,
+    /// `__enter__` of a `with` context manager -- `args = [obj]`.
+    Enter,
+    /// `__exit__` of a `with` context manager -- `args = [obj, exc_type, exc_value, traceback]`.
+    /// Side-effecting (its bool result governs exception suppression in the runtime, not the slot).
+    Exit,
+    /// Module import `import name` -- `args = [name]`, the name an interned-string `PyValue`.
+    Import,
+}
+
+impl PyOp {
+    /// The [`MirType`] this operation's result must have, or `None` when the operation is
+    /// side-effecting and its result is an ignored placeholder (like [`Inst::Store`]). The
+    /// scalar-result ops (`Len`/`Truthy`/`Compare`/`Contains`) yield `int32`; the rest yield a
+    /// `PyValue`.
+    #[must_use]
+    pub fn result_type(self) -> Option<MirType> {
+        match self {
+            PyOp::Len | PyOp::Truthy | PyOp::Compare(_) | PyOp::Contains => Some(MirType::I32),
+            PyOp::Setattr | PyOp::Setitem | PyOp::Exit => None,
+            PyOp::Getattr
+            | PyOp::Binop(_)
+            | PyOp::Call
+            | PyOp::Getitem
+            | PyOp::Iter
+            | PyOp::Next
+            | PyOp::Enter
+            | PyOp::Import => Some(MirType::PyValue),
+        }
+    }
+}
+
 /// One MIR instruction: an operation defining a single typed result value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Inst {
@@ -188,6 +304,22 @@ pub enum Inst {
     CastClassScan {
         /// `[object_typedesc, target_typedesc]` -- the scan's start descriptor and the sought ancestor.
         args: Vec<ValueId>,
+    },
+    /// A dynamic-object operation from Python's abstract object protocol -- the `op`-selected
+    /// operation over `args` (receiver-first). Lowers to a call into the Python runtime-support
+    /// library at a backend-threaded entry point (the [`Inst::Alloc`]/`lamella_gc_alloc` pattern),
+    /// so it is a SAFEPOINT: the support entry may run arbitrary Python that allocates and collects.
+    /// `cache` is the inline-cache site id (0 = no cache); the backend reserves a RAM cache slot per
+    /// nonzero id and passes its address to the entry. The result type is `op.result_type()` (a
+    /// `PyValue`, a scalar `int32`, or an ignored placeholder for a side-effecting op). Added for the
+    /// Python frontend; the C# lowering never emits one. See `docs/python-mir-seams.md`.
+    PyIntrinsic {
+        /// Which abstract-object operation this performs.
+        op: PyOp,
+        /// The operand values, receiver-first, with op-specific arity.
+        args: Vec<ValueId>,
+        /// The inline-cache site id, or 0 for no cache.
+        cache: u32,
     },
     /// Stores `value` to the 32-bit memory address held in `address` -- the
     /// memory-mapped-I/O write primitive. The write is a side effect; the

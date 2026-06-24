@@ -208,6 +208,25 @@ impl Encoder {
     pub fn mul(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
         self.r_type(1, rs2, rs1, 0, rd, 0x33);
     }
+    /// `div rd, rs1, rs2` (the `M` extension's signed division, truncating toward zero). RV32M
+    /// semantics: division by zero yields all-ones (-1) and the MIN/-1 overflow yields MIN, neither
+    /// traps -- a checked-context exception is a separate follow-up (as on ARM).
+    pub fn div(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.r_type(1, rs2, rs1, 4, rd, 0x33);
+    }
+    /// `divu rd, rs1, rs2` (the `M` extension's unsigned division). Division by zero yields all-ones.
+    pub fn divu(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.r_type(1, rs2, rs1, 5, rd, 0x33);
+    }
+    /// `rem rd, rs1, rs2` (the `M` extension's signed remainder, with the sign of the dividend).
+    /// Remainder by zero yields the dividend.
+    pub fn rem(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.r_type(1, rs2, rs1, 6, rd, 0x33);
+    }
+    /// `remu rd, rs1, rs2` (the `M` extension's unsigned remainder). Remainder by zero yields the dividend.
+    pub fn remu(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.r_type(1, rs2, rs1, 7, rd, 0x33);
+    }
 
 
     /// `addi rd, rs1, imm` (12-bit signed immediate).
@@ -386,5 +405,19 @@ mod tests {
         enc.branch(BranchCond::Ne, Reg::T0, Reg::ZERO, top);
         let bytes = enc.finish().unwrap().bytes;
         assert_eq!(bytes.len(), 8);
+    }
+
+    #[test]
+    fn encodes_the_m_extension_division() {
+        let mut enc = Encoder::new();
+        enc.div(Reg::A0, Reg::T0, Reg::T1);
+        enc.divu(Reg::A0, Reg::T0, Reg::T1);
+        enc.rem(Reg::A0, Reg::T0, Reg::T1);
+        enc.remu(Reg::A0, Reg::T0, Reg::T1);
+        let bytes = enc.finish().unwrap().bytes;
+        assert_eq!(&bytes[0..4], &0x0262_c533u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0x0262_d533u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &0x0262_e533u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &0x0262_f533u32.to_le_bytes());
     }
 }

@@ -160,7 +160,8 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::Call { args, .. }
                 | Inst::CallVirtual { args, .. }
                 | Inst::CallInterface { args, .. }
-                | Inst::CastClassScan { args, .. } => {
+                | Inst::CastClassScan { args, .. }
+                | Inst::PyIntrinsic { args, .. } => {
                     for arg in args {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
@@ -394,8 +395,10 @@ pub fn allocate(intervals: &[Interval], reg_count: usize) -> Allocation {
 }
 
 /// For each block, a per-instruction entry: `Some(roots)` when the instruction is a GC
-/// safepoint (a call or an allocation), listing the `ObjectRef` values live across it -- the
-/// roots a relocating collector must find and update at that return address. A value's own
+/// safepoint (a call, an allocation, or a Python intrinsic), listing the `ObjectRef` and
+/// `PyValue` roots live across it -- the roots a relocating collector must find and update at
+/// that return address (a `PyValue` is decoded by tag, so it is recorded but traced only when it
+/// holds a heap pointer). A value's own
 /// result is excluded: at the return it is in the result register, not yet a frame slot, and
 /// it was not a pre-existing root during any collection inside the call. Every call is treated
 /// as a safepoint (conservatively may-allocate), so the stack walk finds caller-frame roots.
@@ -404,7 +407,12 @@ pub(crate) fn safepoint_roots(
     value_types: &[MirType],
 ) -> Vec<Vec<Option<Vec<ValueId>>>> {
     let live = Liveness::analyze(func);
-    let is_ref = |v: usize| matches!(value_types.get(v), Some(MirType::ObjectRef));
+    let is_root = |v: usize| {
+        matches!(
+            value_types.get(v),
+            Some(MirType::ObjectRef | MirType::PyValue)
+        )
+    };
     func.blocks
         .iter()
         .enumerate()
@@ -420,11 +428,12 @@ pub(crate) fn safepoint_roots(
                         | Inst::CallInterface { .. }
                         | Inst::Alloc { .. }
                         | Inst::AllocArray { .. }
+                        | Inst::PyIntrinsic { .. }
                 ) {
                     let roots = alive
                         .iter()
                         .enumerate()
-                        .filter(|&(v, &a)| a && v != result.index() && is_ref(v))
+                        .filter(|&(v, &a)| a && v != result.index() && is_root(v))
                         .map(|(v, _)| ValueId(v as u32))
                         .collect();
                     per_inst[i] = Some(roots);
@@ -479,7 +488,8 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::Call { args, .. }
         | Inst::CallVirtual { args, .. }
         | Inst::CallInterface { args, .. }
-        | Inst::CastClassScan { args, .. } => {
+        | Inst::CastClassScan { args, .. }
+        | Inst::PyIntrinsic { args, .. } => {
             args.iter().for_each(|a| f(*a));
         }
         Inst::Store { address, value } => {

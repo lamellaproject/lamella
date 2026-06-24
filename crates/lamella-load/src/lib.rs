@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-//! Loads an ECMA-335 assembly into a runnable [`lamella_ves`] module.
+//! Loads an ECMA-335 assembly into a runnable [`lamella_cil_runtime`] module.
 
 extern crate alloc;
 
@@ -16,7 +16,7 @@ use lamella_metadata::{
     decode_custom_attribute, exception_tag_for_name,
 };
 use lamella_token::Token;
-use lamella_ves::intrinsics::{
+use lamella_cil_runtime::intrinsics::{
     array_clone, array_empty, array_get_value, array_set_value, boolean_to_string,
     buffer_block_copy, buffer_byte_length, char_to_string, console_write,
     decimal_add, decimal_compare, decimal_divide, decimal_multiply, decimal_remainder,
@@ -38,14 +38,15 @@ use lamella_ves::intrinsics::{
     type_get_method, type_get_name, type_get_property,
 };
 #[cfg(feature = "gc")]
-use lamella_ves::intrinsics::gc_collect;
+use lamella_cil_runtime::intrinsics::gc_collect;
 #[cfg(feature = "finalizers")]
-use lamella_ves::intrinsics::{
+use lamella_cil_runtime::intrinsics::{
     reregister_finalize, suppress_finalize, wait_for_pending_finalizers,
 };
 #[cfg(feature = "NETMFv4_4")]
-use lamella_ves::intrinsics::{
+use lamella_cil_runtime::intrinsics::{
     boolean_parse, char_is_digit, char_is_letter, char_is_letter_or_digit, char_is_lower,
+    activator_create_instance, field_get_value, field_set_value, method_invoke,
     char_is_upper, char_is_white_space, char_to_lower, char_to_upper, collection_contains,
     collection_push, convert_to_boolean_int, convert_to_byte_int, convert_to_char_int, int32_parse,
     int64_parse, list_add, list_clear, list_get_count, list_get_item, list_insert, list_remove_at,
@@ -60,10 +61,13 @@ use lamella_ves::intrinsics::{
     string_index_of_char, string_index_of_string, string_insert, string_join,
     string_last_index_of_char, string_pad_left, string_pad_right, string_remove,
     string_replace_char, string_replace_string, string_split_char, string_starts_with,
-    string_to_char_array, string_to_lower, string_to_upper, string_trim,
+    string_to_char_array, string_to_lower, string_to_upper, string_trim, type_get_assembly,
+    type_get_fields, type_get_full_name, type_get_namespace, type_is_abstract, type_is_array,
+    type_is_class,
+    type_is_enum, type_is_interface, type_is_not_public, type_is_public, type_is_value_type,
 };
 #[cfg(feature = "float")]
-use lamella_ves::intrinsics::{
+use lamella_cil_runtime::intrinsics::{
     console_write_double, console_write_line_double, console_write_line_single, console_write_single,
     convert_to_int32_double, decimal_from_double, decimal_to_double, double_to_fixed,
     double_to_string, math_abs_f64, math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64,
@@ -71,17 +75,19 @@ use lamella_ves::intrinsics::{
     single_to_string,
 };
 #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-use lamella_ves::intrinsics::{
+use lamella_cil_runtime::intrinsics::{
     bitconverter_double_to_int64_bits, bitconverter_int32_bits_to_single,
     bitconverter_int64_bits_to_double, bitconverter_single_to_int32_bits,
 };
 #[cfg(feature = "math-transcendental")]
-use lamella_ves::intrinsics::{
+use lamella_cil_runtime::intrinsics::{
     math_cos_f64, math_exp_f64, math_log_f64, math_log10_f64, math_pow_f64, math_sin_f64,
     math_sqrt_f64, math_tan_f64,
 };
-use lamella_ves::module::{AttrValue, LoadedAttribute, asm_key};
-use lamella_ves::{IntrinsicFn, MethodId, Module, TypeId, Value};
+use lamella_cil_runtime::module::{AttrValue, LoadedAttribute, asm_key};
+#[cfg(feature = "NETMFv4_4")]
+use lamella_cil_runtime::module::{ReflectField, ReflectType};
+use lamella_cil_runtime::{IntrinsicFn, MethodId, Module, TypeId, Value};
 
 const TYPE_REF: u8 = 0x01;
 const TYPE_DEF: u8 = 0x02;
@@ -1324,6 +1330,21 @@ fn bcl_intrinsic(
             _ => None,
         };
     }
+    #[cfg(feature = "NETMFv4_4")]
+    if namespace == "System.Reflection" && type_name == "FieldInfo" {
+        match (method, parameters_of(signature)) {
+            ("GetValue", [SigType::Object]) => return Some(field_get_value),
+            ("SetValue", [SigType::Object, SigType::Object]) => return Some(field_set_value),
+            _ => {}
+        }
+    }
+    #[cfg(feature = "NETMFv4_4")]
+    if namespace == "System.Reflection"
+        && (type_name == "MethodBase" || type_name == "MethodInfo")
+        && method == "Invoke"
+    {
+        return Some(method_invoke);
+    }
     if namespace == "System.Diagnostics"
         && type_name == "DefaultTraceListener"
         && method == "DebugWrite"
@@ -1368,16 +1389,45 @@ fn bcl_intrinsic(
         ("GC", "WaitForPendingFinalizers") => Some(wait_for_pending_finalizers),
         ("Type", "GetTypeFromHandle") => Some(type_from_handle),
         ("Type", "get_Name") => Some(type_get_name),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_FullName") => Some(type_get_full_name),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_Namespace") => Some(type_get_namespace),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_Assembly") => Some(type_get_assembly),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_IsEnum") => Some(type_is_enum),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_IsValueType") => Some(type_is_value_type),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_IsClass") => Some(type_is_class),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_IsInterface") => Some(type_is_interface),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_IsAbstract") => Some(type_is_abstract),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_IsPublic") => Some(type_is_public),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_IsNotPublic") => Some(type_is_not_public),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_IsArray") => Some(type_is_array),
         ("Type", "GetField") => match parameters_of(signature) {
             [SigType::String] => Some(type_get_field),
             _ => None,
         },
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "GetFields") => Some(type_get_fields),
         ("Type", "GetMethod") => match parameters_of(signature) {
             [SigType::String] => Some(type_get_method),
             _ => None,
         },
         ("Type", "GetProperty") => match parameters_of(signature) {
             [SigType::String] => Some(type_get_property),
+            _ => None,
+        },
+        #[cfg(feature = "NETMFv4_4")]
+        ("Activator", "CreateInstance") => match parameters_of(signature) {
+            [_] => Some(activator_create_instance),
             _ => None,
         },
         ("Enum", "Parse") => Some(enum_parse),
@@ -1720,19 +1770,62 @@ fn record_custom_attributes(assembly: &Assembly, module: &mut Module, asm: u8) {
         let type_token = Token::new(TYPE_DEF, (local_index + 1) as u32);
         let type_handle = asm_key(asm, type_token.0);
         record_target_attributes(assembly, module, asm, type_handle, type_token);
+        #[cfg(feature = "NETMFv4_4")]
+        if let Some(type_name) = type_def.name() {
+            let full_name = if type_name.namespace.is_empty() {
+                String::from(type_name.name)
+            } else {
+                alloc::format!("{}.{}", type_name.namespace, type_name.name)
+            };
+            let is_enum = assembly
+                .type_token_name(type_def.extends())
+                .is_some_and(|base| base.namespace == "System" && base.name == "Enum");
+            module.bind_reflect_type(
+                type_handle,
+                ReflectType {
+                    namespace: String::from(type_name.namespace),
+                    full_name,
+                    is_enum,
+                    is_value_type: type_def.is_value_type(),
+                    is_interface: type_def.is_interface(),
+                    is_abstract: type_def.is_abstract(),
+                    is_public: type_def.is_public(),
+                },
+            );
+        }
+        #[cfg(feature = "NETMFv4_4")]
+        let mut reflect_fields = Vec::new();
         for field in type_def.fields() {
             if let Some(name) = field.name() {
                 let handle = asm_key(asm, field.token().0);
                 module.bind_type_field_name(type_handle, name, handle);
                 record_target_attributes(assembly, module, asm, handle, field.token());
+                #[cfg(feature = "NETMFv4_4")]
+                {
+                    module.bind_type_name(asm, field.token(), String::from(name));
+                    let field_flags = field.flags();
+                    reflect_fields.push(ReflectField {
+                        handle,
+                        is_static: field_flags & 0x0010 != 0,
+                        is_public: field_flags & 0x0007 == 0x0006,
+                    });
+                }
             }
         }
+        #[cfg(feature = "NETMFv4_4")]
+        module.bind_type_fields(type_handle, reflect_fields);
         for method in type_def.methods() {
             if let Some(name) = method.name() {
                 let token = Token::new(METHOD_DEF, method.rid());
                 let handle = asm_key(asm, token.0);
                 module.bind_type_method_name(type_handle, name, handle);
                 record_target_attributes(assembly, module, asm, handle, token);
+                #[cfg(feature = "NETMFv4_4")]
+                if name == ".ctor" && parameters_of(method.signature().as_ref()).is_empty() {
+                    if let Some(ctor) = module.resolve_by_handle(handle) {
+                        module.bind_type_ctor(type_handle, ctor);
+                    }
+                }
             }
         }
         for property in type_def.properties() {

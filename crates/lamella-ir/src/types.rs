@@ -8,7 +8,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeHandle(pub u32);
 
-/// The type of a MIR value: one of the CLI's stack types (ECMA-335 III.1.1).
+/// The type of a MIR value: one of the CLI's stack types (ECMA-335 III.1.1), plus
+/// the Python frontend's tagged [`MirType::PyValue`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MirType {
     /// A 32-bit integer (`int32`). Signedness is not part of the stack type; it
@@ -28,6 +29,16 @@ pub enum MirType {
     /// A managed pointer (`&`): a possibly-interior pointer into managed memory,
     /// also reported to the collector and kept distinct from an unmanaged pointer.
     ManagedPtr,
+    /// A Python tagged value (`PyValue`): one target word that is either a small
+    /// immediate (a fixnum, `None`/`True`/`False`, ...) or a tagged pointer to a heap
+    /// object, distinguished by tag bits. Added for the Python frontend; the C#
+    /// lowering never produces one. It is a garbage-collector ROOT, but a CONDITIONAL
+    /// one -- the collector decodes the tag at a safepoint and traces the slot only
+    /// when it holds a heap pointer (see [`MirType::is_tagged_value`] and the
+    /// scan-by-tag stack map). The exact bit layout is the frontend's and the
+    /// runtime's contract (`docs/python-mir-seams.md`); the IR treats it as one
+    /// opaque word.
+    PyValue,
     /// A value-type instance: a `size`-byte struct laid out inline, identified by its
     /// layout [`TypeHandle`]. The size is carried for stack-slot allocation; field
     /// offsets and which fields hold `O`/`&` come from the handle's metadata layout.
@@ -47,6 +58,15 @@ impl MirType {
     #[must_use]
     pub fn is_gc_reference(self) -> bool {
         matches!(self, MirType::ObjectRef | MirType::ManagedPtr)
+    }
+
+    /// Whether this is a Python tagged value -- a CONDITIONAL garbage-collector root
+    /// the collector decodes by tag at a safepoint, as opposed to
+    /// [`MirType::is_gc_reference`], which is an unconditional pointer. Kept distinct
+    /// so a safepoint stack map can record it in its own tagged-root list.
+    #[must_use]
+    pub fn is_tagged_value(self) -> bool {
+        matches!(self, MirType::PyValue)
     }
 
     /// Whether this is one of the integer stack types (`int32`, `int64`, or
@@ -91,6 +111,17 @@ mod tests {
             }
             .is_gc_reference()
         );
+    }
+
+    #[test]
+    fn py_value_is_a_conditional_root_not_an_unconditional_reference() {
+        assert!(MirType::PyValue.is_tagged_value());
+        assert!(!MirType::PyValue.is_gc_reference());
+        assert!(!MirType::PyValue.is_integer());
+        assert!(!MirType::PyValue.is_float());
+        assert!(!MirType::ObjectRef.is_tagged_value());
+        assert!(!MirType::ManagedPtr.is_tagged_value());
+        assert_eq!(MirType::PyValue.stack_slot_bytes(), 4);
     }
 
     #[test]

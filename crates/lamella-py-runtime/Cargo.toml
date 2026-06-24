@@ -1,0 +1,11 @@
+[package]
+name = "lamella-py-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lamella's Python runtime: the bytecode interpreter, the dynamic object model, and built-ins."
+
+[lints]
+workspace = true

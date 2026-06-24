@@ -14,7 +14,7 @@ description = "A host-PC C# REPL that bootstrap-compiles each line with csc and 
 lamella-assemble = { path = "../lamella-assemble" }
 lamella-load = { path = "../lamella-load" }
 lamella-metadata = { path = "../lamella-metadata" }
-lamella-ves = { path = "../lamella-ves" }
+lamella-cil-runtime = { path = "../lamella-cil-runtime" }
 
 [lints]
 workspace = true

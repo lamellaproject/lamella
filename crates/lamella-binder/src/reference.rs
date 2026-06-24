@@ -65,7 +65,7 @@ fn type_info(
             info.fields.push(FieldSymbol {
                 name: field_name.into(),
                 ty: sigtype_to_symbol(assembly, &signature),
-                is_static: false,
+                is_static: field.flags() & 0x0010 != 0 && field.flags() & 0x0040 == 0,
                 is_readonly: false,
                 accessibility: member_accessibility(field.flags()),
                 constant: None,

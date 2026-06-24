@@ -6,7 +6,7 @@ use crate::interp_backend::InterpreterBackend;
 use crate::protocol::{Event, Message, Request, Response};
 use lamella_debug_backend::{DebugBackend, Scope, Stop};
 #[cfg(feature = "interpreter")]
-use lamella_ves::Module;
+use lamella_cil_runtime::Module;
 use serde_json::{Value as Json, json};
 
 #[cfg(feature = "interpreter")]
@@ -548,7 +548,7 @@ mod tests {
 
     fn add_program() -> (Module, u32) {
         let mut module = Module::new();
-        let write_line = module.add_intrinsic(0, lamella_ves::intrinsics::console_write_line, 1);
+        let write_line = module.add_intrinsic(0, lamella_cil_runtime::intrinsics::console_write_line, 1);
         let write_line_token = Token(0x0A00_0001);
         module.bind_token(0, write_line_token, write_line);
         let hi: Vec<u16> = "hi".encode_utf16().collect();

@@ -90,10 +90,43 @@ fn is_object(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Special(SpecialType::Object))
 }
 
+/// Whether `ty` is a reference type (4.2) -- the test array covariance (13.1.4) applies to
+/// both element types: `object`/`string`, any array, or a class/interface/delegate; never a
+/// value type (numeric/bool/char/struct/enum) or pointer.
+fn is_reference_type(model: &Model, ty: &TypeSymbol) -> bool {
+    match ty {
+        TypeSymbol::Special(special) => {
+            matches!(special, SpecialType::Object | SpecialType::String)
+        }
+        TypeSymbol::Array { .. } => true,
+        TypeSymbol::Named(_) => model.get_by_symbol(ty).is_some_and(|info| {
+            matches!(
+                info.kind,
+                TypeKind::Class | TypeKind::Interface | TypeKind::Delegate
+            )
+        }),
+        TypeSymbol::Pointer(_) | TypeSymbol::Error => false,
+    }
+}
+
 /// An implicit reference conversion from `from` to a base class or implemented
 /// interface, transitively (13.1.4).
 fn reference_conversion(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
-    if matches!(from, TypeSymbol::Array { .. }) {
+    if let TypeSymbol::Array {
+        element: from_element,
+        rank: from_rank,
+    } = from
+    {
+        if let TypeSymbol::Array {
+            element: to_element,
+            rank: to_rank,
+        } = to
+        {
+            return from_rank == to_rank
+                && is_reference_type(model, from_element)
+                && is_reference_type(model, to_element)
+                && converts(model, from_element, to_element);
+        }
         return is_array_base_type(to);
     }
     let mut stack: Vec<TypeSymbol> = match model.get_by_symbol(from) {

@@ -1206,7 +1206,11 @@ fn struct_size(ty: MirType) -> Result<i32, LowerError> {
 /// Loads a scalar of MIR type `ty` from the address on the stack, at static `offset`.
 fn emit_typed_load(body: &mut Func, ty: MirType, offset: u32) -> Result<(), LowerError> {
     match ty {
-        MirType::I32 | MirType::NativeInt | MirType::ObjectRef | MirType::ManagedPtr => {
+        MirType::I32
+        | MirType::NativeInt
+        | MirType::ObjectRef
+        | MirType::ManagedPtr
+        | MirType::PyValue => {
             body.i32_load(MemArg::new(4, offset));
         }
         MirType::I64 => body.i64_load(MemArg::new(8, offset)),
@@ -1220,7 +1224,11 @@ fn emit_typed_load(body: &mut Func, ty: MirType, offset: u32) -> Result<(), Lowe
 /// Stores the scalar of MIR type `ty` on the stack (under its address) at static `offset`.
 fn emit_typed_store(body: &mut Func, ty: MirType, offset: u32) -> Result<(), LowerError> {
     match ty {
-        MirType::I32 | MirType::NativeInt | MirType::ObjectRef | MirType::ManagedPtr => {
+        MirType::I32
+        | MirType::NativeInt
+        | MirType::ObjectRef
+        | MirType::ManagedPtr
+        | MirType::PyValue => {
             body.i32_store(MemArg::new(4, offset));
         }
         MirType::I64 => body.i64_store(MemArg::new(8, offset)),
@@ -1444,6 +1452,7 @@ fn valtype(ty: MirType) -> Result<ValType, LowerError> {
         | MirType::NativeInt
         | MirType::ObjectRef
         | MirType::ManagedPtr
+        | MirType::PyValue
         | MirType::ValueType { .. } => ValType::I32,
         MirType::I64 => ValType::I64,
         MirType::F32 => ValType::F32,

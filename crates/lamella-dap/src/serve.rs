@@ -114,12 +114,12 @@ mod tests {
     use crate::protocol::{Message, Request};
     use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand};
     use lamella_token::Token;
-    use lamella_ves::Module;
+    use lamella_cil_runtime::Module;
     use std::io::Cursor;
 
     fn program() -> (Module, u32) {
         let mut module = Module::new();
-        let write_line = module.add_intrinsic(0, lamella_ves::intrinsics::console_write_line, 1);
+        let write_line = module.add_intrinsic(0, lamella_cil_runtime::intrinsics::console_write_line, 1);
         module.bind_token(0, Token(0x0A00_0001), write_line);
         let hi: Vec<u16> = "hi".encode_utf16().collect();
         module.bind_string(0, Token(0x7000_0001), &hi);

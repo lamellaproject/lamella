@@ -1,0 +1,22 @@
+[package]
+name = "lamella-py-frontend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lamella's Python 3 front end: lexer, parser, our versioned bytecode, and the typed Python-to-MIR lowering."
+
+[dependencies]
+lamella-py-bytecode = { path = "../lamella-py-bytecode" }
+lamella-ir = { path = "../lamella-ir" }
+
+[dev-dependencies]
+# The AOT backend, for an integration test that carries the typed lowering all the
+# way to thumbv6m native code (the M4 seam end to end), and a QEMU example that runs
+# the result. Dev-only; the front end itself does not depend on the backend.
+lamella-aot = { path = "../lamella-aot" }
+lamella-asm-arm32 = { path = "../lamella-asm-arm32" }
+
+[lints]
+workspace = true

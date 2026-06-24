@@ -10,7 +10,7 @@ pub mod dap;
 
 use lamella_load::load;
 use lamella_metadata::Assembly;
-use lamella_ves::{Value, Vm, run};
+use lamella_cil_runtime::{Value, Vm, run};
 
 /// A diagnostic surfaced to the embedder. For Tier 1 these are runtime issues
 /// (a malformed image, a failed load, or a trap); `line`/`column` are 1-based and

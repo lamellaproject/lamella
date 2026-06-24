@@ -1,0 +1,11 @@
+[package]
+name = "lamella-py-bytecode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lamella's Python bytecode contract: opcodes, code objects, and the versioned encoding, shared by the Python front end and runtime."
+
+[lints]
+workspace = true

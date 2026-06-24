@@ -18,7 +18,7 @@ serde_json = "1"
 # The interpreter debug backend + the CIL server binary -- behind the `interpreter`
 # feature so a DEVICE DAP server (DeviceBackend over CMSIS-DAP) links the adapter + serve
 # WITHOUT the interpreter.
-lamella-ves = { path = "../lamella-ves", optional = true }
+lamella-cil-runtime = { path = "../lamella-cil-runtime", optional = true }
 lamella-cil = { path = "../lamella-cil", optional = true }
 lamella-load = { path = "../lamella-load", optional = true }
 lamella-metadata = { path = "../lamella-metadata", optional = true }
@@ -30,7 +30,7 @@ default = ["interpreter"]
 # The interpreter backend (InterpreterBackend) + the `lamella-dap` CIL server binary.
 # Off => a trait-only adapter + serve layer a device backend plugs into; no interpreter.
 interpreter = [
-    "dep:lamella-ves",
+    "dep:lamella-cil-runtime",
     "dep:lamella-cil",
     "dep:lamella-load",
     "dep:lamella-metadata",

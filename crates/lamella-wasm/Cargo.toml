@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 lamella-load = { path = "../lamella-load" }
 lamella-metadata = { path = "../lamella-metadata" }
-lamella-ves = { path = "../lamella-ves" }
+lamella-cil-runtime = { path = "../lamella-cil-runtime" }
 # The DAP feature pulls in the debugger and a JSON codec for its wire messages.
 lamella-dap = { path = "../lamella-dap", optional = true }
 # The compile feature pulls in the compiler (source -> assembly) for in-page builds.

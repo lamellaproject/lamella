@@ -2,11 +2,11 @@
 
 use lamella_load::{DeltaContext, load, load_bootstrap, load_delta, load_library};
 use lamella_metadata::Assembly;
-use lamella_ves::intrinsics::object_to_string;
-use lamella_ves::{MethodId, Module, ObjectRef, Vm, run};
+use lamella_cil_runtime::intrinsics::object_to_string;
+use lamella_cil_runtime::{MethodId, Module, ObjectRef, Vm, run};
 use std::path::{Path, PathBuf};
 
-pub use lamella_ves::Value;
+pub use lamella_cil_runtime::Value;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

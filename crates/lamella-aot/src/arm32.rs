@@ -112,6 +112,7 @@ fn lower_inst(
     assign: &impl Fn(ValueId) -> Reg,
 ) -> Result<(), LowerError> {
     match inst {
+        Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
         Inst::ConstInt { value, .. } => {
             if let Ok(imm) = u8::try_from(*value) {
                 enc.movs_imm(assign(result), imm)
@@ -347,6 +348,7 @@ fn lower_spilled_inst(
     func_labels: &[Label],
 ) -> Result<Option<u32>, LowerError> {
     match inst {
+        Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
         Inst::ConstInt {
             ty: MirType::I64,
             value,
@@ -1542,6 +1544,7 @@ fn lower_spilled_into(
     enc: &mut Encoder,
     func_labels: &[Label],
     alloc_addr: Option<u32>,
+    py_support: Option<u32>,
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
     stack_maps: &mut Vec<StackMapEntry>,
@@ -1555,6 +1558,7 @@ fn lower_spilled_into(
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
                     | Inst::CastClassScan { .. }
+                    | Inst::PyIntrinsic { .. }
                     | Inst::Alloc { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
@@ -1588,10 +1592,20 @@ fn lower_spilled_into(
                 .and_then(|b| b.get(inst_pos))
                 .and_then(Option::as_ref)
             {
+                let mut ref_offsets = Vec::new();
+                let mut tagged_offsets = Vec::new();
+                for &v in roots {
+                    if func.value_type(v) == Some(MirType::PyValue) {
+                        tagged_offsets.push(slot(v));
+                    } else {
+                        ref_offsets.push(slot(v));
+                    }
+                }
                 stack_maps.push(StackMapEntry {
                     return_pc,
                     frame_size: frame,
-                    ref_offsets: roots.iter().map(|v| slot(*v)).collect(),
+                    ref_offsets,
+                    tagged_offsets,
                 });
             }
         };
@@ -1740,6 +1754,25 @@ fn lower_spilled_into(
                     record_safepoint(stack_maps, index, inst_pos, enc.position());
                     continue;
                 }
+            }
+            if let Inst::PyIntrinsic {
+                op: lamella_ir::PyOp::Getattr,
+                args,
+                ..
+            } = inst
+            {
+                let support = py_support.ok_or(LowerError::CallUnsupported)?;
+                let stack_bytes = load_call_args(enc, &func.value_types, &slot, args, 0)?;
+                load_const_word(enc, &mut pool, Reg::R2, support)?;
+                enc.blx(Reg::R2);
+                record_safepoint(stack_maps, index, inst_pos, enc.position());
+                if stack_bytes > 0 {
+                    enc.add_sp(stack_bytes)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                enc.str_sp(Reg::R0, slot(*result))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                continue;
             }
             if let Inst::Alloc {
                 handle,
@@ -2200,6 +2233,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
                     | Inst::CastClassScan { .. }
+                    | Inst::PyIntrinsic { .. }
             )
         })
     }) {
@@ -2847,18 +2881,24 @@ impl LineTable {
     }
 }
 
-/// One GC safepoint's stack map: the `ObjectRef` roots live in the frame when a call or
-/// allocation returns, for a relocating collector to find and update. `return_pc` is the native
-/// code offset of the instruction after the call (add the method's load address for the device
-/// PC); each `ref_offsets` entry is a byte offset from SP-at-the-call of a spilled root.
+/// One GC safepoint's stack map: the roots live in the frame when a call or allocation returns,
+/// for a relocating collector to find and update. `return_pc` is the native code offset of the
+/// instruction after the call (add the method's load address for the device PC). `ref_offsets`
+/// are byte offsets from SP-at-the-call of UNCONDITIONAL `ObjectRef` roots; `tagged_offsets` are
+/// the `PyValue` roots (a tagged word the collector decodes -- traced only when the tag marks a
+/// heap pointer). A C#-only image leaves `tagged_offsets` empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackMapEntry {
     /// The return address of the safepoint -- a native code offset, the collector's lookup key.
     pub return_pc: u32,
     /// The frame the safepoint opened, in bytes; the collector steps past it to the caller.
     pub frame_size: u16,
-    /// Byte offsets from SP-at-the-call of the live `ObjectRef` roots in the frame.
+    /// Byte offsets from SP-at-the-call of the live unconditional `ObjectRef` roots in the frame.
     pub ref_offsets: Vec<u16>,
+    /// Byte offsets from SP-at-the-call of the live `PyValue` roots -- tagged words the collector
+    /// traces only when the tag marks a heap pointer (the scan-by-tag predicate). Empty for a C#
+    /// image.
+    pub tagged_offsets: Vec<u16>,
 }
 
 /// The GC stack maps for a lowered program -- one entry per safepoint, sorted by `return_pc` for
@@ -2870,7 +2910,10 @@ pub struct StackMaps(pub Vec<StackMapEntry>);
 
 impl StackMaps {
     /// The little-endian wire format the collector consumes: `u32 count`, then each entry as
-    /// `u32 return_pc; u16 frame_size; u16 nrefs; u16 ref_offsets[nrefs]`.
+    /// `u32 return_pc; u16 frame_size; u16 nrefs; u16 ref_offsets[nrefs]; u16 ntagged;
+    /// u16 tagged_offsets[ntagged]`. `ref_offsets` are unconditional `ObjectRef` roots;
+    /// `tagged_offsets` are `PyValue` roots the collector traces by tag. The tagged fields are
+    /// always present -- a C# image emits `ntagged = 0`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -2880,6 +2923,10 @@ impl StackMaps {
             out.extend_from_slice(&entry.frame_size.to_le_bytes());
             out.extend_from_slice(&(entry.ref_offsets.len() as u16).to_le_bytes());
             for &offset in &entry.ref_offsets {
+                out.extend_from_slice(&offset.to_le_bytes());
+            }
+            out.extend_from_slice(&(entry.tagged_offsets.len() as u16).to_le_bytes());
+            for &offset in &entry.tagged_offsets {
                 out.extend_from_slice(&offset.to_le_bytes());
             }
         }
@@ -2905,6 +2952,7 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
             func,
             &mut enc,
             &[],
+            None,
             None,
             &[],
             &mut _lines,
@@ -2949,6 +2997,7 @@ pub fn lower_debug(
             &mut enc,
             &[],
             None,
+            None,
             source_map,
             &mut lines,
             &mut Vec::new(),
@@ -2966,7 +3015,7 @@ pub fn lower_debug(
 /// direct calls between them resolved. `Call { callee }` names function index
 /// `callee` in `funcs`.
 pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, None, &[], &[]).map(|(bytes, _, _)| bytes)
+    lower_module_inner(funcs, None, None, &[], &[]).map(|(bytes, _, _)| bytes)
 }
 
 /// Lowers a whole program whose reference-type allocations call the garbage-collected
@@ -2974,7 +3023,7 @@ pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
 /// &TypeDesc) -> payload*`, AAPCS (size in r0, descriptor in r1, result in r0). Each `Alloc`
 /// lowers to `blx` that address with a null-check; the type descriptors are emitted per type.
 pub fn lower_module_gc(funcs: &[Function], alloc_addr: u32) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr), &[], &[]).map(|(bytes, _, _)| bytes)
+    lower_module_inner(funcs, Some(alloc_addr), None, &[], &[]).map(|(bytes, _, _)| bytes)
 }
 
 /// As [`lower_module_gc`], but with per-type VTABLES (`(type handle, function indices in slot order)`)
@@ -2985,7 +3034,7 @@ pub fn lower_module_gc_vtables(
     alloc_addr: u32,
     vtables: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr), vtables, &[]).map(|(bytes, _, _)| bytes)
+    lower_module_inner(funcs, Some(alloc_addr), None, vtables, &[]).map(|(bytes, _, _)| bytes)
 }
 
 /// As [`lower_module_gc`], but also returns the GC [`StackMaps`] -- one entry per safepoint
@@ -2994,7 +3043,21 @@ pub fn lower_module_gc_mapped(
     funcs: &[Function],
     alloc_addr: u32,
 ) -> Result<(Vec<u8>, StackMaps), LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr), &[], &[]).map(|(bytes, maps, _)| (bytes, maps))
+    lower_module_inner(funcs, Some(alloc_addr), None, &[], &[])
+        .map(|(bytes, maps, _)| (bytes, maps))
+}
+
+/// Lowers a whole program with the Python runtime-support entry threaded (the first-light Python
+/// path): `alloc_addr` is the `lamella_gc_alloc` address (or `None`), `py_support` the entry a
+/// `PyIntrinsic` calls (the getattr entry for first light). Returns the image plus the GC
+/// [`StackMaps`] (carrying tagged `PyValue` roots).
+pub fn lower_module_py(
+    funcs: &[Function],
+    alloc_addr: Option<u32>,
+    py_support: Option<u32>,
+) -> Result<(Vec<u8>, StackMaps), LowerError> {
+    lower_module_inner(funcs, alloc_addr, py_support, &[], &[])
+        .map(|(bytes, maps, _)| (bytes, maps))
 }
 
 /// Lowers a whole multi-method program WITH debug line tables -- the module variant of [`lower_debug`].
@@ -3008,12 +3071,14 @@ pub fn lower_module_debug(
     alloc_addr: Option<u32>,
     source_maps: &[crate::cil::CilSourceMap],
 ) -> Result<(Vec<u8>, MethodLineTables), LowerError> {
-    lower_module_inner(funcs, alloc_addr, &[], source_maps).map(|(bytes, _, lines)| (bytes, lines))
+    lower_module_inner(funcs, alloc_addr, None, &[], source_maps)
+        .map(|(bytes, _, lines)| (bytes, lines))
 }
 
 fn lower_module_inner(
     funcs: &[Function],
     alloc_addr: Option<u32>,
+    py_support: Option<u32>,
     vtables: &[TypeMeta],
     source_maps: &[crate::cil::CilSourceMap],
 ) -> Result<(Vec<u8>, StackMaps, MethodLineTables), LowerError> {
@@ -3068,6 +3133,7 @@ fn lower_module_inner(
                     &mut enc,
                     &func_labels,
                     alloc_addr,
+                    py_support,
                     source_map,
                     &mut lines,
                     &mut stack_maps,
@@ -4845,5 +4911,95 @@ mod tests {
             maps.0.iter().any(|e| e.ref_offsets == vec![0]),
             "the call holding `a` names it as a root"
         );
+    }
+
+    #[test]
+    fn a_py_value_root_goes_in_the_tagged_list_not_ref_offsets() {
+        let main = Function {
+            params: vec![MirType::PyValue],
+            ret: Some(MirType::PyValue),
+            value_types: vec![MirType::PyValue, MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(1),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(1),
+                            payload_size: 4,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let helper = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let (_code, maps) =
+            lower_module_gc_mapped(&[main, helper], 0x09).expect("lowers with stack maps");
+        assert_eq!(maps.0.len(), 2);
+        assert!(
+            maps.0.iter().any(|e| e.tagged_offsets == vec![0]),
+            "p is recorded as a tagged (scan-by-tag) root"
+        );
+        assert!(
+            maps.0.iter().all(|e| e.ref_offsets.is_empty()),
+            "no unconditional ObjectRef root is recorded"
+        );
+        assert_eq!(&maps.encode()[0..4], &2u32.to_le_bytes());
+    }
+
+    #[test]
+    fn lowers_a_py_getattr_to_a_runtime_support_call() {
+        let main = Function {
+            params: vec![MirType::PyValue, MirType::PyValue],
+            ret: Some(MirType::PyValue),
+            value_types: vec![MirType::PyValue, MirType::PyValue, MirType::PyValue],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1)],
+                insts: vec![(
+                    ValueId(2),
+                    Inst::PyIntrinsic {
+                        op: lamella_ir::PyOp::Getattr,
+                        args: vec![ValueId(0), ValueId(1)],
+                        cache: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let (code, maps) =
+            lower_module_py(&[main.clone()], None, Some(0x1234)).expect("getattr lowers");
+        assert!(!code.is_empty(), "produced code");
+        assert_eq!(maps.0.len(), 1, "the getattr call is one safepoint");
+        assert!(matches!(
+            lower_module_py(&[main], None, None),
+            Err(LowerError::CallUnsupported)
+        ));
     }
 }
