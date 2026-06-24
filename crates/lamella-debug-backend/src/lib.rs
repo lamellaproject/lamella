@@ -75,6 +75,15 @@ pub trait DebugBackend {
     /// as hardware BPU comparators.
     fn set_breakpoints(&mut self, addresses: &[u64]);
 
+    /// The most breakpoints the target can arm at once, or `None` for no limit. The
+    /// device has a fixed number of hardware comparators (the Cortex-M0 BPU has four);
+    /// the interpreter is unbounded. The adapter uses this to report breakpoints past the
+    /// limit as unverified -- so the editor greys them -- instead of silently dropping
+    /// them, and to warn when a run leaves some inactive.
+    fn max_breakpoints(&self) -> Option<usize> {
+        None
+    }
+
     /// The call stack, innermost frame first (DAP's order). Each frame carries its
     /// opaque address, a display name, and a 1-based line (the CIL index until the
     /// compiler's sequence points map it to source).

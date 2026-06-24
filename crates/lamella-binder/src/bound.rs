@@ -987,7 +987,10 @@ impl Binder {
         let constructors = self.type_info_of(&target)?.constructors.clone();
         let argument_types: Vec<TypeSymbol> =
             arguments.iter().map(|argument| argument.ty.clone()).collect();
-        let chosen = match resolve_overload(&self.model, &constructors, &argument_types) {
+        let arg_constants: Vec<Option<i64>> =
+            arguments.iter().map(constant_int_value).collect();
+        let chosen =
+            match resolve_overload(&self.model, &constructors, &argument_types, &arg_constants) {
             OverloadResult::Resolved(method) => method,
             _ => return None,
         };
@@ -1405,7 +1408,7 @@ impl Binder {
         for owner in [&left.ty, &right.ty] {
             let candidates = self.methods_in_chain(owner, name);
             if let OverloadResult::Resolved(method) =
-                resolve_overload(&self.model, &candidates, &argument_types)
+                resolve_overload(&self.model, &candidates, &argument_types, &[])
             {
                 let declaring_type = self.declaring_type_in_chain(owner, name, &method.parameters);
                 return Some(BoundExpr {
@@ -1511,7 +1514,7 @@ impl Binder {
         let argument_types = [operand.ty.clone()];
         let candidates = self.methods_in_chain(&operand.ty, name);
         if let OverloadResult::Resolved(method) =
-            resolve_overload(&self.model, &candidates, &argument_types)
+            resolve_overload(&self.model, &candidates, &argument_types, &[])
         {
             let declaring_type = self.declaring_type_in_chain(&operand.ty, name, &method.parameters);
             return Some(BoundExpr {
@@ -2009,7 +2012,16 @@ impl Binder {
                         .iter()
                         .map(|argument| argument.ty.clone())
                         .collect();
-                    self.resolve_call(&name, &receiver_ty, &candidates, &argument_types, span)
+                    let arg_constants: Vec<Option<i64>> =
+                        arguments.iter().map(constant_int_value).collect();
+                    self.resolve_call(
+                        &name,
+                        &receiver_ty,
+                        &candidates,
+                        &argument_types,
+                        &arg_constants,
+                        span,
+                    )
                 };
                 chosen.map(|method| {
                     params_method = method.is_params;
@@ -2122,9 +2134,10 @@ impl Binder {
         declaring: &TypeSymbol,
         candidates: &[MethodSymbol],
         argument_types: &[TypeSymbol],
+        arg_constants: &[Option<i64>],
         span: Span,
     ) -> Option<MethodSymbol> {
-        match resolve_overload(&self.model, candidates, argument_types) {
+        match resolve_overload(&self.model, candidates, argument_types, arg_constants) {
             OverloadResult::Resolved(method) => {
                 self.check_accessible(declaring, method.accessibility, name, span);
                 Some(method)
@@ -2271,7 +2284,16 @@ impl Binder {
         let candidates = self.methods_in_chain(&receiver.ty, accessor);
         let argument_types: Vec<TypeSymbol> =
             arguments.iter().map(|argument| argument.ty.clone()).collect();
-        let method = self.resolve_call(accessor, &receiver.ty, &candidates, &argument_types, span)?;
+        let arg_constants: Vec<Option<i64>> =
+            arguments.iter().map(constant_int_value).collect();
+        let method = self.resolve_call(
+            accessor,
+            &receiver.ty,
+            &candidates,
+            &argument_types,
+            &arg_constants,
+            span,
+        )?;
         let declaring_type =
             self.declaring_type_in_chain(&receiver.ty, &method.name, &method.parameters);
         let method_ref = MethodReference {
@@ -2352,7 +2374,15 @@ impl Binder {
                     } else {
                         let argument_types: Vec<TypeSymbol> =
                             arguments.iter().map(|argument| argument.ty.clone()).collect();
-                        self.check_constructor(&target_ty, &constructors, &argument_types, span)
+                        let arg_constants: Vec<Option<i64>> =
+                            arguments.iter().map(constant_int_value).collect();
+                        self.check_constructor(
+                            &target_ty,
+                            &constructors,
+                            &argument_types,
+                            &arg_constants,
+                            span,
+                        )
                     };
                     if let Some(chosen) = chosen {
                         if chosen.parameters.len() == arguments.len() {
@@ -2448,9 +2478,10 @@ impl Binder {
         target: &TypeSymbol,
         constructors: &[MethodSymbol],
         argument_types: &[TypeSymbol],
+        arg_constants: &[Option<i64>],
         span: Span,
     ) -> Option<MethodSymbol> {
-        match resolve_overload(&self.model, constructors, argument_types) {
+        match resolve_overload(&self.model, constructors, argument_types, arg_constants) {
             OverloadResult::Resolved(constructor) => return Some(constructor),
             OverloadResult::WrongArgumentCount => self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::NoConstructor {
@@ -2810,7 +2841,7 @@ impl Binder {
         if candidates.is_empty() {
             return None;
         }
-        let chosen = self.resolve_call(name, receiver_ty, &candidates, &[], span)?;
+        let chosen = self.resolve_call(name, receiver_ty, &candidates, &[], &[], span)?;
         let declaring_type =
             self.declaring_type_in_chain(receiver_ty, &chosen.name, &chosen.parameters);
         Some(MethodReference {
@@ -3339,19 +3370,44 @@ enum OverloadResult {
     },
 }
 
-/// Chooses the overload for a call (14.4.2): the unique best among the applicable
-/// candidates, or the diagnostic-bearing outcome otherwise. Conversions are
-/// resolved against `model` so a derived argument matches a base parameter.
+/// Whether an argument -- its type `arg_ty`, plus `arg_const` (its compile-time integer value
+/// when it is a constant) -- is applicable to parameter `param`: a standard implicit conversion,
+/// or the implicit constant-expression conversion (13.1.7) for an `int`/`long` constant whose
+/// value fits an integral parameter (so `Set(0x518, m)` binds when `Set` takes `uint`).
+fn arg_applicable(
+    model: &Model,
+    arg_ty: &TypeSymbol,
+    arg_const: Option<i64>,
+    param: &TypeSymbol,
+) -> bool {
+    if converts(model, arg_ty, param) {
+        return true;
+    }
+    matches!(
+        arg_ty,
+        TypeSymbol::Special(SpecialType::Int32 | SpecialType::Int64)
+    ) && match param {
+        TypeSymbol::Special(target) => arg_const.is_some_and(|value| constant_fits(value, *target)),
+        _ => false,
+    }
+}
+
+/// Chooses the overload for a call (14.4.2): the unique best among the applicable candidates,
+/// or the diagnostic-bearing outcome otherwise. Conversions resolve against `model` so a
+/// derived argument matches a base parameter; `arg_constants` carries each argument's
+/// compile-time integer value (or `None`) to enable the constant conversion (13.1.7) in
+/// applicability. An empty `arg_constants` means "no constants" (e.g. the operator paths).
 fn resolve_overload(
     model: &Model,
     candidates: &[MethodSymbol],
     arguments: &[TypeSymbol],
+    arg_constants: &[Option<i64>],
 ) -> OverloadResult {
     let applicable: Vec<&MethodSymbol> = candidates
         .iter()
-        .filter(|candidate| is_applicable(model, candidate, arguments))
+        .filter(|candidate| is_applicable(model, candidate, arguments, arg_constants))
         .collect();
-    if let Some(best) = best_candidate(model, &applicable, arguments) {
+    if let Some(best) = best_candidate(model, &applicable, arguments, arg_constants) {
         return OverloadResult::Resolved(best.clone());
     }
     if !applicable.is_empty() {
@@ -3366,7 +3422,8 @@ fn resolve_overload(
     for (index, (argument, parameter)) in
         arguments.iter().zip(&count_matched.parameters).enumerate()
     {
-        if !converts(model, argument, parameter) {
+        if !arg_applicable(model, argument, arg_constants.get(index).copied().flatten(), parameter)
+        {
             return OverloadResult::BadArgument {
                 index,
                 from: argument.clone(),
@@ -3380,24 +3437,42 @@ fn resolve_overload(
 /// Whether a method is applicable to the arguments: in normal form the counts match
 /// and every argument converts to its parameter (14.4.2.1); a `params` method is also
 /// applicable in expanded form, where the trailing arguments fill its array.
-fn is_applicable(model: &Model, method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
-    is_normal_applicable(model, method, arguments)
-        || (method.is_params && is_applicable_expanded(model, method, arguments))
+fn is_applicable(
+    model: &Model,
+    method: &MethodSymbol,
+    arguments: &[TypeSymbol],
+    arg_constants: &[Option<i64>],
+) -> bool {
+    is_normal_applicable(model, method, arguments, arg_constants)
+        || (method.is_params && is_applicable_expanded(model, method, arguments, arg_constants))
 }
 
 /// Whether a method applies in NORMAL form: the counts match and every argument converts
 /// to its parameter (14.4.2.1). (Expanded `params` form is [`is_applicable_expanded`].)
-fn is_normal_applicable(model: &Model, method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
+fn is_normal_applicable(
+    model: &Model,
+    method: &MethodSymbol,
+    arguments: &[TypeSymbol],
+    arg_constants: &[Option<i64>],
+) -> bool {
     method.parameters.len() == arguments.len()
         && arguments
             .iter()
             .zip(&method.parameters)
-            .all(|(argument, parameter)| converts(model, argument, parameter))
+            .enumerate()
+            .all(|(i, (argument, parameter))| {
+                arg_applicable(model, argument, arg_constants.get(i).copied().flatten(), parameter)
+            })
 }
 
 /// Whether a `params` method applies in expanded form (14.4.2.1): the leading fixed
 /// parameters convert, and every trailing argument converts to the array's element type.
-fn is_applicable_expanded(model: &Model, method: &MethodSymbol, arguments: &[TypeSymbol]) -> bool {
+fn is_applicable_expanded(
+    model: &Model,
+    method: &MethodSymbol,
+    arguments: &[TypeSymbol],
+    arg_constants: &[Option<i64>],
+) -> bool {
     let fixed = method.parameters.len().saturating_sub(1);
     if arguments.len() < fixed {
         return false;
@@ -3405,16 +3480,24 @@ fn is_applicable_expanded(model: &Model, method: &MethodSymbol, arguments: &[Typ
     if !arguments[..fixed]
         .iter()
         .zip(&method.parameters[..fixed])
-        .all(|(argument, parameter)| converts(model, argument, parameter))
+        .enumerate()
+        .all(|(i, (argument, parameter))| {
+            arg_applicable(model, argument, arg_constants.get(i).copied().flatten(), parameter)
+        })
     {
         return false;
     }
     let TypeSymbol::Array { element, .. } = &method.parameters[fixed] else {
         return false;
     };
-    arguments[fixed..]
-        .iter()
-        .all(|argument| converts(model, argument, element))
+    arguments[fixed..].iter().enumerate().all(|(offset, argument)| {
+        arg_applicable(
+            model,
+            argument,
+            arg_constants.get(fixed + offset).copied().flatten(),
+            element,
+        )
+    })
 }
 
 /// The single applicable candidate better than every other, or `None` when none
@@ -3423,10 +3506,12 @@ fn best_candidate<'a>(
     model: &Model,
     applicable: &[&'a MethodSymbol],
     arguments: &[TypeSymbol],
+    arg_constants: &[Option<i64>],
 ) -> Option<&'a MethodSymbol> {
     applicable.iter().copied().find(|&candidate| {
         applicable.iter().all(|&other| {
-            core::ptr::eq(candidate, other) || is_better(model, candidate, other, arguments)
+            core::ptr::eq(candidate, other)
+                || is_better(model, candidate, other, arguments, arg_constants)
         })
     })
 }
@@ -3439,9 +3524,10 @@ fn is_better(
     c1: &MethodSymbol,
     c2: &MethodSymbol,
     arguments: &[TypeSymbol],
+    arg_constants: &[Option<i64>],
 ) -> bool {
-    let c1_normal = is_normal_applicable(model, c1, arguments);
-    let c2_normal = is_normal_applicable(model, c2, arguments);
+    let c1_normal = is_normal_applicable(model, c1, arguments, arg_constants);
+    let c2_normal = is_normal_applicable(model, c2, arguments, arg_constants);
     if c1_normal != c2_normal {
         return c1_normal;
     }
@@ -3454,6 +3540,15 @@ fn is_better(
         let (p1, p2) = (&c1.parameters[index], &c2.parameters[index]);
         if p1 == p2 {
             continue;
+        }
+        let arg = &arguments[index];
+        let (std1, std2) = (converts(model, arg, p1), converts(model, arg, p2));
+        if std1 != std2 {
+            if std1 {
+                strictly_better_somewhere = true;
+                continue;
+            }
+            return false;
         }
         if converts(model, p1, p2) || signed_preferred(p1, p2) {
             strictly_better_somewhere = true;

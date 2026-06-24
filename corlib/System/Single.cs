@@ -74,6 +74,8 @@ namespace System
 
         [Lamella.Runtime.RuntimeProvided] private static string ToFixed(float value, int decimals) { return null; }
 
+        [Lamella.Runtime.RuntimeProvided] private static string ToExponential(float value, int precision, bool upper) { return null; }
+
         [Lamella.Runtime.RuntimeProvided] private static float ParseValid(string s) { return 0; }
 
         public static float Parse(string s)
@@ -179,6 +181,9 @@ namespace System
             if (specifier == 'G' || specifier == 'g') return value.ToString();
             if (specifier == 'F' || specifier == 'f') return ToFixed(value, precision < 0 ? 2 : precision);
             if (specifier == 'N' || specifier == 'n') return Grouped(value, precision < 0 ? 2 : precision);
+            if (specifier == 'E' || specifier == 'e') return ToExponential(value, precision < 0 ? 6 : precision, specifier == 'E');
+            if (specifier == 'C' || specifier == 'c') return System.Double.Currency(value, precision < 0 ? 2 : precision);
+            if (specifier == 'P' || specifier == 'p') return System.Double.Percent(value, precision < 0 ? 2 : precision);
             throw new FormatException("Format specifier was invalid.");
         }
 

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "RV32IM machine-code encoder for the Lamella backend."
+description = "RV32IM machine-code encoder for the Lamella backend (the RISC-V target)."
 
 [lints]
 workspace = true

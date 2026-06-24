@@ -31,6 +31,9 @@ namespace System
             if (specifier == 'x') return Hex(value, nibbles, precision, false);
             if (specifier == 'N' || specifier == 'n') return Fixed(value, precision < 0 ? 2 : precision, true);
             if (specifier == 'F' || specifier == 'f') return Fixed(value, precision < 0 ? 2 : precision, false);
+            if (specifier == 'E' || specifier == 'e') return System.Double.ToExponential((double)value, precision < 0 ? 6 : precision, specifier == 'E');
+            if (specifier == 'C' || specifier == 'c') return System.Double.Currency((double)value, precision < 0 ? 2 : precision);
+            if (specifier == 'P' || specifier == 'p') return System.Double.Percent((double)value, precision < 0 ? 2 : precision);
             throw new FormatException("Format specifier was invalid.");
         }
 

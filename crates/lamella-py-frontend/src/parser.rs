@@ -6,8 +6,28 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::ast::{Assign, BinOp, CmpOp, Expr, FuncDef, ModuleAst, ParamDef, Stmt};
+use crate::ast::{
+    Assign, BinOp, BoolOp, CmpOp, Expr, FuncDef, ModuleAst, ParamDef, Stmt, UnaryOp,
+};
 use crate::lexer::{Tok, Token};
+
+/// The binary operator of an augmented-assignment token (`+=`, `<<=`, ...), or `None`
+/// if the token is not one.
+fn aug_assign_op(tok: &Tok) -> Option<BinOp> {
+    Some(match tok {
+        Tok::PlusEq => BinOp::Add,
+        Tok::MinusEq => BinOp::Sub,
+        Tok::StarEq => BinOp::Mul,
+        Tok::SlashSlashEq => BinOp::FloorDiv,
+        Tok::PercentEq => BinOp::Mod,
+        Tok::AmperEq => BinOp::BitAnd,
+        Tok::PipeEq => BinOp::BitOr,
+        Tok::CaretEq => BinOp::BitXor,
+        Tok::LtLtEq => BinOp::LShift,
+        Tok::GtGtEq => BinOp::RShift,
+        _ => return None,
+    })
+}
 
 /// A parse failure: the offending line and a human-readable reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +131,7 @@ impl Parser {
             Tok::KwDef => self.parse_funcdef(),
             Tok::KwIf => self.parse_if(),
             Tok::KwWhile => self.parse_while(),
+            Tok::KwFor => self.parse_for(),
             _ => self.parse_small_stmt(),
         }
     }
@@ -143,6 +164,21 @@ impl Parser {
     fn parse_assign_or_expr(&mut self) -> Result<Stmt, ParseError> {
         let target_line = self.current_line();
         let expr = self.parse_expr()?;
+        if let Some(op) = aug_assign_op(self.peek()) {
+            let target = self.target_name(expr, target_line)?;
+            self.advance();
+            let value = self.parse_expr()?;
+            self.expect_newline()?;
+            return Ok(Stmt::Assign(Assign {
+                target: target.clone(),
+                annotation: None,
+                value: Some(Expr::Binary {
+                    op,
+                    lhs: Box::new(Expr::Name(target)),
+                    rhs: Box::new(value),
+                }),
+            }));
+        }
         match self.peek() {
             Tok::Colon => {
                 let target = self.target_name(expr, target_line)?;
@@ -222,6 +258,42 @@ impl Parser {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    fn parse_for(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Tok::KwFor, "'for'")?;
+        let target = self.expect_name()?;
+        self.expect(&Tok::KwIn, "'in'")?;
+        let iter = self.parse_expr()?;
+        let (start, stop) = self.range_bounds(iter)?;
+        self.expect(&Tok::Colon, "':'")?;
+        let body = self.parse_suite()?;
+        Ok(Stmt::For {
+            target,
+            start,
+            stop,
+            body,
+        })
+    }
+
+    /// First light iterates only `range(stop)` or `range(start, stop)`; pull out the
+    /// bounds (a missing start is `0`).
+    fn range_bounds(&self, iter: Expr) -> Result<(Expr, Expr), ParseError> {
+        if let Expr::Call { func, args } = iter {
+            if matches!(&*func, Expr::Name(n) if n == "range") {
+                let mut args = args;
+                match args.len() {
+                    1 => return Ok((Expr::Int(0), args.pop().unwrap())),
+                    2 => {
+                        let stop = args.pop().unwrap();
+                        let start = args.pop().unwrap();
+                        return Ok((start, stop));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(self.error("first light's 'for' iterates only range(stop) or range(start, stop)"))
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
@@ -308,17 +380,84 @@ impl Parser {
 
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_comparison()
+        self.parse_conditional()
+    }
+
+    /// `conditional: or_test ["if" or_test "else" conditional]` -- the ternary
+    /// `body if test else orelse`, the lowest-precedence expression form, with the
+    /// `else` branch right-associative.
+    fn parse_conditional(&mut self) -> Result<Expr, ParseError> {
+        let body = self.parse_or()?;
+        if self.at(&Tok::KwIf) {
+            self.advance();
+            let test = self.parse_or()?;
+            if !self.eat(&Tok::KwElse) {
+                return Err(self.error("expected 'else' in a conditional expression"));
+            }
+            let orelse = self.parse_conditional()?;
+            Ok(Expr::Conditional {
+                test: Box::new(test),
+                body: Box::new(body),
+                orelse: Box::new(orelse),
+            })
+        } else {
+            Ok(body)
+        }
+    }
+
+    /// `or_test: and_test ("or" and_test)*` -- left-associative, just above the
+    /// conditional.
+    fn parse_or(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_and()?;
+        while self.at(&Tok::KwOr) {
+            self.advance();
+            let rhs = self.parse_and()?;
+            lhs = Expr::BoolBinary {
+                op: BoolOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// `and_test: not_test ("and" not_test)*` -- left-associative, just above `or`.
+    fn parse_and(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_not()?;
+        while self.at(&Tok::KwAnd) {
+            self.advance();
+            let rhs = self.parse_not()?;
+            lhs = Expr::BoolBinary {
+                op: BoolOp::And,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// `not_test: "not" not_test | comparison` -- right-associative, just above `and`
+    /// and below a comparison (so `not a < b` is `not (a < b)`).
+    fn parse_not(&mut self) -> Result<Expr, ParseError> {
+        if self.at(&Tok::KwNot) {
+            self.advance();
+            let operand = self.parse_not()?;
+            Ok(Expr::Not {
+                operand: Box::new(operand),
+            })
+        } else {
+            self.parse_comparison()
+        }
     }
 
     /// A single comparison. Python chains comparisons (`a < b < c`), but that
     /// desugars to a boolean `and`, which is out of first light, so a second
     /// comparison operator is rejected.
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let lhs = self.parse_additive()?;
+        let lhs = self.parse_bitor()?;
         if let Some(op) = self.peek_cmp_op() {
             self.advance();
-            let rhs = self.parse_additive()?;
+            let rhs = self.parse_bitor()?;
             if self.peek_cmp_op().is_some() {
                 return Err(self.error("chained comparisons are out of the first-light subset"));
             }
@@ -342,6 +481,73 @@ impl Parser {
             Tok::Ge => Some(CmpOp::Ge),
             _ => None,
         }
+    }
+
+    /// `or_expr: xor_expr ("|" xor_expr)*` -- bitwise OR, left-associative (Python
+    /// precedence: just below comparison, just above `^`).
+    fn parse_bitor(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bitxor()?;
+        while matches!(self.peek(), Tok::Pipe) {
+            self.advance();
+            let rhs = self.parse_bitxor()?;
+            lhs = Expr::Binary {
+                op: BinOp::BitOr,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// `xor_expr: and_expr ("^" and_expr)*` -- bitwise XOR, left-associative.
+    fn parse_bitxor(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_bitand()?;
+        while matches!(self.peek(), Tok::Caret) {
+            self.advance();
+            let rhs = self.parse_bitand()?;
+            lhs = Expr::Binary {
+                op: BinOp::BitXor,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// `and_expr: shift_expr ("&" shift_expr)*` -- bitwise AND, left-associative.
+    fn parse_bitand(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_shift()?;
+        while matches!(self.peek(), Tok::Amper) {
+            self.advance();
+            let rhs = self.parse_shift()?;
+            lhs = Expr::Binary {
+                op: BinOp::BitAnd,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
+    }
+
+    /// `shift_expr: a_expr (("<<" | ">>") a_expr)*` -- left-associative (Python
+    /// precedence: just above additive, just below `&`).
+    fn parse_shift(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_additive()?;
+        loop {
+            let op = match self.peek() {
+                Tok::LtLt => BinOp::LShift,
+                Tok::GtGt => BinOp::RShift,
+                _ => break,
+            };
+            self.advance();
+            let rhs = self.parse_additive()?;
+            lhs = Expr::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(lhs)
     }
 
     /// `a_expr: m_expr | a_expr "+" m_expr | a_expr "-" m_expr` -- left-associative.
@@ -392,33 +598,34 @@ impl Parser {
         Ok(lhs)
     }
 
-    /// `u_expr: power | "-" u_expr`. First light folds unary minus on an integer
-    /// literal (so `-3` is a constant) and otherwise rejects it: a general `-x`
-    /// would need a numeric-negation intrinsic, and attribute access is the only
-    /// dynamic operation in the subset.
+    /// `u_expr: power | ("-" | "+" | "~") u_expr` -- unary minus, plus, and bitwise
+    /// inversion, right-associative. A unary operator applied directly to an integer
+    /// literal is folded to a constant (`-3`, `~3`); otherwise it becomes a `Unary`.
     fn parse_unary(&mut self) -> Result<Expr, ParseError> {
-        if self.at(&Tok::Minus) {
-            let line = self.current_line();
-            self.advance();
-            let operand = self.parse_unary()?;
-            match operand {
-                Expr::Int(value) => {
-                    let negated = value.checked_neg().ok_or_else(|| ParseError {
-                        line,
-                        message: String::from("integer literal out of range"),
-                    })?;
-                    Ok(Expr::Int(negated))
-                }
-                _ => Err(ParseError {
+        let op = match self.peek() {
+            Tok::Minus => UnaryOp::Neg,
+            Tok::Plus => UnaryOp::Pos,
+            Tok::Tilde => UnaryOp::Invert,
+            _ => return self.parse_trailer(),
+        };
+        let line = self.current_line();
+        self.advance();
+        let operand = self.parse_unary()?;
+        if let Expr::Int(value) = operand {
+            let folded = match op {
+                UnaryOp::Neg => value.checked_neg().ok_or_else(|| ParseError {
                     line,
-                    message: String::from(
-                        "unary minus on a non-literal is out of the first-light subset",
-                    ),
-                }),
-            }
-        } else {
-            self.parse_trailer()
+                    message: String::from("integer literal out of range"),
+                })?,
+                UnaryOp::Pos => value,
+                UnaryOp::Invert => !value,
+            };
+            return Ok(Expr::Int(folded));
         }
+        Ok(Expr::Unary {
+            op,
+            operand: Box::new(operand),
+        })
     }
 
     /// Postfix attribute reference (`primary "." identifier`) and call (`primary
@@ -550,6 +757,105 @@ mod tests {
         };
         assert_eq!(assign.value, None);
         assert!(assign.annotation.is_some());
+    }
+
+    #[test]
+    fn augmented_assignment_desugars_to_a_binary_assign() {
+        let module = parse_ok("x += 5\n");
+        let Stmt::Assign(assign) = &module.body[0] else {
+            panic!("expected an assignment");
+        };
+        assert_eq!(assign.target, "x");
+        assert_eq!(assign.annotation, None);
+        let Some(Expr::Binary { op, lhs, .. }) = &assign.value else {
+            panic!("expected a binary value");
+        };
+        assert_eq!(*op, BinOp::Add);
+        assert_eq!(**lhs, Expr::Name("x".into()));
+    }
+
+    #[test]
+    fn all_augmented_operators_map_to_their_binops() {
+        for (src, want) in [
+            ("x += 1\n", BinOp::Add),
+            ("x -= 1\n", BinOp::Sub),
+            ("x *= 1\n", BinOp::Mul),
+            ("x //= 1\n", BinOp::FloorDiv),
+            ("x %= 1\n", BinOp::Mod),
+            ("x &= 1\n", BinOp::BitAnd),
+            ("x |= 1\n", BinOp::BitOr),
+            ("x ^= 1\n", BinOp::BitXor),
+            ("x <<= 1\n", BinOp::LShift),
+            ("x >>= 1\n", BinOp::RShift),
+        ] {
+            let module = parse_ok(src);
+            let Stmt::Assign(assign) = &module.body[0] else {
+                panic!("expected an assignment for {src:?}");
+            };
+            let Some(Expr::Binary { op, .. }) = &assign.value else {
+                panic!("expected a binary value for {src:?}");
+            };
+            assert_eq!(*op, want, "for source {src:?}");
+        }
+    }
+
+    #[test]
+    fn boolean_precedence_is_or_below_and_below_not() {
+        let module = parse_ok("a or b and c\n");
+        let Stmt::Expr(Expr::BoolBinary { op, rhs, .. }) = &module.body[0] else {
+            panic!("expected a top-level boolean expression");
+        };
+        assert_eq!(*op, BoolOp::Or);
+        assert!(matches!(
+            **rhs,
+            Expr::BoolBinary {
+                op: BoolOp::And,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn not_binds_below_a_comparison() {
+        let module = parse_ok("not a < b\n");
+        let Stmt::Expr(Expr::Not { operand }) = &module.body[0] else {
+            panic!("expected a top-level `not`");
+        };
+        assert!(matches!(**operand, Expr::Compare { .. }));
+    }
+
+    #[test]
+    fn conditional_expression_is_right_associative() {
+        let module = parse_ok("a if p else b if q else c\n");
+        let Stmt::Expr(Expr::Conditional { orelse, .. }) = &module.body[0] else {
+            panic!("expected a conditional expression");
+        };
+        assert!(matches!(**orelse, Expr::Conditional { .. }));
+    }
+
+    #[test]
+    fn for_over_range_extracts_its_bounds() {
+        let module = parse_ok("for i in range(5):\n    x = i\n");
+        let Stmt::For {
+            target, start, stop, ..
+        } = &module.body[0]
+        else {
+            panic!("expected a for statement");
+        };
+        assert_eq!(target, "i");
+        assert_eq!(*start, Expr::Int(0));
+        assert_eq!(*stop, Expr::Int(5));
+        let two = parse_ok("for i in range(2, 9):\n    x = i\n");
+        let Stmt::For { start, stop, .. } = &two.body[0] else {
+            panic!("expected a for statement");
+        };
+        assert_eq!(*start, Expr::Int(2));
+        assert_eq!(*stop, Expr::Int(9));
+    }
+
+    #[test]
+    fn for_over_a_non_range_is_rejected() {
+        assert!(parse_src("for x in stuff:\n    y = x\n").is_err());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use lamella_metadata::tables::table;
-use lamella_metadata::{Assembly, SigType, TypeName};
+use lamella_metadata::{Assembly, ConstantValue, SigType, TypeName};
 use lamella_token::Token;
 
 /// Adds every type defined in `assembly` to `model`.
@@ -62,13 +62,15 @@ fn type_info(
     }
     for field in type_def.fields() {
         if let (Some(field_name), Some(signature)) = (field.name(), field.signature()) {
+            let constant = field.constant().and_then(constant_to_i64);
             info.fields.push(FieldSymbol {
                 name: field_name.into(),
                 ty: sigtype_to_symbol(assembly, &signature),
-                is_static: field.flags() & 0x0010 != 0 && field.flags() & 0x0040 == 0,
+                is_static: field.flags() & 0x0010 != 0
+                    && (field.flags() & 0x0040 == 0 || constant.is_some()),
                 is_readonly: false,
                 accessibility: member_accessibility(field.flags()),
-                constant: None,
+                constant,
             });
         }
     }
@@ -128,6 +130,27 @@ fn member_accessibility(flags: u32) -> Accessibility {
     match flags & 0x0007 {
         0x0002 | 0x0003 => Accessibility::Internal,
         _ => Accessibility::Public,
+    }
+}
+
+/// Narrows a metadata constant to the binder's integral fold (`Option<i64>`): the integer,
+/// char, and bool literals fold (enum members, `int.MaxValue`, `SeekOrigin.Begin`); a string,
+/// float, or null constant does not -- the binder folds only integral constants.
+fn constant_to_i64(value: ConstantValue) -> Option<i64> {
+    match value {
+        ConstantValue::Bool(b) => Some(i64::from(b)),
+        ConstantValue::Char(c) => Some(i64::from(c)),
+        ConstantValue::I1(n) => Some(i64::from(n)),
+        ConstantValue::U1(n) => Some(i64::from(n)),
+        ConstantValue::I2(n) => Some(i64::from(n)),
+        ConstantValue::U2(n) => Some(i64::from(n)),
+        ConstantValue::I4(n) => Some(i64::from(n)),
+        ConstantValue::U4(n) => Some(i64::from(n)),
+        ConstantValue::I8(n) => Some(n),
+        ConstantValue::U8(n) => Some(n as i64),
+        ConstantValue::R4(_) | ConstantValue::R8(_) | ConstantValue::String(_) | ConstantValue::Null => {
+            None
+        }
     }
 }
 

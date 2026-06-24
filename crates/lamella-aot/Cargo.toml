@@ -21,6 +21,8 @@ lamella-metadata = { path = "../lamella-metadata" }
 lamella-token = { path = "../lamella-token" }
 
 [dev-dependencies]
+lamella-elf = { path = "../lamella-elf" }
+lamella-link = { path = "../lamella-link" }
 # The deploy-samd21 examples flash AOT output to real hardware: the generic CMSIS-DAP probe plus
 # the SAM D21 NVMCTRL flash routines from lamella-cmsis-dap-sam.
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }

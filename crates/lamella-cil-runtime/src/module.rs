@@ -82,6 +82,9 @@ pub struct ReflectType {
     pub is_abstract: bool,
     /// `Type.IsPublic`: the type has public visibility.
     pub is_public: bool,
+    /// `Type.BaseType`: the asm-folded handle of the type's base class, or 0 for none (an interface,
+    /// or `System.Object` itself).
+    pub base_handle: u64,
 }
 
 /// One field of a type, for `Type.GetFields` enumeration: the field's asm-folded handle plus the
@@ -93,6 +96,19 @@ pub struct ReflectField {
     /// Whether the field is static (`FieldAttributes.Static`).
     pub is_static: bool,
     /// Whether the field is public (`FieldAttributes` access == `Public`).
+    pub is_public: bool,
+}
+
+/// One method of a type, for `Type.GetMethods` enumeration: the method's asm-folded handle plus the
+/// visibility / static bits `BindingFlags` filters on. Constructors (`.ctor`/`.cctor`) are excluded
+/// (they are `GetConstructors`), matching .NET.
+#[derive(Clone, Copy)]
+pub struct ReflectMethod {
+    /// The method's asm-folded `MethodDef` token (the `MethodInfo` handle).
+    pub handle: u64,
+    /// Whether the method is static (`MethodAttributes.Static`).
+    pub is_static: bool,
+    /// Whether the method is public (`MethodAttributes` access == `Public`).
     pub is_public: bool,
 }
 
@@ -347,6 +363,22 @@ pub struct Module {
     /// Each type's parameterless instance `.ctor` (what `Activator.CreateInstance(Type)` runs),
     /// keyed by the type's asm-folded handle. Recorded only under the `NETMFv4_4` reflection tier.
     type_ctors: BTreeMap<u64, MethodId>,
+    /// Each type's instance constructors as `(ctor handle, parameter count)`, keyed by the type's
+    /// asm-folded handle -- `Type.GetConstructor(Type[])` matches by arity. NETMFv4_4 tier only.
+    type_ctors_list: BTreeMap<u64, Vec<(u64, usize)>>,
+    /// Each type's methods in declaration order (the `Type.GetMethods` enumeration, constructors
+    /// excluded), keyed by the type's asm-folded handle. The `NETMFv4_4` reflection tier only.
+    type_methods: BTreeMap<u64, Vec<ReflectMethod>>,
+    /// A member's type (a field's `FieldType` or a method's `ReturnType`) as the type's asm-folded
+    /// handle, keyed by the member's asm-folded handle. The `NETMFv4_4` reflection tier only.
+    member_type_handle: BTreeMap<u64, u64>,
+    /// Full type name (`namespace.name`) -> the type's asm-folded handle, for every
+    /// reflection-recorded type. Resolves a member's `FieldType` / `ReturnType` (e.g. a primitive
+    /// field's `System.Int32`) from its signature. The `NETMFv4_4` reflection tier only.
+    name_to_handle: BTreeMap<String, u64>,
+    /// A method's `MethodAttributes` flags, keyed by the method's asm-folded handle, for the
+    /// `MethodBase.Is*` predicates. The `NETMFv4_4` reflection tier only.
+    method_attrs: BTreeMap<u64, u32>,
 }
 
 /// Folds the assembly id into a token key: the assembly in the HIGH 32 bits, the metadata token
@@ -1365,7 +1397,20 @@ impl Module {
     /// Records the reflection introspection metadata for the type whose asm-folded handle is
     /// `handle` -- the `System.Type` `Namespace`/`FullName`/`Is*` surface.
     pub fn bind_reflect_type(&mut self, handle: u64, info: ReflectType) {
+        if !info.full_name.is_empty() {
+            self.name_to_handle
+                .entry(info.full_name.clone())
+                .or_insert(handle);
+        }
         self.reflect_types.insert(handle, info);
+    }
+
+    /// The asm-folded handle of the type whose full name is `full_name` (`namespace.name`), if a
+    /// type with that name was reflection-recorded -- how `FieldInfo.FieldType` / `MethodInfo
+    /// .ReturnType` resolve a member's type (e.g. a primitive's `System.Int32`) from its signature.
+    #[must_use]
+    pub fn type_handle_by_name(&self, full_name: &str) -> Option<u64> {
+        self.name_to_handle.get(full_name).copied()
     }
 
     /// The reflection introspection metadata recorded for the type whose asm-folded handle is
@@ -1399,6 +1444,63 @@ impl Module {
     #[must_use]
     pub fn type_ctor(&self, type_handle: u64) -> Option<MethodId> {
         self.type_ctors.get(&type_handle).copied()
+    }
+
+    /// Records one instance constructor (its handle + parameter count) of the type whose asm-folded
+    /// handle is `type_handle`, for `Type.GetConstructor`.
+    pub fn bind_type_ctor_overload(&mut self, type_handle: u64, ctor_handle: u64, param_count: usize) {
+        self.type_ctors_list
+            .entry(type_handle)
+            .or_default()
+            .push((ctor_handle, param_count));
+    }
+
+    /// The instance constructors `(handle, parameter count)` of the type whose asm-folded handle is
+    /// `type_handle`, for `Type.GetConstructor` arity matching; empty if none recorded.
+    #[must_use]
+    pub fn type_ctors_list(&self, type_handle: u64) -> &[(u64, usize)] {
+        self.type_ctors_list
+            .get(&type_handle)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Records the method list (for `Type.GetMethods`, constructors excluded) of the type whose
+    /// asm-folded handle is `type_handle`, in declaration order.
+    pub fn bind_type_methods(&mut self, type_handle: u64, methods: Vec<ReflectMethod>) {
+        self.type_methods.insert(type_handle, methods);
+    }
+
+    /// The methods (declaration order, constructors excluded) of the type whose asm-folded handle
+    /// is `type_handle`, for `Type.GetMethods` enumeration; empty if none recorded.
+    #[must_use]
+    pub fn type_methods(&self, type_handle: u64) -> &[ReflectMethod] {
+        self.type_methods
+            .get(&type_handle)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// Records the type of the member whose asm-folded handle is `handle` -- a field's `FieldType`
+    /// or a method's `ReturnType` (the type's own asm-folded handle).
+    pub fn bind_member_type(&mut self, handle: u64, type_handle: u64) {
+        self.member_type_handle.insert(handle, type_handle);
+    }
+
+    /// The type handle recorded for the member whose asm-folded handle is `handle`
+    /// (`FieldInfo.FieldType` / `MethodInfo.ReturnType`), or `None` if its type was not resolvable.
+    #[must_use]
+    pub fn member_type(&self, handle: u64) -> Option<u64> {
+        self.member_type_handle.get(&handle).copied()
+    }
+
+    /// Records a method's `MethodAttributes` flags (for `MethodBase.Is*`), keyed by its handle.
+    pub fn bind_method_attrs(&mut self, handle: u64, attrs: u32) {
+        self.method_attrs.insert(handle, attrs);
+    }
+
+    /// The `MethodAttributes` flags of the method whose asm-folded handle is `handle`, or `None`.
+    #[must_use]
+    pub fn method_attrs(&self, handle: u64) -> Option<u32> {
+        self.method_attrs.get(&handle).copied()
     }
 
     /// Records `type_id`'s FULL name (`namespace.name`, or the bare `name` in the global

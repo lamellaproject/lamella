@@ -1457,17 +1457,17 @@ fn deref_byref_args(frames: &[Frame], vm: &Vm, args: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-/// Truncates an integer being stored by `stind.i1` / `stind.i2` to its low 8 / 16 bits
-/// (ECMA-335 1st ed III.3.62), sign-extended back to the `int32` the slot holds -- so a
-/// later `ldind.i1` / `ldind.i2` reads the same narrowed value. A non-integer (or any other
-/// opcode) is passed through unchanged. C# pre-narrows with `conv.u1`/`conv.u2`, so this
-/// only bites on hand-written IL.
+/// Normalizes the value `stind.i1` / `stind.i2` stores through a byref to a VALUE slot (a local /
+/// argument / field -- NOT raw localloc memory, which takes the byte-accurate path). C# always
+/// pre-narrows with `conv.u1`/`conv.i1` (or the i2 pair) before the store, so the `int32` reaching
+/// the slot is ALREADY the final byte/short value -- signed for an sbyte/short, UNSIGNED for a
+/// byte/ushort, the `conv` having chosen. The slot is read back sign-AGNOSTICALLY (`ldloc` / `ldfld`
+/// / a value-slot `ldind` return it as-is), so the value must be PRESERVED here: re-narrowing cannot
+/// tell a byte from an sbyte and would corrupt an unsigned store -- `(byte)200` is `0xC8`, which must
+/// read back 200, not the sign-extended -56. A `NativeInt` collapses to the `int32` the slot holds.
 fn narrow_stored_int(value: Value, opcode: Opcode) -> Value {
     match (opcode, value) {
-        (Opcode::StindI1, Value::Int32(n)) => Value::Int32(i32::from(n as i8)),
-        (Opcode::StindI1, Value::NativeInt(n)) => Value::Int32(i32::from(n as i8)),
-        (Opcode::StindI2, Value::Int32(n)) => Value::Int32(i32::from(n as i16)),
-        (Opcode::StindI2, Value::NativeInt(n)) => Value::Int32(i32::from(n as i16)),
+        (Opcode::StindI1 | Opcode::StindI2, Value::NativeInt(n)) => Value::Int32(n as i32),
         (_, value) => value,
     }
 }

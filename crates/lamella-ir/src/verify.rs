@@ -458,25 +458,25 @@ mod tests {
     #[test]
     fn py_intrinsic_getattr_yields_a_py_value() {
         let mut f = Function {
-            params: vec![MirType::PyValue, MirType::PyValue],
+            params: vec![MirType::PyValue],
             ret: Some(MirType::PyValue),
-            value_types: vec![MirType::PyValue, MirType::PyValue, MirType::PyValue],
+            value_types: vec![MirType::PyValue, MirType::PyValue],
             entry: BlockId(0),
             blocks: vec![BasicBlock {
-                params: vec![ValueId(0), ValueId(1)],
+                params: vec![ValueId(0)],
                 insts: vec![(
-                    ValueId(2),
+                    ValueId(1),
                     Inst::PyIntrinsic {
-                        op: crate::inst::PyOp::Getattr,
-                        args: vec![ValueId(0), ValueId(1)],
+                        op: crate::inst::PyOp::Getattr { name: 3 },
+                        args: vec![ValueId(0)],
                         cache: 0,
                     },
                 )],
-                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
             }],
         };
         assert_eq!(verify(&f), Ok(()));
-        f.value_types[2] = MirType::I32;
+        f.value_types[1] = MirType::I32;
         f.ret = Some(MirType::I32);
         assert!(
             verify(&f)

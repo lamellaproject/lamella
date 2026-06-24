@@ -48,6 +48,8 @@ namespace System
 
         [Lamella.Runtime.RuntimeProvided] private static string ToFixed(double value, int decimals) { return null; }
 
+        [Lamella.Runtime.RuntimeProvided] internal static string ToExponential(double value, int precision, bool upper) { return null; }
+
         public string ToString(string format)
         {
             return Format(this, format);
@@ -83,12 +85,35 @@ namespace System
             if (specifier == 'G' || specifier == 'g') return value.ToString();
             if (specifier == 'F' || specifier == 'f') return ToFixed(value, precision < 0 ? 2 : precision);
             if (specifier == 'N' || specifier == 'n') return Grouped(value, precision < 0 ? 2 : precision);
+            if (specifier == 'E' || specifier == 'e') return ToExponential(value, precision < 0 ? 6 : precision, specifier == 'E');
+            if (specifier == 'C' || specifier == 'c') return Currency(value, precision < 0 ? 2 : precision);
+            if (specifier == 'P' || specifier == 'p') return Percent(value, precision < 0 ? 2 : precision);
             throw new FormatException("Format specifier was invalid.");
         }
 
         private static bool IsLetter(char c)
         {
             return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+        }
+
+        internal static string Currency(double value, int decimals)
+        {
+            if (!IsFinite(value)) return ToFixed(value, decimals);
+            bool negative = value < 0;
+            double magnitude = negative ? -value : value;
+            string body = ((char)0x00A4).ToString() + Grouped(magnitude, decimals);
+            return negative ? "(" + body + ")" : body;
+        }
+
+        internal static string Percent(double value, int decimals)
+        {
+            if (!IsFinite(value)) return ToFixed(value, decimals);
+            return Grouped(value * 100.0, decimals) + " %";
+        }
+
+        private static bool IsFinite(double value)
+        {
+            return (value == value) && ((value - value) == 0.0);
         }
 
         private static string Grouped(double value, int decimals)

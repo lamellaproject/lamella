@@ -134,6 +134,11 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
         let bps = self.breakpoints.clone();
         let dap = self.dap.get_mut();
         let _ = dap.set_breakpoints(&bps);
+        if let Ok(pc) = dap.read_core_reg(15) {
+            if bps.contains(&(pc & !1)) {
+                let _ = dap.step();
+            }
+        }
         match dap.resume() {
             Ok(()) => Stop::Running,
             Err(_) => Stop::Fault("resume failed".into()),
@@ -145,46 +150,85 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn run_to_return(&mut self) -> Stop {
-        let dap = self.dap.get_mut();
-        let lr = match dap.read_core_reg(14) {
+        let lr = match self.dap.get_mut().read_core_reg(14) {
             Ok(lr) => lr & !1,
             Err(_) => return Stop::Fault("read LR".into()),
         };
-        if self.breakpoints.len() >= 4 && !self.breakpoints.contains(&lr) {
-            return Stop::Step;
-        }
-        let mut armed = self.breakpoints.clone();
-        if !armed.contains(&lr) {
-            armed.push(lr);
-        }
-        if dap.set_breakpoints(&armed).is_err() {
-            return Stop::Fault("arm return breakpoint".into());
-        }
-        if dap.resume().is_err() {
-            return Stop::Fault("resume into call".into());
-        }
-        let mut halted = false;
-        for _ in 0..1_000_000u32 {
-            match dap.is_halted() {
-                Ok(true) => {
-                    halted = true;
-                    break;
+
+        let armed: Option<Vec<u32>> = if self.breakpoints.len() < 4 || self.breakpoints.contains(&lr)
+        {
+            let mut a = self.breakpoints.clone();
+            if !a.contains(&lr) {
+                a.push(lr);
+            }
+            Some(a)
+        } else {
+            let call_line = self.source_line_at(lr.saturating_sub(self.base).saturating_sub(4));
+            let borrow = (call_line != 0)
+                .then(|| {
+                    self.breakpoints.iter().position(|&bp| {
+                        self.source_line_at(bp.saturating_sub(self.base)) == call_line
+                    })
+                })
+                .flatten();
+            borrow.map(|index| {
+                let mut a = self.breakpoints.clone();
+                a[index] = lr;
+                a
+            })
+        };
+
+        if let Some(armed) = armed {
+            let dap = self.dap.get_mut();
+            if dap.set_breakpoints(&armed).is_err() {
+                return Stop::Fault("arm return breakpoint".into());
+            }
+            if dap.resume().is_err() {
+                return Stop::Fault("resume into call".into());
+            }
+            let mut halted = false;
+            for _ in 0..1_000_000u32 {
+                match dap.is_halted() {
+                    Ok(true) => {
+                        halted = true;
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(_) => return Stop::Fault("poll halt".into()),
                 }
-                Ok(false) => {}
-                Err(_) => return Stop::Fault("poll halt".into()),
+            }
+            let _ = dap.set_breakpoints(&self.breakpoints);
+            if !halted {
+                let _ = dap.halt();
+                return Stop::Fault("call did not return".into());
+            }
+            let pc = dap.read_core_reg(15).unwrap_or(0) & !1;
+            return if self.breakpoints.contains(&pc) {
+                Stop::Breakpoint
+            } else {
+                Stop::Step
+            };
+        }
+
+        const FALLBACK_STEP_LIMIT: u32 = 2048;
+        for _ in 0..FALLBACK_STEP_LIMIT {
+            if self.dap.get_mut().step().is_err() {
+                return Stop::Fault("step in call".into());
+            }
+            let pc = self.dap.get_mut().read_core_reg(15).unwrap_or(0) & !1;
+            if pc == lr {
+                return Stop::Step;
+            }
+            if self.breakpoints.contains(&pc) {
+                return Stop::Breakpoint;
             }
         }
-        let _ = dap.set_breakpoints(&self.breakpoints);
-        if !halted {
-            let _ = dap.halt();
-            return Stop::Fault("call did not return".into());
-        }
-        let pc = dap.read_core_reg(15).unwrap_or(0) & !1;
-        if self.breakpoints.contains(&pc) {
-            Stop::Breakpoint
-        } else {
-            Stop::Step
-        }
+        self.output.push_str(
+            "[lamella] Step-over stopped inside a long-running call: all hardware breakpoints \
+             are in use, so the call could not be run at full speed. Free a breakpoint, or set \
+             one past the call and Continue.\n",
+        );
+        Stop::Breakpoint
     }
 
     fn step_out(&mut self) -> Option<Stop> {
@@ -232,9 +276,13 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
     }
 
     fn set_breakpoints(&mut self, addresses: &[u64]) {
-        let words: Vec<u32> = addresses.iter().map(|&a| a as u32).collect();
+        let words: Vec<u32> = addresses.iter().take(4).map(|&a| a as u32).collect();
         self.breakpoints = words.clone();
         let _ = self.dap.get_mut().set_breakpoints(&words);
+    }
+
+    fn max_breakpoints(&self) -> Option<usize> {
+        Some(4)
     }
 
     fn stack(&self) -> Vec<Frame> {

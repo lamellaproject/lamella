@@ -160,12 +160,18 @@ pub enum PyCmpOp {
 
 /// A dynamic-object operation for [`Inst::PyIntrinsic`] -- one entry of Python's abstract
 /// object protocol (CPython's `PyObject_*`/`PyNumber_*`/`tp_*` layer). Each names a single
-/// Python runtime-support entry point the backend calls. The set grows with the protocol;
-/// see `docs/python-mir-seams.md`.
+/// Python runtime-support entry point the backend calls. Beyond `Getattr` (first light) the
+/// catalog is PROVISIONAL: python-frontend owns the op set and grounds it in the official Python
+/// data-model reference; the un-wired ops reject in codegen. See `docs/python-mir-seams.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PyOp {
-    /// Attribute load `obj.name` -- `args = [obj, name]`, the name an interned-string `PyValue`.
-    Getattr,
+    /// Attribute load `obj.name`. `args = [receiver]`; `name` is the attribute's index into the
+    /// module's name table (the per-module name-table-index ABI), and the inst's `cache` is the
+    /// inline-cache slot -- so this lowers to `py_getattr(receiver, name_id, cache_slot)`.
+    Getattr {
+        /// The attribute name, as an index into the module's name table.
+        name: u32,
+    },
     /// Attribute store `obj.name = value` -- `args = [obj, name, value]`. Side-effecting.
     Setattr,
     /// A binary operator `a <op> b` -- `args = [a, b]`, the operator in the payload.
@@ -207,7 +213,7 @@ impl PyOp {
         match self {
             PyOp::Len | PyOp::Truthy | PyOp::Compare(_) | PyOp::Contains => Some(MirType::I32),
             PyOp::Setattr | PyOp::Setitem | PyOp::Exit => None,
-            PyOp::Getattr
+            PyOp::Getattr { .. }
             | PyOp::Binop(_)
             | PyOp::Call
             | PyOp::Getitem
@@ -309,8 +315,9 @@ pub enum Inst {
     /// operation over `args` (receiver-first). Lowers to a call into the Python runtime-support
     /// library at a backend-threaded entry point (the [`Inst::Alloc`]/`lamella_gc_alloc` pattern),
     /// so it is a SAFEPOINT: the support entry may run arbitrary Python that allocates and collects.
-    /// `cache` is the inline-cache site id (0 = no cache); the backend reserves a RAM cache slot per
-    /// nonzero id and passes its address to the entry. The result type is `op.result_type()` (a
+    /// `cache` is the inline-cache SLOT index the frontend assigned (the runtime sizes the table by
+    /// the code object's cache_count, so slot 0 is valid -- not "no cache"); the backend passes it to
+    /// the entry, which reads/writes that RAM cache slot. The result type is `op.result_type()` (a
     /// `PyValue`, a scalar `int32`, or an ignored placeholder for a side-effecting op). Added for the
     /// Python frontend; the C# lowering never emits one. See `docs/python-mir-seams.md`.
     PyIntrinsic {
@@ -318,7 +325,7 @@ pub enum Inst {
         op: PyOp,
         /// The operand values, receiver-first, with op-specific arity.
         args: Vec<ValueId>,
-        /// The inline-cache site id, or 0 for no cache.
+        /// The inline-cache slot index (sized by cache_count; slot 0 is valid, not "no cache").
         cache: u32,
     },
     /// Stores `value` to the 32-bit memory address held in `address` -- the

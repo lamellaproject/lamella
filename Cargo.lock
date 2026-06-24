@@ -22,7 +22,9 @@ dependencies = [
  "lamella-cil",
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-sam",
+ "lamella-elf",
  "lamella-ir",
+ "lamella-link",
  "lamella-metadata",
  "lamella-token",
  "lamella-usbhid",
@@ -133,12 +135,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-elf"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-gc"
 version = "0.0.0"
 
 [[package]]
 name = "lamella-ir"
 version = "0.0.0"
+
+[[package]]
+name = "lamella-link"
+version = "0.0.0"
+dependencies = [
+ "lamella-elf",
+]
 
 [[package]]
 name = "lamella-load"
@@ -183,6 +196,11 @@ dependencies = [
 [[package]]
 name = "lamella-py-runtime"
 version = "0.0.0"
+dependencies = [
+ "lamella-gc",
+ "lamella-py-bytecode",
+ "lamella-py-frontend",
+]
 
 [[package]]
 name = "lamella-repl"

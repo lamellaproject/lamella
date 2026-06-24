@@ -46,7 +46,10 @@ use lamella_cil_runtime::intrinsics::{
 #[cfg(feature = "NETMFv4_4")]
 use lamella_cil_runtime::intrinsics::{
     boolean_parse, char_is_digit, char_is_letter, char_is_letter_or_digit, char_is_lower,
-    activator_create_instance, field_get_value, field_set_value, method_invoke,
+    activator_create_instance, assembly_get_type, field_get_value, field_set_value, member_get_type,
+    method_invoke, method_is_abstract, method_is_final, method_is_public, method_is_static,
+    constructor_invoke, method_is_virtual, reflect_handle_equals, reflect_handle_not_equals,
+    type_get_base_type, type_get_constructor,
     char_is_upper, char_is_white_space, char_to_lower, char_to_upper, collection_contains,
     collection_push, convert_to_boolean_int, convert_to_byte_int, convert_to_char_int, int32_parse,
     int64_parse, list_add, list_clear, list_get_count, list_get_item, list_insert, list_remove_at,
@@ -62,16 +65,18 @@ use lamella_cil_runtime::intrinsics::{
     string_last_index_of_char, string_pad_left, string_pad_right, string_remove,
     string_replace_char, string_replace_string, string_split_char, string_starts_with,
     string_to_char_array, string_to_lower, string_to_upper, string_trim, type_get_assembly,
-    type_get_fields, type_get_full_name, type_get_namespace, type_is_abstract, type_is_array,
-    type_is_class,
+    type_get_fields, type_get_full_name, type_get_methods, type_get_namespace, type_is_abstract,
+    type_is_array, type_is_class,
     type_is_enum, type_is_interface, type_is_not_public, type_is_public, type_is_value_type,
 };
 #[cfg(feature = "float")]
 use lamella_cil_runtime::intrinsics::{
     console_write_double, console_write_line_double, console_write_line_single, console_write_single,
-    convert_to_int32_double, decimal_from_double, decimal_to_double, double_to_fixed,
+    convert_to_int32_double, decimal_from_double, decimal_to_double, double_to_exponential,
+    double_to_fixed,
     double_to_string, math_abs_f64, math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64,
-    math_round_f64, math_sign_f64, math_truncate_f64, single_parse, single_to_fixed,
+    math_round_f64, math_sign_f64, math_truncate_f64, single_parse, single_to_exponential,
+    single_to_fixed,
     single_to_string,
 };
 #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
@@ -86,7 +91,7 @@ use lamella_cil_runtime::intrinsics::{
 };
 use lamella_cil_runtime::module::{AttrValue, LoadedAttribute, asm_key};
 #[cfg(feature = "NETMFv4_4")]
-use lamella_cil_runtime::module::{ReflectField, ReflectType};
+use lamella_cil_runtime::module::{ReflectField, ReflectMethod, ReflectType};
 use lamella_cil_runtime::{IntrinsicFn, MethodId, Module, TypeId, Value};
 
 const TYPE_REF: u8 = 0x01;
@@ -1044,7 +1049,7 @@ fn load_assembly(
         type_index,
         &type_interfaces,
     );
-    record_custom_attributes(assembly, module, asm);
+    record_custom_attributes(assembly, module, asm, type_index);
     entry
 }
 
@@ -1321,6 +1326,14 @@ fn bcl_intrinsic(
     if namespace == "System.Reflection" && type_name == "MemberInfo" && method == "get_Name" {
         return Some(type_get_name);
     }
+    #[cfg(feature = "NETMFv4_4")]
+    if namespace == "System.Reflection" {
+        match method {
+            "op_Equality" => return Some(reflect_handle_equals),
+            "op_Inequality" => return Some(reflect_handle_not_equals),
+            _ => {}
+        }
+    }
     if namespace == "System.Reflection"
         && type_name == "MemberInfo"
         && method == "GetCustomAttributes"
@@ -1335,6 +1348,7 @@ fn bcl_intrinsic(
         match (method, parameters_of(signature)) {
             ("GetValue", [SigType::Object]) => return Some(field_get_value),
             ("SetValue", [SigType::Object, SigType::Object]) => return Some(field_set_value),
+            ("get_FieldType", []) => return Some(member_get_type),
             _ => {}
         }
     }
@@ -1344,6 +1358,35 @@ fn bcl_intrinsic(
         && method == "Invoke"
     {
         return Some(method_invoke);
+    }
+    #[cfg(feature = "NETMFv4_4")]
+    if namespace == "System.Reflection" && type_name == "ConstructorInfo" && method == "Invoke" {
+        if let [SigType::SzArray(_)] = parameters_of(signature) {
+            return Some(constructor_invoke);
+        }
+    }
+    #[cfg(feature = "NETMFv4_4")]
+    if namespace == "System.Reflection" && type_name == "MethodInfo" && method == "get_ReturnType" {
+        return Some(member_get_type);
+    }
+    #[cfg(feature = "NETMFv4_4")]
+    if namespace == "System.Reflection" && type_name == "MethodBase" {
+        match method {
+            "get_IsPublic" => return Some(method_is_public),
+            "get_IsStatic" => return Some(method_is_static),
+            "get_IsFinal" => return Some(method_is_final),
+            "get_IsVirtual" => return Some(method_is_virtual),
+            "get_IsAbstract" => return Some(method_is_abstract),
+            _ => {}
+        }
+    }
+    #[cfg(feature = "NETMFv4_4")]
+    if namespace == "System.Reflection" && type_name == "Assembly" {
+        if method == "GetType" {
+            if let [SigType::String] = parameters_of(signature) {
+                return Some(assembly_get_type);
+            }
+        }
     }
     if namespace == "System.Diagnostics"
         && type_name == "DefaultTraceListener"
@@ -1396,6 +1439,8 @@ fn bcl_intrinsic(
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "get_Assembly") => Some(type_get_assembly),
         #[cfg(feature = "NETMFv4_4")]
+        ("Type", "get_BaseType") => Some(type_get_base_type),
+        #[cfg(feature = "NETMFv4_4")]
         ("Type", "get_IsEnum") => Some(type_is_enum),
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "get_IsValueType") => Some(type_is_value_type),
@@ -1411,18 +1456,29 @@ fn bcl_intrinsic(
         ("Type", "get_IsNotPublic") => Some(type_is_not_public),
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "get_IsArray") => Some(type_is_array),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "op_Equality") => Some(reflect_handle_equals),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "op_Inequality") => Some(reflect_handle_not_equals),
         ("Type", "GetField") => match parameters_of(signature) {
-            [SigType::String] => Some(type_get_field),
+            [SigType::String] | [SigType::String, _] => Some(type_get_field),
             _ => None,
         },
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetFields") => Some(type_get_fields),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "GetMethods") => Some(type_get_methods),
         ("Type", "GetMethod") => match parameters_of(signature) {
-            [SigType::String] => Some(type_get_method),
+            [SigType::String] | [SigType::String, _] => Some(type_get_method),
             _ => None,
         },
         ("Type", "GetProperty") => match parameters_of(signature) {
-            [SigType::String] => Some(type_get_property),
+            [SigType::String] | [SigType::String, _] => Some(type_get_property),
+            _ => None,
+        },
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "GetConstructor") => match parameters_of(signature) {
+            [SigType::SzArray(_)] => Some(type_get_constructor),
             _ => None,
         },
         #[cfg(feature = "NETMFv4_4")]
@@ -1472,10 +1528,20 @@ fn bcl_intrinsic(
             _ => None,
         },
         #[cfg(feature = "float")]
+        ("Double", "ToExponential") => match parameters_of(signature) {
+            [SigType::R8, SigType::I4, SigType::Boolean] => Some(double_to_exponential),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
         ("Single", "ToString") => to_string_overload(single_to_string, signature),
         #[cfg(feature = "float")]
         ("Single", "ToFixed") => match parameters_of(signature) {
             [SigType::R4, SigType::I4] => Some(single_to_fixed),
+            _ => None,
+        },
+        #[cfg(feature = "float")]
+        ("Single", "ToExponential") => match parameters_of(signature) {
+            [SigType::R4, SigType::I4, SigType::Boolean] => Some(single_to_exponential),
             _ => None,
         },
         #[cfg(feature = "float")]
@@ -1757,6 +1823,60 @@ fn bind_type_names(
     }
 }
 
+/// Resolves a field's or method-return `SigType` to the asm-folded handle of its `Type`, for
+/// `FieldInfo.FieldType` / `MethodInfo.ReturnType`. Primitives / string / object / void resolve by
+/// name through the type index (to the corlib type); a same-assembly class/struct uses its folded
+/// `TypeDef` token; a cross-assembly `TypeRef` resolves by name. Arrays / pointers / by-refs are not
+/// modeled as `Type` handles yet (`None`).
+#[cfg(feature = "NETMFv4_4")]
+fn sigtype_to_type_handle(
+    assembly: &Assembly,
+    module: &Module,
+    asm: u8,
+    sig: &SigType,
+    type_index: &TypeNameIndex,
+) -> Option<u64> {
+    let by_name = |namespace: &str, name: &str| {
+        let key = if namespace.is_empty() {
+            String::from(name)
+        } else {
+            alloc::format!("{namespace}.{name}")
+        };
+        module
+            .type_handle_by_name(&key)
+            .or_else(|| type_index.get(&key).and_then(|id| module.type_handle_of(*id)))
+    };
+    match sig {
+        SigType::Boolean => by_name("System", "Boolean"),
+        SigType::Char => by_name("System", "Char"),
+        SigType::I1 => by_name("System", "SByte"),
+        SigType::U1 => by_name("System", "Byte"),
+        SigType::I2 => by_name("System", "Int16"),
+        SigType::U2 => by_name("System", "UInt16"),
+        SigType::I4 => by_name("System", "Int32"),
+        SigType::U4 => by_name("System", "UInt32"),
+        SigType::I8 => by_name("System", "Int64"),
+        SigType::U8 => by_name("System", "UInt64"),
+        SigType::R4 => by_name("System", "Single"),
+        SigType::R8 => by_name("System", "Double"),
+        SigType::IntPtr => by_name("System", "IntPtr"),
+        SigType::UIntPtr => by_name("System", "UIntPtr"),
+        SigType::String => by_name("System", "String"),
+        SigType::Object => by_name("System", "Object"),
+        SigType::Void => by_name("System", "Void"),
+        SigType::Class(token) | SigType::ValueType(token) => {
+            if token.0 >> 24 == u32::from(TYPE_DEF) {
+                Some(asm_key(asm, token.0))
+            } else {
+                assembly
+                    .type_token_name(*token)
+                    .and_then(|name| by_name(name.namespace, name.name))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Records, for every target in this assembly, the custom attributes applied to it (decoded
 /// and resolved to a runtime form) and the member-name maps `Type.GetField`/`GetMethod`/
 /// `GetProperty` resolve through. For a type and each of its fields, methods, and properties,
@@ -1765,13 +1885,19 @@ fn bind_type_names(
 /// `GetCustomAttributes` receiver carries). Framework/compiler attributes (whose ctor is a
 /// cross-assembly `MemberRef` that resolves to no `MethodId`) are skipped. The member-name maps
 /// let an accessor map a name to the member handle whose attributes then read here.
-fn record_custom_attributes(assembly: &Assembly, module: &mut Module, asm: u8) {
+fn record_custom_attributes(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    type_index: &TypeNameIndex,
+) {
     for (local_index, type_def) in assembly.type_defs().enumerate() {
         let type_token = Token::new(TYPE_DEF, (local_index + 1) as u32);
         let type_handle = asm_key(asm, type_token.0);
         record_target_attributes(assembly, module, asm, type_handle, type_token);
         #[cfg(feature = "NETMFv4_4")]
         if let Some(type_name) = type_def.name() {
+            module.bind_type_name(asm, type_token, String::from(type_name.name));
             let full_name = if type_name.namespace.is_empty() {
                 String::from(type_name.name)
             } else {
@@ -1780,6 +1906,26 @@ fn record_custom_attributes(assembly: &Assembly, module: &mut Module, asm: u8) {
             let is_enum = assembly
                 .type_token_name(type_def.extends())
                 .is_some_and(|base| base.namespace == "System" && base.name == "Enum");
+            let base_handle = {
+                let extends = type_def.extends();
+                if extends.0 == 0 {
+                    0
+                } else if extends.0 >> 24 == u32::from(TYPE_DEF) {
+                    asm_key(asm, extends.0)
+                } else {
+                    assembly
+                        .type_token_name(extends)
+                        .and_then(|base| {
+                            let key = if base.namespace.is_empty() {
+                                String::from(base.name)
+                            } else {
+                                alloc::format!("{}.{}", base.namespace, base.name)
+                            };
+                            module.type_handle_by_name(&key)
+                        })
+                        .unwrap_or(0)
+                }
+            };
             module.bind_reflect_type(
                 type_handle,
                 ReflectType {
@@ -1790,6 +1936,7 @@ fn record_custom_attributes(assembly: &Assembly, module: &mut Module, asm: u8) {
                     is_interface: type_def.is_interface(),
                     is_abstract: type_def.is_abstract(),
                     is_public: type_def.is_public(),
+                    base_handle,
                 },
             );
         }
@@ -1809,11 +1956,20 @@ fn record_custom_attributes(assembly: &Assembly, module: &mut Module, asm: u8) {
                         is_static: field_flags & 0x0010 != 0,
                         is_public: field_flags & 0x0007 == 0x0006,
                     });
+                    if let Some(field_sig) = field.signature() {
+                        if let Some(type_handle) =
+                            sigtype_to_type_handle(assembly, module, asm, &field_sig, type_index)
+                        {
+                            module.bind_member_type(handle, type_handle);
+                        }
+                    }
                 }
             }
         }
         #[cfg(feature = "NETMFv4_4")]
         module.bind_type_fields(type_handle, reflect_fields);
+        #[cfg(feature = "NETMFv4_4")]
+        let mut reflect_methods = Vec::new();
         for method in type_def.methods() {
             if let Some(name) = method.name() {
                 let token = Token::new(METHOD_DEF, method.rid());
@@ -1821,13 +1977,41 @@ fn record_custom_attributes(assembly: &Assembly, module: &mut Module, asm: u8) {
                 module.bind_type_method_name(type_handle, name, handle);
                 record_target_attributes(assembly, module, asm, handle, token);
                 #[cfg(feature = "NETMFv4_4")]
-                if name == ".ctor" && parameters_of(method.signature().as_ref()).is_empty() {
-                    if let Some(ctor) = module.resolve_by_handle(handle) {
-                        module.bind_type_ctor(type_handle, ctor);
+                {
+                    module.bind_type_name(asm, token, String::from(name));
+                    if name == ".ctor" {
+                        let param_count = parameters_of(method.signature().as_ref()).len();
+                        module.bind_type_ctor_overload(type_handle, handle, param_count);
+                        if param_count == 0 {
+                            if let Some(ctor) = module.resolve_by_handle(handle) {
+                                module.bind_type_ctor(type_handle, ctor);
+                            }
+                        }
+                    } else if name != ".cctor" {
+                        let method_flags = method.flags();
+                        reflect_methods.push(ReflectMethod {
+                            handle,
+                            is_static: method_flags & 0x0010 != 0,
+                            is_public: method_flags & 0x0007 == 0x0006,
+                        });
+                        module.bind_method_attrs(handle, method_flags);
+                        if let Some(method_sig) = method.signature() {
+                            if let Some(type_handle) = sigtype_to_type_handle(
+                                assembly,
+                                module,
+                                asm,
+                                &method_sig.return_type,
+                                type_index,
+                            ) {
+                                module.bind_member_type(handle, type_handle);
+                            }
+                        }
                     }
                 }
             }
         }
+        #[cfg(feature = "NETMFv4_4")]
+        module.bind_type_methods(type_handle, reflect_methods);
         for property in type_def.properties() {
             if let Some(name) = property.name() {
                 let handle = asm_key(asm, property.token().0);
@@ -1875,10 +2059,13 @@ fn record_target_attributes(
             .collect();
         let mut named_fields = Vec::new();
         for named in &decoded.named {
-            if !named.is_field {
-                continue;
-            }
-            if let Some(slot) = attribute_field_slot(assembly, module, asm, type_id, named.name) {
+            let slot = if named.is_field {
+                attribute_field_slot(assembly, module, asm, type_id, named.name)
+            } else {
+                let backing = alloc::format!("<{}>k__BackingField", named.name);
+                attribute_field_slot(assembly, module, asm, type_id, &backing)
+            };
+            if let Some(slot) = slot {
                 named_fields.push((slot, attr_arg_to_value(&named.value, assembly, asm)));
             }
         }

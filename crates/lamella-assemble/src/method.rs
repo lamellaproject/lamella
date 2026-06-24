@@ -902,7 +902,7 @@ fn emit_statement_expression(
             value,
         } => {
             if let Some(binary) = compound_binary_operator(*operator) {
-                return emit_compound(target, binary, Some(value), frame, tokens, out);
+                return emit_compound(target, binary, Some(value), frame, tokens, out, Leave::Discard);
             }
         }
         BoundExprKind::Postfix { operator, operand } => {
@@ -910,7 +910,7 @@ fn emit_statement_expression(
             if try_user_step(operand, increment, frame, tokens, out)? {
                 return Ok(());
             }
-            return emit_compound(operand, step_operator(increment), None, frame, tokens, out);
+            return emit_compound(operand, step_operator(increment), None, frame, tokens, out, Leave::Discard);
         }
         BoundExprKind::Unary {
             operator: operator @ (UnaryOperator::PreIncrement | UnaryOperator::PreDecrement),
@@ -920,7 +920,7 @@ fn emit_statement_expression(
             if try_user_step(operand, increment, frame, tokens, out)? {
                 return Ok(());
             }
-            return emit_compound(operand, step_operator(increment), None, frame, tokens, out);
+            return emit_compound(operand, step_operator(increment), None, frame, tokens, out, Leave::Discard);
         }
         _ => {}
     }
@@ -932,7 +932,7 @@ fn emit_statement_expression(
 }
 
 /// The binary operator of `++` (Add) or `--` (Subtract).
-fn step_operator(increment: bool) -> BinaryOperator {
+pub(crate) fn step_operator(increment: bool) -> BinaryOperator {
     if increment {
         BinaryOperator::Add
     } else {
@@ -966,17 +966,37 @@ fn try_user_step(
     Ok(true)
 }
 
+/// Whether a read-modify-write leaves its value on the stack (an expression `++`/`--`) and,
+/// if so, which: the value BEFORE the step (postfix) or AFTER it (prefix).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Leave {
+    /// Statement position: store and leave nothing.
+    Discard,
+    /// Postfix `x++`/`x--`: leave the pre-step value.
+    Old,
+    /// Prefix `++x`/`--x`: leave the post-step value.
+    New,
+}
+
 /// Emits a read-modify-write to `target` (an `op=` or, with `rhs` = `None`, a `++`/`--`):
-/// read the target, combine it with the right-hand value via `binary`, and store it
-/// back. The receiver/index is evaluated once. Lowers to 1st-edition CIL only.
-fn emit_compound(
+/// read the target, combine it with the right-hand value via `binary`, and store it back.
+/// The receiver/index is evaluated once. `leave` keeps the expression value on the stack for
+/// a non-local `++`/`--` -- through a temp local, since 1st-edition CIL has no `dup_x1` to
+/// reorder it past the store's receiver/index operands. Lowers to 1st-edition CIL only.
+pub(crate) fn emit_compound(
     target: &BoundExpr,
     binary: BinaryOperator,
     rhs: Option<&BoundExpr>,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
+    leave: Leave,
 ) -> Result<(), EmitError> {
+    let kept = if leave == Leave::Discard {
+        None
+    } else {
+        Some(frame.reserve_local(&target.ty))
+    };
     match &target.kind {
         BoundExprKind::Local(name) => {
             if let Some((slot, element)) = frame.byref(name) {
@@ -1000,14 +1020,33 @@ fn emit_compound(
                 .ok_or(EmitError::Unsupported("field outside this module"))?;
             if field.is_static {
                 out.push(Instruction::new(Opcode::Ldsfld, Operand::Token(token)));
+                if leave == Leave::Old {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
                 emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+                if leave == Leave::New {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
                 out.push(Instruction::new(Opcode::Stsfld, Operand::Token(token)));
             } else {
                 crate::expr::emit_field_receiver(field, receiver, frame, tokens, out)?;
                 out.push(Instruction::simple(Opcode::Dup));
                 out.push(Instruction::new(Opcode::Ldfld, Operand::Token(token)));
+                if leave == Leave::Old {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
                 emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+                if leave == Leave::New {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
                 out.push(Instruction::new(Opcode::Stfld, Operand::Token(token)));
+            }
+            if let Some(slot) = kept {
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
             }
             Ok(())
         }
@@ -1043,8 +1082,19 @@ fn emit_compound(
                 out.push(Instruction::simple(Opcode::Dup));
             }
             out.push(Instruction::new(opcode, Operand::Token(getter)));
+            if leave == Leave::Old {
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+            }
             emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+            if leave == Leave::New {
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+            }
             out.push(Instruction::new(opcode, Operand::Token(setter)));
+            if let Some(slot) = kept {
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+            }
             Ok(())
         }
         BoundExprKind::ElementAccess { receiver, indices } if indices.len() == 1 => {
@@ -1061,8 +1111,19 @@ fn emit_compound(
             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
             out.push(Instruction::simple(load));
+            if leave == Leave::Old {
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+            }
             emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+            if leave == Leave::New {
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+            }
             out.push(Instruction::simple(store));
+            if let Some(slot) = kept {
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+            }
             Ok(())
         }
         _ => Err(EmitError::Unsupported("compound assignment to this target")),

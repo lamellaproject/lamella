@@ -1162,7 +1162,12 @@ fn emit_type(
     let (metadata_namespace, flags) = if nested_in.is_some() {
         ("", (flags & !0x0000_0007) | 0x0000_0002)
     } else {
-        (namespace, flags)
+        let visibility = if declaration.modifiers.contains(&Modifier::Public) {
+            0x0000_0001
+        } else {
+            0x0000_0000
+        };
+        (namespace, (flags & !0x0000_0007) | visibility)
     };
     let type_token = image.add_type(metadata_namespace, &declaration.name, base, flags);
     if let Some(enclosing_full) = &nested_in {
@@ -1687,7 +1692,7 @@ fn emit_one_method(
     let is_static = modifiers.contains(&Modifier::Static);
     let is_virtual = modifiers.contains(&Modifier::Virtual);
     let is_override = modifiers.contains(&Modifier::Override);
-    let mut flags = METHOD_PUBLIC;
+    let mut flags = member_visibility(modifiers);
     if is_static {
         flags |= METHOD_STATIC;
     }
@@ -2138,6 +2143,26 @@ fn accessor_name(prefix: &str, property: &str) -> String {
     name
 }
 
+/// The MemberAccess bits (II.23.1.5 / .10) for a member's declared modifiers: Public (6),
+/// `protected` = Family (4), `internal` = Assembly (3), `protected internal` = FamORAssem (5),
+/// else Private (1, the C# default for a class member). So reflection's NonPublic/Public
+/// binding flags see the real accessibility (a `private` field is not reported as public).
+fn member_visibility(modifiers: &[Modifier]) -> u16 {
+    if modifiers.contains(&Modifier::Public) {
+        0x0006
+    } else if modifiers.contains(&Modifier::Protected) {
+        if modifiers.contains(&Modifier::Internal) {
+            0x0005
+        } else {
+            0x0004
+        }
+    } else if modifiers.contains(&Modifier::Internal) {
+        0x0003
+    } else {
+        0x0001
+    }
+}
+
 /// Adds a `Field` row per declarator, with the field's signature and flags. Field
 /// initializers (which would run in a constructor) are not emitted yet.
 fn emit_field(
@@ -2148,7 +2173,7 @@ fn emit_field(
     declarators: &[VariableDeclarator],
 ) -> Result<(), crate::EmitError> {
     let signature = field_signature(&type_sig(tokens, &bind_type(ty))?);
-    let flags = FIELD_PUBLIC
+    let flags = member_visibility(modifiers)
         | if modifiers.contains(&Modifier::Static) {
             FIELD_STATIC
         } else {
@@ -2428,6 +2453,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 mint_in_expr(index, image, tokens);
             }
             mint_array_members(&receiver.ty, image, tokens);
+            mint_type_token(image, tokens, &expr.ty);
             if matches!(receiver.ty, TypeSymbol::Special(SpecialType::String)) {
                 let getter = lamella_binder::MethodReference {
                     declaring_type: TypeSymbol::Special(SpecialType::String),
@@ -2643,6 +2669,10 @@ fn mint_array_members(array_ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &
     let get_sig = method_signature(true, &int_sigs, &element_sig);
     let get = image.member_ref(type_spec, "Get", &get_sig);
     tokens.insert_method(array_ty, "Get", &int_params, get);
+    let address_sig =
+        method_signature(true, &int_sigs, &TypeSig::ByRef(Box::new(element_sig.clone())));
+    let address = image.member_ref(type_spec, "Address", &address_sig);
+    tokens.insert_method(array_ty, "Address", &int_params, address);
     let mut set_sigs = int_sigs;
     set_sigs.push(element_sig);
     let set_sig = method_signature(true, &set_sigs, &TypeSig::Void);

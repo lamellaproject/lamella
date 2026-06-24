@@ -33,7 +33,7 @@ const kUSBOut: u8 = 0;
 const kUSBBulk: u8 = 2;
 const DONT_CARE: u16 = 0xFFFF;
 
-const PROBE_VIDS: [u16; 4] = [0x2e8a, 0x0d28, 0x1fc9, 0xc251];
+const PROBE_VIDS: [u16; 5] = [0x2e8a, 0x0d28, 0x1fc9, 0xc251, 0x03eb];
 
 const ID_CFPLUGIN: [u8; 16] = [0xC2, 0x44, 0xE8, 0x58, 0x10, 0x9C, 0x11, 0xD4, 0x91, 0xD4, 0x00, 0x50, 0xE4, 0xC6, 0x42, 0x6F];
 const ID_DEV_USERCLIENT: [u8; 16] = [0x9d, 0xc7, 0xb7, 0x80, 0x9e, 0xc0, 0x11, 0xD4, 0xa5, 0x4f, 0x00, 0x0a, 0x27, 0x05, 0x28, 0x61];
@@ -306,7 +306,8 @@ unsafe fn open_vendor_interface(
     found
 }
 
-/// Open the device behind `svc` if it matches `vendor_id`/`product_id` and exposes a vendor bulk interface.
+/// Open the device behind `svc` if it matches `vendor_id`/`product_id` and exposes a vendor
+/// bulk interface.
 unsafe fn try_device(
     svc: io_service_t,
     plugin_id: CFUUIDRef,

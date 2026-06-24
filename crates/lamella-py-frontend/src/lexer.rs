@@ -36,6 +36,16 @@ pub enum Tok {
     KwFalse,
     /// `None`
     KwNone,
+    /// `and`
+    KwAnd,
+    /// `or`
+    KwOr,
+    /// `not`
+    KwNot,
+    /// `for`
+    KwFor,
+    /// `in`
+    KwIn,
 
     /// `+`
     Plus,
@@ -49,6 +59,18 @@ pub enum Tok {
     DoubleSlash,
     /// `%`
     Percent,
+    /// `&`
+    Amper,
+    /// `|`
+    Pipe,
+    /// `^`
+    Caret,
+    /// `~`
+    Tilde,
+    /// `<<`
+    LtLt,
+    /// `>>`
+    GtGt,
     /// `<`
     Lt,
     /// `<=`
@@ -63,6 +85,26 @@ pub enum Tok {
     NotEq,
     /// `=`
     Assign,
+    /// `+=`
+    PlusEq,
+    /// `-=`
+    MinusEq,
+    /// `*=`
+    StarEq,
+    /// `//=`
+    SlashSlashEq,
+    /// `%=`
+    PercentEq,
+    /// `&=`
+    AmperEq,
+    /// `|=`
+    PipeEq,
+    /// `^=`
+    CaretEq,
+    /// `<<=`
+    LtLtEq,
+    /// `>>=`
+    GtGtEq,
     /// `:`
     Colon,
     /// `,`
@@ -152,6 +194,10 @@ impl Lexer {
 
     fn peek2(&self) -> Option<char> {
         self.chars.get(self.pos + 1).copied()
+    }
+
+    fn peek3(&self) -> Option<char> {
+        self.chars.get(self.pos + 2).copied()
     }
 
     fn push(&mut self, kind: Tok) {
@@ -308,14 +354,22 @@ impl Lexer {
         }
     }
 
-    /// Lex a decimal integer literal per the Language Reference (2.4.4): a digit
-    /// run with `_` separators permitted only between digits, no leading zeros on
-    /// a non-zero value. The non-decimal bases (`0x`/`0o`/`0b`) are recognized and
-    /// rejected as out of the first-light subset rather than mis-lexed.
+    /// Lex an integer literal per the Language Reference (2.4.4): a decimal digit run
+    /// (no leading zeros on a non-zero value), or a base-prefixed `0x`/`0o`/`0b`
+    /// literal. In every base, `_` separators are permitted only between digits (or
+    /// right after the prefix). Float and imaginary literals remain out of scope.
     fn lex_number(&mut self) -> Result<(), LexError> {
         let first = self.peek().expect("lex_number called at a digit");
-        if first == '0' && matches!(self.peek2(), Some('x' | 'X' | 'o' | 'O' | 'b' | 'B')) {
-            return Err(self.err("non-decimal integer literals are out of the first-light subset"));
+        if first == '0' {
+            let radix = match self.peek2() {
+                Some('x' | 'X') => Some(16),
+                Some('o' | 'O') => Some(8),
+                Some('b' | 'B') => Some(2),
+                _ => None,
+            };
+            if let Some(radix) = radix {
+                return self.lex_radix_int(radix);
+            }
         }
         let mut digits = String::new();
         digits.push(first);
@@ -353,6 +407,45 @@ impl Lexer {
         }
     }
 
+    /// Lex a base-prefixed integer (`0x`/`0o`/`0b`; the prefix not yet consumed) in
+    /// `radix`, per the Language Reference (2.4.4): at least one digit, with `_`
+    /// separators only between digits (one may follow the prefix). Folded to `i64`.
+    fn lex_radix_int(&mut self, radix: u32) -> Result<(), LexError> {
+        self.pos += 2;
+        let mut digits = String::new();
+        loop {
+            match self.peek() {
+                Some(c) if c.is_digit(radix) => {
+                    digits.push(c);
+                    self.pos += 1;
+                }
+                Some('_') => {
+                    if matches!(self.peek2(), Some(c) if c.is_digit(radix)) {
+                        self.pos += 1;
+                    } else {
+                        return Err(
+                            self.err("underscores in a numeric literal must be between digits"),
+                        );
+                    }
+                }
+                _ => break,
+            }
+        }
+        if digits.is_empty() {
+            return Err(self.err("a base-prefixed integer literal needs at least one digit"));
+        }
+        if matches!(self.peek(), Some(c) if c == '_' || c.is_ascii_alphanumeric()) {
+            return Err(self.err("invalid digit in a base-prefixed integer literal"));
+        }
+        match i64::from_str_radix(&digits, radix) {
+            Ok(value) => {
+                self.push(Tok::Int(value));
+                Ok(())
+            }
+            Err(_) => Err(self.err("integer literal too large for first light (exceeds 64 bits)")),
+        }
+    }
+
     fn lex_name(&mut self) {
         let mut name = String::new();
         while let Some(c) = self.peek() {
@@ -370,13 +463,17 @@ impl Lexer {
             "elif" => Tok::KwElif,
             "else" => Tok::KwElse,
             "while" => Tok::KwWhile,
+            "and" => Tok::KwAnd,
+            "or" => Tok::KwOr,
+            "not" => Tok::KwNot,
+            "for" => Tok::KwFor,
+            "in" => Tok::KwIn,
             "True" => Tok::KwTrue,
             "False" => Tok::KwFalse,
             "None" => Tok::KwNone,
-            "and" | "as" | "assert" | "async" | "await" | "break" | "class"
-            | "continue" | "del" | "except" | "finally" | "for" | "from" | "global"
-            | "import" | "in" | "is" | "lambda" | "nonlocal" | "not" | "or" | "pass"
-            | "raise" | "try" | "with" | "yield" => Tok::Reserved(name),
+            "as" | "assert" | "async" | "await" | "break" | "class" | "continue" | "del"
+            | "except" | "finally" | "from" | "global" | "import" | "is" | "lambda"
+            | "nonlocal" | "pass" | "raise" | "try" | "with" | "yield" => Tok::Reserved(name),
             _ => Tok::Name(name),
         };
         self.push(kind);
@@ -385,19 +482,36 @@ impl Lexer {
     fn lex_operator(&mut self) -> Result<(), LexError> {
         let c = self.peek().expect("lex_operator called at end of input");
         let next = self.peek2();
+        let third = self.peek3();
         let (kind, width) = match c {
+            '+' if next == Some('=') => (Tok::PlusEq, 2),
             '+' => (Tok::Plus, 1),
             '-' if next == Some('>') => (Tok::Arrow, 2),
+            '-' if next == Some('=') => (Tok::MinusEq, 2),
             '-' => (Tok::Minus, 1),
             '*' if next == Some('*') => {
                 return Err(self.err("exponentiation '**' is out of the first-light subset"));
             }
+            '*' if next == Some('=') => (Tok::StarEq, 2),
             '*' => (Tok::Star, 1),
+            '/' if next == Some('/') && third == Some('=') => (Tok::SlashSlashEq, 3),
             '/' if next == Some('/') => (Tok::DoubleSlash, 2),
             '/' => (Tok::Slash, 1),
+            '%' if next == Some('=') => (Tok::PercentEq, 2),
             '%' => (Tok::Percent, 1),
+            '&' if next == Some('=') => (Tok::AmperEq, 2),
+            '&' => (Tok::Amper, 1),
+            '|' if next == Some('=') => (Tok::PipeEq, 2),
+            '|' => (Tok::Pipe, 1),
+            '^' if next == Some('=') => (Tok::CaretEq, 2),
+            '^' => (Tok::Caret, 1),
+            '~' => (Tok::Tilde, 1),
+            '<' if next == Some('<') && third == Some('=') => (Tok::LtLtEq, 3),
+            '<' if next == Some('<') => (Tok::LtLt, 2),
             '<' if next == Some('=') => (Tok::Le, 2),
             '<' => (Tok::Lt, 1),
+            '>' if next == Some('>') && third == Some('=') => (Tok::GtGtEq, 3),
+            '>' if next == Some('>') => (Tok::GtGt, 2),
             '>' if next == Some('=') => (Tok::Ge, 2),
             '>' => (Tok::Gt, 1),
             '=' if next == Some('=') => (Tok::EqEq, 2),
@@ -594,11 +708,10 @@ mod tests {
     #[test]
     fn out_of_subset_keywords_are_reserved_not_names() {
         assert_eq!(
-            kinds("for x and class\n"),
+            kinds("lambda x class\n"),
             vec![
-                Tok::Reserved("for".into()),
+                Tok::Reserved("lambda".into()),
                 Tok::Name("x".into()),
-                Tok::Reserved("and".into()),
                 Tok::Reserved("class".into()),
                 Tok::Newline,
                 Tok::Eof,
@@ -637,7 +750,24 @@ mod tests {
         assert!(tokenize("0123\n").is_err());
         assert!(tokenize("1__2\n").is_err());
         assert!(tokenize("1_\n").is_err());
-        assert!(tokenize("0x1F\n").is_err());
         assert!(tokenize("2 ** 3\n").is_err());
+    }
+
+    #[test]
+    fn non_decimal_integer_literals_follow_the_reference() {
+        assert_eq!(kinds("0xFF\n")[0], Tok::Int(255));
+        assert_eq!(kinds("0Xff\n")[0], Tok::Int(255));
+        assert_eq!(kinds("0o17\n")[0], Tok::Int(15));
+        assert_eq!(kinds("0O17\n")[0], Tok::Int(15));
+        assert_eq!(kinds("0b1010\n")[0], Tok::Int(10));
+        assert_eq!(kinds("0B1010\n")[0], Tok::Int(10));
+        assert_eq!(kinds("0xDE_AD\n")[0], Tok::Int(0xDEAD));
+        assert_eq!(kinds("0x_FF\n")[0], Tok::Int(255));
+        assert!(tokenize("0x\n").is_err());
+        assert!(tokenize("0xFF_\n").is_err());
+        assert!(tokenize("0xF__F\n").is_err());
+        assert!(tokenize("0o8\n").is_err());
+        assert!(tokenize("0b2\n").is_err());
+        assert!(tokenize("0xG\n").is_err());
     }
 }

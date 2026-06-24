@@ -3,6 +3,7 @@
 
 //! Lamella's Python 3 front end.
 
+
 extern crate alloc;
 
 pub mod ast;
@@ -77,7 +78,7 @@ mod tests {
     /// dynamic attribute access. Exercises the whole pipeline end to end and
     /// round-trips through the versioned container. (The top-level `print(fib(10))`
     /// compiles too, but the first-light parity slice drives the call boundary from
-    /// the harness over the `fib` body)
+    /// the harness over the `fib` body.)
     const FIRST_LIGHT: &str = "\
 def fib(n: int) -> int:
     a: int = 0

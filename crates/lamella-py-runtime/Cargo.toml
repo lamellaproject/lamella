@@ -7,5 +7,20 @@ license.workspace = true
 authors.workspace = true
 description = "Lamella's Python runtime: the bytecode interpreter, the dynamic object model, and built-ins."
 
+[dependencies]
+# The single shared collector. Python objects live on the same heap as C# objects;
+# the interpreter scans its tagged-value slots by tag through this contract.
+lamella-gc = { path = "../lamella-gc" }
+# The shared bytecode contract (single source of truth): the interpreter executes
+# what the front end emits, so both depend on this one definition of the bytecode.
+lamella-py-bytecode = { path = "../lamella-py-bytecode" }
+
+[dev-dependencies]
+# The front end (lexer/parser/compiler), used ONLY by the `interp-run` example to turn
+# a corpus `.py` into bytecode the interpreter then executes -- the interpreter lane of
+# the Python differential harness. Not a runtime dependency: the interpreter consumes
+# bytecode, never source. No dependency cycle (the front end does not depend on us).
+lamella-py-frontend = { path = "../lamella-py-frontend" }
+
 [lints]
 workspace = true

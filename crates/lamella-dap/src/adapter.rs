@@ -32,6 +32,9 @@ pub struct Debugger {
     /// wipe the source breakpoints.
     source_breakpoints: Vec<u64>,
     instruction_breakpoints: Vec<u64>,
+    /// The inactive (over-capacity) breakpoint count last reported to the user, so the
+    /// run-time "N inactive" note fires only when that count changes -- not on every continue.
+    last_inactive_note: usize,
     out_seq: i64,
 }
 
@@ -65,6 +68,7 @@ impl Debugger {
             running: false,
             source_breakpoints: Vec::new(),
             instruction_breakpoints: Vec::new(),
+            last_inactive_note: 0,
             out_seq: 0,
         }
     }
@@ -205,6 +209,8 @@ impl Debugger {
             .and_then(Json::as_array)
             .cloned()
             .unwrap_or_default();
+        let cap = self.backend.max_breakpoints();
+        let source_count = self.source_breakpoints.len();
         let mut addresses = Vec::new();
         let mut results = Vec::new();
         for spec in &specs {
@@ -216,10 +222,14 @@ impl Debugger {
             match address {
                 Some(base) => {
                     let address = base.wrapping_add(offset as u64);
+                    let armed = cap.map_or(true, |max| source_count + addresses.len() < max);
                     addresses.push(address);
-                    results.push(
-                        json!({ "verified": true, "instructionReference": address.to_string() }),
-                    );
+                    let mut breakpoint =
+                        json!({ "verified": armed, "instructionReference": address.to_string() });
+                    if !armed {
+                        breakpoint["message"] = json!(over_capacity_message(cap));
+                    }
+                    results.push(breakpoint);
                 }
                 None => results.push(json!({ "verified": false })),
             }
@@ -244,6 +254,7 @@ impl Debugger {
             .and_then(Json::as_array)
             .cloned()
             .unwrap_or_default();
+        let cap = self.backend.max_breakpoints();
         let mut addresses = Vec::new();
         let mut results = Vec::new();
         for spec in &specs {
@@ -253,16 +264,21 @@ impl Debugger {
                 .and_then(|line| self.backend.resolve_source_breakpoint(document, line));
             match address {
                 Some(address) => {
+                    let armed = cap.map_or(true, |max| addresses.len() < max);
                     addresses.push(address);
                     let line = self
                         .backend
                         .source_location(address)
                         .map_or(requested.unwrap_or(0), |location| u64::from(location.line));
-                    results.push(json!({
-                        "verified": true,
+                    let mut breakpoint = json!({
+                        "verified": armed,
                         "line": line,
                         "instructionReference": address.to_string(),
-                    }));
+                    });
+                    if !armed {
+                        breakpoint["message"] = json!(over_capacity_message(cap));
+                    }
+                    results.push(breakpoint);
                 }
                 None => results.push(json!({ "verified": false })),
             }
@@ -275,6 +291,9 @@ impl Debugger {
     /// Runs the target for one command and emits the resulting output + stop/terminate
     /// events.
     fn run(&mut self, action: Action, events: &mut Vec<(&'static str, Option<Json>)>) {
+        if matches!(action, Action::Resume) {
+            self.note_inactive_breakpoints(events);
+        }
         let stop = match action {
             Action::Resume => self.backend.resume(),
             Action::StepIn | Action::StepOver | Action::StepOut if self.backend.has_source() => {
@@ -289,6 +308,33 @@ impl Debugger {
             self.flush_output(events);
         } else {
             self.finish(stop, events);
+        }
+    }
+
+    /// Emits a one-line console note when a run will leave breakpoints inactive -- more than
+    /// the target can arm at once -- so a silently-dropped breakpoint never surprises the user
+    /// mid-run. Throttled: fires only when the inactive count changes since the last note.
+    fn note_inactive_breakpoints(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
+        let Some(max) = self.backend.max_breakpoints() else {
+            return;
+        };
+        let total = self.source_breakpoints.len() + self.instruction_breakpoints.len();
+        let inactive = total.saturating_sub(max);
+        if inactive == self.last_inactive_note {
+            return;
+        }
+        self.last_inactive_note = inactive;
+        if inactive > 0 {
+            events.push((
+                "output",
+                Some(json!({
+                    "category": "console",
+                    "output": format!(
+                        "{max} of {total} breakpoints active: this target has {max} hardware \
+                         breakpoints; {inactive} inactive (shown greyed).\n"
+                    ),
+                })),
+            ));
         }
     }
 
@@ -492,6 +538,18 @@ impl Debugger {
     }
 }
 
+/// The message shown on a breakpoint left unverified because the target's hardware
+/// comparators are all in use -- the editor displays it on the greyed breakpoint.
+fn over_capacity_message(cap: Option<usize>) -> String {
+    match cap {
+        Some(max) => format!(
+            "Inactive: this target has {max} hardware breakpoints and they are all in use. \
+             Disable another breakpoint to enable this one."
+        ),
+        None => "Inactive: breakpoint capacity reached.".to_string(),
+    }
+}
+
 /// One execution command, resolved by [`Debugger::run`] into backend calls.
 #[derive(Clone, Copy)]
 enum Action {
@@ -611,6 +669,118 @@ mod tests {
                 .any(|m| matches!(m, Message::Event(e) if e.event == "terminated"))
         );
         assert_eq!(dbg.output_string(), "hi\n");
+    }
+
+    use lamella_debug_backend::{Disassembled, Frame, Register, Variable};
+
+    /// A minimal backend for capacity tests: it resolves source line N to the opaque address
+    /// N and reports a fixed hardware-breakpoint limit. Everything else is an inert stub.
+    struct CapBackend {
+        max: usize,
+    }
+
+    impl DebugBackend for CapBackend {
+        fn launch(&mut self) -> bool {
+            true
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) {}
+        fn max_breakpoints(&self) -> Option<usize> {
+            Some(self.max)
+        }
+        fn resolve_source_breakpoint(&self, _document: &str, line: u32) -> Option<u64> {
+            Some(u64::from(line))
+        }
+        fn stack(&self) -> Vec<Frame> {
+            Vec::new()
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    fn output_note(messages: &[Message]) -> Option<String> {
+        messages.iter().find_map(|m| match m {
+            Message::Event(e) if e.event == "output" => e
+                .body
+                .as_ref()
+                .and_then(|b| b.get("output"))
+                .and_then(Json::as_str)
+                .map(str::to_owned),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn source_breakpoints_past_the_hardware_limit_are_unverified_with_a_message() {
+        let mut dbg = Debugger::with_backend(Box::new(CapBackend { max: 2 }));
+        dbg.handle(&request(1, "launch", None));
+        let out = dbg.handle(&request(
+            2,
+            "setBreakpoints",
+            Some(json!({
+                "source": { "path": "Program.cs" },
+                "breakpoints": [ { "line": 10 }, { "line": 11 }, { "line": 12 } ],
+            })),
+        ));
+        let Message::Response(r) = &out[0] else {
+            panic!("expected a response");
+        };
+        let bps = r.body.as_ref().unwrap()["breakpoints"].as_array().unwrap();
+        assert_eq!(bps.len(), 3);
+        assert_eq!(bps[0]["verified"], json!(true));
+        assert_eq!(bps[1]["verified"], json!(true));
+        assert_eq!(bps[2]["verified"], json!(false));
+        assert!(
+            bps[2]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("hardware breakpoints")),
+            "the over-capacity breakpoint should carry an explanatory message"
+        );
+    }
+
+    #[test]
+    fn continue_notes_inactive_breakpoints_once() {
+        let mut dbg = Debugger::with_backend(Box::new(CapBackend { max: 2 }));
+        dbg.handle(&request(1, "launch", None));
+        dbg.handle(&request(
+            2,
+            "setBreakpoints",
+            Some(json!({
+                "source": { "path": "Program.cs" },
+                "breakpoints": [ { "line": 1 }, { "line": 2 }, { "line": 3 } ],
+            })),
+        ));
+        let first = dbg.handle(&request(3, "continue", None));
+        assert!(
+            output_note(&first).is_some_and(|note| note.contains("inactive")),
+            "the first continue should note the inactive breakpoint"
+        );
+        let second = dbg.handle(&request(4, "continue", None));
+        assert!(
+            output_note(&second).is_none(),
+            "a repeat continue with the same count should not warn again"
+        );
     }
 
     #[test]

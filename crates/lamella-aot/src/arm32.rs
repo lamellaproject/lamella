@@ -1756,20 +1756,20 @@ fn lower_spilled_into(
                 }
             }
             if let Inst::PyIntrinsic {
-                op: lamella_ir::PyOp::Getattr,
+                op: lamella_ir::PyOp::Getattr { name },
                 args,
-                ..
+                cache,
             } = inst
             {
                 let support = py_support.ok_or(LowerError::CallUnsupported)?;
-                let stack_bytes = load_call_args(enc, &func.value_types, &slot, args, 0)?;
-                load_const_word(enc, &mut pool, Reg::R2, support)?;
-                enc.blx(Reg::R2);
+                let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
+                enc.ldr_sp(Reg::R0, slot(receiver))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                load_const_word(enc, &mut pool, Reg::R1, *name)?;
+                load_const_word(enc, &mut pool, Reg::R2, *cache)?;
+                load_const_word(enc, &mut pool, Reg::R3, support)?;
+                enc.blx(Reg::R3);
                 record_safepoint(stack_maps, index, inst_pos, enc.position());
-                if stack_bytes > 0 {
-                    enc.add_sp(stack_bytes)
-                        .map_err(|_| LowerError::TooManyValues)?;
-                }
                 enc.str_sp(Reg::R0, slot(*result))
                     .map_err(|_| LowerError::TooManyValues)?;
                 continue;
@@ -4976,21 +4976,21 @@ mod tests {
     #[test]
     fn lowers_a_py_getattr_to_a_runtime_support_call() {
         let main = Function {
-            params: vec![MirType::PyValue, MirType::PyValue],
+            params: vec![MirType::PyValue],
             ret: Some(MirType::PyValue),
-            value_types: vec![MirType::PyValue, MirType::PyValue, MirType::PyValue],
+            value_types: vec![MirType::PyValue, MirType::PyValue],
             entry: BlockId(0),
             blocks: vec![BasicBlock {
-                params: vec![ValueId(0), ValueId(1)],
+                params: vec![ValueId(0)],
                 insts: vec![(
-                    ValueId(2),
+                    ValueId(1),
                     Inst::PyIntrinsic {
-                        op: lamella_ir::PyOp::Getattr,
-                        args: vec![ValueId(0), ValueId(1)],
+                        op: lamella_ir::PyOp::Getattr { name: 5 },
+                        args: vec![ValueId(0)],
                         cache: 0,
                     },
                 )],
-                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
             }],
         };
         let (code, maps) =

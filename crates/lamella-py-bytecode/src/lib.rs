@@ -3,6 +3,7 @@
 
 //! Lamella's Python bytecode contract -- the single source of truth.
 
+
 extern crate alloc;
 
 use alloc::string::String;
@@ -49,6 +50,16 @@ pub enum BinOp {
     FloorDiv = 3,
     /// `a % b` -- modulo (the result takes the sign of the divisor, per Python).
     Mod = 4,
+    /// `a & b` -- bitwise AND.
+    BitAnd = 5,
+    /// `a | b` -- bitwise OR.
+    BitOr = 6,
+    /// `a ^ b` -- bitwise XOR.
+    BitXor = 7,
+    /// `a << b` -- left shift.
+    LShift = 8,
+    /// `a >> b` -- right shift (arithmetic: Python ints are signed).
+    RShift = 9,
 }
 
 impl BinOp {
@@ -61,6 +72,11 @@ impl BinOp {
             2 => Some(BinOp::Mul),
             3 => Some(BinOp::FloorDiv),
             4 => Some(BinOp::Mod),
+            5 => Some(BinOp::BitAnd),
+            6 => Some(BinOp::BitOr),
+            7 => Some(BinOp::BitXor),
+            8 => Some(BinOp::LShift),
+            9 => Some(BinOp::RShift),
             _ => None,
         }
     }
@@ -101,6 +117,31 @@ impl CmpOp {
     }
 }
 
+/// A unary operator carried by [`Op::Unary`]. Pops the operand and pushes the result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum UnaryOp {
+    /// `-a` -- arithmetic negation (`__neg__`).
+    Neg = 0,
+    /// `+a` -- unary plus (`__pos__`; identity for ints).
+    Pos = 1,
+    /// `~a` -- bitwise inversion (`__invert__`; `-a - 1` for ints).
+    Invert = 2,
+}
+
+impl UnaryOp {
+    /// The operator for a raw byte, or `None` if it is not defined.
+    #[must_use]
+    pub fn from_u8(byte: u8) -> Option<UnaryOp> {
+        match byte {
+            0 => Some(UnaryOp::Neg),
+            1 => Some(UnaryOp::Pos),
+            2 => Some(UnaryOp::Invert),
+            _ => None,
+        }
+    }
+}
+
 /// One bytecode instruction -- the decoded, in-memory form the interpreter
 /// dispatches and the lowering walks. The set is deliberately small and orthogonal
 /// for first light; it grows behind the version stamp as the language surface
@@ -113,7 +154,7 @@ pub enum Op {
     LoadFast(u32),
     /// Pop and store into the local variable in slot `idx`.
     StoreFast(u32),
-    /// Push the global or built-in named `names[idx]`.
+    /// Push the global or built-in named `names[idx]`. DEFINED for completeness
     LoadGlobal(u32),
     /// Pop an object and push `getattr(object, names[name])` -- the one dynamic
     /// operation in first light, lowering to the `py_getattr` intrinsic. `cache` is
@@ -128,6 +169,8 @@ pub enum Op {
     Binary(BinOp),
     /// Pop the right operand then the left, and push the boolean `left <cmp> right`.
     Compare(CmpOp),
+    /// Pop the operand and push `<op> operand`.
+    Unary(UnaryOp),
     /// Pop and discard the top of the stack -- used after an expression statement
     /// whose value is unused.
     PopTop,
@@ -154,8 +197,7 @@ pub enum Const {
     /// `True` or `False`.
     Bool(bool),
     /// An integer literal. First light keeps it in an `i64`; the interpreter
-    /// materializes it as a tagged 31-bit fixnum (overflow to a heap bignum is
-    /// deferred past first light, per the seams contract).
+    /// materializes it as a tagged 31-bit fixnum
     Int(i64),
     /// A string literal (reserved; the first-light subset does not lex strings yet,
     /// but the pool holds them so the format need not change to add them).
@@ -340,6 +382,10 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(6);
             buf.push(*c as u8);
         }
+        Op::Unary(u) => {
+            buf.push(12);
+            buf.push(*u as u8);
+        }
         Op::PopTop => buf.push(7),
         Op::Jump(t) => {
             buf.push(8);
@@ -519,6 +565,10 @@ impl<'a> Reader<'a> {
             9 => Op::PopJumpIfFalse(self.u32()?),
             10 => Op::Call(self.u32()?),
             11 => Op::Return,
+            12 => {
+                let u = self.u8()?;
+                Op::Unary(UnaryOp::from_u8(u).ok_or(DecodeError::BadTag("UnaryOp", u))?)
+            }
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -676,13 +726,17 @@ mod tests {
 
     #[test]
     fn selector_bytes_round_trip() {
-        for byte in 0u8..=4 {
+        for byte in 0u8..=9 {
             assert_eq!(BinOp::from_u8(byte).unwrap() as u8, byte);
         }
         for byte in 0u8..=5 {
             assert_eq!(CmpOp::from_u8(byte).unwrap() as u8, byte);
         }
-        assert_eq!(BinOp::from_u8(5), None);
+        for byte in 0u8..=2 {
+            assert_eq!(UnaryOp::from_u8(byte).unwrap() as u8, byte);
+        }
+        assert_eq!(BinOp::from_u8(10), None);
         assert_eq!(CmpOp::from_u8(6), None);
+        assert_eq!(UnaryOp::from_u8(3), None);
     }
 }

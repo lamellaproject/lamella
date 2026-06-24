@@ -984,6 +984,29 @@ pub(crate) fn emit_value_type_receiver(
         BoundExprKind::This | BoundExprKind::Base => {
             emit_expression(receiver, frame, tokens, out)
         }
+        BoundExprKind::ElementAccess {
+            receiver: array,
+            indices,
+        } => {
+            emit_expression(array, frame, tokens, out)?;
+            for index in indices {
+                emit_expression(index, frame, tokens, out)?;
+            }
+            if indices.len() == 1 {
+                let element = tokens
+                    .type_token(&receiver.ty)
+                    .ok_or(EmitError::Unsupported("ldelema element type has no token"))?;
+                out.push(Instruction::new(Opcode::Ldelema, Operand::Token(element)));
+            } else {
+                let token = tokens
+                    .method(&array.ty, "Address", &array_int_params(indices.len()))
+                    .ok_or(EmitError::Unsupported(
+                        "rectangular-array Address method (ref a[i,j])",
+                    ))?;
+                out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+            }
+            Ok(())
+        }
         _ => {
             emit_expression(receiver, frame, tokens, out)?;
             let slot = frame.reserve_local(&receiver.ty);
@@ -1036,9 +1059,29 @@ fn emit_step_expression(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     let BoundExprKind::Local(name) = &operand.kind else {
-        return Err(EmitError::Unsupported(
-            "++/-- of a non-local in expression position is not lowered yet",
-        ));
+        let step_name = if increment { "op_Increment" } else { "op_Decrement" };
+        if tokens
+            .method(&operand.ty, step_name, core::slice::from_ref(&operand.ty))
+            .is_some()
+        {
+            return Err(EmitError::Unsupported(
+                "user-defined ++/-- of a non-local in expression position",
+            ));
+        }
+        let leave = if postfix {
+            crate::method::Leave::Old
+        } else {
+            crate::method::Leave::New
+        };
+        return crate::method::emit_compound(
+            operand,
+            crate::method::step_operator(increment),
+            None,
+            frame,
+            tokens,
+            out,
+            leave,
+        );
     };
     if frame.byref(name).is_some() {
         return Err(EmitError::Unsupported(

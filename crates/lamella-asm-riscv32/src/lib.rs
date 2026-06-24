@@ -27,6 +27,8 @@ impl Reg {
     pub const A0: Reg = Reg(10);
     /// Argument `x11` (`a1`).
     pub const A1: Reg = Reg(11);
+    /// Argument / syscall number `x17` (`a7`) -- the syscall id for an `ecall`.
+    pub const A7: Reg = Reg(17);
 
     /// Creates a register from its number, or `None` if `number > 31`.
     #[must_use]
@@ -99,6 +101,9 @@ pub struct Assembled {
 enum Fixup {
     Branch,
     Jump,
+    /// `la rd, label`: the auipc (hi20) at the site and the addi (lo12) at site+4 of a PC-relative
+    /// address load, patched together as one pair.
+    PcRel,
 }
 
 /// Accumulates RV32IM machine code and the label references into it.
@@ -140,6 +145,12 @@ impl Encoder {
     /// Appends one 32-bit instruction word, little-endian.
     pub fn emit_word(&mut self, word: u32) {
         self.bytes.extend_from_slice(&word.to_le_bytes());
+    }
+
+    /// Appends raw, already-assembled bytes (e.g. an embedded stub) into the stream. Their internal
+    /// references must be self-contained -- this encoder's fixups do not reach inside them.
+    pub fn emit_bytes(&mut self, bytes: &[u8]) {
+        self.bytes.extend_from_slice(bytes);
     }
 
     fn r_type(&mut self, funct7: u32, rs2: Reg, rs1: Reg, funct3: u32, rd: Reg, opcode: u32) {
@@ -263,6 +274,22 @@ impl Encoder {
         self.emit_word(((imm20 & 0xfffff) << 12) | (u32::from(rd.number()) << 7) | 0x37);
     }
 
+    /// `auipc rd, imm20` -- rd = pc + (imm20 << 12); the PC-relative high half of an address load.
+    pub fn auipc(&mut self, rd: Reg, imm20: u32) {
+        self.emit_word(((imm20 & 0xfffff) << 12) | (u32::from(rd.number()) << 7) | 0x17);
+    }
+
+    /// `la rd, label` -- load the (PC-relative) address of `label` into `rd`, as the standard
+    /// `auipc rd, %pcrel_hi(label)` + `addi rd, rd, %pcrel_lo(label)` pair (resolved at `finish`).
+    /// Position-independent, so it addresses an in-image datum (e.g. a GC TypeDesc) wherever the
+    /// image loads.
+    pub fn la(&mut self, rd: Reg, label: Label) {
+        let site = self.position();
+        self.auipc(rd, 0);
+        self.fixups.push((site, Fixup::PcRel, label.0));
+        self.i_type(0, rd, 0, rd, 0x13);
+    }
+
     /// `lw rd, imm(rs1)` -- load a word.
     pub fn lw(&mut self, rd: Reg, rs1: Reg, imm: i32) {
         self.i_type(imm, rs1, 2, rd, 0x03);
@@ -345,6 +372,27 @@ impl Encoder {
                 .and_then(|p| *p)
                 .ok_or(AssembleError::UnboundLabel(Label(label)))?;
             let offset = target as i64 - site as i64;
+            if let Fixup::PcRel = fixup {
+                let lo12 = (offset & 0xfff) as u32;
+                let hi20 = (((offset + 0x800) >> 12) & 0xfffff) as u32;
+                let s = site as usize;
+                let auipc = u32::from_le_bytes([
+                    self.bytes[s],
+                    self.bytes[s + 1],
+                    self.bytes[s + 2],
+                    self.bytes[s + 3],
+                ]) | (hi20 << 12);
+                self.bytes[s..s + 4].copy_from_slice(&auipc.to_le_bytes());
+                let a = s + 4;
+                let addi = u32::from_le_bytes([
+                    self.bytes[a],
+                    self.bytes[a + 1],
+                    self.bytes[a + 2],
+                    self.bytes[a + 3],
+                ]) | (lo12 << 20);
+                self.bytes[a..a + 4].copy_from_slice(&addi.to_le_bytes());
+                continue;
+            }
             let base = u32::from_le_bytes([
                 self.bytes[site as usize],
                 self.bytes[site as usize + 1],
@@ -372,6 +420,7 @@ impl Encoder {
                         | ((off >> 11) & 1) << 20
                         | ((off >> 12) & 0xff) << 12
                 }
+                Fixup::PcRel => unreachable!("PcRel is patched before this match"),
             };
             let patched = (base | imm).to_le_bytes();
             self.bytes[site as usize..site as usize + 4].copy_from_slice(&patched);
@@ -419,5 +468,18 @@ mod tests {
         assert_eq!(&bytes[4..8], &0x0262_d533u32.to_le_bytes());
         assert_eq!(&bytes[8..12], &0x0262_e533u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &0x0262_f533u32.to_le_bytes());
+    }
+
+    #[test]
+    fn la_loads_a_pc_relative_label_address() {
+        let mut enc = Encoder::new();
+        let data = enc.new_label();
+        enc.la(Reg::A0, data);
+        enc.ret();
+        enc.bind_label(data);
+        enc.emit_word(0xDEAD_BEEF);
+        let bytes = enc.finish().unwrap().bytes;
+        assert_eq!(&bytes[0..4], &0x0000_0517u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0x00c5_0513u32.to_le_bytes());
     }
 }

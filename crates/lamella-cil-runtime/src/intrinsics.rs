@@ -2886,6 +2886,83 @@ pub fn double_to_fixed(
     Ok(Some(alloc_str(vm, &text)))
 }
 
+/// Renders `value` in .NET exponential ("E"/"e") format: a normalized mantissa carrying `precision`
+/// fractional digits, then the `E`/`e` letter, a mandatory sign, and an exponent of at least three
+/// digits (e.g. `1.234500E+003`). Rust's `{:e}` supplies the value-accurate normalized digits (the
+/// same float engine the F/G formatters use, which match .NET); only the exponent's sign-and-width
+/// layout is reshaped to .NET's. Specials spell out as `NaN` / `Infinity` / `-Infinity`.
+#[cfg(feature = "float")]
+fn format_exponential(value: f64, precision: usize, upper: bool) -> String {
+    if value.is_nan() {
+        return String::from("NaN");
+    }
+    if value.is_infinite() {
+        return String::from(if value < 0.0 { "-Infinity" } else { "Infinity" });
+    }
+    let raw = format!("{value:.precision$e}");
+    let Some((mantissa, exponent)) = raw.split_once('e') else {
+        return raw;
+    };
+    let exp = exponent.parse::<i32>().unwrap_or(0);
+    let exp_char = if upper { 'E' } else { 'e' };
+    let exp_sign = if exp < 0 { '-' } else { '+' };
+    format!("{mantissa}{exp_char}{exp_sign}{:03}", exp.unsigned_abs())
+}
+
+/// `System.Double.ToExponential(double, int, bool)`: the "E"/"e" exponential rendering (the managed
+/// formatter's exponential body; `upper` selects the `E`/`e` letter case).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `this` is not a `Double`.
+#[cfg(feature = "float")]
+pub fn double_to_exponential(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = match args.first() {
+        Some(&Value::Float(value)) => value,
+        Some(&Value::Object(reference)) => match vm.heap().boxed_value(reference) {
+            Some(Value::Float(value)) => value,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        },
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let precision = match args.get(1) {
+        Some(&Value::Int32(precision)) => precision.max(0) as usize,
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let upper = matches!(args.get(2), Some(&Value::Int32(flag)) if flag != 0);
+    Ok(Some(alloc_str(vm, &format_exponential(value, precision, upper))))
+}
+
+/// `System.Single.ToExponential(float, int, bool)`: the "E"/"e" exponential rendering for a Single
+/// (widened to f64 exactly, like the Single "F" body).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `this` is not a `Single`.
+#[cfg(feature = "float")]
+pub fn single_to_exponential(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = match args.first() {
+        Some(&Value::Single(value)) => value,
+        Some(&Value::Object(reference)) => match vm.heap().boxed_value(reference) {
+            Some(Value::Single(value)) => value,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        },
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let precision = match args.get(1) {
+        Some(&Value::Int32(precision)) => precision.max(0) as usize,
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let upper = matches!(args.get(2), Some(&Value::Int32(flag)) if flag != 0);
+    Ok(Some(alloc_str(vm, &format_exponential(f64::from(value), precision, upper))))
+}
+
 /// `System.Single::ParseValid(string)`: the numeric conversion behind the managed `Single.Parse` /
 /// `TryParse`, which have ALREADY validated the format (so the only work left is the
 /// decimal-to-nearest-single rounding managed C# cannot do without `unsafe`). Recognizes the .NET
@@ -3668,35 +3745,259 @@ pub fn type_get_fields(
     let Some(&Value::NativeInt(handle)) = args.first() else {
         return Err(Trap::TypeMismatch(Opcode::Callvirt));
     };
-    const INSTANCE: i32 = 0x04;
-    const STATIC: i32 = 0x08;
-    const PUBLIC: i32 = 0x10;
-    const NON_PUBLIC: i32 = 0x20;
     let flags = match args.get(1) {
         Some(&Value::Int32(value)) => value,
-        _ => PUBLIC | INSTANCE | STATIC,
-    };
-    let wanted = |is_static: bool, is_public: bool| {
-        let scope = if is_static {
-            flags & STATIC != 0
-        } else {
-            flags & INSTANCE != 0
-        };
-        let visibility = if is_public {
-            flags & PUBLIC != 0
-        } else {
-            flags & NON_PUBLIC != 0
-        };
-        scope && visibility
+        _ => 0x04 | 0x08 | 0x10,
     };
     let elements: Vec<Value> = module
         .type_fields(handle as u64)
         .iter()
-        .filter(|field| wanted(field.is_static, field.is_public))
+        .filter(|field| binding_flags_match(flags, field.is_static, field.is_public))
         .map(|field| Value::NativeInt(field.handle as i64))
         .collect();
     let array = vm.heap_mut().alloc_array(elements);
     Ok(Some(Value::Object(array)))
+}
+
+/// Whether a member with the given static / visibility bits matches the `BindingFlags` value
+/// (an int-backed enum). Shared by `GetFields` / `GetMethods`. The parameterless overloads default
+/// to `Public | Instance | Static`.
+#[cfg(feature = "NETMFv4_4")]
+fn binding_flags_match(flags: i32, is_static: bool, is_public: bool) -> bool {
+    const INSTANCE: i32 = 0x04;
+    const STATIC: i32 = 0x08;
+    const PUBLIC: i32 = 0x10;
+    const NON_PUBLIC: i32 = 0x20;
+    let scope = if is_static {
+        flags & STATIC != 0
+    } else {
+        flags & INSTANCE != 0
+    };
+    let visibility = if is_public {
+        flags & PUBLIC != 0
+    } else {
+        flags & NON_PUBLIC != 0
+    };
+    scope && visibility
+}
+
+/// `System.Type.GetMethods(BindingFlags)` (and the parameterless overload): the type's methods
+/// (constructors excluded, matching .NET) that match the binding flags, as a `MethodInfo[]` of
+/// method handles. Only DECLARED methods are modeled, so a caller wanting .NET parity on a derived
+/// type passes `BindingFlags.DeclaredOnly`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn type_get_methods(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let flags = match args.get(1) {
+        Some(&Value::Int32(value)) => value,
+        _ => 0x04 | 0x08 | 0x10,
+    };
+    let elements: Vec<Value> = module
+        .type_methods(handle as u64)
+        .iter()
+        .filter(|method| binding_flags_match(flags, method.is_static, method.is_public))
+        .map(|method| Value::NativeInt(method.handle as i64))
+        .collect();
+    let array = vm.heap_mut().alloc_array(elements);
+    Ok(Some(Value::Object(array)))
+}
+
+/// `System.Reflection.FieldInfo.get_FieldType` (`FieldInfo.FieldType`) and
+/// `System.Reflection.MethodInfo.get_ReturnType` (`MethodInfo.ReturnType`): the member's type as a
+/// `Type` (its asm-folded handle). The loader recorded each member's type at load. Null when the
+/// type was not resolvable as a `Type` handle (an array / pointer / unresolved cross-assembly type
+/// -- not modeled yet); the common primitive / string / object / same-assembly class+struct cases
+/// resolve.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a member handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn member_get_type(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    Ok(Some(match module.member_type(handle as u64) {
+        Some(type_handle) => Value::NativeInt(type_handle as i64),
+        None => Value::Null,
+    }))
+}
+
+/// `System.Type.get_BaseType` (`Type.BaseType`): the type's base class as a `Type`, or null for an
+/// interface or `System.Object`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn type_get_base_type(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let info = reflect_type_of(module, args)?;
+    Ok(Some(if info.base_handle == 0 {
+        Value::Null
+    } else {
+        Value::NativeInt(info.base_handle as i64)
+    }))
+}
+
+/// Reads a `MethodBase.Is*` predicate from the receiver method's recorded `MethodAttributes`.
+#[cfg(feature = "NETMFv4_4")]
+fn method_attr_bit(
+    module: &Module,
+    args: &[Value],
+    pick: impl Fn(u32) -> bool,
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let attrs = module.method_attrs(handle as u64).unwrap_or(0);
+    Ok(Some(Value::Int32(i32::from(pick(attrs)))))
+}
+
+/// `System.Reflection.MethodBase.get_IsPublic` (`MethodAttributes` access == `Public`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a method handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_is_public(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    method_attr_bit(module, args, |attrs| attrs & 0x0007 == 0x0006)
+}
+
+/// `System.Reflection.MethodBase.get_IsStatic` (`MethodAttributes.Static`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a method handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_is_static(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    method_attr_bit(module, args, |attrs| attrs & 0x0010 != 0)
+}
+
+/// `System.Reflection.MethodBase.get_IsFinal` (`MethodAttributes.Final`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a method handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_is_final(_vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    method_attr_bit(module, args, |attrs| attrs & 0x0020 != 0)
+}
+
+/// `System.Reflection.MethodBase.get_IsVirtual` (`MethodAttributes.Virtual`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a method handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_is_virtual(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    method_attr_bit(module, args, |attrs| attrs & 0x0040 != 0)
+}
+
+/// `System.Reflection.MethodBase.get_IsAbstract` (`MethodAttributes.Abstract`).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a method handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_is_abstract(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    method_attr_bit(module, args, |attrs| attrs & 0x0400 != 0)
+}
+
+/// `System.Reflection.Assembly.GetType(string)`: the type named `name` (a full `namespace.name`)
+/// as a `Type` handle, or null if no such type is recorded. The assembly receiver is not scoped --
+/// the name resolves across the loaded assemblies (corlib first) -- which suffices for the single
+/// program + corlib model.
+///
+/// # Errors
+/// Never errors (a missing type or non-string argument yields null).
+#[cfg(feature = "NETMFv4_4")]
+pub fn assembly_get_type(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(name) = string_value(vm, args.get(1)) else {
+        return Ok(Some(Value::Null));
+    };
+    Ok(Some(match module.type_handle_by_name(&name) {
+        Some(handle) => Value::NativeInt(handle as i64),
+        None => Value::Null,
+    }))
+}
+
+/// The asm-folded handle a `Type` / `Assembly` reference argument carries (a native int), or 0 for
+/// null. Reflection references are token-only handles, so reference identity is handle equality.
+#[cfg(feature = "NETMFv4_4")]
+fn reflect_handle(arg: Option<&Value>) -> i64 {
+    match arg {
+        Some(&Value::NativeInt(handle)) => handle,
+        _ => 0,
+    }
+}
+
+/// Canonicalizes a reflection handle for `==`/`!=`. A `Type` reference can arrive via different
+/// tokens for the SAME type (a `TypeRef` vs the defining `TypeDef`, across assemblies -- e.g. a
+/// program's `typeof(int)` vs the corlib `Int32` a field's `FieldType` / a boxed value's `GetType`
+/// resolves to). Resolving each handle to the type's defining-`TypeDef` handle makes `Type ==`
+/// exact type identity, matching .NET's reference equality. A non-type handle (a member's `Field`/
+/// `MethodDef` token, an `Assembly`, an untracked array/pointer `TypeSpec`) has no `TypeId` and is
+/// compared by its own token -- which is exactly the member/assembly identity reflection wants.
+#[cfg(feature = "NETMFv4_4")]
+fn canonical_reflect_handle(module: &Module, handle: i64) -> i64 {
+    module
+        .type_id_by_handle(handle as u64)
+        .and_then(|type_id| module.type_handle_of(type_id))
+        .map_or(handle, |canonical| canonical as i64)
+}
+
+/// `System.Type.op_Equality` / `System.Reflection.{MemberInfo,FieldInfo,MethodInfo,Assembly}
+/// .op_Equality` (.NET overloads `==`/`!=` on all of them): reference identity over the canonical
+/// handle.
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "NETMFv4_4")]
+pub fn reflect_handle_equals(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let left = canonical_reflect_handle(module, reflect_handle(args.first()));
+    let right = canonical_reflect_handle(module, reflect_handle(args.get(1)));
+    Ok(Some(Value::Int32(i32::from(left == right))))
+}
+
+/// `op_Inequality` for the reflection references (the complement of [`reflect_handle_equals`]).
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "NETMFv4_4")]
+pub fn reflect_handle_not_equals(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let left = canonical_reflect_handle(module, reflect_handle(args.first()));
+    let right = canonical_reflect_handle(module, reflect_handle(args.get(1)));
+    Ok(Some(Value::Int32(i32::from(left != right))))
 }
 
 /// `System.Reflection.FieldInfo.GetValue(object obj)`: the value of this field on `obj` (or the
@@ -3874,6 +4175,85 @@ pub fn activator_create_instance(
         }
         None => Ok(()),
     };
+    #[cfg(feature = "gc")]
+    vm.resume_collection();
+    outcome.map(|()| Some(Value::Object(instance)))
+}
+
+/// `System.Type.GetConstructor(Type[])`: the instance constructor whose parameter count matches the
+/// length of the `Type[]`, as a `ConstructorInfo` handle, or null. Matched by ARITY (a type rarely
+/// has two constructors of the same arity; exact per-parameter type matching is deferred -- it would
+/// need cross-assembly type identity).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle.
+#[cfg(feature = "NETMFv4_4")]
+pub fn type_get_constructor(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let arity = match args.get(1) {
+        Some(&Value::Object(array)) => vm.heap().array_len(array).unwrap_or(0),
+        _ => 0,
+    };
+    let ctor = module
+        .type_ctors_list(handle as u64)
+        .iter()
+        .find(|(_, count)| *count == arity)
+        .map(|(ctor_handle, _)| *ctor_handle);
+    Ok(Some(match ctor {
+        Some(ctor_handle) => Value::NativeInt(ctor_handle as i64),
+        None => Value::Null,
+    }))
+}
+
+/// `System.Reflection.ConstructorInfo.Invoke(object[])`: allocates a new instance of the
+/// constructor's declaring type and runs the constructor with the (unboxed) parameters, returning
+/// the new object. Like `Activator.CreateInstance` but for a specific constructor with arguments.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a constructor handle with a recorded layout;
+/// propagates a [`Trap`] from running the constructor.
+#[cfg(feature = "NETMFv4_4")]
+pub fn constructor_invoke(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let method_id = module
+        .resolve_by_handle(handle as u64)
+        .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
+    let type_id = module
+        .method_type(method_id)
+        .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
+    let defaults = module
+        .type_field_defaults(type_id)
+        .map(|fields| fields.to_vec())
+        .unwrap_or_default();
+    let mut params: Vec<Value> = Vec::new();
+    if let Some(&Value::Object(array)) = args.get(1) {
+        let len = vm.heap().array_len(array).unwrap_or(0);
+        for index in 0..len {
+            let element = vm.heap().array_get(array, index).unwrap_or(Value::Null);
+            params.push(unbox_reflect_arg(vm, element));
+        }
+    }
+    #[cfg(feature = "gc")]
+    vm.suspend_collection();
+    let instance = vm.heap_mut().alloc_instance(type_id, defaults);
+    let mut ctor_args = Vec::with_capacity(params.len() + 1);
+    ctor_args.push(Value::Object(instance));
+    ctor_args.extend(params);
+    let outcome = Session::new(module, method_id, ctor_args)
+        .and_then(|mut session| session.run(module, vm))
+        .map(|_| ());
     #[cfg(feature = "gc")]
     vm.resume_collection();
     outcome.map(|()| Some(Value::Object(instance)))

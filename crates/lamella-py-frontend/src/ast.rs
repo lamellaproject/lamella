@@ -19,6 +19,16 @@ pub enum BinOp {
     FloorDiv,
     /// `%`
     Mod,
+    /// `&`
+    BitAnd,
+    /// `|`
+    BitOr,
+    /// `^`
+    BitXor,
+    /// `<<`
+    LShift,
+    /// `>>`
+    RShift,
 }
 
 /// A comparison operator (`== != < <= > >=`).
@@ -36,6 +46,26 @@ pub enum CmpOp {
     Gt,
     /// `>=`
     Ge,
+}
+
+/// A unary operator (`- + ~`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    /// `-a` -- arithmetic negation.
+    Neg,
+    /// `+a` -- unary plus (identity for ints).
+    Pos,
+    /// `~a` -- bitwise inversion.
+    Invert,
+}
+
+/// A short-circuiting boolean operator (`and`, `or`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoolOp {
+    /// `a and b` -- evaluates `b` only if `a` is truthy.
+    And,
+    /// `a or b` -- evaluates `b` only if `a` is falsey.
+    Or,
 }
 
 /// An expression.
@@ -65,6 +95,38 @@ pub enum Expr {
         lhs: Box<Expr>,
         /// The right operand.
         rhs: Box<Expr>,
+    },
+    /// A unary expression, `<op> operand`.
+    Unary {
+        /// The operator.
+        op: UnaryOp,
+        /// The operand.
+        operand: Box<Expr>,
+    },
+    /// A short-circuiting boolean expression, `lhs and rhs` / `lhs or rhs`. The result
+    /// is one of the operand values (not coerced to a bool), per Python.
+    BoolBinary {
+        /// The operator.
+        op: BoolOp,
+        /// The left operand (always evaluated).
+        lhs: Box<Expr>,
+        /// The right operand (evaluated only when the operator does not short-circuit).
+        rhs: Box<Expr>,
+    },
+    /// A logical negation, `not operand` -- always a boolean (`0`/`1`).
+    Not {
+        /// The operand whose truthiness is negated.
+        operand: Box<Expr>,
+    },
+    /// A conditional expression, `body if test else orelse` -- evaluates and yields
+    /// `body` when `test` is truthy, otherwise `orelse`.
+    Conditional {
+        /// The condition.
+        test: Box<Expr>,
+        /// The value when the condition is truthy.
+        body: Box<Expr>,
+        /// The value when the condition is falsey.
+        orelse: Box<Expr>,
     },
     /// A single comparison, `lhs <op> rhs`. First light does not chain
     /// comparisons (`a < b < c`).
@@ -111,6 +173,18 @@ pub enum Stmt {
     While {
         /// The condition, tested before each iteration.
         test: Expr,
+        /// The loop body.
+        body: Vec<Stmt>,
+    },
+    /// A `for` loop over `range(...)` (first light's only iterable): the loop variable
+    /// runs `start, start+1, ..., stop-1`. `start` and `stop` are evaluated once.
+    For {
+        /// The loop variable, bound to each value in turn.
+        target: String,
+        /// The inclusive lower bound (`range`'s start; `0` for `range(stop)`).
+        start: Expr,
+        /// The exclusive upper bound (`range`'s stop).
+        stop: Expr,
         /// The loop body.
         body: Vec<Stmt>,
     },

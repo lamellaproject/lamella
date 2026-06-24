@@ -501,6 +501,8 @@ impl Binder {
     /// enumerator pattern (15.8.4): a block that declares the enumerator, then
     /// `while (e.MoveNext())` whose body binds `name = (V)e.Current` ahead of the original
     /// body. `None` when the collection has no `GetEnumerator` (the array/error path is kept).
+    /// The `Dispose` finally is not emitted yet -- the supported collections' enumerators have
+    /// a no-op Dispose, so it is not observable; it is a tracked follow-up.
     fn bind_for_each_enumerable(
         &mut self,
         span: Span,

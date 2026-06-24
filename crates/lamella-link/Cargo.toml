@@ -1,0 +1,14 @@
+[package]
+name = "lamella-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Lamella's own static linker: resolve symbols, lay out sections, apply relocations."
+
+[dependencies]
+lamella-elf = { path = "../lamella-elf" }
+
+[lints]
+workspace = true
