@@ -128,6 +128,25 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
     Ok((image, debug))
 }
 
+/// Compiles a CIL assembly to ONE ARM/Thumb relocatable ELF object through the RELOCATING path
+/// ([`arm32::lower_object`]): every method becomes a `STT_FUNC` symbol named `f<rid>` (so `f0` is the
+/// startup -> `.cctor`s -> `Main`), cross-method calls become `R_ARM_THM_CALL` relocations, and any
+/// soft-float helper a float op needs is an undefined `__aeabi_*` extern. A linker turns this into a
+/// runnable image -- the bare-metal [`build_cortex_m`] resolves everything itself into a flat blob,
+/// whereas this object path carries the call graph + the relocation-dependent features (float,
+/// function pointers, native calls) the linker resolves. Emitting the object stays linker-free (the
+/// driver/examples own the link step); the `hosted-csharp-arm` example links + runs the result.
+#[cfg(feature = "arm32")]
+pub fn build_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let entry = find_main(&assembly);
+    let funcs = lower_assembly(&assembly, entry);
+    let names: Vec<alloc::string::String> =
+        (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    arm32::lower_object(&funcs, &name_refs, &[]).map_err(BuildError::LowerArm)
+}
+
 /// The MethodDef row of a static `Main` (the run-once widget entry), if the assembly has one.
 fn find_main(assembly: &Assembly) -> Option<u32> {
     for type_def in assembly.type_defs() {
@@ -138,6 +157,20 @@ fn find_main(assembly: &Assembly) -> Option<u32> {
         }
     }
     None
+}
+
+/// Every type initializer (`.cctor`) in the assembly, by `MethodDef` rid, in metadata order. The
+/// startup runs these before `Main` so static field initializers (`static int X = 5;`) take effect.
+fn find_cctors(assembly: &Assembly) -> Vec<u32> {
+    let mut cctors = Vec::new();
+    for type_def in assembly.type_defs() {
+        for method in type_def.methods() {
+            if method.is_static() && method.name() == Some(".cctor") {
+                cctors.push(method.rid());
+            }
+        }
+    }
+    cctors
 }
 
 /// The MIR type the AOT lowers a metadata signature type as.
@@ -180,23 +213,39 @@ fn stub() -> Function {
     }
 }
 
-/// `fn() -> i32 { return entry(); }` at index 0, exported as `main`.
-fn trampoline(entry_rid: u32) -> Function {
+/// The program startup at index 0 (exported as `main`): runs each type initializer (`.cctor`) for
+/// its side effects, then `return entry()`. With no `.cctor`s this is just `return entry()` -- the
+/// plain trampoline. Eager static init before `main` is spec-compliant for the `beforefieldinit`
+/// types the C# compiler emits for field initializers; precise lazy (before-first-access) init is a
+/// follow-on.
+fn startup(cctors: &[u32], entry_rid: u32) -> Function {
+    let mut insts = Vec::with_capacity(cctors.len() + 1);
+    for (i, &cctor) in cctors.iter().enumerate() {
+        insts.push((
+            ValueId(i as u32),
+            Inst::Call {
+                callee: cctor,
+                args: Vec::new(),
+            },
+        ));
+    }
+    let result = ValueId(cctors.len() as u32);
+    insts.push((
+        result,
+        Inst::Call {
+            callee: entry_rid,
+            args: Vec::new(),
+        },
+    ));
     Function {
         params: Vec::new(),
         ret: Some(MirType::I32),
-        value_types: vec![MirType::I32],
+        value_types: vec![MirType::I32; cctors.len() + 1],
         entry: BlockId(0),
         blocks: vec![BasicBlock {
             params: Vec::new(),
-            insts: vec![(
-                ValueId(0),
-                Inst::Call {
-                    callee: entry_rid,
-                    args: Vec::new(),
-                },
-            )],
-            terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            insts,
+            terminator: Some(Terminator::Return(Some(result))),
         }],
     }
 }
@@ -228,7 +277,7 @@ fn lower_assembly_debug(
         .map(|_| cil::CilSourceMap(Vec::new()))
         .collect();
     if let Some(entry_rid) = entry {
-        funcs[0] = trampoline(entry_rid);
+        funcs[0] = startup(&find_cctors(assembly), entry_rid);
     }
     let resolver = MetadataResolver::new(assembly);
     for (rid, method) in &methods {
@@ -311,4 +360,25 @@ mod tests {
             Err(BuildError::Parse)
         ));
     }
+
+    #[test]
+    fn startup_runs_cctors_before_main() {
+        let f = startup(&[5, 7], 3);
+        let callees: Vec<u32> = f.blocks[0]
+            .insts
+            .iter()
+            .filter_map(|(_, inst)| match inst {
+                Inst::Call { callee, .. } => Some(*callee),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(callees, vec![5, 7, 3], "each .cctor, then Main");
+        assert!(matches!(
+            f.blocks[0].terminator,
+            Some(Terminator::Return(Some(_)))
+        ));
+        assert_eq!(startup(&[], 3).blocks[0].insts.len(), 1);
+        assert!(lamella_ir::verify(&f).is_ok());
+    }
+
 }

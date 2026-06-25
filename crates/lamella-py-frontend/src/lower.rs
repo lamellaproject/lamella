@@ -14,7 +14,7 @@ use lamella_ir::{
 use lamella_py_bytecode as bc;
 
 /// Why a code object could not be lowered to MIR. Most variants mark a construct
-/// outside the first-light typed subset rather than a true error.
+/// outside the typed subset rather than a true error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LowerError {
     /// An op needed more operands than the abstract stack held.
@@ -26,16 +26,16 @@ pub enum LowerError {
     BadConstIndex(u32),
     /// A local slot index was out of range.
     BadLocalIndex(u32),
-    /// An integer literal did not fit first light's `i32` typed integer.
+    /// An integer literal did not fit the typed integer (`i32`).
     IntLiteralTooLarge(i64),
     /// A non-integer constant in the typed path (`None`/`True`/`False`/string); not
-    /// yet lowered for first light.
+    /// lowered in the typed integer path.
     UnsupportedConst,
-    /// Arithmetic or comparison on a dynamic (non-`I32`) operand; first light's
-    /// dynamic surface is attribute access only.
+    /// Arithmetic or comparison on a dynamic (non-`I32`) operand; the typed path
+    /// handles integer operands only.
     DynamicOperation,
     /// A global name resolved to no user function in this module (e.g. a builtin like
-    /// `print`); first light lowers only intra-module calls.
+    /// `print`); only intra-module calls are lowered in the typed path.
     UnresolvedGlobal(String),
     /// A name-pool index was out of range.
     BadNameIndex(u32),
@@ -57,11 +57,11 @@ pub enum LowerError {
     ReturnTypeMismatch,
     /// Control fell off the end of the body (a function body that does not return).
     RunsOffEnd,
-    /// A non-parameter local was not an integer, so it has no first-light default to
+    /// A non-parameter local was not an integer, so it has no typed-path default to
     /// initialize it with at entry.
     UnsupportedLocalType(usize),
     /// A non-merge block was reached before its single predecessor was lowered -- an
-    /// irreducible control-flow shape.
+    /// irreducible control-flow shape the structured subset does not emit.
     UnsupportedControlFlow,
 }
 
@@ -73,13 +73,13 @@ impl core::fmt::Display for LowerError {
             LowerError::BadConstIndex(i) => write!(f, "constant index {i} out of range"),
             LowerError::BadLocalIndex(i) => write!(f, "local index {i} out of range"),
             LowerError::IntLiteralTooLarge(v) => {
-                write!(f, "integer literal {v} does not fit first light's i32")
+                write!(f, "integer literal {v} does not fit the typed i32")
             }
             LowerError::UnsupportedConst => {
-                f.write_str("non-integer constant is not lowered for first light")
+                f.write_str("non-integer constant is not lowered in the typed integer path")
             }
             LowerError::DynamicOperation => f.write_str(
-                "arithmetic/comparison on a dynamic value is out of the first-light subset",
+                "arithmetic/comparison on a dynamic value is not supported in the typed path",
             ),
             LowerError::UnresolvedGlobal(name) => {
                 write!(f, "global `{name}` is not a user function in this module")
@@ -98,7 +98,7 @@ impl core::fmt::Display for LowerError {
             }
             LowerError::RunsOffEnd => f.write_str("control runs off the end of the function body"),
             LowerError::UnsupportedLocalType(i) => {
-                write!(f, "local slot {i} has no first-light default initializer")
+                write!(f, "local slot {i} has no typed-path default initializer")
             }
             LowerError::UnsupportedControlFlow => {
                 f.write_str("unsupported (irreducible) control-flow shape")
@@ -107,8 +107,8 @@ impl core::fmt::Display for LowerError {
     }
 }
 
-/// The MIR type a first-light Python type lowers to: an annotated `int` is a
-/// machine `I32` (bignum overflow deferred); anything dynamic is a tagged `PyValue`.
+/// The MIR type a Python static type lowers to: an annotated `int` is a machine
+/// `I32` (machine-width integers, no bignum); anything dynamic is a tagged `PyValue`.
 fn mir_type(ty: bc::StaticType) -> MirType {
     match ty {
         bc::StaticType::Int => MirType::I32,
@@ -162,8 +162,8 @@ fn floor_adjust(
 }
 
 /// Python `a // b` for typed integers: the truncating quotient minus the floor
-/// correction. (A zero divisor traps in hardware here -- raising `ZeroDivisionError`
-/// is deferred with the exception machinery.)
+/// correction. A zero divisor traps in hardware; `ZeroDivisionError` requires
+/// the exception machinery.
 fn emit_floor_div(
     values: &mut Values,
     insts: &mut Vec<(ValueId, Inst)>,
@@ -223,6 +223,88 @@ fn map_cmpop(op: bc::CmpOp) -> MCmpOp {
         bc::CmpOp::Gt => MCmpOp::SignedGt,
         bc::CmpOp::Ge => MCmpOp::SignedGe,
     }
+}
+
+/// Inline a built-in over typed integer arguments, returning the result. All are
+/// branchless: `abs(x)` = `(x ^ (x>>31)) - (x>>31)`; `min`/`max` select via the
+/// `(a ^ b) & -(a < b)` mask. (The interpreter provides the same built-ins for the
+/// dynamic path; here the typed path needs no runtime call.)
+fn inline_builtin(
+    builtin: Builtin,
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    args: &[ValueId],
+) -> Result<ValueId, LowerError> {
+    if args.len() != builtin.arity() {
+        return Err(LowerError::ArityMismatch {
+            expected: builtin.arity(),
+            found: args.len(),
+        });
+    }
+    Ok(match builtin {
+        Builtin::Abs => {
+            let x = args[0];
+            let shift = emit(values, insts, Inst::ConstInt {
+                ty: MirType::I32,
+                value: 31,
+            }, MirType::I32);
+            let mask = emit(values, insts, Inst::Binary {
+                op: MBinOp::ShrSigned,
+                lhs: x,
+                rhs: shift,
+            }, MirType::I32);
+            let flipped = emit(values, insts, Inst::Binary {
+                op: MBinOp::Xor,
+                lhs: x,
+                rhs: mask,
+            }, MirType::I32);
+            emit(values, insts, Inst::Binary {
+                op: MBinOp::Sub,
+                lhs: flipped,
+                rhs: mask,
+            }, MirType::I32)
+        }
+        Builtin::Min => emit_select_extreme(values, insts, args[0], args[1], args[1]),
+        Builtin::Max => emit_select_extreme(values, insts, args[0], args[1], args[0]),
+    })
+}
+
+fn emit_select_extreme(
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    a: ValueId,
+    b: ValueId,
+    pick: ValueId,
+) -> ValueId {
+    let lt = emit(values, insts, Inst::Compare {
+        op: MCmpOp::SignedLt,
+        lhs: a,
+        rhs: b,
+    }, MirType::I32);
+    let zero = emit(values, insts, Inst::ConstInt {
+        ty: MirType::I32,
+        value: 0,
+    }, MirType::I32);
+    let mask = emit(values, insts, Inst::Binary {
+        op: MBinOp::Sub,
+        lhs: zero,
+        rhs: lt,
+    }, MirType::I32);
+    let axb = emit(values, insts, Inst::Binary {
+        op: MBinOp::Xor,
+        lhs: a,
+        rhs: b,
+    }, MirType::I32);
+    let masked = emit(values, insts, Inst::Binary {
+        op: MBinOp::And,
+        lhs: axb,
+        rhs: mask,
+    }, MirType::I32);
+    emit(values, insts, Inst::Binary {
+        op: MBinOp::Xor,
+        lhs: pick,
+        rhs: masked,
+    }, MirType::I32)
 }
 
 /// Allocates dense, single-assignment value ids and records each one's type.
@@ -343,13 +425,14 @@ fn lower_function(
     let mut tramps: Vec<BasicBlock> = Vec::new();
     let mut blocks: Vec<BasicBlock> = Vec::with_capacity(n_bc + 1);
     let mut exit_locals: Vec<Option<Vec<ValueId>>> = vec![None; n_bc];
+    let mut exit_stack: Vec<Option<Vec<(ValueId, MirType)>>> = vec![None; n_bc];
 
     for i in 0..n_bc {
         if !reachable[i] {
             blocks.push(unreachable_block());
             continue;
         }
-        let (params, mut locals) = if is_merge[i] {
+        let (mut params, mut locals) = if is_merge[i] {
             let mut params = Vec::new();
             let mut locals = vec![ValueId(0); n_locals];
             for (s, slot) in locals.iter_mut().enumerate() {
@@ -370,6 +453,30 @@ fn lower_function(
             (Vec::new(), inherited)
         };
 
+        let mut stack: Vec<StackEntry> = if is_merge[i] {
+            let incoming = preds[i]
+                .iter()
+                .find_map(|p| exit_stack[*p].clone())
+                .unwrap_or_default();
+            incoming
+                .into_iter()
+                .map(|(_, ty)| {
+                    let p = values.fresh(ty);
+                    params.push(p);
+                    StackEntry::Value(p, ty)
+                })
+                .collect()
+        } else if i == 0 {
+            Vec::new()
+        } else {
+            exit_stack[preds[i][0]]
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(v, ty)| StackEntry::Value(v, ty))
+                .collect()
+        };
+
         let meta = &metas[i];
         let body_end = if meta.ends_in_terminator {
             meta.end - 1
@@ -377,23 +484,29 @@ fn lower_function(
             meta.end
         };
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
-        let mut stack: Vec<StackEntry> = Vec::new();
         for op in &co.ops[meta.start..body_end] {
             lower_op(co, funcs, &local_ty, &mut values, &mut insts, &mut locals, &mut stack, op)?;
         }
 
         let terminator = if !meta.ends_in_terminator {
-            jump_to(&is_merge, &live_in,meta.succs[0], &locals)
+            let sv = stack_exit(&stack)?;
+            jump_to(&is_merge, &live_in, meta.succs[0], &locals, &sv)
         } else {
             match &co.ops[meta.end - 1] {
-                bc::Op::Jump(_) => jump_to(&is_merge, &live_in,meta.succs[0], &locals),
+                bc::Op::Jump(_) => {
+                    let sv = stack_exit(&stack)?;
+                    jump_to(&is_merge, &live_in, meta.succs[0], &locals, &sv)
+                }
                 bc::Op::PopJumpIfFalse(_) => {
                     let (cond, ct) = pop_value(&mut stack)?;
                     if ct != MirType::I32 {
                         return Err(LowerError::BadConditionType);
                     }
-                    let if_false = branch_edge(&is_merge, &live_in,meta.succs[0], &locals, tramp_base, &mut tramps);
-                    let if_true = branch_edge(&is_merge, &live_in,meta.succs[1], &locals, tramp_base, &mut tramps);
+                    let sv = stack_exit(&stack)?;
+                    let if_false =
+                        branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &sv, tramp_base, &mut tramps);
+                    let if_true =
+                        branch_edge(&is_merge, &live_in, meta.succs[1], &locals, &sv, tramp_base, &mut tramps);
                     Terminator::Branch {
                         cond,
                         if_true,
@@ -412,9 +525,7 @@ fn lower_function(
                 _ => return Err(LowerError::RunsOffEnd),
             }
         };
-        if !stack.is_empty() {
-            return Err(LowerError::StackNotEmpty);
-        }
+        exit_stack[i] = Some(stack_exit(&stack)?);
         exit_locals[i] = Some(locals);
         blocks.push(BasicBlock {
             params,
@@ -423,7 +534,7 @@ fn lower_function(
         });
     }
 
-    let synth_term = jump_to(&is_merge, &live_in,BlockId(0), &synth_locals);
+    let synth_term = jump_to(&is_merge, &live_in, BlockId(0), &synth_locals, &[]);
     blocks.push(BasicBlock {
         params: func_params,
         insts: synth_insts,
@@ -448,44 +559,64 @@ fn unreachable_block() -> BasicBlock {
     }
 }
 
-/// The arguments a branch into `target` carries: the values of `target`'s live-in
-/// locals (its block parameters), in slot order. A non-merge target has no
-/// parameters, so no arguments -- it reuses the predecessor's values directly.
+/// The arguments a branch into `target` carries: when `target` is a merge, its live-in
+/// locals (in slot order) followed by the threaded operand-stack values (bottom to
+/// top) -- matching the order the merge declares those parameters. A non-merge target
+/// has no parameters, so no arguments: it reuses the predecessor's values directly.
 fn merge_args(
     is_merge: &[bool],
     live_in: &[Vec<bool>],
     target: BlockId,
     locals: &[ValueId],
+    stack: &[(ValueId, MirType)],
 ) -> Vec<ValueId> {
     if !is_merge.get(target.index()).copied().unwrap_or(false) {
         return Vec::new();
     }
     let live = &live_in[target.index()];
-    (0..live.len()).filter(|&s| live[s]).map(|s| locals[s]).collect()
+    let mut args: Vec<ValueId> = (0..live.len()).filter(|&s| live[s]).map(|s| locals[s]).collect();
+    args.extend(stack.iter().map(|(v, _)| *v));
+    args
 }
 
-/// A `Jump` to `target`, passing its live-in locals as arguments when `target` is a
-/// merge (which has those as block parameters); a non-merge target takes none.
+/// The operand stack as `(ValueId, type)` pairs, for threading to successors. A
+/// callable left on the stack at a block boundary (a function used across a
+/// mid-expression branch) is not supported in the typed subset.
+fn stack_exit(stack: &[StackEntry]) -> Result<Vec<(ValueId, MirType)>, LowerError> {
+    stack
+        .iter()
+        .map(|e| match e {
+            StackEntry::Value(v, t) => Ok((*v, *t)),
+            StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
+        })
+        .collect()
+}
+
+/// A `Jump` to `target`, passing its live-in locals plus the threaded stack when
+/// `target` is a merge; a non-merge target takes none.
 fn jump_to(
     is_merge: &[bool],
     live_in: &[Vec<bool>],
     target: BlockId,
     locals: &[ValueId],
+    stack: &[(ValueId, MirType)],
 ) -> Terminator {
     Terminator::Jump {
         target,
-        args: merge_args(is_merge, live_in, target, locals),
+        args: merge_args(is_merge, live_in, target, locals, stack),
     }
 }
 
 /// Resolve one edge of a `Branch`. A `Branch` may carry no arguments, so an edge into
-/// a merge block (which expects its live-in locals) is routed through a parameter-less
-/// trampoline that jumps there with them; an edge into a non-merge block is direct.
+/// a merge block (which expects its live-in locals plus the threaded stack) is routed
+/// through a parameter-less trampoline that jumps there with them; an edge into a
+/// non-merge block is direct.
 fn branch_edge(
     is_merge: &[bool],
     live_in: &[Vec<bool>],
     target: BlockId,
     locals: &[ValueId],
+    stack: &[(ValueId, MirType)],
     tramp_base: usize,
     tramps: &mut Vec<BasicBlock>,
 ) -> BlockId {
@@ -496,7 +627,7 @@ fn branch_edge(
             insts: Vec::new(),
             terminator: Some(Terminator::Jump {
                 target,
-                args: merge_args(is_merge, live_in, target, locals),
+                args: merge_args(is_merge, live_in, target, locals, stack),
             }),
         });
         id
@@ -610,24 +741,53 @@ struct FuncSig {
     arity: usize,
 }
 
-/// One operand-stack slot during abstract interpretation: either a typed value or a
-/// reference to a callee (pushed by `LoadGlobal`, consumed by `Call`). Keeping
-/// callables on the stack lets nested calls -- `f(g(x))` -- resolve naturally.
+/// A built-in function the typed path inlines with no runtime call: `abs`, `min`,
+/// `max` over integers. Other built-ins (`len`, container/string operations) dispatch
+/// to the runtime and arrive with the dynamic surface.
+#[derive(Clone, Copy)]
+enum Builtin {
+    Abs,
+    Min,
+    Max,
+}
+
+impl Builtin {
+    fn from_name(name: &str) -> Option<Builtin> {
+        match name {
+            "abs" => Some(Builtin::Abs),
+            "min" => Some(Builtin::Min),
+            "max" => Some(Builtin::Max),
+            _ => None,
+        }
+    }
+
+    fn arity(self) -> usize {
+        match self {
+            Builtin::Abs => 1,
+            Builtin::Min | Builtin::Max => 2,
+        }
+    }
+}
+
+/// One operand-stack slot during abstract interpretation: a typed value, or a reference
+/// to a callee -- a user function or a built-in -- pushed by `LoadGlobal` and consumed
+/// by `Call`. Keeping callees on the stack lets nested calls (`f(g(x))`) resolve.
 enum StackEntry {
     Value(ValueId, MirType),
     Callable(FuncSig),
+    Builtin(Builtin),
 }
 
 fn pop(stack: &mut Vec<StackEntry>) -> Result<StackEntry, LowerError> {
     stack.pop().ok_or(LowerError::StackUnderflow)
 }
 
-/// Pop a typed value; a callable here means a function name used as a plain value,
-/// which the typed subset does not support.
+/// Pop a typed value; a callee here means a function or built-in name used as a plain
+/// value, which the typed subset does not support.
 fn pop_value(stack: &mut Vec<StackEntry>) -> Result<(ValueId, MirType), LowerError> {
     match pop(stack)? {
         StackEntry::Value(v, t) => Ok((v, t)),
-        StackEntry::Callable(_) => Err(LowerError::CallableAsValue),
+        StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
     }
 }
 
@@ -783,6 +943,17 @@ fn lower_op(
             }));
             stack.push(StackEntry::Value(id, MirType::PyValue));
         }
+        bc::Op::Subscript { cache } => {
+            let (index, _it) = pop_value(stack)?;
+            let (container, _ct) = pop_value(stack)?;
+            let id = values.fresh(MirType::PyValue);
+            insts.push((id, Inst::PyIntrinsic {
+                op: PyOp::Getitem,
+                args: vec![container, index],
+                cache: *cache,
+            }));
+            stack.push(StackEntry::Value(id, MirType::PyValue));
+        }
         bc::Op::PopTop => {
             pop(stack)?;
         }
@@ -791,11 +962,13 @@ fn lower_op(
                 .names
                 .get(*name_idx as usize)
                 .ok_or(LowerError::BadNameIndex(*name_idx))?;
-            let sig = funcs
-                .get(name)
-                .copied()
-                .ok_or_else(|| LowerError::UnresolvedGlobal(name.clone()))?;
-            stack.push(StackEntry::Callable(sig));
+            if let Some(sig) = funcs.get(name).copied() {
+                stack.push(StackEntry::Callable(sig));
+            } else if let Some(builtin) = Builtin::from_name(name) {
+                stack.push(StackEntry::Builtin(builtin));
+            } else {
+                return Err(LowerError::UnresolvedGlobal(name.clone()));
+            }
         }
         bc::Op::Call(argc) => {
             let argc = *argc as usize;
@@ -808,22 +981,27 @@ fn lower_op(
                 args.push(value);
             }
             args.reverse();
-            let sig = match pop(stack)? {
-                StackEntry::Callable(sig) => sig,
+            match pop(stack)? {
+                StackEntry::Callable(sig) => {
+                    if argc != sig.arity {
+                        return Err(LowerError::ArityMismatch {
+                            expected: sig.arity,
+                            found: argc,
+                        });
+                    }
+                    let id = values.fresh(sig.ret);
+                    insts.push((id, Inst::Call {
+                        callee: sig.index,
+                        args,
+                    }));
+                    stack.push(StackEntry::Value(id, sig.ret));
+                }
+                StackEntry::Builtin(builtin) => {
+                    let id = inline_builtin(builtin, values, insts, &args)?;
+                    stack.push(StackEntry::Value(id, MirType::I32));
+                }
                 StackEntry::Value(..) => return Err(LowerError::CallTargetNotCallable),
-            };
-            if argc != sig.arity {
-                return Err(LowerError::ArityMismatch {
-                    expected: sig.arity,
-                    found: argc,
-                });
             }
-            let id = values.fresh(sig.ret);
-            insts.push((id, Inst::Call {
-                callee: sig.index,
-                args,
-            }));
-            stack.push(StackEntry::Value(id, sig.ret));
         }
         bc::Op::Jump(_) | bc::Op::PopJumpIfFalse(_) | bc::Op::Return => {
             return Err(LowerError::StackNotEmpty);
@@ -833,8 +1011,8 @@ fn lower_op(
 }
 
 /// Lower every function of a compiled module, returning each `(name, Function)`.
-/// The `<module>` body is not lowered for first light: the parity harness drives the
-/// call boundary.
+/// The `<module>` body is not lowered in the typed path: the parity harness drives
+/// the call boundary.
 pub fn lower_module(module: &bc::Module) -> Result<Vec<(String, Function)>, LowerError> {
     let funcs: BTreeMap<String, FuncSig> = module
         .functions
@@ -1197,5 +1375,54 @@ def sign(n: int) -> int:
             .ops
             .iter()
             .any(|o| matches!(o, bc::Op::Unary(_))));
+    }
+
+    #[test]
+    fn a_nested_boolean_threads_the_stack_and_verifies() {
+        let func = lower_named(
+            "def f(a: int, b: int) -> int:\n    return 10 + (a and b)\n",
+            "f",
+        );
+        assert!(func
+            .blocks
+            .iter()
+            .any(|b| matches!(b.terminator, Some(Terminator::Branch { .. }))));
+    }
+
+    #[test]
+    fn builtins_inline_without_a_call() {
+        let abs = lower_named("def f(x: int) -> int:\n    return abs(x)\n", "f");
+        assert_eq!(count_insts(&abs, |i| matches!(i, Inst::Call { .. })), 0);
+        assert!(count_insts(&abs, |i| matches!(i, Inst::Binary {
+            op: MBinOp::ShrSigned,
+            ..
+        })) >= 1);
+        let mx = lower_named("def f(a: int, b: int) -> int:\n    return max(a, b)\n", "f");
+        assert_eq!(count_insts(&mx, |i| matches!(i, Inst::Call { .. })), 0);
+    }
+
+    #[test]
+    fn subscript_lowers_to_a_getitem_intrinsic() {
+        let func = lower_named("def f(s, i):\n    return s[i]\n", "f");
+        assert_eq!(
+            count_insts(&func, |i| matches!(
+                i,
+                Inst::PyIntrinsic {
+                    op: PyOp::Getitem,
+                    ..
+                }
+            )),
+            1
+        );
+    }
+
+    #[test]
+    fn a_builtin_arity_mismatch_is_rejected() {
+        let module = compile_str("test", "def f(x: int) -> int:\n    return abs(x, x)\n")
+            .expect("compiles");
+        assert!(matches!(
+            lower_module(&module),
+            Err(LowerError::ArityMismatch { .. })
+        ));
     }
 }

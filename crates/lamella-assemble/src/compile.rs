@@ -599,7 +599,11 @@ fn enum_member_constant(model: &Model, expr: &Expr) -> Option<(TypeSymbol, i64)>
     if info.kind != lamella_binder::TypeKind::Enum {
         return None;
     }
-    let value = info.find_field(name)?.constant?;
+    let value = info
+        .find_field(name)?
+        .constant
+        .as_ref()
+        .and_then(lamella_binder::literal_int_value)?;
     Some((enum_ty, value))
 }
 
@@ -1081,7 +1085,14 @@ fn emit_enum(
         .map(|info| {
             info.fields
                 .iter()
-                .map(|field| (field.name.clone(), field.constant.unwrap_or(0)))
+                .map(|field| {
+                    let value = field
+                        .constant
+                        .as_ref()
+                        .and_then(lamella_binder::literal_int_value)
+                        .unwrap_or(0);
+                    (field.name.clone(), value)
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1177,23 +1188,23 @@ fn emit_type(
     }
     emit_attributes(image, binder, tokens, type_token, &declaration.attributes);
     mint_member_signature_types(binder, &declaration.members, image, tokens);
-    let interface_tokens: Vec<Token> = {
-        let model = binder.model();
-        model
-            .get_by_symbol(&enclosing)
-            .map(|info| {
-                info.bases
-                    .iter()
-                    .filter(|base| {
-                        model
-                            .get_by_symbol(base)
-                            .is_some_and(|b| b.kind == lamella_binder::TypeKind::Interface)
-                    })
-                    .filter_map(|base| tokens.type_token(base))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let interfaces: Vec<TypeSymbol> = binder
+        .model()
+        .get_by_symbol(&enclosing)
+        .map(|info| {
+            info.bases
+                .iter()
+                .filter_map(|base| binder.model().resolve_interface_base(base))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut interface_tokens: Vec<Token> = Vec::new();
+    for interface in &interfaces {
+        mint_named_type_token(interface, image, tokens);
+        if let Some(token) = tokens.type_token(interface) {
+            interface_tokens.push(token);
+        }
+    }
     let implements_interface = !interface_tokens.is_empty();
     for interface in interface_tokens {
         image.add_interface_impl(type_token, interface);
@@ -1413,6 +1424,7 @@ fn emit_type(
                 name,
                 getter.as_ref().and_then(|accessor| accessor.body.as_ref()),
                 setter.as_ref().and_then(|accessor| accessor.body.as_ref()),
+                implements_interface,
                 explicit_interface.as_ref(),
                 debug,
             )?;
@@ -2068,6 +2080,7 @@ fn emit_property(
     name: &str,
     getter_body: Option<&lamella_syntax::ast::Stmt>,
     setter_body: Option<&lamella_syntax::ast::Stmt>,
+    implements_interface: bool,
     explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
@@ -2078,6 +2091,13 @@ fn emit_property(
             | METHOD_VIRTUAL
             | METHOD_FINAL
             | METHOD_NEWSLOT
+            | METHOD_HIDEBYSIG
+            | SPECIAL_NAME
+    } else if implements_interface && !is_static {
+        METHOD_PUBLIC
+            | METHOD_VIRTUAL
+            | METHOD_NEWSLOT
+            | METHOD_FINAL
             | METHOD_HIDEBYSIG
             | SPECIAL_NAME
     } else {
@@ -2353,6 +2373,11 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             {
                 mint_value_type_token(&operand.ty, image, tokens);
             }
+            if matches!(expr.ty, TypeSymbol::Named(_)) && !is_value_type(&expr.ty, tokens)
+                || matches!(expr.ty, TypeSymbol::Array { .. })
+            {
+                mint_type_token(image, tokens, &expr.ty);
+            }
         }
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
             mint_in_expr(inner, image, tokens);
@@ -2411,6 +2436,10 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     && tokens.field(&field.declaring_type, &field.name).is_none()
                 {
                     mint_field_ref(field, image, tokens);
+                }
+                if let Some(Literal::String(text)) = &field.constant {
+                    let token = image.user_string(text);
+                    tokens.insert_string(text, token);
                 }
             }
         }
@@ -2728,7 +2757,7 @@ fn system_type_name(special: SpecialType) -> Option<(&'static str, &'static str)
         SpecialType::String => ("System", "String"),
         SpecialType::Object => ("System", "Object"),
         SpecialType::Decimal => ("System", "Decimal"),
-        SpecialType::Void => return None,
+        SpecialType::Void | SpecialType::Null => return None,
     })
 }
 

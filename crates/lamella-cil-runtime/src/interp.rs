@@ -80,6 +80,34 @@ pub struct Vm {
     /// `datetime_now_ticks` intrinsic. It defaults to 0 (the epoch) when the embedder
     /// never sets it, so an unconfigured host reads a defined value rather than garbage.
     now_ticks: i64,
+    /// The cooperative green-thread scheduler's signal channel: a threading intrinsic
+    /// (`Thread.Start` / `Join` / `Yield`) sets this to request a scheduler action; the top-level
+    /// scheduler loop takes it the moment the running thread next pauses. `None` between requests.
+    thread_op: Option<ThreadOp>,
+    /// The next green-thread id to hand out (`Thread.Start` reserves one). Thread 0 is the main
+    /// thread; spawned threads get 1, 2, ...
+    next_thread_id: u32,
+    /// The id of the green thread currently running (for `Thread.CurrentThread`).
+    current_thread_id: u32,
+    /// The number of LIVE (not-yet-finished) green threads, maintained by the scheduler. While this
+    /// is > 1 a GC safepoint in `advance` DEFERS collection (a collection must root EVERY thread's
+    /// frames, which only the scheduler can reach) and the scheduler collects all threads at the
+    /// next switch; <= 1 means the running session's own roots suffice, so collection runs inline.
+    live_thread_count: u32,
+    /// The per-object `Monitor` lock table: each entered lock object, keyed by its heap index, maps
+    /// to its [`LockState`] -- the owning thread, the recursion depth, and the FIFO queue of threads
+    /// blocked waiting to acquire it. A held lock now spans scheduler switches (the holder can be
+    /// preempted inside its critical section, with only CONTENDERS blocking) and therefore GCs, so
+    /// the compactor remaps these keys at every collection ([`run_collection`]) just as it does the
+    /// exception-message table.
+    locks: BTreeMap<u32, LockState>,
+    /// The host clock seam for timed waits (`Thread.Sleep`, the scheduler's idle-block). `now_millis`
+    /// reads a monotonic millisecond count; `sleep_millis` blocks the OS thread that many ms. The
+    /// no_std core has no clock, so the embedder sets these (the host from `std::time`; a device from
+    /// a hardware timer + WFI). When unset, timed waits do not block -- a deadline is treated as
+    /// already due, so wake ORDERING is right but there is no real delay.
+    now_millis_fn: Option<fn() -> u64>,
+    sleep_millis_fn: Option<fn(u64)>,
 }
 
 impl Vm {
@@ -132,6 +160,203 @@ impl Vm {
     /// The managed heap, mutably (to allocate objects).
     pub fn heap_mut(&mut self) -> &mut Heap {
         &mut self.heap
+    }
+
+    /// Reserves the next green-thread id (`Thread.Start`). Ids start at 1; thread 0 is main.
+    pub fn alloc_thread_id(&mut self) -> u32 {
+        if self.next_thread_id == 0 {
+            self.next_thread_id = 1;
+        }
+        let id = self.next_thread_id;
+        self.next_thread_id += 1;
+        id
+    }
+
+    /// Requests that the scheduler spawn a green thread (under the reserved `id`) running `method`
+    /// with `target` as its receiver (`Null` for a static method). Raised by `Thread.Start`.
+    pub fn request_spawn(&mut self, id: u32, method: MethodId, target: Value, background: bool) {
+        self.thread_op = Some(ThreadOp::Spawn { id, method, target, background });
+    }
+
+    /// Requests a cooperative yield to the scheduler (`Thread.Yield` / `Thread.Sleep`).
+    pub fn request_yield(&mut self) {
+        self.thread_op = Some(ThreadOp::Yield);
+    }
+
+    /// Requests that the running thread block until thread `target` completes (`Thread.Join`).
+    pub fn request_join(&mut self, target: u32) {
+        self.thread_op = Some(ThreadOp::Join { target });
+    }
+
+    /// The id of the green thread currently running.
+    #[must_use]
+    pub fn current_thread_id(&self) -> u32 {
+        self.current_thread_id
+    }
+
+    fn set_current_thread(&mut self, id: u32) {
+        self.current_thread_id = id;
+    }
+
+    fn take_thread_op(&mut self) -> Option<ThreadOp> {
+        self.thread_op.take()
+    }
+
+    fn has_thread_op(&self) -> bool {
+        self.thread_op.is_some()
+    }
+
+    /// The scheduler maintains the LIVE green-thread count so a GC safepoint can tell whether an
+    /// inline collection (one thread's roots) is safe or must be deferred to an all-threads collect.
+    fn set_live_thread_count(&mut self, count: u32) {
+        self.live_thread_count = count;
+    }
+
+    fn live_thread_count(&self) -> u32 {
+        self.live_thread_count
+    }
+
+    /// Acquires the `Monitor` lock on object `obj` (its heap index) for `thread`. Returns `true` if
+    /// the lock is now held -- the object was free (a fresh entry is created) or `thread` already
+    /// owned it (a recursive `lock` bumps the depth) -- so the caller proceeds into the critical
+    /// section. Returns `false` on contention: `thread` is appended to the lock's wait queue (once)
+    /// and the caller must block ([`Vm::request_block_on_lock`]); it is handed the lock, and woken,
+    /// when the owner releases.
+    pub fn lock_acquire(&mut self, obj: u32, thread: u32) -> bool {
+        if self.lock_try(obj, thread) {
+            return true;
+        }
+        if let Some(state) = self.locks.get_mut(&obj) {
+            if !state.waiters.iter().any(|waiter| waiter.thread == thread) {
+                state.waiters.push(LockWaiter { thread, depth: 1 });
+            }
+        }
+        false
+    }
+
+    /// Releases one level of `thread`'s `Monitor` lock on `obj`. Returns the id of a newly-woken
+    /// waiter when the outermost level is released and a thread is queued: the lock is HANDED to the
+    /// first waiter (its `owner`/`count` are set so it resumes already holding the lock), whose id is
+    /// returned for [`Vm::request_wake`]. Returns `None` when the lock is still held recursively, when
+    /// it falls idle (the entry is dropped unless `Monitor.Wait`-ers keep it alive), or when `thread`
+    /// is not the owner.
+    pub fn lock_release(&mut self, obj: u32, thread: u32) -> Option<u32> {
+        let state = self.locks.get_mut(&obj)?;
+        if state.owner != Some(thread) {
+            return None;
+        }
+        state.count -= 1;
+        if state.count > 0 {
+            return None;
+        }
+        if let Some(next) = state.grant_to_next_waiter() {
+            return Some(next);
+        }
+        if state.waiting.is_empty() {
+            self.locks.remove(&obj);
+        }
+        None
+    }
+
+    /// Tries to acquire the `Monitor` lock on `obj` for `thread` WITHOUT blocking (`Monitor.TryEnter`
+    /// and the primitive [`Vm::lock_acquire`] builds on): `true` for a free object (no entry, or one
+    /// left unowned by a `Monitor.Wait`) or a recursive acquire (the depth bumps); `false` on
+    /// contention, with NO enqueue.
+    pub fn lock_try(&mut self, obj: u32, thread: u32) -> bool {
+        match self.locks.get_mut(&obj) {
+            None => {
+                self.locks.insert(obj, LockState::owned_by(thread));
+                true
+            }
+            Some(state) if state.owner.is_none() => {
+                state.owner = Some(thread);
+                state.count = 1;
+                true
+            }
+            Some(state) if state.owner == Some(thread) => {
+                state.count += 1;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Whether `thread` owns the `Monitor` lock on `obj` -- the precondition for `Monitor.Wait` /
+    /// `Pulse` / `PulseAll` (which raise `SynchronizationLockException` otherwise).
+    #[must_use]
+    pub fn lock_is_owner(&self, obj: u32, thread: u32) -> bool {
+        matches!(self.locks.get(&obj), Some(state) if state.owner == Some(thread))
+    }
+
+    /// `Monitor.Wait`: the owning `thread` parks in the lock's condition wait-set (at its current
+    /// recursion depth, to restore on reacquire) and FULLY releases the lock. Returns the id of an
+    /// acquire-waiter handed the lock by this release (to wake), or `None`. The caller must have
+    /// verified ownership ([`Vm::lock_is_owner`]) and then blocks the thread.
+    pub fn lock_wait(&mut self, obj: u32, thread: u32) -> Option<u32> {
+        let state = self.locks.get_mut(&obj)?;
+        let depth = state.count;
+        state.waiting.push(LockWaiter { thread, depth });
+        state.grant_to_next_waiter()
+    }
+
+    /// `Monitor.Pulse` (`one` = true) / `Monitor.PulseAll` (false): moves the first / all threads
+    /// blocked in `Monitor.Wait` on `obj` into the acquire-queue, preserving FIFO order. They do not
+    /// run yet -- the first is handed the lock when the (still-owning) pulser later releases it. The
+    /// caller must have verified ownership.
+    pub fn lock_pulse(&mut self, obj: u32, one: bool) {
+        let Some(state) = self.locks.get_mut(&obj) else {
+            return;
+        };
+        if one {
+            if !state.waiting.is_empty() {
+                let waiter = state.waiting.remove(0);
+                state.waiters.push(waiter);
+            }
+        } else {
+            let pulsed = core::mem::take(&mut state.waiting);
+            state.waiters.extend(pulsed);
+        }
+    }
+
+    /// Requests that the scheduler block the running thread on a `Monitor` lock -- either a failed
+    /// acquire (it is queued in the lock's waiters) or a `Monitor.Wait` (it is parked in the
+    /// condition wait-set, having released the lock). The thread is parked until a later wake; by
+    /// then the lock has been handed to it, so it resumes already holding it. `wake`, if set, is a
+    /// contender that a `Monitor.Wait`'s release just handed the lock -- the scheduler wakes it too.
+    pub fn request_block_on_lock(&mut self, wake: Option<u32>) {
+        self.thread_op = Some(ThreadOp::BlockOnLock { wake });
+    }
+
+    /// Requests that the scheduler wake thread `id`, blocked on a `Monitor` lock that a release
+    /// (`Monitor.Exit`) just handed to it.
+    pub fn request_wake(&mut self, id: u32) {
+        self.thread_op = Some(ThreadOp::WakeThread { id });
+    }
+
+    /// Requests that the scheduler block the running thread for `millis` milliseconds (`Thread.Sleep`):
+    /// other threads run meanwhile, and the scheduler idle-sleeps the OS thread to the nearest deadline.
+    pub fn request_sleep(&mut self, millis: u64) {
+        self.thread_op = Some(ThreadOp::SleepFor(millis));
+    }
+
+    /// Sets the host clock seam: a monotonic-millisecond reader and an OS-thread sleep, used by the
+    /// scheduler's idle-block and `Thread.Sleep`. The embedder provides these (the host from
+    /// `std::time`); the no_std core keeps no clock of its own.
+    pub fn set_clock(&mut self, now_millis: fn() -> u64, sleep_millis: fn(u64)) {
+        self.now_millis_fn = Some(now_millis);
+        self.sleep_millis_fn = Some(sleep_millis);
+    }
+
+    /// The current monotonic millisecond count, if a clock seam is set.
+    fn now_millis(&self) -> Option<u64> {
+        self.now_millis_fn.map(|now| now())
+    }
+
+    /// Blocks the OS thread for `millis` milliseconds (a no-op without a clock seam).
+    fn sleep_millis(&self, millis: u64) {
+        if let Some(sleep) = self.sleep_millis_fn {
+            sleep(millis);
+        }
     }
 
     /// Appends UTF-16 code units to the console output.
@@ -487,6 +712,174 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
 /// Returns a [`Trap`] as [`run_method`] does, plus [`Trap::UnresolvedCall`] for a
 /// call token that names no method and [`Trap::CallStackOverflow`] for runaway
 /// recursion.
+/// The cooperative scheduler's deterministic time slice: a thread is preempted after this many CIL
+/// instructions in a multi-threaded run (checked at every interp instruction boundary, which is a GC
+/// safe point). Op-count, not wall-clock, so interleavings reproduce host-and-device. K in the
+/// 256-1024 range per docs/threading-interpreter.md; 256 keeps switch latency well under a quantum.
+const TIME_SLICE_QUANTUM: u32 = 256;
+
+/// A scheduler request an intrinsic raises; the scheduler takes it once the running thread pauses.
+#[derive(Debug)]
+enum ThreadOp {
+    /// Spawn a green thread (id `id`) running `method` with `target` as its receiver; `background`
+    /// marks a daemon thread (a `Timer`) the run loop abandons once the foreground threads finish.
+    Spawn { id: u32, method: MethodId, target: Value, background: bool },
+    /// Cooperatively yield the running thread.
+    Yield,
+    /// Block the running thread until thread `target` completes.
+    Join { target: u32 },
+    /// Block the running thread on a `Monitor` lock -- a failed acquire (queued in the lock's
+    /// waiters) or a `Monitor.Wait` (parked in the condition wait-set). The scheduler parks it until
+    /// a later wake hands it the lock. `wake`, if set, is a contender that a `Monitor.Wait`'s release
+    /// just handed the lock -- the scheduler makes it runnable in the same step.
+    BlockOnLock { wake: Option<u32> },
+    /// Wake thread `id`, blocked on a `Monitor` lock that a release just handed to it.
+    WakeThread { id: u32 },
+    /// Block the running thread until `now` + this many milliseconds (`Thread.Sleep`).
+    SleepFor(u64),
+}
+
+/// The state of one entered `Monitor` lock. Lives in [`Vm::locks`], keyed by the lock object's heap
+/// index. Unlike the old atomic-section approach, a lock can outlive a scheduler switch (the holder
+/// may be preempted inside its critical section, and `Monitor.Wait` parks the owner while OTHER
+/// threads run), so this state persists across switches and GCs -- hence the table's keys are
+/// remapped at every collection.
+#[derive(Debug)]
+struct LockState {
+    /// The owning thread, or `None` when the lock is momentarily unowned -- the entry then exists
+    /// only because `waiting` is non-empty (a `Monitor.Wait`-er released it with no one contending).
+    owner: Option<u32>,
+    /// The owner's recursion depth (recursive `Enter`s); 0 exactly when `owner` is `None`.
+    count: u32,
+    /// Threads blocked trying to ACQUIRE the lock, FIFO; each is handed the lock (restoring its
+    /// recorded depth) when the owner releases.
+    waiters: Vec<LockWaiter>,
+    /// Threads blocked in `Monitor.Wait` until a `Pulse`/`PulseAll` moves them into `waiters`.
+    waiting: Vec<LockWaiter>,
+}
+
+/// A thread queued on a lock, with the recursion depth to restore when it is granted the lock -- 1
+/// for a plain contended `Enter`, or the owner's saved depth for a thread released by `Monitor.Wait`
+/// (so a recursive `Wait` reacquires at the depth it left).
+#[derive(Debug)]
+struct LockWaiter {
+    thread: u32,
+    depth: u32,
+}
+
+impl LockState {
+    /// A fresh lock held once by `thread`, with empty queues.
+    fn owned_by(thread: u32) -> LockState {
+        LockState { owner: Some(thread), count: 1, waiters: Vec::new(), waiting: Vec::new() }
+    }
+
+    /// Hands the lock to the first acquire-waiter (FIFO), restoring its recorded depth, and returns
+    /// its id; if none are waiting, leaves the lock unowned (`owner = None`, depth 0) and returns
+    /// `None`.
+    fn grant_to_next_waiter(&mut self) -> Option<u32> {
+        if self.waiters.is_empty() {
+            self.owner = None;
+            self.count = 0;
+            return None;
+        }
+        let next = self.waiters.remove(0);
+        self.owner = Some(next.thread);
+        self.count = next.depth;
+        Some(next.thread)
+    }
+}
+
+/// One green thread in the cooperative scheduler: a reified [`Session`] plus its scheduling state
+/// and (once finished) its result.
+struct ThreadSlot {
+    id: u32,
+    session: Session,
+    state: ThreadState,
+    result: Option<Option<Value>>,
+    /// A background (daemon) thread -- a `Timer`'s. The scheduler abandons it once every foreground
+    /// thread has finished, rather than waiting for it (.NET's background-thread semantics).
+    background: bool,
+}
+
+#[derive(PartialEq, Eq)]
+enum ThreadState {
+    /// Runnable.
+    Ready,
+    /// Blocked until the thread with this id finishes.
+    Joining(u32),
+    /// Blocked on a `Monitor` lock; set back to `Ready` by a [`ThreadOp::WakeThread`] when the
+    /// lock's owner releases and hands it over.
+    Blocked,
+    /// Sleeping until this monotonic-millisecond deadline (`Thread.Sleep`); woken by the scheduler's
+    /// `idle_wait` once the deadline passes.
+    Sleeping(u64),
+    /// Finished (its `result` is set).
+    Done,
+}
+
+/// The next runnable thread at or after `start` (round-robin, wrapping); `None` once every thread is
+/// finished or blocked.
+fn next_ready_thread(threads: &[ThreadSlot], start: usize) -> Option<usize> {
+    let count = threads.len();
+    (0..count)
+        .map(|offset| (start + offset) % count)
+        .find(|&index| threads[index].state == ThreadState::Ready)
+}
+
+/// The scheduler's reactor idle-hook: with no thread ready, block the OS thread until the nearest
+/// sleeping thread's deadline (real time, via the host clock seam), then wake every sleeper whose
+/// deadline has passed. Returns `false` when no thread is sleeping -- the scheduler then stops (all
+/// threads finished or deadlocked). Without a host clock, sleepers wake immediately (correct wake
+/// ORDERING by deadline, but no real delay). This single blocking wait is also the tickless-idle /
+/// low-power foundation, and where the socket reactor later adds an fd poll-set.
+fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
+    let nearest = threads
+        .iter()
+        .filter_map(|slot| match slot.state {
+            ThreadState::Sleeping(deadline) => Some(deadline),
+            _ => None,
+        })
+        .min();
+    let Some(nearest) = nearest else {
+        return false;
+    };
+    let now = match vm.now_millis() {
+        Some(now) => {
+            if nearest > now {
+                vm.sleep_millis(nearest - now);
+            }
+            vm.now_millis().unwrap_or(nearest)
+        }
+        None => u64::MAX,
+    };
+    for slot in threads.iter_mut() {
+        if let ThreadState::Sleeping(deadline) = slot.state {
+            if deadline <= now {
+                slot.state = ThreadState::Ready;
+            }
+        }
+    }
+    true
+}
+
+/// Why [`Session::run_until_yield`] stopped: the thread finished (with its result), or it hit a
+/// cooperative yield point and the scheduler should take the pending thread-op.
+enum ThreadStatus {
+    Done(Option<Value>),
+    Yielded,
+}
+
+/// Runs `module`'s `entry` (with `args`) to completion, returning its result.
+///
+/// Execution is driven by a COOPERATIVE green-thread scheduler: the entry is thread 0 (the main
+/// thread), and a `Thread.Start` spawns another thread as a fresh [`Session`] (a thread IS a reified
+/// session). The scheduler steps the running thread until it finishes or reaches a yield point
+/// (`Thread.Yield` / `Sleep` / `Join`, signalled via the [`Vm`]'s thread-op channel), then picks the
+/// next runnable thread. With a single thread -- the common case, and every program that spawns none
+/// -- the loop reduces to running thread 0 to completion, exactly as before.
+///
+/// # Errors
+/// Propagates a [`Trap`] from any thread's execution.
 pub fn run(
     module: &Module,
     vm: &mut Vm,
@@ -496,7 +889,99 @@ pub fn run(
     for &cctor in module.static_ctors() {
         Session::new(module, cctor, Vec::new())?.run(module, vm)?;
     }
-    Session::new(module, entry, args)?.run(module, vm)
+    let mut threads = alloc::vec![ThreadSlot {
+        id: 0,
+        session: Session::new(module, entry, args)?,
+        state: ThreadState::Ready,
+        result: None,
+        background: false,
+    }];
+    let mut cursor = 0usize;
+    let mut live = 1u32;
+    loop {
+        if threads
+            .iter()
+            .all(|slot| slot.background || slot.state == ThreadState::Done)
+        {
+            break;
+        }
+        let Some(index) = next_ready_thread(&threads, cursor) else {
+            if idle_wait(&mut threads, vm) {
+                continue;
+            }
+            break;
+        };
+        cursor = index;
+        vm.set_current_thread(threads[index].id);
+        vm.set_live_thread_count(live);
+        match threads[index].session.run_until_yield(module, vm)? {
+            ThreadStatus::Done(value) => {
+                let finished = threads[index].id;
+                threads[index].result = Some(value);
+                threads[index].state = ThreadState::Done;
+                live -= 1;
+                for slot in &mut threads {
+                    if slot.state == ThreadState::Joining(finished) {
+                        slot.state = ThreadState::Ready;
+                    }
+                }
+                cursor = index + 1;
+            }
+            ThreadStatus::Yielded => match vm.take_thread_op() {
+                Some(ThreadOp::Spawn { id, method, target, background }) => {
+                    let session = Session::new(module, method, delegate_call_args(&target, &[]))?;
+                    threads.push(ThreadSlot {
+                        id,
+                        session,
+                        state: ThreadState::Ready,
+                        result: None,
+                        background,
+                    });
+                    live += 1;
+                }
+                Some(ThreadOp::Yield) => cursor = index + 1,
+                Some(ThreadOp::Join { target }) => {
+                    let pending = threads
+                        .iter()
+                        .any(|slot| slot.id == target && slot.state != ThreadState::Done);
+                    if pending {
+                        threads[index].state = ThreadState::Joining(target);
+                    }
+                    cursor = index + 1;
+                }
+                Some(ThreadOp::BlockOnLock { wake }) => {
+                    threads[index].state = ThreadState::Blocked;
+                    if let Some(id) = wake {
+                        for slot in &mut threads {
+                            if slot.id == id && slot.state == ThreadState::Blocked {
+                                slot.state = ThreadState::Ready;
+                            }
+                        }
+                    }
+                    cursor = index + 1;
+                }
+                Some(ThreadOp::WakeThread { id }) => {
+                    for slot in &mut threads {
+                        if slot.id == id && slot.state == ThreadState::Blocked {
+                            slot.state = ThreadState::Ready;
+                        }
+                    }
+                    cursor = index + 1;
+                }
+                Some(ThreadOp::SleepFor(millis)) => {
+                    let deadline = vm.now_millis().map_or(0, |now| now.saturating_add(millis));
+                    threads[index].state = ThreadState::Sleeping(deadline);
+                    cursor = index + 1;
+                }
+                None => cursor = index + 1,
+            },
+        }
+        #[cfg(feature = "gc")]
+        if vm.take_force_collect() {
+            collect_all_threads(&mut threads, module, vm);
+        }
+    }
+    Ok(threads.into_iter().next().and_then(|slot| slot.result).flatten())
 }
 
 /// A steppable, inspectable execution: the foundation the debugger drives.
@@ -762,6 +1247,33 @@ impl Session {
         }
     }
 
+    /// Runs to completion OR until a threading intrinsic raises a scheduler request (the cooperative
+    /// yield points: `Thread.Start` / `Join` / `Yield` / `Sleep`), whichever comes first. The
+    /// scheduler ([`run`]) then acts on the request and resumes a (possibly different) thread. With
+    /// no threading this never yields and is exactly [`Session::run`].
+    ///
+    /// # Errors
+    /// Returns a [`Trap`] if an instruction faults.
+    fn run_until_yield(&mut self, module: &Module, vm: &mut Vm) -> Result<ThreadStatus, Trap> {
+        let mut quantum = TIME_SLICE_QUANTUM;
+        loop {
+            if let Some(result) = &self.result {
+                return Ok(ThreadStatus::Done(result.clone()));
+            }
+            self.advance(module, vm)?;
+            if vm.has_thread_op() {
+                return Ok(ThreadStatus::Yielded);
+            }
+            quantum -= 1;
+            if quantum == 0 {
+                if vm.live_thread_count() > 1 {
+                    return Ok(ThreadStatus::Yielded);
+                }
+                quantum = TIME_SLICE_QUANTUM;
+            }
+        }
+    }
+
     /// The number of frames on the call stack (0 once finished).
     #[must_use]
     pub fn depth(&self) -> usize {
@@ -1023,7 +1535,11 @@ impl Session {
                     vm.request_collect();
                 }
             } else if forced || vm.heap().should_collect() {
-                self.collect_garbage(module, vm);
+                if vm.live_thread_count() <= 1 {
+                    self.collect_garbage(module, vm);
+                } else {
+                    vm.request_collect();
+                }
             }
         }
         let Session { frames, result, .. } = self;
@@ -1663,6 +2179,12 @@ fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str]
         "System.Exception",
         "System.Object",
     ];
+    const SYNC_LOCK: &[&str] = &[
+        "System.Threading.SynchronizationLockException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
     let (text, chain): (&str, &[&str]) = match trap {
         Trap::DivideByZero => ("Attempted to divide by zero.", ARITHMETIC),
         Trap::NullReference => (
@@ -1676,6 +2198,10 @@ fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str]
         ),
         Trap::InvalidCast => ("Unable to cast object to the target type.", INVALID_CAST),
         Trap::InvalidArgument => ("Requested value was not found.", ARGUMENT),
+        Trap::SynchronizationLock => (
+            "Object synchronization method was called from an unsynchronized block of code.",
+            SYNC_LOCK,
+        ),
         Trap::Overflow => ("Arithmetic operation resulted in an overflow.", OVERFLOW),
         _ => return None,
     };
@@ -3746,6 +4272,11 @@ fn resolve_callvirt(
         if let Some(method) = module.sig_dispatch(type_id, key) {
             return Some(method);
         }
+        if static_method.is_none() {
+            if let Some(method) = module.sig_dispatch_nonvirtual(type_id, key) {
+                return Some(method);
+            }
+        }
     }
     static_method
 }
@@ -3857,96 +4388,153 @@ impl Session {
     /// exception, an in-flight multicast), the entry's result, the statics, and the
     /// exception-message table. Called at an instruction boundary, where the frame state
     /// is consistent, so anything still live is reachable from these roots.
-    fn collect_garbage(&mut self, module: &Module, vm: &mut Vm) {
-        #[cfg(feature = "finalizers")]
-        if vm.finalizing {
-            return;
+    /// Visits every heap-reference ROOT this session holds -- each frame's eval stack, locals, args,
+    /// and in-flight new-object / new-value / exception / multicast state, plus the entry's result --
+    /// so the collector can mark and relocate them. Shared by the single-thread `collect_garbage` and
+    /// the scheduler's all-threads collection ([`collect_all_threads`]).
+    #[cfg(feature = "gc")]
+    fn visit_roots(&mut self, visit: &mut dyn FnMut(&mut Value)) {
+        for frame in self.frames.iter_mut() {
+            for value in frame.stack.iter_mut() {
+                visit(value);
+            }
+            for value in frame.locals.iter_mut() {
+                visit(value);
+            }
+            for value in frame.args.iter_mut() {
+                visit(value);
+            }
+            visit_optional_ref(&mut frame.new_object, visit);
+            visit_optional_location(&mut frame.new_value, visit);
+            visit_optional_ref(&mut frame.current_exception, visit);
+            if let Some(pending) = &mut frame.pending {
+                match &mut pending.then {
+                    AfterFinally::Catch { exception, .. } | AfterFinally::Unwind(exception) => {
+                        visit_ref(exception, visit);
+                    }
+                    AfterFinally::Goto(_) => {}
+                }
+            }
+            if let Some(filter) = &mut frame.pending_filter {
+                visit_ref(&mut filter.exception, visit);
+            }
+            if let Some((invocations, params)) = &mut frame.multicast {
+                for (target, _) in invocations.iter_mut() {
+                    visit(target);
+                }
+                for value in params.iter_mut() {
+                    visit(value);
+                }
+            }
         }
-        #[cfg(not(feature = "finalizers"))]
-        let _ = module;
-        let mut messages: Vec<Value> = Vec::with_capacity(vm.exception_messages.len() * 2);
-        for (&exception, &message) in &vm.exception_messages {
-            messages.push(Value::Object(exception));
-            messages.push(Value::Object(message));
-        }
-
-        let Vm { heap, statics, .. } = vm;
-        let frames = &mut self.frames;
-        let result = &mut self.result;
-        let finalizable = heap.collect(|visit| {
-            for frame in frames.iter_mut() {
-                for value in frame.stack.iter_mut() {
-                    visit(value);
-                }
-                for value in frame.locals.iter_mut() {
-                    visit(value);
-                }
-                for value in frame.args.iter_mut() {
-                    visit(value);
-                }
-                visit_optional_ref(&mut frame.new_object, visit);
-                visit_optional_location(&mut frame.new_value, visit);
-                visit_optional_ref(&mut frame.current_exception, visit);
-                if let Some(pending) = &mut frame.pending {
-                    match &mut pending.then {
-                        AfterFinally::Catch { exception, .. } | AfterFinally::Unwind(exception) => {
-                            visit_ref(exception, visit);
-                        }
-                        AfterFinally::Goto(_) => {}
-                    }
-                }
-                if let Some(filter) = &mut frame.pending_filter {
-                    visit_ref(&mut filter.exception, visit);
-                }
-                if let Some((invocations, params)) = &mut frame.multicast {
-                    for (target, _) in invocations.iter_mut() {
-                        visit(target);
-                    }
-                    for value in params.iter_mut() {
-                        visit(value);
-                    }
-                }
-            }
-            if let Some(Some(value)) = result.as_mut() {
-                visit(value);
-            }
-            for value in statics.iter_mut() {
-                visit(value);
-            }
-            for value in messages.iter_mut() {
-                visit(value);
-            }
-        });
-
-        vm.exception_messages = messages
-            .chunks_exact(2)
-            .filter_map(|pair| match (&pair[0], &pair[1]) {
-                (Value::Object(key), Value::Object(value)) => Some((*key, *value)),
-                _ => None,
-            })
-            .collect();
-
-        #[cfg(not(feature = "finalizers"))]
-        let _ = finalizable;
-        #[cfg(feature = "finalizers")]
-        if !finalizable.is_empty() {
-            vm.finalizing = true;
-            for object in finalizable {
-                let Some(type_id) = vm.heap().type_of(object) else {
-                    continue;
-                };
-                let Some(finalize) = module.finalizer_of(type_id) else {
-                    continue;
-                };
-                if let Ok(mut session) =
-                    Session::new(module, finalize, alloc::vec![Value::Object(object)])
-                {
-                    let _ = session.run(module, vm);
-                }
-            }
-            vm.finalizing = false;
+        if let Some(Some(value)) = self.result.as_mut() {
+            visit(value);
         }
     }
+
+    fn collect_garbage(&mut self, module: &Module, vm: &mut Vm) {
+        run_collection(vm, module, |visit| self.visit_roots(visit));
+    }
+}
+
+/// The shared body of a mark-compact collection, parameterized by the root walk (`roots`). The
+/// single-thread [`Session::collect_garbage`] passes its own session's roots; the scheduler's
+/// [`collect_all_threads`] passes every live thread's. Beyond the caller's roots it marks the
+/// statics, the exception-message table, and the per-object `Monitor` lock table, then rebuilds the
+/// two heap-index-keyed side tables from their relocated keys and runs any finalizers.
+///
+/// The lock table is the subtle one: a `Monitor` lock now spans scheduler switches (the holder can
+/// be preempted inside its critical section) and therefore GCs, and its keys are heap indices the
+/// compactor renumbers. So each key is mirrored as a `Value::Object` root -- marked and remapped in
+/// place exactly like the exception-message keys -- and the table is rebuilt from the new indices.
+/// The lock objects are independently reachable (the owner's and every waiter's frame holds the
+/// `lock(obj)` reference, walked by `roots`), so this never resurrects a dead lock.
+#[cfg(feature = "gc")]
+fn run_collection(vm: &mut Vm, module: &Module, mut roots: impl FnMut(&mut dyn FnMut(&mut Value))) {
+    #[cfg(feature = "finalizers")]
+    if vm.finalizing {
+        return;
+    }
+    #[cfg(not(feature = "finalizers"))]
+    let _ = module;
+
+    let mut messages: Vec<Value> = Vec::with_capacity(vm.exception_messages.len() * 2);
+    for (&exception, &message) in &vm.exception_messages {
+        messages.push(Value::Object(exception));
+        messages.push(Value::Object(message));
+    }
+    let mut lock_states: Vec<LockState> = Vec::with_capacity(vm.locks.len());
+    let mut lock_keys: Vec<Value> = Vec::with_capacity(vm.locks.len());
+    for (key, state) in core::mem::take(&mut vm.locks) {
+        lock_keys.push(Value::Object(ObjectRef(key)));
+        lock_states.push(state);
+    }
+
+    let Vm { heap, statics, .. } = vm;
+    let finalizable = heap.collect(|visit| {
+        roots(&mut *visit);
+        for value in statics.iter_mut() {
+            visit(value);
+        }
+        for value in messages.iter_mut() {
+            visit(value);
+        }
+        for value in lock_keys.iter_mut() {
+            visit(value);
+        }
+    });
+
+    vm.exception_messages = messages
+        .chunks_exact(2)
+        .filter_map(|pair| match (&pair[0], &pair[1]) {
+            (Value::Object(key), Value::Object(value)) => Some((*key, *value)),
+            _ => None,
+        })
+        .collect();
+    vm.locks = lock_keys
+        .into_iter()
+        .zip(lock_states)
+        .filter_map(|(key, state)| match key {
+            Value::Object(reference) => Some((reference.0, state)),
+            _ => None,
+        })
+        .collect();
+
+    #[cfg(not(feature = "finalizers"))]
+    let _ = finalizable;
+    #[cfg(feature = "finalizers")]
+    if !finalizable.is_empty() {
+        vm.finalizing = true;
+        for object in finalizable {
+            let Some(type_id) = vm.heap().type_of(object) else {
+                continue;
+            };
+            let Some(finalize) = module.finalizer_of(type_id) else {
+                continue;
+            };
+            if let Ok(mut session) =
+                Session::new(module, finalize, alloc::vec![Value::Object(object)])
+            {
+                let _ = session.run(module, vm);
+            }
+        }
+        vm.finalizing = false;
+    }
+}
+
+/// Collects with the roots of EVERY green thread, not just the running one -- the scheduler's
+/// multi-thread safe point (after a thread yields/finishes, when all frames are consistent). A
+/// collection while several threads are live must mark from ALL of their reified `Session` stacks (a
+/// paused thread's frames hold live objects too); rooting only the running thread would reclaim the
+/// others' objects. Shares [`run_collection`] with the single-thread path, walking every thread's
+/// [`Session::visit_roots`].
+#[cfg(feature = "gc")]
+fn collect_all_threads(threads: &mut [ThreadSlot], module: &Module, vm: &mut Vm) {
+    run_collection(vm, module, |visit| {
+        for slot in threads.iter_mut() {
+            slot.session.visit_roots(visit);
+        }
+    });
 }
 
 /// Relocates an optional heap-reference root through the collector's value visitor.

@@ -37,6 +37,9 @@ pub enum Trap {
     /// An argument was invalid (the `ArgumentException` site) -- e.g. `Enum.Parse` of a
     /// name that names no constant of the enum.
     InvalidArgument,
+    /// `Monitor.Wait`/`Pulse`/`PulseAll` by a thread that does not own the object's lock (the
+    /// `SynchronizationLockException` site).
+    SynchronizationLock,
     /// A checked arithmetic operation or conversion overflowed (the `OverflowException`
     /// site) -- `add.ovf` / `sub.ovf` / `mul.ovf` and `conv.ovf.*`.
     Overflow,
@@ -75,6 +78,9 @@ impl fmt::Display for Trap {
             Trap::NullReference => f.write_str("dereferenced a null reference"),
             Trap::InvalidCast => f.write_str("invalid cast"),
             Trap::InvalidArgument => f.write_str("invalid argument"),
+            Trap::SynchronizationLock => {
+                f.write_str("monitor wait/pulse by a thread that does not own the lock")
+            }
             Trap::Overflow => f.write_str("arithmetic overflow"),
             Trap::UnresolvedField(token) => {
                 write!(f, "field token 0x{:08X} resolved to no field", token.0)

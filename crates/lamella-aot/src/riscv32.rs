@@ -76,6 +76,20 @@ pub fn lower_module_gc(funcs: &[Function], alloc_addr: u32) -> Result<Vec<u8>, L
 }
 
 fn lower_module_inner(funcs: &[Function], alloc_addr: Option<u32>) -> Result<Vec<u8>, LowerError> {
+    lower_module_to_image(funcs, alloc_addr, false).map(|(bytes, _, _)| bytes)
+}
+
+/// A lowered module: the code bytes, each function's entry offset, and the call relocations as
+/// `(auipc offset, callee index)` pairs (empty unless lowering for a relocatable object).
+type LoweredModule = (Vec<u8>, Vec<u32>, Vec<(u32, u32)>);
+
+/// Lowers a module and also reports each function's byte offset in the image (its entry point) --
+/// the basis for the symbol table when emitting a relocatable object.
+fn lower_module_to_image(
+    funcs: &[Function],
+    alloc_addr: Option<u32>,
+    relocate: bool,
+) -> Result<LoweredModule, LowerError> {
     for func in funcs {
         if lamella_ir::verify(func).is_err() {
             return Err(LowerError::NotWellFormed);
@@ -83,13 +97,61 @@ fn lower_module_inner(funcs: &[Function], alloc_addr: Option<u32>) -> Result<Vec
     }
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = (0..funcs.len()).map(|_| enc.new_label()).collect();
+    let mut offsets: Vec<u32> = Vec::with_capacity(funcs.len());
+    let mut call_relocs: Vec<(u32, u32)> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
         enc.bind_label(func_labels[index]);
-        lower_function(&mut enc, func, &func_labels, alloc_addr)?;
+        offsets.push(enc.position());
+        lower_function(
+            &mut enc,
+            func,
+            &func_labels,
+            alloc_addr,
+            &mut call_relocs,
+            relocate,
+        )?;
     }
-    enc.finish()
+    let bytes = enc
+        .finish()
         .map(|assembled| assembled.bytes)
-        .map_err(|_| LowerError::CodeTooLarge)
+        .map_err(|_| LowerError::CodeTooLarge)?;
+    Ok((bytes, offsets, call_relocs))
+}
+
+/// Lowers a module into an ELF32 relocatable object: each function becomes a global `STT_FUNC`
+/// symbol (named by `names[i]`) at its entry offset, and every call becomes an `R_RISCV_CALL_PLT`
+/// relocation to the callee's symbol -- so a linker (ours or another) resolves them and can see the
+/// call graph for `--gc-sections`. `names` must have one entry per function in `funcs`.
+pub fn lower_object(funcs: &[Function], names: &[&str]) -> Result<Vec<u8>, LowerError> {
+    let (text, offsets, call_relocs) = lower_module_to_image(funcs, None, true)?;
+    let symbols: Vec<lamella_elf::Symbol> = (0..funcs.len())
+        .map(|i| {
+            let end = offsets.get(i + 1).copied().unwrap_or(text.len() as u32);
+            lamella_elf::Symbol {
+                name: names[i],
+                value: offsets[i],
+                size: end - offsets[i],
+                binding: lamella_elf::Binding::Global,
+                kind: lamella_elf::SymbolType::Func,
+                section: lamella_elf::SymbolSection::Text,
+            }
+        })
+        .collect();
+    let relocations: Vec<lamella_elf::Relocation> = call_relocs
+        .iter()
+        .map(|&(offset, callee)| lamella_elf::Relocation {
+            offset,
+            symbol: callee,
+            kind: lamella_elf::riscv::R_RISCV_CALL_PLT,
+            addend: 0,
+        })
+        .collect();
+    Ok(lamella_elf::write_relocatable_object(
+        lamella_elf::Machine::RiscV,
+        &text,
+        &symbols,
+        &relocations,
+    ))
 }
 
 /// Lowers one function into `enc`: a prologue that allocates a frame and saves the callee-saved
@@ -101,6 +163,8 @@ fn lower_function(
     func: &Function,
     func_labels: &[Label],
     alloc_addr: Option<u32>,
+    relocs: &mut Vec<(u32, u32)>,
+    relocate: bool,
 ) -> Result<(), LowerError> {
     let pool = allocatable();
     let value_count = func.value_types.len();
@@ -110,7 +174,7 @@ fn lower_function(
             .any(|(_, i)| matches!(i, Inst::Alloc { .. } | Inst::AllocArray { .. }))
     });
     if value_count > pool.len() || allocates {
-        return lower_function_spilled(enc, func, func_labels, alloc_addr);
+        return lower_function_spilled(enc, func, func_labels, alloc_addr, relocs, relocate);
     }
     let reg = |v: ValueId| pool[v.index()];
     let used = &pool[..value_count];
@@ -163,7 +227,16 @@ fn lower_function(
         };
 
         for (result, inst) in body {
-            lower_inst(enc, &reg, &func.value_types, func_labels, *result, inst)?;
+            lower_inst(
+                enc,
+                &reg,
+                &func.value_types,
+                func_labels,
+                *result,
+                inst,
+                relocs,
+                relocate,
+            )?;
         }
 
         match &block.terminator {
@@ -228,7 +301,31 @@ fn lower_function(
     Ok(())
 }
 
+/// Emits a call to function `callee`: in object mode (`relocate`) an `auipc`+`jalr` pair whose
+/// target is left for a `R_RISCV_CALL_PLT` relocation (the site recorded in `relocs`); otherwise a
+/// resolved `jal` to the callee's intra-module label.
+fn emit_call(
+    enc: &mut Encoder,
+    func_labels: &[Label],
+    relocs: &mut Vec<(u32, u32)>,
+    relocate: bool,
+    callee: u32,
+) -> Result<(), LowerError> {
+    if relocate {
+        relocs.push((enc.position(), callee));
+        enc.auipc(Reg::RA, 0);
+        enc.jalr(Reg::RA, Reg::RA, 0);
+    } else {
+        let label = *func_labels
+            .get(callee as usize)
+            .ok_or(LowerError::ControlFlowUnsupported)?;
+        enc.jal(Reg::RA, label);
+    }
+    Ok(())
+}
+
 /// Lowers one value-defining instruction into its assigned register.
+#[allow(clippy::too_many_arguments)]
 fn lower_inst(
     enc: &mut Encoder,
     reg: &impl Fn(ValueId) -> Reg,
@@ -236,6 +333,8 @@ fn lower_inst(
     func_labels: &[Label],
     result: ValueId,
     inst: &Inst,
+    relocs: &mut Vec<(u32, u32)>,
+    relocate: bool,
 ) -> Result<(), LowerError> {
     match inst {
         Inst::ConstInt { value, .. } => enc.li(reg(result), *value as i32),
@@ -246,10 +345,7 @@ fn lower_inst(
                     enc.mv(target, reg(arg));
                 }
             }
-            let label = *func_labels
-                .get(*callee as usize)
-                .ok_or(LowerError::ControlFlowUnsupported)?;
-            enc.jal(Reg::RA, label);
+            emit_call(enc, func_labels, relocs, relocate, *callee)?;
             if reg(result) != Reg::A0 {
                 enc.mv(reg(result), Reg::A0);
             }
@@ -341,6 +437,8 @@ fn lower_function_spilled(
     func: &Function,
     func_labels: &[Label],
     alloc_addr: Option<u32>,
+    relocs: &mut Vec<(u32, u32)>,
+    relocate: bool,
 ) -> Result<(), LowerError> {
     let value_count = func.value_types.len();
     let has_calls = func.blocks.iter().any(|b| {
@@ -402,6 +500,8 @@ fn lower_function_spilled(
                 alloc_addr,
                 &mut type_descs,
                 &mut type_desc_labels,
+                relocs,
+                relocate,
             )?;
         }
         match &block.terminator {
@@ -484,6 +584,8 @@ fn lower_inst_spilled(
     alloc_addr: Option<u32>,
     type_descs: &mut Vec<(Label, Vec<u32>)>,
     type_desc_labels: &mut Vec<(TypeHandle, Label)>,
+    relocs: &mut Vec<(u32, u32)>,
+    relocate: bool,
 ) -> Result<(), LowerError> {
     let (t0, t1, t2) = (Reg::T0, Reg::T1, Reg::T2);
     match inst {
@@ -649,10 +751,7 @@ fn lower_inst_spilled(
                 let target = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
                 enc.lw(target, Reg::SP, slot(arg));
             }
-            let label = *func_labels
-                .get(*callee as usize)
-                .ok_or(LowerError::ControlFlowUnsupported)?;
-            enc.jal(Reg::RA, label);
+            emit_call(enc, func_labels, relocs, relocate, *callee)?;
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         _ => return Err(LowerError::Unsupported),

@@ -38,6 +38,10 @@ pub enum SpecialType {
     Object,
     /// `void` -- `System.Void`.
     Void,
+    /// The null type (11.2.7) -- the type of the `null` literal, and its only value. It has
+    /// no keyword and no `System` identity; it converts implicitly to every reference type
+    /// (13.1.6) and is never a value type, so it is never boxed.
+    Null,
 }
 
 impl SpecialType {
@@ -85,6 +89,7 @@ impl SpecialType {
             SpecialType::String => "string",
             SpecialType::Object => "object",
             SpecialType::Void => "void",
+            SpecialType::Null => "<null>",
         }
     }
 
@@ -108,6 +113,7 @@ impl SpecialType {
             SpecialType::String => "String",
             SpecialType::Object => "Object",
             SpecialType::Void => "Void",
+            SpecialType::Null => "Object",
         };
         ("System", name)
     }

@@ -246,6 +246,8 @@ dependencies = [
  "lamella-dap",
  "lamella-load",
  "lamella-metadata",
+ "lamella-py-frontend",
+ "lamella-py-runtime",
  "lamella-syntax",
  "serde_json",
 ]

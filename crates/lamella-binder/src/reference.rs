@@ -1,5 +1,6 @@
 //! Loading a reference assembly's types into the binder's [`Model`].
 
+use crate::bound::integer_literal;
 use crate::special::SpecialType;
 use crate::symbols::{
     Accessibility, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind,
@@ -10,6 +11,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use lamella_metadata::tables::table;
 use lamella_metadata::{Assembly, ConstantValue, SigType, TypeName};
+use lamella_syntax::ast::Literal;
+use lamella_syntax::token::RealSuffix;
 use lamella_token::Token;
 
 /// Adds every type defined in `assembly` to `model`.
@@ -31,6 +34,9 @@ fn type_info(
 ) -> Option<TypeInfo> {
     let TypeName { namespace, name } = type_def.name()?;
     if name == "<Module>" {
+        return None;
+    }
+    if type_def.is_nested() {
         return None;
     }
     let extends = type_def.extends();
@@ -62,7 +68,7 @@ fn type_info(
     }
     for field in type_def.fields() {
         if let (Some(field_name), Some(signature)) = (field.name(), field.signature()) {
-            let constant = field.constant().and_then(constant_to_i64);
+            let constant = field.constant().and_then(constant_to_literal);
             info.fields.push(FieldSymbol {
                 name: field_name.into(),
                 ty: sigtype_to_symbol(assembly, &signature),
@@ -133,25 +139,33 @@ fn member_accessibility(flags: u32) -> Accessibility {
     }
 }
 
-/// Narrows a metadata constant to the binder's integral fold (`Option<i64>`): the integer,
-/// char, and bool literals fold (enum members, `int.MaxValue`, `SeekOrigin.Begin`); a string,
-/// float, or null constant does not -- the binder folds only integral constants.
-fn constant_to_i64(value: ConstantValue) -> Option<i64> {
-    match value {
-        ConstantValue::Bool(b) => Some(i64::from(b)),
-        ConstantValue::Char(c) => Some(i64::from(c)),
-        ConstantValue::I1(n) => Some(i64::from(n)),
-        ConstantValue::U1(n) => Some(i64::from(n)),
-        ConstantValue::I2(n) => Some(i64::from(n)),
-        ConstantValue::U2(n) => Some(i64::from(n)),
-        ConstantValue::I4(n) => Some(i64::from(n)),
-        ConstantValue::U4(n) => Some(i64::from(n)),
-        ConstantValue::I8(n) => Some(n),
-        ConstantValue::U8(n) => Some(n as i64),
-        ConstantValue::R4(_) | ConstantValue::R8(_) | ConstantValue::String(_) | ConstantValue::Null => {
-            None
-        }
-    }
+/// Maps a metadata constant to the literal the binder folds a `const` field or enum member
+/// to at its use site (instead of an `ldsfld` on a storageless slot): the integral, char, and
+/// bool values, and now the float (`Single.MaxValue`, `Double.NaN`) and string ones. A null
+/// constant has no fold -- it is already the null literal at the use site.
+fn constant_to_literal(value: ConstantValue) -> Option<Literal> {
+    Some(match value {
+        ConstantValue::Bool(b) => Literal::Boolean(b),
+        ConstantValue::Char(c) => Literal::Character(c),
+        ConstantValue::I1(n) => integer_literal(i64::from(n)),
+        ConstantValue::U1(n) => integer_literal(i64::from(n)),
+        ConstantValue::I2(n) => integer_literal(i64::from(n)),
+        ConstantValue::U2(n) => integer_literal(i64::from(n)),
+        ConstantValue::I4(n) => integer_literal(i64::from(n)),
+        ConstantValue::U4(n) => integer_literal(i64::from(n)),
+        ConstantValue::I8(n) => integer_literal(n),
+        ConstantValue::U8(n) => integer_literal(n as i64),
+        ConstantValue::R4(f) => Literal::Real {
+            bits: f64::from(f).to_bits(),
+            suffix: RealSuffix::Float,
+        },
+        ConstantValue::R8(f) => Literal::Real {
+            bits: f.to_bits(),
+            suffix: RealSuffix::Double,
+        },
+        ConstantValue::String(units) => Literal::String(units.into_boxed_slice()),
+        ConstantValue::Null => return None,
+    })
 }
 
 /// Maps a metadata signature element to a [`TypeSymbol`].

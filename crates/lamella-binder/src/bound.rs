@@ -43,9 +43,9 @@ pub struct FieldReference {
     pub is_static: bool,
     /// The field's accessibility.
     pub accessibility: Accessibility,
-    /// The compile-time constant value, for an enum member (its underlying value),
-    /// so emission folds the access to a constant load. `None` for an ordinary field.
-    pub constant: Option<i64>,
+    /// The compile-time constant value of a `const` field or enum member, so emission folds
+    /// the access to a constant load (not an `ldsfld`). `None` for an ordinary field.
+    pub constant: Option<Literal>,
 }
 
 /// The method an invocation resolved to, recorded so emission can name it with a
@@ -637,7 +637,9 @@ impl Binder {
     /// Whether a type is a value type (boxed when converted to `object`).
     fn is_value_type(&self, ty: &TypeSymbol) -> bool {
         match ty {
-            TypeSymbol::Special(SpecialType::Object | SpecialType::String) => false,
+            TypeSymbol::Special(
+                SpecialType::Object | SpecialType::String | SpecialType::Null,
+            ) => false,
             TypeSymbol::Special(_) => true,
             TypeSymbol::Named(_) => matches!(
                 self.type_info_of(ty).map(|info| info.kind),
@@ -645,6 +647,31 @@ impl Binder {
             ),
             TypeSymbol::Array { .. } | TypeSymbol::Pointer(_) | TypeSymbol::Error => false,
         }
+    }
+
+    /// The result of `==`/`!=` when one operand is the null literal (14.9.6): the null type
+    /// is reference-comparable with any reference type (and with the null type itself),
+    /// giving `bool`. It is not comparable with a value type -- which has no null -- so that
+    /// returns `None` and falls through to the not-applicable diagnostic. `None` also when
+    /// neither operand is the null type.
+    fn null_equality_result(
+        &self,
+        operator: BinaryOperator,
+        left: &TypeSymbol,
+        right: &TypeSymbol,
+    ) -> Option<TypeSymbol> {
+        if !matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
+            return None;
+        }
+        let null = TypeSymbol::Special(SpecialType::Null);
+        let other = if *left == null {
+            right
+        } else if *right == null {
+            left
+        } else {
+            return None;
+        };
+        (!self.is_value_type(other)).then(|| TypeSymbol::Special(SpecialType::Boolean))
     }
 
     /// The diagnostics gathered so far.
@@ -1350,6 +1377,8 @@ impl Binder {
             result
         } else if let Some(result) = pointer_binary_result(operator, &left.ty, &right.ty) {
             result
+        } else if let Some(result) = self.null_equality_result(operator, &left.ty, &right.ty) {
+            result
         } else if let Some(result) = binary_result_type(operator, &left.ty, &right.ty) {
             result
         } else {
@@ -1889,7 +1918,7 @@ impl Binder {
                             ty: ty.clone(),
                             is_static: true,
                             accessibility: Accessibility::Public,
-                            constant: Some(constant),
+                            constant: Some(integer_literal(constant)),
                         }),
                     },
                     ty,
@@ -2662,7 +2691,7 @@ impl Binder {
                     ty: self.resolve_type(&field.ty),
                     is_static: field.is_static,
                     accessibility: field.accessibility,
-                    constant: field.constant,
+                    constant: field.constant.clone(),
                 });
             }
             if let Some(property) = info.find_property(name) {
@@ -3326,13 +3355,34 @@ fn constant_int_value(expr: &BoundExpr) -> Option<i64> {
         BoundExprKind::Literal(Literal::Integer { value, .. }) => i64::try_from(*value).ok(),
         BoundExprKind::FieldAccess {
             field: Some(field), ..
-        } => field.constant,
+        } => field.constant.as_ref().and_then(literal_int_value),
         BoundExprKind::Unary { operator, operand } => match operator {
             UnaryOperator::Plus => constant_int_value(operand),
             UnaryOperator::Minus => constant_int_value(operand)?.checked_neg(),
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// An integer constant literal of the given value (the form a folded enum member /
+/// `const` field / predefined `MaxValue` takes); its `i64` round-trips via `value as u64`.
+pub(crate) fn integer_literal(value: i64) -> Literal {
+    Literal::Integer {
+        value: value as u64,
+        suffix: lamella_syntax::token::IntegerSuffix::None,
+    }
+}
+
+/// The `i64` value of an integral constant literal -- an integer (its two's-complement
+/// bits), a `char`, or a `bool` -- the form case labels, constant-conversion checks, and the
+/// enum-member value table compare. `None` for a real, string, or null literal.
+pub fn literal_int_value(literal: &Literal) -> Option<i64> {
+    match literal {
+        Literal::Integer { value, .. } => Some(*value as i64),
+        Literal::Character(unit) => Some(i64::from(*unit)),
+        Literal::Boolean(b) => Some(i64::from(*b)),
+        Literal::Real { .. } | Literal::String(_) | Literal::Null => None,
     }
 }
 
@@ -3822,7 +3872,7 @@ fn literal_type(literal: &Literal) -> TypeSymbol {
         Literal::Character(_) => SpecialType::Char,
         Literal::String(_) => SpecialType::String,
         Literal::Boolean(_) => SpecialType::Boolean,
-        Literal::Null => SpecialType::Object,
+        Literal::Null => SpecialType::Null,
     };
     TypeSymbol::Special(special)
 }

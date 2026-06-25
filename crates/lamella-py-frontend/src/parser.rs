@@ -1,4 +1,4 @@
-//! A recursive-descent parser for the first-light Python subset.
+//! A recursive-descent parser for the Python subset.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -141,6 +141,18 @@ impl Parser {
     fn parse_small_stmt(&mut self) -> Result<Stmt, ParseError> {
         if self.at(&Tok::KwReturn) {
             self.parse_return()
+        } else if self.at(&Tok::KwBreak) {
+            self.advance();
+            self.expect_newline()?;
+            Ok(Stmt::Break)
+        } else if self.at(&Tok::KwContinue) {
+            self.advance();
+            self.expect_newline()?;
+            Ok(Stmt::Continue)
+        } else if self.at(&Tok::KwPass) {
+            self.advance();
+            self.expect_newline()?;
+            Ok(Stmt::Pass)
         } else {
             self.parse_assign_or_expr()
         }
@@ -159,8 +171,8 @@ impl Parser {
 
     /// `assignment_stmt`, `annotated_assignment_stmt`, or `expression_stmt`. The
     /// statement is parsed as an expression first; a following `:` or `=` then
-    /// reinterprets it as an (annotated) assignment, whose target first light
-    /// restricts to a bare name.
+    /// reinterprets it as an (annotated) assignment, restricted to a bare name
+    /// as the target.
     fn parse_assign_or_expr(&mut self) -> Result<Stmt, ParseError> {
         let target_line = self.current_line();
         let expr = self.parse_expr()?;
@@ -197,18 +209,24 @@ impl Parser {
                 }))
             }
             Tok::Assign => {
-                let target = self.target_name(expr, target_line)?;
+                let mut targets = vec![self.target_name(expr, target_line)?];
                 self.advance();
-                let value = self.parse_expr()?;
-                if self.at(&Tok::Assign) {
-                    return Err(self.error("chained assignment is out of the first-light subset"));
+                let mut value = self.parse_expr()?;
+                while self.at(&Tok::Assign) {
+                    targets.push(self.target_name(value, target_line)?);
+                    self.advance();
+                    value = self.parse_expr()?;
                 }
                 self.expect_newline()?;
-                Ok(Stmt::Assign(Assign {
-                    target,
-                    annotation: None,
-                    value: Some(value),
-                }))
+                if targets.len() == 1 {
+                    Ok(Stmt::Assign(Assign {
+                        target: targets.pop().unwrap(),
+                        annotation: None,
+                        value: Some(value),
+                    }))
+                } else {
+                    Ok(Stmt::MultiAssign { targets, value })
+                }
             }
             _ => {
                 self.expect_newline()?;
@@ -217,16 +235,16 @@ impl Parser {
         }
     }
 
-    /// Require an assignment target to be a bare name (first light does not assign
-    /// to attributes, subscriptions, or target lists).
+    /// Require an assignment target to be a bare name (attribute, subscript, and
+    /// tuple targets are not supported in this subset).
     fn target_name(&self, expr: Expr, line: u32) -> Result<String, ParseError> {
         match expr {
             Expr::Name(name) => Ok(name),
             _ => Err(ParseError {
                 line,
                 message: String::from(
-                    "first light assigns only to a bare name (attribute, subscript, and \
-                     tuple targets are out of the subset)",
+                    "only a bare name is a valid assignment target (attribute, subscript, \
+                     and tuple targets are not supported in this subset)",
                 ),
             }),
         }
@@ -265,35 +283,56 @@ impl Parser {
         let target = self.expect_name()?;
         self.expect(&Tok::KwIn, "'in'")?;
         let iter = self.parse_expr()?;
-        let (start, stop) = self.range_bounds(iter)?;
+        let (start, stop, step) = self.range_bounds(iter)?;
         self.expect(&Tok::Colon, "':'")?;
         let body = self.parse_suite()?;
+        let orelse = self.parse_loop_else()?;
         Ok(Stmt::For {
             target,
             start,
             stop,
+            step,
             body,
+            orelse,
         })
     }
 
-    /// First light iterates only `range(stop)` or `range(start, stop)`; pull out the
-    /// bounds (a missing start is `0`).
-    fn range_bounds(&self, iter: Expr) -> Result<(Expr, Expr), ParseError> {
+    /// Only `range(stop)`, `range(start, stop)`, or `range(start, stop, step)` are
+    /// iterable in this subset; pull out the bounds (a missing start is `0`, a
+    /// missing step is `1`). The step must be a non-zero integer literal.
+    fn range_bounds(&self, iter: Expr) -> Result<(Expr, Expr, i64), ParseError> {
         if let Expr::Call { func, args } = iter {
             if matches!(&*func, Expr::Name(n) if n == "range") {
                 let mut args = args;
                 match args.len() {
-                    1 => return Ok((Expr::Int(0), args.pop().unwrap())),
+                    1 => return Ok((Expr::Int(0), args.pop().unwrap(), 1)),
                     2 => {
                         let stop = args.pop().unwrap();
                         let start = args.pop().unwrap();
-                        return Ok((start, stop));
+                        return Ok((start, stop, 1));
+                    }
+                    3 => {
+                        let step_expr = args.pop().unwrap();
+                        let stop = args.pop().unwrap();
+                        let start = args.pop().unwrap();
+                        let Expr::Int(step) = step_expr else {
+                            return Err(
+                                self.error("the range() step must be an integer literal")
+                            );
+                        };
+                        if step == 0 {
+                            return Err(self.error("range() step must not be zero"));
+                        }
+                        return Ok((start, stop, step));
                     }
                     _ => {}
                 }
             }
         }
-        Err(self.error("first light's 'for' iterates only range(stop) or range(start, stop)"))
+        Err(self.error(
+            "'for' iterates only range(stop), range(start, stop), or range(start, stop, step) \
+             in this subset",
+        ))
     }
 
     fn parse_while(&mut self) -> Result<Stmt, ParseError> {
@@ -301,10 +340,22 @@ impl Parser {
         let test = self.parse_expr()?;
         self.expect(&Tok::Colon, "':'")?;
         let body = self.parse_suite()?;
-        Ok(Stmt::While { test, body })
+        let orelse = self.parse_loop_else()?;
+        Ok(Stmt::While { test, body, orelse })
     }
 
-    /// `suite: stmt_list NEWLINE | NEWLINE INDENT statement+ DEDENT`. First light's
+    /// An optional `else:` suite on a `while`/`for` (run when the loop exits without
+    /// `break`). Empty when the clause is absent.
+    fn parse_loop_else(&mut self) -> Result<Vec<Stmt>, ParseError> {
+        if self.eat(&Tok::KwElse) {
+            self.expect(&Tok::Colon, "':'")?;
+            self.parse_suite()
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// `suite: stmt_list NEWLINE | NEWLINE INDENT statement+ DEDENT`. The
     /// single-line form holds one simple statement (no `;`-separated list).
     fn parse_suite(&mut self) -> Result<Vec<Stmt>, ParseError> {
         if self.eat(&Tok::Newline) {
@@ -352,7 +403,7 @@ impl Parser {
         loop {
             if self.at(&Tok::Star) || self.at(&Tok::DoubleSlash) {
                 return Err(self.error(
-                    "variadic and positional-only parameters are out of the first-light subset",
+                    "variadic and positional-only parameters are not supported in this subset",
                 ));
             }
             let name = self.expect_name()?;
@@ -363,7 +414,7 @@ impl Parser {
             };
             if self.at(&Tok::Assign) {
                 return Err(
-                    self.error("default parameter values are out of the first-light subset")
+                    self.error("default parameter values are not supported in this subset")
                 );
             }
             params.push(ParamDef { name, annotation });
@@ -450,25 +501,32 @@ impl Parser {
         }
     }
 
-    /// A single comparison. Python chains comparisons (`a < b < c`), but that
-    /// desugars to a boolean `and`, which is out of first light, so a second
-    /// comparison operator is rejected.
+    /// A comparison, including Python's chains (`a < b < c`), which desugar to the
+    /// `and` of the adjacent comparisons -- `(a < b) and (b < c)`. A shared middle
+    /// operand is re-evaluated per comparison (exact for the side-effect-free
+    /// operands chains typically use, e.g. `0 <= i < n`).
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
-        let lhs = self.parse_bitor()?;
-        if let Some(op) = self.peek_cmp_op() {
+        let mut lhs = self.parse_bitor()?;
+        let mut chain: Option<Expr> = None;
+        while let Some(op) = self.peek_cmp_op() {
             self.advance();
             let rhs = self.parse_bitor()?;
-            if self.peek_cmp_op().is_some() {
-                return Err(self.error("chained comparisons are out of the first-light subset"));
-            }
-            Ok(Expr::Compare {
+            let cmp = Expr::Compare {
                 op,
                 lhs: Box::new(lhs),
-                rhs: Box::new(rhs),
-            })
-        } else {
-            Ok(lhs)
+                rhs: Box::new(rhs.clone()),
+            };
+            chain = Some(match chain {
+                None => cmp,
+                Some(prev) => Expr::BoolBinary {
+                    op: BoolOp::And,
+                    lhs: Box::new(prev),
+                    rhs: Box::new(cmp),
+                },
+            });
+            lhs = rhs;
         }
+        Ok(chain.unwrap_or(lhs))
     }
 
     fn peek_cmp_op(&self) -> Option<CmpOp> {
@@ -581,7 +639,7 @@ impl Parser {
                 Tok::Percent => BinOp::Mod,
                 Tok::Slash => {
                     return Err(self.error(
-                        "true division '/' is out of the first-light subset; use '//' for \
+                        "true division '/' is not supported in this subset; use '//' for \
                          integer floor division",
                     ));
                 }
@@ -628,8 +686,9 @@ impl Parser {
         })
     }
 
-    /// Postfix attribute reference (`primary "." identifier`) and call (`primary
-    /// "(" [args] ")"`), both left-associative and binding tightest.
+    /// Postfix attribute reference (`primary "." identifier`), call (`primary "("
+    /// [args] ")"`), and subscript (`primary "[" expr "]"`) -- all left-associative and
+    /// binding tightest.
     fn parse_trailer(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_atom()?;
         loop {
@@ -649,6 +708,15 @@ impl Parser {
                     expr = Expr::Call {
                         func: Box::new(expr),
                         args,
+                    };
+                }
+                Tok::LBracket => {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    self.expect(&Tok::RBracket, "']' closing the subscript")?;
+                    expr = Expr::Subscript {
+                        value: Box::new(expr),
+                        index: Box::new(index),
                     };
                 }
                 _ => break,
@@ -681,6 +749,15 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Int(value))
             }
+            Tok::Str(value) => {
+                self.advance();
+                let mut joined = value;
+                while let Tok::Str(next) = self.peek().clone() {
+                    joined.push_str(&next);
+                    self.advance();
+                }
+                Ok(Expr::Str(joined))
+            }
             Tok::KwTrue => {
                 self.advance();
                 Ok(Expr::Bool(true))
@@ -704,7 +781,7 @@ impl Parser {
                 Ok(inner)
             }
             Tok::Reserved(word) => Err(self.error(format!(
-                "'{word}' is a reserved keyword not supported in the first-light subset"
+                "'{word}' is a reserved keyword not supported in this subset"
             ))),
             _ => Err(self.error("expected an expression")),
         }
@@ -859,6 +936,94 @@ mod tests {
     }
 
     #[test]
+    fn pass_parses_to_a_no_op() {
+        assert!(matches!(parse_ok("pass\n").body[0], Stmt::Pass));
+    }
+
+    #[test]
+    fn loops_take_an_optional_else_clause() {
+        let with = parse_ok("for i in range(3):\n    pass\nelse:\n    pass\n");
+        let Stmt::For { orelse, .. } = &with.body[0] else {
+            panic!("expected a for loop");
+        };
+        assert_eq!(orelse.len(), 1);
+        let without = parse_ok("while x:\n    pass\n");
+        let Stmt::While { orelse, .. } = &without.body[0] else {
+            panic!("expected a while loop");
+        };
+        assert!(orelse.is_empty());
+    }
+
+    #[test]
+    fn subscript_parses_left_associative() {
+        let module = parse_ok("s[i]\n");
+        let Stmt::Expr(Expr::Subscript { value, index }) = &module.body[0] else {
+            panic!("expected a subscript");
+        };
+        assert!(matches!(&**value, Expr::Name(n) if n == "s"));
+        assert!(matches!(&**index, Expr::Name(n) if n == "i"));
+        let chained = parse_ok("m[i][j]\n");
+        let Stmt::Expr(Expr::Subscript { value, .. }) = &chained.body[0] else {
+            panic!("expected a subscript");
+        };
+        assert!(matches!(&**value, Expr::Subscript { .. }));
+    }
+
+    #[test]
+    fn adjacent_string_literals_concatenate() {
+        assert_eq!(parse_ok("\"ab\" \"cd\"\n").body[0], Stmt::Expr(Expr::Str("abcd".into())));
+        assert!(matches!(
+            parse_ok("\"ab\" + \"cd\"\n").body[0],
+            Stmt::Expr(Expr::Binary { .. })
+        ));
+    }
+
+    #[test]
+    fn multiple_assignment_collects_targets() {
+        let module = parse_ok("a = b = c = 0\n");
+        let Stmt::MultiAssign { targets, value } = &module.body[0] else {
+            panic!("expected a multiple assignment");
+        };
+        assert_eq!(targets, &["a", "b", "c"]);
+        assert_eq!(*value, Expr::Int(0));
+        assert!(matches!(parse_ok("a = 0\n").body[0], Stmt::Assign(_)));
+    }
+
+    #[test]
+    fn chained_comparison_desugars_to_and() {
+        let module = parse_ok("a < b < c\n");
+        let Stmt::Expr(Expr::BoolBinary { op, lhs, rhs }) = &module.body[0] else {
+            panic!("expected a boolean expression");
+        };
+        assert_eq!(*op, BoolOp::And);
+        assert!(matches!(**lhs, Expr::Compare { .. }));
+        assert!(matches!(**rhs, Expr::Compare { .. }));
+        let single = parse_ok("a < b\n");
+        assert!(matches!(single.body[0], Stmt::Expr(Expr::Compare { .. })));
+    }
+
+    #[test]
+    fn break_and_continue_parse() {
+        let module = parse_ok("while x:\n    break\n    continue\n");
+        let Stmt::While { body, .. } = &module.body[0] else {
+            panic!("expected a while");
+        };
+        assert!(matches!(body[0], Stmt::Break));
+        assert!(matches!(body[1], Stmt::Continue));
+    }
+
+    #[test]
+    fn range_with_a_step_is_extracted_and_validated() {
+        let module = parse_ok("for i in range(0, 10, 2):\n    x = i\n");
+        let Stmt::For { step, .. } = &module.body[0] else {
+            panic!("expected a for");
+        };
+        assert_eq!(*step, 2);
+        assert!(parse_src("for i in range(0, 10, n):\n    x = i\n").is_err());
+        assert!(parse_src("for i in range(0, 10, 0):\n    x = i\n").is_err());
+    }
+
+    #[test]
     fn precedence_matches_the_reference() {
         let module = parse_ok("1 + 2 * 3\n");
         let Stmt::Expr(Expr::Binary { op, rhs, .. }) = &module.body[0] else {
@@ -936,10 +1101,10 @@ else:
     #[test]
     fn out_of_subset_constructs_are_rejected_clearly() {
         assert!(parse_src("obj.x = 5\n").is_err());
-        assert!(parse_src("a = b = c\n").is_err());
-        assert!(parse_src("a < b < c\n").is_err());
+        assert!(parse_src("a, b = 1, 2\n").is_err());
         assert!(parse_src("a / b\n").is_err());
         assert!(parse_src("def f(x=1): return x\n").is_err());
-        assert!(parse_src("for x in y: pass\n").is_err());
+        assert!(parse_src("import os\n").is_err());
+        assert!(parse_src("for x in stuff:\n    pass\n").is_err());
     }
 }

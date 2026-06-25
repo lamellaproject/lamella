@@ -19,9 +19,11 @@ lamella-metadata = { path = "../lamella-metadata" }
 # Metadata tokens: the MetadataResolver names a constructor/catch type token's declaring
 # type (the exception-tag seam); tests also construct tokens directly.
 lamella-token = { path = "../lamella-token" }
+# The backend emits ELF relocatable objects (riscv32::lower_object) for the own linker.
+lamella-elf = { path = "../lamella-elf" }
 
 [dev-dependencies]
-lamella-elf = { path = "../lamella-elf" }
+# The linker examples (link-run, hosted-elf) link our objects into a runnable program.
 lamella-link = { path = "../lamella-link" }
 # The deploy-samd21 examples flash AOT output to real hardware: the generic CMSIS-DAP probe plus
 # the SAM D21 NVMCTRL flash routines from lamella-cmsis-dap-sam.

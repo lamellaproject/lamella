@@ -9,6 +9,10 @@ use alloc::vec::Vec;
 /// reference conversions that walk `model`'s inheritance graph (13.1).
 #[must_use]
 pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    if matches!(from, TypeSymbol::Special(SpecialType::Null)) {
+        return is_reference_type(model, to)
+            || matches!(to, TypeSymbol::Special(SpecialType::Null));
+    }
     has_implicit_conversion(from, to)
         || reference_conversion(model, from, to)
         || delegate_to_base(model, from, to)

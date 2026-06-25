@@ -1,12 +1,12 @@
-//! The abstract syntax tree for the first-light Python subset.
+//! The abstract syntax tree for the Python subset.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 /// A binary arithmetic operator (the `+ - * // %` of the subset). True division
-/// (`/`) is intentionally absent -- it produces a float, which is out of first
-/// light.
+/// (`/`) is intentionally absent -- it produces a float, which is outside the
+/// typed integer subset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     /// `+`
@@ -74,13 +74,15 @@ pub enum Expr {
     /// An integer literal (already folded to its signed value, so a source `-3`
     /// arrives here as `Int(-3)`).
     Int(i64),
+    /// A string literal (its decoded value). A dynamic value -- no typed AOT lowering.
+    Str(String),
     /// A `True` or `False` literal.
     Bool(bool),
     /// The `None` literal.
     None,
     /// A bare name -- a local, a parameter, or a global/built-in.
     Name(String),
-    /// Attribute access, `value.attr` -- the one dynamic operation in first light.
+    /// Attribute access, `value.attr` -- the one dynamic operation in the typed subset.
     Attribute {
         /// The object whose attribute is read.
         value: Box<Expr>,
@@ -128,8 +130,8 @@ pub enum Expr {
         /// The value when the condition is falsey.
         orelse: Box<Expr>,
     },
-    /// A single comparison, `lhs <op> rhs`. First light does not chain
-    /// comparisons (`a < b < c`).
+    /// A single comparison, `lhs <op> rhs`. Chained comparisons (`a < b < c`)
+    /// are desugared by the parser into `and`-joined pairs.
     Compare {
         /// The operator.
         op: CmpOp,
@@ -145,6 +147,13 @@ pub enum Expr {
         /// The positional arguments, in order.
         args: Vec<Expr>,
     },
+    /// A subscript, `value[index]`. A dynamic operation (no typed lowering).
+    Subscript {
+        /// The container being indexed.
+        value: Box<Expr>,
+        /// The index expression.
+        index: Box<Expr>,
+    },
 }
 
 /// A statement.
@@ -154,9 +163,17 @@ pub enum Stmt {
     FuncDef(FuncDef),
     /// `return` with an optional value (a bare `return` yields `None`).
     Return(Option<Expr>),
-    /// An assignment or an annotated assignment/declaration. First light assigns
+    /// An assignment or an annotated assignment/declaration. The parser assigns
     /// only to a bare name.
     Assign(Assign),
+    /// A multiple assignment, `a = b = value` -- the value is evaluated once and bound
+    /// to every target (left to right).
+    MultiAssign {
+        /// The target names, in source order (two or more).
+        targets: Vec<String>,
+        /// The value bound to each target.
+        value: Expr,
+    },
     /// An expression evaluated for its effect; its value is discarded.
     Expr(Expr),
     /// An `if`/`elif`/`else`. Each `elif` is desugared by the parser into a
@@ -169,15 +186,18 @@ pub enum Stmt {
         /// The `else` body (empty when there is no `else`).
         orelse: Vec<Stmt>,
     },
-    /// A `while` loop (no `else` clause in the first-light subset).
+    /// A `while` loop.
     While {
         /// The condition, tested before each iteration.
         test: Expr,
         /// The loop body.
         body: Vec<Stmt>,
+        /// The `else` clause, run if the loop exits normally (not via `break`).
+        orelse: Vec<Stmt>,
     },
-    /// A `for` loop over `range(...)` (first light's only iterable): the loop variable
-    /// runs `start, start+1, ..., stop-1`. `start` and `stop` are evaluated once.
+    /// A `for` loop over `range(...)` (the only iterable in this subset): the loop
+    /// variable runs `start, start+step, ...`, stopping before `stop`. The range
+    /// bounds are evaluated once.
     For {
         /// The loop variable, bound to each value in turn.
         target: String,
@@ -185,17 +205,27 @@ pub enum Stmt {
         start: Expr,
         /// The exclusive upper bound (`range`'s stop).
         stop: Expr,
+        /// The step (`range`'s step; `1` when omitted). Must be a non-zero integer literal.
+        step: i64,
         /// The loop body.
         body: Vec<Stmt>,
+        /// The `else` clause, run if the loop runs to completion (not via `break`).
+        orelse: Vec<Stmt>,
     },
+    /// `break` -- exit the innermost enclosing loop.
+    Break,
+    /// `continue` -- skip to the next iteration of the innermost enclosing loop.
+    Continue,
+    /// `pass` -- a no-op statement (a placeholder where a statement is required).
+    Pass,
 }
 
 /// An assignment statement: a target name, an optional annotation, and an optional
-/// value. The three first-light forms are `name = value`, `name: ann = value`,
-/// and the bare declaration `name: ann` (which records a type but stores nothing).
+/// value. The three forms are `name = value`, `name: ann = value`, and the bare
+/// declaration `name: ann` (which records a type but stores nothing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assign {
-    /// The target name (first light assigns only to a bare name).
+    /// The target name (assignments target only a bare name in this subset).
     pub target: String,
     /// The annotation expression, if the assignment is annotated.
     pub annotation: Option<Expr>,

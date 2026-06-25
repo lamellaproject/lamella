@@ -154,6 +154,22 @@ fn check_inst(
                 use_value(func, defined, arg, errors);
             }
         }
+        Inst::CallIndirect { target, args } => {
+            use_value(func, defined, *target, errors);
+            for &arg in args {
+                use_value(func, defined, arg, errors);
+            }
+        }
+        Inst::CallNative { args, .. } => {
+            for &arg in args {
+                use_value(func, defined, arg, errors);
+            }
+        }
+        Inst::FuncAddr { .. } => {
+            if let Some(r) = result_ty {
+                expect(MirType::I32, r, errors);
+            }
+        }
         Inst::PyIntrinsic { op, args, .. } => {
             for &arg in args {
                 use_value(func, defined, arg, errors);

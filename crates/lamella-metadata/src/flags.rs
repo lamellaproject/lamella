@@ -72,6 +72,13 @@ pub fn type_is_public(flags: u32) -> bool {
     flags & type_attr::VISIBILITY_MASK == type_attr::PUBLIC
 }
 
+/// Whether a type's flags mark it nested (any `Nested*` visibility, II.23.1.15): such a
+/// type has no namespace of its own and is named through its enclosing type.
+#[must_use]
+pub fn type_is_nested(flags: u32) -> bool {
+    flags & type_attr::VISIBILITY_MASK > type_attr::PUBLIC
+}
+
 /// Whether a type's flags mark it an interface.
 #[must_use]
 pub fn type_is_interface(flags: u32) -> bool {

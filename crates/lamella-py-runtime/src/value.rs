@@ -22,14 +22,30 @@ const NONE_BITS: u32 = 0b0010;
 const FALSE_BITS: u32 = 0b0110;
 /// `True` -- a reserved singleton (distinct word from a `1` fixnum).
 const TRUE_BITS: u32 = 0b1010;
-/// A module-function reference: low nibble `0b1110`, the function index in the high
-/// bits. It is `2 (mod 4)`, so the collector skips it (a function lives in the bytecode,
-/// not the managed heap), and its low nibble never collides with None=2 / False=6 /
-/// True=10. First light's only callable: an intra-module function resolved by name.
-const FUNCTION_REF_TAG: u32 = 0b1110;
+/// Callable references share the low nibble `0b1110` -- a `2 (mod 4)` immediate the
+/// collector skips (a callable lives in the bytecode / runtime, not the managed heap),
+/// never colliding with None=2 / False=6 / True=10 -- and split on bit 4: a module
+/// FUNCTION (bit 4 clear) versus a BUILT-IN (bit 4 set). The index/id occupies bits 5..,
+/// distinguished by the 5-bit [`CALLABLE_TAG_MASK`].
+const FUNCTION_REF_TAG: u32 = 0b0_1110;
+/// A built-in reference (`abs`/`min`/`max`/`len`/...): the callable nibble plus bit 4.
+const BUILTIN_REF_TAG: u32 = 0b1_1110;
+/// The low-5-bit mask that selects between a function ref and a built-in ref.
+const CALLABLE_TAG_MASK: u32 = 0b1_1111;
+
+/// The iteration sentinel `py_next` returns when an iterator is exhausted (`PY_STOP` in
+/// the runtime ABI). A reserved `2 (mod 4)` immediate the GC skips, distinct from
+/// None=2/False=6/True=10 and never produced by a function-ref (`32k+14`) or builtin-ref
+/// (`32k+30`), so it can never be a real element.
+const STOP_BITS: u32 = 0b1_0010;
+/// The error sentinel a runtime-support entry returns after it raised (`PY_ERROR` in the
+/// ABI): the AOT call site checks `== PY_ERROR` and branches to the EH path, the actual
+/// error living in the EH runtime's current-error slot. Another reserved `2 (mod 4)`
+/// immediate.
+const ERROR_BITS: u32 = 0b1_0110;
 
 /// The most negative integer representable as a fixnum (the rest overflow to a
-/// bignum, which is post-first-light).
+/// bignum).
 pub const FIXNUM_MIN: i32 = -(1 << 30);
 /// The most positive integer representable as a fixnum.
 pub const FIXNUM_MAX: i32 = (1 << 30) - 1;
@@ -41,12 +57,18 @@ impl Value {
     pub const TRUE: Value = Value(TRUE_BITS);
     /// The Python `False` singleton.
     pub const FALSE: Value = Value(FALSE_BITS);
-    /// The unbound/empty sentinel: a slot that holds no value yet (reading a local
-    /// before it is assigned). Distinct from `None`. The collector skips it.
+    /// The unbound/empty sentinel: a slot that holds no value (a local read before it is
+    /// assigned). Distinct from `None`. The collector skips it.
     pub const UNBOUND: Value = Value(0);
+    /// The iteration sentinel (`PY_STOP` in the runtime ABI): `py_next` returns it when
+    /// the iterator is exhausted. A reserved value, never a user-visible object.
+    pub const STOP: Value = Value(STOP_BITS);
+    /// The error sentinel (`PY_ERROR`): a runtime-support entry returns it after raising;
+    /// the actual error lives in the EH runtime's current-error slot. Never user-visible.
+    pub const PY_ERROR: Value = Value(ERROR_BITS);
 
     /// Wraps `n` as a fixnum, or `None` if it falls outside the 31-bit fixnum range
-    /// (the caller promotes to a bignum -- not in the first-light subset -- or traps).
+    /// (the caller promotes to a bignum, or traps).
     #[must_use]
     pub const fn fixnum(n: i32) -> Option<Value> {
         if n >= FIXNUM_MIN && n <= FIXNUM_MAX {
@@ -112,25 +134,47 @@ impl Value {
     }
 
     /// A reference to module function `index` -- the callable `LoadGlobal` pushes and
-    /// `Call` consumes. The index occupies the high 28 bits (first light's modules are
-    /// far smaller); it is an immediate, not a managed pointer, since a function lives in
-    /// the bytecode rather than the GC heap.
+    /// `Call` consumes. The index occupies bits 5..; it is an immediate, not a managed
+    /// pointer, since a function lives in the bytecode rather than the GC heap.
     #[must_use]
     pub const fn function_ref(index: u32) -> Value {
-        Value((index << 4) | FUNCTION_REF_TAG)
+        Value((index << 5) | FUNCTION_REF_TAG)
     }
 
     /// Whether this is a module-function reference.
     #[must_use]
     pub const fn is_function_ref(self) -> bool {
-        self.0 & 0b1111 == FUNCTION_REF_TAG
+        self.0 & CALLABLE_TAG_MASK == FUNCTION_REF_TAG
     }
 
     /// The module-function index if this is a function reference, else `None`.
     #[must_use]
     pub const fn as_function_index(self) -> Option<u32> {
         if self.is_function_ref() {
-            Some(self.0 >> 4)
+            Some(self.0 >> 5)
+        } else {
+            None
+        }
+    }
+
+    /// A reference to built-in `id` (the runtime's built-in namespace -- `abs`/`min`/
+    /// `max`/`len`/...). Like a function ref, an immediate the GC skips.
+    #[must_use]
+    pub const fn builtin_ref(id: u32) -> Value {
+        Value((id << 5) | BUILTIN_REF_TAG)
+    }
+
+    /// Whether this is a built-in reference.
+    #[must_use]
+    pub const fn is_builtin_ref(self) -> bool {
+        self.0 & CALLABLE_TAG_MASK == BUILTIN_REF_TAG
+    }
+
+    /// The built-in id if this is a built-in reference, else `None`.
+    #[must_use]
+    pub const fn as_builtin_id(self) -> Option<u32> {
+        if self.is_builtin_ref() {
+            Some(self.0 >> 5)
         } else {
             None
         }
@@ -164,6 +208,18 @@ impl Value {
         self.0 == 0
     }
 
+    /// Whether this is the iteration sentinel ([`Value::STOP`]).
+    #[must_use]
+    pub const fn is_stop(self) -> bool {
+        self.0 == STOP_BITS
+    }
+
+    /// Whether this is the error sentinel ([`Value::PY_ERROR`]).
+    #[must_use]
+    pub const fn is_py_error(self) -> bool {
+        self.0 == ERROR_BITS
+    }
+
     /// Whether this is one of the reserved singletons (`None`/`True`/`False`/...).
     #[must_use]
     pub const fn is_singleton(self) -> bool {
@@ -190,14 +246,14 @@ impl Value {
     /// `False` or `__len__()` returning `0`; the built-in false values include `None`,
     /// `False`, and zero of any numeric type. So a fixnum is true when non-zero, `None`
     /// and `False` are false, `True` is true, and a heap object is true -- the
-    /// first-light subset defines no `__bool__`/`__len__`, and an object with neither is
-    /// true by that same rule (the customizable `py_truthy` path is later work, not a
+    /// interpreter defines no `__bool__`/`__len__`, and an object with neither is true by
+    /// that same rule (the customizable `py_truthy` path is a separate concern, not a
     /// deviation here).
     #[must_use]
     pub fn is_truthy(self) -> bool {
         if let Some(n) = self.as_fixnum() {
             n != 0
-        } else if self.is_pointer() || self.is_function_ref() {
+        } else if self.is_pointer() || self.is_function_ref() || self.is_builtin_ref() {
             true
         } else {
             self == Value::TRUE
@@ -232,6 +288,12 @@ impl core::fmt::Debug for Value {
             write!(f, "Value::False")
         } else if let Some(index) = self.as_function_index() {
             write!(f, "Value::Function({index})")
+        } else if let Some(id) = self.as_builtin_id() {
+            write!(f, "Value::Builtin({id})")
+        } else if self.is_stop() {
+            write!(f, "Value::Stop")
+        } else if self.is_py_error() {
+            write!(f, "Value::PyError")
         } else if self.is_unbound() {
             write!(f, "Value::Unbound")
         } else {
@@ -302,7 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn truthiness_matches_python_for_the_first_light_types() {
+    fn truthiness_matches_python_for_the_supported_types() {
         assert!(!Value::fixnum(0).unwrap().is_truthy());
         assert!(Value::fixnum(1).unwrap().is_truthy());
         assert!(Value::fixnum(-5).unwrap().is_truthy());
@@ -343,6 +405,51 @@ mod tests {
         let mut slot = Value::function_ref(3);
         Value::trace_slot(&mut slot, &mut |r| *r = Ref(r.0 + 0x100));
         assert_eq!(slot, Value::function_ref(3));
+    }
+
+    #[test]
+    fn builtin_refs_are_distinct_from_function_refs_and_immediates() {
+        for id in [0u32, 1, 2, 3, 99] {
+            let b = Value::builtin_ref(id);
+            assert!(b.is_builtin_ref());
+            assert_eq!(b.as_builtin_id(), Some(id));
+            assert!(!b.is_function_ref());
+            assert_eq!(b.as_function_index(), None);
+            assert!(!b.is_pointer());
+            assert!(!b.is_fixnum());
+            assert_eq!(b.as_int(), None);
+            assert!(b.is_truthy());
+        }
+        assert_ne!(Value::function_ref(0), Value::builtin_ref(0));
+        assert!(!Value::function_ref(0).is_builtin_ref());
+        assert!(!Value::builtin_ref(0).is_function_ref());
+        assert!(!Value::NONE.is_builtin_ref());
+        assert!(!Value::TRUE.is_builtin_ref());
+        assert!(!Value::FALSE.is_builtin_ref());
+    }
+
+    #[test]
+    fn reserved_sentinels_are_distinct() {
+        for s in [Value::STOP, Value::PY_ERROR] {
+            assert!(!s.is_fixnum());
+            assert!(!s.is_pointer());
+            assert!(!s.is_function_ref());
+            assert!(!s.is_builtin_ref());
+            assert_eq!(s.as_ref(), None);
+        }
+        assert!(Value::STOP.is_stop() && !Value::STOP.is_py_error());
+        assert!(Value::PY_ERROR.is_py_error() && !Value::PY_ERROR.is_stop());
+        for other in [
+            Value::NONE,
+            Value::TRUE,
+            Value::FALSE,
+            Value::function_ref(0),
+            Value::builtin_ref(0),
+        ] {
+            assert_ne!(Value::STOP, other);
+            assert_ne!(Value::PY_ERROR, other);
+        }
+        assert_ne!(Value::STOP, Value::PY_ERROR);
     }
 
     #[test]

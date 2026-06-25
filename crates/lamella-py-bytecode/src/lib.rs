@@ -154,7 +154,9 @@ pub enum Op {
     LoadFast(u32),
     /// Pop and store into the local variable in slot `idx`.
     StoreFast(u32),
-    /// Push the global or built-in named `names[idx]`. DEFINED for completeness
+    /// Push the global or built-in named `names[idx]`. DEFINED for completeness;
+    /// the first-light parity slice emits function bodies only (no globals), so the
+    /// interpreter may leave this unimplemented until typed calls are enabled.
     LoadGlobal(u32),
     /// Pop an object and push `getattr(object, names[name])` -- the one dynamic
     /// operation in first light, lowering to the `py_getattr` intrinsic. `cache` is
@@ -162,6 +164,12 @@ pub enum Op {
     LoadAttr {
         /// The attribute name's index into the code object's `names` pool.
         name: u32,
+        /// This site's inline-cache slot, assigned by ascending static position.
+        cache: u32,
+    },
+    /// Pop the index then the container, and push `container[index]` (subscript),
+    /// lowering to the `py_getitem` intrinsic. `cache` is this site's inline-cache slot.
+    Subscript {
         /// This site's inline-cache slot, assigned by ascending static position.
         cache: u32,
     },
@@ -197,7 +205,8 @@ pub enum Const {
     /// `True` or `False`.
     Bool(bool),
     /// An integer literal. First light keeps it in an `i64`; the interpreter
-    /// materializes it as a tagged 31-bit fixnum
+    /// materializes it as a tagged 31-bit fixnum (overflow to a heap bignum is
+    /// deferred past first light).
     Int(i64),
     /// A string literal (reserved; the first-light subset does not lex strings yet,
     /// but the pool holds them so the format need not change to add them).
@@ -400,6 +409,10 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             put_u32(buf, *argc);
         }
         Op::Return => buf.push(11),
+        Op::Subscript { cache } => {
+            buf.push(13);
+            put_u32(buf, *cache);
+        }
     }
 }
 
@@ -569,6 +582,9 @@ impl<'a> Reader<'a> {
                 let u = self.u8()?;
                 Op::Unary(UnaryOp::from_u8(u).ok_or(DecodeError::BadTag("UnaryOp", u))?)
             }
+            13 => Op::Subscript {
+                cache: self.u32()?,
+            },
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -696,6 +712,8 @@ mod tests {
             Op::Jump(9),
             Op::PopJumpIfFalse(10),
             Op::Call(2),
+            Op::Unary(UnaryOp::Neg),
+            Op::Subscript { cache: 6 },
             Op::Return,
         ];
         let mut buf = Vec::new();

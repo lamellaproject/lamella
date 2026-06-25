@@ -9,9 +9,11 @@ use alloc::vec::Vec;
 
 /// A reference to a heap object: an index into the [`Heap`] arena. The null
 /// reference is [`crate::value::Value::Null`], not an `ObjectRef`, so every
-/// `ObjectRef` names a live object.
+/// `ObjectRef` names a live object. The index is `pub(crate)` so the interpreter's
+/// side tables keyed by heap position -- the exception-message map and the `Monitor`
+/// lock table -- can read it to remap their keys when the compactor relocates objects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObjectRef(u32);
+pub struct ObjectRef(pub(crate) u32);
 
 /// The in-heap representation of a `System.String`'s code units, chosen by the string
 /// storage encoding. UTF-16 by default (O(1) indexing, lone surrogates free); the
@@ -132,6 +134,17 @@ pub enum Object {
         /// append outgrows it (.NET's growth rule), tracked apart from the `Vec`'s own.
         capacity: usize,
     },
+    /// A weak cell: a single `target` reference the collector treats WEAKLY -- it is NOT traced
+    /// (so the cell alone never keeps the target alive) and is cleared to `Null` when the target is
+    /// reclaimed, or forwarded when the target survives. The managed `System.WeakReference` holds
+    /// this cell by a STRONG reference, so the cell lives exactly as long as the `WeakReference`
+    /// does, then is reclaimed normally -- no weak-handle leak. `target` is `Object` or `Null`.
+    #[cfg(feature = "gc")]
+    Weak {
+        /// The weakly-held target (an `Object` reference or `Null`); the collector clears it to
+        /// `Null` when the target is reclaimed, or forwards it when the target survives.
+        target: Value,
+    },
 }
 
 /// The initial collection threshold (object count) before the live set is known; it
@@ -205,6 +218,8 @@ impl Heap {
     pub fn as_string(&self, reference: ObjectRef) -> Option<Cow<'_, [u16]>> {
         match self.get(reference)? {
             Object::Str(store) => Some(decode_string(store)),
+            #[cfg(feature = "gc")]
+            Object::Weak { .. } => None,
             Object::Instance { .. }
             | Object::Array { .. }
             | Object::MdArray { .. }
@@ -220,12 +235,45 @@ impl Heap {
         self.alloc(Object::Instance { type_id, fields })
     }
 
+    /// Allocates a weak cell holding `target` (an object reference or `Null`) and returns a
+    /// reference to it. The collector treats the cell's target weakly (see [`Object::Weak`]); the
+    /// managed `WeakReference` keeps this cell alive by a strong reference.
+    #[cfg(feature = "gc")]
+    pub fn alloc_weak(&mut self, target: Value) -> ObjectRef {
+        self.alloc(Object::Weak { target })
+    }
+
+    /// The target of the weak cell at `reference` (`Null` once the target has been reclaimed), or
+    /// `None` if `reference` is not a weak cell.
+    #[cfg(feature = "gc")]
+    #[must_use]
+    pub fn weak_cell_target(&self, reference: ObjectRef) -> Option<Value> {
+        match self.get(reference)? {
+            Object::Weak { target } => Some(target.clone()),
+            _ => None,
+        }
+    }
+
+    /// Re-points the weak cell at `reference` to `target`. Returns `false` if it is not a weak cell.
+    #[cfg(feature = "gc")]
+    pub fn set_weak_cell_target(&mut self, reference: ObjectRef, target: Value) -> bool {
+        match self.objects.get_mut(reference.0 as usize) {
+            Some(Object::Weak { target: slot }) => {
+                *slot = target;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// The value of instance field `slot` at `reference`, if it is an instance with
     /// that slot.
     #[must_use]
     pub fn instance_field(&self, reference: ObjectRef, slot: u32) -> Option<Value> {
         match self.get(reference)? {
             Object::Instance { fields, .. } => fields.get(slot as usize).cloned(),
+            #[cfg(feature = "gc")]
+            Object::Weak { .. } => None,
             Object::Str(_)
             | Object::Array { .. }
             | Object::MdArray { .. }
@@ -277,6 +325,8 @@ impl Heap {
     pub fn type_of(&self, reference: ObjectRef) -> Option<u32> {
         match self.get(reference)? {
             Object::Instance { type_id, .. } => Some(*type_id),
+            #[cfg(feature = "gc")]
+            Object::Weak { .. } => None,
             Object::Str(_)
             | Object::Array { .. }
             | Object::MdArray { .. }
@@ -996,6 +1046,7 @@ fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
         Object::Delegate { invocations } => invocations
             .iter()
             .for_each(|(target, _)| collect_refs(target, visit)),
+        Object::Weak { .. } => {}
         Object::Str(_) | Object::StringBuilder { .. } => {}
     }
 }
@@ -1039,6 +1090,22 @@ fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
         Object::Delegate { invocations } => invocations
             .iter_mut()
             .for_each(|(target, _)| remap_value(target, remap)),
+        Object::Weak { target } => {
+            let cleared = if let Value::Object(reference) = target {
+                match remap.get(reference.0 as usize).copied().flatten() {
+                    Some(new) => {
+                        reference.0 = new;
+                        false
+                    }
+                    None => true,
+                }
+            } else {
+                false
+            };
+            if cleared {
+                *target = Value::Null;
+            }
+        }
         Object::Str(_) | Object::StringBuilder { .. } => {}
     }
 }
@@ -1096,6 +1163,52 @@ mod gc_tests {
             other => panic!("field not an object: {other:?}"),
         };
         assert_eq!(heap.as_string(kept).as_deref(), Some(&[b'a' as u16][..]));
+    }
+
+    #[test]
+    fn weak_cell_does_not_keep_its_target_alive_and_is_cleared() {
+        let mut heap = Heap::new();
+        let target = heap.alloc_string(&[b'w' as u16]);
+        let cell = heap.alloc_weak(Value::Object(target));
+        let mut roots = alloc::vec![Value::Object(cell)];
+        heap.collect(|visit| roots.iter_mut().for_each(visit));
+
+        assert_eq!(heap.object_count(), 1);
+        let cell = match &roots[0] {
+            Value::Object(reference) => *reference,
+            other => panic!("root not an object: {other:?}"),
+        };
+        assert_eq!(heap.weak_cell_target(cell), Some(Value::Null));
+    }
+
+    #[test]
+    fn weak_cell_forwards_a_target_that_survives_via_a_strong_root() {
+        let mut heap = Heap::new();
+        let _garbage = heap.alloc_string(&[b'x' as u16]);
+        let target = heap.alloc_string(&[b'k' as u16]);
+        let cell = heap.alloc_weak(Value::Object(target));
+        let keeper = heap.alloc_instance(3, alloc::vec![Value::Object(target)]);
+        let mut roots = alloc::vec![Value::Object(cell), Value::Object(keeper)];
+        heap.collect(|visit| roots.iter_mut().for_each(visit));
+
+        let cell = match &roots[0] {
+            Value::Object(reference) => *reference,
+            other => panic!("root not an object: {other:?}"),
+        };
+        let keeper = match &roots[1] {
+            Value::Object(reference) => *reference,
+            other => panic!("root not an object: {other:?}"),
+        };
+        let weak_target = match heap.weak_cell_target(cell).unwrap() {
+            Value::Object(reference) => reference,
+            other => panic!("weak target not forwarded to an object: {other:?}"),
+        };
+        let strong_target = match heap.instance_field(keeper, 0).unwrap() {
+            Value::Object(reference) => reference,
+            other => panic!("strong field not an object: {other:?}"),
+        };
+        assert_eq!(weak_target, strong_target);
+        assert_eq!(heap.as_string(weak_target).as_deref(), Some(&[b'k' as u16][..]));
     }
 }
 

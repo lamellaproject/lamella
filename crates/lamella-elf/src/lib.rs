@@ -17,6 +17,23 @@ pub mod riscv {
     pub const R_RISCV_PCREL_HI20: u32 = 23;
     /// `R_RISCV_PCREL_LO12_I` -- the low 12 bits of a PC-relative reference (an I-type).
     pub const R_RISCV_PCREL_LO12_I: u32 = 24;
+    /// `R_RISCV_RELAX` -- a linker-relaxation hint paired with a real relocation; nothing to patch.
+    pub const R_RISCV_RELAX: u32 = 51;
+}
+
+/// ARM (AArch32) ELF relocation type numbers (the `r_info` low byte), from "ELF for the ARM
+/// Architecture" (the ARM ELF ABI). ARM objects conventionally use `SHT_REL` (`.rel.text`, an
+/// implicit addend in the instruction field), unlike RISC-V's `SHT_RELA`; the linker handles both.
+pub mod arm {
+    /// `R_ARM_ABS32` -- a 32-bit absolute reference, `(S + A) | T`.
+    pub const R_ARM_ABS32: u32 = 2;
+    /// `R_ARM_THM_CALL` -- a Thumb `BL`/`BLX` call (the 32-bit T1 `BL`): `((S + A) | T) - P`, the
+    /// 24-bit signed halfword-scaled offset in the S:J1:J2:imm10:imm11 swizzle. Our Thumb backend's
+    /// calls become these.
+    pub const R_ARM_THM_CALL: u32 = 10;
+    /// `R_ARM_CALL` -- an A32 (ARM-state) `BL`/`BLX` call: `((S + A) | T) - P`, a 24-bit signed
+    /// word-scaled offset in bits[23:0].
+    pub const R_ARM_CALL: u32 = 28;
 }
 
 /// A target machine, selecting the ELF `e_machine`.
@@ -100,6 +117,7 @@ const EHDR_SIZE: u32 = 52;
 const SHDR_SIZE: u16 = 40;
 const SYM_SIZE: usize = 16;
 const RELA_SIZE: usize = 12;
+const REL_SIZE: usize = 8;
 
 /// Emits an ELF32 relocatable object (`ET_REL`) holding `text` as `.text`, `symbols` in `.symtab`,
 /// and `relocations` in `.rela.text`. `machine` sets `e_machine`; output is little-endian. A
@@ -301,15 +319,40 @@ pub fn write_relocatable_object(
     out
 }
 
+/// The file offset (and, since the file maps at `base`, the `base`-relative virtual offset) of
+/// `.text` in a [`write_executable`] image: the 52-byte ELF header plus the 32-byte program header.
+/// So `.text` offset 0 lives at virtual address `base + EXEC_TEXT_OFFSET` -- what an absolute
+/// relocation needs (`lamella_link::link_at_base`).
+pub const EXEC_TEXT_OFFSET: u32 = EHDR_SIZE + 32;
+
 /// Emits a minimal ELF32 EXECUTABLE (`ET_EXEC`): one `PT_LOAD` segment mapping the whole file at
 /// `base` (read + execute), with `e_entry` at `base + headers + entry_offset`. Runnable under a
 /// user-mode loader (e.g. `qemu-<arch>`). The linked `text` must be correct for this `base` --
-/// PC-relative code (what our linker produces) is, regardless of `base`. `base` must be page-aligned
-/// (a multiple of `p_align` = 0x1000) so the file-offset-0 mapping satisfies the loader.
+/// PC-relative code (what our linker produces) is, regardless of `base`; absolute relocations need
+/// the matching `lamella_link::link_at_base`. `base` must be page-aligned (a multiple of `p_align`
+/// = 0x1000) so the file-offset-0 mapping satisfies the loader.
 pub fn write_executable(machine: Machine, text: &[u8], entry_offset: u32, base: u32) -> Vec<u8> {
+    write_executable_impl(machine, text, entry_offset, base, false)
+}
+
+/// As [`write_executable`], but for an ARM Thumb entry: `e_entry` gets its low bit set so the loader
+/// (the Linux/`qemu-arm` ELF loader keys ARM-vs-Thumb start state off `e_entry & 1`) enters Thumb
+/// state. Our AArch32 backend emits Thumb (thumbv6m), so a hosted ARM image starts here.
+pub fn write_executable_arm_thumb(text: &[u8], entry_offset: u32, base: u32) -> Vec<u8> {
+    write_executable_impl(Machine::Arm, text, entry_offset, base, true)
+}
+
+fn write_executable_impl(
+    machine: Machine,
+    text: &[u8],
+    entry_offset: u32,
+    base: u32,
+    entry_thumb: bool,
+) -> Vec<u8> {
     const PHDR_SIZE: u32 = 32;
     let text_off = EHDR_SIZE + PHDR_SIZE;
     let total = text_off + text.len() as u32;
+    let entry = (base + text_off + entry_offset) | entry_thumb as u32;
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&[0x7f, b'E', b'L', b'F']);
@@ -318,7 +361,7 @@ pub fn write_executable(machine: Machine, text: &[u8], entry_offset: u32, base: 
     push_u16(&mut out, 2);
     push_u16(&mut out, machine.e_machine());
     push_u32(&mut out, 1);
-    push_u32(&mut out, base + text_off + entry_offset);
+    push_u32(&mut out, entry);
     push_u32(&mut out, EHDR_SIZE);
     push_u32(&mut out, 0);
     push_u32(&mut out, 0);
@@ -437,6 +480,10 @@ pub enum ElfError {
     Truncated,
     /// The object has no `.symtab`.
     MissingSymbolTable,
+    /// Not a `!<arch>` archive (bad magic).
+    NotArchive,
+    /// A malformed archive member header (bad terminator, a non-decimal size, a dangling long name).
+    BadArchive,
 }
 
 /// A symbol parsed from an object's `.symtab`.
@@ -456,7 +503,7 @@ pub struct ParsedSymbol {
     pub defined: bool,
 }
 
-/// A relocation parsed from an object's `.rela.text`.
+/// A relocation parsed from an object's `.rela.text` (explicit addend) or `.rel.text` (implicit).
 #[derive(Debug, Clone, Copy)]
 pub struct ParsedRelocation {
     /// `r_offset` within `.text`.
@@ -465,8 +512,12 @@ pub struct ParsedRelocation {
     pub symbol: u32,
     /// The relocation type (the low byte of `r_info`).
     pub kind: u32,
-    /// `r_addend`.
+    /// `r_addend` (an explicit `RELA` addend; 0 when [`Self::implicit_addend`] is set).
     pub addend: i32,
+    /// True for a `SHT_REL` relocation (`.rel.text`, the ARM C toolchain's convention): the addend
+    /// is not in this entry but stored in-place in the instruction field, so a consumer that needs
+    /// it extracts it from the relocated bytes. False for `SHT_RELA` (the addend is [`Self::addend`]).
+    pub implicit_addend: bool,
 }
 
 /// A parsed ELF32 relocatable object.
@@ -476,6 +527,9 @@ pub struct Object {
     pub machine: Machine,
     /// The `.text` section bytes.
     pub text: Vec<u8>,
+    /// `.text`'s `sh_addralign` -- the byte alignment the linker must give this object's code (4 for
+    /// RISC-V + our own output, 2 for an ARM `-mthumb` toolchain's `.text`). 1 if absent.
+    pub text_align: u32,
     /// The symbols, in symbol-table order (index 0 is the null symbol).
     pub symbols: Vec<ParsedSymbol>,
     /// The `.text` relocations.
@@ -510,6 +564,7 @@ const SH_TYPE: usize = 4;
 const SH_OFFSET: usize = 16;
 const SH_SIZE: usize = 20;
 const SH_LINK: usize = 24;
+const SH_ADDRALIGN: usize = 32;
 
 /// Parses an ELF32 little-endian relocatable object (as written by [`write_relocatable_object`],
 /// and, later, a C toolchain): the `.text` bytes, the symbol table (names resolved), and the
@@ -540,26 +595,29 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         rd_cstr(bytes, shstr_off + sh(i, SH_NAME)? as usize)
     };
 
-    let (mut symtab_i, mut text_i, mut rela_i) = (None, None, None);
+    let (mut symtab_i, mut text_i, mut reloc) = (None, None, None);
     for i in 0..e_shnum {
         match sh(i, SH_TYPE)? {
             2 => symtab_i = Some(i),
-            4 => rela_i = Some(i),
+            4 if section_name(i)? == ".rela.text" => reloc = Some((i, false)),
+            9 if section_name(i)? == ".rel.text" => reloc = Some((i, true)),
             1 if section_name(i)? == ".text" => text_i = Some(i),
             _ => {}
         }
     }
     let symtab_i = symtab_i.ok_or(ElfError::MissingSymbolTable)?;
 
-    let text = if let Some(ti) = text_i {
+    let (text, text_align) = if let Some(ti) = text_i {
         let off = sh(ti, SH_OFFSET)? as usize;
         let size = sh(ti, SH_SIZE)? as usize;
-        bytes
+        let align = sh(ti, SH_ADDRALIGN)?.max(1);
+        let bytes = bytes
             .get(off..off + size)
             .ok_or(ElfError::Truncated)?
-            .to_vec()
+            .to_vec();
+        (bytes, align)
     } else {
-        Vec::new()
+        (Vec::new(), 1)
     };
 
     let strtab_off = sh(sh(symtab_i, SH_LINK)? as usize, SH_OFFSET)? as usize;
@@ -594,17 +652,23 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     }
 
     let mut relocations = Vec::new();
-    if let Some(ri) = rela_i {
+    if let Some((ri, implicit)) = reloc {
         let off = sh(ri, SH_OFFSET)? as usize;
         let size = sh(ri, SH_SIZE)? as usize;
-        for r in 0..size / RELA_SIZE {
-            let base = off + r * RELA_SIZE;
+        let entsize = if implicit { REL_SIZE } else { RELA_SIZE };
+        for r in 0..size / entsize {
+            let base = off + r * entsize;
             let r_info = rd_u32(bytes, base + 4)?;
             relocations.push(ParsedRelocation {
                 offset: rd_u32(bytes, base)?,
                 symbol: r_info >> 8,
                 kind: r_info & 0xff,
-                addend: rd_u32(bytes, base + 8)? as i32,
+                addend: if implicit {
+                    0
+                } else {
+                    rd_u32(bytes, base + 8)? as i32
+                },
+                implicit_addend: implicit,
             });
         }
     }
@@ -612,9 +676,98 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     Ok(Object {
         machine,
         text,
+        text_align,
         symbols,
         relocations,
     })
+}
+
+/// One object member of an archive: its name and the parsed object.
+#[derive(Debug, Clone)]
+pub struct ArchiveMember {
+    /// The member's file name (e.g. `memcpy.o`).
+    pub name: String,
+    /// The member parsed as an ELF object.
+    pub object: Object,
+}
+
+/// A parsed `ar` archive (`.a`): its object members, in file order. The symbol-index (`/`) and
+/// long-name (`//`) bookkeeping members are consumed during parsing, not exposed.
+#[derive(Debug, Clone)]
+pub struct Archive {
+    /// The object members.
+    pub members: Vec<ArchiveMember>,
+}
+
+const AR_MAGIC: &[u8] = b"!<arch>\n";
+const AR_HEADER_SIZE: usize = 60;
+
+/// Parses a System V / GNU `ar` archive: the `!<arch>` magic, then 60-byte member headers each
+/// followed by an even-padded payload. The `/` symbol index is skipped (this crate scans each
+/// member's own symbol table); the `//` long-name table resolves members named `/<offset>`. Every
+/// other member is parsed as an ELF object. (Thin archives, which reference external files, are not
+/// supported.)
+pub fn read_archive(bytes: &[u8]) -> Result<Archive, ElfError> {
+    if bytes.len() < AR_MAGIC.len() || &bytes[..AR_MAGIC.len()] != AR_MAGIC {
+        return Err(ElfError::NotArchive);
+    }
+    let mut pos = AR_MAGIC.len();
+    let mut long_names: Vec<u8> = Vec::new();
+    let mut members = Vec::new();
+    while pos + AR_HEADER_SIZE <= bytes.len() {
+        let header = &bytes[pos..pos + AR_HEADER_SIZE];
+        if &header[58..60] != b"\x60\x0a" {
+            return Err(ElfError::BadArchive);
+        }
+        let size = parse_ar_decimal(&header[48..58])?;
+        let data_start = pos + AR_HEADER_SIZE;
+        let data = bytes
+            .get(data_start..data_start + size)
+            .ok_or(ElfError::Truncated)?;
+        let raw_name = trim_ar_field(&header[0..16]);
+        if raw_name == b"/" || raw_name == b"/SYM64/" {
+        } else if raw_name == b"//" {
+            long_names = data.to_vec();
+        } else if let Ok(object) = read_object(data) {
+            let name = resolve_ar_name(raw_name, &long_names)?;
+            members.push(ArchiveMember { name, object });
+        }
+        pos = data_start + size + (size & 1);
+    }
+    Ok(Archive { members })
+}
+
+/// Trims trailing spaces from a fixed-width `ar` header field.
+fn trim_ar_field(field: &[u8]) -> &[u8] {
+    let end = field.iter().rposition(|&b| b != b' ').map_or(0, |p| p + 1);
+    &field[..end]
+}
+
+/// Parses a space-padded ASCII decimal `ar` header field (the member size).
+fn parse_ar_decimal(field: &[u8]) -> Result<usize, ElfError> {
+    let digits = trim_ar_field(field);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(ElfError::BadArchive);
+    }
+    Ok(digits
+        .iter()
+        .fold(0usize, |n, &b| n * 10 + (b - b'0') as usize))
+}
+
+/// Resolves a member name: a `/<offset>` reference into the `//` long-name table, or a short name
+/// with its GNU trailing `/` stripped.
+fn resolve_ar_name(raw: &[u8], long_names: &[u8]) -> Result<String, ElfError> {
+    if raw.len() > 1 && raw[0] == b'/' && raw[1..].iter().all(u8::is_ascii_digit) {
+        let offset = parse_ar_decimal(&raw[1..])?;
+        let rest = long_names.get(offset..).ok_or(ElfError::BadArchive)?;
+        let end = rest
+            .iter()
+            .position(|&b| b == b'/' || b == b'\n')
+            .unwrap_or(rest.len());
+        return Ok(String::from_utf8_lossy(&rest[..end]).into_owned());
+    }
+    let name = raw.strip_suffix(b"/").unwrap_or(raw);
+    Ok(String::from_utf8_lossy(name).into_owned())
 }
 
 #[cfg(test)]
@@ -753,5 +906,96 @@ mod tests {
             0x1_0000
         );
         assert_eq!(&exe[84..84 + text.len()], &text);
+    }
+
+    #[test]
+    fn write_executable_arm_thumb_sets_the_entry_thumb_bit() {
+        let text = [0x2a, 0x20, 0x70, 0x47];
+        let exe = write_executable_arm_thumb(&text, 0, 0x1_0000);
+        assert_eq!(u16::from_le_bytes([exe[16], exe[17]]), 2);
+        assert_eq!(u16::from_le_bytes([exe[18], exe[19]]), 40);
+        assert_eq!(
+            u32::from_le_bytes([exe[24], exe[25], exe[26], exe[27]]),
+            (0x1_0000 + 84) | 1
+        );
+    }
+
+    /// Wraps `members` in a minimal GNU `ar` archive (short names; the mtime/uid/gid/mode header
+    /// fields stay spaces, which the reader ignores).
+    fn make_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::new();
+        out.extend_from_slice(b"!<arch>\n");
+        for (name, data) in members {
+            let mut header = [b' '; 60];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            header[name.len()] = b'/';
+            let mut size = data.len();
+            let mut digits: Vec<u8> = Vec::new();
+            loop {
+                digits.push(b'0' + (size % 10) as u8);
+                size /= 10;
+                if size == 0 {
+                    break;
+                }
+            }
+            digits.reverse();
+            header[48..48 + digits.len()].copy_from_slice(&digits);
+            header[58] = 0x60;
+            header[59] = 0x0a;
+            out.extend_from_slice(&header);
+            out.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn read_archive_parses_object_members() {
+        let func = |name: &'static str, code: &[u8]| {
+            write_relocatable_object(
+                Machine::RiscV,
+                code,
+                &[Symbol {
+                    name,
+                    value: 0,
+                    size: code.len() as u32,
+                    binding: Binding::Global,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::Text,
+                }],
+                &[],
+            )
+        };
+        let answer = func("answer", &[0x13, 0x05, 0xa0, 0x02]);
+        let unused = func("unused", &[0x13, 0x05, 0x00, 0x00, 0x67, 0x80, 0x00]);
+        let ar = make_archive(&[("answer.o", &answer), ("unused.o", &unused)]);
+        let archive = read_archive(&ar).unwrap();
+        assert_eq!(archive.members.len(), 2);
+        assert_eq!(archive.members[0].name, "answer.o");
+        assert_eq!(archive.members[1].name, "unused.o");
+        assert!(
+            archive.members[0]
+                .object
+                .symbols
+                .iter()
+                .any(|s| s.name == "answer")
+        );
+        assert!(
+            archive.members[1]
+                .object
+                .symbols
+                .iter()
+                .any(|s| s.name == "unused")
+        );
+    }
+
+    #[test]
+    fn read_archive_rejects_non_archive() {
+        assert_eq!(
+            read_archive(b"not an ar").unwrap_err(),
+            ElfError::NotArchive
+        );
     }
 }

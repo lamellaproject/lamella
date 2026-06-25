@@ -83,6 +83,19 @@ pub struct Assembled {
     pub bytes: Vec<u8>,
     /// References to external symbols the link step must still resolve.
     pub relocs: Vec<Reloc>,
+    /// Each label's FINAL bound offset (after branch relaxation), or `None` if it was never bound --
+    /// so a caller that captured `Label`s (e.g. one per function) can read the post-relaxation layout.
+    labels: Vec<Option<u32>>,
+}
+
+impl Assembled {
+    /// The final byte offset of `label` in [`Assembled::bytes`], after relaxation; `None` if the label
+    /// was never bound. A caller binds a label at each region of interest, then reads the true layout
+    /// here -- correct even when relaxation grew the image (unlike an offset captured during emission).
+    #[must_use]
+    pub fn label_position(&self, label: Label) -> Option<u32> {
+        self.labels.get(label.0 as usize).copied().flatten()
+    }
 }
 
 /// Accumulates Thumb machine code and the references into it.
@@ -808,6 +821,21 @@ impl Encoder {
         self.emit_thumb32(0xF000, 0xD000);
     }
 
+    /// `BL <external symbol>` -- a call (32-bit `BL`, encoding T1) to a symbol defined elsewhere,
+    /// recorded as a [`Reloc`] ([`RelocKind::ThumbCall`]) for the link step rather than resolved
+    /// here. The placeholder halfwords are overwritten by the linker (`R_ARM_THM_CALL`), so an
+    /// object emitter (`arm32::lower_object`) uses this for a cross-object/intra-module call it wants
+    /// the linker to see -- the BL twin of [`Encoder::data_word_symbol`].
+    pub fn bl_symbol(&mut self, symbol: u32) {
+        let at = self.position();
+        self.relocs.push(Reloc {
+            at,
+            kind: RelocKind::ThumbCall,
+            symbol,
+        });
+        self.emit_thumb32(0xF000, 0xD000);
+    }
+
     /// `BLX Rm` -- branch with link and exchange to the address in `Rm` (an
     /// indirect call). 16-bit encoding T1 (A6.7.14).
     pub fn blx(&mut self, rm: Reg) {
@@ -998,6 +1026,7 @@ impl Encoder {
         Ok(Assembled {
             bytes: self.bytes,
             relocs: self.relocs,
+            labels: self.labels,
         })
     }
 }
@@ -1382,6 +1411,23 @@ mod tests {
                 at: 0,
                 kind: RelocKind::Abs32,
                 symbol: 42
+            }]
+        );
+    }
+
+    #[test]
+    fn bl_symbol_becomes_a_thumb_call_relocation() {
+        let mut enc = Encoder::new();
+        enc.bx(Reg::LR);
+        enc.bl_symbol(7);
+        let out = enc.finish().unwrap();
+        assert_eq!(out.bytes, [0x70, 0x47, 0x00, 0xF0, 0x00, 0xD0]);
+        assert_eq!(
+            out.relocs,
+            [Reloc {
+                at: 2,
+                kind: RelocKind::ThumbCall,
+                symbol: 7
             }]
         );
     }

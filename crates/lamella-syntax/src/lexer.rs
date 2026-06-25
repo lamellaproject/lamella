@@ -5,6 +5,7 @@ use crate::span::Span;
 use crate::token::{IntegerSuffix, Keyword, Punctuator, RealSuffix, Token, TokenKind};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 /// The result of scanning a source file: the full token stream (ending in one
@@ -200,7 +201,9 @@ impl<'a> Lexer<'a> {
             self.scan_skipped_text()
         } else if c == '/' && matches!(self.peek_second(), Some('/' | '*')) {
             self.scan_comment(start)
-        } else if is_identifier_start(c) {
+        } else if is_identifier_start(c)
+            || (c == '\\' && matches!(self.peek_second(), Some('u' | 'U')))
+        {
             self.scan_identifier_or_keyword(start)
         } else if c == '@' {
             self.scan_verbatim(start)
@@ -681,10 +684,52 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Scans an identifier or keyword (9.4.2). The common case -- no `\uXXXX` escape --
+    /// stays a zero-allocation source slice; an escape (anywhere, including the first
+    /// character) switches to building the decoded identifier text, which is what names
+    /// the keyword/identifier (so `if` is the keyword `if`).
     fn scan_identifier_or_keyword(&mut self, start: usize) -> TokenKind {
-        self.bump();
-        self.consume_identifier_part();
-        let text = &self.source[start..self.position];
+        let mut decoded: Option<String> = None;
+        if self.peek() == Some('\\') {
+            match self.unicode_escape_char() {
+                Some(c) if is_identifier_start(c) => decoded = Some(c.to_string()),
+                Some(_) => {
+                    self.report(DiagnosticKind::UnexpectedCharacter { character: '\\' }, start);
+                    return TokenKind::Unknown;
+                }
+                None => {
+                    self.bump();
+                    self.report(DiagnosticKind::UnexpectedCharacter { character: '\\' }, start);
+                    return TokenKind::Unknown;
+                }
+            }
+        } else {
+            self.bump();
+        }
+        loop {
+            match self.peek() {
+                Some(c) if is_identifier_part(c) => {
+                    if let Some(text) = &mut decoded {
+                        text.push(c);
+                    }
+                    self.bump();
+                }
+                Some('\\') if matches!(self.peek_second(), Some('u' | 'U')) => {
+                    let prefix_end = self.position;
+                    match self.unicode_escape_char() {
+                        Some(c) if is_identifier_part(c) => decoded
+                            .get_or_insert_with(|| self.source[start..prefix_end].to_string())
+                            .push(c),
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        let text: &str = match &decoded {
+            Some(decoded) => decoded,
+            None => &self.source[start..self.position],
+        };
         match Keyword::from_text(text) {
             Some(keyword) => TokenKind::Keyword(keyword),
             None => TokenKind::Identifier(text.into()),
@@ -719,6 +764,42 @@ impl<'a> Lexer<'a> {
                 self.bump();
             } else {
                 break;
+            }
+        }
+    }
+
+    /// Decodes a Unicode-escape character within an identifier (9.4.2): a `\uXXXX`
+    /// (4 hex digits) or `\UXXXXXXXX` (8 hex digits) sequence at the cursor (on the
+    /// backslash) to a `char`, advancing past it. Returns `None` -- leaving the cursor
+    /// unmoved, on the backslash -- when the digits are missing or name no Unicode
+    /// scalar value, so the caller can treat the `\` as not part of the identifier.
+    fn unicode_escape_char(&mut self) -> Option<char> {
+        let width = match self.peek_second() {
+            Some('u') => 4,
+            Some('U') => 8,
+            _ => return None,
+        };
+        let checkpoint = self.position;
+        self.bump();
+        self.bump();
+        let mut value: u32 = 0;
+        for _ in 0..width {
+            match self.peek().and_then(|c| c.to_digit(16)) {
+                Some(digit) => {
+                    value = value * 16 + digit;
+                    self.bump();
+                }
+                None => {
+                    self.position = checkpoint;
+                    return None;
+                }
+            }
+        }
+        match char::from_u32(value) {
+            Some(c) => Some(c),
+            None => {
+                self.position = checkpoint;
+                None
             }
         }
     }
@@ -1276,6 +1357,19 @@ mod tests {
     fn verbatim_identifier_drops_the_at_and_is_never_a_keyword() {
         assert_eq!(kinds("@class"), vec![ident("class"), TokenKind::EndOfFile]);
         assert_eq!(kinds("@foo"), vec![ident("foo"), TokenKind::EndOfFile]);
+    }
+
+    #[test]
+    fn unicode_escapes_in_identifiers_denote_the_named_characters() {
+        assert_eq!(kinds("\\u0061bc"), vec![ident("abc"), TokenKind::EndOfFile]);
+        assert_eq!(kinds("x\\u0079z"), vec![ident("xyz"), TokenKind::EndOfFile]);
+        assert_eq!(kinds("\\U00000071"), vec![ident("q"), TokenKind::EndOfFile]);
+        assert_eq!(
+            kinds("\\u0069f"),
+            vec![TokenKind::Keyword(Keyword::If), TokenKind::EndOfFile]
+        );
+        assert_eq!(kinds("plain1"), vec![ident("plain1"), TokenKind::EndOfFile]);
+        assert!(kinds("\\x41").contains(&TokenKind::Unknown));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Statement binding (ECMA-334 1st ed, clause 15).
 
 use crate::bind::bind_type;
-use crate::bound::{Binder, BoundExpr, BoundExprKind, MethodReference};
+use crate::bound::{Binder, BoundExpr, BoundExprKind, MethodReference, literal_int_value};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
@@ -473,7 +473,7 @@ impl Binder {
         match &bound.kind {
             BoundExprKind::FieldAccess {
                 field: Some(field), ..
-            } => field.constant,
+            } => field.constant.as_ref().and_then(literal_int_value),
             _ => None,
         }
     }
@@ -500,9 +500,8 @@ impl Binder {
     /// Desugars `foreach (V name in collection)` over a non-array collection into the
     /// enumerator pattern (15.8.4): a block that declares the enumerator, then
     /// `while (e.MoveNext())` whose body binds `name = (V)e.Current` ahead of the original
-    /// body. `None` when the collection has no `GetEnumerator` (the array/error path is kept).
-    /// The `Dispose` finally is not emitted yet -- the supported collections' enumerators have
-    /// a no-op Dispose, so it is not observable; it is a tracked follow-up.
+    /// body, the loop wrapped in `try { ... } finally { <e> as IDisposable, disposed if non-null }`.
+    /// `None` when the collection has no `GetEnumerator` (the array/error path is kept).
     fn bind_for_each_enumerable(
         &mut self,
         span: Span,
@@ -590,7 +589,74 @@ impl Binder {
             },
             span,
         };
-        Some(BoundStmtKind::Block(alloc::vec![enumerator_decl, while_stmt]))
+
+        let idisposable: TypeSymbol = {
+            let parts: alloc::vec::Vec<Box<str>> =
+                alloc::vec!["System".into(), "IDisposable".into()];
+            TypeSymbol::Named(parts.into_boxed_slice())
+        };
+        let loop_stmt = match self.resolve_instance_method(&idisposable, "Dispose", span) {
+            Some(dispose) => {
+                let disposable: Box<str> = format!("<disposable>{}", span.start).into();
+                let disposable_ref = || BoundExpr {
+                    kind: BoundExprKind::Local(disposable.clone()),
+                    ty: idisposable.clone(),
+                };
+                let disposable_decl = BoundStmt {
+                    kind: BoundStmtKind::Local {
+                        ty: idisposable.clone(),
+                        declarators: alloc::vec![BoundDeclarator {
+                            name: disposable.clone(),
+                            initializer: Some(BoundExpr {
+                                kind: BoundExprKind::TypeTest {
+                                    operation: lamella_syntax::ast::TypeTestOperation::As,
+                                    operand: Box::new(enumerator_ref()),
+                                    target: idisposable.clone(),
+                                },
+                                ty: idisposable.clone(),
+                            }),
+                        }],
+                    },
+                    span,
+                };
+                let guard = BoundStmt {
+                    kind: BoundStmtKind::If {
+                        condition: BoundExpr {
+                            kind: BoundExprKind::Binary {
+                                operator: lamella_syntax::ast::BinaryOperator::NotEqual,
+                                left: Box::new(disposable_ref()),
+                                right: Box::new(BoundExpr {
+                                    kind: BoundExprKind::Literal(Literal::Null),
+                                    ty: TypeSymbol::Special(SpecialType::Object),
+                                }),
+                                checked: false,
+                            },
+                            ty: TypeSymbol::Special(SpecialType::Boolean),
+                        },
+                        then_branch: Box::new(BoundStmt {
+                            kind: BoundStmtKind::Expression(call(disposable_ref(), dispose)),
+                            span,
+                        }),
+                        else_branch: None,
+                    },
+                    span,
+                };
+                let finally = BoundStmt {
+                    kind: BoundStmtKind::Block(alloc::vec![disposable_decl, guard]),
+                    span,
+                };
+                BoundStmt {
+                    kind: BoundStmtKind::Try {
+                        body: Box::new(while_stmt),
+                        catches: Vec::new(),
+                        finally: Some(Box::new(finally)),
+                    },
+                    span,
+                }
+            }
+            None => while_stmt,
+        };
+        Some(BoundStmtKind::Block(alloc::vec![enumerator_decl, loop_stmt]))
     }
 
     fn bind_using(&mut self, resource: &UsingResource, body: &Stmt) -> BoundStmtKind {

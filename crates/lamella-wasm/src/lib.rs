@@ -7,6 +7,8 @@ pub mod aot;
 pub mod compile;
 #[cfg(feature = "dap")]
 pub mod dap;
+#[cfg(feature = "py")]
+pub mod py;
 
 use lamella_load::load;
 use lamella_metadata::Assembly;

@@ -133,6 +133,12 @@ struct TypeInfo {
     /// keyed by a signature key (name + parameter types), for interface and
     /// abstract-method dispatch where the static target carries no vtable slot.
     sig_methods: BTreeMap<String, MethodId>,
+    /// The type's NON-virtual instance methods (own + inherited), keyed by the same signature key.
+    /// Consulted only when a `callvirt`'s static target is absent because its declaring type is in
+    /// no loaded assembly -- e.g. a corlib base type our NETMF-surface corlib omits (modern .NET
+    /// declares `ManualResetEvent.Set` on `EventWaitHandle`) -- so the call binds to the runtime
+    /// type's own method by signature.
+    sig_methods_nonvirtual: BTreeMap<String, MethodId>,
     /// Whether this type is a value type (a struct / primitive, extending `System.ValueType`
     /// or `System.Enum`). A `callvirt` (or `constrained. callvirt`) that dispatches to a value
     /// type's OWN instance method on a boxed receiver auto-unboxes `this` to a managed pointer
@@ -548,6 +554,7 @@ impl Module {
             base: None,
             interfaces: Vec::new(),
             sig_methods: BTreeMap::new(),
+            sig_methods_nonvirtual: BTreeMap::new(),
             value_type: false,
         });
         id
@@ -1135,6 +1142,30 @@ impl Module {
         self.types
             .get(type_id as usize)?
             .sig_methods
+            .get(sig_key)
+            .copied()
+    }
+
+    /// Records `type_id`'s non-virtual instance methods keyed by signature (the map should include
+    /// inherited methods), for [`Module::sig_dispatch_nonvirtual`].
+    pub fn set_sig_methods_nonvirtual(
+        &mut self,
+        type_id: TypeId,
+        methods: BTreeMap<String, MethodId>,
+    ) {
+        if let Some(info) = self.types.get_mut(type_id as usize) {
+            info.sig_methods_nonvirtual = methods;
+        }
+    }
+
+    /// The non-virtual instance method of `type_id` matching `sig_key` -- the last-resort
+    /// `callvirt` target when the static target is absent (its declaring type is in no loaded
+    /// assembly), so dispatch falls to the runtime type's own method by signature.
+    #[must_use]
+    pub fn sig_dispatch_nonvirtual(&self, type_id: TypeId, sig_key: &str) -> Option<MethodId> {
+        self.types
+            .get(type_id as usize)?
+            .sig_methods_nonvirtual
             .get(sig_key)
             .copied()
     }

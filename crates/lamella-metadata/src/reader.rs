@@ -1047,6 +1047,13 @@ impl<'a> TypeDef<'a> {
         flags::type_is_public(self.flags())
     }
 
+    /// Whether the type is nested in another type (II.23.1.15): it has no namespace of its
+    /// own and is named through its enclosing type, never by a simple name.
+    #[must_use]
+    pub fn is_nested(&self) -> bool {
+        flags::type_is_nested(self.flags())
+    }
+
     /// Whether the type is an interface.
     #[must_use]
     pub fn is_interface(&self) -> bool {

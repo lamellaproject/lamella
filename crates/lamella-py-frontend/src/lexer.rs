@@ -1,4 +1,4 @@
-//! The lexer for the first-light Python subset.
+//! The lexer for the Python subset.
 
 use alloc::format;
 use alloc::string::String;
@@ -10,12 +10,16 @@ use alloc::vec::Vec;
 pub enum Tok {
     /// A decimal integer literal.
     Int(i64),
+    /// A short string literal -- its decoded value, with escape sequences resolved.
+    /// Single-line `'...'` and `"..."` are handled; triple-quoted and prefixed
+    /// (`r`/`b`/`f`) strings are outside this subset.
+    Str(String),
     /// An identifier that is not a keyword.
     Name(String),
-    /// A reserved keyword that exists in Python but is outside the first-light
-    /// subset (e.g. `for`, `class`, `and`, `import`). The lexer recognizes the
-    /// full reserved set (Language Reference 2.3.1) so these can never be used as
-    /// identifiers; the parser rejects them with a clear message.
+    /// A reserved keyword that exists in Python but is outside this subset
+    /// (e.g. `class`, `import`). The lexer recognizes the full reserved set
+    /// (Language Reference 2.3.1) so these can never be used as identifiers;
+    /// the parser rejects them with a clear message.
     Reserved(String),
 
     /// `def`
@@ -46,6 +50,12 @@ pub enum Tok {
     KwFor,
     /// `in`
     KwIn,
+    /// `break`
+    KwBreak,
+    /// `continue`
+    KwContinue,
+    /// `pass`
+    KwPass,
 
     /// `+`
     Plus,
@@ -117,6 +127,10 @@ pub enum Tok {
     LParen,
     /// `)`
     RParen,
+    /// `[`
+    LBracket,
+    /// `]`
+    RBracket,
 
     /// The end of a logical line.
     Newline,
@@ -349,9 +363,161 @@ impl Lexer {
         } else if c == '_' || c.is_ascii_alphabetic() {
             self.lex_name();
             Ok(())
+        } else if c == '\'' || c == '"' {
+            if self.peek2() == Some(c) && self.peek3() == Some(c) {
+                self.lex_long_string(c)
+            } else {
+                self.lex_string()
+            }
         } else {
             self.lex_operator()
         }
+    }
+
+    /// Lex a triple-quoted string (Language Reference 2.4.1): `'''...'''` or
+    /// `"""..."""`. Unlike a short string it may span lines (a literal newline becomes a
+    /// `\n` in the value); the same escape sequences apply, and a single or double quote
+    /// inside is an ordinary character. It closes at the next three matching quotes.
+    fn lex_long_string(&mut self, quote: char) -> Result<(), LexError> {
+        self.pos += 3;
+        let mut value = String::new();
+        loop {
+            match self.peek() {
+                None => return Err(self.err("unterminated triple-quoted string literal")),
+                Some(c)
+                    if c == quote
+                        && self.peek2() == Some(quote)
+                        && self.peek3() == Some(quote) =>
+                {
+                    self.pos += 3;
+                    self.push(Tok::Str(value));
+                    return Ok(());
+                }
+                Some('\\') => {
+                    self.pos += 1;
+                    self.lex_string_escape(&mut value)?;
+                }
+                Some('\n') => {
+                    value.push('\n');
+                    self.pos += 1;
+                    self.line += 1;
+                }
+                Some('\r') => {
+                    value.push('\n');
+                    self.pos += 1;
+                    if self.peek() == Some('\n') {
+                        self.pos += 1;
+                    }
+                    self.line += 1;
+                }
+                Some(c) => {
+                    value.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// Lex a short string literal (Language Reference 2.4.1): `'...'` or `"..."` on one
+    /// logical line, with the 2.4.1 escape sequences resolved. A `\`-newline continues
+    /// the line; an UNescaped newline or end-of-input before the close is an error; an
+    /// unrecognized escape keeps its backslash, exactly as CPython does (`'\d'` is `\d`).
+    /// Triple-quoted and prefixed (`r`/`b`/`f`/`u`) strings are outside this subset.
+    fn lex_string(&mut self) -> Result<(), LexError> {
+        let quote = self.peek().expect("lex_string called at a quote");
+        self.pos += 1;
+        let mut value = String::new();
+        loop {
+            match self.peek() {
+                None | Some('\n') | Some('\r') => {
+                    return Err(self.err("unterminated string literal"));
+                }
+                Some(c) if c == quote => {
+                    self.pos += 1;
+                    self.push(Tok::Str(value));
+                    return Ok(());
+                }
+                Some('\\') => {
+                    self.pos += 1;
+                    self.lex_string_escape(&mut value)?;
+                }
+                Some(c) => {
+                    value.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// Resolve one escape sequence (the leading backslash already consumed) into `out`.
+    fn lex_string_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+        let c = match self.peek() {
+            Some(c) => c,
+            None => return Err(self.err("unterminated string literal")),
+        };
+        if ('0'..='7').contains(&c) {
+            return self.lex_octal_escape(out);
+        }
+        self.pos += 1;
+        match c {
+            '\n' => self.line += 1,
+            '\r' => {
+                if matches!(self.peek(), Some('\n')) {
+                    self.pos += 1;
+                }
+                self.line += 1;
+            }
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            'a' => out.push('\u{07}'),
+            'b' => out.push('\u{08}'),
+            'f' => out.push('\u{0C}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{0B}'),
+            'x' => self.lex_hex_escape(out)?,
+            other => {
+                out.push('\\');
+                out.push(other);
+            }
+        }
+        Ok(())
+    }
+
+    /// `\xhh`: exactly two hex digits (the `x` already consumed), a character of that value.
+    fn lex_hex_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+        let mut value: u32 = 0;
+        for _ in 0..2 {
+            match self.peek() {
+                Some(c) if c.is_ascii_hexdigit() => {
+                    value = value * 16 + c.to_digit(16).expect("a hex digit");
+                    self.pos += 1;
+                }
+                _ => return Err(self.err("invalid '\\x' escape: two hex digits required")),
+            }
+        }
+        out.push(char::from_u32(value).expect("a byte value is a valid scalar"));
+        Ok(())
+    }
+
+    /// `\ooo`: one to three octal digits, a character of that value.
+    fn lex_octal_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+        let mut value: u32 = 0;
+        let mut digits = 0;
+        while digits < 3 {
+            match self.peek() {
+                Some(c @ '0'..='7') => {
+                    value = value * 8 + (c as u32 - '0' as u32);
+                    self.pos += 1;
+                    digits += 1;
+                }
+                _ => break,
+            }
+        }
+        out.push(char::from_u32(value).expect("an octal escape below 512 is a valid scalar"));
+        Ok(())
     }
 
     /// Lex an integer literal per the Language Reference (2.4.4): a decimal digit run
@@ -403,7 +569,7 @@ impl Lexer {
                 self.push(Tok::Int(value));
                 Ok(())
             }
-            Err(_) => Err(self.err("integer literal too large for first light (exceeds 64 bits)")),
+            Err(_) => Err(self.err("integer literal too large (exceeds 64 bits)")),
         }
     }
 
@@ -442,7 +608,7 @@ impl Lexer {
                 self.push(Tok::Int(value));
                 Ok(())
             }
-            Err(_) => Err(self.err("integer literal too large for first light (exceeds 64 bits)")),
+            Err(_) => Err(self.err("integer literal too large (exceeds 64 bits)")),
         }
     }
 
@@ -468,12 +634,15 @@ impl Lexer {
             "not" => Tok::KwNot,
             "for" => Tok::KwFor,
             "in" => Tok::KwIn,
+            "break" => Tok::KwBreak,
+            "continue" => Tok::KwContinue,
+            "pass" => Tok::KwPass,
             "True" => Tok::KwTrue,
             "False" => Tok::KwFalse,
             "None" => Tok::KwNone,
-            "as" | "assert" | "async" | "await" | "break" | "class" | "continue" | "del"
-            | "except" | "finally" | "from" | "global" | "import" | "is" | "lambda"
-            | "nonlocal" | "pass" | "raise" | "try" | "with" | "yield" => Tok::Reserved(name),
+            "as" | "assert" | "async" | "await" | "class" | "del" | "except" | "finally"
+            | "from" | "global" | "import" | "is" | "lambda" | "nonlocal" | "raise"
+            | "try" | "with" | "yield" => Tok::Reserved(name),
             _ => Tok::Name(name),
         };
         self.push(kind);
@@ -490,7 +659,7 @@ impl Lexer {
             '-' if next == Some('=') => (Tok::MinusEq, 2),
             '-' => (Tok::Minus, 1),
             '*' if next == Some('*') => {
-                return Err(self.err("exponentiation '**' is out of the first-light subset"));
+                return Err(self.err("exponentiation '**' is not supported in this subset"));
             }
             '*' if next == Some('=') => (Tok::StarEq, 2),
             '*' => (Tok::Star, 1),
@@ -523,12 +692,14 @@ impl Lexer {
             '.' => (Tok::Dot, 1),
             '(' => (Tok::LParen, 1),
             ')' => (Tok::RParen, 1),
+            '[' => (Tok::LBracket, 1),
+            ']' => (Tok::RBracket, 1),
             other => return Err(self.err(format!("unexpected character {other:?}"))),
         };
         self.pos += width;
-        if kind == Tok::LParen {
+        if matches!(kind, Tok::LParen | Tok::LBracket) {
             self.bracket_depth += 1;
-        } else if kind == Tok::RParen {
+        } else if matches!(kind, Tok::RParen | Tok::RBracket) {
             self.bracket_depth = self.bracket_depth.saturating_sub(1);
         }
         self.push(kind);
@@ -675,6 +846,54 @@ mod tests {
                 Tok::Eof,
             ]
         );
+    }
+
+    #[test]
+    fn short_strings_lex_with_either_quote() {
+        assert_eq!(kinds("'hello'\n")[0], Tok::Str("hello".into()));
+        assert_eq!(kinds("\"hello\"\n")[0], Tok::Str("hello".into()));
+        assert_eq!(kinds("'say \"hi\"'\n")[0], Tok::Str("say \"hi\"".into()));
+        assert_eq!(kinds("''\n")[0], Tok::Str(String::new()));
+    }
+
+    #[test]
+    fn string_escape_sequences_decode_per_2_4_1() {
+        assert_eq!(kinds("'a\\tb'\n")[0], Tok::Str("a\tb".into()));
+        assert_eq!(kinds("'\\n\\r'\n")[0], Tok::Str("\n\r".into()));
+        assert_eq!(kinds("'\\\\'\n")[0], Tok::Str("\\".into()));
+        assert_eq!(kinds("'\\''\n")[0], Tok::Str("'".into()));
+        assert_eq!(kinds("'\\x41\\x7e'\n")[0], Tok::Str("A~".into()));
+        assert_eq!(kinds("'\\101'\n")[0], Tok::Str("A".into()));
+        assert_eq!(kinds("'\\0'\n")[0], Tok::Str("\0".into()));
+        assert_eq!(kinds("'\\q'\n")[0], Tok::Str("\\q".into()));
+    }
+
+    #[test]
+    fn a_backslash_newline_continues_a_short_string() {
+        assert_eq!(kinds("'a\\\nb'\n")[0], Tok::Str("ab".into()));
+    }
+
+    #[test]
+    fn an_ill_formed_short_string_is_rejected() {
+        assert!(tokenize("'abc\n").is_err());
+        assert!(tokenize("'abc").is_err());
+        assert!(tokenize("'\\x4'\n").is_err());
+    }
+
+    #[test]
+    fn triple_quoted_strings_span_lines() {
+        assert_eq!(
+            kinds("\"\"\"hello\nworld\"\"\"\n")[0],
+            Tok::Str("hello\nworld".into())
+        );
+        assert_eq!(kinds("'''abc'''\n")[0], Tok::Str("abc".into()));
+        assert_eq!(kinds("\"\"\"a\"b\"\"\"\n")[0], Tok::Str("a\"b".into()));
+        assert_eq!(kinds("\"\"\"\"\"\"\n")[0], Tok::Str(String::new()));
+    }
+
+    #[test]
+    fn an_unterminated_triple_quoted_string_is_rejected() {
+        assert!(tokenize("\"\"\"abc\n").is_err());
     }
 
     #[test]

@@ -357,12 +357,20 @@ fn emit_element_load(
         out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
         return Ok(());
     }
-    out.push(Instruction::simple(ldelem_opcode(element_ty)?));
+    if tokens.is_struct(element_ty) || tokens.is_enum(element_ty) {
+        let token = tokens
+            .type_token(element_ty)
+            .ok_or(EmitError::Unsupported("array element type has no token"))?;
+        out.push(Instruction::new(Opcode::Ldelema, Operand::Token(token)));
+        out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
+    } else {
+        out.push(Instruction::simple(ldelem_opcode(element_ty)?));
+    }
     Ok(())
 }
 
-/// Lowers `a[i] = v`: array, index, and value are pushed, then `stelem.*`. Shared
-/// by assignment emission.
+/// Lowers `a[i] = v`: array, index, and value are pushed, then `stelem.*` (a value-type
+/// element stores through its address). Shared by assignment emission.
 pub(crate) fn emit_element_store(
     element_ty: &TypeSymbol,
     receiver: &BoundExpr,
@@ -401,8 +409,17 @@ pub(crate) fn emit_element_store(
     }
     emit_expression(receiver, frame, tokens, out)?;
     emit_expression(&indices[0], frame, tokens, out)?;
-    emit_expression(value, frame, tokens, out)?;
-    out.push(Instruction::simple(stelem_opcode(element_ty)?));
+    if tokens.is_struct(element_ty) || tokens.is_enum(element_ty) {
+        let token = tokens
+            .type_token(element_ty)
+            .ok_or(EmitError::Unsupported("array element type has no token"))?;
+        out.push(Instruction::new(Opcode::Ldelema, Operand::Token(token)));
+        emit_expression(value, frame, tokens, out)?;
+        out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
+    } else {
+        emit_expression(value, frame, tokens, out)?;
+        out.push(Instruction::simple(stelem_opcode(element_ty)?));
+    }
     Ok(())
 }
 
@@ -626,8 +643,8 @@ fn emit_field_load(
             "a field access that did not resolve",
         ));
     };
-    if let Some(value) = field.constant {
-        out.push(const_load(value, &field.ty));
+    if let Some(value) = &field.constant {
+        emit_literal(value, &field.ty, tokens, out)?;
         return Ok(());
     }
     let token = tokens
@@ -804,7 +821,9 @@ fn emit_cast(
         out.push(Instruction::simple(opcode));
         return Ok(());
     }
-    if matches!(to, TypeSymbol::Named(_)) && !is_value_type(to, tokens) {
+    let to_reference = matches!(to, TypeSymbol::Array { .. })
+        || (matches!(to, TypeSymbol::Named(_)) && !is_value_type(to, tokens));
+    if to_reference {
         let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
             "a cast to a reference type with no metadata token",
         ))?;
@@ -1059,15 +1078,7 @@ fn emit_step_expression(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     let BoundExprKind::Local(name) = &operand.kind else {
-        let step_name = if increment { "op_Increment" } else { "op_Decrement" };
-        if tokens
-            .method(&operand.ty, step_name, core::slice::from_ref(&operand.ty))
-            .is_some()
-        {
-            return Err(EmitError::Unsupported(
-                "user-defined ++/-- of a non-local in expression position",
-            ));
-        }
+        let user_step = crate::method::user_step_method(operand, increment, tokens);
         let leave = if postfix {
             crate::method::Leave::Old
         } else {
@@ -1077,6 +1088,7 @@ fn emit_step_expression(
             operand,
             crate::method::step_operator(increment),
             None,
+            user_step,
             frame,
             tokens,
             out,
@@ -1093,9 +1105,7 @@ fn emit_step_expression(
         Some(Slot::Argument(slot)) => Instruction::new(Opcode::Starg, Operand::Variable(slot)),
         None => return Err(EmitError::Unsupported("++/-- of a name with no frame slot")),
     };
-    let step_name = if increment { "op_Increment" } else { "op_Decrement" };
-    if let Some(token) = tokens.method(&operand.ty, step_name, core::slice::from_ref(&operand.ty))
-    {
+    if let Some(token) = crate::method::user_step_method(operand, increment, tokens) {
         if postfix {
             emit_local(name, frame, tokens, out)?;
         }
@@ -1486,19 +1496,6 @@ fn push_logical_negation(out: &mut Vec<Instruction>) {
 
 fn load_i4(value: i32) -> Instruction {
     Instruction::new(Opcode::LdcI4, Operand::Int32(value))
-}
-
-/// Loads a folded integer constant: `ldc.i8` for the 64-bit integral types,
-/// otherwise `ldc.i4` (the value's low 32 bits, two's-complement).
-fn const_load(value: i64, ty: &TypeSymbol) -> Instruction {
-    if matches!(
-        ty,
-        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
-    ) {
-        Instruction::new(Opcode::LdcI8, Operand::Int64(value))
-    } else {
-        load_i4(value as i32)
-    }
 }
 
 #[cfg(test)]

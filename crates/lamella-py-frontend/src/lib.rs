@@ -24,7 +24,7 @@ pub enum FrontendError {
     Lex(lexer::LexError),
     /// A syntax error.
     Parse(parser::ParseError),
-    /// A lowering error (a construct outside the first-light subset).
+    /// A lowering error (a construct outside the typed subset).
     Compile(compile::CompileError),
 }
 
@@ -56,8 +56,8 @@ impl From<compile::CompileError> for FrontendError {
     }
 }
 
-/// Compile first-light Python `source` (named `module_name` for diagnostics) all
-/// the way to a versioned [`bytecode::Module`]: tokenize, parse, then lower.
+/// Compile Python `source` (named `module_name` for diagnostics) all the way to
+/// a versioned [`bytecode::Module`]: tokenize, parse, then lower.
 pub fn compile_str(
     module_name: &str,
     source: &str,
@@ -74,11 +74,10 @@ mod tests {
     use alloc::string::String;
     use bytecode::{FeatureFlags, Module, Op, StaticType};
 
-    /// The first-light tracer-bullet program: a typed iterative `fib` plus one
-    /// dynamic attribute access. Exercises the whole pipeline end to end and
-    /// round-trips through the versioned container. (The top-level `print(fib(10))`
-    /// compiles too, but the first-light parity slice drives the call boundary from
-    /// the harness over the `fib` body.)
+    /// A typed iterative `fib` plus one dynamic attribute access. Exercises the
+    /// whole pipeline end to end and round-trips through the versioned container.
+    /// (The top-level `print(fib(10))` compiles too, but the typed parity slice
+    /// drives the call boundary from the harness over the `fib` body.)
     const FIRST_LIGHT: &str = "\
 def fib(n: int) -> int:
     a: int = 0

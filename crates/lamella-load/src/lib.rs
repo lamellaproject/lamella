@@ -36,9 +36,11 @@ use lamella_cil_runtime::intrinsics::{
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
     string_not_equals, string_substring, string_substring_len, type_from_handle, type_get_field,
     type_get_method, type_get_name, type_get_property,
+    thread_start, thread_join, thread_yield, thread_sleep, monitor_enter, monitor_exit,
+    monitor_try_enter, monitor_wait, monitor_pulse, monitor_pulse_all,
 };
 #[cfg(feature = "gc")]
-use lamella_cil_runtime::intrinsics::gc_collect;
+use lamella_cil_runtime::intrinsics::{gc_collect, weak_make_cell, weak_read_cell, weak_write_cell};
 #[cfg(feature = "finalizers")]
 use lamella_cil_runtime::intrinsics::{
     reregister_finalize, suppress_finalize, wait_for_pending_finalizers,
@@ -730,6 +732,7 @@ fn load_assembly(
     let mut type_extends: Vec<Token> = Vec::new();
     let mut type_interfaces: Vec<Vec<Token>> = Vec::new();
     let mut type_virtuals: Vec<Vec<VirtualMethod>> = Vec::new();
+    let mut type_nonvirtuals: Vec<Vec<VirtualMethod>> = Vec::new();
     let mut type_is_value_type: Vec<bool> = Vec::new();
     let mut own_fields: Vec<Vec<(Token, Value)>> = Vec::new();
     let mut method_row: u32 = 0;
@@ -792,6 +795,7 @@ fn load_assembly(
         type_interfaces.push(type_def.interfaces().collect());
 
         let mut virtuals = Vec::new();
+        let mut nonvirtuals = Vec::new();
         let type_name = type_def.name();
         let is_delegate = is_delegate_type(assembly, type_def.extends());
         let is_value_type = type_def.is_value_type();
@@ -988,12 +992,20 @@ fn load_assembly(
                     params,
                     newslot: method.flags() & METHOD_NEWSLOT != 0,
                 });
+            } else if !method.is_static() && name != ".ctor" {
+                nonvirtuals.push(VirtualMethod {
+                    id,
+                    name,
+                    params,
+                    newslot: false,
+                });
             }
             if token.0 == entry_token {
                 entry = Some(id);
             }
         }
         type_virtuals.push(virtuals);
+        type_nonvirtuals.push(nonvirtuals);
     }
 
     bind_strings(assembly, module, asm, &string_tokens);
@@ -1037,7 +1049,15 @@ fn load_assembly(
         &type_extends,
         &type_virtuals,
     );
-    build_sig_methods(module, assembly, asm, type_offset, &type_extends, &type_virtuals);
+    build_sig_methods(
+        module,
+        assembly,
+        asm,
+        type_offset,
+        &type_extends,
+        &type_virtuals,
+        &type_nonvirtuals,
+    );
     bind_call_targets(module, assembly, asm, &callvirt_tokens, &methoddef_sigs);
     bind_explicit_overrides(module, assembly, asm, type_offset);
     bind_types(module, asm, type_offset, &type_extends, &type_is_value_type);
@@ -1094,6 +1114,13 @@ fn bind_bcl_calls(
                 .map_or(0, |sig| sig.parameters.len() + usize::from(sig.has_this)),
         )
         .unwrap_or(u16::MAX);
+
+        if method_name == ".ctor" {
+            if let [SigType::Object, SigType::IntPtr] = params {
+                module.mark_delegate_ctor(asm, *token);
+                continue;
+            }
+        }
 
         let function = if parent.table() == TYPE_SPEC {
             match method_name {
@@ -1397,6 +1424,26 @@ fn bcl_intrinsic(
             _ => None,
         };
     }
+    if namespace == "System.Threading" && type_name == "Thread" {
+        match method {
+            "StartThread" => return Some(thread_start),
+            "JoinThread" => return Some(thread_join),
+            "YieldThread" => return Some(thread_yield),
+            "SleepThread" => return Some(thread_sleep),
+            _ => {}
+        }
+    }
+    if namespace == "System.Threading" && type_name == "Monitor" {
+        match method {
+            "EnterLock" => return Some(monitor_enter),
+            "ExitLock" => return Some(monitor_exit),
+            "TryEnterLock" => return Some(monitor_try_enter),
+            "WaitLock" => return Some(monitor_wait),
+            "PulseLock" => return Some(monitor_pulse),
+            "PulseAllLock" => return Some(monitor_pulse_all),
+            _ => {}
+        }
+    }
     if namespace != "System" {
         return None;
     }
@@ -1430,6 +1477,12 @@ fn bcl_intrinsic(
         ("GC", "Collect") => Some(gc_collect),
         #[cfg(feature = "finalizers")]
         ("GC", "WaitForPendingFinalizers") => Some(wait_for_pending_finalizers),
+        #[cfg(feature = "gc")]
+        ("WeakReference", "MakeWeakCell") => Some(weak_make_cell),
+        #[cfg(feature = "gc")]
+        ("WeakReference", "ReadWeakCell") => Some(weak_read_cell),
+        #[cfg(feature = "gc")]
+        ("WeakReference", "WriteWeakCell") => Some(weak_write_cell),
         ("Type", "GetTypeFromHandle") => Some(type_from_handle),
         ("Type", "get_Name") => Some(type_get_name),
         #[cfg(feature = "NETMFv4_4")]
@@ -2442,13 +2495,14 @@ struct VtableSlot {
 /// Whether a type extends `System.MulticastDelegate` / `System.Delegate` -- i.e. is a
 /// delegate type, whose runtime-provided `.ctor` / `Invoke` the loader records.
 fn is_delegate_type(assembly: &Assembly, extends: Token) -> bool {
-    if extends.table() != TYPE_REF {
+    let base_name = if extends.table() == TYPE_REF {
+        assembly.type_ref(extends.row()).and_then(|type_ref| type_ref.name())
+    } else if extends.table() == TYPE_DEF {
+        assembly.type_def(extends.row()).and_then(|type_def| type_def.name())
+    } else {
         return false;
-    }
-    assembly
-        .type_ref(extends.row())
-        .and_then(|type_ref| type_ref.name())
-        .is_some_and(|name| matches!(name.name, "MulticastDelegate" | "Delegate"))
+    };
+    base_name.is_some_and(|name| matches!(name.name, "MulticastDelegate" | "Delegate"))
 }
 
 /// Whether a type extends `System.Enum` -- i.e. is an enum, whose literal constants the
@@ -2535,12 +2589,21 @@ fn build_sig_methods(
     type_offset: usize,
     extends: &[Token],
     virtuals: &[Vec<VirtualMethod>],
+    nonvirtuals: &[Vec<VirtualMethod>],
 ) {
-    let mut memo: Vec<Option<BTreeMap<String, MethodId>>> = alloc::vec![None; extends.len()];
+    let mut virtual_memo: Vec<Option<BTreeMap<String, MethodId>>> =
+        alloc::vec![None; extends.len()];
+    let mut nonvirtual_memo: Vec<Option<BTreeMap<String, MethodId>>> =
+        alloc::vec![None; extends.len()];
     for local in 0..extends.len() {
-        let methods = compute_sig_methods(assembly, local, extends, virtuals, &mut memo);
+        let methods = compute_sig_methods(assembly, local, extends, virtuals, &mut virtual_memo);
         if !methods.is_empty() {
             module.set_sig_methods((type_offset + local) as u32, methods);
+        }
+        let nonvirtual =
+            compute_sig_methods(assembly, local, extends, nonvirtuals, &mut nonvirtual_memo);
+        if !nonvirtual.is_empty() {
+            module.set_sig_methods_nonvirtual((type_offset + local) as u32, nonvirtual);
         }
     }
 }

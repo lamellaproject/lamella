@@ -1,8 +1,10 @@
 //! The type and member symbol model (ECMA-334 1st ed, clauses 17-18).
 
 use crate::resolve::TypeTable;
+use crate::special::SpecialType;
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
+use lamella_syntax::ast::Literal;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -51,9 +53,9 @@ pub struct FieldSymbol {
     pub is_readonly: bool,
     /// The field's accessibility.
     pub accessibility: Accessibility,
-    /// The compile-time constant value for an enum member (its underlying value);
-    /// `None` for an ordinary field.
-    pub constant: Option<i64>,
+    /// The compile-time constant value of a `const` field or enum member (folded at the use
+    /// site instead of an `ldsfld`); `None` for an ordinary field.
+    pub constant: Option<Literal>,
 }
 
 /// A property of a type (17.6), reduced to its name and type.
@@ -229,6 +231,7 @@ impl Model {
                 let (namespace, name) = split_named(parts);
                 self.get(&namespace, name)
             }
+            TypeSymbol::Special(SpecialType::Null) => None,
             TypeSymbol::Special(special) => {
                 let (namespace, name) = special.full_name();
                 self.get(namespace, name)
@@ -258,18 +261,13 @@ impl Model {
         }
     }
 
-    fn is_class(&self, ty: &TypeSymbol) -> bool {
-        self.get_by_symbol(ty)
-            .is_some_and(|info| info.kind == TypeKind::Class)
-    }
-
-    /// Resolves a written base to the symbol of a class in the model: by exact match,
-    /// else (for an unqualified base such as a `using`-imported `Exception`) by a unique
-    /// simple-name match across namespaces. `None` if it is not a class, or the simple
-    /// name is ambiguous -- base names are not yet resolved through `using` directives,
-    /// so this stands in for that for a BCL base.
-    fn resolve_class_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
-        if self.is_class(base) {
+    /// Resolves a written base to the symbol of a model type of `kind`: by exact match,
+    /// else (for an unqualified base such as a `using`-imported `Exception` or
+    /// `IEnumerator`) by a unique simple-name match across namespaces. `None` if no such
+    /// type exists, or the simple name is ambiguous -- base names are not yet resolved
+    /// through `using` directives, so this stands in for that for a BCL base.
+    fn resolve_base_of_kind(&self, base: &TypeSymbol, kind: TypeKind) -> Option<TypeSymbol> {
+        if self.get_by_symbol(base).is_some_and(|info| info.kind == kind) {
             return Some(base.clone());
         }
         let TypeSymbol::Named(parts) = base else {
@@ -281,7 +279,7 @@ impl Model {
         let simple = &*parts[0];
         let mut found: Option<TypeSymbol> = None;
         for ((namespace, name), info) in &self.types {
-            if &**name == simple && info.kind == TypeKind::Class {
+            if &**name == simple && info.kind == kind {
                 if found.is_some() {
                     return None;
                 }
@@ -289,6 +287,17 @@ impl Model {
             }
         }
         found
+    }
+
+    /// Resolves a written base to a class in the model -- the inheritance-chain base.
+    fn resolve_class_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
+        self.resolve_base_of_kind(base, TypeKind::Class)
+    }
+
+    /// Resolves a written base to an interface in the model -- the `InterfaceImpl` source
+    /// for a class that implements an interface, named qualified or (via `using`) not.
+    pub fn resolve_interface_base(&self, base: &TypeSymbol) -> Option<TypeSymbol> {
+        self.resolve_base_of_kind(base, TypeKind::Interface)
     }
 
     /// Whether `namespace` is a declared namespace -- some type lives in it or in a

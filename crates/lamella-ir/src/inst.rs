@@ -186,7 +186,9 @@ pub enum PyOp {
     Iter,
     /// `next(it)` -- advance an iterator. `args = [it]`.
     Next,
-    /// `len(obj)` -- the result is an `int32` length. `args = [obj]`.
+    /// `len(obj)` -- the result is a `PyValue` (the Python `int` length, per the locked
+    /// `py_len(x) -> PyValue` ABI; the frontend unboxes it where a raw `int32` is wanted). `args =
+    /// [obj]`.
     Len,
     /// Truthiness `bool(obj)` for a condition -- the result is an `int32` 0 or 1. `args = [obj]`.
     Truthy,
@@ -206,12 +208,12 @@ pub enum PyOp {
 impl PyOp {
     /// The [`MirType`] this operation's result must have, or `None` when the operation is
     /// side-effecting and its result is an ignored placeholder (like [`Inst::Store`]). The
-    /// scalar-result ops (`Len`/`Truthy`/`Compare`/`Contains`) yield `int32`; the rest yield a
-    /// `PyValue`.
+    /// C-bool-result ops (`Truthy`/`Compare`/`Contains`, consumed by a branch) yield `int32`; the
+    /// rest yield a `PyValue` (`Len` returns the Python `int` length object, not a raw `int32`).
     #[must_use]
     pub fn result_type(self) -> Option<MirType> {
         match self {
-            PyOp::Len | PyOp::Truthy | PyOp::Compare(_) | PyOp::Contains => Some(MirType::I32),
+            PyOp::Truthy | PyOp::Compare(_) | PyOp::Contains => Some(MirType::I32),
             PyOp::Setattr | PyOp::Setitem | PyOp::Exit => None,
             PyOp::Getattr { .. }
             | PyOp::Binop(_)
@@ -219,6 +221,7 @@ impl PyOp {
             | PyOp::Getitem
             | PyOp::Iter
             | PyOp::Next
+            | PyOp::Len
             | PyOp::Enter
             | PyOp::Import => Some(MirType::PyValue),
         }
@@ -300,6 +303,36 @@ pub enum Inst {
         /// The called interface method's identity tag (`resolver::interface_method_tag`).
         tag: u32,
         /// The argument values, in order; `args[0]` is the receiver (`this`).
+        args: Vec<ValueId>,
+    },
+    /// The ADDRESS of a function of the program (a code pointer), named by index -- the CIL `ldftn`,
+    /// the substrate for delegates and callbacks. The result is an `i32` raw address (the target's
+    /// entry, with the Thumb bit on ARM so it can be `blx`ed). In an object the backend emits it as an
+    /// absolute relocation to the function's symbol; the linker fills the real address.
+    FuncAddr {
+        /// The index of the referenced function within the program.
+        func: u32,
+    },
+    /// An INDIRECT call through a code pointer in `target` (the CIL `calli`, and the engine of a
+    /// delegate's `Invoke`): passes `args` in the ABI's argument registers and calls `target`.
+    /// Produces the callee's return value, like [`Inst::Call`], and is a safepoint.
+    CallIndirect {
+        /// The code pointer to call (e.g. from [`Inst::FuncAddr`] or a delegate's method field).
+        target: ValueId,
+        /// The argument values, in order (placed in the ABI's argument registers).
+        args: Vec<ValueId>,
+    },
+    /// A call to an EXTERNAL native symbol named by `symbol` -- a `u32` index into the module's
+    /// extern-symbol table (`__aeabi_fadd`, a `[DllImport]` entry point, a `py_*` helper). The
+    /// substrate for soft-float helpers, P/Invoke, and the GC/Python support entries. `args` pass in
+    /// the platform C ABI (ARM AAPCS, so an `f64` rides `r0:r1`); the result is the call's return
+    /// value (typed by the producing op). The backend lowers it to a call plus an `R_<arch>_CALL_PLT`
+    /// relocation the linker resolves (e.g. against `libgcc.a`). A safepoint. Added per the lead's
+    /// 2026-06-24 seam decision; marshaling (by-ref structs, varargs, callbacks) layers on top later.
+    CallNative {
+        /// The index of the external symbol in the module's extern-symbol table.
+        symbol: u32,
+        /// The argument values, in order (placed in the C ABI's argument registers).
         args: Vec<ValueId>,
     },
     /// A `castclass` base-pointer chain scan: walks `args[0]` (the object's TypeDesc address) up the

@@ -113,6 +113,9 @@ fn lower_inst(
 ) -> Result<(), LowerError> {
     match inst {
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
+        Inst::FuncAddr { .. } | Inst::CallIndirect { .. } | Inst::CallNative { .. } => {
+            return Err(LowerError::CallUnsupported);
+        }
         Inst::ConstInt { value, .. } => {
             if let Ok(imm) = u8::try_from(*value) {
                 enc.movs_imm(assign(result), imm)
@@ -339,6 +342,7 @@ fn is_pointer_base(value_types: &[MirType], base: ValueId) -> bool {
 fn lower_spilled_inst(
     enc: &mut Encoder,
     pool: &mut Vec<(Label, u32)>,
+    sym_pool: &mut Vec<(Label, u32)>,
     strings: &mut Vec<(Label, Box<[u8]>)>,
     string_blobs: &mut Vec<(Label, Box<[u16]>)>,
     value_types: &[MirType],
@@ -346,6 +350,7 @@ fn lower_spilled_inst(
     inst: &Inst,
     result_ty: Option<MirType>,
     func_labels: &[Label],
+    relocate: bool,
 ) -> Result<Option<u32>, LowerError> {
     match inst {
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
@@ -498,10 +503,49 @@ fn lower_spilled_inst(
         }
         Inst::Call { callee, args } => {
             let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
-            let target = *func_labels
-                .get(*callee as usize)
-                .ok_or(LowerError::CallUnsupported)?;
-            enc.bl(target);
+            if relocate {
+                enc.bl_symbol(*callee);
+            } else {
+                let target = *func_labels
+                    .get(*callee as usize)
+                    .ok_or(LowerError::CallUnsupported)?;
+                enc.bl(target);
+            }
+            let return_pc = enc.position();
+            if stack_bytes > 0 {
+                enc.add_sp(stack_bytes)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+            return Ok(Some(return_pc));
+        }
+        Inst::FuncAddr { func } => {
+            if !relocate {
+                return Err(LowerError::CallUnsupported);
+            }
+            let label = enc.new_label();
+            sym_pool.push((label, *func));
+            enc.ldr_literal(Reg::R0, label)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::CallIndirect { target, args } => {
+            enc.ldr_sp(Reg::R0, slot(*target))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.mov_reg(Reg::R12, Reg::R0);
+            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            enc.blx(Reg::R12);
+            let return_pc = enc.position();
+            if stack_bytes > 0 {
+                enc.add_sp(stack_bytes)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+            return Ok(Some(return_pc));
+        }
+        Inst::CallNative { symbol, args } => {
+            if !relocate {
+                return Err(LowerError::CallUnsupported);
+            }
+            let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
+            enc.bl_symbol(EXTERN_SYMBOL_FLAG | *symbol);
             let return_pc = enc.position();
             if stack_bytes > 0 {
                 enc.add_sp(stack_bytes)
@@ -1544,11 +1588,12 @@ fn lower_spilled_into(
     enc: &mut Encoder,
     func_labels: &[Label],
     alloc_addr: Option<u32>,
-    py_support: Option<u32>,
+    py_support: PySupport,
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
     stack_maps: &mut Vec<StackMapEntry>,
     vtables: &[TypeMeta],
+    relocate: bool,
 ) -> Result<(), LowerError> {
     let has_calls = func.blocks.iter().any(|b| {
         b.insts.iter().any(|(_, i)| {
@@ -1557,6 +1602,8 @@ fn lower_spilled_into(
                 Inst::Call { .. }
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
+                    | Inst::CallIndirect { .. }
+                    | Inst::CallNative { .. }
                     | Inst::CastClassScan { .. }
                     | Inst::PyIntrinsic { .. }
                     | Inst::Alloc { .. }
@@ -1577,6 +1624,22 @@ fn lower_spilled_into(
     if returns_big_struct {
         used += 4;
     }
+    let max_call_argc = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|(_, i)| match i {
+            Inst::PyIntrinsic {
+                op: lamella_ir::PyOp::Call,
+                args,
+                ..
+            } => Some(args.len().saturating_sub(1)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let argv_scratch_off = used;
+    used += (max_call_argc as u16) * 4;
     let frame = ((used as usize + lr_bytes + 7) & !7usize) - lr_bytes;
     if frame > 508 {
         return Err(LowerError::TooManyValues);
@@ -1611,6 +1674,7 @@ fn lower_spilled_into(
         };
 
     let mut pool: Vec<(Label, u32)> = Vec::new();
+    let mut sym_pool: Vec<(Label, u32)> = Vec::new();
     let mut strings: Vec<(Label, Box<[u8]>)> = Vec::new();
     let mut string_blobs: Vec<(Label, Box<[u16]>)> = Vec::new();
     let mut type_descs: Vec<(Label, Box<[u32]>)> = Vec::new();
@@ -1747,31 +1811,62 @@ fn lower_spilled_into(
                     enc.add_sp_imm(Reg::R0, slot(*result))
                         .map_err(|_| LowerError::TooManyValues)?;
                     load_call_args(enc, &func.value_types, &slot, args, 1)?;
-                    let target = *func_labels
-                        .get(*callee as usize)
-                        .ok_or(LowerError::CallUnsupported)?;
-                    enc.bl(target);
+                    if relocate {
+                        enc.bl_symbol(*callee);
+                    } else {
+                        let target = *func_labels
+                            .get(*callee as usize)
+                            .ok_or(LowerError::CallUnsupported)?;
+                        enc.bl(target);
+                    }
                     record_safepoint(stack_maps, index, inst_pos, enc.position());
                     continue;
                 }
             }
-            if let Inst::PyIntrinsic {
-                op: lamella_ir::PyOp::Getattr { name },
-                args,
-                cache,
-            } = inst
-            {
-                let support = py_support.ok_or(LowerError::CallUnsupported)?;
-                let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
-                enc.ldr_sp(Reg::R0, slot(receiver))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                load_const_word(enc, &mut pool, Reg::R1, *name)?;
-                load_const_word(enc, &mut pool, Reg::R2, *cache)?;
-                load_const_word(enc, &mut pool, Reg::R3, support)?;
-                enc.blx(Reg::R3);
+            if let Inst::PyIntrinsic { op, args, cache } = inst {
+                match op {
+                    lamella_ir::PyOp::Getattr { name } => {
+                        let support = py_support.getattr.ok_or(LowerError::CallUnsupported)?;
+                        let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
+                        enc.ldr_sp(Reg::R0, slot(receiver))
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        load_const_word(enc, &mut pool, Reg::R1, *name)?;
+                        load_const_word(enc, &mut pool, Reg::R2, *cache)?;
+                        load_const_word(enc, &mut pool, Reg::R3, support)?;
+                        enc.blx(Reg::R3);
+                    }
+                    lamella_ir::PyOp::Len => {
+                        let support = py_support.len.ok_or(LowerError::CallUnsupported)?;
+                        let x = *args.first().ok_or(LowerError::CallUnsupported)?;
+                        enc.ldr_sp(Reg::R0, slot(x))
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        load_const_word(enc, &mut pool, Reg::R1, support)?;
+                        enc.blx(Reg::R1);
+                    }
+                    lamella_ir::PyOp::Call => {
+                        let support = py_support.call.ok_or(LowerError::CallUnsupported)?;
+                        let callee = *args.first().ok_or(LowerError::CallUnsupported)?;
+                        for (i, &arg) in args[1..].iter().enumerate() {
+                            enc.ldr_sp(Reg::R0, slot(arg))
+                                .map_err(|_| LowerError::TooManyValues)?;
+                            enc.str_sp(Reg::R0, argv_scratch_off + (i as u16) * 4)
+                                .map_err(|_| LowerError::TooManyValues)?;
+                        }
+                        enc.ldr_sp(Reg::R0, slot(callee))
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        enc.add_sp_imm(Reg::R1, argv_scratch_off)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        load_const_word(enc, &mut pool, Reg::R2, (args.len() - 1) as u32)?;
+                        load_const_word(enc, &mut pool, Reg::R3, support)?;
+                        enc.blx(Reg::R3);
+                    }
+                    _ => return Err(LowerError::CallUnsupported),
+                }
                 record_safepoint(stack_maps, index, inst_pos, enc.position());
-                enc.str_sp(Reg::R0, slot(*result))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                if op.result_type().is_some() {
+                    enc.str_sp(Reg::R0, slot(*result))
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
                 continue;
             }
             if let Inst::Alloc {
@@ -1952,6 +2047,7 @@ fn lower_spilled_into(
             let call_pc = lower_spilled_inst(
                 enc,
                 &mut pool,
+                &mut sym_pool,
                 &mut strings,
                 &mut string_blobs,
                 &func.value_types,
@@ -1959,6 +2055,7 @@ fn lower_spilled_into(
                 inst,
                 func.value_type(*result),
                 func_labels,
+                relocate,
             )?;
             if let Some(return_pc) = call_pc {
                 record_safepoint(stack_maps, index, inst_pos, return_pc);
@@ -2059,6 +2156,13 @@ fn lower_spilled_into(
         for (entry, value) in pool {
             enc.bind_label(entry);
             enc.emit_word(value);
+        }
+    }
+    if !sym_pool.is_empty() {
+        enc.align_to_word();
+        for (entry, func) in sym_pool {
+            enc.bind_label(entry);
+            enc.data_word_symbol(func);
         }
     }
     for (entry, text) in strings {
@@ -2234,6 +2338,9 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::CallInterface { .. }
                     | Inst::CastClassScan { .. }
                     | Inst::PyIntrinsic { .. }
+                    | Inst::CallIndirect { .. }
+                    | Inst::CallNative { .. }
+                    | Inst::FuncAddr { .. }
             )
         })
     }) {
@@ -2350,6 +2457,7 @@ fn lower_call(
     callee: u32,
     args: &[ValueId],
     func_labels: &[Label],
+    relocate: bool,
 ) -> Result<(), LowerError> {
     if args.len() > 4 {
         return Err(LowerError::CallUnsupported);
@@ -2360,10 +2468,14 @@ fn lower_call(
         .map(|(i, a)| (Reg::new(i as u8).unwrap_or(Reg::R0), assign(*a)))
         .collect();
     emit_parallel_move(enc, &moves);
-    let target = *func_labels
-        .get(callee as usize)
-        .ok_or(LowerError::CallUnsupported)?;
-    enc.bl(target);
+    if relocate {
+        enc.bl_symbol(callee);
+    } else {
+        let target = *func_labels
+            .get(callee as usize)
+            .ok_or(LowerError::CallUnsupported)?;
+        enc.bl(target);
+    }
     if assign(result) != Reg::R0 {
         enc.mov_reg(assign(result), Reg::R0);
     }
@@ -2372,7 +2484,9 @@ fn lower_call(
 
 /// Lowers one function's body into a shared encoder, given its register
 /// assignment. `func_labels` resolves `Call` targets by program index; pass an
-/// empty slice for a function that makes no calls.
+/// empty slice for a function that makes no calls. `relocate` makes each `Call` an
+/// `R_ARM_THM_CALL` relocation (object emission) rather than a resolved branch.
+#[allow(clippy::too_many_arguments)]
 fn lower_into(
     func: &Function,
     enc: &mut Encoder,
@@ -2381,6 +2495,7 @@ fn lower_into(
     func_labels: &[Label],
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
+    relocate: bool,
 ) -> Result<(), LowerError> {
     let assign = |v: ValueId| regs.get(v.index()).copied().unwrap_or(Reg::R0);
     let has_calls = func
@@ -2419,7 +2534,7 @@ fn lower_into(
                 line_table.push((enc.position(), cil));
             }
             if let Inst::Call { callee, args } = inst {
-                lower_call(enc, &assign, *result, *callee, args, func_labels)?;
+                lower_call(enc, &assign, *result, *callee, args, func_labels, relocate)?;
             } else {
                 lower_inst(enc, &mut pool, *result, inst, &assign)?;
             }
@@ -2529,6 +2644,7 @@ fn lower_mixed_into(
     func_labels: &[Label],
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
+    relocate: bool,
 ) -> Result<(), LowerError> {
     let has_calls = func
         .blocks
@@ -2585,7 +2701,7 @@ fn lower_mixed_into(
                 line_table.push((enc.position(), cil));
             }
             if let Inst::Call { callee, args } = inst {
-                lower_mixed_call(enc, &home, *result, *callee, args, func_labels)?;
+                lower_mixed_call(enc, &home, *result, *callee, args, func_labels, relocate)?;
             } else {
                 lower_mixed_value(enc, &mut pool, &home, *result, inst)?;
             }
@@ -2747,6 +2863,7 @@ fn lower_mixed_call(
     callee: u32,
     args: &[ValueId],
     func_labels: &[Label],
+    relocate: bool,
 ) -> Result<(), LowerError> {
     if args.len() > 4 {
         return Err(LowerError::CallUnsupported);
@@ -2757,10 +2874,14 @@ fn lower_mixed_call(
         .map(|(i, a)| (Home::Reg(Reg::new(i as u8).unwrap_or(Reg::R0)), home(*a)))
         .collect();
     emit_home_moves(enc, &moves, Reg::R0)?;
-    let target = *func_labels
-        .get(callee as usize)
-        .ok_or(LowerError::CallUnsupported)?;
-    enc.bl(target);
+    if relocate {
+        enc.bl_symbol(callee);
+    } else {
+        let target = *func_labels
+            .get(callee as usize)
+            .ok_or(LowerError::CallUnsupported)?;
+        enc.bl(target);
+    }
     match home(result) {
         Home::Reg(r) => {
             if r != Reg::R0 {
@@ -2897,7 +3018,7 @@ pub struct StackMapEntry {
     pub ref_offsets: Vec<u16>,
     /// Byte offsets from SP-at-the-call of the live `PyValue` roots -- tagged words the collector
     /// traces only when the tag marks a heap pointer (the scan-by-tag predicate). Empty for a C#
-    /// image.
+    /// image. See `docs/python-mir-seams.md`.
     pub tagged_offsets: Vec<u16>,
 }
 
@@ -2941,23 +3062,34 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
     let mut _lines = Vec::new();
     match prepare(func)? {
         Assignment::Registers { regs, saved } => {
-            lower_into(func, &mut enc, &regs, saved, &[], &[], &mut _lines)?
+            lower_into(func, &mut enc, &regs, saved, &[], &[], &mut _lines, false)?
         }
         Assignment::Mixed {
             homes,
             saved,
             frame,
-        } => lower_mixed_into(func, &mut enc, &homes, saved, frame, &[], &[], &mut _lines)?,
+        } => lower_mixed_into(
+            func,
+            &mut enc,
+            &homes,
+            saved,
+            frame,
+            &[],
+            &[],
+            &mut _lines,
+            false,
+        )?,
         Assignment::Spilled => lower_spilled_into(
             func,
             &mut enc,
             &[],
             None,
-            None,
+            PySupport::default(),
             &[],
             &mut _lines,
             &mut Vec::new(),
             &[],
+            false,
         )?,
     }
     enc.finish()
@@ -2975,9 +3107,16 @@ pub fn lower_debug(
     let mut enc = Encoder::new();
     let mut lines = Vec::new();
     match prepare(func)? {
-        Assignment::Registers { regs, saved } => {
-            lower_into(func, &mut enc, &regs, saved, &[], source_map, &mut lines)?
-        }
+        Assignment::Registers { regs, saved } => lower_into(
+            func,
+            &mut enc,
+            &regs,
+            saved,
+            &[],
+            source_map,
+            &mut lines,
+            false,
+        )?,
         Assignment::Mixed {
             homes,
             saved,
@@ -2991,17 +3130,19 @@ pub fn lower_debug(
             &[],
             source_map,
             &mut lines,
+            false,
         )?,
         Assignment::Spilled => lower_spilled_into(
             func,
             &mut enc,
             &[],
             None,
-            None,
+            PySupport::default(),
             source_map,
             &mut lines,
             &mut Vec::new(),
             &[],
+            false,
         )?,
     }
     let bytes = enc
@@ -3015,7 +3156,7 @@ pub fn lower_debug(
 /// direct calls between them resolved. `Call { callee }` names function index
 /// `callee` in `funcs`.
 pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, None, None, &[], &[]).map(|(bytes, _, _)| bytes)
+    lower_module_inner(funcs, None, PySupport::default(), &[], &[]).map(|(bytes, _, _)| bytes)
 }
 
 /// Lowers a whole program whose reference-type allocations call the garbage-collected
@@ -3023,7 +3164,8 @@ pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
 /// &TypeDesc) -> payload*`, AAPCS (size in r0, descriptor in r1, result in r0). Each `Alloc`
 /// lowers to `blx` that address with a null-check; the type descriptors are emitted per type.
 pub fn lower_module_gc(funcs: &[Function], alloc_addr: u32) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr), None, &[], &[]).map(|(bytes, _, _)| bytes)
+    lower_module_inner(funcs, Some(alloc_addr), PySupport::default(), &[], &[])
+        .map(|(bytes, _, _)| bytes)
 }
 
 /// As [`lower_module_gc`], but with per-type VTABLES (`(type handle, function indices in slot order)`)
@@ -3034,7 +3176,8 @@ pub fn lower_module_gc_vtables(
     alloc_addr: u32,
     vtables: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr), None, vtables, &[]).map(|(bytes, _, _)| bytes)
+    lower_module_inner(funcs, Some(alloc_addr), PySupport::default(), vtables, &[])
+        .map(|(bytes, _, _)| bytes)
 }
 
 /// As [`lower_module_gc`], but also returns the GC [`StackMaps`] -- one entry per safepoint
@@ -3043,21 +3186,297 @@ pub fn lower_module_gc_mapped(
     funcs: &[Function],
     alloc_addr: u32,
 ) -> Result<(Vec<u8>, StackMaps), LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr), None, &[], &[])
+    lower_module_inner(funcs, Some(alloc_addr), PySupport::default(), &[], &[])
         .map(|(bytes, maps, _)| (bytes, maps))
 }
 
-/// Lowers a whole program with the Python runtime-support entry threaded (the first-light Python
-/// path): `alloc_addr` is the `lamella_gc_alloc` address (or `None`), `py_support` the entry a
-/// `PyIntrinsic` calls (the getattr entry for first light). Returns the image plus the GC
-/// [`StackMaps`] (carrying tagged `PyValue` roots).
+/// Addresses of the Python runtime-support entry points a `PyIntrinsic` calls -- first-light
+/// stand-ins for the linker-resolved `py_*` symbols. Each is `None` until that op is wired, so
+/// emitting an un-wired op errors ([`LowerError::CallUnsupported`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PySupport {
+    /// `py_getattr(receiver, name_id, cache_slot) -> PyValue` (r0, r1, r2 -> r0).
+    pub getattr: Option<u32>,
+    /// `py_len(x) -> PyValue` (r0 -> r0).
+    pub len: Option<u32>,
+    /// `py_call(callee, argv: *const PyValue, argc) -> PyValue` (r0, r1, r2 -> r0); the backend
+    /// spills the positional `PyValue` args to a stack array and passes its pointer + count.
+    pub call: Option<u32>,
+}
+
+/// Lowers a whole program with the Python runtime-support entries threaded (the first-light Python
+/// path): `alloc_addr` is the `lamella_gc_alloc` address (or `None`), `py_support` the per-op entry
+/// addresses a `PyIntrinsic` calls. Returns the image plus the GC [`StackMaps`] (carrying tagged
+/// `PyValue` roots).
 pub fn lower_module_py(
     funcs: &[Function],
     alloc_addr: Option<u32>,
-    py_support: Option<u32>,
+    py_support: PySupport,
 ) -> Result<(Vec<u8>, StackMaps), LowerError> {
     lower_module_inner(funcs, alloc_addr, py_support, &[], &[])
         .map(|(bytes, maps, _)| (bytes, maps))
+}
+
+/// The high bit of a relocation's symbol index flags it as an EXTERN symbol (a `CallNative` target --
+/// `__aeabi_*`, a P/Invoke entry, a `py_*` helper) rather than an intra-module function index. The
+/// backend ORs it in at the call site; `lower_object` decodes it to the extern symbol's ELF index.
+const EXTERN_SYMBOL_FLAG: u32 = 0x8000_0000;
+
+/// The `__aeabi_*` soft-float helper for a float arithmetic `Binary` op, keyed by the operand type;
+/// `None` for an integer op (a different type) or a non-arithmetic op. ARM AAPCS soft-float passes
+/// f32 in a core register and f64 in a register pair, which falls out of the C-ABI arg lowering.
+fn aeabi_float_helper(op: BinOp, operand_ty: Option<MirType>) -> Option<&'static str> {
+    match operand_ty {
+        Some(MirType::F32) => Some(match op {
+            BinOp::Add => "__aeabi_fadd",
+            BinOp::Sub => "__aeabi_fsub",
+            BinOp::Mul => "__aeabi_fmul",
+            BinOp::DivSigned | BinOp::DivUnsigned => "__aeabi_fdiv",
+            _ => return None,
+        }),
+        Some(MirType::F64) => Some(match op {
+            BinOp::Add => "__aeabi_dadd",
+            BinOp::Sub => "__aeabi_dsub",
+            BinOp::Mul => "__aeabi_dmul",
+            BinOp::DivSigned | BinOp::DivUnsigned => "__aeabi_ddiv",
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+/// Interns `name` into the module's extern-symbol table, returning its index.
+fn intern_extern(externs: &mut Vec<alloc::string::String>, name: &str) -> u32 {
+    if let Some(i) = externs.iter().position(|s| s == name) {
+        i as u32
+    } else {
+        externs.push(name.into());
+        (externs.len() - 1) as u32
+    }
+}
+
+/// The `__aeabi_*cmp*` soft-float comparison helper for a float `Compare`, with whether its result
+/// must be INVERTED, keyed by the operand type; `None` for an integer compare. The EABI helpers are
+/// ORDERED (0 for NaN): `fcmplt/le/gt/ge/eq`. The CLI's unordered compares (`clt.un` etc.) and `!=`
+/// are the negation of an ordered helper -- e.g. `clt.un` (a<b or unordered) = `!(a>=b)`, so
+/// `UnsignedLt` is `fcmpge` inverted. f32 -> `__aeabi_fcmp*`, f64 -> `__aeabi_dcmp*`.
+fn aeabi_float_compare(
+    op: CmpOp,
+    operand_ty: Option<MirType>,
+) -> Option<(alloc::string::String, bool)> {
+    let prefix = match operand_ty {
+        Some(MirType::F32) => "__aeabi_fcmp",
+        Some(MirType::F64) => "__aeabi_dcmp",
+        _ => return None,
+    };
+    let (suffix, invert) = match op {
+        CmpOp::Eq => ("eq", false),
+        CmpOp::Ne => ("eq", true),
+        CmpOp::SignedLt => ("lt", false),
+        CmpOp::SignedLe => ("le", false),
+        CmpOp::SignedGt => ("gt", false),
+        CmpOp::SignedGe => ("ge", false),
+        CmpOp::UnsignedLt => ("ge", true),
+        CmpOp::UnsignedLe => ("gt", true),
+        CmpOp::UnsignedGt => ("le", true),
+        CmpOp::UnsignedGe => ("lt", true),
+    };
+    Some((alloc::format!("{prefix}{suffix}"), invert))
+}
+
+/// Rewrites each soft-float op to a `CallNative` to its `__aeabi_*` helper (interning the name), so
+/// the backend lowers float `+ - * /` and the comparisons through the external-call path the linker
+/// resolves against `libgcc.a`. Float stays a target-independent typed MIR op (the lead's layering
+/// decision); a hard-float (VFP) target would lower these inline instead -- a later knob. A comparison
+/// whose CLI form is a negation (the unordered compares, `!=`) expands to the ordered helper plus a
+/// logical-not (`== 0`), which is why the instruction list is rebuilt rather than edited in place.
+fn lower_float_ops(func: &Function, externs: &mut Vec<alloc::string::String>) -> Function {
+    let mut func = func.clone();
+    for bi in 0..func.blocks.len() {
+        let old = core::mem::take(&mut func.blocks[bi].insts);
+        let mut insts = Vec::with_capacity(old.len());
+        for (result, inst) in old {
+            let plan = match &inst {
+                Inst::Binary { op, lhs, rhs } => {
+                    aeabi_float_helper(*op, func.value_types.get(lhs.index()).copied())
+                        .map(|name| (intern_extern(externs, name), *lhs, *rhs, false))
+                }
+                Inst::Compare { op, lhs, rhs } => {
+                    aeabi_float_compare(*op, func.value_types.get(lhs.index()).copied())
+                        .map(|(name, invert)| (intern_extern(externs, &name), *lhs, *rhs, invert))
+                }
+                _ => None,
+            };
+            match plan {
+                None => insts.push((result, inst)),
+                Some((symbol, lhs, rhs, false)) => insts.push((
+                    result,
+                    Inst::CallNative {
+                        symbol,
+                        args: alloc::vec![lhs, rhs],
+                    },
+                )),
+                Some((symbol, lhs, rhs, true)) => {
+                    let tmp = ValueId(func.value_types.len() as u32);
+                    func.value_types.push(MirType::I32);
+                    let zero = ValueId(func.value_types.len() as u32);
+                    func.value_types.push(MirType::I32);
+                    insts.push((
+                        tmp,
+                        Inst::CallNative {
+                            symbol,
+                            args: alloc::vec![lhs, rhs],
+                        },
+                    ));
+                    insts.push((
+                        zero,
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0,
+                        },
+                    ));
+                    insts.push((
+                        result,
+                        Inst::Compare {
+                            op: CmpOp::Eq,
+                            lhs: tmp,
+                            rhs: zero,
+                        },
+                    ));
+                }
+            }
+        }
+        func.blocks[bi].insts = insts;
+    }
+    func
+}
+
+/// Lowers a module into an ELF32 relocatable object -- the ARM/Thumb twin of
+/// `riscv32::lower_object`. Each function becomes a global `STT_FUNC` symbol (named by `names[i]`,
+/// the Thumb bit set in its value as an ARM toolchain marks a Thumb function) at its entry offset,
+/// and every direct call becomes an `R_ARM_THM_CALL` relocation to the callee's symbol (its function
+/// index), so a linker resolves them and sees the call graph. `names` must have one entry per
+/// function. `extern_syms` names the module's external symbols (`CallNative` targets) -- undefined
+/// globals the linker resolves (e.g. from `libgcc.a`); a `CallNative { symbol: i }` references
+/// `extern_syms[i]`.
+///
+/// The register, mixed, and spilled paths all emit objects (so a function with a value live across a
+/// call, or many values, qualifies). A function that needs a runtime address it has no symbol for
+/// (an `Alloc` without an allocator, a `PyIntrinsic`), or whose branches relax (which would shift the
+/// pre-finish symbol offsets), is rejected rather than mis-emitted -- the GC/dynamic objects await
+/// emitting those helper references as relocations too.
+pub fn lower_object(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+) -> Result<Vec<u8>, LowerError> {
+    let mut externs: Vec<alloc::string::String> = extern_syms.iter().map(|s| (*s).into()).collect();
+    let funcs: Vec<Function> = funcs
+        .iter()
+        .map(|f| lower_float_ops(f, &mut externs))
+        .collect();
+    let funcs = funcs.as_slice();
+    let mut enc = Encoder::new();
+    let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
+    for (index, func) in funcs.iter().enumerate() {
+        if lamella_ir::verify(func).is_err() {
+            return Err(LowerError::NotWellFormed);
+        }
+        enc.bind_label(func_labels[index]);
+        match prepare(func)? {
+            Assignment::Registers { regs, saved } => lower_into(
+                func,
+                &mut enc,
+                &regs,
+                saved,
+                &func_labels,
+                &[],
+                &mut Vec::new(),
+                true,
+            )?,
+            Assignment::Mixed {
+                homes,
+                saved,
+                frame,
+            } => lower_mixed_into(
+                func,
+                &mut enc,
+                &homes,
+                saved,
+                frame,
+                &func_labels,
+                &[],
+                &mut Vec::new(),
+                true,
+            )?,
+            Assignment::Spilled => lower_spilled_into(
+                func,
+                &mut enc,
+                &func_labels,
+                None,
+                PySupport::default(),
+                &[],
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &[],
+                true,
+            )?,
+        }
+    }
+    let assembled = enc.finish().map_err(|_| LowerError::CodeTooLarge)?;
+    let offsets: Vec<u32> = func_labels
+        .iter()
+        .map(|&l| assembled.label_position(l).unwrap_or(0))
+        .collect();
+    let text = assembled.bytes;
+    let mut symbols: Vec<lamella_elf::Symbol> = (0..funcs.len())
+        .map(|i| {
+            let end = offsets.get(i + 1).copied().unwrap_or(text.len() as u32);
+            lamella_elf::Symbol {
+                name: names[i],
+                value: offsets[i] | 1,
+                size: end - offsets[i],
+                binding: lamella_elf::Binding::Global,
+                kind: lamella_elf::SymbolType::Func,
+                section: lamella_elf::SymbolSection::Text,
+            }
+        })
+        .collect();
+    for name in &externs {
+        symbols.push(lamella_elf::Symbol {
+            name: name.as_str(),
+            value: 0,
+            size: 0,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Undefined,
+        });
+    }
+    let mut relocations: Vec<lamella_elf::Relocation> = Vec::with_capacity(assembled.relocs.len());
+    for r in &assembled.relocs {
+        let (kind, addend) = match r.kind {
+            lamella_asm_arm32::RelocKind::ThumbCall => (lamella_elf::arm::R_ARM_THM_CALL, -4),
+            lamella_asm_arm32::RelocKind::Abs32 => (lamella_elf::arm::R_ARM_ABS32, 0),
+            _ => return Err(LowerError::CallUnsupported),
+        };
+        let symbol = if r.symbol & EXTERN_SYMBOL_FLAG != 0 {
+            funcs.len() as u32 + (r.symbol & !EXTERN_SYMBOL_FLAG)
+        } else {
+            r.symbol
+        };
+        relocations.push(lamella_elf::Relocation {
+            offset: r.at,
+            symbol,
+            kind,
+            addend,
+        });
+    }
+    Ok(lamella_elf::write_relocatable_object(
+        lamella_elf::Machine::Arm,
+        &text,
+        &symbols,
+        &relocations,
+    ))
 }
 
 /// Lowers a whole multi-method program WITH debug line tables -- the module variant of [`lower_debug`].
@@ -3071,14 +3490,14 @@ pub fn lower_module_debug(
     alloc_addr: Option<u32>,
     source_maps: &[crate::cil::CilSourceMap],
 ) -> Result<(Vec<u8>, MethodLineTables), LowerError> {
-    lower_module_inner(funcs, alloc_addr, None, &[], source_maps)
+    lower_module_inner(funcs, alloc_addr, PySupport::default(), &[], source_maps)
         .map(|(bytes, _, lines)| (bytes, lines))
 }
 
 fn lower_module_inner(
     funcs: &[Function],
     alloc_addr: Option<u32>,
-    py_support: Option<u32>,
+    py_support: PySupport,
     vtables: &[TypeMeta],
     source_maps: &[crate::cil::CilSourceMap],
 ) -> Result<(Vec<u8>, StackMaps, MethodLineTables), LowerError> {
@@ -3109,6 +3528,7 @@ fn lower_module_inner(
                     &func_labels,
                     source_map,
                     &mut lines,
+                    false,
                 )?;
             }
             Assignment::Mixed {
@@ -3125,6 +3545,7 @@ fn lower_module_inner(
                     &func_labels,
                     source_map,
                     &mut lines,
+                    false,
                 )?;
             }
             Assignment::Spilled => {
@@ -3138,6 +3559,7 @@ fn lower_module_inner(
                     &mut lines,
                     &mut stack_maps,
                     vtables,
+                    false,
                 )?;
             }
         }
@@ -4993,13 +5415,523 @@ mod tests {
                 terminator: Some(Terminator::Return(Some(ValueId(1)))),
             }],
         };
-        let (code, maps) =
-            lower_module_py(&[main.clone()], None, Some(0x1234)).expect("getattr lowers");
+        let support = PySupport {
+            getattr: Some(0x1234),
+            ..Default::default()
+        };
+        let (code, maps) = lower_module_py(&[main.clone()], None, support).expect("getattr lowers");
         assert!(!code.is_empty(), "produced code");
         assert_eq!(maps.0.len(), 1, "the getattr call is one safepoint");
         assert!(matches!(
-            lower_module_py(&[main], None, None),
+            lower_module_py(&[main], None, PySupport::default()),
             Err(LowerError::CallUnsupported)
         ));
+    }
+
+    #[test]
+    fn lowers_a_py_len_to_a_runtime_support_call() {
+        let main = Function {
+            params: vec![MirType::PyValue],
+            ret: Some(MirType::PyValue),
+            value_types: vec![MirType::PyValue, MirType::PyValue],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::PyIntrinsic {
+                        op: lamella_ir::PyOp::Len,
+                        args: vec![ValueId(0)],
+                        cache: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let support = PySupport {
+            len: Some(0x2000),
+            ..Default::default()
+        };
+        let (code, maps) = lower_module_py(&[main.clone()], None, support).expect("len lowers");
+        assert!(!code.is_empty(), "produced code");
+        assert_eq!(maps.0.len(), 1, "the len call is one safepoint");
+        assert!(matches!(
+            lower_module_py(
+                &[main],
+                None,
+                PySupport {
+                    getattr: Some(1),
+                    ..Default::default()
+                }
+            ),
+            Err(LowerError::CallUnsupported)
+        ));
+    }
+
+    #[test]
+    fn lowers_a_py_call_to_a_runtime_support_call() {
+        let main = Function {
+            params: vec![MirType::PyValue, MirType::PyValue, MirType::PyValue],
+            ret: Some(MirType::PyValue),
+            value_types: vec![
+                MirType::PyValue,
+                MirType::PyValue,
+                MirType::PyValue,
+                MirType::PyValue,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                insts: vec![(
+                    ValueId(3),
+                    Inst::PyIntrinsic {
+                        op: lamella_ir::PyOp::Call,
+                        args: vec![ValueId(0), ValueId(1), ValueId(2)],
+                        cache: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(3)))),
+            }],
+        };
+        let support = PySupport {
+            call: Some(0x3000),
+            ..Default::default()
+        };
+        let (code, maps) = lower_module_py(&[main.clone()], None, support).expect("call lowers");
+        assert!(!code.is_empty(), "produced code");
+        assert_eq!(maps.0.len(), 1, "the py_call is one safepoint");
+        assert!(matches!(
+            lower_module_py(&[main], None, PySupport::default()),
+            Err(LowerError::CallUnsupported)
+        ));
+    }
+
+    #[test]
+    fn lower_object_emits_an_arm_relocatable_object() {
+        let answer = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 42,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Call {
+                        callee: 1,
+                        args: Vec::new(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let obj_bytes =
+            lower_object(&[main, answer], &["main", "answer"], &[]).expect("lower_object");
+        let obj = lamella_elf::read_object(&obj_bytes).expect("a valid ELF object");
+        assert_eq!(obj.machine, lamella_elf::Machine::Arm);
+        let main_sym = obj.symbols.iter().find(|s| s.name == "main").unwrap();
+        let answer_sym = obj.symbols.iter().find(|s| s.name == "answer").unwrap();
+        assert_eq!(main_sym.value & 1, 1, "main is a Thumb function");
+        assert_eq!(answer_sym.value & 1, 1, "answer is a Thumb function");
+        assert_eq!(obj.relocations.len(), 1);
+        assert_eq!(obj.relocations[0].kind, lamella_elf::arm::R_ARM_THM_CALL);
+        assert_eq!(obj.relocations[0].addend, -4);
+    }
+
+    #[test]
+    fn lower_object_emits_a_spilled_function() {
+        let answer = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 42,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert!(matches!(prepare(&main), Ok(Assignment::Spilled)));
+        let obj_bytes =
+            lower_object(&[main, answer], &["main", "answer"], &[]).expect("lower_object");
+        let obj = lamella_elf::read_object(&obj_bytes).unwrap();
+        assert_eq!(obj.relocations.len(), 2);
+        assert!(
+            obj.relocations
+                .iter()
+                .all(|r| r.kind == lamella_elf::arm::R_ARM_THM_CALL && r.addend == -4)
+        );
+    }
+
+    #[test]
+    fn lower_object_emits_a_function_pointer_and_indirect_call() {
+        let answer = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 42,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::FuncAddr { func: 1 }),
+                    (
+                        ValueId(1),
+                        Inst::CallIndirect {
+                            target: ValueId(0),
+                            args: Vec::new(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(matches!(prepare(&main), Ok(Assignment::Spilled)));
+        let obj = lamella_elf::read_object(
+            &lower_object(&[main, answer], &["main", "answer"], &[]).expect("lower_object"),
+        )
+        .unwrap();
+        assert_eq!(obj.relocations.len(), 1);
+        assert_eq!(obj.relocations[0].kind, lamella_elf::arm::R_ARM_ABS32);
+    }
+
+    #[test]
+    fn lower_object_emits_a_callnative_to_an_extern_symbol() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 20,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 22,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::CallNative {
+                            symbol: 0,
+                            args: vec![ValueId(0), ValueId(1)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let obj = lamella_elf::read_object(&lower_object(&[main], &["main"], &["cadd"]).unwrap())
+            .unwrap();
+        let cadd = obj.symbols.iter().find(|s| s.name == "cadd").unwrap();
+        assert!(!cadd.defined, "the extern symbol is undefined");
+        assert_eq!(obj.relocations.len(), 1);
+        assert_eq!(obj.relocations[0].kind, lamella_elf::arm::R_ARM_THM_CALL);
+        assert_eq!(obj.symbols[obj.relocations[0].symbol as usize].name, "cadd");
+    }
+
+    #[test]
+    fn lower_object_lowers_float_add_to_aeabi_fadd() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::F32, MirType::F32, MirType::F32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::F32,
+                            value: 0x41A0_0000,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::F32,
+                            value: 0x41B0_0000,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::Convert {
+                            value: ValueId(2),
+                            kind: ConvKind::Float32ToInt,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(3)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "__aeabi_fadd" && !s.defined)
+        );
+        assert_eq!(obj.relocations.len(), 1);
+        assert_eq!(
+            obj.symbols[obj.relocations[0].symbol as usize].name,
+            "__aeabi_fadd"
+        );
+    }
+
+    #[test]
+    fn lower_object_lowers_float_compares_to_aeabi_cmp_helpers() {
+        let cmp = |op, lhs, rhs| Inst::Compare { op, lhs, rhs };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![
+                MirType::F32,
+                MirType::F32,
+                MirType::F64,
+                MirType::F64,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::F32,
+                            value: 0,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::F32,
+                            value: 0,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::ConstInt {
+                            ty: MirType::F64,
+                            value: 0,
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::ConstInt {
+                            ty: MirType::F64,
+                            value: 0,
+                        },
+                    ),
+                    (ValueId(4), cmp(CmpOp::SignedLt, ValueId(0), ValueId(1))),
+                    (ValueId(5), cmp(CmpOp::Ne, ValueId(0), ValueId(1))),
+                    (ValueId(6), cmp(CmpOp::SignedLt, ValueId(2), ValueId(3))),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(4)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        let has = |n: &str| obj.symbols.iter().any(|s| s.name == n && !s.defined);
+        assert!(has("__aeabi_fcmplt"), "f32 < -> fcmplt");
+        assert!(has("__aeabi_fcmpeq"), "f32 != -> fcmpeq (inverted)");
+        assert!(has("__aeabi_dcmplt"), "f64 < -> dcmplt");
+        assert_eq!(obj.relocations.len(), 3);
+    }
+
+    #[test]
+    fn lower_object_handles_branch_relaxation() {
+        let leaf = |v: i64| Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: v,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Call {
+                        callee: 2,
+                        args: Vec::new(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let big = {
+            const N: u32 = 200;
+            let mut value_types = vec![MirType::I32];
+            let mut adds = Vec::new();
+            let mut prev = ValueId(0);
+            for i in 1..=N {
+                value_types.push(MirType::I32);
+                adds.push((
+                    ValueId(i),
+                    Inst::Binary {
+                        op: BinOp::Add,
+                        lhs: prev,
+                        rhs: ValueId(0),
+                    },
+                ));
+                prev = ValueId(i);
+            }
+            Function {
+                params: Vec::new(),
+                ret: Some(MirType::I32),
+                value_types,
+                entry: BlockId(0),
+                blocks: vec![
+                    BasicBlock {
+                        params: Vec::new(),
+                        insts: vec![(
+                            ValueId(0),
+                            Inst::ConstInt {
+                                ty: MirType::I32,
+                                value: 1,
+                            },
+                        )],
+                        terminator: Some(Terminator::Branch {
+                            cond: ValueId(0),
+                            if_true: BlockId(1),
+                            true_args: Vec::new(),
+                            if_false: BlockId(2),
+                            false_args: Vec::new(),
+                        }),
+                    },
+                    BasicBlock {
+                        params: Vec::new(),
+                        insts: adds,
+                        terminator: Some(Terminator::Return(Some(prev))),
+                    },
+                    BasicBlock {
+                        params: Vec::new(),
+                        insts: Vec::new(),
+                        terminator: Some(Terminator::Return(Some(ValueId(0)))),
+                    },
+                ],
+            }
+        };
+        let obj = lamella_elf::read_object(
+            &lower_object(&[main, big, leaf(42)], &["main", "big", "answer"], &[])
+                .expect("a relaxing module lowers (no longer rejected)"),
+        )
+        .unwrap();
+        let answer = obj.symbols.iter().find(|s| s.name == "answer").unwrap();
+        let off = (answer.value & !1) as usize;
+        assert_eq!(
+            &obj.text[off..off + 2],
+            &[0x2A, 0x20],
+            "answer's post-relaxation offset must point to `movs r0, #42`"
+        );
     }
 }

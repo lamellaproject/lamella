@@ -60,7 +60,7 @@ fn compile_function(func: &FuncDef) -> Result<bc::CodeObject, CompileError> {
     compile_code_object(Scope::Function, &func.name, &func.params, &func.ret, &body)
 }
 
-/// Resolve an annotation expression to a first-light type: a bare `int` is the typed
+/// Resolve an annotation expression to a static type: a bare `int` is the typed
 /// integer path; everything else (including no annotation) is dynamic.
 fn resolve_type(annotation: &Option<Expr>) -> bc::StaticType {
     match annotation {
@@ -89,6 +89,7 @@ fn compile_code_object(
         names: Vec::new(),
         local_names,
         local_types,
+        loops: Vec::new(),
     };
     for stmt in body {
         compiler.compile_stmt(stmt)?;
@@ -146,6 +147,14 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 }
             }
         }
+        Stmt::MultiAssign { targets, .. } => {
+            for target in targets {
+                if !names.iter().any(|n| n == target) {
+                    names.push(target.clone());
+                    types.push(bc::StaticType::Dynamic);
+                }
+            }
+        }
         Stmt::If { body, orelse, .. } => {
             for s in body {
                 collect_locals_stmt(s, names, types);
@@ -154,21 +163,31 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 collect_locals_stmt(s, names, types);
             }
         }
-        Stmt::While { body, .. } => {
-            for s in body {
+        Stmt::While { body, orelse, .. } => {
+            for s in body.iter().chain(orelse) {
                 collect_locals_stmt(s, names, types);
             }
         }
-        Stmt::For { target, body, .. } => {
+        Stmt::For {
+            target,
+            body,
+            orelse,
+            ..
+        } => {
             if !names.iter().any(|n| n == target) {
                 names.push(target.clone());
                 types.push(bc::StaticType::Int);
             }
-            for s in body {
+            for s in body.iter().chain(orelse) {
                 collect_locals_stmt(s, names, types);
             }
         }
-        Stmt::Return(_) | Stmt::Expr(_) | Stmt::FuncDef(_) => {}
+        Stmt::Return(_)
+        | Stmt::Expr(_)
+        | Stmt::FuncDef(_)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Pass => {}
     }
 }
 
@@ -238,6 +257,13 @@ fn gather_assignments_stmt(
                 }
             }
         }
+        Stmt::MultiAssign { targets, value } => {
+            for target in targets {
+                if let Some(slot) = names.iter().position(|n| n == target) {
+                    rhss[slot].push(value.clone());
+                }
+            }
+        }
         Stmt::If { body, orelse, .. } => {
             for s in body {
                 gather_assignments_stmt(s, names, pinned, rhss);
@@ -246,25 +272,35 @@ fn gather_assignments_stmt(
                 gather_assignments_stmt(s, names, pinned, rhss);
             }
         }
-        Stmt::While { body, .. } => {
-            for s in body {
+        Stmt::While { body, orelse, .. } => {
+            for s in body.iter().chain(orelse) {
                 gather_assignments_stmt(s, names, pinned, rhss);
             }
         }
-        Stmt::For { target, body, .. } => {
+        Stmt::For {
+            target,
+            body,
+            orelse,
+            ..
+        } => {
             if let Some(slot) = names.iter().position(|n| n == target) {
                 pinned[slot] = true;
             }
-            for s in body {
+            for s in body.iter().chain(orelse) {
                 gather_assignments_stmt(s, names, pinned, rhss);
             }
         }
-        Stmt::Return(_) | Stmt::Expr(_) | Stmt::FuncDef(_) => {}
+        Stmt::Return(_)
+        | Stmt::Expr(_)
+        | Stmt::FuncDef(_)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Pass => {}
     }
 }
 
-/// The statically-known first-light type of an expression given the locals settled so
-/// far: an integer/boolean literal, an integer-typed name, or arithmetic/comparison
+/// The statically-known type of an expression given the locals settled so far:
+/// an integer/boolean literal, an integer-typed name, or arithmetic/comparison
 /// over integers is `Int`; a call result, attribute, `None`, or string is `Dynamic`.
 fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
     let both_int = |a: &Expr, b: &Expr| {
@@ -296,6 +332,14 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
                 bc::StaticType::Dynamic
             }
         }
+        Expr::Call { func, args }
+            if matches!(&**func, Expr::Name(n) if matches!(n.as_str(), "abs" | "min" | "max"))
+                && args
+                    .iter()
+                    .all(|a| expr_static_type(a, names, types) == bc::StaticType::Int) =>
+        {
+            bc::StaticType::Int
+        }
         _ => bc::StaticType::Dynamic,
     }
 }
@@ -307,6 +351,8 @@ struct Compiler {
     names: Vec<String>,
     local_names: Vec<String>,
     local_types: Vec<bc::StaticType>,
+    /// A stack of the enclosing loops' `(continue, break)` jump targets.
+    loops: Vec<(Label, Label)>,
 }
 
 impl Compiler {
@@ -336,14 +382,14 @@ impl Compiler {
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
             Stmt::FuncDef(_) => {
-                Err(error("nested function definitions are out of the first-light subset"))
+                Err(error("nested function definitions are not supported in this subset"))
             }
             Stmt::Return(value) => {
                 if self.scope != Scope::Function {
                     return Err(error("'return' outside a function"));
                 }
                 match value {
-                    Some(expr) => self.compile_expr_tail(expr)?,
+                    Some(expr) => self.compile_expr(expr)?,
                     None => {
                         let none = self.const_index(bc::Const::None);
                         self.asm.emit(bc::Op::LoadConst(none));
@@ -353,19 +399,43 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Assign(assign) => self.compile_assign(assign),
+            Stmt::MultiAssign { targets, value } => self.compile_multi_assign(targets, value),
             Stmt::Expr(expr) => {
-                self.compile_expr_tail(expr)?;
+                self.compile_expr(expr)?;
                 self.asm.emit(bc::Op::PopTop);
                 Ok(())
             }
             Stmt::If { test, body, orelse } => self.compile_if(test, body, orelse),
-            Stmt::While { test, body } => self.compile_while(test, body),
+            Stmt::While { test, body, orelse } => self.compile_while(test, body, orelse),
             Stmt::For {
                 target,
                 start,
                 stop,
+                step,
                 body,
-            } => self.compile_for(target, start, stop, body),
+                orelse,
+            } => self.compile_for(target, start, stop, *step, body, orelse),
+            Stmt::Break => {
+                let target = self
+                    .loops
+                    .last()
+                    .copied()
+                    .ok_or_else(|| error("'break' outside a loop"))?
+                    .1;
+                self.asm.emit_jump(target);
+                Ok(())
+            }
+            Stmt::Continue => {
+                let target = self
+                    .loops
+                    .last()
+                    .copied()
+                    .ok_or_else(|| error("'continue' outside a loop"))?
+                    .0;
+                self.asm.emit_jump(target);
+                Ok(())
+            }
+            Stmt::Pass => Ok(()),
         }
     }
 
@@ -373,11 +443,33 @@ impl Compiler {
         let Some(value) = &assign.value else {
             return Ok(());
         };
-        self.compile_expr_tail(value)?;
+        self.compile_expr(value)?;
         let slot = self
             .local_slot(&assign.target)
             .expect("an assigned name is always a local (added by the pre-pass)");
         self.asm.emit(bc::Op::StoreFast(slot));
+        Ok(())
+    }
+
+    /// `a = b = value`: evaluate the value once, store it to the first target, then copy
+    /// that into each remaining target (left to right), so all bind the same value.
+    fn compile_multi_assign(
+        &mut self,
+        targets: &[String],
+        value: &Expr,
+    ) -> Result<(), CompileError> {
+        self.compile_expr(value)?;
+        let first = self
+            .local_slot(&targets[0])
+            .expect("an assigned name is always a local (added by the pre-pass)");
+        self.asm.emit(bc::Op::StoreFast(first));
+        for target in &targets[1..] {
+            let slot = self
+                .local_slot(target)
+                .expect("an assigned name is always a local (added by the pre-pass)");
+            self.asm.emit(bc::Op::LoadFast(first));
+            self.asm.emit(bc::Op::StoreFast(slot));
+        }
         Ok(())
     }
 
@@ -387,7 +479,7 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), CompileError> {
-        self.compile_expr_tail(test)?;
+        self.compile_expr(test)?;
         let else_label = self.asm.new_label();
         self.asm.emit_branch(else_label);
         for stmt in body {
@@ -407,17 +499,29 @@ impl Compiler {
         Ok(())
     }
 
-    fn compile_while(&mut self, test: &Expr, body: &[Stmt]) -> Result<(), CompileError> {
+    fn compile_while(
+        &mut self,
+        test: &Expr,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), CompileError> {
         let top_label = self.asm.new_label();
+        let else_label = self.asm.new_label();
+        let after_label = self.asm.new_label();
         self.asm.place(top_label);
-        self.compile_expr_tail(test)?;
-        let end_label = self.asm.new_label();
-        self.asm.emit_branch(end_label);
+        self.compile_expr(test)?;
+        self.asm.emit_branch(else_label);
+        self.loops.push((top_label, after_label));
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
+        self.loops.pop();
         self.asm.emit_jump(top_label);
-        self.asm.place(end_label);
+        self.asm.place(else_label);
+        for stmt in orelse {
+            self.compile_stmt(stmt)?;
+        }
+        self.asm.place(after_label);
         Ok(())
     }
 
@@ -429,59 +533,64 @@ impl Compiler {
         target: &str,
         start: &Expr,
         stop: &Expr,
+        step: i64,
         body: &[Stmt],
+        orelse: &[Stmt],
     ) -> Result<(), CompileError> {
         let counter = self.alloc_temp();
         let stop_tmp = self.alloc_temp();
-        self.compile_expr_tail(start)?;
+        self.compile_expr(start)?;
         self.asm.emit(bc::Op::StoreFast(counter));
-        self.compile_expr_tail(stop)?;
+        self.compile_expr(stop)?;
         self.asm.emit(bc::Op::StoreFast(stop_tmp));
         let target_slot = self
             .local_slot(target)
             .expect("the loop variable is a local (added by the pre-pass)");
 
         let top = self.asm.new_label();
-        let end = self.asm.new_label();
+        let cont = self.asm.new_label();
+        let else_label = self.asm.new_label();
+        let after = self.asm.new_label();
         self.asm.place(top);
         self.asm.emit(bc::Op::LoadFast(counter));
         self.asm.emit(bc::Op::LoadFast(stop_tmp));
-        self.asm.emit(bc::Op::Compare(bc::CmpOp::Lt));
-        self.asm.emit_branch(end);
+        let cmp = if step > 0 {
+            bc::CmpOp::Lt
+        } else {
+            bc::CmpOp::Gt
+        };
+        self.asm.emit(bc::Op::Compare(cmp));
+        self.asm.emit_branch(else_label);
         self.asm.emit(bc::Op::LoadFast(counter));
         self.asm.emit(bc::Op::StoreFast(target_slot));
+        self.loops.push((cont, after));
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
+        self.loops.pop();
+        self.asm.place(cont);
         self.asm.emit(bc::Op::LoadFast(counter));
-        let one = self.const_index(bc::Const::Int(1));
-        self.asm.emit(bc::Op::LoadConst(one));
+        let step_const = self.const_index(bc::Const::Int(step));
+        self.asm.emit(bc::Op::LoadConst(step_const));
         self.asm.emit(bc::Op::Binary(bc::BinOp::Add));
         self.asm.emit(bc::Op::StoreFast(counter));
         self.asm.emit_jump(top);
-        self.asm.place(end);
-        Ok(())
-    }
-
-    /// Compile an expression in TAIL position -- the whole right-hand side of an
-    /// assignment, an `if`/`while` test, or a `return` value -- where the operand
-    /// stack is empty, so a short-circuiting boolean operator may emit its branches.
-    /// Any non-boolean expression delegates to [`Self::compile_expr`].
-    fn compile_expr_tail(&mut self, expr: &Expr) -> Result<(), CompileError> {
-        match expr {
-            Expr::BoolBinary { op, lhs, rhs } => self.compile_bool_binary(*op, lhs, rhs),
-            Expr::Not { operand } => self.compile_not(operand),
-            Expr::Conditional { test, body, orelse } => {
-                self.compile_conditional(test, body, orelse)
-            }
-            _ => self.compile_expr(expr),
+        self.asm.place(else_label);
+        for stmt in orelse {
+            self.compile_stmt(stmt)?;
         }
+        self.asm.place(after);
+        Ok(())
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
             Expr::Int(value) => {
                 let idx = self.const_index(bc::Const::Int(*value));
+                self.asm.emit(bc::Op::LoadConst(idx));
+            }
+            Expr::Str(value) => {
+                let idx = self.const_index(bc::Const::Str(value.clone()));
                 self.asm.emit(bc::Op::LoadConst(idx));
             }
             Expr::Bool(value) => {
@@ -505,6 +614,12 @@ impl Compiler {
                 let cache = self.asm.next_cache_slot();
                 self.asm.emit(bc::Op::LoadAttr { name, cache });
             }
+            Expr::Subscript { value, index } => {
+                self.compile_expr(value)?;
+                self.compile_expr(index)?;
+                let cache = self.asm.next_cache_slot();
+                self.asm.emit(bc::Op::Subscript { cache });
+            }
             Expr::Binary { op, lhs, rhs } => {
                 self.compile_expr(lhs)?;
                 self.compile_expr(rhs)?;
@@ -514,12 +629,10 @@ impl Compiler {
                 self.compile_expr(operand)?;
                 self.asm.emit(bc::Op::Unary(unop_sel(*op)));
             }
-            Expr::BoolBinary { .. } | Expr::Not { .. } | Expr::Conditional { .. } => {
-                return Err(error(
-                    "a boolean operator (and/or/not) or conditional expression nested in a \
-                     larger expression is out of the first-light subset; assign it to a \
-                     variable first",
-                ));
+            Expr::BoolBinary { op, lhs, rhs } => self.compile_bool_binary(*op, lhs, rhs)?,
+            Expr::Not { operand } => self.compile_not(operand)?,
+            Expr::Conditional { test, body, orelse } => {
+                self.compile_conditional(test, body, orelse)?
             }
             Expr::Compare { op, lhs, rhs } => {
                 self.compile_expr(lhs)?;
@@ -557,14 +670,14 @@ impl Compiler {
         rhs: &Expr,
     ) -> Result<(), CompileError> {
         let tmp = self.alloc_temp();
-        self.compile_expr_tail(lhs)?;
+        self.compile_expr(lhs)?;
         self.asm.emit(bc::Op::StoreFast(tmp));
         let end = self.asm.new_label();
         self.asm.emit(bc::Op::LoadFast(tmp));
         match op {
             BoolOp::And => {
                 self.asm.emit_branch(end);
-                self.compile_expr_tail(rhs)?;
+                self.compile_expr(rhs)?;
                 self.asm.emit(bc::Op::StoreFast(tmp));
             }
             BoolOp::Or => {
@@ -572,7 +685,7 @@ impl Compiler {
                 self.asm.emit_branch(eval_rhs);
                 self.asm.emit_jump(end);
                 self.asm.place(eval_rhs);
-                self.compile_expr_tail(rhs)?;
+                self.compile_expr(rhs)?;
                 self.asm.emit(bc::Op::StoreFast(tmp));
             }
         }
@@ -585,7 +698,7 @@ impl Compiler {
     /// temporary so the stack stays empty across the branch.
     fn compile_not(&mut self, operand: &Expr) -> Result<(), CompileError> {
         let tmp = self.alloc_temp();
-        self.compile_expr_tail(operand)?;
+        self.compile_expr(operand)?;
         let falsey = self.asm.new_label();
         let end = self.asm.new_label();
         self.asm.emit_branch(falsey);
@@ -611,15 +724,15 @@ impl Compiler {
         orelse: &Expr,
     ) -> Result<(), CompileError> {
         let tmp = self.alloc_temp();
-        self.compile_expr_tail(test)?;
+        self.compile_expr(test)?;
         let else_case = self.asm.new_label();
         let end = self.asm.new_label();
         self.asm.emit_branch(else_case);
-        self.compile_expr_tail(body)?;
+        self.compile_expr(body)?;
         self.asm.emit(bc::Op::StoreFast(tmp));
         self.asm.emit_jump(end);
         self.asm.place(else_case);
-        self.compile_expr_tail(orelse)?;
+        self.compile_expr(orelse)?;
         self.asm.emit(bc::Op::StoreFast(tmp));
         self.asm.place(end);
         self.asm.emit(bc::Op::LoadFast(tmp));
@@ -793,10 +906,8 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_boolean_operator_is_rejected() {
-        assert!(
-            compile_src("def f(a: int, b: int) -> int:\n    return (a and b) + 1\n").is_err()
-        );
+    fn a_nested_boolean_operator_compiles() {
+        assert!(compile_src("def f(a: int, b: int) -> int:\n    return (a and b) + 1\n").is_ok());
     }
 
     #[test]
@@ -808,8 +919,8 @@ mod tests {
     }
 
     #[test]
-    fn a_nested_conditional_is_rejected() {
-        assert!(compile_src("def f(a: int) -> int:\n    return 1 + (a if a else 0)\n").is_err());
+    fn a_nested_conditional_compiles() {
+        assert!(compile_src("def f(a: int) -> int:\n    return 1 + (a if a else 0)\n").is_ok());
     }
 
     #[test]
@@ -821,6 +932,40 @@ mod tests {
         let f = func(&module, "f");
         let i_slot = f.local_names.iter().position(|n| n == "i").unwrap();
         assert_eq!(f.local_types[i_slot], StaticType::Int);
+    }
+
+    #[test]
+    fn break_or_continue_outside_a_loop_is_rejected() {
+        assert!(compile_src("def f() -> int:\n    break\n    return 0\n").is_err());
+        assert!(compile_src("def f() -> int:\n    continue\n    return 0\n").is_err());
+    }
+
+    #[test]
+    fn break_and_continue_inside_a_loop_compile() {
+        assert!(compile_src(
+            "def f() -> int:\n    s = 0\n    for i in range(10):\n        if i == 5:\n            break\n        if i == 2:\n            continue\n        s += i\n    return s\n"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_method_call_emits_loadattr_then_call() {
+        let module = compile_src("def f(s, p):\n    return s.startswith(p)\n").unwrap();
+        let f = func(&module, "f");
+        let attr = f.ops.iter().position(|op| matches!(op, Op::LoadAttr { .. }));
+        let call = f.ops.iter().position(|op| matches!(op, Op::Call(1)));
+        assert!(attr.is_some(), "expected a LoadAttr for the method name");
+        assert!(call.is_some(), "expected a Call(1)");
+        assert!(attr < call, "the bound method must load before the call");
+    }
+
+    #[test]
+    fn a_builtin_result_is_inferred_int() {
+        let module =
+            compile_src("def f(x: int) -> int:\n    y = abs(x)\n    return y\n").unwrap();
+        let f = func(&module, "f");
+        let y_slot = f.local_names.iter().position(|n| n == "y").unwrap();
+        assert_eq!(f.local_types[y_slot], StaticType::Int);
     }
 
     #[test]

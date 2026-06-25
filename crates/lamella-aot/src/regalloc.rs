@@ -161,11 +161,19 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 | Inst::CallVirtual { args, .. }
                 | Inst::CallInterface { args, .. }
                 | Inst::CastClassScan { args, .. }
+                | Inst::CallNative { args, .. }
                 | Inst::PyIntrinsic { args, .. } => {
                     for arg in args {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
                 }
+                Inst::CallIndirect { target, args } => {
+                    mark(&mut lo, &mut hi, &mut defined, *target, ip);
+                    for arg in args {
+                        mark(&mut lo, &mut hi, &mut defined, *arg, ip);
+                    }
+                }
+                Inst::FuncAddr { .. } => {}
                 Inst::Store { address, value } => {
                     mark(&mut lo, &mut hi, &mut defined, *address, ip);
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
@@ -489,9 +497,15 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         | Inst::CallVirtual { args, .. }
         | Inst::CallInterface { args, .. }
         | Inst::CastClassScan { args, .. }
+        | Inst::CallNative { args, .. }
         | Inst::PyIntrinsic { args, .. } => {
             args.iter().for_each(|a| f(*a));
         }
+        Inst::CallIndirect { target, args } => {
+            f(*target);
+            args.iter().for_each(|a| f(*a));
+        }
+        Inst::FuncAddr { .. } => {}
         Inst::Store { address, value } => {
             f(*address);
             f(*value);

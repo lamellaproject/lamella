@@ -2,6 +2,7 @@
 //! clauses 16-18).
 
 use crate::bind::bind_type;
+use crate::bound::integer_literal;
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::symbols::{
@@ -74,7 +75,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     is_static: true,
                     is_readonly: false,
                     accessibility: Accessibility::Public,
-                    constant: Some(value),
+                    constant: Some(integer_literal(value)),
                 });
             }
             model.insert(info);
@@ -157,6 +158,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     if matches!(declaration.kind, SyntaxTypeKind::Struct) {
         info.bases.push(named_symbol("System", "ValueType"));
     }
+    if matches!(declaration.kind, SyntaxTypeKind::Class) {
+        info.bases.push(named_symbol("System", "Object"));
+    }
     let is_interface = matches!(declaration.kind, SyntaxTypeKind::Interface);
     let access = |modifiers: &[Modifier]| {
         if is_interface {
@@ -179,7 +183,11 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let accessibility = access(modifiers);
                 for declarator in declarators {
                     let constant = if is_const {
-                        declarator.initializer.as_ref().and_then(enum_member_value)
+                        declarator
+                            .initializer
+                            .as_ref()
+                            .and_then(enum_member_value)
+                            .map(integer_literal)
                     } else {
                         None
                     };

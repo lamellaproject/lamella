@@ -26,6 +26,9 @@ serde_json = { version = "1", optional = true }
 # The AOT backend, for the in-page chip/wasm exporter (lamella_aot_build). Default features bring the
 # ARM32 backend (chip images); enable lamella-aot's `wasm` feature too for the C# -> .wasm widget path.
 lamella-aot = { path = "../lamella-aot", optional = true }
+# The py feature pulls in the Python front end + runtime for the in-page Python runner.
+lamella-py-frontend = { path = "../lamella-py-frontend", optional = true }
+lamella-py-runtime = { path = "../lamella-py-runtime", optional = true }
 
 [features]
 # Adds the lamella_selftest export (embeds a fixture) so a wasm host can validate
@@ -46,6 +49,9 @@ compile = [
 # Adds the in-page AOT exporter (lamella_aot_build: CIL -> a flashable chip image, e.g. micro:bit, or
 # a .wasm widget) so Studio compiles the user's C# all the way to a microcontroller image client-side.
 aot = ["dep:lamella-aot"]
+# Adds the in-page Python runner (lamella_py_run: Python source -> compile + run main() -> rendered
+# result + diagnostics) so Studio compiles + runs the user's Python client-side. Off by default.
+py = ["dep:lamella-py-frontend", "dep:lamella-py-runtime"]
 
 [lints]
 workspace = true

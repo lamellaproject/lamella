@@ -3271,6 +3271,264 @@ pub fn gc_collect(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Opti
     Ok(None)
 }
 
+/// `System.WeakReference.MakeWeakCell(object)`: allocates a weak cell holding `target` and returns
+/// a reference to it. `System.WeakReference` stores the cell by a STRONG reference, so the cell
+/// lives with the WeakReference; the collector treats the cell's target weakly. Present only with
+/// the `gc` feature (a weak reference is meaningless without a collector).
+///
+/// # Errors
+/// Never errors (a missing argument is treated as a null target).
+#[cfg(feature = "gc")]
+pub fn weak_make_cell(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let target = args.first().cloned().unwrap_or(Value::Null);
+    let cell = vm.heap_mut().alloc_weak(target);
+    Ok(Some(Value::Object(cell)))
+}
+
+/// `System.WeakReference.ReadWeakCell(object cell)`: the weak cell's current target -- `Null` once
+/// the target has been reclaimed (which is what makes `IsAlive` go false).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a weak-cell reference.
+#[cfg(feature = "gc")]
+pub fn weak_read_cell(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(cell)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    Ok(Some(vm.heap().weak_cell_target(cell).unwrap_or(Value::Null)))
+}
+
+/// `System.WeakReference.WriteWeakCell(object cell, object target)`: re-points the weak cell at a
+/// new target (the `WeakReference.Target` setter).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the first argument is not a weak-cell reference.
+#[cfg(feature = "gc")]
+pub fn weak_write_cell(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(cell)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let target = args.get(1).cloned().unwrap_or(Value::Null);
+    vm.heap_mut().set_weak_cell_target(cell, target);
+    Ok(None)
+}
+
+/// `System.Threading.Thread.StartThread(ThreadStart)`: reads the delegate's bound `(target,
+/// method)`, reserves a green-thread id, and asks the scheduler to spawn a thread running it (a
+/// thread IS a reified `Session`); returns the id, which the managed `Thread` stores for `Join`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a single-cast delegate.
+pub fn thread_start(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(delegate)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let background = matches!(args.get(1), Some(&Value::Int32(flag)) if flag != 0);
+    let invocations = vm
+        .heap()
+        .delegate_invocations(delegate)
+        .ok_or(Trap::TypeMismatch(Opcode::Call))?
+        .to_vec();
+    let bound = invocations.first().ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let target = bound.0.clone();
+    let method = bound.1;
+    let id = vm.alloc_thread_id();
+    vm.request_spawn(id, method, target, background);
+    Ok(Some(Value::Int32(id as i32)))
+}
+
+/// `System.Threading.Thread.JoinThread(int)`: blocks the running thread until thread `id` finishes.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an int.
+pub fn thread_join(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let id = match args.first() {
+        Some(&Value::Int32(id)) => id as u32,
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    vm.request_join(id);
+    Ok(None)
+}
+
+/// `System.Threading.Thread.YieldThread()`: cooperatively yields to the scheduler (the body of
+/// `Thread.Yield`).
+///
+/// # Errors
+/// Never errors.
+pub fn thread_yield(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    vm.request_yield();
+    Ok(None)
+}
+
+/// `System.Threading.Thread.SleepThread(int)`: blocks the running thread for `millisecondsTimeout`
+/// milliseconds (`Thread.Sleep`). Other green threads run meanwhile and the scheduler idle-sleeps the
+/// OS thread to the nearest deadline; without a host clock it degrades to a cooperative yield (no
+/// real delay). A negative timeout is clamped to 0.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an int.
+pub fn thread_sleep(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(millis)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    vm.request_sleep(millis.max(0) as u64);
+    Ok(None)
+}
+
+/// `System.Threading.Monitor.EnterLock(object)`: acquires the per-object lock for the running
+/// thread. If the object is free or already owned by this thread (a recursive `lock`) the thread
+/// holds it and proceeds into the critical section. On contention the thread is queued in the lock's
+/// waiters and asked to BLOCK ([`Vm::request_block_on_lock`]); it resumes here -- already holding the
+/// lock -- only once the owner releases and hands it over, so it never re-tries.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an object reference.
+pub fn monitor_enter(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(obj)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let thread = vm.current_thread_id();
+    if !vm.lock_acquire(obj.0, thread) {
+        vm.request_block_on_lock(None);
+    }
+    Ok(None)
+}
+
+/// `System.Threading.Monitor.ExitLock(object)`: releases one level of the running thread's lock on
+/// the object. When the outermost level is released and a thread is queued, the lock is handed to
+/// the first waiter, which is woken ([`Vm::request_wake`]).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an object reference.
+pub fn monitor_exit(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(obj)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let thread = vm.current_thread_id();
+    if let Some(woken) = vm.lock_release(obj.0, thread) {
+        vm.request_wake(woken);
+    }
+    Ok(None)
+}
+
+/// `System.Threading.Monitor.TryEnterLock(object)`: tries to acquire the per-object lock WITHOUT
+/// blocking, returning `true` (an `int32` 1) if it is now held by this thread (the object was free
+/// or already owned by it) or `false` (0) if another thread owns it. Backs `Monitor.TryEnter`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an object reference.
+pub fn monitor_try_enter(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(obj)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let thread = vm.current_thread_id();
+    Ok(Some(Value::Int32(i32::from(vm.lock_try(obj.0, thread)))))
+}
+
+/// `System.Threading.Monitor.WaitLock(object)`: the running thread (which MUST own the lock)
+/// FULLY releases it, parks in the object's condition wait-set, and blocks until a `Pulse`/`PulseAll`
+/// moves it to the acquire-queue and a later release hands it the lock -- at which point it resumes
+/// here holding the lock again at its original recursion depth. Backs `Monitor.Wait`. If the release
+/// handed the lock to a contender, that thread is woken in the same step.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an object reference; [`Trap::SynchronizationLock`]
+/// if the running thread does not own the lock (the `SynchronizationLockException` site).
+pub fn monitor_wait(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(obj)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let thread = vm.current_thread_id();
+    if !vm.lock_is_owner(obj.0, thread) {
+        return Err(Trap::SynchronizationLock);
+    }
+    let woken = vm.lock_wait(obj.0, thread);
+    vm.request_block_on_lock(woken);
+    Ok(None)
+}
+
+/// `System.Threading.Monitor.PulseLock(object)`: moves ONE thread blocked in `Monitor.Wait` on the
+/// object into the lock's acquire-queue (it is handed the lock when the running thread later
+/// releases it). The running thread must own the lock; a no-op if none are waiting. Backs
+/// `Monitor.Pulse`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-object argument; [`Trap::SynchronizationLock`] if the running
+/// thread does not own the lock.
+pub fn monitor_pulse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(obj)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let thread = vm.current_thread_id();
+    if !vm.lock_is_owner(obj.0, thread) {
+        return Err(Trap::SynchronizationLock);
+    }
+    vm.lock_pulse(obj.0, true);
+    Ok(None)
+}
+
+/// `System.Threading.Monitor.PulseAllLock(object)`: like [`monitor_pulse`] but moves ALL threads
+/// blocked in `Monitor.Wait` on the object into the acquire-queue. Backs `Monitor.PulseAll`.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] for a non-object argument; [`Trap::SynchronizationLock`] if the running
+/// thread does not own the lock.
+pub fn monitor_pulse_all(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(obj)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let thread = vm.current_thread_id();
+    if !vm.lock_is_owner(obj.0, thread) {
+        return Err(Trap::SynchronizationLock);
+    }
+    vm.lock_pulse(obj.0, false);
+    Ok(None)
+}
+
 /// `System.GC.WaitForPendingFinalizers()`: a no-op -- finalizers run inline during the
 /// collection, so there is nothing to wait for. Present only with the `finalizers` feature.
 ///

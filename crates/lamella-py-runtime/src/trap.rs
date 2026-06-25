@@ -1,10 +1,10 @@
-//! Interpreter traps
+//! Interpreter traps -- the ways executing the bytecode can fail.
 
 /// A reason an interpreter run aborted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trap {
     /// An operation popped from an empty evaluation stack -- a malformed instruction
-    /// stream (the verifier will rule this out; surfaced defensively for now).
+    /// stream (a verifier rules this out; surfaced defensively).
     StackUnderflow,
     /// A `LoadFast` read a local before any value was bound to it -- Python's
     /// `UnboundLocalError` (a subclass of `NameError`).
@@ -16,23 +16,26 @@ pub enum Trap {
     TypeError,
     /// An attribute reference failed -- Python's `AttributeError`.
     AttributeError,
+    /// A sequence index was out of range -- Python's `IndexError` (here: a `str` index
+    /// outside `[-len, len)`).
+    IndexError,
     /// An argument of the right type had an inappropriate value -- Python's `ValueError`
     /// (here: a negative shift count, `x << -1` / `x >> -1`).
     ValueError,
     /// The second operand of `//` or `%` was zero -- Python's `ZeroDivisionError`.
     ZeroDivisionError,
     /// A name was not found -- Python's `NameError` (here: a `LoadGlobal` of a name that
-    /// is not an intra-module function; first light resolves no builtins or imports).
+    /// is neither an intra-module function nor a built-in).
     NameError,
     /// Call nesting exceeded the interpreter's depth limit -- Python's `RecursionError`.
     RecursionError,
-    /// An opcode or operand the bytecode defines but the first-light interpreter does not
-    /// implement yet -- currently a string constant (there is no string object yet). A
-    /// clean "not yet", distinct from malformed input.
+    /// An opcode or operand the bytecode defines that is outside the interpreter's
+    /// implemented set (e.g. a string constant outside the supported forms). Distinct
+    /// from malformed input.
     Unsupported,
     /// An integer result overflowed the fixnum range. Python's `int` has an unlimited
-    /// range (data model, Numbers), so full Python promotes to a bignum; the first-light
-    /// subset has no bignums yet, so this is a trap rather than a silent wrap.
+    /// range (data model, Numbers); the interpreter traps the overflow rather than
+    /// wrapping silently.
     Overflow,
     /// A heap allocation failed after collection -- out of memory.
     OutOfMemory,

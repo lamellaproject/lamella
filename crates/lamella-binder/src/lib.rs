@@ -26,7 +26,7 @@ pub use complete::{
 };
 pub use bound::{
     Binder, BoundExpr, BoundExprKind, ConversionKind, DeclaredField, FieldReference,
-    MethodReference, SubmissionBinding, bind_expression,
+    MethodReference, SubmissionBinding, bind_expression, literal_int_value,
 };
 pub use conversion::has_implicit_conversion;
 pub use declaration::{collect_into, collect_model, collect_types};

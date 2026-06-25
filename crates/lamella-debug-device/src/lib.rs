@@ -121,62 +121,39 @@ impl<T: Transport> DeviceBackend<T> {
     }
 }
 
-impl<T: Transport> DebugBackend for DeviceBackend<T> {
-    fn launch(&mut self) -> bool {
-        let dap = self.dap.get_mut();
-        dap.connect_swd().is_ok()
-            && dap.read_idcode().is_ok()
-            && dap.init_mem().is_ok()
-            && dap.halt().is_ok()
-    }
-
-    fn resume(&mut self) -> Stop {
-        let bps = self.breakpoints.clone();
-        let dap = self.dap.get_mut();
-        let _ = dap.set_breakpoints(&bps);
-        if let Ok(pc) = dap.read_core_reg(15) {
-            if bps.contains(&(pc & !1)) {
-                let _ = dap.step();
-            }
-        }
-        match dap.resume() {
-            Ok(()) => Stop::Running,
-            Err(_) => Stop::Fault("resume failed".into()),
-        }
-    }
-
-    fn pause(&mut self) -> bool {
-        self.dap.get_mut().halt().is_ok()
-    }
-
-    fn run_to_return(&mut self) -> Stop {
-        let lr = match self.dap.get_mut().read_core_reg(14) {
-            Ok(lr) => lr & !1,
-            Err(_) => return Stop::Fault("read LR".into()),
-        };
-
-        let armed: Option<Vec<u32>> = if self.breakpoints.len() < 4 || self.breakpoints.contains(&lr)
-        {
-            let mut a = self.breakpoints.clone();
-            if !a.contains(&lr) {
-                a.push(lr);
-            }
-            Some(a)
-        } else {
-            let call_line = self.source_line_at(lr.saturating_sub(self.base).saturating_sub(4));
-            let borrow = (call_line != 0)
-                .then(|| {
-                    self.breakpoints.iter().position(|&bp| {
-                        self.source_line_at(bp.saturating_sub(self.base)) == call_line
-                    })
-                })
-                .flatten();
-            borrow.map(|index| {
+impl<T: Transport> DeviceBackend<T> {
+    /// Runs the target at full speed to `target` -- a return address -- arming it as a temporary
+    /// breakpoint; reports `Step` on arrival or `Breakpoint` if a user breakpoint intervened. Used
+    /// by step-over (run a callee to the live LR) and step-out (run the frame to its saved return).
+    /// Comparators: keep all user breakpoints and add `target` if a slot is free or `target` is
+    /// already one; else BORROW the comparator of the breakpoint on `target`'s call-site line (the
+    /// instruction before it) -- that code cannot run before we reach `target`, so disarming it for
+    /// the duration misses nothing; else single-step with a bound (never hanging), stopping on any
+    /// user breakpoint (never missing).
+    fn run_to_address(&mut self, target: u32) -> Stop {
+        let armed: Option<Vec<u32>> =
+            if self.breakpoints.len() < 4 || self.breakpoints.contains(&target) {
                 let mut a = self.breakpoints.clone();
-                a[index] = lr;
-                a
-            })
-        };
+                if !a.contains(&target) {
+                    a.push(target);
+                }
+                Some(a)
+            } else {
+                let call_line =
+                    self.source_line_at(target.saturating_sub(self.base).saturating_sub(4));
+                let borrow = (call_line != 0)
+                    .then(|| {
+                        self.breakpoints.iter().position(|&bp| {
+                            self.source_line_at(bp.saturating_sub(self.base)) == call_line
+                        })
+                    })
+                    .flatten();
+                borrow.map(|index| {
+                    let mut a = self.breakpoints.clone();
+                    a[index] = target;
+                    a
+                })
+            };
 
         if let Some(armed) = armed {
             let dap = self.dap.get_mut();
@@ -216,7 +193,7 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
                 return Stop::Fault("step in call".into());
             }
             let pc = self.dap.get_mut().read_core_reg(15).unwrap_or(0) & !1;
-            if pc == lr {
+            if pc == target {
                 return Stop::Step;
             }
             if self.breakpoints.contains(&pc) {
@@ -224,11 +201,92 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
             }
         }
         self.output.push_str(
-            "[lamella] Step-over stopped inside a long-running call: all hardware breakpoints \
-             are in use, so the call could not be run at full speed. Free a breakpoint, or set \
-             one past the call and Continue.\n",
+            "[lamella] Step stopped inside a long-running call: all hardware breakpoints are in \
+             use, so it could not be run at full speed. Free a breakpoint, or set one past the \
+             call and Continue.\n",
         );
         Stop::Breakpoint
+    }
+
+    /// The current frame's return address, recovered by reading the saved LR off the stack -- so
+    /// step-out works from a NON-LEAF frame, where the live LR is the frame's own internal return
+    /// (set by a call it already made), not its caller's. Our AOT prologue for a non-leaf method is
+    /// `push {<callee-saved>, lr}` then an optional `sub sp, #frame`, so the saved LR is the topmost
+    /// pushed word, at `sp + frame + 4*saved_count` (SP sits `frame` below the push through the
+    /// body). Decodes those two Thumb instructions at the method's entry. Returns `None` if the
+    /// prologue is not that shape (e.g. a leaf that never saved LR), so the caller can fall back.
+    fn frame_return_address(&mut self, pc: u32) -> Option<u32> {
+        let off = pc.saturating_sub(self.base);
+        let method_off = self
+            .names
+            .iter()
+            .rev()
+            .find(|&&(start, _)| start <= off)
+            .map(|&(start, _)| start)?;
+        let method_start = self.base + method_off;
+        let dap = self.dap.get_mut();
+        let w0 = dap.read_word(method_start & !3).ok()?;
+        let push = if method_start & 2 != 0 {
+            (w0 >> 16) as u16
+        } else {
+            w0 as u16
+        };
+        if push & 0xFE00 != 0xB400 || push & 0x0100 == 0 {
+            return None;
+        }
+        let saved_count = u32::from(push & 0x00FF).count_ones();
+        let after = method_start + 2;
+        let w1 = dap.read_word(after & !3).ok()?;
+        let next = if after & 2 != 0 {
+            (w1 >> 16) as u16
+        } else {
+            w1 as u16
+        };
+        let frame = if next & 0xFF80 == 0xB080 {
+            u32::from(next & 0x7F) * 4
+        } else {
+            0
+        };
+        let sp = dap.read_core_reg(13).ok()?;
+        let saved_lr = dap.read_word((sp + frame + 4 * saved_count) & !3).ok()?;
+        Some(saved_lr & !1)
+    }
+}
+
+impl<T: Transport> DebugBackend for DeviceBackend<T> {
+    fn launch(&mut self) -> bool {
+        let dap = self.dap.get_mut();
+        dap.connect_swd().is_ok()
+            && dap.read_idcode().is_ok()
+            && dap.init_mem().is_ok()
+            && dap.halt().is_ok()
+    }
+
+    fn resume(&mut self) -> Stop {
+        let bps = self.breakpoints.clone();
+        let dap = self.dap.get_mut();
+        let _ = dap.set_breakpoints(&bps);
+        if let Ok(pc) = dap.read_core_reg(15) {
+            if bps.contains(&(pc & !1)) {
+                let _ = dap.step();
+            }
+        }
+        match dap.resume() {
+            Ok(()) => Stop::Running,
+            Err(_) => Stop::Fault("resume failed".into()),
+        }
+    }
+
+    fn pause(&mut self) -> bool {
+        self.dap.get_mut().halt().is_ok()
+    }
+
+    fn run_to_return(&mut self) -> Stop {
+        let lr = match self.dap.get_mut().read_core_reg(14) {
+            Ok(lr) => lr & !1,
+            Err(_) => return Stop::Fault("read LR".into()),
+        };
+        self.run_to_address(lr)
     }
 
     fn step_out(&mut self) -> Option<Stop> {
@@ -244,7 +302,10 @@ impl<T: Transport> DebugBackend for DeviceBackend<T> {
             return Some(self.resume());
         }
         if self.method_name_at(lr.saturating_sub(self.base)) == here {
-            return Some(Stop::Step);
+            return Some(match self.frame_return_address(pc) {
+                Some(ret) => self.run_to_address(ret),
+                None => Stop::Step,
+            });
         }
         Some(self.run_to_return())
     }

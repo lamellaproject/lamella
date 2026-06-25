@@ -902,25 +902,21 @@ fn emit_statement_expression(
             value,
         } => {
             if let Some(binary) = compound_binary_operator(*operator) {
-                return emit_compound(target, binary, Some(value), frame, tokens, out, Leave::Discard);
+                return emit_compound(target, binary, Some(value), None, frame, tokens, out, Leave::Discard);
             }
         }
         BoundExprKind::Postfix { operator, operand } => {
             let increment = *operator == PostfixOperator::Increment;
-            if try_user_step(operand, increment, frame, tokens, out)? {
-                return Ok(());
-            }
-            return emit_compound(operand, step_operator(increment), None, frame, tokens, out, Leave::Discard);
+            let user_step = user_step_method(operand, increment, tokens);
+            return emit_compound(operand, step_operator(increment), None, user_step, frame, tokens, out, Leave::Discard);
         }
         BoundExprKind::Unary {
             operator: operator @ (UnaryOperator::PreIncrement | UnaryOperator::PreDecrement),
             operand,
         } => {
             let increment = *operator == UnaryOperator::PreIncrement;
-            if try_user_step(operand, increment, frame, tokens, out)? {
-                return Ok(());
-            }
-            return emit_compound(operand, step_operator(increment), None, frame, tokens, out, Leave::Discard);
+            let user_step = user_step_method(operand, increment, tokens);
+            return emit_compound(operand, step_operator(increment), None, user_step, frame, tokens, out, Leave::Discard);
         }
         _ => {}
     }
@@ -940,30 +936,17 @@ pub(crate) fn step_operator(increment: bool) -> BinaryOperator {
     }
 }
 
-/// Emits a user-defined `++`/`--` (op_Increment/op_Decrement) on a local operand as a
-/// statement: read the local, call the operator, store the result back. Returns `false`
-/// when the operand has no such operator (a numeric `++`/`--`, handled by the implicit-`1`
-/// read-modify-write instead).
-fn try_user_step(
+/// The `op_Increment`/`op_Decrement` method token for a `++`/`--` on `operand`'s type, when
+/// the type defines one (a user-defined stepper); `None` for a numeric `++`/`--`, which steps
+/// by the implicit `1`. Shared by statement- and expression-position `++`/`--` emission, which
+/// route through [`emit_compound`] (so any lvalue -- local, field, element, property -- works).
+pub(crate) fn user_step_method(
     operand: &BoundExpr,
     increment: bool,
-    frame: &Frame,
     tokens: &Tokens,
-    out: &mut Vec<Instruction>,
-) -> Result<bool, EmitError> {
+) -> Option<Token> {
     let name = if increment { "op_Increment" } else { "op_Decrement" };
-    let Some(token) = tokens.method(&operand.ty, name, core::slice::from_ref(&operand.ty)) else {
-        return Ok(false);
-    };
-    let BoundExprKind::Local(local) = &operand.kind else {
-        return Err(EmitError::Unsupported(
-            "user-defined ++/-- of a non-local is not lowered yet",
-        ));
-    };
-    crate::expr::emit_local(local, frame, tokens, out)?;
-    out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
-    store_to(frame, local, out)?;
-    Ok(true)
+    tokens.method(&operand.ty, name, core::slice::from_ref(&operand.ty))
 }
 
 /// Whether a read-modify-write leaves its value on the stack (an expression `++`/`--`) and,
@@ -979,14 +962,17 @@ pub(crate) enum Leave {
 }
 
 /// Emits a read-modify-write to `target` (an `op=` or, with `rhs` = `None`, a `++`/`--`):
-/// read the target, combine it with the right-hand value via `binary`, and store it back.
-/// The receiver/index is evaluated once. `leave` keeps the expression value on the stack for
-/// a non-local `++`/`--` -- through a temp local, since 1st-edition CIL has no `dup_x1` to
-/// reorder it past the store's receiver/index operands. Lowers to 1st-edition CIL only.
+/// read the target, apply the modification, and store it back. The modification is a user
+/// `op_Increment`/`op_Decrement` call when `user_step` is `Some` (a `++`/`--` on a user
+/// type), else combining the right-hand value via `binary`. The receiver/index is evaluated
+/// once. `leave` keeps the expression value on the stack for a non-local `++`/`--` -- through
+/// a temp local, since 1st-edition CIL has no `dup_x1` to reorder it past the store's
+/// receiver/index operands. Lowers to 1st-edition CIL only.
 pub(crate) fn emit_compound(
     target: &BoundExpr,
     binary: BinaryOperator,
     rhs: Option<&BoundExpr>,
+    user_step: Option<Token>,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1002,12 +988,12 @@ pub(crate) fn emit_compound(
             if let Some((slot, element)) = frame.byref(name) {
                 out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
                 emit_local(name, frame, tokens, out)?;
-                emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
                 crate::expr::emit_byref_store(element, tokens, out)?;
                 return Ok(());
             }
             emit_local(name, frame, tokens, out)?;
-            emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+            emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
             store_to(frame, name, out)
         }
         BoundExprKind::FieldAccess {
@@ -1024,7 +1010,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
                 if leave == Leave::New {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1038,7 +1024,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
                 if leave == Leave::New {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1086,7 +1072,7 @@ pub(crate) fn emit_compound(
                 out.push(Instruction::simple(Opcode::Dup));
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
             }
-            emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
+            emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
             if leave == Leave::New {
                 out.push(Instruction::simple(Opcode::Dup));
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1104,29 +1090,73 @@ pub(crate) fn emit_compound(
             emit_expression(&indices[0], frame, tokens, out)?;
             let index = frame.reserve_local(&TypeSymbol::Special(SpecialType::Int32));
             out.push(Instruction::new(Opcode::Stloc, Operand::Variable(index)));
-            let load = crate::expr::ldelem_opcode(&target.ty)?;
-            let store = crate::expr::stelem_opcode(&target.ty)?;
-            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
-            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
-            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
-            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
-            out.push(Instruction::simple(load));
-            if leave == Leave::Old {
+            if tokens.is_struct(&target.ty) || tokens.is_enum(&target.ty) {
+                let token = tokens
+                    .type_token(&target.ty)
+                    .ok_or(EmitError::Unsupported("array element type has no token"))?;
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
+                out.push(Instruction::new(Opcode::Ldelema, Operand::Token(token)));
                 out.push(Instruction::simple(Opcode::Dup));
-                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
+                if leave == Leave::Old {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
+                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                if leave == Leave::New {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
+                out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
+            } else {
+                let load = crate::expr::ldelem_opcode(&target.ty)?;
+                let store = crate::expr::stelem_opcode(&target.ty)?;
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
+                out.push(Instruction::simple(load));
+                if leave == Leave::Old {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
+                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                if leave == Leave::New {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
+                out.push(Instruction::simple(store));
             }
-            emit_combine(binary, &target.ty, rhs, frame, tokens, out)?;
-            if leave == Leave::New {
-                out.push(Instruction::simple(Opcode::Dup));
-                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
-            }
-            out.push(Instruction::simple(store));
             if let Some(slot) = kept {
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
             }
             Ok(())
         }
         _ => Err(EmitError::Unsupported("compound assignment to this target")),
+    }
+}
+
+/// Applies the modification of a read-modify-write to the value already on the stack: a
+/// user `op_Increment`/`op_Decrement` (`user_step`, for a `++`/`--` on a user type) is a
+/// static call that consumes the value and pushes the stepped one; otherwise the numeric
+/// `++`/`--` or `op=` combine pushes the right-hand value (or the implicit `1`) and applies
+/// `binary`.
+fn emit_modify(
+    user_step: Option<Token>,
+    binary: BinaryOperator,
+    operand_ty: &TypeSymbol,
+    rhs: Option<&BoundExpr>,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    match user_step {
+        Some(token) => {
+            out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+            Ok(())
+        }
+        None => emit_combine(binary, operand_ty, rhs, frame, tokens, out),
     }
 }
 
