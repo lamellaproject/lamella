@@ -151,8 +151,18 @@ pub enum Expr {
     Subscript {
         /// The container being indexed.
         value: Box<Expr>,
-        /// The index expression.
+        /// The index expression (a plain expression, or a `Slice`).
         index: Box<Expr>,
+    },
+    /// A slice `[lower:upper:step]`, appearing only as a subscript index. Each bound is
+    /// `None` when omitted (6.3.2.1).
+    Slice {
+        /// The lower bound (`None` if omitted).
+        lower: Option<Box<Expr>>,
+        /// The upper bound (`None` if omitted).
+        upper: Option<Box<Expr>>,
+        /// The step (`None` if omitted).
+        step: Option<Box<Expr>>,
     },
 }
 

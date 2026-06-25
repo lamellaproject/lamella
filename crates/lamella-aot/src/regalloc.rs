@@ -174,12 +174,22 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     }
                 }
                 Inst::FuncAddr { .. } => {}
-                Inst::Store { address, value } => {
+                Inst::Store { address, value, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *address, ip);
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
-                Inst::Load { address } => {
+                Inst::Load { address, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *address, ip);
+                }
+                Inst::CopyBlock { dst, src, size } => {
+                    mark(&mut lo, &mut hi, &mut defined, *dst, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *src, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *size, ip);
+                }
+                Inst::FillBlock { dst, value, size } => {
+                    mark(&mut lo, &mut hi, &mut defined, *dst, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *size, ip);
                 }
                 Inst::Convert { value, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
@@ -506,11 +516,21 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             args.iter().for_each(|a| f(*a));
         }
         Inst::FuncAddr { .. } => {}
-        Inst::Store { address, value } => {
+        Inst::Store { address, value, .. } => {
             f(*address);
             f(*value);
         }
-        Inst::Load { address } => f(*address),
+        Inst::Load { address, .. } => f(*address),
+        Inst::CopyBlock { dst, src, size } => {
+            f(*dst);
+            f(*src);
+            f(*size);
+        }
+        Inst::FillBlock { dst, value, size } => {
+            f(*dst);
+            f(*value);
+            f(*size);
+        }
         Inst::Convert { value, .. } => f(*value),
         Inst::Widen { value, .. } => f(*value),
         Inst::Truncate { value } => f(*value),

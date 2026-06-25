@@ -18,6 +18,17 @@ const STR_LOWER: u32 = 1;
 const STR_STARTSWITH: u32 = 2;
 const STR_ENDSWITH: u32 = 3;
 const STR_FIND: u32 = 4;
+const STR_STRIP: u32 = 5;
+const STR_LSTRIP: u32 = 6;
+const STR_RSTRIP: u32 = 7;
+const STR_REPLACE: u32 = 8;
+const STR_COUNT: u32 = 9;
+const STR_ISDIGIT: u32 = 10;
+const STR_ISALPHA: u32 = 11;
+const STR_ISALNUM: u32 = 12;
+const STR_ISSPACE: u32 = 13;
+const STR_ISUPPER: u32 = 14;
+const STR_ISLOWER: u32 = 15;
 
 /// The id of the `str` method `name`, or `None` if `str` has no such method.
 fn str_method_id(name: &str) -> Option<u32> {
@@ -27,8 +38,149 @@ fn str_method_id(name: &str) -> Option<u32> {
         "startswith" => Some(STR_STARTSWITH),
         "endswith" => Some(STR_ENDSWITH),
         "find" => Some(STR_FIND),
+        "strip" => Some(STR_STRIP),
+        "lstrip" => Some(STR_LSTRIP),
+        "rstrip" => Some(STR_RSTRIP),
+        "replace" => Some(STR_REPLACE),
+        "count" => Some(STR_COUNT),
+        "isdigit" => Some(STR_ISDIGIT),
+        "isalpha" => Some(STR_ISALPHA),
+        "isalnum" => Some(STR_ISALNUM),
+        "isspace" => Some(STR_ISSPACE),
+        "isupper" => Some(STR_ISUPPER),
+        "islower" => Some(STR_ISLOWER),
         _ => None,
     }
+}
+
+/// Whether `s` satisfies a `str` predicate (`isdigit`/`isalpha`/`isalnum`/`isspace`/
+/// `isupper`/`islower`, Python 3.14.6 "String Methods"). The category predicates require
+/// at least one character; `isupper`/`islower` require at least one CASED character and
+/// that every cased character has that case. Character classes use Rust's Unicode
+/// classification, which matches CPython for ASCII and the common cases; exact agreement
+/// on the Unicode-category edges (e.g. `Numeric_Type=Digit` superscripts, titlecase, the
+/// bidirectional whitespace controls) is a Unicode-database refinement.
+fn str_predicate(method_id: u32, s: &str) -> bool {
+    match method_id {
+        STR_ISDIGIT => !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+        STR_ISALPHA => !s.is_empty() && s.chars().all(char::is_alphabetic),
+        STR_ISALNUM => !s.is_empty() && s.chars().all(char::is_alphanumeric),
+        STR_ISSPACE => !s.is_empty() && s.chars().all(char::is_whitespace),
+        STR_ISUPPER => {
+            let mut cased = false;
+            for c in s.chars() {
+                if c.is_lowercase() {
+                    return false;
+                }
+                cased |= c.is_uppercase();
+            }
+            cased
+        }
+        STR_ISLOWER => {
+            let mut cased = false;
+            for c in s.chars() {
+                if c.is_uppercase() {
+                    return false;
+                }
+                cased |= c.is_lowercase();
+            }
+            cased
+        }
+        _ => false,
+    }
+}
+
+/// Parses a `(affix_or_sub[, start[, end]])` argument list for `startswith`/`endswith`/
+/// `find`: the first argument is the str to match (checked by the caller); the optional
+/// `start`/`end` are slice bounds -- an `int` (a slice index) or `None` for the default.
+/// A wrong count, or a non-int / non-`None` bound, is a `TypeError`.
+fn affix_and_bounds(args: &[Value]) -> Result<(Value, Option<i64>, Option<i64>), Trap> {
+    fn bound(v: Value) -> Result<Option<i64>, Trap> {
+        if v.is_none() {
+            Ok(None)
+        } else {
+            Ok(Some(v.as_int().ok_or(Trap::TypeError)?))
+        }
+    }
+    match args {
+        [affix] => Ok((*affix, None, None)),
+        [affix, start] => Ok((*affix, bound(*start)?, None)),
+        [affix, start, end] => Ok((*affix, bound(*start)?, bound(*end)?)),
+        _ => Err(Trap::TypeError),
+    }
+}
+
+/// Normalizes Python slice bounds `[start:end]` over `len` code points: a negative bound
+/// counts from the end (`+ len`), then both clamp to `[0, len]`; an absent bound defaults
+/// to `0` (start) or `len` (end). The returned `(start, end)` may have `start > end`,
+/// which denotes an empty range.
+fn normalize_bounds(start: Option<i64>, end: Option<i64>, len: i64) -> (i64, i64) {
+    fn norm(i: i64, len: i64) -> i64 {
+        (if i < 0 { i + len } else { i }).clamp(0, len)
+    }
+    (
+        start.map_or(0, |i| norm(i, len)),
+        end.map_or(len, |i| norm(i, len)),
+    )
+}
+
+/// The substring spanning code points `[a, b)` of `s` (empty if `a >= b`). Indexing is by
+/// code point -- `s[a:b]` in Python terms, not a byte slice.
+fn cp_slice(s: &str, a: i64, b: i64) -> &str {
+    if a >= b {
+        return "";
+    }
+    let byte = |cp: i64| s.char_indices().nth(cp as usize).map_or(s.len(), |(i, _)| i);
+    &s[byte(a)..byte(b)]
+}
+
+/// Python slice-bound adjustment for `[start:stop:step]` over `len` code points
+/// (`PySlice_Unpack` + `PySlice_AdjustIndices`, Python 3.14.6 `slice.indices`): a `None`
+/// bound takes its default for the step direction, a negative bound counts from the end,
+/// and an out-of-range bound CLAMPS. Returns the `(start, stop)` to iterate with `step`. A
+/// non-int, non-`None` bound is a `TypeError`.
+fn adjust_slice(start_v: Value, stop_v: Value, step: i64, len: i64) -> Result<(i64, i64), Trap> {
+    let clamp = |bound: i64| {
+        if bound < 0 {
+            let shifted = bound + len;
+            if shifted < 0 {
+                if step < 0 {
+                    -1
+                } else {
+                    0
+                }
+            } else {
+                shifted
+            }
+        } else if bound >= len {
+            if step < 0 {
+                len - 1
+            } else {
+                len
+            }
+        } else {
+            bound
+        }
+    };
+    let start = if start_v.is_none() {
+        if step < 0 {
+            len - 1
+        } else {
+            0
+        }
+    } else {
+        clamp(start_v.as_int().ok_or(Trap::TypeError)?)
+    };
+    let stop = if stop_v.is_none() {
+        if step < 0 {
+            -1
+        } else {
+            len
+        }
+    } else {
+        clamp(stop_v.as_int().ok_or(Trap::TypeError)?)
+    };
+    Ok((start, stop))
 }
 
 /// A Python type's metadata: a name and a fixed set of named attribute
@@ -153,6 +305,8 @@ pub struct ObjectModel {
     str_type_id: u32,
     /// The GC type-descriptor id of a bound method (`str.method`); it follows `str`.
     bound_method_type_id: u32,
+    /// The GC type-descriptor id of a `slice(start, stop, step)`; it follows the bound method.
+    slice_type_id: u32,
 }
 
 impl ObjectModel {
@@ -179,12 +333,18 @@ impl ObjectModel {
             payload_size: 8,
             ref_offsets: Vec::new(),
         });
+        let slice_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 12,
+            ref_offsets: Vec::new(),
+        });
         ObjectModel {
             heap: Heap::new(heap_capacity, descs),
             types,
             strings: Vec::new(),
             str_type_id,
             bound_method_type_id,
+            slice_type_id,
         }
     }
 
@@ -293,10 +453,14 @@ impl ObjectModel {
     /// dispatch later -- the one-source-of-truth path the interpreter and the AOT
     /// `py_getitem` intrinsic both consume.
     pub fn py_getitem(&mut self, container: Value, index: Value) -> Result<Value, Trap> {
+        if self.str_value(container).is_none() {
+            return Err(Trap::TypeError);
+        }
+        if self.is_slice(index) {
+            return self.str_getitem_slice(container, index);
+        }
         let ch = {
-            let Some(s) = self.str_value(container) else {
-                return Err(Trap::TypeError);
-            };
+            let s = self.str_value(container).ok_or(Trap::TypeError)?;
             let i = index.as_int().ok_or(Trap::TypeError)?;
             let len = s.chars().count() as i64;
             let at = if i < 0 { i + len } else { i };
@@ -307,6 +471,61 @@ impl ObjectModel {
         };
         let mut buf = [0u8; 4];
         self.new_str(ch.encode_utf8(&mut buf))
+    }
+
+    /// `str` slicing -- `container[slice]`. Reads the slice's `[start, stop, step]` and
+    /// builds the substring per Python 3.14.6 (`slice.indices`): a `None` start/stop takes
+    /// its default for the step direction, a negative bound counts from the end, out-of-range
+    /// bounds CLAMP (no IndexError, unlike integer indexing), and the step may be negative
+    /// (reversing). `step == 0` is a `ValueError`; a non-int, non-`None` bound a `TypeError`.
+    fn str_getitem_slice(&mut self, container: Value, slice: Value) -> Result<Value, Trap> {
+        let reference = slice.as_ref().ok_or(Trap::TypeError)?;
+        let start_v = Value::from_bits(self.heap.read_u32(reference.0));
+        let stop_v = Value::from_bits(self.heap.read_u32(reference.0 + 4));
+        let step_v = Value::from_bits(self.heap.read_u32(reference.0 + 8));
+        let step = if step_v.is_none() {
+            1
+        } else {
+            let step = step_v.as_int().ok_or(Trap::TypeError)?;
+            if step == 0 {
+                return Err(Trap::ValueError);
+            }
+            step
+        };
+        let out = {
+            let s = self.str_value(container).ok_or(Trap::TypeError)?;
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            let (start, stop) = adjust_slice(start_v, stop_v, step, len)?;
+            let mut out = String::new();
+            let mut i = start;
+            while (step > 0 && i < stop) || (step < 0 && i > stop) {
+                if i >= 0 && i < len {
+                    out.push(chars[i as usize]);
+                }
+                i += step;
+            }
+            out
+        };
+        self.new_str(&out)
+    }
+
+    /// Builds a `slice(start, stop, step)` object (each bound an int or `None`) -- the value
+    /// `Op::BuildSlice` pushes and `Subscript` consumes. A small GC-leaf heap object.
+    pub fn new_slice(&mut self, start: Value, stop: Value, step: Value) -> Result<Value, Trap> {
+        let reference = self.heap.alloc(self.slice_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, start.bits());
+        self.heap.write_u32(reference.0 + 4, stop.bits());
+        self.heap.write_u32(reference.0 + 8, step.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a slice object (the value `Op::BuildSlice` produces).
+    #[must_use]
+    pub fn is_slice(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|reference| self.heap.type_id_of(reference) == self.slice_type_id)
     }
 
     /// The shared heap (for the collector, and for tests that drive a collection).
@@ -425,29 +644,86 @@ impl ObjectModel {
                 self.new_str(&cased)
             }
             STR_STARTSWITH | STR_ENDSWITH => {
-                if args.len() != 1 {
-                    return Err(Trap::TypeError);
-                }
+                let (affix, start, end) = affix_and_bounds(args)?;
                 let s = self.str_value(receiver).ok_or(Trap::TypeError)?;
-                let affix = self.str_value(args[0]).ok_or(Trap::TypeError)?;
+                let affix = self.str_value(affix).ok_or(Trap::TypeError)?;
+                let (a, b) = normalize_bounds(start, end, s.chars().count() as i64);
+                let window = cp_slice(s, a, b);
                 let holds = if method_id == STR_STARTSWITH {
-                    s.starts_with(affix)
+                    window.starts_with(affix)
                 } else {
-                    s.ends_with(affix)
+                    window.ends_with(affix)
                 };
                 Ok(Value::from_bool(holds))
             }
             STR_FIND => {
-                if args.len() != 1 {
-                    return Err(Trap::TypeError);
-                }
+                let (sub, start, end) = affix_and_bounds(args)?;
                 let s = self.str_value(receiver).ok_or(Trap::TypeError)?;
-                let sub = self.str_value(args[0]).ok_or(Trap::TypeError)?;
-                let index = match s.find(sub) {
-                    Some(byte_offset) => s[..byte_offset].chars().count() as i32,
+                let sub = self.str_value(sub).ok_or(Trap::TypeError)?;
+                let (a, b) = normalize_bounds(start, end, s.chars().count() as i64);
+                let window = cp_slice(s, a, b);
+                let index = match window.find(sub) {
+                    Some(byte_offset) => a as i32 + window[..byte_offset].chars().count() as i32,
                     None => -1,
                 };
                 Value::fixnum(index).ok_or(Trap::Overflow)
+            }
+            STR_STRIP | STR_LSTRIP | STR_RSTRIP => {
+                let chars = match args {
+                    [] => None,
+                    [c] if c.is_none() => None,
+                    [c] => Some(*c),
+                    _ => return Err(Trap::TypeError),
+                };
+                let s = self.str_value(receiver).ok_or(Trap::TypeError)?;
+                let trimmed = match chars {
+                    None => match method_id {
+                        STR_STRIP => s.trim(),
+                        STR_LSTRIP => s.trim_start(),
+                        _ => s.trim_end(),
+                    },
+                    Some(chars) => {
+                        let set = self.str_value(chars).ok_or(Trap::TypeError)?;
+                        match method_id {
+                            STR_STRIP => s.trim_matches(|c| set.contains(c)),
+                            STR_LSTRIP => s.trim_start_matches(|c| set.contains(c)),
+                            _ => s.trim_end_matches(|c| set.contains(c)),
+                        }
+                    }
+                };
+                let trimmed = String::from(trimmed);
+                self.new_str(&trimmed)
+            }
+            STR_REPLACE => {
+                let (old, new, count) = match args {
+                    [old, new] => (*old, *new, -1i64),
+                    [old, new, count] => (*old, *new, count.as_int().ok_or(Trap::TypeError)?),
+                    _ => return Err(Trap::TypeError),
+                };
+                let s = self.str_value(receiver).ok_or(Trap::TypeError)?;
+                let old = self.str_value(old).ok_or(Trap::TypeError)?;
+                let new = self.str_value(new).ok_or(Trap::TypeError)?;
+                let replaced = if count < 0 {
+                    s.replace(old, new)
+                } else {
+                    s.replacen(old, new, count as usize)
+                };
+                self.new_str(&replaced)
+            }
+            STR_COUNT => {
+                let (sub, start, end) = affix_and_bounds(args)?;
+                let s = self.str_value(receiver).ok_or(Trap::TypeError)?;
+                let sub = self.str_value(sub).ok_or(Trap::TypeError)?;
+                let (a, b) = normalize_bounds(start, end, s.chars().count() as i64);
+                let window = cp_slice(s, a, b);
+                Value::fixnum(window.matches(sub).count() as i32).ok_or(Trap::Overflow)
+            }
+            STR_ISDIGIT | STR_ISALPHA | STR_ISALNUM | STR_ISSPACE | STR_ISUPPER | STR_ISLOWER => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let s = self.str_value(receiver).ok_or(Trap::TypeError)?;
+                Ok(Value::from_bool(str_predicate(method_id, s)))
             }
             _ => Err(Trap::Malformed),
         }
@@ -575,6 +851,121 @@ mod tests {
         );
         let sw3 = model.getattr(s, "startswith", &mut InlineCache::empty()).unwrap();
         assert_eq!(model.call_bound_method(sw3, &[]), Err(Trap::TypeError));
+    }
+
+    #[test]
+    fn str_methods_with_start_end_bounds() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let s = model.new_str("hello world").unwrap();
+        let o = model.new_str("o").unwrap();
+        let lo = model.new_str("lo").unwrap();
+        let wor = model.new_str("wor").unwrap();
+        let n = |v: i32| Value::fixnum(v).unwrap();
+
+        let f = model.getattr(s, "find", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(f, &[o, n(5)]).unwrap().as_fixnum(), Some(7));
+        let f = model.getattr(s, "find", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(f, &[wor, n(0), n(5)]).unwrap().as_fixnum(), Some(-1));
+        let f = model.getattr(s, "find", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(f, &[o, n(-3)]).unwrap().as_fixnum(), Some(-1));
+
+        let sw = model.getattr(s, "startswith", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(sw, &[wor, n(6)]).unwrap(), Value::TRUE);
+        let ew = model.getattr(s, "endswith", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(ew, &[lo, n(0), n(5)]).unwrap(), Value::TRUE);
+
+        let f = model.getattr(s, "find", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(f, &[o, lo]), Err(Trap::TypeError));
+        let f = model.getattr(s, "find", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(f, &[o, n(0), n(1), n(2)]), Err(Trap::TypeError));
+    }
+
+    #[test]
+    fn str_methods_strip_replace_count() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+
+        let s = model.new_str("  hi  ").unwrap();
+        let bm = model.getattr(s, "strip", &mut InlineCache::empty()).unwrap();
+        let r = model.call_bound_method(bm, &[]).unwrap();
+        assert_eq!(model.str_value(r), Some("hi"));
+
+        let url = model.new_str("www.example.com").unwrap();
+        let set = model.new_str("cmowz.").unwrap();
+        let bm = model.getattr(url, "strip", &mut InlineCache::empty()).unwrap();
+        let r = model.call_bound_method(bm, &[set]).unwrap();
+        assert_eq!(model.str_value(r), Some("example"));
+
+        let spam = model.new_str("spam, spam, spam").unwrap();
+        let old = model.new_str("spam").unwrap();
+        let new = model.new_str("eggs").unwrap();
+        let bm = model.getattr(spam, "replace", &mut InlineCache::empty()).unwrap();
+        let r = model.call_bound_method(bm, &[old, new]).unwrap();
+        assert_eq!(model.str_value(r), Some("eggs, eggs, eggs"));
+        let bm = model.getattr(spam, "replace", &mut InlineCache::empty()).unwrap();
+        let r = model.call_bound_method(bm, &[old, new, Value::fixnum(1).unwrap()]).unwrap();
+        assert_eq!(model.str_value(r), Some("eggs, spam, spam"));
+
+        let bm = model.getattr(spam, "count", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(bm, &[old]).unwrap().as_fixnum(), Some(3));
+        let bm = model.getattr(spam, "count", &mut InlineCache::empty()).unwrap();
+        let five = Value::fixnum(5).unwrap();
+        assert_eq!(model.call_bound_method(bm, &[old, five]).unwrap().as_fixnum(), Some(2));
+    }
+
+    #[test]
+    fn str_methods_predicates() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let cases: &[(&str, &str, bool)] = &[
+            ("0123", "isdigit", true),
+            ("12a", "isdigit", false),
+            ("", "isdigit", false),
+            ("abcDEF", "isalpha", true),
+            ("abc1", "isalpha", false),
+            ("abc123", "isalnum", true),
+            ("a b", "isalnum", false),
+            ("  \t\n", "isspace", true),
+            (" a ", "isspace", false),
+            ("BANANA", "isupper", true),
+            ("BANANA1", "isupper", true),
+            ("Banana", "isupper", false),
+            ("123", "isupper", false),
+            ("banana", "islower", true),
+            ("baNana", "islower", false),
+        ];
+        for &(text, method, expected) in cases {
+            let s = model.new_str(text).unwrap();
+            let bm = model.getattr(s, method, &mut InlineCache::empty()).unwrap();
+            let got = model.call_bound_method(bm, &[]).unwrap();
+            assert_eq!(got, Value::from_bool(expected), "{text:?}.{method}()");
+        }
+    }
+
+    #[test]
+    fn str_slicing() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let s = model.new_str("hello").unwrap();
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let slice = |m: &mut ObjectModel, a: Value, b: Value, st: Value| {
+            let sl = m.new_slice(a, b, st).unwrap();
+            m.py_getitem(s, sl)
+        };
+        let r = slice(&mut model, n(1), n(4), Value::NONE).unwrap();
+        assert_eq!(model.str_value(r), Some("ell"));
+        let r = slice(&mut model, Value::NONE, Value::NONE, Value::NONE).unwrap();
+        assert_eq!(model.str_value(r), Some("hello"));
+        let r = slice(&mut model, Value::NONE, Value::NONE, n(-1)).unwrap();
+        assert_eq!(model.str_value(r), Some("olleh"));
+        let r = slice(&mut model, n(-3), n(-1), Value::NONE).unwrap();
+        assert_eq!(model.str_value(r), Some("ll"));
+        let r = slice(&mut model, Value::NONE, Value::NONE, n(2)).unwrap();
+        assert_eq!(model.str_value(r), Some("hlo"));
+        let r = slice(&mut model, n(2), n(99), Value::NONE).unwrap();
+        assert_eq!(model.str_value(r), Some("llo"));
+        let r = slice(&mut model, n(4), n(1), Value::NONE).unwrap();
+        assert_eq!(model.str_value(r), Some(""));
+        assert_eq!(slice(&mut model, Value::NONE, Value::NONE, n(0)), Err(Trap::ValueError));
+        assert_eq!(slice(&mut model, s, Value::NONE, Value::NONE), Err(Trap::TypeError));
+        assert_eq!(model.py_getitem(s, n(99)), Err(Trap::IndexError));
     }
 
     #[test]

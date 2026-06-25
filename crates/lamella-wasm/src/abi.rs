@@ -55,6 +55,20 @@ pub unsafe extern "C" fn lamella_py_run(ptr: *const u8, len: usize) -> *mut u8 {
     result_buffer(to_json(&crate::py::run_py_str(source)).into_bytes())
 }
 
+/// Compile-CHECKS the Python source at `ptr..ptr + len` (UTF-8) WITHOUT running it, returning
+/// `[u32 length][UTF-8 JSON]` (`{stdout:"", exitCode, diagnostics}`) like [`lamella_run`] -- the
+/// editor / LSP diagnostics path. Free with `lamella_dealloc(result, 4 + length)`. Behind `py`.
+///
+/// # Safety
+/// `ptr`/`len` must be the UTF-8 buffer the host filled via a prior [`lamella_alloc`].
+#[cfg(feature = "py")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_py_check(ptr: *const u8, len: usize) -> *mut u8 {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    let source = core::str::from_utf8(bytes).unwrap_or("");
+    result_buffer(to_json(&crate::py::check_py_str(source)).into_bytes())
+}
+
 /// Packages `bytes` into a freshly allocated `[u32 little-endian length][bytes]`
 /// buffer and returns a pointer to it; the host reads the length, then the bytes,
 /// then frees it with `lamella_dealloc(result, 4 + length)`. Shared by the run and

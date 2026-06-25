@@ -443,6 +443,27 @@ impl Binder {
         resolve_type(&self.world, ty, &mut self.diagnostics, span)
     }
 
+    /// Rewrites a single-part named type to its canonical fully-qualified symbol when that
+    /// simple name is unambiguous in the model, so a body-bound type (e.g. a method's declared
+    /// return type, structurally bound from syntax) is the SAME [`TypeSymbol`] as the qualified
+    /// form a `new`/cast produces. Mirrors [`Model::canonicalize_signatures`] for the types the
+    /// body re-binds from syntax; non-reporting (an unresolved name stays as is for the normal
+    /// resolver to diagnose). Arrays and pointers canonicalize their element type.
+    pub(crate) fn canonicalize(&self, ty: &TypeSymbol) -> TypeSymbol {
+        match ty {
+            TypeSymbol::Named(parts) if parts.len() == 1 => self
+                .model
+                .type_with_simple_name(&parts[0])
+                .unwrap_or_else(|| ty.clone()),
+            TypeSymbol::Array { element, rank } => TypeSymbol::Array {
+                element: Box::new(self.canonicalize(element)),
+                rank: *rank,
+            },
+            TypeSymbol::Pointer(inner) => TypeSymbol::Pointer(Box::new(self.canonicalize(inner))),
+            _ => ty.clone(),
+        }
+    }
+
     /// Whether `from` implicitly converts to `to`, including reference conversions
     /// that walk the model's inheritance graph (13.1).
     pub(crate) fn converts(&self, from: &TypeSymbol, to: &TypeSymbol) -> bool {
@@ -552,6 +573,11 @@ impl Binder {
         {
             return self.bind_delegate_creation(target, &[expr], Span::empty_at(0));
         }
+        if matches!(target, TypeSymbol::ByRef(_))
+            && matches!(expr.kind, BoundExprKind::Ref { .. })
+        {
+            return expr;
+        }
         if expr.ty == *target || expr.ty.is_error() || target.is_error() {
             return expr;
         }
@@ -645,7 +671,10 @@ impl Binder {
                 self.type_info_of(ty).map(|info| info.kind),
                 Some(TypeKind::Struct | TypeKind::Enum)
             ),
-            TypeSymbol::Array { .. } | TypeSymbol::Pointer(_) | TypeSymbol::Error => false,
+            TypeSymbol::Array { .. }
+            | TypeSymbol::Pointer(_)
+            | TypeSymbol::ByRef(_)
+            | TypeSymbol::Error => false,
         }
     }
 
@@ -781,6 +810,7 @@ impl Binder {
         parameters: &[(Box<str>, TypeSymbol)],
         body: &lamella_syntax::ast::Stmt,
     ) -> crate::statement::BoundStmt {
+        let return_type = self.canonicalize(&return_type);
         let returns_value = !return_type.is_void();
         let body_span = body.span;
         self.current_type = enclosing_type;
@@ -793,7 +823,7 @@ impl Binder {
         self.loop_depth = 0;
         self.switch_depth = 0;
         for (parameter, ty) in parameters {
-            self.declare_local(parameter, ty.clone());
+            self.declare_local(parameter, self.canonicalize(ty));
         }
         let bound = self.bind_statement(body);
         self.exit_scope();

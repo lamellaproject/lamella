@@ -195,6 +195,20 @@ pub fn emit_expression(
             }
             Ok(())
         }
+        BoundExprKind::Assignment {
+            operator: lamella_syntax::ast::AssignmentOperator::Assign,
+            target,
+            value,
+        } => match &target.kind {
+            BoundExprKind::Local(name) if frame.byref(name).is_none() => {
+                emit_expression(value, frame, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Dup));
+                crate::method::store_to(frame, name, out)
+            }
+            _ => Err(EmitError::Unsupported(
+                "assignment as an expression is lowered only to a local",
+            )),
+        },
         _ => Err(EmitError::Unsupported(
             "this expression form is not lowered yet",
         )),
@@ -445,6 +459,7 @@ pub(crate) fn ldelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError
         },
         TypeSymbol::Named(_) | TypeSymbol::Array { .. } => Opcode::LdelemRef,
         TypeSymbol::Pointer(_) => return Err(EmitError::Unsupported("ldelem on a pointer")),
+        TypeSymbol::ByRef(_) => return Err(EmitError::Unsupported("ldelem on a byref")),
         TypeSymbol::Error => return Err(EmitError::Unsupported("element access of an error type")),
     })
 }
@@ -468,6 +483,7 @@ pub(crate) fn stelem_opcode(element_ty: &TypeSymbol) -> Result<Opcode, EmitError
         },
         TypeSymbol::Named(_) | TypeSymbol::Array { .. } => Opcode::StelemRef,
         TypeSymbol::Pointer(_) => return Err(EmitError::Unsupported("stelem on a pointer")),
+        TypeSymbol::ByRef(_) => return Err(EmitError::Unsupported("stelem on a byref")),
         TypeSymbol::Error => return Err(EmitError::Unsupported("element store of an error type")),
     })
 }
@@ -985,7 +1001,7 @@ pub(crate) fn emit_value_type_receiver(
             receiver: container,
             field: Some(field),
             ..
-        } => {
+        } if field.constant.is_none() => {
             if tokens.is_struct(&container.ty) {
                 emit_value_type_receiver(container, frame, tokens, out)?;
             } else {

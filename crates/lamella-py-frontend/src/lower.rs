@@ -954,6 +954,9 @@ fn lower_op(
             }));
             stack.push(StackEntry::Value(id, MirType::PyValue));
         }
+        bc::Op::BuildSlice => {
+            return Err(LowerError::DynamicOperation);
+        }
         bc::Op::PopTop => {
             pop(stack)?;
         }

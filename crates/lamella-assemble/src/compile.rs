@@ -2732,6 +2732,10 @@ fn mint_type_token(image: &mut ImageBuilder, tokens: &mut Tokens, ty: &TypeSymbo
             mint_type_token(image, tokens, element);
             None
         }
+        TypeSymbol::ByRef(element) => {
+            mint_type_token(image, tokens, element);
+            None
+        }
         TypeSymbol::Error => None,
     };
     if let Some(token) = reference {
@@ -3075,6 +3079,9 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
         }
         TypeSymbol::Pointer(element) => {
             return Ok(TypeSig::Pointer(Box::new(type_sig(tokens, element)?)));
+        }
+        TypeSymbol::ByRef(element) => {
+            return Ok(TypeSig::ByRef(Box::new(type_sig(tokens, element)?)));
         }
         TypeSymbol::Error => {
             return Err(crate::EmitError::Unsupported(

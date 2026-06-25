@@ -16,6 +16,12 @@ use lamella_ir::{
 /// resolver shifts them), so a throw/dispatch and an `ldsfld`/`stsfld` never alias.
 const G_EXCEPTION_TAG_OFFSET: u32 = 0;
 
+/// A single-cast delegate's field offsets within its heap object: `object _target` (a GC ref) first,
+/// then `IntPtr _methodPtr` (the `ldftn` code address). The object pointer is the payload start, so
+/// these are absolute offsets. The layout matches the managed `System.Delegate` the runtime defines.
+const DELEGATE_TARGET_OFFSET: u32 = 0;
+const DELEGATE_METHODPTR_OFFSET: u32 = 4;
+
 /// Why a method body could not be lowered to MIR.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CilError {
@@ -133,6 +139,21 @@ pub trait CallResolver {
     /// its identity, payload size, and reference-field offsets (the GC trace map), so the
     /// lowering can allocate the object on the heap. `None` for a value type or unresolved type.
     fn newobj_reference_layout(&self, _operand: &Operand) -> Option<ReferenceLayout> {
+        None
+    }
+
+    /// The heap layout of a delegate type a `newobj` builds, or `None` if the operand is not a
+    /// delegate constructor. A delegate (`_target` at offset 0, `_methodPtr` at offset 4) is
+    /// special-cased: the lowering allocates it and stores the two ctor args directly, skipping the
+    /// bodyless `Delegate(object, native int)` ctor. Defaults to `None`.
+    fn newobj_delegate(&self, _operand: &Operand) -> Option<ReferenceLayout> {
+        None
+    }
+
+    /// A delegate `Invoke` a `callvirt` names: its explicit argument count (the signature params,
+    /// excluding the delegate receiver) and whether it returns a value, or `None` if the call is not a
+    /// delegate `Invoke`. The lowering loads `_methodPtr` and calls it indirectly. Defaults to `None`.
+    fn delegate_invoke_args(&self, _operand: &Operand) -> Option<(usize, bool)> {
         None
     }
 
@@ -885,6 +906,51 @@ fn binary(
     Ok(())
 }
 
+/// Lowers a `stind.i{1,2,4}`: `*(addr) = value`, a `width`-byte store (the value is on top of the
+/// address). The store yields no stack value.
+fn stind(
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    width: u32,
+) -> Result<(), CilError> {
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let result = new_value(value_types, MirType::I32);
+    insts.push((
+        result,
+        Inst::Store {
+            address,
+            value,
+            width,
+        },
+    ));
+    Ok(())
+}
+
+/// Lowers a `ldind.{i,u}{1,2,4}`: `value = *(addr)`, a `width`-byte load sign- or zero-extended to
+/// i32 per `signed` (the address is on top; the loaded value replaces it).
+fn ldind(
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    width: u32,
+    signed: bool,
+) -> Result<(), CilError> {
+    let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let result = new_value(value_types, MirType::I32);
+    insts.push((
+        result,
+        Inst::Load {
+            address,
+            width,
+            signed,
+        },
+    ));
+    stack.push(result);
+    Ok(())
+}
+
 /// Pops two operands and pushes a comparison yielding 0 or 1.
 fn compare(
     value_types: &mut Vec<MirType>,
@@ -1061,6 +1127,17 @@ fn apply_value_op(
             ));
             stack.push(result);
         }
+        Opcode::Ldftn => {
+            let info = resolver
+                .resolve(&inst.operand)
+                .ok_or(CilError::UnresolvedCall)?;
+            let CallTarget::Internal(func) = info.target else {
+                return Err(CilError::UnresolvedCall);
+            };
+            let result = new_value(value_types, MirType::I32);
+            insts.push((result, Inst::FuncAddr { func }));
+            stack.push(result);
+        }
         Opcode::LdcI4M1 => push_const(value_types, stack, insts, -1),
         Opcode::LdcI40 => push_const(value_types, stack, insts, 0),
         Opcode::LdcI41 => push_const(value_types, stack, insts, 1),
@@ -1231,17 +1308,27 @@ fn apply_value_op(
             stack.push(top);
         }
         Opcode::ConvI | Opcode::ConvU => {}
-        Opcode::StindI4 => {
-            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
-            let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+        Opcode::StindI1 => stind(value_types, stack, insts, 1)?,
+        Opcode::StindI2 => stind(value_types, stack, insts, 2)?,
+        Opcode::StindI4 => stind(value_types, stack, insts, 4)?,
+        Opcode::LdindI1 => ldind(value_types, stack, insts, 1, true)?,
+        Opcode::LdindU1 => ldind(value_types, stack, insts, 1, false)?,
+        Opcode::LdindI2 => ldind(value_types, stack, insts, 2, true)?,
+        Opcode::LdindU2 => ldind(value_types, stack, insts, 2, false)?,
+        Opcode::LdindI4 | Opcode::LdindU4 => ldind(value_types, stack, insts, 4, false)?,
+        Opcode::Cpblk => {
+            let size = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let src = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let dst = stack.pop().ok_or(CilError::StackUnderflow)?;
             let result = new_value(value_types, MirType::I32);
-            insts.push((result, Inst::Store { address, value }));
+            insts.push((result, Inst::CopyBlock { dst, src, size }));
         }
-        Opcode::LdindI4 | Opcode::LdindU4 => {
-            let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+        Opcode::Initblk => {
+            let size = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let dst = stack.pop().ok_or(CilError::StackUnderflow)?;
             let result = new_value(value_types, MirType::I32);
-            insts.push((result, Inst::Load { address }));
-            stack.push(result);
+            insts.push((result, Inst::FillBlock { dst, value, size }));
         }
         Opcode::Ldstr => {
             let bytes = resolver
@@ -1258,6 +1345,34 @@ fn apply_value_op(
             stack.push(value);
         }
         Opcode::Call | Opcode::Callvirt => {
+            if let Some((arg_count, has_result)) = resolver.delegate_invoke_args(&inst.operand) {
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..arg_count {
+                    args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+                }
+                args.reverse();
+                let delegate = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let method_ptr = new_value(value_types, MirType::I32);
+                insts.push((
+                    method_ptr,
+                    Inst::FieldLoad {
+                        base: delegate,
+                        offset: DELEGATE_METHODPTR_OFFSET,
+                    },
+                ));
+                let result = new_value(value_types, MirType::I32);
+                insts.push((
+                    result,
+                    Inst::CallIndirect {
+                        target: method_ptr,
+                        args,
+                    },
+                ));
+                if has_result {
+                    stack.push(result);
+                }
+                return Ok(());
+            }
             match resolver.array_2d_op(&inst.operand) {
                 Some(Array2DOp::Get {
                     element_size,
@@ -1667,6 +1782,35 @@ fn apply_value_op(
         Opcode::Newobj => {
             if let Some(tag) = resolver.exception_tag(&inst.operand) {
                 push_const(value_types, stack, insts, i64::from(tag));
+                return Ok(());
+            }
+            if let Some(layout) = resolver.newobj_delegate(&inst.operand) {
+                let method_ptr = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let target = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let obj = new_value(value_types, MirType::ObjectRef);
+                insts.push((
+                    obj,
+                    Inst::Alloc {
+                        handle: layout.handle,
+                        payload_size: layout.size,
+                        ref_offsets: layout.reference_offsets.into_boxed_slice(),
+                    },
+                ));
+                let store =
+                    |insts: &mut Vec<(ValueId, Inst)>, vts: &mut Vec<MirType>, offset, value| {
+                        let placeholder = new_value(vts, MirType::I32);
+                        insts.push((
+                            placeholder,
+                            Inst::FieldStore {
+                                base: obj,
+                                offset,
+                                value,
+                            },
+                        ));
+                    };
+                store(insts, value_types, DELEGATE_TARGET_OFFSET, target);
+                store(insts, value_types, DELEGATE_METHODPTR_OFFSET, method_ptr);
+                stack.push(obj);
                 return Ok(());
             }
             if let Some(Array2DOp::New {
@@ -2128,7 +2272,7 @@ fn build_eh_throw(
 /// nonzero, branches to the catch's dispatch instead of leaving normally; when it is zero the try
 /// completed, so it leaves to `leave_target` (through a landing block when that is a merge, since a
 /// `Branch` edge carries no arguments). Scoped to one may-throw call per try body checked at the
-/// exit -- a side effect between a throwing call and the leave is a later increment.
+/// exit -- a side effect between a throwing call and the leave is not yet modeled.
 #[allow(clippy::too_many_arguments)]
 fn build_eh_leave(
     leave_target: usize,
@@ -3484,6 +3628,96 @@ mod control_flow {
                         ..
                     }
                 ))
+        );
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_sub_word_indirect_load_store() {
+        use super::*;
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::StindI1),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::StindI2),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdindI1),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdindU1),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdindU2),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).expect("lower sub-word stind/ldind");
+        let stores: Vec<u32> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|(_, i)| match i {
+                Inst::Store { width, .. } => Some(*width),
+                _ => None,
+            })
+            .collect();
+        let loads: Vec<(u32, bool)> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|(_, i)| match i {
+                Inst::Load { width, signed, .. } => Some((*width, *signed)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stores, vec![1, 2]);
+        assert_eq!(loads, vec![(1, true), (1, false), (2, false)]);
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_block_copy_and_fill() {
+        use super::*;
+        let body = MethodBodyImage {
+            max_stack: 3,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Cpblk),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Initblk),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).expect("lower cpblk/initblk");
+        let insts: Vec<&Inst> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .map(|(_, i)| i)
+            .collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::CopyBlock { .. })),
+            "cpblk -> CopyBlock"
+        );
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::FillBlock { .. })),
+            "initblk -> FillBlock"
         );
         assert!(crate::arm32::lower(&func).is_ok());
     }

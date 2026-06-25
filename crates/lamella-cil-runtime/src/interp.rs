@@ -108,6 +108,11 @@ pub struct Vm {
     /// already due, so wake ORDERING is right but there is no real delay.
     now_millis_fn: Option<fn() -> u64>,
     sleep_millis_fn: Option<fn(u64)>,
+    /// The host networking seam ([`crate::net::NetBackend`]) -- non-blocking sockets + a readiness
+    /// poll for the scheduler's reactor. The no_std core keeps none; the embedder sets it (the host
+    /// with `std::net` + `mio`; a device with lwIP / an AT modem). `None` until set -- socket ops
+    /// then report failure (no networking on this build).
+    net_backend: Option<alloc::boxed::Box<dyn crate::net::NetBackend>>,
 }
 
 impl Vm {
@@ -356,6 +361,32 @@ impl Vm {
     fn sleep_millis(&self, millis: u64) {
         if let Some(sleep) = self.sleep_millis_fn {
             sleep(millis);
+        }
+    }
+
+    /// Sets the host networking seam ([`crate::net::NetBackend`]). The embedder provides it (the host
+    /// with `std::net` + `mio`); without it, socket operations report failure.
+    pub fn set_net_backend(&mut self, backend: alloc::boxed::Box<dyn crate::net::NetBackend>) {
+        self.net_backend = Some(backend);
+    }
+
+    /// The host networking seam, if set -- the socket intrinsics and the reactor's idle poll use it.
+    pub fn net_backend(&mut self) -> Option<&mut (dyn crate::net::NetBackend + 'static)> {
+        self.net_backend.as_deref_mut()
+    }
+
+    /// Requests that the scheduler park the running thread on socket I/O (a socket op would block):
+    /// register `socket` for `interest`, then wake when the reactor's poll reports it ready.
+    pub fn request_block_on_io(&mut self, socket: u32, interest: crate::net::Interest) {
+        self.thread_op = Some(ThreadOp::BlockOnIo { socket, interest });
+    }
+
+    /// The reactor's poll: block until a watched socket is ready or `timeout_ms` elapses, returning
+    /// the ready handles (empty without a backend). Used by `idle_wait`.
+    fn net_poll(&mut self, timeout_ms: Option<u64>) -> alloc::vec::Vec<u32> {
+        match self.net_backend.as_deref_mut() {
+            Some(backend) => backend.poll(timeout_ms),
+            None => alloc::vec::Vec::new(),
         }
     }
 
@@ -737,6 +768,12 @@ enum ThreadOp {
     WakeThread { id: u32 },
     /// Block the running thread until `now` + this many milliseconds (`Thread.Sleep`).
     SleepFor(u64),
+    /// Block the running thread on socket I/O: register `socket` for `interest` with the reactor and
+    /// park until its `poll` reports the socket ready (a socket op that would block).
+    BlockOnIo {
+        socket: u32,
+        interest: crate::net::Interest,
+    },
 }
 
 /// The state of one entered `Monitor` lock. Lives in [`Vm::locks`], keyed by the lock object's heap
@@ -813,6 +850,9 @@ enum ThreadState {
     /// Sleeping until this monotonic-millisecond deadline (`Thread.Sleep`); woken by the scheduler's
     /// `idle_wait` once the deadline passes.
     Sleeping(u64),
+    /// Blocked on socket I/O -- parked until this socket handle becomes ready. Set by a socket op
+    /// that would block; woken in `idle_wait` when the reactor's poll reports the socket ready.
+    IoWait(u32),
     /// Finished (its `result` is set).
     Done,
 }
@@ -833,30 +873,40 @@ fn next_ready_thread(threads: &[ThreadSlot], start: usize) -> Option<usize> {
 /// ORDERING by deadline, but no real delay). This single blocking wait is also the tickless-idle /
 /// low-power foundation, and where the socket reactor later adds an fd poll-set.
 fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
-    let nearest = threads
+    let nearest_deadline = threads
         .iter()
         .filter_map(|slot| match slot.state {
             ThreadState::Sleeping(deadline) => Some(deadline),
             _ => None,
         })
         .min();
-    let Some(nearest) = nearest else {
+    let any_io = threads
+        .iter()
+        .any(|slot| matches!(slot.state, ThreadState::IoWait(_)));
+    if nearest_deadline.is_none() && !any_io {
         return false;
+    }
+    let timeout = match (nearest_deadline, vm.now_millis()) {
+        (Some(deadline), Some(now)) => Some(deadline.saturating_sub(now)),
+        (Some(_), None) => Some(0),
+        (None, _) => None,
     };
-    let now = match vm.now_millis() {
-        Some(now) => {
-            if nearest > now {
-                vm.sleep_millis(nearest - now);
-            }
-            vm.now_millis().unwrap_or(nearest)
+    let ready = if any_io {
+        vm.net_poll(timeout)
+    } else {
+        if let Some(ms) = timeout {
+            vm.sleep_millis(ms);
         }
-        None => u64::MAX,
+        alloc::vec::Vec::new()
     };
+    let now = vm.now_millis().unwrap_or(u64::MAX);
     for slot in threads.iter_mut() {
-        if let ThreadState::Sleeping(deadline) = slot.state {
-            if deadline <= now {
+        match slot.state {
+            ThreadState::Sleeping(deadline) if deadline <= now => slot.state = ThreadState::Ready,
+            ThreadState::IoWait(socket) if ready.contains(&socket) => {
                 slot.state = ThreadState::Ready;
             }
+            _ => {}
         }
     }
     true
@@ -971,6 +1021,13 @@ pub fn run(
                 Some(ThreadOp::SleepFor(millis)) => {
                     let deadline = vm.now_millis().map_or(0, |now| now.saturating_add(millis));
                     threads[index].state = ThreadState::Sleeping(deadline);
+                    cursor = index + 1;
+                }
+                Some(ThreadOp::BlockOnIo { socket, interest }) => {
+                    if let Some(backend) = vm.net_backend() {
+                        backend.register(socket, interest);
+                    }
+                    threads[index].state = ThreadState::IoWait(socket);
                     cursor = index + 1;
                 }
                 None => cursor = index + 1,

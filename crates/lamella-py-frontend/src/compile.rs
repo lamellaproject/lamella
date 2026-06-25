@@ -1,5 +1,6 @@
 //! Lowering the AST to our bytecode.
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -620,6 +621,12 @@ impl Compiler {
                 let cache = self.asm.next_cache_slot();
                 self.asm.emit(bc::Op::Subscript { cache });
             }
+            Expr::Slice { lower, upper, step } => {
+                self.compile_slice_bound(lower)?;
+                self.compile_slice_bound(upper)?;
+                self.compile_slice_bound(step)?;
+                self.asm.emit(bc::Op::BuildSlice);
+            }
             Expr::Binary { op, lhs, rhs } => {
                 self.compile_expr(lhs)?;
                 self.compile_expr(rhs)?;
@@ -648,6 +655,18 @@ impl Compiler {
             }
         }
         Ok(())
+    }
+
+    /// Push a slice bound: the expression, or `None` when the bound is omitted.
+    fn compile_slice_bound(&mut self, bound: &Option<Box<Expr>>) -> Result<(), CompileError> {
+        match bound {
+            Some(e) => self.compile_expr(e),
+            None => {
+                let none = self.const_index(bc::Const::None);
+                self.asm.emit(bc::Op::LoadConst(none));
+                Ok(())
+            }
+        }
     }
 
     /// Allocate a fresh synthetic integer-typed local (a boolean short-circuit
@@ -946,6 +965,17 @@ mod tests {
             "def f() -> int:\n    s = 0\n    for i in range(10):\n        if i == 5:\n            break\n        if i == 2:\n            continue\n        s += i\n    return s\n"
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_slice_emits_buildslice_then_subscript() {
+        let m = compile_src("def f(s):\n    return s[1:3]\n").unwrap();
+        let f = func(&m, "f");
+        let bs = f.ops.iter().position(|op| matches!(op, Op::BuildSlice));
+        let sub = f.ops.iter().position(|op| matches!(op, Op::Subscript { .. }));
+        assert!(bs.is_some(), "expected a BuildSlice");
+        assert!(sub.is_some(), "expected a Subscript");
+        assert!(bs < sub, "the slice is built before the subscript");
     }
 
     #[test]

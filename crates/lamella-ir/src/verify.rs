@@ -178,12 +178,22 @@ fn check_inst(
                 expect(expected, r, errors);
             }
         }
-        Inst::Store { address, value } => {
+        Inst::Store { address, value, .. } => {
             use_value(func, defined, *address, errors);
             use_value(func, defined, *value, errors);
         }
-        Inst::Load { address } => {
+        Inst::Load { address, .. } => {
             use_value(func, defined, *address, errors);
+        }
+        Inst::CopyBlock { dst, src, size } => {
+            use_value(func, defined, *dst, errors);
+            use_value(func, defined, *src, errors);
+            use_value(func, defined, *size, errors);
+        }
+        Inst::FillBlock { dst, value, size } => {
+            use_value(func, defined, *dst, errors);
+            use_value(func, defined, *value, errors);
+            use_value(func, defined, *size, errors);
         }
         Inst::Convert { value, kind } => {
             use_value(func, defined, *value, errors);

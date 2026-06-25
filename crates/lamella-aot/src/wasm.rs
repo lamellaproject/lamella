@@ -966,15 +966,33 @@ fn lower_inst(
                 body.local_set(local(result));
             }
         }
-        Inst::Load { address } => {
+        Inst::Load {
+            address,
+            width,
+            signed,
+        } => {
             body.local_get(local(*address));
-            body.i32_load(MemArg::new(4, 0));
+            match (*width, *signed) {
+                (1, true) => body.i32_load8_s(MemArg::new(1, 0)),
+                (1, false) => body.i32_load8_u(MemArg::new(1, 0)),
+                (2, true) => body.i32_load16_s(MemArg::new(2, 0)),
+                (2, false) => body.i32_load16_u(MemArg::new(2, 0)),
+                _ => body.i32_load(MemArg::new(4, 0)),
+            }
             body.local_set(local(result));
         }
-        Inst::Store { address, value } => {
+        Inst::Store {
+            address,
+            value,
+            width,
+        } => {
             body.local_get(local(*address));
             body.local_get(local(*value));
-            body.i32_store(MemArg::new(4, 0));
+            match *width {
+                1 => body.i32_store8(MemArg::new(1, 0)),
+                2 => body.i32_store16(MemArg::new(2, 0)),
+                _ => body.i32_store(MemArg::new(4, 0)),
+            }
         }
         Inst::FieldLoad { base, offset } => {
             if !is_addressable(value_types, *base) {

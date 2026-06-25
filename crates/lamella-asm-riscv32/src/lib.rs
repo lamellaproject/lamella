@@ -294,17 +294,47 @@ impl Encoder {
     pub fn lw(&mut self, rd: Reg, rs1: Reg, imm: i32) {
         self.i_type(imm, rs1, 2, rd, 0x03);
     }
-    /// `sw rs2, imm(rs1)` -- store a word.
-    pub fn sw(&mut self, rs2: Reg, rs1: Reg, imm: i32) {
+    /// An S-type store (`STORE` opcode `0x23`): `rs2 -> imm(rs1)`, the `funct3` selecting the width
+    /// (`sb`=0, `sh`=1, `sw`=2).
+    fn s_type(&mut self, imm: i32, rs2: Reg, rs1: Reg, funct3: u32) {
         let imm = imm as u32;
         self.emit_word(
             ((imm >> 5) & 0x7f) << 25
                 | (u32::from(rs2.number()) << 20)
                 | (u32::from(rs1.number()) << 15)
-                | (2 << 12)
+                | (funct3 << 12)
                 | ((imm & 0x1f) << 7)
                 | 0x23,
         );
+    }
+
+    /// `lb rd, imm(rs1)` -- load a sign-extended byte.
+    pub fn lb(&mut self, rd: Reg, rs1: Reg, imm: i32) {
+        self.i_type(imm, rs1, 0, rd, 0x03);
+    }
+    /// `lh rd, imm(rs1)` -- load a sign-extended halfword.
+    pub fn lh(&mut self, rd: Reg, rs1: Reg, imm: i32) {
+        self.i_type(imm, rs1, 1, rd, 0x03);
+    }
+    /// `lbu rd, imm(rs1)` -- load a zero-extended byte.
+    pub fn lbu(&mut self, rd: Reg, rs1: Reg, imm: i32) {
+        self.i_type(imm, rs1, 4, rd, 0x03);
+    }
+    /// `lhu rd, imm(rs1)` -- load a zero-extended halfword.
+    pub fn lhu(&mut self, rd: Reg, rs1: Reg, imm: i32) {
+        self.i_type(imm, rs1, 5, rd, 0x03);
+    }
+    /// `sb rs2, imm(rs1)` -- store a byte.
+    pub fn sb(&mut self, rs2: Reg, rs1: Reg, imm: i32) {
+        self.s_type(imm, rs2, rs1, 0);
+    }
+    /// `sh rs2, imm(rs1)` -- store a halfword.
+    pub fn sh(&mut self, rs2: Reg, rs1: Reg, imm: i32) {
+        self.s_type(imm, rs2, rs1, 1);
+    }
+    /// `sw rs2, imm(rs1)` -- store a word.
+    pub fn sw(&mut self, rs2: Reg, rs1: Reg, imm: i32) {
+        self.s_type(imm, rs2, rs1, 2);
     }
 
     /// `jalr rd, rs1, imm` -- jump to `rs1 + imm`, link into rd.

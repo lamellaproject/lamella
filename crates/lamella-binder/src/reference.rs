@@ -182,7 +182,9 @@ fn sigtype_to_symbol(assembly: &Assembly, sig: &SigType) -> TypeSymbol {
         SigType::Array { element, rank } => {
             sigtype_to_symbol(assembly, element).into_array(*rank as u8)
         }
-        SigType::ByRef(referent) => sigtype_to_symbol(assembly, referent),
+        SigType::ByRef(referent) => {
+            TypeSymbol::ByRef(Box::new(sigtype_to_symbol(assembly, referent)))
+        }
         SigType::Pointer(_) => TypeSymbol::Error,
         _ => TypeSymbol::Error,
     }

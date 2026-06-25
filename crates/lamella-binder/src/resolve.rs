@@ -80,6 +80,14 @@ pub fn resolve_type(
                 TypeSymbol::Pointer(alloc::boxed::Box::new(resolved))
             }
         }
+        TypeSymbol::ByRef(element) => {
+            let resolved = resolve_type(table, element, diagnostics, span);
+            if resolved.is_error() {
+                TypeSymbol::Error
+            } else {
+                TypeSymbol::ByRef(alloc::boxed::Box::new(resolved))
+            }
+        }
     }
 }
 

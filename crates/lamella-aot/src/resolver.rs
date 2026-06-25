@@ -77,6 +77,31 @@ impl<'a> MetadataResolver<'a> {
         self.assembly.find_type(declaring.namespace, declaring.name)
     }
 
+    /// Whether `type_def` is a delegate -- its `extends` chain reaches `System.MulticastDelegate` (or
+    /// `System.Delegate`). The bounded base-chain walk the catch-type and cast detection also use.
+    fn is_delegate_type(&self, type_def: &TypeDef<'a>) -> bool {
+        let mut current = type_def.extends();
+        for _ in 0..64 {
+            if current.row() == 0 {
+                return false;
+            }
+            let Some(name) = self.assembly.type_token_name(current) else {
+                return false;
+            };
+            if name.namespace == "System" && matches!(name.name, "MulticastDelegate" | "Delegate") {
+                return true;
+            }
+            if current.table() != table::TYPE_DEF {
+                return false;
+            }
+            let Some(base_def) = self.assembly.type_def(current.row()) else {
+                return false;
+            };
+            current = base_def.extends();
+        }
+        false
+    }
+
     /// The type token a metadata token names: a type token as-is (`TypeRef`/`TypeDef`/
     /// `TypeSpec`), or the declaring type of a constructor token -- a `MemberRef`'s parent (an
     /// external type like `System.Exception`), or a `MethodDef`'s owning type resolved by name
@@ -202,7 +227,7 @@ impl<'a> MetadataResolver<'a> {
     /// of its full name (the shared FNV-1a32 scheme, so an exception type's `type_tag` EQUALS its
     /// exception tag -- one tag space for all types). The interpreter computes the same from metadata,
     /// so a shared object's type is identified identically both ways -- the mixed-mode type-identity
-    /// bridge (runtime's `docs/mixed-mode-object-model.md`). Keyed by `TypeHandle(token.0)`.
+    /// bridge. Keyed by `TypeHandle(token.0)`.
     #[must_use]
     pub fn type_tags(&self) -> Vec<(TypeHandle, u32)> {
         self.assembly
@@ -532,6 +557,41 @@ impl CallResolver for MetadataResolver<'_> {
             size: layout.size,
             reference_offsets: layout.reference_offsets,
         })
+    }
+
+    fn newobj_delegate(&self, operand: &Operand) -> Option<ReferenceLayout> {
+        let type_def = self.newobj_type_def(operand)?;
+        if !self.is_delegate_type(&type_def) {
+            return None;
+        }
+        let layout = self
+            .assembly
+            .value_type_layout(type_def.token(), &TargetLayout::ilp32())
+            .ok()?;
+        Some(ReferenceLayout {
+            handle: TypeHandle(type_def.token().0),
+            size: layout.size,
+            reference_offsets: layout.reference_offsets,
+        })
+    }
+
+    fn delegate_invoke_args(&self, operand: &Operand) -> Option<(usize, bool)> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let method = self.assembly.resolve_method(*token)?;
+        if method.name != Some("Invoke") {
+            return None;
+        }
+        let declaring = method.declaring_type?;
+        let type_def = self
+            .assembly
+            .find_type(declaring.namespace, declaring.name)?;
+        if !self.is_delegate_type(&type_def) {
+            return None;
+        }
+        let sig = method.signature?;
+        Some((sig.parameters.len(), sig.return_type != SigType::Void))
     }
 
     fn array_element(&self, operand: &Operand) -> Option<ArrayElement> {

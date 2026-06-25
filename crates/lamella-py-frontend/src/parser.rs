@@ -712,7 +712,7 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     self.advance();
-                    let index = self.parse_expr()?;
+                    let index = self.parse_slice_or_index()?;
                     self.expect(&Tok::RBracket, "']' closing the subscript")?;
                     expr = Expr::Subscript {
                         value: Box::new(expr),
@@ -723,6 +723,35 @@ impl Parser {
             }
         }
         Ok(expr)
+    }
+
+    /// A subscript index: a plain expression `s[i]`, or a slice `s[lower:upper:step]`
+    /// where each part is optional (6.3.2.1). A `:` is what makes it a slice.
+    fn parse_slice_or_index(&mut self) -> Result<Expr, ParseError> {
+        let lower = if self.at(&Tok::Colon) {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+        if !self.at(&Tok::Colon) {
+            return Ok(*lower.expect("a non-slice index parsed an expression"));
+        }
+        self.advance();
+        let upper = if self.at(&Tok::Colon) || self.at(&Tok::RBracket) {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+        let step = if self.eat(&Tok::Colon) {
+            if self.at(&Tok::RBracket) {
+                None
+            } else {
+                Some(Box::new(self.parse_expr()?))
+            }
+        } else {
+            None
+        };
+        Ok(Expr::Slice { lower, upper, step })
     }
 
     fn parse_args(&mut self) -> Result<Vec<Expr>, ParseError> {
@@ -952,6 +981,43 @@ mod tests {
             panic!("expected a while loop");
         };
         assert!(orelse.is_empty());
+    }
+
+    #[test]
+    fn slice_parses_with_optional_parts() {
+        let sub_index = |src| {
+            let m = parse_ok(src);
+            let Stmt::Expr(Expr::Subscript { index, .. }) = m.body.into_iter().next().unwrap()
+            else {
+                panic!("expected a subscript");
+            };
+            *index
+        };
+        assert!(matches!(
+            sub_index("s[1:3]\n"),
+            Expr::Slice {
+                lower: Some(_),
+                upper: Some(_),
+                step: None
+            }
+        ));
+        assert!(matches!(
+            sub_index("s[:]\n"),
+            Expr::Slice {
+                lower: None,
+                upper: None,
+                step: None
+            }
+        ));
+        assert!(matches!(
+            sub_index("s[::2]\n"),
+            Expr::Slice {
+                lower: None,
+                upper: None,
+                step: Some(_)
+            }
+        ));
+        assert!(matches!(sub_index("s[i]\n"), Expr::Name(_)));
     }
 
     #[test]

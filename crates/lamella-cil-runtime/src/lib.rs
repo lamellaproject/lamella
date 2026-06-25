@@ -11,6 +11,7 @@ pub mod interp;
 #[cfg(feature = "bcl")]
 pub mod intrinsics;
 pub mod module;
+pub mod net;
 pub mod object;
 pub mod trap;
 pub mod value;

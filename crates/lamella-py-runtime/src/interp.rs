@@ -309,6 +309,12 @@ fn exec(
                 let container = frame.pop()?;
                 frame.push(model.py_getitem(container, index)?);
             }
+            Op::BuildSlice => {
+                let step = frame.pop()?;
+                let upper = frame.pop()?;
+                let lower = frame.pop()?;
+                frame.push(model.new_slice(lower, upper, step)?);
+            }
             Op::PopTop => {
                 frame.pop()?;
             }
@@ -726,6 +732,35 @@ mod tests {
         );
         let r = run(&prog, &[], &[], &mut model).unwrap();
         assert_eq!(model.str_value(r), Some("ABC"));
+    }
+
+    #[test]
+    fn str_slice_through_the_interpreter() {
+        use Op::*;
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let prog = code(
+            0,
+            0,
+            vec![
+                Const::Str(String::from("hello")),
+                Const::Int(1),
+                Const::Int(4),
+                Const::None,
+            ],
+            Vec::new(),
+            1,
+            vec![
+                LoadConst(0),
+                LoadConst(1),
+                LoadConst(2),
+                LoadConst(3),
+                BuildSlice,
+                Subscript { cache: 0 },
+                Return,
+            ],
+        );
+        let r = run(&prog, &[], &[], &mut model).unwrap();
+        assert_eq!(model.str_value(r), Some("ell"));
     }
 
     #[test]

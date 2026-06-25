@@ -9,6 +9,9 @@ use alloc::vec::Vec;
 /// reference conversions that walk `model`'s inheritance graph (13.1).
 #[must_use]
 pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    if let TypeSymbol::ByRef(element) = to {
+        return from == element.as_ref();
+    }
     if matches!(from, TypeSymbol::Special(SpecialType::Null)) {
         return is_reference_type(model, to)
             || matches!(to, TypeSymbol::Special(SpecialType::Null));
@@ -109,7 +112,7 @@ fn is_reference_type(model: &Model, ty: &TypeSymbol) -> bool {
                 TypeKind::Class | TypeKind::Interface | TypeKind::Delegate
             )
         }),
-        TypeSymbol::Pointer(_) | TypeSymbol::Error => false,
+        TypeSymbol::Pointer(_) | TypeSymbol::ByRef(_) | TypeSymbol::Error => false,
     }
 }
 

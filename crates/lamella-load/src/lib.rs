@@ -38,6 +38,9 @@ use lamella_cil_runtime::intrinsics::{
     type_get_method, type_get_name, type_get_property,
     thread_start, thread_join, thread_yield, thread_sleep, monitor_enter, monitor_exit,
     monitor_try_enter, monitor_wait, monitor_pulse, monitor_pulse_all,
+    socket_connect_start, socket_connect_poll, socket_listen, socket_accept,
+    socket_send, socket_recv, socket_local_port, socket_close,
+    socket_udp_bind, socket_udp_send_to, socket_udp_recv_from,
 };
 #[cfg(feature = "gc")]
 use lamella_cil_runtime::intrinsics::{gc_collect, weak_make_cell, weak_read_cell, weak_write_cell};
@@ -1444,6 +1447,22 @@ fn bcl_intrinsic(
             _ => {}
         }
     }
+    if namespace == "System.Net.Sockets" && type_name == "Socket" {
+        match method {
+            "ConnectStart" => return Some(socket_connect_start),
+            "ConnectPoll" => return Some(socket_connect_poll),
+            "ListenStart" => return Some(socket_listen),
+            "AcceptPoll" => return Some(socket_accept),
+            "SendPoll" => return Some(socket_send),
+            "ReceivePoll" => return Some(socket_recv),
+            "LocalPort" => return Some(socket_local_port),
+            "CloseSocket" => return Some(socket_close),
+            "UdpBind" => return Some(socket_udp_bind),
+            "UdpSendTo" => return Some(socket_udp_send_to),
+            "UdpReceiveFrom" => return Some(socket_udp_recv_from),
+            _ => {}
+        }
+    }
     if namespace != "System" {
         return None;
     }
@@ -2111,15 +2130,16 @@ fn record_target_attributes(
             .map(|argument| attr_arg_to_value(argument, assembly, asm))
             .collect();
         let mut named_fields = Vec::new();
+        let mut named_properties = Vec::new();
         for named in &decoded.named {
-            let slot = if named.is_field {
-                attribute_field_slot(assembly, module, asm, type_id, named.name)
-            } else {
-                let backing = alloc::format!("<{}>k__BackingField", named.name);
-                attribute_field_slot(assembly, module, asm, type_id, &backing)
-            };
-            if let Some(slot) = slot {
-                named_fields.push((slot, attr_arg_to_value(&named.value, assembly, asm)));
+            if named.is_field {
+                if let Some(slot) = attribute_field_slot(assembly, module, asm, type_id, named.name) {
+                    named_fields.push((slot, attr_arg_to_value(&named.value, assembly, asm)));
+                }
+            } else if let Some(setter) =
+                attribute_setter_method(assembly, module, asm, type_id, named.name)
+            {
+                named_properties.push((setter, attr_arg_to_value(&named.value, assembly, asm)));
             }
         }
         module.add_custom_attribute(
@@ -2129,6 +2149,7 @@ fn record_target_attributes(
                 type_id,
                 positional,
                 named_fields,
+                named_properties,
             },
         );
     }
@@ -2154,6 +2175,31 @@ fn attribute_field_slot(
             }
             if field.name() == Some(name) {
                 return module.field_slot(asm, field.token());
+            }
+        }
+    }
+    None
+}
+
+/// The bound [`MethodId`] of the property setter `set_<name>` on the attribute type `type_id` (a
+/// same-module type) -- the method a named-PROPERTY custom-attribute argument invokes. Invoking the
+/// setter (rather than guessing a backing field) handles auto- AND explicit-property setters alike.
+/// `None` if the type declares no such setter.
+fn attribute_setter_method(
+    assembly: &Assembly,
+    module: &Module,
+    asm: u8,
+    type_id: TypeId,
+    name: &str,
+) -> Option<MethodId> {
+    let setter = alloc::format!("set_{name}");
+    for type_def in assembly.type_defs() {
+        if module.type_id_of(asm, type_def.token()) != Some(type_id) {
+            continue;
+        }
+        for method in type_def.methods() {
+            if method.name() == Some(setter.as_str()) {
+                return module.resolve(asm, Token::new(METHOD_DEF, method.rid()));
             }
         }
     }

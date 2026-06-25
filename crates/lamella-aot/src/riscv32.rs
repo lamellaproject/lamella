@@ -350,8 +350,26 @@ fn lower_inst(
                 enc.mv(reg(result), Reg::A0);
             }
         }
-        Inst::Load { address } => enc.lw(reg(result), reg(*address), 0),
-        Inst::Store { address, value } => enc.sw(reg(*value), reg(*address), 0),
+        Inst::Load {
+            address,
+            width,
+            signed,
+        } => match (*width, *signed) {
+            (1, true) => enc.lb(reg(result), reg(*address), 0),
+            (1, false) => enc.lbu(reg(result), reg(*address), 0),
+            (2, true) => enc.lh(reg(result), reg(*address), 0),
+            (2, false) => enc.lhu(reg(result), reg(*address), 0),
+            _ => enc.lw(reg(result), reg(*address), 0),
+        },
+        Inst::Store {
+            address,
+            value,
+            width,
+        } => match *width {
+            1 => enc.sb(reg(*value), reg(*address), 0),
+            2 => enc.sh(reg(*value), reg(*address), 0),
+            _ => enc.sw(reg(*value), reg(*address), 0),
+        },
         Inst::FieldLoad { base, offset } => {
             if !is_pointer(value_types, *base) {
                 return Err(LowerError::Unsupported);
@@ -619,15 +637,33 @@ fn lower_inst_spilled(
             materialize_compare(enc, t2, t0, t1, *op);
             enc.sw(t2, Reg::SP, slot(result));
         }
-        Inst::Load { address } => {
+        Inst::Load {
+            address,
+            width,
+            signed,
+        } => {
             enc.lw(t0, Reg::SP, slot(*address));
-            enc.lw(t1, t0, 0);
+            match (*width, *signed) {
+                (1, true) => enc.lb(t1, t0, 0),
+                (1, false) => enc.lbu(t1, t0, 0),
+                (2, true) => enc.lh(t1, t0, 0),
+                (2, false) => enc.lhu(t1, t0, 0),
+                _ => enc.lw(t1, t0, 0),
+            }
             enc.sw(t1, Reg::SP, slot(result));
         }
-        Inst::Store { address, value } => {
+        Inst::Store {
+            address,
+            value,
+            width,
+        } => {
             enc.lw(t0, Reg::SP, slot(*address));
             enc.lw(t1, Reg::SP, slot(*value));
-            enc.sw(t1, t0, 0);
+            match *width {
+                1 => enc.sb(t1, t0, 0),
+                2 => enc.sh(t1, t0, 0),
+                _ => enc.sw(t1, t0, 0),
+            }
         }
         Inst::FieldLoad { base, offset } => {
             if !is_pointer(value_types, *base) {
@@ -925,12 +961,15 @@ mod tests {
                         Inst::Store {
                             address: ValueId(6),
                             value: ValueId(5),
+                            width: 4,
                         },
                     ),
                     (
                         ValueId(8),
                         Inst::Load {
                             address: ValueId(6),
+                            width: 4,
+                            signed: false,
                         },
                     ),
                 ],

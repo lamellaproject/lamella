@@ -2,6 +2,7 @@
 
 use crate::interp::{Session, Vm};
 use crate::module::{AttrValue, Module};
+use crate::net::{Interest, NetResult};
 use crate::object::{Object, ObjectRef, decode_string};
 use crate::trap::Trap;
 use crate::value::Value;
@@ -3403,6 +3404,359 @@ pub fn thread_sleep(
     Ok(None)
 }
 
+
+/// Returned when a socket op parked the thread; the managed caller re-invokes it on wake.
+const WOULD_BLOCK: i32 = -1;
+/// Returned when a socket op failed; the managed caller throws a `SocketException`.
+const SOCK_ERROR: i32 = -2;
+
+/// Decodes a socket-handle argument (a non-negative `int`) at `args[index]`.
+fn socket_arg(args: &[Value], index: usize) -> Result<u32, Trap> {
+    match args.get(index) {
+        Some(&Value::Int32(handle)) => Ok(handle as u32),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// Reads a managed `byte[]` IP address (4 octets IPv4 / 16 IPv6, network order) into a byte vector
+/// for the seam, which picks the address family from the length.
+fn read_addr_bytes(vm: &mut Vm, array: ObjectRef) -> alloc::vec::Vec<u8> {
+    let len = vm.heap_mut().array_len(array).unwrap_or(0);
+    let mut bytes = alloc::vec![0u8; len];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        if let Some(Value::Int32(octet)) = vm.heap_mut().array_get(array, i) {
+            *slot = octet as u8;
+        }
+    }
+    bytes
+}
+
+/// `Socket.ConnectStart(int addr, int port)`: opens a TCP socket and begins connecting (IPv4, host
+/// byte order). Returns the socket handle (>= 0) immediately, or `SOCK_ERROR`; the managed caller then
+/// loops on `ConnectPoll` until the connection completes.
+pub fn socket_connect_start(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(addr_array)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(port)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let addr = read_addr_bytes(vm, addr_array);
+    let result = match vm.net_backend() {
+        Some(backend) => backend.tcp_connect(&addr, port as u16),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    Ok(Some(Value::Int32(match result {
+        NetResult::Ready(handle) => handle as i32,
+        _ => SOCK_ERROR,
+    })))
+}
+
+/// `Socket.ConnectPoll(int handle)`: `0` connected, `WOULD_BLOCK` still connecting (the thread parks
+/// for writability), `SOCK_ERROR` the connect failed.
+pub fn socket_connect_poll(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let result = match vm.net_backend() {
+        Some(backend) => backend.connect_check(handle),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    Ok(Some(Value::Int32(match result {
+        NetResult::Ready(()) => 0,
+        NetResult::WouldBlock => {
+            vm.request_block_on_io(handle, Interest::Write);
+            WOULD_BLOCK
+        }
+        NetResult::Error => SOCK_ERROR,
+    })))
+}
+
+/// `Socket.ListenStart(int addr, int port, int backlog)`: binds a TCP listener (port 0 = ephemeral)
+/// and begins listening. Returns the listener handle (>= 0) or `SOCK_ERROR`.
+pub fn socket_listen(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(addr_array)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(port)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(backlog)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let addr = read_addr_bytes(vm, addr_array);
+    let result = match vm.net_backend() {
+        Some(backend) => backend.tcp_listen(&addr, port as u16, backlog),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    Ok(Some(Value::Int32(match result {
+        NetResult::Ready(handle) => handle as i32,
+        _ => SOCK_ERROR,
+    })))
+}
+
+/// `Socket.AcceptPoll(int listener)`: a newly accepted connection's handle (>= 0), `WOULD_BLOCK` (no
+/// connection pending -- the thread parks for readability), or `SOCK_ERROR`.
+pub fn socket_accept(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let listener = socket_arg(args, 0)?;
+    let result = match vm.net_backend() {
+        Some(backend) => backend.accept(listener),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    Ok(Some(Value::Int32(match result {
+        NetResult::Ready(handle) => handle as i32,
+        NetResult::WouldBlock => {
+            vm.request_block_on_io(listener, Interest::Read);
+            WOULD_BLOCK
+        }
+        NetResult::Error => SOCK_ERROR,
+    })))
+}
+
+/// `Socket.SendPoll(int handle, byte[] buffer, int offset, int count)`: bytes sent (>= 0),
+/// `WOULD_BLOCK` (the send buffer is full -- the thread parks for writability), or `SOCK_ERROR`.
+pub fn socket_send(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(offset)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(count)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let mut buf = alloc::vec![0u8; count];
+    for (i, slot) in buf.iter_mut().enumerate() {
+        if let Some(Value::Int32(byte)) = vm.heap_mut().array_get(array, offset + i) {
+            *slot = byte as u8;
+        }
+    }
+    let result = match vm.net_backend() {
+        Some(backend) => backend.send(handle, &buf),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    Ok(Some(Value::Int32(match result {
+        NetResult::Ready(n) => n as i32,
+        NetResult::WouldBlock => {
+            vm.request_block_on_io(handle, Interest::Write);
+            WOULD_BLOCK
+        }
+        NetResult::Error => SOCK_ERROR,
+    })))
+}
+
+/// `Socket.ReceivePoll(int handle, byte[] buffer, int offset, int count)`: bytes received (>= 0; `0`
+/// = the peer closed cleanly), `WOULD_BLOCK` (no data yet -- the thread parks for readability), or
+/// `SOCK_ERROR`.
+pub fn socket_recv(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(offset)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(count)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let mut buf = alloc::vec![0u8; count];
+    let result = match vm.net_backend() {
+        Some(backend) => backend.recv(handle, &mut buf),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    match result {
+        NetResult::Ready(n) => {
+            for i in 0..n {
+                vm.heap_mut()
+                    .array_set(array, offset + i, Value::Int32(i32::from(buf[i])));
+            }
+            Ok(Some(Value::Int32(n as i32)))
+        }
+        NetResult::WouldBlock => {
+            vm.request_block_on_io(handle, Interest::Read);
+            Ok(Some(Value::Int32(WOULD_BLOCK)))
+        }
+        NetResult::Error => Ok(Some(Value::Int32(SOCK_ERROR))),
+    }
+}
+
+/// `Socket.LocalPort(int handle)`: the local port the socket/listener is bound to, or `-1`.
+pub fn socket_local_port(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let port = match vm.net_backend() {
+        Some(backend) => backend.local_port(handle),
+        None => None,
+    };
+    Ok(Some(Value::Int32(port.map_or(-1, i32::from))))
+}
+
+/// `Socket.CloseSocket(int handle)`: closes a socket or listener and releases its handle.
+pub fn socket_close(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    if let Some(backend) = vm.net_backend() {
+        backend.close(handle);
+    }
+    Ok(None)
+}
+
+/// `Socket.UdpBind(byte[] addr, int port)`: opens a UDP socket bound to `addr:port`. Returns the
+/// handle (>= 0) or `SOCK_ERROR`.
+pub fn socket_udp_bind(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(addr_array)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(port)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let addr = read_addr_bytes(vm, addr_array);
+    let result = match vm.net_backend() {
+        Some(backend) => backend.udp_bind(&addr, port as u16),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    Ok(Some(Value::Int32(match result {
+        NetResult::Ready(handle) => handle as i32,
+        _ => SOCK_ERROR,
+    })))
+}
+
+/// `Socket.UdpSendTo(int handle, byte[] buffer, int offset, int count, byte[] addr, int port)`: sends
+/// one datagram. Returns bytes sent (>= 0), `WOULD_BLOCK`, or `SOCK_ERROR`.
+pub fn socket_udp_send_to(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(offset)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(count)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(addr_array)) = args.get(4) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(port)) = args.get(5) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let mut buf = alloc::vec![0u8; count];
+    for (i, slot) in buf.iter_mut().enumerate() {
+        if let Some(Value::Int32(byte)) = vm.heap_mut().array_get(array, offset + i) {
+            *slot = byte as u8;
+        }
+    }
+    let addr = read_addr_bytes(vm, addr_array);
+    let result = match vm.net_backend() {
+        Some(backend) => backend.udp_send_to(handle, &buf, &addr, port as u16),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    Ok(Some(Value::Int32(match result {
+        NetResult::Ready(n) => n as i32,
+        NetResult::WouldBlock => {
+            vm.request_block_on_io(handle, Interest::Write);
+            WOULD_BLOCK
+        }
+        NetResult::Error => SOCK_ERROR,
+    })))
+}
+
+/// `Socket.UdpReceiveFrom(int handle, byte[] buffer, int offset, int count, byte[] senderAddr,
+/// int[] senderMeta)`: receives one datagram, writing the sender's address octets into `senderAddr`
+/// and `[addrLen, port]` into `senderMeta`. Returns bytes received (>= 0; the datagram is truncated to
+/// `count`), `WOULD_BLOCK`, or `SOCK_ERROR`.
+pub fn socket_udp_recv_from(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(offset)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(count)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(sender_addr_array)) = args.get(4) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(sender_meta_array)) = args.get(5) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let mut buf = alloc::vec![0u8; count];
+    let mut sender = alloc::vec![0u8; 16];
+    let result = match vm.net_backend() {
+        Some(backend) => backend.udp_recv_from(handle, &mut buf, &mut sender),
+        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    };
+    match result {
+        NetResult::Ready((n, addr_len, port)) => {
+            for i in 0..n {
+                vm.heap_mut()
+                    .array_set(array, offset + i, Value::Int32(i32::from(buf[i])));
+            }
+            for i in 0..addr_len {
+                vm.heap_mut()
+                    .array_set(sender_addr_array, i, Value::Int32(i32::from(sender[i])));
+            }
+            vm.heap_mut()
+                .array_set(sender_meta_array, 0, Value::Int32(addr_len as i32));
+            vm.heap_mut()
+                .array_set(sender_meta_array, 1, Value::Int32(i32::from(port)));
+            Ok(Some(Value::Int32(n as i32)))
+        }
+        NetResult::WouldBlock => {
+            vm.request_block_on_io(handle, Interest::Read);
+            Ok(Some(Value::Int32(WOULD_BLOCK)))
+        }
+        NetResult::Error => Ok(Some(Value::Int32(SOCK_ERROR))),
+    }
+}
+
 /// `System.Threading.Monitor.EnterLock(object)`: acquires the per-object lock for the running
 /// thread. If the object is free or already owned by this thread (a recursive `lock`) the thread
 /// holds it and proceeds into the critical section. On contention the thread is queued in the lock's
@@ -4568,6 +4922,11 @@ fn instantiate_attribute(
         let materialized = materialize_attr_value(vm, value);
         vm.heap_mut()
             .set_instance_field(instance, *slot, materialized);
+    }
+    for (setter, value) in &attribute.named_properties {
+        let materialized = materialize_attr_value(vm, value);
+        Session::new(module, *setter, alloc::vec![Value::Object(instance), materialized])?
+            .run(module, vm)?;
     }
     Ok(instance)
 }

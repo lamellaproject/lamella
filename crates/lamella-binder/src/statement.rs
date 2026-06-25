@@ -399,10 +399,7 @@ impl Binder {
                     .as_ref()
                     .map(|block| Box::new(self.bind_statement(block))),
             },
-            StmtKind::Lock { expression, body } => BoundStmtKind::Lock {
-                expression: self.bind_expression(expression),
-                body: Box::new(self.bind_statement(body)),
-            },
+            StmtKind::Lock { expression, body } => self.bind_lock(expression, body),
             StmtKind::Using { resource, body } => self.bind_using(resource, body),
             StmtKind::Fixed {
                 ty,
@@ -659,24 +656,200 @@ impl Binder {
         Some(BoundStmtKind::Block(alloc::vec![enumerator_decl, loop_stmt]))
     }
 
+    /// Desugars `lock (x) body` (15.12) to the monitor pattern: evaluate `x` once into an
+    /// `object` temp, `Monitor.Enter` it, then `try { body } finally { Monitor.Exit }`. 1st-ed
+    /// CIL puts Enter before the try (the `ref taken` overload is 2.0+); the locking is identical.
+    fn bind_lock(&mut self, expression: &Expr, body: &Stmt) -> BoundStmtKind {
+        let span = expression.span;
+        let object_ty = TypeSymbol::Special(SpecialType::Object);
+        let void_ty = TypeSymbol::Special(SpecialType::Void);
+        let monitor: TypeSymbol = {
+            let parts: alloc::vec::Vec<Box<str>> =
+                alloc::vec!["System".into(), "Threading".into(), "Monitor".into()];
+            TypeSymbol::Named(parts.into_boxed_slice())
+        };
+        let lock_obj: Box<str> = format!("<lock>{}", span.start).into();
+        let monitor_call = |name: &str| BoundStmt {
+            kind: BoundStmtKind::Expression(BoundExpr {
+                kind: BoundExprKind::Call {
+                    callee: Box::new(BoundExpr {
+                        kind: BoundExprKind::MethodGroup {
+                            receiver: Box::new(BoundExpr {
+                                kind: BoundExprKind::TypeReference(monitor.clone()),
+                                ty: monitor.clone(),
+                            }),
+                            name: name.into(),
+                        },
+                        ty: TypeSymbol::Error,
+                    }),
+                    arguments: alloc::vec![BoundExpr {
+                        kind: BoundExprKind::Local(lock_obj.clone()),
+                        ty: object_ty.clone(),
+                    }],
+                    method: Some(MethodReference {
+                        declaring_type: monitor.clone(),
+                        name: name.into(),
+                        parameters: alloc::vec![object_ty.clone()],
+                        return_type: void_ty.clone(),
+                        is_static: true,
+                    }),
+                },
+                ty: void_ty.clone(),
+            }),
+            span,
+        };
+        let held = self.bind_expression(expression);
+        let held = self.convert(held, &object_ty);
+        let lock_decl = BoundStmt {
+            kind: BoundStmtKind::Local {
+                ty: object_ty.clone(),
+                declarators: alloc::vec![BoundDeclarator {
+                    name: lock_obj.clone(),
+                    initializer: Some(held),
+                }],
+            },
+            span,
+        };
+        let bound_body = self.bind_statement(body);
+        let guarded = BoundStmt {
+            kind: BoundStmtKind::Try {
+                body: Box::new(bound_body),
+                catches: Vec::new(),
+                finally: Some(Box::new(BoundStmt {
+                    kind: BoundStmtKind::Block(alloc::vec![monitor_call("Exit")]),
+                    span,
+                })),
+            },
+            span,
+        };
+        BoundStmtKind::Block(alloc::vec![lock_decl, monitor_call("Enter"), guarded])
+    }
+
+    /// Desugars `using (resource) body` (15.13) to `try`/`finally` that disposes the resource:
+    /// `{ <resource decl>; try { body } finally { IDisposable __d = r as IDisposable;
+    /// if (__d != null) __d.Dispose(); } }`. A declaration's resources are disposed in reverse
+    /// (nested-using order); an expression resource is held in a temp. The `as`+null-check form
+    /// is conformant (a null resource is a no-op), like the foreach `Dispose` (15.8.4).
     fn bind_using(&mut self, resource: &UsingResource, body: &Stmt) -> BoundStmtKind {
         self.enter_scope();
-        let resource = match resource {
+        let mut resource_decls: alloc::vec::Vec<BoundStmt> = Vec::new();
+        let mut resources: alloc::vec::Vec<(Box<str>, TypeSymbol)> = Vec::new();
+        match resource {
             UsingResource::Declaration { ty, declarators } => {
+                let resource_ty = self.resolve_named_type(&bind_type(ty), ty.span);
                 let kind = self.bind_local(ty, declarators);
-                alloc::vec![BoundStmt {
-                    kind,
-                    span: ty.span,
-                }]
+                resource_decls.push(BoundStmt { kind, span: ty.span });
+                for declarator in declarators {
+                    resources.push((declarator.name.clone(), resource_ty.clone()));
+                }
             }
-            UsingResource::Expression(expression) => alloc::vec![BoundStmt {
-                kind: BoundStmtKind::Expression(self.bind_expression(expression)),
-                span: expression.span,
-            }],
-        };
-        let body = Box::new(self.bind_statement(body));
+            UsingResource::Expression(expression) => {
+                let span = expression.span;
+                let bound = self.bind_expression(expression);
+                let resource_ty = bound.ty.clone();
+                let temp: Box<str> = format!("<using>{}", span.start).into();
+                resource_decls.push(BoundStmt {
+                    kind: BoundStmtKind::Local {
+                        ty: resource_ty.clone(),
+                        declarators: alloc::vec![BoundDeclarator {
+                            name: temp.clone(),
+                            initializer: Some(bound),
+                        }],
+                    },
+                    span,
+                });
+                resources.push((temp, resource_ty));
+            }
+        }
+        let bound_body = self.bind_statement(body);
         self.exit_scope();
-        BoundStmtKind::Using { resource, body }
+
+        let span = body.span;
+        let idisposable: TypeSymbol = {
+            let parts: alloc::vec::Vec<Box<str>> =
+                alloc::vec!["System".into(), "IDisposable".into()];
+            TypeSymbol::Named(parts.into_boxed_slice())
+        };
+        let Some(dispose) = self.resolve_instance_method(&idisposable, "Dispose", span) else {
+            resource_decls.push(bound_body);
+            return BoundStmtKind::Block(resource_decls);
+        };
+        let mut finally_stmts: alloc::vec::Vec<BoundStmt> = Vec::new();
+        for (index, (name, resource_ty)) in resources.iter().enumerate().rev() {
+            let disposable: Box<str> = format!("<dispose>{}_{}", span.start, index).into();
+            let disposable_ref = || BoundExpr {
+                kind: BoundExprKind::Local(disposable.clone()),
+                ty: idisposable.clone(),
+            };
+            finally_stmts.push(BoundStmt {
+                kind: BoundStmtKind::Local {
+                    ty: idisposable.clone(),
+                    declarators: alloc::vec![BoundDeclarator {
+                        name: disposable.clone(),
+                        initializer: Some(BoundExpr {
+                            kind: BoundExprKind::TypeTest {
+                                operation: lamella_syntax::ast::TypeTestOperation::As,
+                                operand: Box::new(BoundExpr {
+                                    kind: BoundExprKind::Local(name.clone()),
+                                    ty: resource_ty.clone(),
+                                }),
+                                target: idisposable.clone(),
+                            },
+                            ty: idisposable.clone(),
+                        }),
+                    }],
+                },
+                span,
+            });
+            finally_stmts.push(BoundStmt {
+                kind: BoundStmtKind::If {
+                    condition: BoundExpr {
+                        kind: BoundExprKind::Binary {
+                            operator: lamella_syntax::ast::BinaryOperator::NotEqual,
+                            left: Box::new(disposable_ref()),
+                            right: Box::new(BoundExpr {
+                                kind: BoundExprKind::Literal(Literal::Null),
+                                ty: TypeSymbol::Special(SpecialType::Object),
+                            }),
+                            checked: false,
+                        },
+                        ty: TypeSymbol::Special(SpecialType::Boolean),
+                    },
+                    then_branch: Box::new(BoundStmt {
+                        kind: BoundStmtKind::Expression(BoundExpr {
+                            kind: BoundExprKind::Call {
+                                callee: Box::new(BoundExpr {
+                                    kind: BoundExprKind::MethodGroup {
+                                        receiver: Box::new(disposable_ref()),
+                                        name: dispose.name.clone(),
+                                    },
+                                    ty: TypeSymbol::Error,
+                                }),
+                                arguments: Vec::new(),
+                                method: Some(dispose.clone()),
+                            },
+                            ty: dispose.return_type.clone(),
+                        }),
+                        span,
+                    }),
+                    else_branch: None,
+                },
+                span,
+            });
+        }
+        let guarded = BoundStmt {
+            kind: BoundStmtKind::Try {
+                body: Box::new(bound_body),
+                catches: Vec::new(),
+                finally: Some(Box::new(BoundStmt {
+                    kind: BoundStmtKind::Block(finally_stmts),
+                    span,
+                })),
+            },
+            span,
+        };
+        resource_decls.push(guarded);
+        BoundStmtKind::Block(resource_decls)
     }
 
     /// Binds a `fixed (T* name = init) body`: `init` (an array/string) is pinned, and `name`

@@ -332,14 +332,35 @@ pub const EXEC_TEXT_OFFSET: u32 = EHDR_SIZE + 32;
 /// the matching `lamella_link::link_at_base`. `base` must be page-aligned (a multiple of `p_align`
 /// = 0x1000) so the file-offset-0 mapping satisfies the loader.
 pub fn write_executable(machine: Machine, text: &[u8], entry_offset: u32, base: u32) -> Vec<u8> {
-    write_executable_impl(machine, text, entry_offset, base, false)
+    write_executable_impl(machine, text, entry_offset, base, false, None)
 }
 
 /// As [`write_executable`], but for an ARM Thumb entry: `e_entry` gets its low bit set so the loader
 /// (the Linux/`qemu-arm` ELF loader keys ARM-vs-Thumb start state off `e_entry & 1`) enters Thumb
 /// state. Our AArch32 backend emits Thumb (thumbv6m), so a hosted ARM image starts here.
 pub fn write_executable_arm_thumb(text: &[u8], entry_offset: u32, base: u32) -> Vec<u8> {
-    write_executable_impl(Machine::Arm, text, entry_offset, base, true)
+    write_executable_impl(Machine::Arm, text, entry_offset, base, true, None)
+}
+
+/// As [`write_executable_arm_thumb`], but the load segment is WRITABLE and extends to cover a
+/// zero-filled heap region at `base + heap_offset` of `heap_size` bytes (a `.bss`-style reservation).
+/// A program with a fixed-address bump allocator (the runtime-allocator stand-in) writes its objects
+/// there. `heap_offset` must clear the code, which sits right after the headers.
+pub fn write_executable_arm_thumb_with_heap(
+    text: &[u8],
+    entry_offset: u32,
+    base: u32,
+    heap_offset: u32,
+    heap_size: u32,
+) -> Vec<u8> {
+    write_executable_impl(
+        Machine::Arm,
+        text,
+        entry_offset,
+        base,
+        true,
+        Some((heap_offset, heap_size)),
+    )
 }
 
 fn write_executable_impl(
@@ -348,6 +369,7 @@ fn write_executable_impl(
     entry_offset: u32,
     base: u32,
     entry_thumb: bool,
+    heap: Option<(u32, u32)>,
 ) -> Vec<u8> {
     const PHDR_SIZE: u32 = 32;
     let text_off = EHDR_SIZE + PHDR_SIZE;
@@ -375,9 +397,13 @@ fn write_executable_impl(
     push_u32(&mut out, 0);
     push_u32(&mut out, base);
     push_u32(&mut out, base);
+    let (memsz, flags) = match heap {
+        Some((offset, size)) => (offset + size, 0x4 | 0x2 | 0x1),
+        None => (total, 0x4 | 0x1),
+    };
     push_u32(&mut out, total);
-    push_u32(&mut out, total);
-    push_u32(&mut out, 0x4 | 0x1);
+    push_u32(&mut out, memsz);
+    push_u32(&mut out, flags);
     push_u32(&mut out, 0x1000);
     out.extend_from_slice(text);
     out

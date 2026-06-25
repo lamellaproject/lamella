@@ -45,6 +45,7 @@ pub fn bind_compilation_unit_with_model(
     mut model: Model,
 ) -> Vec<Diagnostic> {
     collect_into(&mut model, unit);
+    model.canonicalize_signatures();
     model.link_bases();
     let mut binder = Binder::with_model(model);
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
@@ -242,7 +243,7 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             Member::Field {
                 ty, declarators, ..
             } => {
-                let field_ty = bind_type(ty);
+                let field_ty = binder.canonicalize(&bind_type(ty));
                 for declarator in declarators {
                     if let Some(initializer) = &declarator.initializer {
                         binder.bind_field_initializer(enclosing.clone(), &field_ty, initializer);

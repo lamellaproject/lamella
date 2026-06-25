@@ -116,6 +116,9 @@ fn lower_inst(
         Inst::FuncAddr { .. } | Inst::CallIndirect { .. } | Inst::CallNative { .. } => {
             return Err(LowerError::CallUnsupported);
         }
+        Inst::CopyBlock { .. } | Inst::FillBlock { .. } => {
+            return Err(LowerError::CallUnsupported);
+        }
         Inst::ConstInt { value, .. } => {
             if let Ok(imm) = u8::try_from(*value) {
                 enc.movs_imm(assign(result), imm)
@@ -149,13 +152,19 @@ fn lower_inst(
             materialize_compare(enc, assign(result), assign(*lhs), assign(*rhs), *op)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::Store { address, value } => {
-            enc.str_imm(assign(*value), assign(*address), 0)
-                .map_err(|_| LowerError::TooManyValues)?;
+        Inst::Store {
+            address,
+            value,
+            width,
+        } => {
+            emit_sized_store(enc, assign(*value), assign(*address), *width)?;
         }
-        Inst::Load { address } => {
-            enc.ldr_imm(assign(result), assign(*address), 0)
-                .map_err(|_| LowerError::TooManyValues)?;
+        Inst::Load {
+            address,
+            width,
+            signed,
+        } => {
+            emit_sized_load(enc, assign(result), assign(*address), *width, *signed)?;
         }
         Inst::Convert { value, kind } => {
             if matches!(kind, ConvKind::Float32ToInt | ConvKind::IntToFloat32) {
@@ -678,19 +687,73 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.bind_label(done);
         }
-        Inst::Store { address, value } => {
+        Inst::Store {
+            address,
+            value,
+            width,
+        } => {
             enc.ldr_sp(Reg::R0, slot(*address))
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_sp(Reg::R1, slot(*value))
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.str_imm(Reg::R1, Reg::R0, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
+            emit_sized_store(enc, Reg::R1, Reg::R0, *width)?;
         }
-        Inst::Load { address } => {
+        Inst::Load {
+            address,
+            width,
+            signed,
+        } => {
             enc.ldr_sp(Reg::R0, slot(*address))
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_imm(Reg::R0, Reg::R0, 0)
+            emit_sized_load(enc, Reg::R0, Reg::R0, *width, *signed)?;
+        }
+        Inst::CopyBlock { dst, src, size } => {
+            enc.ldr_sp(Reg::R0, slot(*dst))
                 .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*src))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R2, slot(*size))
+                .map_err(|_| LowerError::TooManyValues)?;
+            let body = enc.new_label();
+            let test = enc.new_label();
+            enc.b(test);
+            enc.bind_label(body);
+            enc.ldrb_imm(Reg::R3, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.strb_imm(Reg::R3, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm3(Reg::R0, Reg::R0, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm3(Reg::R1, Reg::R1, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.subs_imm3(Reg::R2, Reg::R2, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(test);
+            enc.cmp_imm(Reg::R2, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Ne, body);
+        }
+        Inst::FillBlock { dst, value, size } => {
+            enc.ldr_sp(Reg::R0, slot(*dst))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*value))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R2, slot(*size))
+                .map_err(|_| LowerError::TooManyValues)?;
+            let body = enc.new_label();
+            let test = enc.new_label();
+            enc.b(test);
+            enc.bind_label(body);
+            enc.strb_imm(Reg::R1, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm3(Reg::R0, Reg::R0, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.subs_imm3(Reg::R2, Reg::R2, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(test);
+            enc.cmp_imm(Reg::R2, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Ne, body);
         }
         Inst::FieldLoad { base, offset } => {
             let two_words = matches!(result_ty, Some(MirType::I64 | MirType::F64));
@@ -1015,6 +1078,49 @@ const STATIC_FIELD_BASE: u32 = 0x2000_1000;
 /// model lands, an out-of-range access aborts rather than throwing a catchable exception.
 fn emit_array_bounds_check(enc: &mut Encoder) -> Result<(), LowerError> {
     emit_dim_bounds_check(enc, 0)
+}
+
+/// Emits a `width`-byte store of `rt` to `[rn]` (offset 0): `strb` (1), `strh` (2), or `str` (4) --
+/// the indirect-store primitive shared by the register and spilled paths.
+fn emit_sized_store(enc: &mut Encoder, rt: Reg, rn: Reg, width: u32) -> Result<(), LowerError> {
+    match width {
+        1 => enc.strb_imm(rt, rn, 0),
+        2 => enc.strh_imm(rt, rn, 0),
+        _ => enc.str_imm(rt, rn, 0),
+    }
+    .map_err(|_| LowerError::TooManyValues)
+}
+
+/// Emits a `width`-byte load from `[rn]` into `rt` (offset 0), then sign-extends a sub-word result
+/// when `signed` (`ldrb`+`sxtb` / `ldrh`+`sxth` / `ldr`) -- the indirect-load primitive shared by the
+/// register and spilled paths. (Thumb-1 has no immediate-offset `ldrsb`/`ldrsh`, hence the extend.)
+fn emit_sized_load(
+    enc: &mut Encoder,
+    rt: Reg,
+    rn: Reg,
+    width: u32,
+    signed: bool,
+) -> Result<(), LowerError> {
+    match width {
+        1 => {
+            enc.ldrb_imm(rt, rn, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            if signed {
+                enc.sxtb(rt, rt).map_err(|_| LowerError::TooManyValues)?;
+            }
+        }
+        2 => {
+            enc.ldrh_imm(rt, rn, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            if signed {
+                enc.sxth(rt, rt).map_err(|_| LowerError::TooManyValues)?;
+            }
+        }
+        _ => enc
+            .ldr_imm(rt, rn, 0)
+            .map_err(|_| LowerError::TooManyValues)?,
+    }
+    Ok(())
 }
 
 /// Bounds-checks the index in `r1` against the dimension word at `[r0 + dim_offset]` (an array's
@@ -2341,6 +2447,8 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::CallIndirect { .. }
                     | Inst::CallNative { .. }
                     | Inst::FuncAddr { .. }
+                    | Inst::CopyBlock { .. }
+                    | Inst::FillBlock { .. }
             )
         })
     }) {
@@ -3018,7 +3126,7 @@ pub struct StackMapEntry {
     pub ref_offsets: Vec<u16>,
     /// Byte offsets from SP-at-the-call of the live `PyValue` roots -- tagged words the collector
     /// traces only when the tag marks a heap pointer (the scan-by-tag predicate). Empty for a C#
-    /// image. See `docs/python-mir-seams.md`.
+    /// image.
     pub tagged_offsets: Vec<u16>,
 }
 
@@ -3190,9 +3298,9 @@ pub fn lower_module_gc_mapped(
         .map(|(bytes, maps, _)| (bytes, maps))
 }
 
-/// Addresses of the Python runtime-support entry points a `PyIntrinsic` calls -- first-light
-/// stand-ins for the linker-resolved `py_*` symbols. Each is `None` until that op is wired, so
-/// emitting an un-wired op errors ([`LowerError::CallUnsupported`]).
+/// Addresses of the Python runtime-support entry points a `PyIntrinsic` calls -- stand-ins for the
+/// linker-resolved `py_*` symbols. Each is `None` until that op is wired, so emitting an un-wired op
+/// errors ([`LowerError::CallUnsupported`]); only the wired ops are present.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PySupport {
     /// `py_getattr(receiver, name_id, cache_slot) -> PyValue` (r0, r1, r2 -> r0).
@@ -3204,10 +3312,9 @@ pub struct PySupport {
     pub call: Option<u32>,
 }
 
-/// Lowers a whole program with the Python runtime-support entries threaded (the first-light Python
-/// path): `alloc_addr` is the `lamella_gc_alloc` address (or `None`), `py_support` the per-op entry
-/// addresses a `PyIntrinsic` calls. Returns the image plus the GC [`StackMaps`] (carrying tagged
-/// `PyValue` roots).
+/// Lowers a whole program with the Python runtime-support entries threaded: `alloc_addr` is the
+/// `lamella_gc_alloc` address (or `None`), `py_support` the per-op entry addresses a `PyIntrinsic`
+/// calls. Returns the image plus the GC [`StackMaps`] (carrying tagged `PyValue` roots).
 pub fn lower_module_py(
     funcs: &[Function],
     alloc_addr: Option<u32>,
@@ -3284,18 +3391,47 @@ fn aeabi_float_compare(
     Some((alloc::format!("{prefix}{suffix}"), invert))
 }
 
-/// Rewrites each soft-float op to a `CallNative` to its `__aeabi_*` helper (interning the name), so
-/// the backend lowers float `+ - * /` and the comparisons through the external-call path the linker
-/// resolves against `libgcc.a`. Float stays a target-independent typed MIR op (the lead's layering
-/// decision); a hard-float (VFP) target would lower these inline instead -- a later knob. A comparison
-/// whose CLI form is a negation (the unordered compares, `!=`) expands to the ordered helper plus a
-/// logical-not (`== 0`), which is why the instruction list is rebuilt rather than edited in place.
-fn lower_float_ops(func: &Function, externs: &mut Vec<alloc::string::String>) -> Function {
+/// Rewrites the ops the object path resolves through the linker into `CallNative`s (interning each
+/// extern name): soft-float `+ - * /` and the comparisons to `__aeabi_*` helpers (against `libgcc.a`),
+/// and a heap allocation to `lamella_gc_alloc`. Float stays a target-independent typed MIR op; a
+/// hard-float (VFP) target would lower it inline instead -- a later knob. A comparison whose CLI form
+/// is a negation (the unordered compares, `!=`) expands to the ordered helper plus a logical-not
+/// (`== 0`), which is why the instruction list is rebuilt rather than edited in place.
+fn lower_runtime_calls(func: &Function, externs: &mut Vec<alloc::string::String>) -> Function {
     let mut func = func.clone();
     for bi in 0..func.blocks.len() {
         let old = core::mem::take(&mut func.blocks[bi].insts);
         let mut insts = Vec::with_capacity(old.len());
         for (result, inst) in old {
+            if let Inst::Alloc { payload_size, .. } = &inst {
+                let symbol = intern_extern(externs, "lamella_gc_alloc");
+                let size = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                let typedesc = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                insts.push((
+                    size,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i64::from(*payload_size),
+                    },
+                ));
+                insts.push((
+                    typedesc,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                ));
+                insts.push((
+                    result,
+                    Inst::CallNative {
+                        symbol,
+                        args: alloc::vec![size, typedesc],
+                    },
+                ));
+                continue;
+            }
             let plan = match &inst {
                 Inst::Binary { op, lhs, rhs } => {
                     aeabi_float_helper(*op, func.value_types.get(lhs.index()).copied())
@@ -3373,7 +3509,7 @@ pub fn lower_object(
     let mut externs: Vec<alloc::string::String> = extern_syms.iter().map(|s| (*s).into()).collect();
     let funcs: Vec<Function> = funcs
         .iter()
-        .map(|f| lower_float_ops(f, &mut externs))
+        .map(|f| lower_runtime_calls(f, &mut externs))
         .collect();
     let funcs = funcs.as_slice();
     let mut enc = Encoder::new();
@@ -3656,6 +3792,7 @@ mod tests {
                         Inst::Store {
                             address: ValueId(0),
                             value: ValueId(1),
+                            width: 4,
                         },
                     ),
                 ],
@@ -4126,6 +4263,8 @@ mod tests {
                         ValueId(1),
                         Inst::Load {
                             address: ValueId(0),
+                            width: 4,
+                            signed: false,
                         },
                     ),
                 ],
@@ -4193,6 +4332,7 @@ mod tests {
                         Inst::Store {
                             address: ValueId(0),
                             value: ValueId(1),
+                            width: 4,
                         },
                     ),
                 ],
@@ -5766,6 +5906,36 @@ mod tests {
         assert_eq!(
             obj.symbols[obj.relocations[0].symbol as usize].name,
             "__aeabi_fadd"
+        );
+    }
+
+    #[test]
+    fn lower_object_lowers_alloc_to_the_runtime_allocator() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: lamella_ir::TypeHandle(0),
+                        payload_size: 8,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "lamella_gc_alloc" && !s.defined),
+            "Alloc lowers to a call to the undefined lamella_gc_alloc"
         );
     }
 

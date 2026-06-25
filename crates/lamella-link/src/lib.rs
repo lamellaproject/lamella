@@ -1,4 +1,4 @@
-//! A minimal static linker over `lamella-elf` objects -- rung 2 of `docs/own-linker.md`.
+//! A minimal static linker over `lamella-elf` objects.
 
 #![no_std]
 

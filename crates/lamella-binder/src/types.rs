@@ -21,6 +21,13 @@ pub enum TypeSymbol {
     },
     /// An unsafe pointer type `T*` (III.1.1.5): a raw managed pointer to `element`.
     Pointer(Box<TypeSymbol>),
+    /// A managed-pointer (`ref`/`out`) parameter type `T&` (III.1.1.4.2): the referent is
+    /// `element`. It arises only on a method signature's parameter -- an external method's
+    /// `ref`/`out` parameter, preserved from its metadata so the minted MemberRef encodes the
+    /// byref (without it `bool.TryParse(string, out bool)` would call `(string, bool)` and
+    /// MissingMethod). For argument matching it behaves like its referent (a `ref`/`out` argument
+    /// already supplies the address); only the signature distinguishes it.
+    ByRef(Box<TypeSymbol>),
     /// A type that could not be resolved; emitted with a diagnostic so binding
     /// continues.
     Error,
@@ -76,6 +83,7 @@ impl fmt::Display for TypeSymbol {
                 f.write_str("]")
             }
             TypeSymbol::Pointer(element) => write!(f, "{element}*"),
+            TypeSymbol::ByRef(element) => write!(f, "ref {element}"),
             TypeSymbol::Error => f.write_str("<error>"),
         }
     }

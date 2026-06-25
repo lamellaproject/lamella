@@ -160,9 +160,8 @@ pub enum PyCmpOp {
 
 /// A dynamic-object operation for [`Inst::PyIntrinsic`] -- one entry of Python's abstract
 /// object protocol (CPython's `PyObject_*`/`PyNumber_*`/`tp_*` layer). Each names a single
-/// Python runtime-support entry point the backend calls. Beyond `Getattr` (first light) the
-/// catalog is PROVISIONAL: python-frontend owns the op set and grounds it in the official Python
-/// data-model reference; the un-wired ops reject in codegen. See `docs/python-mir-seams.md`.
+/// Python runtime-support entry point the backend calls. The op set follows the official Python
+/// data-model reference; an un-wired op rejects in codegen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PyOp {
     /// Attribute load `obj.name`. `args = [receiver]`; `name` is the attribute's index into the
@@ -327,8 +326,8 @@ pub enum Inst {
     /// substrate for soft-float helpers, P/Invoke, and the GC/Python support entries. `args` pass in
     /// the platform C ABI (ARM AAPCS, so an `f64` rides `r0:r1`); the result is the call's return
     /// value (typed by the producing op). The backend lowers it to a call plus an `R_<arch>_CALL_PLT`
-    /// relocation the linker resolves (e.g. against `libgcc.a`). A safepoint. Added per the lead's
-    /// 2026-06-24 seam decision; marshaling (by-ref structs, varargs, callbacks) layers on top later.
+    /// relocation the linker resolves (e.g. against `libgcc.a`). A safepoint. Marshaling (by-ref
+    /// structs, varargs, callbacks) layers on top later.
     CallNative {
         /// The index of the external symbol in the module's extern-symbol table.
         symbol: u32,
@@ -351,8 +350,8 @@ pub enum Inst {
     /// `cache` is the inline-cache SLOT index the frontend assigned (the runtime sizes the table by
     /// the code object's cache_count, so slot 0 is valid -- not "no cache"); the backend passes it to
     /// the entry, which reads/writes that RAM cache slot. The result type is `op.result_type()` (a
-    /// `PyValue`, a scalar `int32`, or an ignored placeholder for a side-effecting op). Added for the
-    /// Python frontend; the C# lowering never emits one. See `docs/python-mir-seams.md`.
+    /// `PyValue`, a scalar `int32`, or an ignored placeholder for a side-effecting op). Emitted by the
+    /// Python frontend; the C# lowering never emits one.
     PyIntrinsic {
         /// Which abstract-object operation this performs.
         op: PyOp,
@@ -361,20 +360,50 @@ pub enum Inst {
         /// The inline-cache slot index (sized by cache_count; slot 0 is valid, not "no cache").
         cache: u32,
     },
-    /// Stores `value` to the 32-bit memory address held in `address` -- the
-    /// memory-mapped-I/O write primitive. The write is a side effect; the
-    /// instruction's own result value is a placeholder that callers ignore.
+    /// Stores `value` to the memory address held in `address` -- the memory-mapped-I/O write
+    /// primitive. The write is a side effect; the instruction's own result value is a placeholder
+    /// that callers ignore.
     Store {
         /// The value holding the destination address.
         address: ValueId,
         /// The value to write there.
         value: ValueId,
+        /// The width in bytes of the store: 1 (`stind.i1` -> `strb`), 2 (`stind.i2` -> `strh`), or
+        /// 4 (`stind.i4` -> `str`). The low bits of `value` are written; the rest are ignored.
+        width: u32,
     },
-    /// Loads the 32-bit value at the memory address held in `address` -- the
-    /// memory-mapped-I/O read primitive. The instruction's result is the loaded value.
+    /// Loads the value at the memory address held in `address` -- the memory-mapped-I/O read
+    /// primitive. The instruction's result is the loaded value, a sub-word load sign- or
+    /// zero-extended to 32 bits.
     Load {
         /// The value holding the source address.
         address: ValueId,
+        /// The width in bytes of the load: 1 (`ldind.i1`/`u1`), 2 (`ldind.i2`/`u2`), or 4
+        /// (`ldind.i4`/`u4`).
+        width: u32,
+        /// Whether a sub-word load is sign-extended (`ldind.i1`/`i2` -> `ldrsb`/`ldrsh`) or
+        /// zero-extended (`ldind.u1`/`u2` -> `ldrb`/`ldrh`). Ignored at word width.
+        signed: bool,
+    },
+    /// Copies `size` bytes from `src` to `dst` -- the CLI's `cpblk` (a raw block copy / `memcpy`). A
+    /// side effect; the instruction's result is a placeholder callers ignore.
+    CopyBlock {
+        /// The destination address.
+        dst: ValueId,
+        /// The source address.
+        src: ValueId,
+        /// The number of bytes to copy.
+        size: ValueId,
+    },
+    /// Fills `size` bytes at `dst` with the low byte of `value` -- the CLI's `initblk` (a raw block
+    /// fill / `memset`). A side effect; the instruction's result is a placeholder callers ignore.
+    FillBlock {
+        /// The destination address.
+        dst: ValueId,
+        /// The fill byte (the low 8 bits of this value).
+        value: ValueId,
+        /// The number of bytes to fill.
+        size: ValueId,
     },
     /// Zero-initializes the value-type instance this defines -- the CLI's `initobj`. The
     /// result is the zeroed value type; its size comes from the result's [`MirType`].

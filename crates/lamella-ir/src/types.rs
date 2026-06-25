@@ -36,8 +36,7 @@ pub enum MirType {
     /// one -- the collector decodes the tag at a safepoint and traces the slot only
     /// when it holds a heap pointer (see [`MirType::is_tagged_value`] and the
     /// scan-by-tag stack map). The exact bit layout is the frontend's and the
-    /// runtime's contract (`docs/python-mir-seams.md`); the IR treats it as one
-    /// opaque word.
+    /// runtime's contract; the IR treats it as one opaque word.
     PyValue,
     /// A value-type instance: a `size`-byte struct laid out inline, identified by its
     /// layout [`TypeHandle`]. The size is carried for stack-slot allocation; field

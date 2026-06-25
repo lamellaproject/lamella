@@ -33,5 +33,9 @@ varargs = ["typed-references", "lamella-cil-runtime/varargs"]
 # The floating-point transcendentals (Math.Sqrt/Sin/Pow/...), via libm. See lamella-cil-runtime.
 math-transcendental = ["NETMFv4_4", "float", "lamella-cil-runtime/math-transcendental"]
 
+[dev-dependencies]
+# Host-only: the reactor's readiness poll for the run-with-corlib example's NetBackend (sockets).
+mio = { version = "1", features = ["net", "os-poll"] }
+
 [lints]
 workspace = true

@@ -60,6 +60,10 @@ pub struct LoadedAttribute {
     pub positional: Vec<AttrValue>,
     /// The named field assignments: `(field slot, value)`, applied after the ctor.
     pub named_fields: Vec<(u32, AttrValue)>,
+    /// The named PROPERTY assignments: `(setter MethodId, value)`, applied after the named fields by
+    /// INVOKING the setter -- so an explicit property's hand-written setter runs (not just an
+    /// auto-property's backing field).
+    pub named_properties: Vec<(MethodId, AttrValue)>,
 }
 
 /// Reflection metadata for a type, keyed by its asm-folded handle (the `System.Type` a `typeof`

@@ -1226,7 +1226,11 @@ fn compound_binary_operator(operator: AssignmentOperator) -> Option<BinaryOperat
     })
 }
 
-fn store_to(frame: &Frame, name: &str, out: &mut Vec<Instruction>) -> Result<(), EmitError> {
+pub(crate) fn store_to(
+    frame: &Frame,
+    name: &str,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
     match frame.slot(name) {
         Some(Slot::Local(slot)) => {
             out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)))

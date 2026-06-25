@@ -173,6 +173,10 @@ pub enum Op {
         /// This site's inline-cache slot, assigned by ascending static position.
         cache: u32,
     },
+    /// Pop the step, then upper, then lower bound (each a `None` on the stack when
+    /// omitted) and push `slice(lower, upper, step)`; the slice then feeds a `Subscript`.
+    /// Used for `s[i:j]` / `s[i:j:k]`.
+    BuildSlice,
     /// Pop the right operand then the left, and push `left <op> right`.
     Binary(BinOp),
     /// Pop the right operand then the left, and push the boolean `left <cmp> right`.
@@ -413,6 +417,7 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(13);
             put_u32(buf, *cache);
         }
+        Op::BuildSlice => buf.push(14),
     }
 }
 
@@ -585,6 +590,7 @@ impl<'a> Reader<'a> {
             13 => Op::Subscript {
                 cache: self.u32()?,
             },
+            14 => Op::BuildSlice,
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -714,6 +720,7 @@ mod tests {
             Op::Call(2),
             Op::Unary(UnaryOp::Neg),
             Op::Subscript { cache: 6 },
+            Op::BuildSlice,
             Op::Return,
         ];
         let mut buf = Vec::new();

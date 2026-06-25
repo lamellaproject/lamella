@@ -236,7 +236,10 @@ impl Model {
                 let (namespace, name) = special.full_name();
                 self.get(namespace, name)
             }
-            TypeSymbol::Array { .. } | TypeSymbol::Pointer(_) | TypeSymbol::Error => None,
+            TypeSymbol::Array { .. }
+            | TypeSymbol::Pointer(_)
+            | TypeSymbol::ByRef(_)
+            | TypeSymbol::Error => None,
         }
     }
 
@@ -362,6 +365,62 @@ impl Model {
             }
         }
         found
+    }
+
+    /// Rewrites every member signature's single-part named types to their canonical
+    /// fully-qualified form, so a type written `WeakReference` (resolved through a `using`)
+    /// is the SAME [`TypeSymbol`] as `System.WeakReference` -- one type, as conversions,
+    /// overload resolution, and identity all require. Source signatures arrive unqualified
+    /// (collected structurally by `bind_type`); reference signatures are already canonical, so
+    /// this is a no-op for them. Only UNAMBIGUOUS simple names are rewritten: a name declared in
+    /// two namespaces is left untouched for the using-aware use-site resolver. Run on the
+    /// complete model (references + source) before `link_bases`, so the base chain links canonical.
+    pub fn canonicalize_signatures(&mut self) {
+        let mut canon: BTreeMap<String, Option<TypeSymbol>> = BTreeMap::new();
+        for (namespace, type_name) in self.types.keys() {
+            match canon.get_mut(type_name.as_str()) {
+                Some(slot) => *slot = None,
+                None => {
+                    canon.insert(type_name.clone(), Some(symbol_from_key(namespace, type_name)));
+                }
+            }
+        }
+        for info in self.types.values_mut() {
+            for base in &mut info.bases {
+                canonicalize_type(base, &canon);
+            }
+            for field in &mut info.fields {
+                canonicalize_type(&mut field.ty, &canon);
+            }
+            for property in &mut info.properties {
+                canonicalize_type(&mut property.ty, &canon);
+            }
+            for event in &mut info.events {
+                canonicalize_type(&mut event.ty, &canon);
+            }
+            for method in &mut info.methods {
+                canonicalize_type(&mut method.return_type, &canon);
+                for parameter in &mut method.parameters {
+                    canonicalize_type(parameter, &canon);
+                }
+            }
+        }
+    }
+}
+
+/// Canonicalizes a single signature type in place (see [`Model::canonicalize_signatures`]):
+/// an unambiguous single-part named type becomes its full symbol; arrays and pointers recurse
+/// into their element type; everything else is left as is.
+fn canonicalize_type(ty: &mut TypeSymbol, canon: &BTreeMap<String, Option<TypeSymbol>>) {
+    match ty {
+        TypeSymbol::Named(parts) if parts.len() == 1 => {
+            if let Some(Some(full)) = canon.get(parts[0].as_ref()) {
+                *ty = full.clone();
+            }
+        }
+        TypeSymbol::Array { element, .. } => canonicalize_type(element, canon),
+        TypeSymbol::Pointer(inner) => canonicalize_type(inner, canon),
+        _ => {}
     }
 }
 
