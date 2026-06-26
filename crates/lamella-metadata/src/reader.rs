@@ -988,6 +988,49 @@ impl<'a> Assembly<'a> {
         map
     }
 
+    /// The methods marked `[UnmanagedCallersOnly]` (II.22.10 scan, matched by the attribute type name
+    /// regardless of namespace, so a clean-room Lamella attribute of that name works too), each mapped to
+    /// its EXPORT-NAME override: the attribute's `EntryPoint` named argument if present, else `None` (the
+    /// AOT then uses the method's own name). Naming a method this way makes it a global symbol the linker
+    /// resolves a `CallNative` against -- so a managed method can BACK a native seam: a C# `lamella_gc_alloc`
+    /// the AOT's own `new` then calls. One pass over CustomAttribute (like
+    /// [`Assembly::conditional_symbols`]) to avoid an O(rows)-per-method scan of the BCL.
+    #[must_use]
+    pub fn unmanaged_callers_only(&self) -> BTreeMap<u32, Option<Box<str>>> {
+        let mut exports = BTreeMap::new();
+        for index in 1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE) {
+            let Some(row) = self.tables.row(table::CUSTOM_ATTRIBUTE, index) else {
+                continue;
+            };
+            let parent = row.token(0);
+            if parent.table() != table::METHOD_DEF {
+                continue;
+            }
+            let is_unmanaged_callers_only = self
+                .resolve_method(row.token(1))
+                .and_then(|target| target.declaring_type)
+                .is_some_and(|name| name.name == "UnmanagedCallersOnlyAttribute");
+            if !is_unmanaged_callers_only {
+                continue;
+            }
+            let blob = self.image.blob().get(row.raw(2)).unwrap_or(&[]);
+            let entry_point =
+                decode_custom_attribute(blob, &[], &|_| element::I4).and_then(|decoded| {
+                    decoded
+                        .named
+                        .into_iter()
+                        .find_map(|named| match named.value {
+                            AttrArg::Str(s) if named.name == "EntryPoint" => {
+                                Some(Box::<str>::from(s))
+                            }
+                            _ => None,
+                        })
+                });
+            exports.insert(parent.row(), entry_point);
+        }
+        exports
+    }
+
     /// The constant value attached to `parent` (a Field/Param/Property token),
     /// from the `Constant` table (II.22.9), or `None` if it has no constant.
     #[must_use]
@@ -1726,7 +1769,8 @@ mod tests {
     #[test]
     fn decodes_positional_int_and_string_arguments() {
         let blob = [
-            0x01, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x06, b'a', b'n', b's', b'w', b'e', b'r', 0x00, 0x00,
+            0x01, 0x00, 0x2a, 0x00, 0x00, 0x00, 0x06, b'a', b'n', b's', b'w', b'e', b'r', 0x00,
+            0x00,
         ];
         let decoded =
             decode_custom_attribute(&blob, &[SigType::I4, SigType::String], &|_| element::I4)
@@ -1738,9 +1782,9 @@ mod tests {
     #[test]
     fn decodes_named_string_and_enum_arguments() {
         let blob = [
-            0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x53, 0x0e, 0x04, b'N', b'o', b't', b'e',
-            0x02, b'h', b'i', 0x53, 0x55, 0x05, b'C', b'o', b'l', b'o', b'r', 0x05, b'S', b'h', b'a',
-            b'd', b'e', 0x28, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x53, 0x0e, 0x04, b'N', b'o', b't',
+            b'e', 0x02, b'h', b'i', 0x53, 0x55, 0x05, b'C', b'o', b'l', b'o', b'r', 0x05, b'S',
+            b'h', b'a', b'd', b'e', 0x28, 0x00, 0x00, 0x00,
         ];
         let decoded = decode_custom_attribute(&blob, &[SigType::I4], &|name| {
             assert_eq!(name, "Color");
@@ -1768,8 +1812,8 @@ mod tests {
     #[test]
     fn decodes_named_typeof_argument() {
         let blob = [
-            0x01, 0x00, 0x01, 0x00, 0x53, 0x50, 0x04, b'K', b'i', b'n', b'd', 0x07, b'P', b'r', b'o',
-            b'g', b'r', b'a', b'm',
+            0x01, 0x00, 0x01, 0x00, 0x53, 0x50, 0x04, b'K', b'i', b'n', b'd', 0x07, b'P', b'r',
+            b'o', b'g', b'r', b'a', b'm',
         ];
         let decoded = decode_custom_attribute(&blob, &[], &|_| element::I4).unwrap();
         assert!(decoded.fixed.is_empty());

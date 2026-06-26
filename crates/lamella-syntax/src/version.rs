@@ -10,13 +10,21 @@ use core::fmt;
 ///
 /// Ordering follows release order, so `>=` is the natural way to ask whether a
 /// version is recent enough for a given feature.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum LanguageVersion {
     /// C# 1.0, as standardised by ECMA-334 1st edition (December 2001).
+    #[default]
     CSharp1,
-    /// C# 2.0. Present only to gate post-1.0 features; not yet implemented.
+    /// C# 2.0 (ECMA-334 3rd ed). Present only to gate post-1.0 features; not yet implemented.
     CSharp2,
+    /// C# 3.0. A gating label only; not yet implemented.
+    CSharp3,
+    /// C# 6.0 (ECMA-334 6th ed, 2022). A gating label only; not yet implemented.
+    CSharp6,
+    /// C# 7.0 (ECMA-334 7th ed, 2023 -- ISO/IEC 20619:2023 -- the latest ratified standard). A
+    /// gating label only; not yet implemented.
+    CSharp7,
 }
 
 impl LanguageVersion {
@@ -70,6 +78,9 @@ impl LanguageVersion {
         match self {
             LanguageVersion::CSharp1 => "ISO-1",
             LanguageVersion::CSharp2 => "ISO-2",
+            LanguageVersion::CSharp3 => "3",
+            LanguageVersion::CSharp6 => "6",
+            LanguageVersion::CSharp7 => "7",
         }
     }
 
@@ -79,6 +90,9 @@ impl LanguageVersion {
         match self {
             LanguageVersion::CSharp1 => "C# 1.0",
             LanguageVersion::CSharp2 => "C# 2.0",
+            LanguageVersion::CSharp3 => "C# 3.0",
+            LanguageVersion::CSharp6 => "C# 6.0",
+            LanguageVersion::CSharp7 => "C# 7.0",
         }
     }
 }
@@ -119,6 +133,15 @@ pub enum Feature {
     AnonymousMethods,
     /// Nullable value types, for example `int?`. Introduced in C# 2.0.
     NullableValueTypes,
+    /// The null-coalescing operator `??` (`a ?? b`). Introduced in C# 2.0.
+    NullCoalescing,
+    /// The namespace alias qualifier `::` (`global::System`). Introduced in C# 2.0.
+    NamespaceAlias,
+    /// The `=>` operator -- lambda expressions, and later expression-bodied members.
+    /// Introduced in C# 3.0.
+    LambdaArrow,
+    /// The null-conditional operators `?.` and `?[`. Introduced in C# 6.0.
+    NullConditional,
 }
 
 impl Feature {
@@ -126,9 +149,13 @@ impl Feature {
     #[must_use]
     pub fn introduced_in(self) -> LanguageVersion {
         match self {
-            Feature::Generics | Feature::AnonymousMethods | Feature::NullableValueTypes => {
-                LanguageVersion::CSharp2
-            }
+            Feature::Generics
+            | Feature::AnonymousMethods
+            | Feature::NullableValueTypes
+            | Feature::NullCoalescing
+            | Feature::NamespaceAlias => LanguageVersion::CSharp2,
+            Feature::LambdaArrow => LanguageVersion::CSharp3,
+            Feature::NullConditional => LanguageVersion::CSharp6,
         }
     }
 
@@ -140,6 +167,10 @@ impl Feature {
             Feature::Generics => "generics",
             Feature::AnonymousMethods => "anonymous methods",
             Feature::NullableValueTypes => "nullable value types",
+            Feature::NullCoalescing => "the null-coalescing operator '??'",
+            Feature::NamespaceAlias => "the namespace alias qualifier '::'",
+            Feature::LambdaArrow => "lambda and expression-bodied members ('=>')",
+            Feature::NullConditional => "null-conditional operators ('?.' and '?[')",
         }
     }
 }

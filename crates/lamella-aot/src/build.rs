@@ -153,10 +153,36 @@ pub fn build_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
     let funcs = lower_assembly(&assembly, entry)?;
-    let names: Vec<alloc::string::String> =
-        (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
+    let names = object_symbol_names(&assembly, funcs.len());
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     arm32::lower_object(&funcs, &name_refs, &[]).map_err(BuildError::LowerArm)
+}
+
+/// The per-function symbol names for [`build_object`]: `f{rid}` by default (`f0` = the startup), but a
+/// method marked `[UnmanagedCallersOnly]` takes its OWN method name instead. That makes it a global symbol
+/// the linker resolves a `CallNative` against -- so a managed method can back a native seam: a C#
+/// `lamella_gc_alloc` the AOT's own `new` then calls (the 100%-C# allocator/GC, no native stub).
+#[cfg(feature = "arm32")]
+fn object_symbol_names(assembly: &Assembly, count: usize) -> Vec<alloc::string::String> {
+    let mut names: Vec<alloc::string::String> =
+        (0..count).map(|i| alloc::format!("f{i}")).collect();
+    let exports = assembly.unmanaged_callers_only();
+    if !exports.is_empty() {
+        for type_def in assembly.type_defs() {
+            for method in type_def.methods() {
+                let rid = method.rid();
+                let Some(entry_point) = exports.get(&rid) else {
+                    continue;
+                };
+                if (rid as usize) < names.len() {
+                    if let Some(name) = entry_point.as_deref().or_else(|| method.name()) {
+                        names[rid as usize] = name.into();
+                    }
+                }
+            }
+        }
+    }
+    names
 }
 
 /// The MethodDef row of a static `Main` (the run-once widget entry), if the assembly has one.

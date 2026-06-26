@@ -194,6 +194,13 @@ impl Debugger {
                 true,
                 Some(self.variables(arg_u32(request, "variablesReference"))),
             ),
+            "setVariable" => match self.set_variable(request) {
+                Some(value) => (true, Some(json!({ "value": value, "variablesReference": 0 }))),
+                None => {
+                    let name = arg_str(request, "name");
+                    return self.fail(request, &format!("cannot set {name}"));
+                }
+            },
             "continue" => {
                 self.run(Action::Resume, &mut events);
                 (true, Some(json!({ "allThreadsContinued": true })))
@@ -627,6 +634,26 @@ impl Debugger {
         json!({ "instructions": instructions })
     }
 
+    /// Decodes a `setVariable` request -- `variablesReference` to (frame, scope) exactly as
+    /// `variables` does, plus `name` and `value` -- and asks the backend to write it. Returns
+    /// the backend's re-rendered value on success, or `None` (an unknown/uneditable variable, or
+    /// a value that does not parse as the slot's kind) for the caller to report as a failure.
+    fn set_variable(&mut self, request: &Request) -> Option<String> {
+        let reference = arg_u32(request, "variablesReference");
+        if reference == 0 {
+            return None;
+        }
+        let frame_index = ((reference - 1) / 3) as usize;
+        let scope = match (reference - 1) % 3 {
+            0 => Scope::Arguments,
+            1 => Scope::Locals,
+            _ => Scope::Stack,
+        };
+        let name = arg_str(request, "name");
+        let value = arg_str(request, "value");
+        self.backend.set_variable(frame_index, scope, name, value)
+    }
+
     fn response(&mut self, request: &Request, success: bool, body: Option<Json>) -> Message {
         self.out_seq += 1;
         Message::Response(Response {
@@ -637,6 +664,21 @@ impl Debugger {
             message: (!success).then(|| "unsupported request".to_owned()),
             body,
         })
+    }
+
+    /// A standalone unsuccessful response carrying a custom `message` (the generic
+    /// [`Self::response`] path always says "unsupported request"). Returned as the whole
+    /// reply -- a failed request emits no follow-up events.
+    fn fail(&mut self, request: &Request, message: &str) -> Vec<Message> {
+        self.out_seq += 1;
+        vec![Message::Response(Response {
+            seq: self.out_seq,
+            request_seq: request.seq,
+            success: false,
+            command: request.command.clone(),
+            message: Some(message.to_owned()),
+            body: None,
+        })]
     }
 
     fn event(&mut self, event: &str, body: Option<Json>) -> Message {
@@ -679,6 +721,7 @@ fn capabilities() -> Json {
         "supportsConfigurationDoneRequest": true,
         "supportsInstructionBreakpoints": true,
         "supportsDisassembleRequest": true,
+        "supportsSetVariable": true,
     })
 }
 
@@ -689,6 +732,15 @@ fn arg_u32(request: &Request, field: &str) -> u32 {
         .and_then(|args| args.get(field))
         .and_then(Json::as_u64)
         .unwrap_or(0) as u32
+}
+
+fn arg_str<'r>(request: &'r Request, field: &str) -> &'r str {
+    request
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get(field))
+        .and_then(Json::as_str)
+        .unwrap_or("")
 }
 
 #[cfg(all(test, feature = "interpreter"))]
@@ -1062,6 +1114,167 @@ mod tests {
             .clone();
         assert_eq!(variables.len(), 1);
         assert_eq!(variables[0]["value"], json!("\"hi\""));
+    }
+
+    #[test]
+    fn set_variable_edits_an_argument_and_echoes_the_rerendered_value() {
+        let (module, main) = call_program();
+        let mut dbg = Debugger::new(module, main);
+        dbg.handle(&request(1, "launch", None));
+        dbg.handle(&request(2, "stepIn", None));
+        dbg.handle(&request(3, "stepIn", None));
+        dbg.handle(&request(4, "stepIn", None));
+        assert_eq!(frame_count(&mut dbg), 2);
+
+        let scopes = dbg.handle(&request(5, "scopes", Some(json!({ "frameId": 1 }))));
+        let args_ref = find_scope(&scopes[0].response_body(), "Arguments");
+
+        let before = dbg.handle(&request(
+            6,
+            "variables",
+            Some(json!({ "variablesReference": args_ref })),
+        ));
+        let arg0 = before[0].response_body()["variables"][0].clone();
+        let arg0_name = arg0["name"].as_str().unwrap().to_owned();
+        assert_eq!(arg0["value"], json!("2"));
+        assert_eq!(arg0["type"], json!("int"));
+
+        let out = dbg.handle(&request(
+            7,
+            "setVariable",
+            Some(json!({
+                "variablesReference": args_ref,
+                "name": arg0_name,
+                "value": "42",
+            })),
+        ));
+        let Message::Response(r) = &out[0] else {
+            panic!("expected a response");
+        };
+        assert!(r.success);
+        assert_eq!(r.body.as_ref().unwrap()["value"], json!("42"));
+        assert_eq!(r.body.as_ref().unwrap()["variablesReference"], json!(0));
+
+        let after = dbg.handle(&request(
+            8,
+            "variables",
+            Some(json!({ "variablesReference": args_ref })),
+        ));
+        assert_eq!(after[0].response_body()["variables"][0]["value"], json!("42"));
+    }
+
+    #[test]
+    fn set_variable_rejects_a_non_numeric_value_for_an_int_slot() {
+        let (module, main) = call_program();
+        let mut dbg = Debugger::new(module, main);
+        dbg.handle(&request(1, "launch", None));
+        dbg.handle(&request(2, "stepIn", None));
+        dbg.handle(&request(3, "stepIn", None));
+        dbg.handle(&request(4, "stepIn", None));
+        let scopes = dbg.handle(&request(5, "scopes", Some(json!({ "frameId": 1 }))));
+        let args_ref = find_scope(&scopes[0].response_body(), "Arguments");
+        let before = dbg.handle(&request(
+            6,
+            "variables",
+            Some(json!({ "variablesReference": args_ref })),
+        ));
+        let arg0_name = before[0].response_body()["variables"][0]["name"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let out = dbg.handle(&request(
+            7,
+            "setVariable",
+            Some(json!({
+                "variablesReference": args_ref,
+                "name": arg0_name,
+                "value": "oops",
+            })),
+        ));
+        let Message::Response(r) = &out[0] else {
+            panic!("expected a response");
+        };
+        assert!(!r.success);
+        assert!(r.message.as_deref().is_some_and(|m| m.contains("cannot set")));
+    }
+
+    fn string_local_program() -> (Module, u32) {
+        let mut module = Module::new();
+        let hi: Vec<u16> = "hi".encode_utf16().collect();
+        let string_token = Token(0x7000_0001);
+        module.bind_string(0, string_token, &hi);
+        let main = module.add_method(
+            0,
+            body(vec![
+                Instruction::new(Opcode::Ldstr, Operand::Token(string_token)),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ret),
+            ]),
+            0,
+        );
+        (module, main)
+    }
+
+    #[test]
+    fn set_variable_edits_a_string_local_and_echoes_the_quoted_new_value() {
+        let (module, main) = string_local_program();
+        let mut dbg = Debugger::new(module, main);
+        dbg.handle(&request(1, "launch", None));
+        dbg.handle(&request(2, "next", None));
+        dbg.handle(&request(3, "next", None));
+
+        let scopes = dbg.handle(&request(4, "scopes", Some(json!({ "frameId": 0 }))));
+        let locals_ref = find_scope(&scopes[0].response_body(), "Locals");
+
+        let before = dbg.handle(&request(
+            5,
+            "variables",
+            Some(json!({ "variablesReference": locals_ref })),
+        ));
+        let local0 = before[0].response_body()["variables"][0].clone();
+        let local0_name = local0["name"].as_str().unwrap().to_owned();
+        assert_eq!(local0["value"], json!("\"hi\""));
+        assert_eq!(local0["type"], json!("string"));
+
+        let out = dbg.handle(&request(
+            6,
+            "setVariable",
+            Some(json!({
+                "variablesReference": locals_ref,
+                "name": local0_name,
+                "value": "world",
+            })),
+        ));
+        let Message::Response(r) = &out[0] else {
+            panic!("expected a response");
+        };
+        assert!(r.success);
+        assert_eq!(r.body.as_ref().unwrap()["value"], json!("\"world\""));
+
+        let after = dbg.handle(&request(
+            7,
+            "variables",
+            Some(json!({ "variablesReference": locals_ref })),
+        ));
+        let reread = &after[0].response_body()["variables"][0];
+        assert_eq!(reread["value"], json!("\"world\""));
+        assert_eq!(reread["type"], json!("string"));
+
+        let quoted = dbg.handle(&request(
+            8,
+            "setVariable",
+            Some(json!({
+                "variablesReference": locals_ref,
+                "name": local0_name,
+                "value": "\"hi\"",
+            })),
+        ));
+        let Message::Response(r) = &quoted[0] else {
+            panic!("expected a response");
+        };
+        assert!(r.success);
+        assert_eq!(r.body.as_ref().unwrap()["value"], json!("\"hi\""));
     }
 
     #[test]

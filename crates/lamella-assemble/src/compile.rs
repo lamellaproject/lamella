@@ -56,6 +56,8 @@ const DELEGATE_INVOKE_FLAGS: u16 =
 const FIELD_PUBLIC: u16 = 0x0006;
 const FIELD_PRIVATE: u16 = 0x0001;
 const FIELD_STATIC: u16 = 0x0010;
+const FIELD_LITERAL: u16 = 0x0040;
+const FIELD_HAS_DEFAULT: u16 = 0x8000;
 const CTOR_FLAGS: u16 = 0x0006 | 0x0800 | 0x1000;
 const CCTOR_FLAGS: u16 = 0x0001 | METHOD_STATIC | METHOD_HIDEBYSIG | 0x0800 | 0x1000;
 const SPECIAL_NAME: u16 = 0x0800;
@@ -63,7 +65,7 @@ const IL_MANAGED: u16 = 0x0000;
 const FINALIZE_FLAGS: u16 = 0x0004 | METHOD_VIRTUAL | METHOD_HIDEBYSIG;
 const ENUM_TYPE_FLAGS: u32 = 0x0000_0001 | 0x0000_0100;
 const ENUM_VALUE_FIELD_FLAGS: u16 = FIELD_PUBLIC | 0x0200 | 0x0400;
-const ENUM_MEMBER_FIELD_FLAGS: u16 = FIELD_PUBLIC | FIELD_STATIC | 0x0040 | 0x8000;
+const ENUM_MEMBER_FIELD_FLAGS: u16 = FIELD_PUBLIC | FIELD_STATIC | FIELD_LITERAL | FIELD_HAS_DEFAULT;
 
 /// A diagnostic from any stage of compilation -- parsing or binding -- reduced to
 /// what a driver reports: the `CSxxxx` code, the rendered message, and the span.
@@ -1249,7 +1251,7 @@ fn emit_type(
             ..
         } = member
         {
-            emit_field(image, tokens, modifiers, ty, declarators)?;
+            emit_field(image, binder, tokens, &enclosing, modifiers, ty, declarators)?;
             for declarator in declarators {
                 if let Some(field_token) = tokens.field(&enclosing, &declarator.name) {
                     emit_attributes(image, binder, tokens, field_token, attributes);
@@ -2218,22 +2220,85 @@ fn member_visibility(modifiers: &[Modifier]) -> u16 {
 /// initializers (which would run in a constructor) are not emitted yet.
 fn emit_field(
     image: &mut ImageBuilder,
+    binder: &Binder,
     tokens: &Tokens,
+    enclosing: &TypeSymbol,
     modifiers: &[Modifier],
     ty: &lamella_syntax::ast::TypeRef,
     declarators: &[VariableDeclarator],
 ) -> Result<(), crate::EmitError> {
-    let signature = field_signature(&type_sig(tokens, &bind_type(ty))?);
-    let flags = member_visibility(modifiers)
-        | if modifiers.contains(&Modifier::Static) {
-            FIELD_STATIC
-        } else {
-            0
-        };
+    let field_ty = bind_type(ty);
+    let signature = field_signature(&type_sig(tokens, &field_ty)?);
+    let visibility = member_visibility(modifiers);
+    let is_const = modifiers.contains(&Modifier::Const);
+    let is_static = is_const || modifiers.contains(&Modifier::Static);
     for declarator in declarators {
-        image.add_field(&declarator.name, &signature, flags);
+        let constant = if is_const {
+            const_field_row(binder.model(), enclosing, &declarator.name, &field_ty)
+        } else {
+            None
+        };
+        let mut flags = visibility;
+        if is_static {
+            flags |= FIELD_STATIC;
+        }
+        if constant.is_some() {
+            flags |= FIELD_LITERAL | FIELD_HAS_DEFAULT;
+        }
+        let field = image.add_field(&declarator.name, &signature, flags);
+        if let Some((element, value)) = constant {
+            image.add_constant(field, element, &value);
+        }
     }
     Ok(())
+}
+
+/// The `Constant` row (II.22.9) for a `const` field: its element-type byte and value bytes, taken
+/// from the literal the binder folded for the field. `None` if the field has no folded value or is
+/// a type with no `Constant` encoding -- e.g. `decimal`, which uses a `DecimalConstantAttribute`
+/// (not yet emitted), so a `const decimal` falls back to a plain static field.
+fn const_field_row(
+    model: &Model,
+    enclosing: &TypeSymbol,
+    name: &str,
+    field_ty: &TypeSymbol,
+) -> Option<(u8, alloc::vec::Vec<u8>)> {
+    let literal = model.get_by_symbol(enclosing)?.find_field(name)?.constant.clone()?;
+    if matches!(literal, Literal::Null) {
+        return Some((0x12, alloc::vec![0u8; 4]));
+    }
+    if model
+        .get_by_symbol(field_ty)
+        .is_some_and(|info| info.kind == lamella_binder::TypeKind::Enum)
+    {
+        let underlying = TypeSymbol::Special(enum_underlying(model, field_ty));
+        let (element, width) = enum_constant_encoding(&underlying).ok()?;
+        let value = lamella_binder::literal_int_value(&literal)?;
+        return Some((element, value.to_le_bytes()[..width].to_vec()));
+    }
+    let TypeSymbol::Special(special) = field_ty else {
+        return None;
+    };
+    let element = primitive_element_code(*special)?;
+    let mut value = alloc::vec::Vec::new();
+    match (special, &literal) {
+        (SpecialType::Boolean, Literal::Boolean(set)) => value.push(u8::from(*set)),
+        (SpecialType::Char, Literal::Character(unit)) => value.extend_from_slice(&unit.to_le_bytes()),
+        (SpecialType::String, Literal::String(units)) => {
+            for unit in units.iter() {
+                value.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        (SpecialType::Single, Literal::Real { bits, .. }) => {
+            value.extend_from_slice(&(f64::from_bits(*bits) as f32).to_le_bytes());
+        }
+        (SpecialType::Double, Literal::Real { bits, .. }) => {
+            value.extend_from_slice(&f64::from_bits(*bits).to_le_bytes());
+        }
+        (_, Literal::Integer { value: int, .. }) => encode_integer(*special, *int, &mut value)?,
+        _ => return None,
+    }
+    Some((element, value))
 }
 
 /// Walks a bound body, minting tokens for the things it references so emission can
@@ -3199,6 +3264,8 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
         TypeSymbol::Named(_) if crate::expr::is_typed_reference(ty) => {
             return Ok(TypeSig::TypedByRef);
         }
+        TypeSymbol::Named(_) if crate::expr::is_native_int(ty) => return Ok(TypeSig::NativeInt),
+        TypeSymbol::Named(_) if crate::expr::is_native_uint(ty) => return Ok(TypeSig::NativeUInt),
         TypeSymbol::Named(_) if tokens.is_struct(ty) || tokens.is_enum(ty) => {
             return tokens.type_token(ty).map(TypeSig::ValueType).ok_or(
                 crate::EmitError::Unsupported("a value type outside this module in a signature"),

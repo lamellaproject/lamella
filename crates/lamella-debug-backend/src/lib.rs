@@ -129,6 +129,21 @@ pub trait DebugBackend {
     /// from the AOT debug-info (register or stack-slot homes), read via memory/regs.
     fn variables(&self, frame: usize, scope: Scope) -> Vec<Variable>;
 
+    /// Writes a new value into the variable named `name` in one scope of frame `index`,
+    /// for DAP's `setVariable`. `value` is the new value as the user typed it; the backend
+    /// parses it as the slot's existing kind (the inverse of how [`DebugBackend::variables`]
+    /// rendered it). Returns the re-rendered value string on success (so the adapter can echo
+    /// it back, matching the `variables` rendering), or `None` if the variable is unknown, the
+    /// scope is not editable, the kind is unsupported, or the string does not parse.
+    ///
+    /// The default supports no edits -- right for a read-only target (a device without a write
+    /// path, or the mock backends) -- so only a backend that can edit a live frame (the
+    /// interpreter, over its `Session`) overrides it.
+    fn set_variable(&mut self, frame: usize, scope: Scope, name: &str, value: &str) -> Option<String> {
+        let _ = (frame, scope, name, value);
+        None
+    }
+
     /// Reads `len` bytes of target memory at `address`. Device: an ADIv5 MEM-AP read.
     /// Interpreter: the managed heap is not flat addressable, so this is typically
     /// empty -- inspection goes through [`DebugBackend::variables`] instead.
@@ -196,6 +211,7 @@ pub struct SourceLocation {
 }
 
 /// A variable scope of a frame.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Scope {
     /// The method's arguments.
     Arguments,

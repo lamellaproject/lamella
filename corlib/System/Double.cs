@@ -46,7 +46,7 @@ namespace System
 
         [Lamella.Runtime.RuntimeProvided] public override string ToString() { return null; }
 
-        [Lamella.Runtime.RuntimeProvided] private static string ToFixed(double value, int decimals) { return null; }
+        [Lamella.Runtime.RuntimeProvided] internal static string ToFixed(double value, int decimals) { return null; }
 
         [Lamella.Runtime.RuntimeProvided] internal static string ToExponential(double value, int precision, bool upper) { return null; }
 
@@ -62,6 +62,12 @@ namespace System
 
         private static string Format(double value, string format)
         {
+            if (NumberFormatter.IsCustom(format))
+            {
+                if (!IsFinite(value)) return value.ToString();
+                bool negativeValue = value < 0;
+                return NumberFormatter.Custom(format, negativeValue, false, 0, negativeValue ? -value : value);
+            }
             char specifier = 'G';
             int precision = -1;
             if ((object)format != null && format.Length != 0)

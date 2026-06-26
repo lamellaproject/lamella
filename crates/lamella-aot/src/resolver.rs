@@ -451,7 +451,7 @@ impl CallResolver for MetadataResolver<'_> {
             MethodKind::Reference if is_int32_tostring(&method) => {
                 CallTarget::Intrinsic(Intrinsic::IntToString)
             }
-            MethodKind::Reference if is_object_ctor(&method) => {
+            MethodKind::Reference if is_noop_base_ctor(&method) => {
                 CallTarget::Intrinsic(Intrinsic::ObjectCtor)
             }
             MethodKind::Reference if is_array_getlength(&method) => {
@@ -1067,13 +1067,15 @@ fn is_console_writeline_int(method: &ResolvedMethod) -> bool {
             .is_some_and(|sig| matches!(sig.parameters.as_slice(), [SigType::I4]))
 }
 
-/// Whether a resolved method is `System.Object::.ctor()` -- the base constructor a derived
-/// constructor chains to, which the lowering treats as a no-op.
-fn is_object_ctor(method: &ResolvedMethod) -> bool {
+/// Whether a resolved method is a parameterless base-class constructor the lowering treats as a no-op:
+/// `System.Object::.ctor()` (the universal base a derived ctor chains to) or `System.Attribute::.ctor()`
+/// (so a user-defined attribute class -- e.g. a clean-room `[UnmanagedCallersOnly]` -- lowers; an
+/// attribute's ctor is never run on this target, attributes being pure metadata).
+fn is_noop_base_ctor(method: &ResolvedMethod) -> bool {
     method.name == Some(".ctor")
-        && method
-            .declaring_type
-            .is_some_and(|t| t.namespace == "System" && t.name == "Object")
+        && method.declaring_type.is_some_and(|t| {
+            t.namespace == "System" && (t.name == "Object" || t.name == "Attribute")
+        })
 }
 
 /// Whether a resolved method is `System.Array::GetLength(int)` -- the per-dimension length accessor

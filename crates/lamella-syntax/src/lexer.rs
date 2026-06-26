@@ -5,6 +5,7 @@ use crate::span::Span;
 use crate::token::{
     IntegerSuffix, Keyword, Punctuator, RealSuffix, Token, TokenKind, TypedRefKeyword,
 };
+use crate::version::{Feature, LanguageVersion};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
@@ -54,6 +55,11 @@ pub struct LexOptions {
     /// recognized as [`TypedRefKeyword`]s. Off in strict ISO-1 (they are not ECMA-334);
     /// on for csc parity, where they lower to `mkrefany`/`refanyval`/`refanytype`.
     pub typedref: bool,
+    /// The language version being compiled. Defaults to [`LanguageVersion::CSharp1`] (the only
+    /// implemented one). A post-1.0 operator (`=>`/`??`/`?.`/`?[`/`::`) under a version that
+    /// predates it is rejected with a `Feature requires C# N` diagnostic instead of munching as
+    /// the 1.0 tokens it would otherwise split into (so the error names the feature, not `=` `>`).
+    pub version: LanguageVersion,
 }
 
 impl LexOptions {
@@ -262,7 +268,7 @@ impl<'a> Lexer<'a> {
         } else if is_identifier_start(c)
             || (c == '\\' && matches!(self.peek_second(), Some('u' | 'U')))
         {
-            self.scan_identifier_or_keyword(start)
+            self.scan_identifier_or_keyword(start, false)
         } else if c == '@' {
             self.scan_verbatim(start)
         } else if c.is_ascii_digit()
@@ -273,6 +279,8 @@ impl<'a> Lexer<'a> {
             self.scan_character_literal(start)
         } else if c == '"' {
             self.scan_string_literal(start)
+        } else if let Some(kind) = self.try_gate_post_1_0_operator(start) {
+            kind
         } else if let Some(punctuator) = self.try_scan_operator() {
             TokenKind::Punctuator(punctuator)
         } else {
@@ -755,7 +763,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn scan_identifier_or_keyword(&mut self, start: usize) -> TokenKind {
+    fn scan_identifier_or_keyword(&mut self, start: usize, verbatim: bool) -> TokenKind {
         let mut decoded: Option<String> = None;
         if self.peek() == Some('\\') {
             match self.unicode_escape_char() {
@@ -797,13 +805,15 @@ impl<'a> Lexer<'a> {
             Some(decoded) => decoded,
             None => &self.source[start..self.position],
         };
-        if let Some(keyword) = Keyword::from_text(text) {
-            TokenKind::Keyword(keyword)
-        } else if let Some(operator) = self.typedref_keyword(text) {
-            TokenKind::TypedRefKeyword(operator)
-        } else {
-            TokenKind::Identifier(self.identifier_name(text))
+        if !verbatim {
+            if let Some(keyword) = Keyword::from_text(text) {
+                return TokenKind::Keyword(keyword);
+            }
+            if let Some(operator) = self.typedref_keyword(text) {
+                return TokenKind::TypedRefKeyword(operator);
+            }
         }
+        TokenKind::Identifier(self.identifier_name(text))
     }
 
     /// The typed-reference operator `text` names, but only in csc-parity mode
@@ -817,15 +827,11 @@ impl<'a> Lexer<'a> {
 
     fn scan_verbatim(&mut self, start: usize) -> TokenKind {
         match self.peek_second() {
-            Some(c) if is_identifier_start(c) => {
-                self.bump();
-                let name_start = self.position;
-                self.bump();
-                self.consume_identifier_part();
-                let text = &self.source[name_start..self.position];
-                TokenKind::Identifier(self.identifier_name(text))
-            }
             Some('"') => self.scan_verbatim_string(start),
+            Some(c) if c == '\\' || is_identifier_start(c) => {
+                self.bump();
+                self.scan_identifier_or_keyword(self.position, true)
+            }
             _ => {
                 self.bump();
                 self.report(
@@ -1216,6 +1222,41 @@ impl<'a> Lexer<'a> {
         value
     }
 
+    /// Recognizes a post-1.0 operator at the current position that the target version does not
+    /// support (`=>` from C# 3.0, `??`/`::` from 2.0, `?.`/`?[` from 6.0), reports a `CS1644`
+    /// feature diagnostic, consumes it as one token, and returns `Unknown`. Without this, maximal
+    /// munch over the 1.0 operator set would split it (`=` then `>`, two `?`, ...) and the error
+    /// would name those, not the feature. `?.` is NOT gated when a digit follows -- it is then a
+    /// conditional `?` and a `.5`-style real literal (`a ?.5 : b`), valid in any version (9.4.4.3).
+    fn try_gate_post_1_0_operator(&mut self, start: usize) -> Option<TokenKind> {
+        const GATED: &[(&str, Feature)] = &[
+            ("=>", Feature::LambdaArrow),
+            ("??", Feature::NullCoalescing),
+            ("?[", Feature::NullConditional),
+            ("?.", Feature::NullConditional),
+            ("::", Feature::NamespaceAlias),
+        ];
+        let rest = self.remaining();
+        for &(spelling, feature) in GATED {
+            if !rest.starts_with(spelling) || self.options.version.supports(feature) {
+                continue;
+            }
+            if spelling == "?." && rest[spelling.len()..].starts_with(|c: char| c.is_ascii_digit()) {
+                continue;
+            }
+            self.position += spelling.len();
+            self.report(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: feature.description(),
+                    required: feature.introduced_in().display_name(),
+                },
+                start,
+            );
+            return Some(TokenKind::Unknown);
+        }
+        None
+    }
+
     /// Tries to scan an operator or punctuator at the current position by maximal
     /// munch, taking the longest spelling that matches (9.4.5). Returns `None`
     /// without advancing if none matches.
@@ -1536,6 +1577,29 @@ mod tests {
     fn verbatim_identifier_drops_the_at_and_is_never_a_keyword() {
         assert_eq!(kinds("@class"), vec![ident("class"), TokenKind::EndOfFile]);
         assert_eq!(kinds("@foo"), vec![ident("foo"), TokenKind::EndOfFile]);
+    }
+
+    #[test]
+    fn post_1_0_operators_report_cs1644_under_csharp1() {
+        for src in ["a => b", "a ?? b", "a?.b", "a?[0]", "global::System"] {
+            let diagnostics = tokenize(src).diagnostics;
+            assert!(
+                diagnostics.iter().any(|d| d.code() == 1644),
+                "{src:?} should report CS1644, got {diagnostics:?}"
+            );
+        }
+        assert!(
+            tokenize("c?.5:.3").diagnostics.is_empty(),
+            "c?.5:.3 is a valid 1.0 conditional: {:?}",
+            tokenize("c?.5:.3").diagnostics
+        );
+    }
+
+    #[test]
+    fn a_verbatim_identifier_name_may_use_unicode_escapes() {
+        assert_eq!(kinds("@\\u0041bc"), vec![ident("Abc"), TokenKind::EndOfFile]);
+        assert_eq!(kinds("@\\u0069f"), vec![ident("if"), TokenKind::EndOfFile]);
+        assert_eq!(kinds("@\\u0020"), vec![TokenKind::Unknown, TokenKind::EndOfFile]);
     }
 
     #[test]

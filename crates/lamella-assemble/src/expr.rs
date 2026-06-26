@@ -210,8 +210,46 @@ pub fn emit_expression(
                 out.push(Instruction::simple(Opcode::Dup));
                 crate::method::store_to(frame, name, out)
             }
+            BoundExprKind::Local(name) => {
+                let (slot, element) = frame.byref(name).expect("byref checked above");
+                out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
+                emit_expression(value, frame, tokens, out)?;
+                let kept = keep_assigned(true, &value.ty, frame, out);
+                emit_byref_store(element, tokens, out)?;
+                load_kept(kept, out);
+                Ok(())
+            }
+            BoundExprKind::FieldAccess {
+                receiver, field, ..
+            } => emit_field_store(field.as_ref(), receiver, value, true, frame, tokens, out),
+            BoundExprKind::ElementAccess { receiver, indices } => {
+                emit_element_store(&target.ty, receiver, indices, value, true, frame, tokens, out)
+            }
+            BoundExprKind::PropertyAccess {
+                receiver,
+                declaring_type,
+                name,
+            } => emit_property_store(
+                &target.ty,
+                receiver,
+                declaring_type,
+                name,
+                value,
+                true,
+                frame,
+                tokens,
+                out,
+            ),
+            BoundExprKind::Dereference { operand } => {
+                emit_expression(operand, frame, tokens, out)?;
+                emit_expression(value, frame, tokens, out)?;
+                let kept = keep_assigned(true, &value.ty, frame, out);
+                out.push(Instruction::simple(stind_opcode(&target.ty)));
+                load_kept(kept, out);
+                Ok(())
+            }
             _ => Err(EmitError::Unsupported(
-                "assignment as an expression is lowered only to a local",
+                "this assignment target is not lowered as an expression yet",
             )),
         },
         _ => Err(EmitError::Unsupported(
@@ -406,6 +444,7 @@ pub(crate) fn emit_element_store(
     receiver: &BoundExpr,
     indices: &[BoundExpr],
     value: &BoundExpr,
+    leave: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -416,12 +455,14 @@ pub(crate) fn emit_element_store(
             emit_expression(index, frame, tokens, out)?;
         }
         emit_expression(value, frame, tokens, out)?;
+        let kept = keep_assigned(leave, &value.ty, frame, out);
         let mut set_params = array_int_params(indices.len());
         set_params.push(element_ty.clone());
         let set = tokens
             .method(&receiver.ty, "Set", &set_params)
             .ok_or(EmitError::Unsupported("array Set was not minted"))?;
         out.push(Instruction::new(Opcode::Call, Operand::Token(set)));
+        load_kept(kept, out);
         return Ok(());
     }
     if indices.len() != 1 {
@@ -434,12 +475,14 @@ pub(crate) fn emit_element_store(
         out.push(Instruction::simple(Opcode::Mul));
         out.push(Instruction::simple(Opcode::Add));
         emit_expression(value, frame, tokens, out)?;
+        let kept = keep_assigned(leave, &value.ty, frame, out);
         out.push(Instruction::simple(stind_opcode(element_ty)));
+        load_kept(kept, out);
         return Ok(());
     }
     emit_expression(receiver, frame, tokens, out)?;
     emit_expression(&indices[0], frame, tokens, out)?;
-    if tokens.is_struct(element_ty)
+    let kept = if tokens.is_struct(element_ty)
         || tokens.is_enum(element_ty)
         || matches!(element_ty, TypeSymbol::Special(SpecialType::Decimal))
     {
@@ -448,11 +491,16 @@ pub(crate) fn emit_element_store(
             .ok_or(EmitError::Unsupported("array element type has no token"))?;
         out.push(Instruction::new(Opcode::Ldelema, Operand::Token(token)));
         emit_expression(value, frame, tokens, out)?;
+        let kept = keep_assigned(leave, &value.ty, frame, out);
         out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
+        kept
     } else {
         emit_expression(value, frame, tokens, out)?;
+        let kept = keep_assigned(leave, &value.ty, frame, out);
         out.push(Instruction::simple(stelem_opcode(element_ty)?));
-    }
+        kept
+    };
+    load_kept(kept, out);
     Ok(())
 }
 
@@ -701,12 +749,40 @@ fn emit_field_load(
     Ok(())
 }
 
+/// After an assignment's value is on the stack and before the store consumes it, saves a copy to
+/// a fresh temp when the assignment is used as an EXPRESSION (`leave`), so its value survives the
+/// store; [`load_kept`] reloads it afterward. A statement-position store passes `leave = false`
+/// and this emits nothing. (14.14: an assignment expression's value is the value assigned.)
+fn keep_assigned(
+    leave: bool,
+    value_ty: &TypeSymbol,
+    frame: &Frame,
+    out: &mut Vec<Instruction>,
+) -> Option<u16> {
+    if !leave {
+        return None;
+    }
+    out.push(Instruction::simple(Opcode::Dup));
+    let temp = frame.reserve_local(value_ty);
+    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(temp)));
+    Some(temp)
+}
+
+/// Reloads the value [`keep_assigned`] saved, leaving it as the assignment expression's result.
+fn load_kept(kept: Option<u16>, out: &mut Vec<Instruction>) {
+    if let Some(temp) = kept {
+        out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(temp)));
+    }
+}
+
 /// Lowers a field write: the value (and receiver, if an instance field) are on the
-/// stack, then `stsfld`/`stfld` stores. Shared by assignment emission.
+/// stack, then `stsfld`/`stfld` stores. Shared by assignment emission. `leave` keeps the
+/// assigned value on the stack (the assignment used as an expression, 14.14).
 pub(crate) fn emit_field_store(
     field: Option<&FieldReference>,
     receiver: &BoundExpr,
     value: &BoundExpr,
+    leave: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -717,14 +793,19 @@ pub(crate) fn emit_field_store(
     let token = tokens
         .field(&field.declaring_type, &field.name)
         .ok_or(EmitError::Unsupported("field outside this module"))?;
-    if field.is_static {
+    let kept = if field.is_static {
         emit_expression(value, frame, tokens, out)?;
+        let kept = keep_assigned(leave, &value.ty, frame, out);
         out.push(Instruction::new(Opcode::Stsfld, Operand::Token(token)));
+        kept
     } else {
         emit_field_receiver(field, receiver, frame, tokens, out)?;
         emit_expression(value, frame, tokens, out)?;
+        let kept = keep_assigned(leave, &value.ty, frame, out);
         out.push(Instruction::new(Opcode::Stfld, Operand::Token(token)));
-    }
+        kept
+    };
+    load_kept(kept, out);
     Ok(())
 }
 
@@ -769,6 +850,7 @@ pub(crate) fn emit_property_store(
     declaring_type: &TypeSymbol,
     name: &str,
     value: &BoundExpr,
+    leave: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -783,6 +865,7 @@ pub(crate) fn emit_property_store(
         }
     }
     emit_expression(value, frame, tokens, out)?;
+    let kept = keep_assigned(leave, &value.ty, frame, out);
     let token = tokens
         .method(
             declaring_type,
@@ -798,6 +881,7 @@ pub(crate) fn emit_property_store(
         Opcode::Callvirt
     };
     out.push(Instruction::new(opcode, Operand::Token(token)));
+    load_kept(kept, out);
     Ok(())
 }
 
@@ -1414,6 +1498,23 @@ pub(crate) fn runtime_type_handle_symbol() -> TypeSymbol {
 pub(crate) fn is_typed_reference(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Named(parts)
         if parts.len() == 2 && &*parts[0] == "System" && &*parts[1] == "TypedReference")
+}
+
+/// Whether `ty` is `System.IntPtr`. In a signature it is the `native int` (ELEMENT_TYPE_I)
+/// primitive -- the encoding the BCL uses -- so a MemberRef to a method taking or returning it
+/// (e.g. `Marshal.AllocHGlobal(int) -> IntPtr`, `IntPtr.Zero`) resolves. It is the same type
+/// either way (II.14.4.3 deems `System.IntPtr` and `native int` interchangeable), but only the
+/// primitive form matches the BCL's own signatures.
+pub(crate) fn is_native_int(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Named(parts)
+        if parts.len() == 2 && &*parts[0] == "System" && &*parts[1] == "IntPtr")
+}
+
+/// Whether `ty` is `System.UIntPtr` -- the `native uint` (ELEMENT_TYPE_U) primitive, the unsigned
+/// companion to [`is_native_int`].
+pub(crate) fn is_native_uint(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Named(parts)
+        if parts.len() == 2 && &*parts[0] == "System" && &*parts[1] == "UIntPtr")
 }
 
 /// Lowers `__makeref(variable)`: take the variable's address (a managed pointer), then

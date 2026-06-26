@@ -114,6 +114,16 @@ pub enum DiagnosticKind {
     OverloadableOperatorExpected,
     /// A `foreach` header was missing the `in` keyword (15.8.4).
     InExpected,
+    /// A post-1.0 operator (`=>`, `??`, `?.`, `?[`, `::`) was used while targeting a language
+    /// version that predates it. Carries the feature's description and the version that introduced
+    /// it, both already rendered to text (the lexer builds them from [`crate::version::Feature`]),
+    /// so this stays decoupled from the version model.
+    FeatureRequiresLaterVersion {
+        /// The feature's noun phrase, e.g. "the null-coalescing operator '??'".
+        feature: &'static str,
+        /// The version that introduced it, e.g. "C# 3.0".
+        required: &'static str,
+    },
 }
 
 impl DiagnosticKind {
@@ -155,6 +165,7 @@ impl DiagnosticKind {
             DiagnosticKind::TypeDeclarationExpected => 1518,
             DiagnosticKind::OverloadableOperatorExpected => 1037,
             DiagnosticKind::InExpected => 1515,
+            DiagnosticKind::FeatureRequiresLaterVersion { .. } => 1644,
         }
     }
 
@@ -234,6 +245,9 @@ impl fmt::Display for DiagnosticKind {
                 f.write_str("Overloadable operator expected")
             }
             DiagnosticKind::InExpected => f.write_str("'in' expected"),
+            DiagnosticKind::FeatureRequiresLaterVersion { feature, required } => {
+                write!(f, "Feature {feature} is not available in C# 1.0; it requires {required} or greater")
+            }
         }
     }
 }

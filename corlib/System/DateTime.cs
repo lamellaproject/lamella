@@ -204,21 +204,168 @@ namespace System
             for (int i = 0; i < width; i++) builder.Append(digits[i]);
         }
 
+        private static void AppendNumber(System.Text.StringBuilder builder, int value)
+        {
+            builder.Append(value.ToString());
+        }
+
         public override string ToString()
         {
+            return ToString("G", System.Globalization.DateTimeFormatInfo.InvariantInfo);
+        }
+
+        public string ToString(string format)
+        {
+            return ToString(format, System.Globalization.DateTimeFormatInfo.InvariantInfo);
+        }
+
+        public string ToString(string format, IFormatProvider provider)
+        {
+            System.Globalization.DateTimeFormatInfo dtfi = GetFormatInfo(provider);
+            if (format == null || format.Length == 0) format = "G";
+            string pattern = (format.Length == 1) ? ExpandStandard(format[0], dtfi) : format;
+            return Format(this, pattern, dtfi);
+        }
+
+        private static System.Globalization.DateTimeFormatInfo GetFormatInfo(IFormatProvider provider)
+        {
+            if (provider != null)
+            {
+                object formatInfo = provider.GetFormat(typeof(System.Globalization.DateTimeFormatInfo));
+                if (formatInfo != null) return (System.Globalization.DateTimeFormatInfo)formatInfo;
+            }
+            return System.Globalization.DateTimeFormatInfo.InvariantInfo;
+        }
+
+        private static string ExpandStandard(char format, System.Globalization.DateTimeFormatInfo dtfi)
+        {
+            switch (format)
+            {
+                case 'd': return dtfi.ShortDatePattern;
+                case 'D': return dtfi.LongDatePattern;
+                case 't': return dtfi.ShortTimePattern;
+                case 'T': return dtfi.LongTimePattern;
+                case 'f': return dtfi.LongDatePattern + " " + dtfi.ShortTimePattern;
+                case 'F': return dtfi.FullDateTimePattern;
+                case 'g': return dtfi.ShortDatePattern + " " + dtfi.ShortTimePattern;
+                case 'G': return dtfi.ShortDatePattern + " " + dtfi.LongTimePattern;
+                case 's': return "yyyy-MM-ddTHH:mm:ss";
+                case 'u': return "yyyy-MM-dd HH:mm:ssZ";
+                case 'o':
+                case 'O': return "yyyy-MM-ddTHH:mm:ss.fffffff";
+                case 'r':
+                case 'R': return "ddd, dd MMM yyyy HH:mm:ss 'GMT'";
+                case 'm':
+                case 'M': return "MMMM dd";
+                case 'y':
+                case 'Y': return "yyyy MMMM";
+                default: throw new FormatException("Invalid format string for DateTime.");
+            }
+        }
+
+        private static bool IsDateTimeSpecifier(char c)
+        {
+            return c == 'y' || c == 'M' || c == 'd' || c == 'H' || c == 'h'
+                || c == 'm' || c == 's' || c == 't' || c == 'f' || c == 'F';
+        }
+
+        private static string Format(DateTime dt, string pattern, System.Globalization.DateTimeFormatInfo dtfi)
+        {
             System.Text.StringBuilder result = new System.Text.StringBuilder();
-            AppendPadded(result, Month, 2);
-            result.Append('/');
-            AppendPadded(result, Day, 2);
-            result.Append('/');
-            AppendPadded(result, Year, 4);
-            result.Append(' ');
-            AppendPadded(result, Hour, 2);
-            result.Append(':');
-            AppendPadded(result, Minute, 2);
-            result.Append(':');
-            AppendPadded(result, Second, 2);
+            int i = 0;
+            int n = pattern.Length;
+            while (i < n)
+            {
+                char c = pattern[i];
+                if (c == '\'' || c == '"')
+                {
+                    char quote = c;
+                    i = i + 1;
+                    while (i < n && pattern[i] != quote) { result.Append(pattern[i]); i = i + 1; }
+                    if (i < n) i = i + 1;
+                }
+                else if (c == '\\')
+                {
+                    if (i + 1 < n) { result.Append(pattern[i + 1]); i = i + 2; }
+                    else i = i + 1;
+                }
+                else if (IsDateTimeSpecifier(c))
+                {
+                    int count = 1;
+                    while (i + count < n && pattern[i + count] == c) count = count + 1;
+                    AppendField(result, dt, c, count, dtfi);
+                    i = i + count;
+                }
+                else if (c == '/') { result.Append(dtfi.DateSeparator); i = i + 1; }
+                else if (c == ':') { result.Append(dtfi.TimeSeparator); i = i + 1; }
+                else { result.Append(c); i = i + 1; }
+            }
             return result.ToString();
+        }
+
+        private static void AppendField(System.Text.StringBuilder result, DateTime dt, char c, int count, System.Globalization.DateTimeFormatInfo dtfi)
+        {
+            if (c == 'y')
+            {
+                int year = dt.Year;
+                if (count == 1) AppendNumber(result, year % 100);
+                else if (count == 2) AppendPadded(result, year % 100, 2);
+                else AppendPadded(result, year, count);
+            }
+            else if (c == 'M')
+            {
+                int month = dt.Month;
+                if (count == 1) AppendNumber(result, month);
+                else if (count == 2) AppendPadded(result, month, 2);
+                else if (count == 3) result.Append(dtfi.GetAbbreviatedMonthName(month));
+                else result.Append(dtfi.GetMonthName(month));
+            }
+            else if (c == 'd')
+            {
+                if (count == 1) AppendNumber(result, dt.Day);
+                else if (count == 2) AppendPadded(result, dt.Day, 2);
+                else if (count == 3) result.Append(dtfi.GetAbbreviatedDayName(dt.DayOfWeek));
+                else result.Append(dtfi.GetDayName(dt.DayOfWeek));
+            }
+            else if (c == 'H')
+            {
+                if (count == 1) AppendNumber(result, dt.Hour);
+                else AppendPadded(result, dt.Hour, 2);
+            }
+            else if (c == 'h')
+            {
+                int h12 = dt.Hour % 12;
+                if (h12 == 0) h12 = 12;
+                if (count == 1) AppendNumber(result, h12);
+                else AppendPadded(result, h12, 2);
+            }
+            else if (c == 'm')
+            {
+                if (count == 1) AppendNumber(result, dt.Minute);
+                else AppendPadded(result, dt.Minute, 2);
+            }
+            else if (c == 's')
+            {
+                if (count == 1) AppendNumber(result, dt.Second);
+                else AppendPadded(result, dt.Second, 2);
+            }
+            else if (c == 't')
+            {
+                string designator = (dt.Hour < 12) ? dtfi.AMDesignator : dtfi.PMDesignator;
+                if (count == 1) { if (designator.Length > 0) result.Append(designator[0]); }
+                else result.Append(designator);
+            }
+            else if (c == 'f' || c == 'F')
+            {
+                long fraction = dt.Ticks % TicksPerSecond;
+                char[] digits = new char[7];
+                long f = fraction;
+                for (int k = 6; k >= 0; k--) { digits[k] = (char)('0' + (int)(f % 10)); f = f / 10; }
+                int take = count;
+                if (take > 7) take = 7;
+                if (c == 'F') { while (take > 0 && digits[take - 1] == '0') take = take - 1; }
+                for (int k = 0; k < take; k++) result.Append(digits[k]);
+            }
         }
     }
 }

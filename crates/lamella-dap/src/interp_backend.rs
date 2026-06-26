@@ -342,6 +342,47 @@ impl DebugBackend for InterpreterBackend {
             .collect()
     }
 
+    fn set_variable(
+        &mut self,
+        frame_index: usize,
+        scope: Scope,
+        name: &str,
+        value: &str,
+    ) -> Option<String> {
+        if matches!(scope, Scope::Stack) {
+            return None;
+        }
+        let slot = self
+            .variables(frame_index, scope)
+            .iter()
+            .position(|variable| variable.name == name)?;
+        let frame = self.session.as_ref()?.frame(frame_index)?;
+        let current = match scope {
+            Scope::Arguments => frame.args.get(slot),
+            Scope::Locals => frame.locals.get(slot),
+            Scope::Stack => None,
+        }?
+        .clone();
+        let new_value = match &current {
+            Value::Object(reference) if self.vm.heap().as_string(*reference).is_some() => {
+                let text = strip_one_quote_pair(value);
+                let chars: Vec<u16> = text.encode_utf16().collect();
+                Value::Object(self.vm.heap_mut().alloc_string(&chars))
+            }
+            _ => parse_value(&current, value)?,
+        };
+        let session = self.session.as_mut()?;
+        let written = match scope {
+            Scope::Arguments => session.set_arg(frame_index, slot, new_value.clone()),
+            Scope::Locals => session.set_local(frame_index, slot, new_value.clone()),
+            Scope::Stack => false,
+        };
+        if !written {
+            return None;
+        }
+        Some(format_value(&self.vm, new_value).0)
+    }
+
     fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
         Vec::new()
     }
@@ -421,6 +462,46 @@ fn format_value(vm: &Vm, value: Value) -> (String, String) {
         Value::ByRef(_) => ("&".to_owned(), "byref".to_owned()),
         Value::TypedRef { .. } => ("typedref".to_owned(), "typedref".to_owned()),
     }
+}
+
+/// Parses `text` into a [`Value`] of the SAME kind as `current` -- the inverse of
+/// [`format_value`]'s rendering, so a `setVariable` round-trips. Returns `None` when the
+/// text does not parse as that kind, or when the kind is one this editor does not support
+/// (null / struct / byref / typedref, plus a NON-string object -- see the trailing arms):
+/// those render as a description, not an editable literal, so there is nothing to parse back
+/// into. A managed-`String` object IS editable, but `set_variable` handles it before reaching
+/// here (it mints a new String rather than parsing), so the `Value::Object` arm here only ever
+/// covers non-string objects.
+///
+/// `bool` and `char` are not distinguished here: the runtime widens both to [`Value::Int32`]
+/// (see `Value`), and `format_value` renders that slot as a plain decimal, so the inverse is
+/// an integer parse -- typing `1` into a `bool` local sets it to 1, matching how it reads back.
+fn parse_value(current: &Value, text: &str) -> Option<Value> {
+    let text = text.trim();
+    match current {
+        Value::Int32(_) => text.parse::<i32>().ok().map(Value::Int32),
+        Value::Int64(_) => text.parse::<i64>().ok().map(Value::Int64),
+        Value::NativeInt(_) => text.parse::<i64>().ok().map(Value::NativeInt),
+        Value::Float(_) => text.parse::<f64>().ok().map(Value::Float),
+        Value::Single(_) => text.parse::<f32>().ok().map(Value::Single),
+        Value::Object(_)
+        | Value::Null
+        | Value::Struct(_)
+        | Value::ByRef(_)
+        | Value::TypedRef { .. } => None,
+    }
+}
+
+/// Strips one matched pair of surrounding double-quotes from `text`, if present, returning
+/// the inner content; otherwise returns `text` unchanged. This is the inverse of
+/// [`format_value`]'s `"hi"` rendering of a string, so a `setVariable` round-trips whether the
+/// client sends the rendered `"hi"` or the bare `hi`. Only the outermost pair is removed and
+/// the content is taken verbatim (no trimming or unescaping): `"a b"` -> `a b`, `"` -> `"`
+/// (a lone quote has no pair), `""` -> `` (empty string).
+fn strip_one_quote_pair(text: &str) -> &str {
+    text.strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(text)
 }
 
 /// Renders one CIL instruction as a mnemonic and its operand, for disassembly.

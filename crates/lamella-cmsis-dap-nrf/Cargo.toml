@@ -24,3 +24,10 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }
 lamella-usbhid = { path = "../lamella-usbhid" }
 # The deploy-cs example builds a C# assembly to a chip image (build_cortex_m) before flashing.
 lamella-aot = { path = "../lamella-aot", features = ["arm32"] }
+# The deploy-py example compiles a Python function through the shared backend, then hand-assembles a stub.
+lamella-py-frontend = { path = "../lamella-py-frontend" }
+lamella-asm-arm32 = { path = "../lamella-asm-arm32" }
+lamella-ir = { path = "../lamella-ir" }
+# The deploy-alloc example links a C# object against a Rust GC-seed object (the object-path deploy).
+lamella-elf = { path = "../lamella-elf" }
+lamella-link = { path = "../lamella-link" }

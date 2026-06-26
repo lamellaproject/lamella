@@ -872,6 +872,7 @@ fn emit_statement_expression(
                     field.as_ref(),
                     receiver,
                     value,
+                    false,
                     frame,
                     tokens,
                     out,
@@ -879,7 +880,7 @@ fn emit_statement_expression(
             }
             if let BoundExprKind::ElementAccess { receiver, indices } = &target.kind {
                 return crate::expr::emit_element_store(
-                    &target.ty, receiver, indices, value, frame, tokens, out,
+                    &target.ty, receiver, indices, value, false, frame, tokens, out,
                 );
             }
             if let BoundExprKind::Dereference { operand } = &target.kind {
@@ -910,6 +911,7 @@ fn emit_statement_expression(
                     declaring_type,
                     name,
                     value,
+                    false,
                     frame,
                     tokens,
                     out,

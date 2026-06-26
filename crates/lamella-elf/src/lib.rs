@@ -585,12 +585,15 @@ fn rd_cstr(bytes: &[u8], o: usize) -> Result<&str, ElfError> {
     core::str::from_utf8(&rest[..end]).map_err(|_| ElfError::Truncated)
 }
 
-const SH_NAME: usize = 0;
 const SH_TYPE: usize = 4;
+const SH_FLAGS: usize = 8;
 const SH_OFFSET: usize = 16;
 const SH_SIZE: usize = 20;
 const SH_LINK: usize = 24;
+const SH_INFO: usize = 28;
 const SH_ADDRALIGN: usize = 32;
+const SHF_ALLOC: u32 = 0x2;
+const SHF_EXECINSTR: u32 = 0x4;
 
 /// Parses an ELF32 little-endian relocatable object (as written by [`write_relocatable_object`],
 /// and, later, a C toolchain): the `.text` bytes, the symbol table (names resolved), and the
@@ -613,38 +616,34 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     };
     let e_shoff = rd_u32(bytes, 32)? as usize;
     let e_shnum = rd_u16(bytes, 48)? as usize;
-    let e_shstrndx = rd_u16(bytes, 50)? as usize;
     let sh = |i: usize, field: usize| rd_u32(bytes, e_shoff + i * 40 + field);
 
-    let shstr_off = sh(e_shstrndx, SH_OFFSET)? as usize;
-    let section_name = |i: usize| -> Result<&str, ElfError> {
-        rd_cstr(bytes, shstr_off + sh(i, SH_NAME)? as usize)
-    };
-
-    let (mut symtab_i, mut text_i, mut reloc) = (None, None, None);
+    let mut symtab_i = None;
+    let mut section_base: Vec<Option<u32>> = Vec::new();
+    section_base.resize(e_shnum, None);
+    let mut text: Vec<u8> = Vec::new();
+    let mut text_align = 1u32;
     for i in 0..e_shnum {
-        match sh(i, SH_TYPE)? {
-            2 => symtab_i = Some(i),
-            4 if section_name(i)? == ".rela.text" => reloc = Some((i, false)),
-            9 if section_name(i)? == ".rel.text" => reloc = Some((i, true)),
-            1 if section_name(i)? == ".text" => text_i = Some(i),
-            _ => {}
+        if sh(i, SH_TYPE)? == 2 {
+            symtab_i = Some(i);
         }
+        let flags = sh(i, SH_FLAGS)?;
+        let executable =
+            sh(i, SH_TYPE)? == 1 && flags & SHF_EXECINSTR != 0 && flags & SHF_ALLOC != 0;
+        if !executable {
+            continue;
+        }
+        let align = sh(i, SH_ADDRALIGN)?.max(1);
+        text_align = text_align.max(align);
+        while text.len() as u32 % align != 0 {
+            text.push(0);
+        }
+        section_base[i] = Some(text.len() as u32);
+        let off = sh(i, SH_OFFSET)? as usize;
+        let size = sh(i, SH_SIZE)? as usize;
+        text.extend_from_slice(bytes.get(off..off + size).ok_or(ElfError::Truncated)?);
     }
     let symtab_i = symtab_i.ok_or(ElfError::MissingSymbolTable)?;
-
-    let (text, text_align) = if let Some(ti) = text_i {
-        let off = sh(ti, SH_OFFSET)? as usize;
-        let size = sh(ti, SH_SIZE)? as usize;
-        let align = sh(ti, SH_ADDRALIGN)?.max(1);
-        let bytes = bytes
-            .get(off..off + size)
-            .ok_or(ElfError::Truncated)?
-            .to_vec();
-        (bytes, align)
-    } else {
-        (Vec::new(), 1)
-    };
 
     let strtab_off = sh(sh(symtab_i, SH_LINK)? as usize, SH_OFFSET)? as usize;
     let symtab_off = sh(symtab_i, SH_OFFSET)? as usize;
@@ -667,9 +666,14 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         } else {
             SymbolType::NoType
         };
+        let rebase = section_base
+            .get(st_shndx as usize)
+            .copied()
+            .flatten()
+            .unwrap_or(0);
         symbols.push(ParsedSymbol {
             name: String::from(rd_cstr(bytes, strtab_off + st_name)?),
-            value: st_value,
+            value: st_value + rebase,
             size: st_size,
             binding,
             kind,
@@ -678,7 +682,19 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     }
 
     let mut relocations = Vec::new();
-    if let Some((ri, implicit)) = reloc {
+    for ri in 0..e_shnum {
+        let implicit = match sh(ri, SH_TYPE)? {
+            4 => false,
+            9 => true,
+            _ => continue,
+        };
+        let Some(target_base) = section_base
+            .get(sh(ri, SH_INFO)? as usize)
+            .copied()
+            .flatten()
+        else {
+            continue;
+        };
         let off = sh(ri, SH_OFFSET)? as usize;
         let size = sh(ri, SH_SIZE)? as usize;
         let entsize = if implicit { REL_SIZE } else { RELA_SIZE };
@@ -686,7 +702,7 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             let base = off + r * entsize;
             let r_info = rd_u32(bytes, base + 4)?;
             relocations.push(ParsedRelocation {
-                offset: rd_u32(bytes, base)?,
+                offset: rd_u32(bytes, base)? + target_base,
                 symbol: r_info >> 8,
                 kind: r_info & 0xff,
                 addend: if implicit {

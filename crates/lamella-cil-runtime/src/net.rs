@@ -33,7 +33,7 @@ pub trait NetBackend: core::fmt::Debug {
     /// Resolves a host name to its IP addresses -- each entry is the address bytes in network order
     /// (4 = IPv4, 16 = IPv6), in the host resolver's order. An empty vec means resolution failed. The
     /// managed `System.Net.Dns` builds an `IPAddress[]` from these (so both families + multiple
-    /// addresses surface).
+    /// addresses surface). (Async DNS is later.)
     fn resolve(&mut self, host: &str) -> alloc::vec::Vec<alloc::vec::Vec<u8>>;
 
     /// Opens a non-blocking TCP socket and begins connecting to `addr:port`. `addr` is the address

@@ -48,8 +48,10 @@ pub enum TypeSig {
     String,
     /// `object`.
     Object,
-    /// `native int` (e.g. the method pointer in a delegate's constructor).
+    /// `native int` (e.g. the method pointer in a delegate's constructor, or `System.IntPtr`).
     NativeInt,
+    /// `native uint` (`System.UIntPtr`).
+    NativeUInt,
     /// A reference type, carrying the token of its `TypeDef`/`TypeRef`.
     Class(Token),
     /// A value type, carrying the token of its `TypeDef`/`TypeRef`.
@@ -94,6 +96,7 @@ fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
         TypeSig::String => out.push(element::STRING),
         TypeSig::Object => out.push(element::OBJECT),
         TypeSig::NativeInt => out.push(element::I),
+        TypeSig::NativeUInt => out.push(element::U),
         TypeSig::Class(token) => {
             out.push(element::CLASS);
             compress_u32(CodedIndex::TypeDefOrRef.encode(*token), out);
