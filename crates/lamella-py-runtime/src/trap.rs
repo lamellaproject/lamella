@@ -16,9 +16,11 @@ pub enum Trap {
     TypeError,
     /// An attribute reference failed -- Python's `AttributeError`.
     AttributeError,
-    /// A sequence index was out of range -- Python's `IndexError` (here: a `str` index
-    /// outside `[-len, len)`).
+    /// A sequence index was out of range -- Python's `IndexError` (here: a `str`/`list`/
+    /// `tuple` index outside `[-len, len)`).
     IndexError,
+    /// A mapping key was not found -- Python's `KeyError` (here: a missing `dict` key).
+    KeyError,
     /// An argument of the right type had an inappropriate value -- Python's `ValueError`
     /// (here: a negative shift count, `x << -1` / `x >> -1`).
     ValueError,
@@ -42,4 +44,9 @@ pub enum Trap {
     /// The bytecode was malformed: an out-of-range pool index, jump target, local slot,
     /// inline-cache slot, or argument count. A well-formed front end never emits this.
     Malformed,
+    /// A Python exception is in flight (a `raise`, a `Reraise`, or a propagated exception):
+    /// the exception object lives in the model's pending slot, and the interpreter's
+    /// exception-table search routes it to a handler. It only surfaces as an "uncaught
+    /// exception" when it escapes the top frame; it is never a bytecode/VM fault.
+    Raised,
 }

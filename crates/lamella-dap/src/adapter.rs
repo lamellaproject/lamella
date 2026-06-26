@@ -32,10 +32,66 @@ pub struct Debugger {
     /// wipe the source breakpoints.
     source_breakpoints: Vec<u64>,
     instruction_breakpoints: Vec<u64>,
+    /// Per-source-breakpoint hit-count / logpoint behavior, by code address. Rebuilt on each
+    /// `setBreakpoints`; an address with no entry is an ordinary breakpoint that always stops.
+    breakpoint_meta: Vec<BreakpointMeta>,
     /// The inactive (over-capacity) breakpoint count last reported to the user, so the
     /// run-time "N inactive" note fires only when that count changes -- not on every continue.
     last_inactive_note: usize,
     out_seq: i64,
+}
+
+/// Per-breakpoint behavior for a source breakpoint: a hit-count condition and/or a logpoint
+/// message, with the running hit count. Both fields empty means an ordinary breakpoint that
+/// always stops.
+struct BreakpointMeta {
+    address: u64,
+    hit_condition: Option<String>,
+    log_message: Option<String>,
+    hits: u32,
+}
+
+/// What to do when execution stops at a source breakpoint, decided from its [`BreakpointMeta`].
+enum BreakpointAction {
+    /// Report the stop to the client: a plain breakpoint, or a hit count now satisfied.
+    Stop,
+    /// Log the message and keep running -- a logpoint never stops.
+    Log(String),
+    /// Keep running without reporting -- a hit count not yet satisfied.
+    Skip,
+}
+
+/// Interprets a DAP `hitCondition` against the running hit count: an optional operator
+/// (`>`, `>=`, `<`, `<=`, `==`, `%`) then a number; a bare number means `==` (break on exactly
+/// that hit), `%n` breaks every nth hit. An unparseable condition stops always (fail safe).
+fn hit_satisfied(condition: &str, hits: u32) -> bool {
+    let condition = condition.trim();
+    let (op, number) = if let Some(rest) = condition.strip_prefix(">=") {
+        (">=", rest)
+    } else if let Some(rest) = condition.strip_prefix("<=") {
+        ("<=", rest)
+    } else if let Some(rest) = condition.strip_prefix("==") {
+        ("==", rest)
+    } else if let Some(rest) = condition.strip_prefix('>') {
+        (">", rest)
+    } else if let Some(rest) = condition.strip_prefix('<') {
+        ("<", rest)
+    } else if let Some(rest) = condition.strip_prefix('%') {
+        ("%", rest)
+    } else {
+        ("==", condition)
+    };
+    let Ok(n) = number.trim().parse::<u32>() else {
+        return true;
+    };
+    match op {
+        ">=" => hits >= n,
+        "<=" => hits <= n,
+        ">" => hits > n,
+        "<" => hits < n,
+        "%" => n != 0 && hits % n == 0,
+        _ => hits == n,
+    }
 }
 
 impl Debugger {
@@ -68,6 +124,7 @@ impl Debugger {
             running: false,
             source_breakpoints: Vec::new(),
             instruction_breakpoints: Vec::new(),
+            breakpoint_meta: Vec::new(),
             last_inactive_note: 0,
             out_seq: 0,
         }
@@ -256,6 +313,7 @@ impl Debugger {
             .unwrap_or_default();
         let cap = self.backend.max_breakpoints();
         let mut addresses = Vec::new();
+        let mut meta = Vec::new();
         let mut results = Vec::new();
         for spec in &specs {
             let requested = spec.get("line").and_then(Json::as_u64);
@@ -266,6 +324,20 @@ impl Debugger {
                 Some(address) => {
                     let armed = cap.map_or(true, |max| addresses.len() < max);
                     addresses.push(address);
+                    meta.push(BreakpointMeta {
+                        address,
+                        hit_condition: spec
+                            .get("hitCondition")
+                            .and_then(Json::as_str)
+                            .filter(|text| !text.trim().is_empty())
+                            .map(String::from),
+                        log_message: spec
+                            .get("logMessage")
+                            .and_then(Json::as_str)
+                            .filter(|text| !text.is_empty())
+                            .map(String::from),
+                        hits: 0,
+                    });
                     let line = self
                         .backend
                         .source_location(address)
@@ -284,6 +356,7 @@ impl Debugger {
             }
         }
         self.source_breakpoints = addresses;
+        self.breakpoint_meta = meta;
         self.apply_breakpoints();
         json!({ "breakpoints": results })
     }
@@ -294,7 +367,7 @@ impl Debugger {
         if matches!(action, Action::Resume) {
             self.note_inactive_breakpoints(events);
         }
-        let stop = match action {
+        let mut stop = match action {
             Action::Resume => self.backend.resume(),
             Action::StepIn | Action::StepOver | Action::StepOut if self.backend.has_source() => {
                 self.source_step(action)
@@ -303,11 +376,49 @@ impl Debugger {
             Action::StepOver => self.step_to_depth(|depth, start| depth <= start),
             Action::StepOut => self.step_to_depth(|depth, start| depth < start),
         };
+        while matches!(stop, Stop::Breakpoint) {
+            match self.breakpoint_action() {
+                BreakpointAction::Stop => break,
+                BreakpointAction::Log(message) => {
+                    self.flush_output(events);
+                    events.push((
+                        "output",
+                        Some(json!({ "category": "console", "output": format!("{message}\n") })),
+                    ));
+                    stop = self.backend.resume();
+                }
+                BreakpointAction::Skip => stop = self.backend.resume(),
+            }
+        }
         if matches!(stop, Stop::Running) {
             self.running = true;
             self.flush_output(events);
         } else {
             self.finish(stop, events);
+        }
+    }
+
+    /// Decides what to do at the current breakpoint stop from its [`BreakpointMeta`]: counts the
+    /// hit, then returns whether to log (logpoint), keep running (hit count not yet met), or stop.
+    /// The current location is the innermost frame's address; an address with no metadata stops.
+    fn breakpoint_action(&mut self) -> BreakpointAction {
+        let Some(address) = self.backend.stack().first().map(|frame| frame.address) else {
+            return BreakpointAction::Stop;
+        };
+        let Some(meta) = self
+            .breakpoint_meta
+            .iter_mut()
+            .find(|entry| entry.address == address)
+        else {
+            return BreakpointAction::Stop;
+        };
+        meta.hits += 1;
+        if let Some(message) = &meta.log_message {
+            return BreakpointAction::Log(message.clone());
+        }
+        match &meta.hit_condition {
+            Some(condition) if !hit_satisfied(condition, meta.hits) => BreakpointAction::Skip,
+            _ => BreakpointAction::Stop,
         }
     }
 
@@ -729,6 +840,146 @@ mod tests {
                 .map(str::to_owned),
             _ => None,
         })
+    }
+
+    #[test]
+    fn hit_condition_parsing() {
+        assert!(hit_satisfied("3", 3));
+        assert!(!hit_satisfied("3", 2));
+        assert!(!hit_satisfied("3", 4));
+        assert!(hit_satisfied("==3", 3));
+        assert!(hit_satisfied(">2", 3));
+        assert!(!hit_satisfied(">2", 2));
+        assert!(hit_satisfied(">=3", 3));
+        assert!(hit_satisfied("<3", 2));
+        assert!(!hit_satisfied("<3", 3));
+        assert!(hit_satisfied("%5", 10));
+        assert!(!hit_satisfied("%5", 11));
+        assert!(hit_satisfied("  > 2 ", 3));
+        assert!(hit_satisfied("garbage", 1));
+    }
+
+    /// A backend that reports a breakpoint `total_hits` times (as a loop would), then `Done`.
+    /// `stack` always sits at the single breakpoint address, so the adapter's hit-count /
+    /// logpoint filter finds its metadata. Inert otherwise.
+    struct LoopBackend {
+        address: u64,
+        total_hits: u32,
+        seen: u32,
+    }
+
+    impl DebugBackend for LoopBackend {
+        fn launch(&mut self) -> bool {
+            true
+        }
+        fn resume(&mut self) -> Stop {
+            if self.seen < self.total_hits {
+                self.seen += 1;
+                Stop::Breakpoint
+            } else {
+                Stop::Done
+            }
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, addresses: &[u64]) {
+            self.address = addresses.first().copied().unwrap_or(0);
+        }
+        fn resolve_source_breakpoint(&self, _document: &str, line: u32) -> Option<u64> {
+            Some(u64::from(line))
+        }
+        fn stack(&self) -> Vec<Frame> {
+            vec![Frame {
+                address: self.address,
+                name: String::new(),
+                line: 0,
+            }]
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    fn loop_debugger(total_hits: u32) -> Debugger {
+        let mut dbg = Debugger::with_backend(Box::new(LoopBackend {
+            address: 0,
+            total_hits,
+            seen: 0,
+        }));
+        dbg.handle(&request(1, "launch", None));
+        dbg
+    }
+
+    fn set_one_breakpoint(dbg: &mut Debugger, extra: Json) {
+        let mut breakpoint = json!({ "line": 10 });
+        if let (Some(obj), Some(extra)) = (breakpoint.as_object_mut(), extra.as_object()) {
+            for (key, value) in extra {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        dbg.handle(&request(
+            2,
+            "setBreakpoints",
+            Some(json!({ "source": { "path": "x.cs" }, "breakpoints": [breakpoint] })),
+        ));
+    }
+
+    fn has_event(messages: &[Message], event: &str) -> bool {
+        messages
+            .iter()
+            .any(|m| matches!(m, Message::Event(e) if e.event == event))
+    }
+
+    #[test]
+    fn a_hit_count_breakpoint_skips_until_its_count_then_stops() {
+        let mut dbg = loop_debugger(5);
+        set_one_breakpoint(&mut dbg, json!({ "hitCondition": "3" }));
+        let out = dbg.handle(&request(3, "continue", None));
+        assert!(has_event(&out, "stopped"));
+        assert!(!has_event(&out, "exited"));
+    }
+
+    #[test]
+    fn a_hit_count_never_reached_runs_to_completion() {
+        let mut dbg = loop_debugger(2);
+        set_one_breakpoint(&mut dbg, json!({ "hitCondition": "5" }));
+        let out = dbg.handle(&request(3, "continue", None));
+        assert!(has_event(&out, "exited"));
+        assert!(!has_event(&out, "stopped"));
+    }
+
+    #[test]
+    fn a_logpoint_logs_each_hit_and_never_stops() {
+        let mut dbg = loop_debugger(3);
+        set_one_breakpoint(&mut dbg, json!({ "logMessage": "loop hit" }));
+        let out = dbg.handle(&request(3, "continue", None));
+        let logs = out
+            .iter()
+            .filter(|m| {
+                matches!(m, Message::Event(e) if e.event == "output"
+                    && e.body.as_ref().and_then(|b| b.get("output")).and_then(Json::as_str)
+                        == Some("loop hit\n"))
+            })
+            .count();
+        assert_eq!(logs, 3);
+        assert!(has_event(&out, "exited"));
+        assert!(!has_event(&out, "stopped"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod intrinsics;
 pub mod module;
 pub mod net;
 pub mod object;
+pub mod tls;
 pub mod trap;
 pub mod value;
 

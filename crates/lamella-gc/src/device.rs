@@ -339,6 +339,7 @@ mod tests {
         TypeDesc {
             payload_size: 4,
             ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
         }
     }
 
@@ -347,6 +348,7 @@ mod tests {
         TypeDesc {
             payload_size: 4,
             ref_offsets: vec![0],
+            tagged_offsets: Vec::new(),
         }
     }
 
@@ -399,6 +401,7 @@ mod tests {
                 TypeDesc {
                     payload_size: 64,
                     ref_offsets: Vec::new(),
+                    tagged_offsets: Vec::new(),
                 },
             ],
         );

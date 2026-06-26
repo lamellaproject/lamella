@@ -6,6 +6,8 @@
 extern crate alloc;
 
 pub mod ast;
+/// Generated single-byte ANSI code-page tables (see `tools/gen-codepages.ps1`), used by `decode`.
+mod codepages;
 pub mod decode;
 pub mod diagnostic;
 pub mod lexer;

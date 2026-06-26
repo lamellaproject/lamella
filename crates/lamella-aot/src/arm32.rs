@@ -113,7 +113,12 @@ fn lower_inst(
 ) -> Result<(), LowerError> {
     match inst {
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
-        Inst::FuncAddr { .. } | Inst::CallIndirect { .. } | Inst::CallNative { .. } => {
+        Inst::FuncAddr { .. }
+        | Inst::CallIndirect { .. }
+        | Inst::CallNative { .. }
+        | Inst::InvokeDelegate { .. }
+        | Inst::TypeDescLiteral { .. }
+        | Inst::PInvoke { .. } => {
             return Err(LowerError::CallUnsupported);
         }
         Inst::CopyBlock { .. } | Inst::FillBlock { .. } => {
@@ -354,6 +359,7 @@ fn lower_spilled_inst(
     sym_pool: &mut Vec<(Label, u32)>,
     strings: &mut Vec<(Label, Box<[u8]>)>,
     string_blobs: &mut Vec<(Label, Box<[u16]>)>,
+    desc_pool: &mut Vec<(Label, Box<[u32]>)>,
     value_types: &[MirType],
     slot: &impl Fn(ValueId) -> u16,
     inst: &Inst,
@@ -520,7 +526,7 @@ fn lower_spilled_inst(
                     .ok_or(LowerError::CallUnsupported)?;
                 enc.bl(target);
             }
-            let return_pc = enc.position();
+            let return_pc = enc.safepoint_label();
             if stack_bytes > 0 {
                 enc.add_sp(stack_bytes)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -536,18 +542,74 @@ fn lower_spilled_inst(
             enc.ldr_literal(Reg::R0, label)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::TypeDescLiteral { words } => {
+            let label = enc.new_label();
+            desc_pool.push((label, words.clone()));
+            enc.adr(Reg::R0, label)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
         Inst::CallIndirect { target, args } => {
             enc.ldr_sp(Reg::R0, slot(*target))
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.mov_reg(Reg::R12, Reg::R0);
             let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
-            let return_pc = enc.position();
+            let return_pc = enc.safepoint_label();
             if stack_bytes > 0 {
                 enc.add_sp(stack_bytes)
                     .map_err(|_| LowerError::TooManyValues)?;
             }
             return Ok(Some(return_pc));
+        }
+        Inst::InvokeDelegate { delegate, args } => {
+            if args.len() > 3 {
+                return Err(LowerError::CallUnsupported);
+            }
+            let mloop = enc.new_label();
+            let multi = enc.new_label();
+            let dispatch = enc.new_label();
+            let d_static = enc.new_label();
+            let d_call = enc.new_label();
+            let mdone = enc.new_label();
+            let e = |_| LowerError::TooManyValues;
+            enc.movs_imm(Reg::R4, 0).map_err(e)?;
+            enc.bind_label(mloop);
+            enc.ldr_sp(Reg::R3, slot(*delegate)).map_err(e)?;
+            enc.ldr_imm(Reg::R1, Reg::R3, 8).map_err(e)?;
+            enc.cmp_imm(Reg::R1, 0).map_err(e)?;
+            enc.b_cond(Cond::Ne, multi);
+            enc.cmp_imm(Reg::R4, 1).map_err(e)?;
+            enc.b_cond(Cond::GreaterOrEqual, mdone);
+            enc.b(dispatch);
+            enc.bind_label(multi);
+            enc.ldr_imm(Reg::R2, Reg::R1, 0).map_err(e)?;
+            enc.cmp_reg(Reg::R4, Reg::R2).map_err(e)?;
+            enc.b_cond(Cond::GreaterOrEqual, mdone);
+            enc.lsls_imm(Reg::R2, Reg::R4, 2).map_err(e)?;
+            enc.adds_imm3(Reg::R2, Reg::R2, 4).map_err(e)?;
+            enc.ldr_reg(Reg::R3, Reg::R1, Reg::R2).map_err(e)?;
+            enc.bind_label(dispatch);
+            enc.ldr_imm(Reg::R2, Reg::R3, 4).map_err(e)?;
+            enc.mov_reg(Reg::R12, Reg::R2);
+            enc.ldr_imm(Reg::R0, Reg::R3, 0).map_err(e)?;
+            enc.cmp_imm(Reg::R0, 0).map_err(e)?;
+            enc.b_cond(Cond::Eq, d_static);
+            load_call_args(enc, value_types, slot, args, 1)?;
+            enc.b(d_call);
+            enc.bind_label(d_static);
+            load_call_args(enc, value_types, slot, args, 0)?;
+            enc.bind_label(d_call);
+            enc.blx(Reg::R12);
+            let return_pc = enc.safepoint_label();
+            enc.movs_reg(Reg::R5, Reg::R0).map_err(e)?;
+            enc.adds_imm8(Reg::R4, 1).map_err(e)?;
+            enc.b(mloop);
+            enc.bind_label(mdone);
+            enc.movs_reg(Reg::R0, Reg::R5).map_err(e)?;
+            return Ok(Some(return_pc));
+        }
+        Inst::PInvoke { .. } => {
+            return Err(LowerError::CallUnsupported);
         }
         Inst::CallNative { symbol, args } => {
             if !relocate {
@@ -555,7 +617,7 @@ fn lower_spilled_inst(
             }
             let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
             enc.bl_symbol(EXTERN_SYMBOL_FLAG | *symbol);
-            let return_pc = enc.position();
+            let return_pc = enc.safepoint_label();
             if stack_bytes > 0 {
                 enc.add_sp(stack_bytes)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -590,7 +652,7 @@ fn lower_spilled_inst(
             enc.mov_reg(Reg::R12, Reg::R0);
             let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
-            let return_pc = enc.position();
+            let return_pc = enc.safepoint_label();
             if stack_bytes > 0 {
                 enc.add_sp(stack_bytes)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -648,7 +710,7 @@ fn lower_spilled_inst(
             enc.mov_reg(Reg::R12, Reg::R0);
             let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
-            let return_pc = enc.position();
+            let return_pc = enc.safepoint_label();
             if stack_bytes > 0 {
                 enc.add_sp(stack_bytes)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -1710,6 +1772,7 @@ fn lower_spilled_into(
                     | Inst::CallInterface { .. }
                     | Inst::CallIndirect { .. }
                     | Inst::CallNative { .. }
+                    | Inst::InvokeDelegate { .. }
                     | Inst::CastClassScan { .. }
                     | Inst::PyIntrinsic { .. }
                     | Inst::Alloc { .. }
@@ -1718,6 +1781,13 @@ fn lower_spilled_into(
             )
         })
     });
+    let invokes_delegate = func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|(_, i)| matches!(i, Inst::InvokeDelegate { .. }))
+    });
+    let saved_mask: u8 = if invokes_delegate { 0x30 } else { 0 };
+    let saved_bytes: u16 = (saved_mask.count_ones() as u16 + 1) * 4;
     let lr_bytes = if has_calls { 4 } else { 0 };
     let mut offsets: Vec<u16> = Vec::with_capacity(func.value_types.len());
     let mut used = 0u16;
@@ -1756,13 +1826,13 @@ fn lower_spilled_into(
     let safepoints = crate::regalloc::safepoint_roots(func, &func.value_types);
     let record_safepoint =
         |stack_maps: &mut Vec<StackMapEntry>, index: usize, inst_pos: usize, return_pc: u32| {
+            let mut ref_offsets = Vec::new();
+            let mut tagged_offsets = Vec::new();
             if let Some(roots) = safepoints
                 .get(index)
                 .and_then(|b| b.get(inst_pos))
                 .and_then(Option::as_ref)
             {
-                let mut ref_offsets = Vec::new();
-                let mut tagged_offsets = Vec::new();
                 for &v in roots {
                     if func.value_type(v) == Some(MirType::PyValue) {
                         tagged_offsets.push(slot(v));
@@ -1770,13 +1840,14 @@ fn lower_spilled_into(
                         ref_offsets.push(slot(v));
                     }
                 }
-                stack_maps.push(StackMapEntry {
-                    return_pc,
-                    frame_size: frame,
-                    ref_offsets,
-                    tagged_offsets,
-                });
             }
+            stack_maps.push(StackMapEntry {
+                return_pc,
+                frame_size: frame,
+                saved_bytes,
+                ref_offsets,
+                tagged_offsets,
+            });
         };
 
     let mut pool: Vec<(Label, u32)> = Vec::new();
@@ -1785,8 +1856,9 @@ fn lower_spilled_into(
     let mut string_blobs: Vec<(Label, Box<[u16]>)> = Vec::new();
     let mut type_descs: Vec<(Label, Box<[u32]>)> = Vec::new();
     let mut type_desc_labels: Vec<(lamella_ir::TypeHandle, Label)> = Vec::new();
+    let mut desc_pool: Vec<(Label, Box<[u32]>)> = Vec::new();
     if has_calls {
-        enc.push_registers(0, true);
+        enc.push_registers(saved_mask, true);
     }
     enc.sub_sp(frame).map_err(|_| LowerError::TooManyValues)?;
 
@@ -1925,7 +1997,7 @@ fn lower_spilled_into(
                             .ok_or(LowerError::CallUnsupported)?;
                         enc.bl(target);
                     }
-                    record_safepoint(stack_maps, index, inst_pos, enc.position());
+                    record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
                     continue;
                 }
             }
@@ -1968,7 +2040,7 @@ fn lower_spilled_into(
                     }
                     _ => return Err(LowerError::CallUnsupported),
                 }
-                record_safepoint(stack_maps, index, inst_pos, enc.position());
+                record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
                 if op.result_type().is_some() {
                     enc.str_sp(Reg::R0, slot(*result))
                         .map_err(|_| LowerError::TooManyValues)?;
@@ -2005,7 +2077,7 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 load_const_word(enc, &mut pool, Reg::R2, alloc)?;
                 enc.blx(Reg::R2);
-                record_safepoint(stack_maps, index, inst_pos, enc.position());
+                record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
                 let ok = enc.new_label();
                 enc.cmp_imm(Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -2077,7 +2149,7 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 load_const_word(enc, &mut pool, Reg::R2, alloc)?;
                 enc.blx(Reg::R2);
-                record_safepoint(stack_maps, index, inst_pos, enc.position());
+                record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
                 let ok = enc.new_label();
                 enc.cmp_imm(Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -2131,7 +2203,7 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 load_const_word(enc, &mut pool, Reg::R2, alloc)?;
                 enc.blx(Reg::R2);
-                record_safepoint(stack_maps, index, inst_pos, enc.position());
+                record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
                 let ok = enc.new_label();
                 enc.cmp_imm(Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -2156,6 +2228,7 @@ fn lower_spilled_into(
                 &mut sym_pool,
                 &mut strings,
                 &mut string_blobs,
+                &mut desc_pool,
                 &func.value_types,
                 &slot,
                 inst,
@@ -2203,7 +2276,7 @@ fn lower_spilled_into(
                 }
                 enc.add_sp(frame).map_err(|_| LowerError::TooManyValues)?;
                 if has_calls {
-                    enc.pop_registers(0, true);
+                    enc.pop_registers(saved_mask, true);
                 } else {
                     enc.bx(Reg::LR);
                 }
@@ -2269,6 +2342,15 @@ fn lower_spilled_into(
         for (entry, func) in sym_pool {
             enc.bind_label(entry);
             enc.data_word_symbol(func);
+        }
+    }
+    if !desc_pool.is_empty() {
+        enc.align_to_word();
+        for (entry, words) in desc_pool {
+            enc.bind_label(entry);
+            for &word in words.iter() {
+                enc.emit_word(word);
+            }
         }
     }
     for (entry, text) in strings {
@@ -2446,7 +2528,9 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::PyIntrinsic { .. }
                     | Inst::CallIndirect { .. }
                     | Inst::CallNative { .. }
+                    | Inst::InvokeDelegate { .. }
                     | Inst::FuncAddr { .. }
+                    | Inst::TypeDescLiteral { .. }
                     | Inst::CopyBlock { .. }
                     | Inst::FillBlock { .. }
             )
@@ -2464,10 +2548,11 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     }) {
         return Ok(Assignment::Spilled);
     }
-    let has_calls = func
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
+    let has_calls = func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|(_, i)| crate::regalloc::is_safepoint(i))
+    });
     if has_calls && crate::regalloc::Liveness::analyze(func).any_value_live_across_call(func) {
         return Ok(Assignment::Spilled);
     }
@@ -2508,10 +2593,11 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
         })
         .collect();
     let saved = sparse_callee_saved(&homes);
-    let has_calls = func
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
+    let has_calls = func.blocks.iter().any(|b| {
+        b.insts.iter().any(|(_, i)| {
+            crate::regalloc::is_safepoint(i) || matches!(i, Inst::CastClassScan { .. })
+        })
+    });
     let lr_bytes = if has_calls { 4 } else { 0 };
     let pushed = saved.count_ones() as usize * 4 + lr_bytes;
     let frame = ((pushed + mixed.spill_count as usize * 4 + 7) & !7usize) - pushed;
@@ -2603,6 +2689,7 @@ fn lower_into(
     func_labels: &[Label],
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
+    stack_maps: &mut Vec<StackMapEntry>,
     relocate: bool,
 ) -> Result<(), LowerError> {
     let assign = |v: ValueId| regs.get(v.index()).copied().unwrap_or(Reg::R0);
@@ -2610,6 +2697,7 @@ fn lower_into(
         .blocks
         .iter()
         .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::Call { .. })));
+    let saved_bytes: u16 = (saved.count_ones() as u16 + 1) * 4;
 
     if has_calls || saved != 0 {
         enc.push_registers(saved, has_calls);
@@ -2643,6 +2731,13 @@ fn lower_into(
             }
             if let Inst::Call { callee, args } = inst {
                 lower_call(enc, &assign, *result, *callee, args, func_labels, relocate)?;
+                stack_maps.push(StackMapEntry {
+                    return_pc: enc.safepoint_label(),
+                    frame_size: 0,
+                    saved_bytes,
+                    ref_offsets: Vec::new(),
+                    tagged_offsets: Vec::new(),
+                });
             } else {
                 lower_inst(enc, &mut pool, *result, inst, &assign)?;
             }
@@ -2752,8 +2847,10 @@ fn lower_mixed_into(
     func_labels: &[Label],
     source_map: &[Vec<u32>],
     line_table: &mut Vec<(u32, u32)>,
+    stack_maps: &mut Vec<StackMapEntry>,
     relocate: bool,
 ) -> Result<(), LowerError> {
+    let saved_bytes: u16 = (saved.count_ones() as u16 + 1) * 4;
     let has_calls = func
         .blocks
         .iter()
@@ -2810,6 +2907,13 @@ fn lower_mixed_into(
             }
             if let Inst::Call { callee, args } = inst {
                 lower_mixed_call(enc, &home, *result, *callee, args, func_labels, relocate)?;
+                stack_maps.push(StackMapEntry {
+                    return_pc: enc.safepoint_label(),
+                    frame_size: frame,
+                    saved_bytes,
+                    ref_offsets: Vec::new(),
+                    tagged_offsets: Vec::new(),
+                });
             } else {
                 lower_mixed_value(enc, &mut pool, &home, *result, inst)?;
             }
@@ -3120,8 +3224,13 @@ impl LineTable {
 pub struct StackMapEntry {
     /// The return address of the safepoint -- a native code offset, the collector's lookup key.
     pub return_pc: u32,
-    /// The frame the safepoint opened, in bytes; the collector steps past it to the caller.
+    /// The sub-SP slot area in bytes -- the roots' container. `ref_offsets`/`tagged_offsets` index it.
     pub frame_size: u16,
+    /// The pushed callee-saved registers + LR in bytes, sitting just ABOVE the slots (the prologue
+    /// pushes them, then sub-SPs the slots). So the caller's SP is `SP + frame_size + saved_bytes` and
+    /// the saved LR (the caller's return address) is the word below it, at `caller_SP - 4`. The
+    /// register path has `frame_size == 0` (no slots, just this push); a leaf gets no entry.
+    pub saved_bytes: u16,
     /// Byte offsets from SP-at-the-call of the live unconditional `ObjectRef` roots in the frame.
     pub ref_offsets: Vec<u16>,
     /// Byte offsets from SP-at-the-call of the live `PyValue` roots -- tagged words the collector
@@ -3130,16 +3239,16 @@ pub struct StackMapEntry {
     pub tagged_offsets: Vec<u16>,
 }
 
-/// The GC stack maps for a lowered program -- one entry per safepoint, sorted by `return_pc` for
-/// the collector's binary search. The all-spilled path keeps every root in a frame slot, so the
-/// map names slot offsets only; on this path no callee-saved register is used (`saved == 0`), so
-/// the saved LR a frame walk reads sits at `SP-at-the-call + frame_size`.
+/// The GC stack maps for a lowered program -- one entry per safepoint (every call + allocation, on
+/// ALL register-allocation paths so the collector can step past any frame), sorted by `return_pc`
+/// for its binary search. A frame walk reads the saved LR at `SP + frame_size + saved_bytes - 4` and
+/// the caller's SP at `SP + frame_size + saved_bytes`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StackMaps(pub Vec<StackMapEntry>);
 
 impl StackMaps {
     /// The little-endian wire format the collector consumes: `u32 count`, then each entry as
-    /// `u32 return_pc; u16 frame_size; u16 nrefs; u16 ref_offsets[nrefs]; u16 ntagged;
+    /// `u32 return_pc; u16 frame_size; u16 saved_bytes; u16 nrefs; u16 ref_offsets[nrefs]; u16 ntagged;
     /// u16 tagged_offsets[ntagged]`. `ref_offsets` are unconditional `ObjectRef` roots;
     /// `tagged_offsets` are `PyValue` roots the collector traces by tag. The tagged fields are
     /// always present -- a C# image emits `ntagged = 0`.
@@ -3150,6 +3259,7 @@ impl StackMaps {
         for entry in &self.0 {
             out.extend_from_slice(&entry.return_pc.to_le_bytes());
             out.extend_from_slice(&entry.frame_size.to_le_bytes());
+            out.extend_from_slice(&entry.saved_bytes.to_le_bytes());
             out.extend_from_slice(&(entry.ref_offsets.len() as u16).to_le_bytes());
             for &offset in &entry.ref_offsets {
                 out.extend_from_slice(&offset.to_le_bytes());
@@ -3169,9 +3279,17 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
     let mut enc = Encoder::new();
     let mut _lines = Vec::new();
     match prepare(func)? {
-        Assignment::Registers { regs, saved } => {
-            lower_into(func, &mut enc, &regs, saved, &[], &[], &mut _lines, false)?
-        }
+        Assignment::Registers { regs, saved } => lower_into(
+            func,
+            &mut enc,
+            &regs,
+            saved,
+            &[],
+            &[],
+            &mut _lines,
+            &mut Vec::new(),
+            false,
+        )?,
         Assignment::Mixed {
             homes,
             saved,
@@ -3185,6 +3303,7 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
             &[],
             &[],
             &mut _lines,
+            &mut Vec::new(),
             false,
         )?,
         Assignment::Spilled => lower_spilled_into(
@@ -3223,6 +3342,7 @@ pub fn lower_debug(
             &[],
             source_map,
             &mut lines,
+            &mut Vec::new(),
             false,
         )?,
         Assignment::Mixed {
@@ -3238,6 +3358,7 @@ pub fn lower_debug(
             &[],
             source_map,
             &mut lines,
+            &mut Vec::new(),
             false,
         )?,
         Assignment::Spilled => lower_spilled_into(
@@ -3403,8 +3524,27 @@ fn lower_runtime_calls(func: &Function, externs: &mut Vec<alloc::string::String>
         let old = core::mem::take(&mut func.blocks[bi].insts);
         let mut insts = Vec::with_capacity(old.len());
         for (result, inst) in old {
-            if let Inst::Alloc { payload_size, .. } = &inst {
+            if let Inst::PInvoke { import, args } = &inst {
+                let symbol = intern_extern(externs, import);
+                insts.push((
+                    result,
+                    Inst::CallNative {
+                        symbol,
+                        args: args.clone(),
+                    },
+                ));
+                continue;
+            }
+            if let Inst::Alloc {
+                payload_size,
+                ref_offsets,
+                ..
+            } = &inst
+            {
                 let symbol = intern_extern(externs, "lamella_gc_alloc");
+                let mut words: Vec<u32> =
+                    alloc::vec![*payload_size, ref_offsets.len() as u32, 0, 0];
+                words.extend(ref_offsets.iter().copied());
                 let size = ValueId(func.value_types.len() as u32);
                 func.value_types.push(MirType::I32);
                 let typedesc = ValueId(func.value_types.len() as u32);
@@ -3418,9 +3558,8 @@ fn lower_runtime_calls(func: &Function, externs: &mut Vec<alloc::string::String>
                 ));
                 insts.push((
                     typedesc,
-                    Inst::ConstInt {
-                        ty: MirType::I32,
-                        value: 0,
+                    Inst::TypeDescLiteral {
+                        words: words.into_boxed_slice(),
                     },
                 ));
                 insts.push((
@@ -3514,6 +3653,7 @@ pub fn lower_object(
     let funcs = funcs.as_slice();
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
+    let mut stack_maps: Vec<StackMapEntry> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
         if lamella_ir::verify(func).is_err() {
             return Err(LowerError::NotWellFormed);
@@ -3528,6 +3668,7 @@ pub fn lower_object(
                 &func_labels,
                 &[],
                 &mut Vec::new(),
+                &mut stack_maps,
                 true,
             )?,
             Assignment::Mixed {
@@ -3543,6 +3684,7 @@ pub fn lower_object(
                 &func_labels,
                 &[],
                 &mut Vec::new(),
+                &mut stack_maps,
                 true,
             )?,
             Assignment::Spilled => lower_spilled_into(
@@ -3553,7 +3695,7 @@ pub fn lower_object(
                 PySupport::default(),
                 &[],
                 &mut Vec::new(),
-                &mut Vec::new(),
+                &mut stack_maps,
                 &[],
                 true,
             )?,
@@ -3564,7 +3706,10 @@ pub fn lower_object(
         .iter()
         .map(|&l| assembled.label_position(l).unwrap_or(0))
         .collect();
-    let text = assembled.bytes;
+    for entry in &mut stack_maps {
+        entry.return_pc = assembled.label_position_by_id(entry.return_pc).unwrap_or(0);
+    }
+    let mut text = assembled.bytes;
     let mut symbols: Vec<lamella_elf::Symbol> = (0..funcs.len())
         .map(|i| {
             let end = offsets.get(i + 1).copied().unwrap_or(text.len() as u32);
@@ -3605,6 +3750,28 @@ pub fn lower_object(
             symbol,
             kind,
             addend,
+        });
+    }
+    if !stack_maps.is_empty() {
+        stack_maps.sort_by_key(|entry| entry.return_pc);
+        let blob_offset = text.len() as u32;
+        let blob = StackMaps(stack_maps).encode();
+        text.extend_from_slice(&blob);
+        symbols.push(lamella_elf::Symbol {
+            name: "__lamella_gc_stackmaps",
+            value: blob_offset,
+            size: blob.len() as u32,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        });
+        symbols.push(lamella_elf::Symbol {
+            name: "__lamella_text_base",
+            value: 0,
+            size: 0,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
         });
     }
     Ok(lamella_elf::write_relocatable_object(
@@ -3664,6 +3831,7 @@ fn lower_module_inner(
                     &func_labels,
                     source_map,
                     &mut lines,
+                    &mut stack_maps,
                     false,
                 )?;
             }
@@ -3681,6 +3849,7 @@ fn lower_module_inner(
                     &func_labels,
                     source_map,
                     &mut lines,
+                    &mut stack_maps,
                     false,
                 )?;
             }
@@ -3703,9 +3872,14 @@ fn lower_module_inner(
             method_lines.push((func_offset, LineTable(lines)));
         }
     }
-    stack_maps.sort_by_key(|entry| entry.return_pc);
     enc.finish()
-        .map(|assembled| (assembled.bytes, StackMaps(stack_maps), method_lines))
+        .map(|assembled| {
+            for entry in &mut stack_maps {
+                entry.return_pc = assembled.label_position_by_id(entry.return_pc).unwrap_or(0);
+            }
+            stack_maps.sort_by_key(|entry| entry.return_pc);
+            (assembled.bytes, StackMaps(stack_maps), method_lines)
+        })
         .map_err(|_| LowerError::CodeTooLarge)
 }
 
@@ -5936,6 +6110,191 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "lamella_gc_alloc" && !s.defined),
             "Alloc lowers to a call to the undefined lamella_gc_alloc"
+        );
+    }
+
+    #[test]
+    fn alloc_carries_a_per_type_descriptor() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: lamella_ir::TypeHandle(0),
+                        payload_size: 12,
+                        ref_offsets: vec![0, 4].into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let lowered = lower_runtime_calls(&main, &mut Vec::new());
+        let words = lowered
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(_, i)| match i {
+                Inst::TypeDescLiteral { words } => Some(words.clone()),
+                _ => None,
+            })
+            .expect("the alloc emits a TypeDescLiteral");
+        assert_eq!(&*words, &[12, 2, 0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn lower_object_emits_the_gc_stackmap_symbol() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(0),
+                            payload_size: 4,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let g = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let (_, maps) = lower_module_gc_mapped(&[main.clone(), g.clone()], 0x1000).unwrap();
+        assert!(
+            maps.0.iter().any(|e| !e.ref_offsets.is_empty()),
+            "the live ObjectRef `o` is a root across the call to g"
+        );
+        let obj = lamella_elf::read_object(&lower_object(&[main, g], &["main", "g"], &[]).unwrap())
+            .unwrap();
+        let sym = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_gc_stackmaps")
+            .expect("__lamella_gc_stackmaps is emitted");
+        assert!(
+            sym.defined,
+            "the GC stack-map symbol is a defined data symbol"
+        );
+        assert!(
+            sym.size > 4,
+            "the blob carries at least one safepoint entry past the u32 count"
+        );
+    }
+
+    #[test]
+    fn register_path_call_gets_a_frame_walk_entry() {
+        let h = Function {
+            params: Vec::new(),
+            ret: None,
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Call {
+                        callee: 1,
+                        args: Vec::new(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let g = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        assert!(
+            matches!(prepare(&h).unwrap(), Assignment::Registers { saved: 0, .. }),
+            "h takes the register path (nothing live across the call)"
+        );
+        let (_, maps) = lower_module_gc_mapped(&[h, g], 0x1000).unwrap();
+        let entry = maps
+            .0
+            .iter()
+            .find(|e| e.ref_offsets.is_empty() && e.frame_size == 0)
+            .expect("the register-path call site has a frame-walk entry");
+        assert_eq!(
+            entry.saved_bytes, 4,
+            "the pushed LR above the register frame, no callee-saved"
+        );
+    }
+
+    #[test]
+    fn invoke_delegate_roots_its_reloaded_inputs() {
+        let f = Function {
+            params: vec![MirType::ObjectRef, MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1)],
+                insts: vec![(
+                    ValueId(2),
+                    Inst::InvokeDelegate {
+                        delegate: ValueId(0),
+                        args: vec![ValueId(1)],
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let (_, maps) = lower_module_gc_mapped(&[f], 0x1000).unwrap();
+        let entry = maps
+            .0
+            .iter()
+            .find(|e| !e.ref_offsets.is_empty())
+            .expect("the InvokeDelegate safepoint records roots");
+        assert_eq!(
+            entry.ref_offsets.len(),
+            2,
+            "both the delegate and the ref arg are rooted (reloaded each iteration)"
         );
     }
 

@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Threading.Thread
+#if LAMELLA_SURFACE_THREADS
 namespace System.Threading
 {
     public sealed class Thread
@@ -45,3 +46,4 @@ namespace System.Threading
         [Lamella.Runtime.RuntimeProvided] private static void SleepThread(int millisecondsTimeout) { }
     }
 }
+#endif

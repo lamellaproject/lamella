@@ -8,13 +8,13 @@ use lamella_cil::Operand;
 use lamella_ir::{Function, MirType, TypeHandle};
 use lamella_metadata::tables::table;
 use lamella_metadata::{
-    Assembly, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef, TypeName,
-    exception_tag_for_name, fnv1a32,
+    Assembly, CharSet, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef,
+    TypeName, exception_tag_for_name, fnv1a32,
 };
 use lamella_token::Token;
 
 use crate::cil::{
-    Array2DOp, ArrayElement, CallInfo, CallResolver, CallTarget, CilError, Intrinsic,
+    Array2DOp, ArrayElement, CallInfo, CallResolver, CallTarget, CilError, Intrinsic, PInvokeCall,
     ReferenceLayout, lower_method_typed,
 };
 
@@ -592,6 +592,38 @@ impl CallResolver for MetadataResolver<'_> {
         }
         let sig = method.signature?;
         Some((sig.parameters.len(), sig.return_type != SigType::Void))
+    }
+
+    fn pinvoke_call(&self, operand: &Operand) -> Option<PInvokeCall> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        if token.table() != table::METHOD_DEF {
+            return None;
+        }
+        let import = self.assembly.pinvoke_import(token.row())?;
+        let sig = self.assembly.resolve_method(*token)?.signature?;
+        let result_type = if sig.return_type == SigType::Void {
+            None
+        } else {
+            mir_type(&sig.return_type, self.assembly, &TargetLayout::ilp32())
+        };
+        let param_is_string = sig
+            .parameters
+            .iter()
+            .map(|p| *p == SigType::String)
+            .collect();
+        let charset = match self.assembly.pinvoke_charset(token.row()) {
+            Some(CharSet::Unicode) => 1,
+            _ => 0,
+        };
+        Some(PInvokeCall {
+            import: import.into(),
+            param_is_string,
+            result_type,
+            result_is_bool: sig.return_type == SigType::Boolean,
+            charset,
+        })
     }
 
     fn array_element(&self, operand: &Operand) -> Option<ArrayElement> {

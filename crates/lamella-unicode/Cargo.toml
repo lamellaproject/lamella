@@ -1,0 +1,17 @@
+[package]
+name = "lamella-unicode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Language-neutral Unicode Character Database properties (from UCD 16.0.0) as compact range tables."
+
+# A leaf crate: raw UCD facts (general category, White_Space, the case/alphabetic derived
+# properties, numeric type, XID) shared by the Python str predicates, the C# BCL, and the C#
+# lexer -- each derives its own surface. No dependencies; no_std. Per-property tables are
+# separate statics so an unused property is dropped by the linker.
+[dependencies]
+
+[lints]
+workspace = true

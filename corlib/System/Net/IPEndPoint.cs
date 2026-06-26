@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Net.IPEndPoint
+#if LAMELLA_SURFACE_NET
 namespace System.Net
 {
     public class IPEndPoint : EndPoint
@@ -17,3 +18,4 @@ namespace System.Net
         public int Port { get { return _port; } }
     }
 }
+#endif

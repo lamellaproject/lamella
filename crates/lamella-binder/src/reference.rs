@@ -49,6 +49,8 @@ fn type_info(
         TypeKind::Enum
     } else if is_base(&base, "System", "ValueType") {
         TypeKind::Struct
+    } else if is_base(&base, "System", "MulticastDelegate") || is_base(&base, "System", "Delegate") {
+        TypeKind::Delegate
     } else {
         TypeKind::Class
     };
@@ -74,7 +76,7 @@ fn type_info(
                 ty: sigtype_to_symbol(assembly, &signature),
                 is_static: field.flags() & 0x0010 != 0
                     && (field.flags() & 0x0040 == 0 || constant.is_some()),
-                is_readonly: false,
+                is_readonly: field.flags() & 0x0020 != 0,
                 accessibility: member_accessibility(field.flags()),
                 constant,
             });
@@ -256,6 +258,7 @@ fn special_for_named(namespace: &str, name: &str) -> Option<SpecialType> {
         "UInt64" => SpecialType::UInt64,
         "Single" => SpecialType::Single,
         "Double" => SpecialType::Double,
+        "Decimal" => SpecialType::Decimal,
         _ => return None,
     })
 }

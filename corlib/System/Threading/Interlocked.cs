@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Threading.Interlocked
+#if LAMELLA_SURFACE_THREADS
 namespace System.Threading
 {
     public static class Interlocked
@@ -40,3 +41,4 @@ namespace System.Threading
         }
     }
 }
+#endif

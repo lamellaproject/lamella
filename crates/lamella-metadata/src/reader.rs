@@ -26,6 +26,23 @@ impl From<TableError> for MetadataError {
     }
 }
 
+/// The `CharSet` of a P/Invoke (its `DllImport` `CharSet`), decoded from the `ImplMap` MappingFlags
+/// (II.23.1.8, mask `0x0006`). It selects how a `string` argument marshals to native -- `Ansi` to a
+/// byte `char*`, `Unicode` to a `wchar_t*`. The calling convention (bits `0x0700`: Cdecl/StdCall/...)
+/// is an x86 stack-cleanup distinction with no effect on the AOT's AAPCS targets (ARM/RISC-V), so it is
+/// not modeled; `SetLastError` (`0x0040`) is likewise a later concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CharSet {
+    /// Unspecified -- treated as `Ansi` by convention.
+    NotSpecified,
+    /// One-byte characters: a native `char*`.
+    Ansi,
+    /// Two-byte characters: a native `wchar_t*`.
+    Unicode,
+    /// Platform default (`Ansi` here; .NET historically chose per-OS).
+    Auto,
+}
+
 /// A type's namespace and name (II.22.37), as borrowed `#Strings` slices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeName<'a> {
@@ -584,6 +601,41 @@ impl<'a> Assembly<'a> {
     pub fn member_refs(&self) -> impl Iterator<Item = MemberRef<'a>> + '_ {
         (1..=self.tables.row_count(table::MEMBER_REF))
             .filter_map(move |index| self.member_ref(index))
+    }
+
+    /// The unmanaged import name of a P/Invoke method -- its `DllImport` entry point -- from the
+    /// `ImplMap` table (II.22.22): `[MappingFlags(u16), MemberForwarded, ImportName, ImportScope]`.
+    /// Returns the `ImportName` of the row whose `MemberForwarded` is this `MethodDef` rid, or `None`
+    /// for an ordinary method. The AOT lowering turns a call to such a method into a `CallNative` to
+    /// the returned symbol (the C ABI boundary the own-linker resolves).
+    #[must_use]
+    pub fn pinvoke_import(&self, method_rid: u32) -> Option<&'a str> {
+        let forwarded = (method_rid << 1) | 1;
+        (1..=self.tables.row_count(table::IMPL_MAP)).find_map(|index| {
+            let row = self.tables.row(table::IMPL_MAP, index)?;
+            if row.raw(1) == forwarded {
+                self.strings().get(row.raw(2)).ok()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The [`CharSet`] of a P/Invoke method, from its `ImplMap` MappingFlags (column 0, mask `0x0006`).
+    /// `None` for an ordinary method (no `ImplMap` row). The string-marshaling layer reads this to pick
+    /// the native encoding of a `string` argument.
+    #[must_use]
+    pub fn pinvoke_charset(&self, method_rid: u32) -> Option<CharSet> {
+        let forwarded = (method_rid << 1) | 1;
+        (1..=self.tables.row_count(table::IMPL_MAP)).find_map(|index| {
+            let row = self.tables.row(table::IMPL_MAP, index)?;
+            (row.raw(1) == forwarded).then(|| match row.raw(0) & 0x0006 {
+                0x0002 => CharSet::Ansi,
+                0x0004 => CharSet::Unicode,
+                0x0006 => CharSet::Auto,
+                _ => CharSet::NotSpecified,
+            })
+        })
     }
 
     /// The decoded signature of the `TypeSpec` named by `token` (II.23.2.14): the type a

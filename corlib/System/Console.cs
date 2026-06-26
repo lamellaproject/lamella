@@ -11,12 +11,16 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] public static void WriteLine(uint value) { }
         [Lamella.Runtime.RuntimeProvided] public static void WriteLine(ulong value) { }
 
+#if LAMELLA_SURFACE_DECIMAL
         public static void WriteLine(decimal value) { WriteLine(value.ToString()); }
+#endif
 
         [Lamella.Runtime.RuntimeProvided] public static void Write(string value) { }
         [Lamella.Runtime.RuntimeProvided] public static void Write(char value) { }
         [Lamella.Runtime.RuntimeProvided] public static void Write(int value) { }
+#if LAMELLA_SURFACE_DECIMAL
         public static void Write(decimal value) { Write(value.ToString()); }
+#endif
 
         private static System.IO.TextWriter _out;
         public static System.IO.TextWriter Out

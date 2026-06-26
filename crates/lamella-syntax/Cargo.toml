@@ -7,5 +7,10 @@ license.workspace = true
 authors.workspace = true
 description = "C# lexer, parser, and syntax tree, implemented from ECMA-334."
 
+[dependencies]
+# The lexer classifies identifier (9.4.2) and white-space (9.3.3) characters by Unicode general
+# category -- the shared UCD facts, no_std, no further deps.
+lamella-unicode = { path = "../lamella-unicode" }
+
 [lints]
 workspace = true

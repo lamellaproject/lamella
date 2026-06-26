@@ -35,6 +35,10 @@ interpreter = [
     "dep:lamella-load",
     "dep:lamella-metadata",
     "dep:lamella-token",
+    # The host debugger renders the full value model, so it opts into the same full-compliance
+    # surface the desktop runner uses (typed references) -- and lamella-load's default pulls it in
+    # via unification anyway, so this keeps lamella-dap's Value match exhaustive in every build.
+    "lamella-cil-runtime/typed-references",
 ]
 
 # The CIL server binary needs the interpreter; a device server is a separate binary.

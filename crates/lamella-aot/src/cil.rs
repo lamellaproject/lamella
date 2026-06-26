@@ -86,6 +86,29 @@ pub struct CallInfo {
     pub target: CallTarget,
 }
 
+/// What a `[DllImport]` P/Invoke `call` resolves to -- enough for the lowering to emit the import call
+/// AND marshal its arguments (strings to native buffers, bool result normalized).
+pub struct PInvokeCall {
+    /// The unmanaged import symbol (the `DllImport` entry point).
+    pub import: Box<str>,
+    /// Per parameter (in order), whether it is a managed `string` -- so the lowering marshals it to a
+    /// native `char*` via the runtime helper instead of passing the ObjectRef. Its length is the
+    /// argument count.
+    pub param_is_string: Vec<bool>,
+    /// The result [`MirType`], or `None` for a `void` import.
+    pub result_type: Option<MirType>,
+    /// Whether the result is a `bool` (normalized to 0/1 after the call).
+    pub result_is_bool: bool,
+    /// The `CharSet` as the marshal helper's encoding selector: 0 = Ansi, 1 = Unicode.
+    pub charset: u8,
+}
+
+/// The runtime helper that transcodes a managed string to a native NUL-terminated buffer (in a per-call
+/// arena), selected by CharSet: `(objref, charset) -> char*`. Emitted as a P/Invoke (a `CallNative`).
+const PINVOKE_STR_TO_NATIVE: &str = "lamella_pinvoke_str_to_native";
+/// The runtime helper that frees the per-call arena of marshaled buffers, once, after the import returns.
+const PINVOKE_FRAME_END: &str = "lamella_pinvoke_frame_end";
+
 /// Resolves a `call`'s metadata token to a [`CallInfo`]. The lowering owns this seam; the
 /// implementation (over `lamella-metadata`) lives in the caller, so CIL->MIR lowering
 /// needs no metadata of its own and stays testable against a mock.
@@ -154,6 +177,15 @@ pub trait CallResolver {
     /// excluding the delegate receiver) and whether it returns a value, or `None` if the call is not a
     /// delegate `Invoke`. The lowering loads `_methodPtr` and calls it indirectly. Defaults to `None`.
     fn delegate_invoke_args(&self, _operand: &Operand) -> Option<(usize, bool)> {
+        None
+    }
+
+    /// The [`PInvokeCall`] a `call` resolves to if its method is a `[DllImport]` P/Invoke (the import
+    /// symbol, per-parameter string-ness, result type/bool-ness, and CharSet), or `None` for an ordinary
+    /// call. The lowering emits an [`Inst::PInvoke`] (rewritten to a `CallNative` to the symbol),
+    /// marshaling string arguments through the runtime helper. A P/Invoke method has no managed body, so
+    /// it is intercepted here BEFORE the normal call resolution. Defaults to `None`.
+    fn pinvoke_call(&self, _operand: &Operand) -> Option<PInvokeCall> {
         None
     }
 
@@ -1352,23 +1384,96 @@ fn apply_value_op(
                 }
                 args.reverse();
                 let delegate = stack.pop().ok_or(CilError::StackUnderflow)?;
-                let method_ptr = new_value(value_types, MirType::I32);
-                insts.push((
-                    method_ptr,
-                    Inst::FieldLoad {
-                        base: delegate,
-                        offset: DELEGATE_METHODPTR_OFFSET,
-                    },
-                ));
                 let result = new_value(value_types, MirType::I32);
-                insts.push((
-                    result,
-                    Inst::CallIndirect {
-                        target: method_ptr,
-                        args,
-                    },
-                ));
+                insts.push((result, Inst::InvokeDelegate { delegate, args }));
                 if has_result {
+                    stack.push(result);
+                }
+                return Ok(());
+            }
+            if let Some(call) = resolver.pinvoke_call(&inst.operand) {
+                let PInvokeCall {
+                    import,
+                    param_is_string,
+                    result_type,
+                    result_is_bool,
+                    charset,
+                } = call;
+                let arg_count = param_is_string.len();
+                let by_ref = last_local_addr
+                    .take()
+                    .map(|(source, off)| -> Result<ValueId, CilError> {
+                        let base =
+                            addr_base(source, locals, local_types, args, value_types, insts)?;
+                        let ptr = new_value(value_types, MirType::ManagedPtr);
+                        insts.push((ptr, Inst::FieldAddr { base, offset: off }));
+                        Ok(ptr)
+                    })
+                    .transpose()?;
+                let explicit = arg_count.saturating_sub(by_ref.is_some() as usize);
+                let mut args = Vec::with_capacity(arg_count);
+                for _ in 0..explicit {
+                    args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+                }
+                args.reverse();
+                if let Some(ptr) = by_ref {
+                    args.insert(0, ptr);
+                }
+                let mut marshaled_a_string = false;
+                for (slot, &is_string) in args.iter_mut().zip(param_is_string.iter()) {
+                    if is_string {
+                        let charset_arg = new_value(value_types, MirType::I32);
+                        insts.push((
+                            charset_arg,
+                            Inst::ConstInt {
+                                ty: MirType::I32,
+                                value: i64::from(charset),
+                            },
+                        ));
+                        let native = new_value(value_types, MirType::I32);
+                        insts.push((
+                            native,
+                            Inst::PInvoke {
+                                import: PINVOKE_STR_TO_NATIVE.into(),
+                                args: alloc::vec![*slot, charset_arg],
+                            },
+                        ));
+                        *slot = native;
+                        marshaled_a_string = true;
+                    }
+                }
+                let result = new_value(value_types, result_type.unwrap_or(MirType::I32));
+                insts.push((result, Inst::PInvoke { import, args }));
+                if marshaled_a_string {
+                    let freed = new_value(value_types, MirType::I32);
+                    insts.push((
+                        freed,
+                        Inst::PInvoke {
+                            import: PINVOKE_FRAME_END.into(),
+                            args: Vec::new(),
+                        },
+                    ));
+                }
+                if result_is_bool {
+                    let zero = new_value(value_types, MirType::I32);
+                    insts.push((
+                        zero,
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0,
+                        },
+                    ));
+                    let normalized = new_value(value_types, MirType::I32);
+                    insts.push((
+                        normalized,
+                        Inst::Compare {
+                            op: CmpOp::Ne,
+                            lhs: result,
+                            rhs: zero,
+                        },
+                    ));
+                    stack.push(normalized);
+                } else if result_type.is_some() {
                     stack.push(result);
                 }
                 return Ok(());

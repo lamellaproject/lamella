@@ -113,6 +113,10 @@ pub struct Vm {
     /// with `std::net` + `mio`; a device with lwIP / an AT modem). `None` until set -- socket ops
     /// then report failure (no networking on this build).
     net_backend: Option<alloc::boxed::Box<dyn crate::net::NetBackend>>,
+    /// The host TLS crypto seam ([`crate::tls::TlsBackend`]) -- a pure byte-transform (no sockets, no
+    /// blocking) the managed `SslStream` drives over the socket layer. `None` until set (no TLS on
+    /// this build); the embedder supplies it (the host with rustls / mbedTLS; a device with mbedTLS).
+    tls_backend: Option<alloc::boxed::Box<dyn crate::tls::TlsBackend>>,
 }
 
 impl Vm {
@@ -375,6 +379,18 @@ impl Vm {
         self.net_backend.as_deref_mut()
     }
 
+    /// Sets the host TLS crypto seam ([`crate::tls::TlsBackend`]). The embedder provides it (the host
+    /// with rustls / mbedTLS; a device with mbedTLS); without it, the TLS intrinsics report failure.
+    pub fn set_tls_backend(&mut self, backend: alloc::boxed::Box<dyn crate::tls::TlsBackend>) {
+        self.tls_backend = Some(backend);
+    }
+
+    /// The host TLS crypto seam, if set -- the `System.Net.Security` intrinsics drive it. Pure: it
+    /// transforms buffers only, so (unlike the socket seam) it is never involved in the reactor.
+    pub fn tls_backend(&mut self) -> Option<&mut (dyn crate::tls::TlsBackend + 'static)> {
+        self.tls_backend.as_deref_mut()
+    }
+
     /// Requests that the scheduler park the running thread on socket I/O (a socket op would block):
     /// register `socket` for `interest`, then wake when the reactor's poll reports it ready.
     pub fn request_block_on_io(&mut self, socket: u32, interest: crate::net::Interest) {
@@ -387,6 +403,15 @@ impl Vm {
         match self.net_backend.as_deref_mut() {
             Some(backend) => backend.poll(timeout_ms),
             None => alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Drops a socket from the reactor's poll-set once the thread parked on it has been woken, so the
+    /// poll-set holds only sockets with a currently-parked waiter (no stale-registration spurious wake).
+    /// A later socket op that parks re-arms it via `register`. Used by `idle_wait`'s wake step.
+    fn net_deregister(&mut self, socket: u32) {
+        if let Some(backend) = self.net_backend.as_deref_mut() {
+            backend.deregister(socket);
         }
     }
 
@@ -905,6 +930,7 @@ fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
             ThreadState::Sleeping(deadline) if deadline <= now => slot.state = ThreadState::Ready,
             ThreadState::IoWait(socket) if ready.contains(&socket) => {
                 slot.state = ThreadState::Ready;
+                vm.net_deregister(socket);
             }
             _ => {}
         }
@@ -1349,6 +1375,32 @@ impl Session {
             locals: &frame.locals,
             args: &frame.args,
         })
+    }
+
+    /// Writes `value` into local-variable slot `slot` of frame `index` (the write companion to
+    /// [`frame`](Session::frame)'s read view -- the debugger's `setVariable`, editing a local
+    /// mid-debug). Returns `true` if written, `false` if the frame index or slot is out of range. The
+    /// caller is responsible for supplying a value of the slot's existing kind.
+    pub fn set_local(&mut self, index: usize, slot: usize, value: Value) -> bool {
+        match self.frames.get_mut(index) {
+            Some(frame) if slot < frame.locals.len() => {
+                frame.locals[slot] = value;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Writes `value` into argument slot `slot` of frame `index` -- like [`set_local`](Session::set_local)
+    /// but for the frame's arguments. Returns `true` if written, `false` if out of range.
+    pub fn set_arg(&mut self, index: usize, slot: usize, value: Value) -> bool {
+        match self.frames.get_mut(index) {
+            Some(frame) if slot < frame.args.len() => {
+                frame.args[slot] = value;
+                true
+            }
+            _ => false,
+        }
     }
 
     fn at_breakpoint(&self) -> bool {
@@ -5094,6 +5146,29 @@ mod tests {
             session.step(&module, &mut vm),
             Ok(Status::Done(Some(Value::Int32(5))))
         );
+    }
+
+    #[test]
+    fn set_arg_and_set_local_edit_a_live_frame() {
+        let mut module = Module::new();
+        let main = module.add_method(
+            0,
+            method(vec![
+                Instruction::simple(Opcode::LdcI42),
+                Instruction::simple(Opcode::Ret),
+            ]),
+            1,
+        );
+        let mut session = Session::new(&module, main, vec![Value::Int32(7)]).unwrap();
+
+        assert_eq!(session.frame(0).unwrap().args, [Value::Int32(7)].as_slice());
+        assert!(session.set_arg(0, 0, Value::Int32(42)));
+        assert_eq!(session.frame(0).unwrap().args, [Value::Int32(42)].as_slice());
+
+        assert!(!session.set_arg(0, 9, Value::Int32(0)));
+        assert!(!session.set_arg(5, 0, Value::Int32(0)));
+        assert!(!session.set_local(0, 0, Value::Int32(0)));
+        assert!(!session.set_local(5, 0, Value::Int32(0)));
     }
 
     #[test]

@@ -569,7 +569,6 @@ fn emit_statement(
                     "foreach over a non-array collection is not lowered yet",
                 ));
             };
-            let load_element = ldelem_opcode(element)?;
             let array = frame.reserve_local(&collection.ty);
             let index = frame.reserve_local(&TypeSymbol::Special(SpecialType::Int32));
 
@@ -592,7 +591,18 @@ fn emit_statement(
 
             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array)));
             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(index)));
-            out.push(Instruction::simple(load_element));
+            if tokens.is_struct(element)
+                || tokens.is_enum(element)
+                || matches!(&**element, TypeSymbol::Special(SpecialType::Decimal))
+            {
+                let token = tokens.type_token(element).ok_or(EmitError::Unsupported(
+                    "foreach element type has no token",
+                ))?;
+                out.push(Instruction::new(Opcode::Ldelema, Operand::Token(token)));
+                out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
+            } else {
+                out.push(Instruction::simple(ldelem_opcode(element)?));
+            }
             store_to(frame, name, out)?;
 
             labels.loops.push(LoopContext {
@@ -1171,7 +1181,22 @@ fn emit_combine(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     match rhs {
-        Some(value) => emit_expression(value, frame, tokens, out)?,
+        Some(value) => {
+            emit_expression(value, frame, tokens, out)?;
+            if value.ty != *operand_ty
+                && matches!(
+                    operand_ty,
+                    TypeSymbol::Special(
+                        SpecialType::Int64
+                            | SpecialType::UInt64
+                            | SpecialType::Single
+                            | SpecialType::Double
+                    )
+                )
+            {
+                out.push(Instruction::simple(crate::expr::numeric_conversion(operand_ty)?));
+            }
+        }
         None => push_one(operand_ty, out),
     }
     if binary == BinaryOperator::Add

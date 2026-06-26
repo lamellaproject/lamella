@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Net.Sockets enums
+#if LAMELLA_SURFACE_NET
 namespace System.Net.Sockets
 {
     public enum AddressFamily
@@ -25,3 +26,4 @@ namespace System.Net.Sockets
         None = 0,
     }
 }
+#endif

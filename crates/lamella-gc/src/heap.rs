@@ -50,9 +50,16 @@ pub struct TypeDesc {
     /// The payload size in bytes (excluding the header). The allocator rounds the
     /// reserved space up to [`ALIGN`].
     pub payload_size: u32,
-    /// Byte offsets *within the payload* of the 4-byte slots that hold child
-    /// references. Each names a [`Ref`] the collector traces and relocates.
+    /// Byte offsets *within the payload* of 4-byte slots holding a child reference as a
+    /// BARE [`Ref`] (a raw payload address, or null). Each is traced and relocated
+    /// unconditionally -- the layout a C# object reports.
     pub ref_offsets: Vec<u32>,
+    /// Byte offsets *within the payload* of 4-byte slots holding a TAGGED value (the
+    /// interpreter's `Value`): such a slot is a managed reference -- traced and relocated
+    /// -- iff its low two bits are clear and it is non-null; otherwise (a fixnum or
+    /// singleton, which set a low bit) it is left untouched. This is how a Python
+    /// container's interior is scanned: its elements are tagged words, not bare pointers.
+    pub tagged_offsets: Vec<u32>,
 }
 
 impl TypeDesc {
@@ -73,6 +80,7 @@ impl TypeDesc {
             TypeDesc {
                 payload_size,
                 ref_offsets,
+                tagged_offsets: Vec::new(),
             },
             pos,
         ))
@@ -421,6 +429,13 @@ pub(crate) trait TypeResolver {
     /// Invokes `f` with each byte offset (within the payload) of a reference field of
     /// the object whose header holds `header_word`.
     fn for_each_ref_offset(&self, header_word: u32, f: &mut dyn FnMut(u32));
+
+    /// Invokes `f` with each byte offset (within the payload) of a TAGGED-value slot of
+    /// the object whose header holds `header_word` -- traced by tag (see
+    /// [`TypeDesc::tagged_offsets`]). The default is none, so a resolver that has no
+    /// tagged layout (e.g. the device path until its wire format carries them) need not
+    /// override it.
+    fn for_each_tagged_offset(&self, _header_word: u32, _f: &mut dyn FnMut(u32)) {}
 }
 
 /// The host resolver: an object's header word is an index into a [`TypeDesc`] table.
@@ -438,6 +453,12 @@ impl TypeResolver for TableResolver<'_> {
     fn for_each_ref_offset(&self, header_word: u32, f: &mut dyn FnMut(u32)) {
         for &ref_offset in &self.type_descs[header_word as usize].ref_offsets {
             f(ref_offset);
+        }
+    }
+
+    fn for_each_tagged_offset(&self, header_word: u32, f: &mut dyn FnMut(u32)) {
+        for &tagged_offset in &self.type_descs[header_word as usize].tagged_offsets {
+            f(tagged_offset);
         }
     }
 }
@@ -488,6 +509,13 @@ where
             let mut child = read_field(bytes, object, ref_offset);
             mark(&mut child, &mut live, &mut work);
         });
+        resolver.for_each_tagged_offset(header_word, &mut |tagged_offset| {
+            let word = read_word(bytes, object.0 + tagged_offset);
+            if word != 0 && word & 0b11 == 0 {
+                let mut child = Ref(word);
+                mark(&mut child, &mut live, &mut work);
+            }
+        });
     }
 
     let mut forward: BTreeMap<u32, u32> = BTreeMap::new();
@@ -523,6 +551,17 @@ where
             let at = (new_ref.0 + ref_offset) as usize;
             bytes[at..at + 4].copy_from_slice(&child.0.to_le_bytes());
         }
+        let mut tagged: Vec<u32> = Vec::new();
+        resolver.for_each_tagged_offset(header_word, &mut |tagged_offset| tagged.push(tagged_offset));
+        for tagged_offset in tagged {
+            let word = read_word(bytes, new_ref.0 + tagged_offset);
+            if word != 0 && word & 0b11 == 0 {
+                let mut child = Ref(word);
+                relocate(&mut child);
+                let at = (new_ref.0 + tagged_offset) as usize;
+                bytes[at..at + 4].copy_from_slice(&child.0.to_le_bytes());
+            }
+        }
     }
 
     bytes[dest as usize..].fill(0);
@@ -539,6 +578,7 @@ mod tests {
         TypeDesc {
             payload_size: 4,
             ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
         }
     }
 
@@ -547,6 +587,7 @@ mod tests {
         TypeDesc {
             payload_size: 4,
             ref_offsets: vec![0],
+            tagged_offsets: Vec::new(),
         }
     }
 
@@ -555,6 +596,7 @@ mod tests {
         let descs = vec![TypeDesc {
             payload_size: 8,
             ref_offsets: vec![4],
+            tagged_offsets: Vec::new(),
         }];
         let mut heap = Heap::new(1024, descs);
         let a = heap.alloc(0).unwrap();
@@ -570,6 +612,7 @@ mod tests {
         let descs = vec![TypeDesc {
             payload_size: 5,
             ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
         }];
         let mut heap = Heap::new(1024, descs);
         let _ = heap.alloc(0).unwrap();
@@ -677,6 +720,35 @@ mod tests {
     }
 
     #[test]
+    fn tagged_interior_relocates_pointers_and_leaves_fixnums() {
+        let container = TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: vec![0, 4],
+        };
+        let mut heap = Heap::new(4096, vec![container, leaf()]);
+        let a = heap.alloc(0).unwrap();
+        let garbage = heap.alloc(1).unwrap();
+        let b = heap.alloc(1).unwrap();
+        let fixnum = 0x15u32;
+        heap.write_u32(a.0, b.0);
+        heap.write_u32(a.0 + 4, fixnum);
+        let _ = garbage;
+        let top_before = heap.top();
+
+        let mut root = a;
+        heap.collect(|visit| visit(&mut root));
+
+        let a_new = root;
+        assert_eq!(a_new, Ref(ALIGN + HEADER_SIZE));
+        let b_new = Ref(heap.read_u32(a_new.0));
+        assert_eq!(heap.type_id_of(b_new), 1);
+        assert_eq!(b_new.0 & 0b11, 0);
+        assert_eq!(heap.read_u32(a_new.0 + 4), fixnum);
+        assert!(heap.top() < top_before);
+    }
+
+    #[test]
     fn type_desc_decode_matches_backend_blob() {
         let mut blob = Vec::new();
         blob.extend_from_slice(&12u32.to_le_bytes());
@@ -690,6 +762,7 @@ mod tests {
             TypeDesc {
                 payload_size: 12,
                 ref_offsets: vec![4, 8],
+                tagged_offsets: Vec::new(),
             }
         );
         assert!(TypeDesc::decode(&blob[..6]).is_none());

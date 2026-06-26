@@ -96,6 +96,13 @@ impl Assembled {
     pub fn label_position(&self, label: Label) -> Option<u32> {
         self.labels.get(label.0 as usize).copied().flatten()
     }
+
+    /// The final position of a label by its raw id (from [`Encoder::safepoint_label`]) -- for resolving
+    /// a stack-map entry's `return_pc`, stored as a label id during lowering, after relaxation.
+    #[must_use]
+    pub fn label_position_by_id(&self, id: u32) -> Option<u32> {
+        self.label_position(Label(id))
+    }
 }
 
 /// Accumulates Thumb machine code and the references into it.
@@ -150,6 +157,16 @@ impl Encoder {
         if let Some(slot) = self.labels.get_mut(label.0 as usize) {
             *slot = Some(here);
         }
+    }
+
+    /// Binds a fresh label at the current position and returns its raw id -- for recording a SAFEPOINT
+    /// return address that must survive branch relaxation. The id is stored in a stack-map entry's
+    /// `return_pc` during lowering and resolved to the final offset via [`Assembled::label_position`]
+    /// after [`Encoder::finish`]; a bare `position()` would capture a pre-relaxation offset.
+    pub fn safepoint_label(&mut self) -> u32 {
+        let label = self.new_label();
+        self.bind_label(label);
+        label.0
     }
 
     /// Appends one 16-bit halfword, low byte first.

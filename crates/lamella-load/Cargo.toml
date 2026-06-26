@@ -12,11 +12,20 @@ lamella-cil = { path = "../lamella-cil" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-token = { path = "../lamella-token" }
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+# Host-only, OPT-IN: the SECOND TLS stack -- mbedTLS (the same library shipped on device behind the
+# backend's native-link track), so the host can run EITHER stack behind the runtime stack selector and
+# validate the seam contract the device implements. OPTIONAL (a regular dep so a feature can gate it;
+# dev-deps cannot be optional), so the DEFAULT build needs neither mbedTLS's C build NOR libclang. To
+# build the mbedTLS host path: `--features tls-mbedtls` (requires libclang on PATH / LIBCLANG_PATH --
+# bindgen needs it; e.g. `pip install libclang`). The differential harness + default CI stay clean.
+mbedtls = { version = "0.12", optional = true, features = ["ssl"] }
 
 [features]
 # Mirror lamella-cil-runtime's BCL surface tiers + capability knobs, so a minimal loader build
-# gates out the same bindings the interpreter does.
-default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental"]
+# gates out the same bindings the interpreter does. The DEFAULT is the full desktop profile (the
+# differential's run-with-corlib runner = full ECMA-335 1st-ed compliance, incl. typed references);
+# a constrained target builds --no-default-features + an explicit subset.
+default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references"]
 bcl = ["lamella-cil-runtime/bcl"]
 NETMFv4_4 = ["bcl", "lamella-cil-runtime/NETMFv4_4"]
 exceptions = ["lamella-cil-runtime/exceptions"]
@@ -32,10 +41,25 @@ typed-references = ["lamella-cil-runtime/typed-references"]
 varargs = ["typed-references", "lamella-cil-runtime/varargs"]
 # The floating-point transcendentals (Math.Sqrt/Sin/Pow/...), via libm. See lamella-cil-runtime.
 math-transcendental = ["NETMFv4_4", "float", "lamella-cil-runtime/math-transcendental"]
+# Host-only, OPT-IN: compile the mbedTLS host TLS backend (the second desktop stack) into the
+# run-with-corlib example + the tls_seam conformance test. Requires libclang for the bindgen step.
+tls-mbedtls = ["dep:mbedtls"]
 
 [dev-dependencies]
 # Host-only: the reactor's readiness poll for the run-with-corlib example's NetBackend (sockets).
 mio = { version = "1", features = ["net", "os-poll"] }
+# Host-only: the TLS crypto for the run-with-corlib example's + tls_seam test's TlsBackend. rustls is
+# the default host stack (pure-Rust; its crypto provider has C/asm -- fine for a host dev-dep, pinned
+# in Cargo.lock). The device stack (mbedTLS, backend's track) implements the SAME pure-transform seam.
+rustls = "0.23"
+rustls-pemfile = "2"
+webpki-roots = "0.26"
+# Test-only: generate a throwaway self-signed identity for the tls_seam conformance test (reuses the
+# aws-lc-rs backend rustls already pulls, so no second crypto build).
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+# Host-only: parse the PKCS#12 / PFX server identity the managed X509Certificate2 delivers (rustls has
+# no PKCS#12 reader). Pure-Rust; handles the classic SHA1+3DES PFX that .NET / Windows export.
+p12 = "0.6"
 
 [lints]
 workspace = true

@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Net.Sockets.NetworkStream
+#if LAMELLA_SURFACE_NET
 using System.IO;
 
 namespace System.Net.Sockets
@@ -35,3 +36,4 @@ namespace System.Net.Sockets
         public override void Close() { _socket.Close(); }
     }
 }
+#endif

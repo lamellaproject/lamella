@@ -248,12 +248,25 @@ pub enum TokenKind {
     },
     /// A real literal (9.4.4.3): its value as `f64` bits (see [`f64::from_bits`];
     /// stored as bits so the token stays `Eq`/`Hash`) and the type suffix. A `float`
-    /// narrows the value at emit; `decimal` keeps the bits but is not lowered yet.
+    /// narrows the value at emit. A `decimal` (`m`) literal is a [`TokenKind::DecimalLiteral`].
     RealLiteral {
         /// The value's `f64` bit pattern. On a malformed literal this is 0.
         bits: u64,
         /// The `F`, `D`, or `M` suffix, if any.
         suffix: RealSuffix,
+    },
+    /// A `decimal` (`m`-suffixed) literal (9.4.4.3), kept EXACTLY as its 96-bit integer mantissa
+    /// (`lo`/`mid`/`hi`) and power-of-ten `scale` -- `f64` cannot represent every decimal, nor
+    /// preserve the scale (`0.10m` vs `0.1m`).
+    DecimalLiteral {
+        /// Bits 0..32 of the mantissa.
+        lo: u32,
+        /// Bits 32..64 of the mantissa.
+        mid: u32,
+        /// Bits 64..96 of the mantissa.
+        hi: u32,
+        /// The power-of-ten scale (0..=28).
+        scale: u8,
     },
     /// A character literal (9.4.4.4): a single UTF-16 code unit, with escape
     /// sequences decoded. Held as `u16` rather than `char` because a literal

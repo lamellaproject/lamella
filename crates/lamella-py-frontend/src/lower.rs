@@ -957,6 +957,37 @@ fn lower_op(
         bc::Op::BuildSlice => {
             return Err(LowerError::DynamicOperation);
         }
+        bc::Op::BuildList(_) | bc::Op::BuildTuple(_) | bc::Op::BuildDict(_) => {
+            return Err(LowerError::DynamicOperation);
+        }
+        bc::Op::GetIter | bc::Op::ForIter(_) => {
+            return Err(LowerError::DynamicOperation);
+        }
+        bc::Op::Setitem => {
+            return Err(LowerError::DynamicOperation);
+        }
+        bc::Op::Contains { .. } => {
+            return Err(LowerError::DynamicOperation);
+        }
+        bc::Op::Raise(_)
+        | bc::Op::MatchExc
+        | bc::Op::LoadExc
+        | bc::Op::PopExcept
+        | bc::Op::Reraise
+        | bc::Op::DeleteFast(_) => {
+            return Err(LowerError::DynamicOperation);
+        }
+        bc::Op::MakeFunction(_)
+        | bc::Op::BuildClass
+        | bc::Op::SetAttr { .. }
+        | bc::Op::UnpackSequence(_)
+        | bc::Op::ListAppend
+        | bc::Op::SetAdd
+        | bc::Op::DictInsert
+        | bc::Op::LoadSuper(_)
+        | bc::Op::BuildSet(_) => {
+            return Err(LowerError::DynamicOperation);
+        }
         bc::Op::PopTop => {
             pop(stack)?;
         }

@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Threading.WaitHandle
+#if LAMELLA_SURFACE_WAIT_HANDLES
 namespace System.Threading
 {
     public abstract class WaitHandle : IDisposable
@@ -126,3 +127,4 @@ namespace System.Threading
         }
     }
 }
+#endif

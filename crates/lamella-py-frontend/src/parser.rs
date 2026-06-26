@@ -7,9 +7,15 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ast::{
-    Assign, BinOp, BoolOp, CmpOp, Expr, FuncDef, ModuleAst, ParamDef, Stmt, UnaryOp,
+    Assign, BinOp, BoolOp, CmpOp, CompClause, ExceptHandler, Expr, FuncDef, ModuleAst, ParamDef,
+    Stmt, UnaryOp,
 };
-use crate::lexer::{Tok, Token};
+use crate::lexer::{FStringPart, Tok, Token};
+
+/// Whether an expression is a `range(...)` call -- the counted-loop form of `for`.
+fn is_range_call(iter: &Expr) -> bool {
+    matches!(iter, Expr::Call { func, .. } if matches!(&**func, Expr::Name(n) if n == "range"))
+}
 
 /// The binary operator of an augmented-assignment token (`+=`, `<<=`, ...), or `None`
 /// if the token is not one.
@@ -58,6 +64,12 @@ struct Parser {
 impl Parser {
     fn peek(&self) -> &Tok {
         &self.tokens[self.pos].kind
+    }
+
+    /// The token one past the cursor (clamped to the trailing `Eof`).
+    fn peek2(&self) -> &Tok {
+        let i = (self.pos + 1).min(self.tokens.len() - 1);
+        &self.tokens[i].kind
     }
 
     fn current_line(&self) -> u32 {
@@ -132,6 +144,8 @@ impl Parser {
             Tok::KwIf => self.parse_if(),
             Tok::KwWhile => self.parse_while(),
             Tok::KwFor => self.parse_for(),
+            Tok::KwTry => self.parse_try(),
+            Tok::KwClass => self.parse_classdef(),
             _ => self.parse_small_stmt(),
         }
     }
@@ -153,9 +167,31 @@ impl Parser {
             self.advance();
             self.expect_newline()?;
             Ok(Stmt::Pass)
+        } else if self.at(&Tok::KwRaise) {
+            self.parse_raise()
         } else {
             self.parse_assign_or_expr()
         }
+    }
+
+    fn parse_raise(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Tok::KwRaise, "'raise'")?;
+        let exc = if self.at(&Tok::Newline) {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        let cause = if matches!(self.peek(), Tok::Reserved(s) if s == "from") {
+            self.advance();
+            if exc.is_none() {
+                return Err(self.error("'raise from' needs an exception before 'from'"));
+            }
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        self.expect_newline()?;
+        Ok(Stmt::Raise { exc, cause })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, ParseError> {
@@ -208,6 +244,35 @@ impl Parser {
                     value,
                 }))
             }
+            Tok::Assign if matches!(&expr, Expr::Attribute { .. }) => {
+                let Expr::Attribute { value, attr } = expr else {
+                    unreachable!("guarded to an attribute")
+                };
+                self.advance();
+                let rhs = self.parse_expr()?;
+                self.expect_newline()?;
+                Ok(Stmt::SetAttr {
+                    obj: *value,
+                    attr,
+                    value: rhs,
+                })
+            }
+            Tok::Assign if matches!(&expr, Expr::Subscript { .. }) => {
+                let Expr::Subscript { value, index } = expr else {
+                    unreachable!("guarded to a subscript")
+                };
+                if matches!(&*index, Expr::Slice { .. }) {
+                    return Err(self.error("slice assignment is out of the subset"));
+                }
+                self.advance();
+                let rhs = self.parse_expr()?;
+                self.expect_newline()?;
+                Ok(Stmt::SetItem {
+                    container: *value,
+                    index: *index,
+                    value: rhs,
+                })
+            }
             Tok::Assign => {
                 let mut targets = vec![self.target_name(expr, target_line)?];
                 self.advance();
@@ -228,11 +293,47 @@ impl Parser {
                     Ok(Stmt::MultiAssign { targets, value })
                 }
             }
+            Tok::Comma => {
+                let mut targets = vec![self.target_name(expr, target_line)?];
+                while self.eat(&Tok::Comma) {
+                    if self.at(&Tok::Assign) {
+                        break;
+                    }
+                    let t = self.parse_expr()?;
+                    targets.push(self.target_name(t, target_line)?);
+                }
+                self.expect(&Tok::Assign, "'=' in the tuple-unpacking assignment")?;
+                let value = self.parse_rhs_value()?;
+                self.expect_newline()?;
+                if targets.len() < 2 {
+                    return Err(
+                        self.error("a tuple-unpacking assignment needs two or more targets")
+                    );
+                }
+                Ok(Stmt::TupleAssign { targets, value })
+            }
             _ => {
                 self.expect_newline()?;
                 Ok(Stmt::Expr(expr))
             }
         }
+    }
+
+    /// The right-hand side of an assignment: a single expression, or a bare tuple
+    /// `1, 2, 3` (the latter becomes a tuple display so `a, b = 1, 2` unpacks).
+    fn parse_rhs_value(&mut self) -> Result<Expr, ParseError> {
+        let first = self.parse_expr()?;
+        if !self.at(&Tok::Comma) {
+            return Ok(first);
+        }
+        let mut elems = vec![first];
+        while self.eat(&Tok::Comma) {
+            if self.at(&Tok::Newline) || self.at(&Tok::Eof) {
+                break;
+            }
+            elems.push(self.parse_expr()?);
+        }
+        Ok(Expr::Tuple(elems))
     }
 
     /// Require an assignment target to be a bare name (attribute, subscript, and
@@ -280,21 +381,143 @@ impl Parser {
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwFor, "'for'")?;
-        let target = self.expect_name()?;
+        let mut targets = vec![self.expect_name()?];
+        while self.eat(&Tok::Comma) {
+            if self.at(&Tok::KwIn) {
+                break;
+            }
+            targets.push(self.expect_name()?);
+        }
         self.expect(&Tok::KwIn, "'in'")?;
         let iter = self.parse_expr()?;
-        let (start, stop, step) = self.range_bounds(iter)?;
         self.expect(&Tok::Colon, "':'")?;
-        let body = self.parse_suite()?;
+        let mut body = self.parse_suite()?;
         let orelse = self.parse_loop_else()?;
-        Ok(Stmt::For {
-            target,
-            start,
-            stop,
-            step,
+        if targets.len() > 1 {
+            let tmp = String::from(".unpack");
+            let mut new_body = Vec::with_capacity(body.len() + 1);
+            new_body.push(Stmt::TupleAssign {
+                targets,
+                value: Expr::Name(tmp.clone()),
+            });
+            new_body.append(&mut body);
+            return Ok(Stmt::ForIter {
+                target: tmp,
+                iterable: iter,
+                body: new_body,
+                orelse,
+            });
+        }
+        let target = targets.into_iter().next().unwrap();
+        if is_range_call(&iter) {
+            let (start, stop, step) = self.range_bounds(iter)?;
+            Ok(Stmt::For {
+                target,
+                start,
+                stop,
+                step,
+                body,
+                orelse,
+            })
+        } else {
+            Ok(Stmt::ForIter {
+                target,
+                iterable: iter,
+                body,
+                orelse,
+            })
+        }
+    }
+
+    fn parse_try(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Tok::KwTry, "'try'")?;
+        self.expect(&Tok::Colon, "':' after 'try'")?;
+        let body = self.parse_suite()?;
+        let mut handlers = Vec::new();
+        let mut seen_bare = false;
+        while self.at(&Tok::KwExcept) {
+            if seen_bare {
+                return Err(self.error("the bare 'except:' must be the last handler"));
+            }
+            self.advance();
+            let (typ, name) = if self.at(&Tok::Colon) {
+                (None, None)
+            } else {
+                let t = self.parse_expr()?;
+                let n = if self.at(&Tok::KwAs) {
+                    self.advance();
+                    Some(self.expect_name()?)
+                } else {
+                    None
+                };
+                (Some(t), n)
+            };
+            if typ.is_none() {
+                seen_bare = true;
+            }
+            self.expect(&Tok::Colon, "':' after the except clause")?;
+            let handler_body = self.parse_suite()?;
+            handlers.push(ExceptHandler {
+                typ,
+                name,
+                body: handler_body,
+            });
+        }
+        let orelse = if self.at(&Tok::KwElse) {
+            self.advance();
+            self.expect(&Tok::Colon, "':' after 'else'")?;
+            self.parse_suite()?
+        } else {
+            Vec::new()
+        };
+        let finalbody = if self.at(&Tok::KwFinally) {
+            self.advance();
+            self.expect(&Tok::Colon, "':' after 'finally'")?;
+            self.parse_suite()?
+        } else {
+            Vec::new()
+        };
+        if handlers.is_empty() && finalbody.is_empty() {
+            return Err(self.error("'try' needs at least one 'except' or a 'finally'"));
+        }
+        if !orelse.is_empty() && handlers.is_empty() {
+            return Err(self.error("'try ... else' needs an 'except' clause"));
+        }
+        Ok(Stmt::Try {
             body,
+            handlers,
             orelse,
+            finalbody,
         })
+    }
+
+    fn parse_classdef(&mut self) -> Result<Stmt, ParseError> {
+        self.expect(&Tok::KwClass, "'class'")?;
+        let name = self.expect_name()?;
+        let base = if self.eat(&Tok::LParen) {
+            let b = if self.at(&Tok::RParen) {
+                None
+            } else {
+                Some(self.parse_expr()?)
+            };
+            if self.at(&Tok::Comma) {
+                return Err(self.error("multiple inheritance is out of the subset"));
+            }
+            self.expect(&Tok::RParen, "')' closing the base list")?;
+            b
+        } else {
+            None
+        };
+        self.expect(&Tok::Colon, "':' after the class header")?;
+        let body = self.parse_suite()?;
+        for stmt in &body {
+            if !matches!(stmt, Stmt::FuncDef(_) | Stmt::Assign(_) | Stmt::Pass) {
+                return Err(self.error(
+                    "a class body supports only methods and attribute assignments in this subset",
+                ));
+            }
+        }
+        Ok(Stmt::ClassDef { name, base, body })
     }
 
     /// Only `range(stop)`, `range(start, stop)`, or `range(start, stop, step)` are
@@ -508,8 +731,10 @@ impl Parser {
     fn parse_comparison(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_bitor()?;
         let mut chain: Option<Expr> = None;
-        while let Some(op) = self.peek_cmp_op() {
-            self.advance();
+        while let Some((op, width)) = self.peek_cmp_op() {
+            for _ in 0..width {
+                self.advance();
+            }
             let rhs = self.parse_bitor()?;
             let cmp = Expr::Compare {
                 op,
@@ -529,16 +754,20 @@ impl Parser {
         Ok(chain.unwrap_or(lhs))
     }
 
-    fn peek_cmp_op(&self) -> Option<CmpOp> {
-        match self.peek() {
-            Tok::EqEq => Some(CmpOp::Eq),
-            Tok::NotEq => Some(CmpOp::Ne),
-            Tok::Lt => Some(CmpOp::Lt),
-            Tok::Le => Some(CmpOp::Le),
-            Tok::Gt => Some(CmpOp::Gt),
-            Tok::Ge => Some(CmpOp::Ge),
-            _ => None,
-        }
+    /// The comparison operator at the cursor, with the number of tokens it spans (`not in`
+    /// is two). Membership (`in` / `not in`) sits at the comparison level, like `<`.
+    fn peek_cmp_op(&self) -> Option<(CmpOp, usize)> {
+        Some(match self.peek() {
+            Tok::EqEq => (CmpOp::Eq, 1),
+            Tok::NotEq => (CmpOp::Ne, 1),
+            Tok::Lt => (CmpOp::Lt, 1),
+            Tok::Le => (CmpOp::Le, 1),
+            Tok::Gt => (CmpOp::Gt, 1),
+            Tok::Ge => (CmpOp::Ge, 1),
+            Tok::KwIn => (CmpOp::In, 1),
+            Tok::KwNot if matches!(self.peek2(), Tok::KwIn) => (CmpOp::NotIn, 2),
+            _ => return None,
+        })
     }
 
     /// `or_expr: xor_expr ("|" xor_expr)*` -- bitwise OR, left-associative (Python
@@ -754,6 +983,146 @@ impl Parser {
         Ok(Expr::Slice { lower, upper, step })
     }
 
+    /// Desugar an f-string into the literal parts and `str(expr)` of each replacement
+    /// field, concatenated left to right (a field with no format spec is `str(value)`,
+    /// 2.4.3). An empty f-string is the empty string.
+    fn parse_fstring(&mut self, parts: Vec<FStringPart>) -> Result<Expr, ParseError> {
+        let mut acc: Option<Expr> = None;
+        for part in parts {
+            let piece = match part {
+                FStringPart::Literal(s) => Expr::Str(s),
+                FStringPart::Expr(raw) => Expr::Call {
+                    func: Box::new(Expr::Name(String::from("str"))),
+                    args: vec![self.parse_embedded_expr(&raw)?],
+                },
+            };
+            acc = Some(match acc {
+                None => piece,
+                Some(prev) => Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(prev),
+                    rhs: Box::new(piece),
+                },
+            });
+        }
+        Ok(acc.unwrap_or(Expr::Str(String::new())))
+    }
+
+    /// Re-lex and parse a replacement field's raw source as one expression.
+    fn parse_embedded_expr(&self, raw: &str) -> Result<Expr, ParseError> {
+        let tokens = crate::lexer::tokenize(raw)
+            .map_err(|e| self.error(format!("in f-string expression: {}", e.message)))?;
+        let mut sub = Parser { tokens, pos: 0 };
+        let expr = sub.parse_expr()?;
+        if !matches!(sub.peek(), Tok::Newline | Tok::Eof) {
+            return Err(self.error("unexpected trailing tokens in an f-string expression"));
+        }
+        Ok(expr)
+    }
+
+    /// Comma-separated expressions up to (not including) `end`, with an optional trailing
+    /// comma. Used for list and tuple displays.
+    fn parse_expr_list(&mut self, end: &Tok) -> Result<Vec<Expr>, ParseError> {
+        let mut items = Vec::new();
+        while !self.at(end) {
+            items.push(self.parse_expr()?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(items)
+    }
+
+    /// A comma-separated target list `a` or `a, b, c` (a trailing comma before `in` is ok).
+    fn parse_target_list(&mut self) -> Result<Vec<String>, ParseError> {
+        let mut targets = vec![self.expect_name()?];
+        while self.eat(&Tok::Comma) {
+            if self.at(&Tok::KwIn) {
+                break;
+            }
+            targets.push(self.expect_name()?);
+        }
+        Ok(targets)
+    }
+
+    /// The `for target(s) in iterable [if cond ...]` clause chain of a comprehension (the
+    /// first `for` not yet consumed). Multiple `for`s nest; iterables and filters parse below
+    /// the conditional, so a trailing `if` is a filter, not a conditional expression.
+    fn parse_comp_clauses(&mut self) -> Result<Vec<CompClause>, ParseError> {
+        let mut clauses = Vec::new();
+        while self.eat(&Tok::KwFor) {
+            let targets = self.parse_target_list()?;
+            self.expect(&Tok::KwIn, "'in' in the comprehension")?;
+            let iterable = self.parse_or()?;
+            let mut conditions = Vec::new();
+            while self.eat(&Tok::KwIf) {
+                conditions.push(self.parse_or()?);
+            }
+            clauses.push(CompClause {
+                targets,
+                iterable,
+                conditions,
+            });
+        }
+        Ok(clauses)
+    }
+
+    /// A dict display `{key: value, ...}` (the `{` not yet consumed); `{}` is the empty
+    /// dict. A set display `{x, ...}` (no colon) is out of subset.
+    fn parse_dict(&mut self) -> Result<Expr, ParseError> {
+        self.advance();
+        if self.at(&Tok::RBrace) {
+            self.advance();
+            return Ok(Expr::Dict(Vec::new()));
+        }
+        let key = self.parse_expr()?;
+        if !self.eat(&Tok::Colon) {
+            if self.at(&Tok::KwFor) {
+                let clauses = self.parse_comp_clauses()?;
+                self.expect(&Tok::RBrace, "'}' closing the comprehension")?;
+                return Ok(Expr::SetComp {
+                    element: Box::new(key),
+                    clauses,
+                });
+            }
+            let mut elems = vec![key];
+            if self.eat(&Tok::Comma) {
+                while !self.at(&Tok::RBrace) {
+                    elems.push(self.parse_expr()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RBrace, "'}' closing the set")?;
+            return Ok(Expr::Set(elems));
+        }
+        let value = self.parse_expr()?;
+        if self.at(&Tok::KwFor) {
+            let clauses = self.parse_comp_clauses()?;
+            self.expect(&Tok::RBrace, "'}' closing the comprehension")?;
+            return Ok(Expr::DictComp {
+                key: Box::new(key),
+                value: Box::new(value),
+                clauses,
+            });
+        }
+        let mut pairs = vec![(key, value)];
+        if self.eat(&Tok::Comma) {
+            while !self.at(&Tok::RBrace) {
+                let k = self.parse_expr()?;
+                self.expect(&Tok::Colon, "':' in the dict")?;
+                let v = self.parse_expr()?;
+                pairs.push((k, v));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace, "'}' closing the dict")?;
+        Ok(Expr::Dict(pairs))
+    }
+
     fn parse_args(&mut self) -> Result<Vec<Expr>, ParseError> {
         let mut args = Vec::new();
         if self.at(&Tok::RParen) {
@@ -787,6 +1156,33 @@ impl Parser {
                 }
                 Ok(Expr::Str(joined))
             }
+            Tok::FString(parts) => {
+                self.advance();
+                self.parse_fstring(parts)
+            }
+            Tok::LBracket => {
+                self.advance();
+                if self.at(&Tok::RBracket) {
+                    self.advance();
+                    return Ok(Expr::List(Vec::new()));
+                }
+                let first = self.parse_expr()?;
+                if self.at(&Tok::KwFor) {
+                    let clauses = self.parse_comp_clauses()?;
+                    self.expect(&Tok::RBracket, "']' closing the comprehension")?;
+                    Ok(Expr::ListComp {
+                        element: Box::new(first),
+                        clauses,
+                    })
+                } else {
+                    let mut elements = vec![first];
+                    if self.eat(&Tok::Comma) {
+                        elements.extend(self.parse_expr_list(&Tok::RBracket)?);
+                    }
+                    self.expect(&Tok::RBracket, "']' closing the list")?;
+                    Ok(Expr::List(elements))
+                }
+            }
             Tok::KwTrue => {
                 self.advance();
                 Ok(Expr::Bool(true))
@@ -805,10 +1201,22 @@ impl Parser {
             }
             Tok::LParen => {
                 self.advance();
-                let inner = self.parse_expr()?;
-                self.expect(&Tok::RParen, "')'")?;
-                Ok(inner)
+                if self.at(&Tok::RParen) {
+                    self.advance();
+                    return Ok(Expr::Tuple(Vec::new()));
+                }
+                let first = self.parse_expr()?;
+                if self.eat(&Tok::Comma) {
+                    let mut items = vec![first];
+                    items.extend(self.parse_expr_list(&Tok::RParen)?);
+                    self.expect(&Tok::RParen, "')'")?;
+                    Ok(Expr::Tuple(items))
+                } else {
+                    self.expect(&Tok::RParen, "')'")?;
+                    Ok(first)
+                }
             }
+            Tok::LBrace => self.parse_dict(),
             Tok::Reserved(word) => Err(self.error(format!(
                 "'{word}' is a reserved keyword not supported in this subset"
             ))),
@@ -960,8 +1368,15 @@ mod tests {
     }
 
     #[test]
-    fn for_over_a_non_range_is_rejected() {
-        assert!(parse_src("for x in stuff:\n    y = x\n").is_err());
+    fn for_dispatches_range_vs_general_iterable() {
+        assert!(matches!(
+            parse_ok("for x in range(3):\n    y = x\n").body[0],
+            Stmt::For { .. }
+        ));
+        assert!(matches!(
+            parse_ok("for x in stuff:\n    y = x\n").body[0],
+            Stmt::ForIter { .. }
+        ));
     }
 
     #[test]
@@ -981,6 +1396,106 @@ mod tests {
             panic!("expected a while loop");
         };
         assert!(orelse.is_empty());
+    }
+
+    #[test]
+    fn fstring_desugars_to_str_and_concat() {
+        let single = parse_ok("f\"{x}\"\n");
+        let Stmt::Expr(Expr::Call { func, args }) = &single.body[0] else {
+            panic!("expected str(x)");
+        };
+        assert!(matches!(&**func, Expr::Name(n) if n == "str"));
+        assert!(matches!(&args[0], Expr::Name(n) if n == "x"));
+        assert!(matches!(parse_ok("f\"plain\"\n").body[0], Stmt::Expr(Expr::Str(_))));
+        let braces = parse_ok("f\"{{x}}\"\n");
+        let Stmt::Expr(Expr::Str(s)) = &braces.body[0] else {
+            panic!("expected literal braces");
+        };
+        assert_eq!(s, "{x}");
+        assert!(matches!(
+            parse_ok("f\"a{x}\"\n").body[0],
+            Stmt::Expr(Expr::Binary { .. })
+        ));
+    }
+
+    #[test]
+    fn tuple_and_dict_displays_parse() {
+        assert!(matches!(parse_ok("(a, b)\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 2));
+        assert!(matches!(parse_ok("(a,)\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 1));
+        assert!(matches!(parse_ok("()\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.is_empty()));
+        assert!(matches!(parse_ok("(a)\n").body[0], Stmt::Expr(Expr::Name(_))));
+        assert!(matches!(parse_ok("{1: 2, 3: 4}\n").body[0], Stmt::Expr(Expr::Dict(ref p)) if p.len() == 2));
+        assert!(matches!(parse_ok("{}\n").body[0], Stmt::Expr(Expr::Dict(ref p)) if p.is_empty()));
+        assert!(matches!(parse_ok("{1, 2}\n").body[0], Stmt::Expr(Expr::Set(_))));
+        assert!(matches!(parse_ok("{}\n").body[0], Stmt::Expr(Expr::Dict(_))));
+    }
+
+    #[test]
+    fn tuple_unpacking_parses() {
+        assert!(matches!(
+            parse_ok("a, b = p\n").body[0],
+            Stmt::TupleAssign { .. }
+        ));
+        let m = parse_ok("a, b = 1, 2\n");
+        let Stmt::TupleAssign { targets, value } = &m.body[0] else {
+            panic!("expected a tuple assignment");
+        };
+        assert_eq!(targets, &["a", "b"]);
+        assert!(matches!(value, Expr::Tuple(_)));
+        let f = parse_ok("for k, v in d:\n    pass\n");
+        let Stmt::ForIter { body, .. } = &f.body[0] else {
+            panic!("expected a for-iter");
+        };
+        assert!(matches!(body[0], Stmt::TupleAssign { .. }));
+        assert!(matches!(
+            parse_ok("for x in d:\n    pass\n").body[0],
+            Stmt::ForIter { .. }
+        ));
+        assert!(parse_src("a, = x\n").is_err());
+    }
+
+    #[test]
+    fn comprehensions_parse() {
+        assert!(matches!(
+            parse_ok("[x for x in r]\n").body[0],
+            Stmt::Expr(Expr::ListComp { .. })
+        ));
+        let m = parse_ok("[x for a in xs if a for x in a]\n");
+        let Stmt::Expr(Expr::ListComp { clauses, .. }) = &m.body[0] else {
+            panic!("expected a list comprehension");
+        };
+        assert_eq!(clauses.len(), 2);
+        assert_eq!(clauses[0].conditions.len(), 1);
+        let d = parse_ok("{k: v for k, v in items}\n");
+        let Stmt::Expr(Expr::DictComp { clauses, .. }) = &d.body[0] else {
+            panic!("expected a dict comprehension");
+        };
+        assert_eq!(clauses[0].targets, ["k", "v"]);
+        assert!(matches!(
+            parse_ok("{k: v for k in r}\n").body[0],
+            Stmt::Expr(Expr::DictComp { .. })
+        ));
+        assert!(matches!(parse_ok("[1, 2, 3]\n").body[0], Stmt::Expr(Expr::List(_))));
+        assert!(matches!(parse_ok("{1: 2}\n").body[0], Stmt::Expr(Expr::Dict(_))));
+        assert!(matches!(
+            parse_ok("{x for x in r}\n").body[0],
+            Stmt::Expr(Expr::SetComp { .. })
+        ));
+    }
+
+    #[test]
+    fn list_display_parses() {
+        let m = parse_ok("[a, b, c]\n");
+        let Stmt::Expr(Expr::List(items)) = &m.body[0] else {
+            panic!("expected a list display");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(parse_ok("[]\n").body[0], Stmt::Expr(Expr::List(ref v)) if v.is_empty()));
+        assert!(matches!(parse_ok("[1, 2,]\n").body[0], Stmt::Expr(Expr::List(ref v)) if v.len() == 2));
+        assert!(matches!(
+            parse_ok("[a, b][0]\n").body[0],
+            Stmt::Expr(Expr::Subscript { .. })
+        ));
     }
 
     #[test]
@@ -1018,6 +1533,83 @@ mod tests {
             }
         ));
         assert!(matches!(sub_index("s[i]\n"), Expr::Name(_)));
+    }
+
+    #[test]
+    fn class_def_parses() {
+        let m = parse_ok("class C(Base):\n    k = 1\n    def m(self):\n        return self.k\n");
+        let Stmt::ClassDef { name, base, body } = &m.body[0] else {
+            panic!("expected a class def");
+        };
+        assert_eq!(name, "C");
+        assert!(base.is_some());
+        assert_eq!(body.len(), 2);
+        assert!(matches!(
+            parse_ok("class D:\n    pass\n").body[0],
+            Stmt::ClassDef { base: None, .. }
+        ));
+        assert!(parse_src("class E(A, B):\n    pass\n").is_err());
+        assert!(matches!(parse_ok("obj.x = 5\n").body[0], Stmt::SetAttr { .. }));
+    }
+
+    #[test]
+    fn try_except_and_raise_parse() {
+        assert!(matches!(
+            parse_ok("raise E\n").body[0],
+            Stmt::Raise {
+                exc: Some(_),
+                cause: None
+            }
+        ));
+        assert!(matches!(
+            parse_ok("raise\n").body[0],
+            Stmt::Raise {
+                exc: None,
+                cause: None
+            }
+        ));
+        assert!(matches!(
+            parse_ok("raise E from C\n").body[0],
+            Stmt::Raise {
+                exc: Some(_),
+                cause: Some(_)
+            }
+        ));
+        let src = "try:\n    x = 1\nexcept E as e:\n    x = 2\nexcept:\n    x = 3\nelse:\n    x = 4\n";
+        let Stmt::Try {
+            handlers, orelse, ..
+        } = &parse_ok(src).body[0]
+        else {
+            panic!("expected a try statement");
+        };
+        assert_eq!(handlers.len(), 2);
+        assert_eq!(handlers[0].name.as_deref(), Some("e"));
+        assert!(handlers[1].typ.is_none());
+        assert_eq!(orelse.len(), 1);
+        assert!(parse_src("try:\n    pass\nexcept:\n    pass\nexcept E:\n    pass\n").is_err());
+        assert!(parse_src("raise from C\n").is_err());
+    }
+
+    #[test]
+    fn membership_parses_at_the_comparison_level() {
+        assert!(matches!(
+            parse_ok("x in c\n").body[0],
+            Stmt::Expr(Expr::Compare { op: CmpOp::In, .. })
+        ));
+        assert!(matches!(
+            parse_ok("x not in c\n").body[0],
+            Stmt::Expr(Expr::Compare {
+                op: CmpOp::NotIn,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn subscript_assignment_is_setitem() {
+        assert!(matches!(parse_ok("c[i] = v\n").body[0], Stmt::SetItem { .. }));
+        assert!(parse_src("c[1:2] = v\n").is_err());
+        assert!(matches!(parse_ok("a = v\n").body[0], Stmt::Assign(_)));
     }
 
     #[test]
@@ -1166,11 +1758,11 @@ else:
 
     #[test]
     fn out_of_subset_constructs_are_rejected_clearly() {
-        assert!(parse_src("obj.x = 5\n").is_err());
-        assert!(parse_src("a, b = 1, 2\n").is_err());
+        assert!(parse_src("obj.x += 5\n").is_err());
+        assert!(parse_src("(a, b) = x\n").is_err());
         assert!(parse_src("a / b\n").is_err());
         assert!(parse_src("def f(x=1): return x\n").is_err());
         assert!(parse_src("import os\n").is_err());
-        assert!(parse_src("for x in stuff:\n    pass\n").is_err());
+        assert!(parse_src("del x\n").is_err());
     }
 }

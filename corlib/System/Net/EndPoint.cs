@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Net.EndPoint
+#if LAMELLA_SURFACE_NET
 namespace System.Net
 {
     public abstract class EndPoint
@@ -6,3 +7,4 @@ namespace System.Net
         protected EndPoint() { }
     }
 }
+#endif

@@ -46,6 +46,10 @@ pub enum CmpOp {
     Gt,
     /// `>=`
     Ge,
+    /// `in` -- a membership test.
+    In,
+    /// `not in` -- a negated membership test.
+    NotIn,
 }
 
 /// A unary operator (`- + ~`).
@@ -164,6 +168,49 @@ pub enum Expr {
         /// The step (`None` if omitted).
         step: Option<Box<Expr>>,
     },
+    /// A list display `[a, b, c]`. A dynamic value (no typed lowering).
+    List(Vec<Expr>),
+    /// A tuple display `(a, b, c)` / `(a,)` / `()`. A dynamic value.
+    Tuple(Vec<Expr>),
+    /// A dict display `{k: v, ...}` -- key/value pairs in source order. A dynamic value.
+    Dict(Vec<(Expr, Expr)>),
+    /// A set display `{a, b, c}` -- elements in source order (deduped at runtime). A dynamic
+    /// value. `{}` is an empty dict, not a set.
+    Set(Vec<Expr>),
+    /// A list comprehension `[element for target in iterable [if cond]]`.
+    ListComp {
+        /// The element expression, evaluated per innermost item.
+        element: Box<Expr>,
+        /// One or more `for ... [if ...]` clauses, outermost first.
+        clauses: Vec<CompClause>,
+    },
+    /// A set comprehension `{element for target in iterable [if cond]}`.
+    SetComp {
+        /// The element expression.
+        element: Box<Expr>,
+        /// One or more `for ... [if ...]` clauses, outermost first.
+        clauses: Vec<CompClause>,
+    },
+    /// A dict comprehension `{key: value for target in iterable [if cond]}`.
+    DictComp {
+        /// The key expression.
+        key: Box<Expr>,
+        /// The value expression.
+        value: Box<Expr>,
+        /// One or more `for ... [if ...]` clauses, outermost first.
+        clauses: Vec<CompClause>,
+    },
+}
+
+/// One `for target(s) in iterable [if cond ...]` clause of a comprehension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompClause {
+    /// The loop target(s): one name, or several for a tuple target `for k, v in ...`.
+    pub targets: Vec<String>,
+    /// The iterable.
+    pub iterable: Expr,
+    /// Zero or more `if` filters that follow this `for` (before the next `for`).
+    pub conditions: Vec<Expr>,
 }
 
 /// A statement.
@@ -182,6 +229,32 @@ pub enum Stmt {
         /// The target names, in source order (two or more).
         targets: Vec<String>,
         /// The value bound to each target.
+        value: Expr,
+    },
+    /// Tuple-unpacking assignment `a, b = expr` -- the value is a sequence whose elements
+    /// bind to the targets in order. Flat targets only (nested `(a, (b, c))` is post-cut).
+    TupleAssign {
+        /// The target names, in source order (two or more).
+        targets: Vec<String>,
+        /// The sequence value to unpack.
+        value: Expr,
+    },
+    /// A subscript assignment `container[index] = value` on a mutable container.
+    SetItem {
+        /// The container being mutated.
+        container: Expr,
+        /// The index.
+        index: Expr,
+        /// The value to store.
+        value: Expr,
+    },
+    /// An attribute assignment `obj.attr = value` (e.g. `self.x = v`).
+    SetAttr {
+        /// The object whose attribute is set.
+        obj: Expr,
+        /// The attribute name.
+        attr: String,
+        /// The value to store.
         value: Expr,
     },
     /// An expression evaluated for its effect; its value is discarded.
@@ -222,6 +295,50 @@ pub enum Stmt {
         /// The `else` clause, run if the loop runs to completion (not via `break`).
         orelse: Vec<Stmt>,
     },
+    /// A `for target in iterable:` over a general iterable (anything other than a
+    /// `range(...)` call, which stays the counted `For` above) -- the iterator protocol.
+    ForIter {
+        /// The loop variable, bound to each item.
+        target: String,
+        /// The iterable expression.
+        iterable: Expr,
+        /// The loop body.
+        body: Vec<Stmt>,
+        /// The `else` clause, run if the loop runs to completion (not via `break`).
+        orelse: Vec<Stmt>,
+    },
+    /// A `raise` statement. `raise exc` raises a value; a bare `raise` (`exc` is `None`)
+    /// re-raises the exception currently being handled; `raise exc from cause` chains the
+    /// cause onto the raised exception's `__cause__`.
+    Raise {
+        /// The exception to raise, or `None` for a bare re-raise.
+        exc: Option<Expr>,
+        /// The explicit cause (`raise exc from cause`), or `None`. `raise exc from None`
+        /// carries `cause` as the `None` literal (to suppress implicit chaining).
+        cause: Option<Expr>,
+    },
+    /// A `try` statement with `except` handlers and an optional `else`. (A `finally`
+    /// clause parses into `finalbody`.)
+    Try {
+        /// The protected body.
+        body: Vec<Stmt>,
+        /// The `except` handlers, in source order (a bare `except:`, if present, is last).
+        handlers: Vec<ExceptHandler>,
+        /// The `else` clause -- run when the body completes with no exception; empty if absent.
+        orelse: Vec<Stmt>,
+        /// The `finally` clause; empty if absent.
+        finalbody: Vec<Stmt>,
+    },
+    /// A `class Name [(Base)]:` definition. The body holds method definitions (`FuncDef`)
+    /// and class-attribute assignments (`Assign`).
+    ClassDef {
+        /// The class name.
+        name: String,
+        /// The single base-class expression, if any (`None` inherits `object`).
+        base: Option<Expr>,
+        /// The class body.
+        body: Vec<Stmt>,
+    },
     /// `break` -- exit the innermost enclosing loop.
     Break,
     /// `continue` -- skip to the next iteration of the innermost enclosing loop.
@@ -241,6 +358,17 @@ pub struct Assign {
     pub annotation: Option<Expr>,
     /// The value to store, or `None` for a bare annotated declaration.
     pub value: Option<Expr>,
+}
+
+/// One `except [type [as name]]:` clause of a [`Stmt::Try`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExceptHandler {
+    /// The exception type to match, or `None` for a bare `except:` (catches anything).
+    pub typ: Option<Expr>,
+    /// The name the caught exception is bound to (`as name`), if any.
+    pub name: Option<String>,
+    /// The handler body.
+    pub body: Vec<Stmt>,
 }
 
 /// A function parameter declaration.

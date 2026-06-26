@@ -165,6 +165,17 @@ fn check_inst(
                 use_value(func, defined, arg, errors);
             }
         }
+        Inst::PInvoke { args, .. } => {
+            for &arg in args {
+                use_value(func, defined, arg, errors);
+            }
+        }
+        Inst::InvokeDelegate { delegate, args } => {
+            use_value(func, defined, *delegate, errors);
+            for &arg in args {
+                use_value(func, defined, arg, errors);
+            }
+        }
         Inst::FuncAddr { .. } => {
             if let Some(r) = result_ty {
                 expect(MirType::I32, r, errors);
@@ -229,6 +240,8 @@ fn check_inst(
             use_value(func, defined, *object, errors);
         }
         Inst::TypeDescAddr { .. } => {
+        }
+        Inst::TypeDescLiteral { .. } => {
         }
         Inst::CopyStruct { src } => {
             use_value(func, defined, *src, errors);

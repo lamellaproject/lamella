@@ -30,8 +30,11 @@ pub enum NetResult<T> {
 /// The networking seam. `Debug` is a supertrait so the [`crate::interp::Vm`] -- which holds an
 /// `Option<Box<dyn NetBackend>>` -- still derives `Debug`.
 pub trait NetBackend: core::fmt::Debug {
-    /// Resolves a host name to an IPv4 address (host byte order), or `None`. (IPv6 / async DNS later.)
-    fn resolve(&mut self, host: &str) -> Option<u32>;
+    /// Resolves a host name to its IP addresses -- each entry is the address bytes in network order
+    /// (4 = IPv4, 16 = IPv6), in the host resolver's order. An empty vec means resolution failed. The
+    /// managed `System.Net.Dns` builds an `IPAddress[]` from these (so both families + multiple
+    /// addresses surface).
+    fn resolve(&mut self, host: &str) -> alloc::vec::Vec<alloc::vec::Vec<u8>>;
 
     /// Opens a non-blocking TCP socket and begins connecting to `addr:port`. `addr` is the address
     /// bytes in network order (the first byte is the high-order octet) -- 4 for IPv4, 16 for IPv6.
@@ -79,10 +82,19 @@ pub trait NetBackend: core::fmt::Debug {
     fn close(&mut self, socket: SocketHandle);
 
     /// Registers (or updates) the interest a parked thread is waiting on, so the next [`poll`] watches
-    /// `socket` for `interest`. Called by the scheduler when a socket op parks a thread.
+    /// `socket` for `interest`. Called by the scheduler when a socket op parks a thread. Re-registers a
+    /// socket that was [`deregister`](NetBackend::deregister)ed after a prior wake.
     ///
     /// [`poll`]: NetBackend::poll
     fn register(&mut self, socket: SocketHandle, interest: Interest);
+
+    /// Drops `socket` from the poll-set once the thread parked on it has been woken (the scheduler
+    /// calls this in its reactor wake step). Keeps the poll-set to only sockets with a currently-parked
+    /// waiter, so a stale registration never produces a spurious wake; a later [`register`] re-arms it.
+    /// A no-op if the socket is not currently in the poll-set.
+    ///
+    /// [`register`]: NetBackend::register
+    fn deregister(&mut self, socket: SocketHandle);
 
     /// Blocks until at least one registered socket is ready for its interest, or `timeout_ms` elapses
     /// (`None` = block indefinitely). Returns the handles now ready. The scheduler's single OS-thread

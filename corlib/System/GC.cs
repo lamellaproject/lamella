@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.GC
+#if LAMELLA_SURFACE_GC
 namespace System
 {
     public static class GC
@@ -12,3 +13,4 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] public static void WaitForPendingFinalizers() { }
     }
 }
+#endif

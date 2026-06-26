@@ -14,8 +14,8 @@ pub mod session;
 pub mod tokens;
 
 pub use compile::{
-    Compilation, Diagnostic, compile_source, compile_unit, compile_unit_with_debug,
-    compile_unit_with_references,
+    Compilation, Diagnostic, compile_source, compile_source_with, compile_unit,
+    compile_unit_with_debug, compile_unit_with_references,
 };
 pub use debug::{LineMap, SpanLines};
 pub use expr::{EmitError, emit_expression};

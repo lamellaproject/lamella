@@ -23,12 +23,34 @@ pub struct Tokenized {
 
 /// Scans `source` into a complete [`Tokenized`] stream.
 ///
+/// How identifiers are compared (9.4.2). They differ only for a decomposed vs precomposed spelling
+/// of one identifier: `None` keeps the raw code points, which csc does (it does NOT normalize, so
+/// the two spellings are distinct -- this matches the differential oracle); `Nfc` folds to Unicode
+/// Normalization Form C, which the ECMA-334 standard requires (the two spellings are then one
+/// identifier). The compiler default is `None`; `Nfc` is the spec-strict knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Normalization {
+    /// Raw code points -- the Roslyn/csc behaviour. The default.
+    #[default]
+    None,
+    /// Unicode Normalization Form C, per ECMA-334 9.4.2.
+    Nfc,
+}
+
 /// The token stream is a gap-free cover of the source: concatenating the text of
 /// every non-`EndOfFile` token reproduces the input, after the single trailing
-/// Control-Z removal of 9.3.1.
+/// Control-Z removal of 9.3.1. Identifiers are NOT normalized (matching csc); use
+/// [`tokenize_with`] for the ECMA-334 9.4.2 NFC behaviour.
 #[must_use]
 pub fn tokenize(source: &str) -> Tokenized {
+    tokenize_with(source, Normalization::None)
+}
+
+/// Like [`tokenize`], but folds identifiers per `normalization` (9.4.2).
+#[must_use]
+pub fn tokenize_with(source: &str, normalization: Normalization) -> Tokenized {
     let mut lexer = Lexer::new(source);
+    lexer.normalization = normalization;
     let mut tokens = Vec::new();
     loop {
         let token = lexer.next_token();
@@ -69,6 +91,8 @@ pub struct Lexer<'a> {
     /// The stack of open `#if`/`#region` constructs, innermost last (9.5.4). Its
     /// top decides whether source is currently being included or skipped.
     conditionals: Vec<Conditional>,
+    /// How to fold identifier names (9.4.2); `None` (raw code points) by default.
+    normalization: Normalization,
 }
 
 /// One open conditional construct: an `#if`/`#elif`/`#else`/`#endif` group or a
@@ -154,6 +178,7 @@ impl<'a> Lexer<'a> {
             seen_token: false,
             defined_symbols: BTreeSet::new(),
             conditionals: Vec::new(),
+            normalization: Normalization::None,
         }
     }
 
@@ -688,6 +713,15 @@ impl<'a> Lexer<'a> {
     /// stays a zero-allocation source slice; an escape (anywhere, including the first
     /// character) switches to building the decoded identifier text, which is what names
     /// the keyword/identifier (so `if` is the keyword `if`).
+    /// An identifier's name, folded per the lexer's [`Normalization`] mode (9.4.2). ASCII is
+    /// already in NFC, so it is returned unchanged regardless of mode.
+    fn identifier_name(&self, text: &str) -> Box<str> {
+        match self.normalization {
+            Normalization::None => text.into(),
+            Normalization::Nfc => nfc_identifier(text),
+        }
+    }
+
     fn scan_identifier_or_keyword(&mut self, start: usize) -> TokenKind {
         let mut decoded: Option<String> = None;
         if self.peek() == Some('\\') {
@@ -732,7 +766,7 @@ impl<'a> Lexer<'a> {
         };
         match Keyword::from_text(text) {
             Some(keyword) => TokenKind::Keyword(keyword),
-            None => TokenKind::Identifier(text.into()),
+            None => TokenKind::Identifier(self.identifier_name(text)),
         }
     }
 
@@ -744,7 +778,7 @@ impl<'a> Lexer<'a> {
                 self.bump();
                 self.consume_identifier_part();
                 let text = &self.source[name_start..self.position];
-                TokenKind::Identifier(text.into())
+                TokenKind::Identifier(self.identifier_name(text))
             }
             Some('"') => self.scan_verbatim_string(start),
             _ => {
@@ -980,9 +1014,9 @@ impl<'a> Lexer<'a> {
             self.bump();
             self.consume_decimal_digits();
             self.consume_exponent();
-            let bits = self.parse_real_value(&self.source[start..self.position], start);
+            let value_end = self.position;
             let suffix = self.try_consume_real_suffix().unwrap_or(RealSuffix::None);
-            return TokenKind::RealLiteral { bits, suffix };
+            return self.numeric_real_token(&self.source[start..value_end], suffix, start);
         }
 
         if self.peek() == Some('0') && matches!(self.peek_second(), Some('x' | 'X')) {
@@ -1014,12 +1048,11 @@ impl<'a> Lexer<'a> {
         }
 
         if is_real {
-            let bits = self.parse_real_value(&self.source[start..self.position], start);
+            let value_end = self.position;
             let suffix = self.try_consume_real_suffix().unwrap_or(RealSuffix::None);
-            TokenKind::RealLiteral { bits, suffix }
+            self.numeric_real_token(&self.source[start..value_end], suffix, start)
         } else if let Some(suffix) = self.try_consume_real_suffix() {
-            let bits = self.parse_real_value(&self.source[start..integer_digits_end], start);
-            TokenKind::RealLiteral { bits, suffix }
+            self.numeric_real_token(&self.source[start..integer_digits_end], suffix, start)
         } else {
             let digits = &self.source[digits_start..integer_digits_end];
             let suffix = self.consume_integer_suffix();
@@ -1038,6 +1071,25 @@ impl<'a> Lexer<'a> {
                 0
             }
         }
+    }
+
+    /// Builds the token for a real-literal text (without its suffix). A `decimal` (`m`) literal
+    /// keeps its EXACT 96-bit mantissa and scale; `float`/`double` narrow to `f64` bits.
+    fn numeric_real_token(&mut self, text: &str, suffix: RealSuffix, start: usize) -> TokenKind {
+        if suffix == RealSuffix::Decimal {
+            if let Some((lo, mid, hi, scale)) = parse_decimal_literal(text) {
+                return TokenKind::DecimalLiteral { lo, mid, hi, scale };
+            }
+            self.report(DiagnosticKind::MalformedNumericLiteral, start);
+            return TokenKind::DecimalLiteral {
+                lo: 0,
+                mid: 0,
+                hi: 0,
+                scale: 0,
+            };
+        }
+        let bits = self.parse_real_value(text, start);
+        TokenKind::RealLiteral { bits, suffix }
     }
 
     fn consume_decimal_digits(&mut self) {
@@ -1162,24 +1214,98 @@ impl<'a> Lexer<'a> {
 }
 
 /// A line terminator (9.3.1). A CR/LF pair is combined into one by the scanner.
+/// Parses a `decimal`-literal's numeric text (digits with an optional `.` and `e`/`E` exponent, no
+/// suffix or sign) to `(lo, mid, hi, scale)` -- the 96-bit integer mantissa split into three `u32`
+/// and the power-of-ten scale, so the value is `mantissa x 10^-scale`. `None` if the mantissa
+/// overflows 96 bits, the scale falls outside `0..=28`, or a character is not a digit. (The sign of
+/// `-2.5m` is a separate unary minus, folded later, not part of the literal.)
+fn parse_decimal_literal(text: &str) -> Option<(u32, u32, u32, u8)> {
+    let (mantissa_text, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exp)) => (mantissa, exp.parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let mut mantissa: u128 = 0;
+    let mut fractional_digits: i32 = 0;
+    let mut after_point = false;
+    for ch in mantissa_text.chars() {
+        if ch == '.' {
+            after_point = true;
+            continue;
+        }
+        let digit = ch.to_digit(10)?;
+        mantissa = mantissa.checked_mul(10)?.checked_add(u128::from(digit))?;
+        if after_point {
+            fractional_digits += 1;
+        }
+    }
+    let mut scale = fractional_digits - exponent;
+    while scale < 0 {
+        mantissa = mantissa.checked_mul(10)?;
+        scale += 1;
+    }
+    if scale > 28 || mantissa > 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF {
+        return None;
+    }
+    Some((
+        mantissa as u32,
+        (mantissa >> 32) as u32,
+        (mantissa >> 64) as u32,
+        scale as u8,
+    ))
+}
+
+/// An identifier's name in Unicode Normalization Form C (9.4.2). ASCII is already NFC, so only a
+/// non-ASCII spelling is normalized -- the common path stays allocation-light, and a build that
+/// never lexes a non-ASCII identifier drops the normalization tables.
+fn nfc_identifier(text: &str) -> Box<str> {
+    if text.is_ascii() {
+        text.into()
+    } else {
+        lamella_unicode::normalize(text, lamella_unicode::NormalizationForm::Nfc).into()
+    }
+}
+
+/// A line terminator (9.3.2): carriage return (U+000D), line feed (U+000A), next line (U+0085),
+/// line separator (U+2028), or paragraph separator (U+2029). These end a single-line comment and
+/// advance the line count; they are NOT white space (9.3.3).
 fn is_new_line(c: char) -> bool {
-    matches!(c, '\r' | '\n' | '\u{2028}' | '\u{2029}')
+    matches!(c, '\r' | '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}')
 }
 
-/// White space (9.3.3). ASCII-only for now: the space is the only ASCII member
-/// of Unicode class Zs, and the remaining Zs characters need UCD tables.
+/// White space (9.3.3): a Unicode space separator (class Zs -- the space U+0020, NBSP, the
+/// U+2000..U+200A set, etc.), or one of the spec's three explicit characters (horizontal tab,
+/// vertical tab, form feed). Line terminators (9.3.2, e.g. CR/LF/U+2028/U+2029) are NOT white
+/// space -- they are recognized separately by [`is_new_line`].
 fn is_whitespace(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\u{000B}' | '\u{000C}')
+    matches!(c, '\t' | '\u{000B}' | '\u{000C}')
+        || lamella_unicode::general_category(c as u32)
+            == lamella_unicode::GeneralCategory::SpaceSeparator
 }
 
-/// An identifier-start character (9.4.2). ASCII-only for now.
+/// A letter-character (9.4.2): a Unicode letter (classes Lu, Ll, Lt, Lm, Lo) or letter-number
+/// (class Nl, e.g. the Roman numerals).
+fn is_letter_character(c: char) -> bool {
+    let category = lamella_unicode::general_category(c as u32);
+    category.is_letter() || category == lamella_unicode::GeneralCategory::LetterNumber
+}
+
+/// An identifier-start character (9.4.2): a letter-character, or the underscore `_` (U+005F).
 fn is_identifier_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
+    c == '_' || is_letter_character(c)
 }
 
-/// An identifier-part character (9.4.2). ASCII-only for now.
+/// An identifier-part character (9.4.2): a letter-character, a decimal digit (class Nd), a
+/// connecting character (class Pc -- includes `_`), a combining mark (Mn/Mc), or a formatting
+/// character (class Cf).
 fn is_identifier_part(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    use lamella_unicode::GeneralCategory::{
+        ConnectorPunctuation, DecimalDigitNumber, Format, NonSpacingMark, SpacingCombiningMark,
+    };
+    is_letter_character(c)
+        || matches!(
+            lamella_unicode::general_category(c as u32),
+            DecimalDigitNumber | ConnectorPunctuation | NonSpacingMark | SpacingCombiningMark | Format
+        )
 }
 
 /// The Unicode replacement character (U+FFFD), stood in for one ill-formed
@@ -1316,7 +1442,15 @@ mod tests {
         );
         assert_eq!(
             kinds("3m"),
-            vec![real(3.0, RealSuffix::Decimal), TokenKind::EndOfFile]
+            vec![
+                TokenKind::DecimalLiteral {
+                    lo: 3,
+                    mid: 0,
+                    hi: 0,
+                    scale: 0
+                },
+                TokenKind::EndOfFile
+            ]
         );
     }
 
@@ -1373,6 +1507,68 @@ mod tests {
     }
 
     #[test]
+    fn unicode_identifiers_and_whitespace_by_general_category() {
+        let significant = |src: &str| -> Vec<TokenKind> {
+            tokenize(src)
+                .tokens
+                .into_iter()
+                .map(|token| token.kind)
+                .filter(|kind| !kind.is_trivia() && *kind != TokenKind::EndOfFile)
+                .collect()
+        };
+        assert_eq!(significant("Διπλάσιο"), vec![ident("Διπλάσιο")]);
+        assert_eq!(significant("café"), vec![ident("café")]);
+        assert_eq!(significant("Ⅻ"), vec![ident("Ⅻ")]);
+        assert_eq!(significant("a\u{0301}b"), vec![ident("a\u{0301}b")]);
+        assert_eq!(significant("\u{20000}z"), vec![ident("\u{20000}z")]);
+        assert_eq!(significant("x9"), vec![ident("x9")]);
+        assert_eq!(significant("a\u{00A0}b"), vec![ident("a"), ident("b")]);
+        let around_symbol = significant("a\u{00A4}b");
+        assert_eq!(around_symbol.first(), Some(&ident("a")));
+        assert_eq!(around_symbol.last(), Some(&ident("b")));
+    }
+
+    #[test]
+    fn decimal_literals_keep_their_exact_mantissa_and_scale() {
+        assert_eq!(parse_decimal_literal("1.5"), Some((15, 0, 0, 1)));
+        assert_eq!(parse_decimal_literal("0.10"), Some((10, 0, 0, 2)));
+        assert_eq!(parse_decimal_literal("100"), Some((100, 0, 0, 0)));
+        assert_eq!(parse_decimal_literal("0.05"), Some((5, 0, 0, 2)));
+        assert_eq!(parse_decimal_literal("4294967296"), Some((0, 1, 0, 0)));
+        assert_eq!(parse_decimal_literal("1.5e2"), Some((150, 0, 0, 0)));
+        assert_eq!(parse_decimal_literal("1.5e-1"), Some((15, 0, 0, 2)));
+        assert_eq!(parse_decimal_literal("79228162514264337593543950336"), None);
+    }
+
+    #[test]
+    fn nfc_knob_folds_decomposed_identifiers_only_when_enabled() {
+        let significant = |tokenized: Tokenized| -> Vec<TokenKind> {
+            tokenized
+                .tokens
+                .into_iter()
+                .map(|token| token.kind)
+                .filter(|kind| !kind.is_trivia() && *kind != TokenKind::EndOfFile)
+                .collect()
+        };
+        assert_ne!(
+            significant(tokenize("cafe\u{0301}")),
+            significant(tokenize("caf\u{00e9}"))
+        );
+        assert_eq!(
+            significant(tokenize_with("cafe\u{0301}", Normalization::Nfc)),
+            vec![ident("caf\u{00e9}")]
+        );
+        assert_eq!(
+            significant(tokenize_with("cafe\u{0301}", Normalization::Nfc)),
+            significant(tokenize_with("caf\u{00e9}", Normalization::Nfc))
+        );
+        assert_eq!(
+            significant(tokenize_with("plain", Normalization::Nfc)),
+            vec![ident("plain")]
+        );
+    }
+
+    #[test]
     fn line_terminators_collapse_crlf() {
         assert_eq!(kinds("\n"), vec![TokenKind::NewLine, TokenKind::EndOfFile]);
         assert_eq!(kinds("\r"), vec![TokenKind::NewLine, TokenKind::EndOfFile]);
@@ -1382,6 +1578,14 @@ mod tests {
         );
         assert_eq!(
             kinds("\u{2028}"),
+            vec![TokenKind::NewLine, TokenKind::EndOfFile]
+        );
+        assert_eq!(
+            kinds("\u{0085}"),
+            vec![TokenKind::NewLine, TokenKind::EndOfFile]
+        );
+        assert_eq!(
+            kinds("\u{2029}"),
             vec![TokenKind::NewLine, TokenKind::EndOfFile]
         );
         assert_eq!(

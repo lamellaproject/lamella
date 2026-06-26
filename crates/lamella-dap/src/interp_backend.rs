@@ -419,6 +419,7 @@ fn format_value(vm: &Vm, value: Value) -> (String, String) {
         Value::Null => ("null".to_owned(), "object".to_owned()),
         Value::Struct(fields) => (format!("struct[{}]", fields.len()), "struct".to_owned()),
         Value::ByRef(_) => ("&".to_owned(), "byref".to_owned()),
+        Value::TypedRef { .. } => ("typedref".to_owned(), "typedref".to_owned()),
     }
 }
 

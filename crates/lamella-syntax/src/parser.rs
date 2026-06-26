@@ -10,7 +10,7 @@ use crate::ast::{
     UnaryOperator, UsingDirective, UsingKind, UsingResource, VariableDeclarator,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::lexer::{Tokenized, tokenize};
+use crate::lexer::{Normalization, Tokenized, tokenize, tokenize_with};
 use crate::span::Span;
 use crate::token::{Keyword, Punctuator, Token, TokenKind};
 use alloc::boxed::Box;
@@ -73,10 +73,20 @@ pub struct ParsedCompilationUnit {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Lexes and parses `source` as a whole compilation unit (ECMA-334 1st ed, 16.1).
+/// Lexes and parses `source` as a whole compilation unit (ECMA-334 1st ed, 16.1). Identifiers are
+/// not normalized (the csc-matching default); use [`parse_compilation_unit_with`] for 9.4.2 NFC.
 #[must_use]
 pub fn parse_compilation_unit(source: &str) -> ParsedCompilationUnit {
-    let mut parser = Parser::new(tokenize(source));
+    parse_compilation_unit_with(source, Normalization::None)
+}
+
+/// Like [`parse_compilation_unit`], but folds identifiers per `normalization` (9.4.2).
+#[must_use]
+pub fn parse_compilation_unit_with(
+    source: &str,
+    normalization: Normalization,
+) -> ParsedCompilationUnit {
+    let mut parser = Parser::new(tokenize_with(source, normalization));
     let unit = parser.parse_compilation_unit();
     ParsedCompilationUnit {
         unit,
@@ -1980,6 +1990,7 @@ impl Parser {
             TokenKind::Identifier(_)
             | TokenKind::IntegerLiteral { .. }
             | TokenKind::RealLiteral { .. }
+            | TokenKind::DecimalLiteral { .. }
             | TokenKind::CharacterLiteral(_)
             | TokenKind::StringLiteral(_) => true,
             TokenKind::Punctuator(punctuator) => matches!(
@@ -2079,6 +2090,24 @@ impl Parser {
             TokenKind::RealLiteral { bits, suffix } => {
                 self.bump();
                 Expr::new(ExprKind::Literal(Literal::Real { bits, suffix }), span)
+            }
+            TokenKind::DecimalLiteral {
+                lo,
+                mid,
+                hi,
+                scale,
+            } => {
+                self.bump();
+                Expr::new(
+                    ExprKind::Literal(Literal::Decimal {
+                        lo,
+                        mid,
+                        hi,
+                        scale,
+                        negative: false,
+                    }),
+                    span,
+                )
             }
             TokenKind::CharacterLiteral(unit) => {
                 self.bump();
@@ -2590,6 +2619,7 @@ mod tests {
         match &expr.kind {
             ExprKind::Literal(Literal::Integer { value, .. }) => format!("{value}"),
             ExprKind::Literal(Literal::Real { .. }) => String::from("real"),
+            ExprKind::Literal(Literal::Decimal { .. }) => String::from("decimal"),
             ExprKind::Literal(Literal::Character(unit)) => format!("char:{unit}"),
             ExprKind::Literal(Literal::String(_)) => String::from("str"),
             ExprKind::Literal(Literal::Boolean(value)) => format!("{value}"),

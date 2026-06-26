@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Net.Sockets.TcpListener
+#if LAMELLA_SURFACE_NET
 namespace System.Net.Sockets
 {
     public class TcpListener
@@ -35,3 +36,4 @@ namespace System.Net.Sockets
         public void Stop() { _socket.Close(); }
     }
 }
+#endif

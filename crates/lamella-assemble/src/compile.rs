@@ -27,7 +27,8 @@ use lamella_syntax::ast::{
     TypeRef, UsingDirective, UsingKind, VariableDeclarator, explicit_interface_member_name,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
-use lamella_syntax::parser::parse_compilation_unit;
+use lamella_syntax::lexer::Normalization;
+use lamella_syntax::parser::parse_compilation_unit_with;
 use lamella_syntax::span::Span;
 use lamella_token::Token;
 
@@ -172,7 +173,30 @@ pub fn compile_source(
     references: &[Assembly],
     emit_debug: bool,
 ) -> Compilation {
-    let parsed = parse_compilation_unit(source);
+    compile_source_with(
+        source,
+        source_path,
+        module_name,
+        assembly_name,
+        references,
+        emit_debug,
+        Normalization::None,
+    )
+}
+
+/// Like [`compile_source`], but compares identifiers per `normalization` (9.4.2): `None` keeps raw
+/// code points (the csc-matching default), `Nfc` folds to Unicode Normalization Form C (the
+/// ECMA-334 spec).
+pub fn compile_source_with(
+    source: &str,
+    source_path: &str,
+    module_name: &str,
+    assembly_name: &str,
+    references: &[Assembly],
+    emit_debug: bool,
+    normalization: Normalization,
+) -> Compilation {
+    let parsed = parse_compilation_unit_with(source, normalization);
     let parse_diagnostics: Vec<Diagnostic> = parsed
         .diagnostics
         .iter()
@@ -2327,6 +2351,9 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             let token = image.user_string(text);
             tokens.insert_string(text, token);
         }
+        BoundExprKind::Literal(Literal::Decimal { .. }) => {
+            mint_decimal_ctor(image, tokens);
+        }
         BoundExprKind::Binary {
             left,
             right,
@@ -2424,6 +2451,34 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     .is_none()
                 {
                     mint_member_ref(constructor, image, tokens);
+                }
+            }
+        }
+        BoundExprKind::DelegateCreation {
+            delegate_type,
+            target,
+            receiver,
+        } => {
+            if let Some(receiver) = receiver {
+                mint_in_expr(receiver, image, tokens);
+            }
+            if tokens
+                .method(&target.declaring_type, &target.name, &target.parameters)
+                .is_none()
+            {
+                mint_member_ref(target, image, tokens);
+            }
+            if tokens.method(delegate_type, ".ctor", &[]).is_none() {
+                if let Some((namespace, name)) = split_type_name(delegate_type) {
+                    mint_named_type_token(delegate_type, image, tokens);
+                    let ctor_sig = method_signature(
+                        true,
+                        &[TypeSig::Object, TypeSig::NativeInt],
+                        &TypeSig::Void,
+                    );
+                    let type_ref = image.type_ref(&namespace, &name);
+                    let ctor = image.member_ref(type_ref, ".ctor", &ctor_sig);
+                    tokens.insert_method(delegate_type, ".ctor", &[], ctor);
                 }
             }
         }
@@ -2637,7 +2692,7 @@ fn mint_member_ref(
     let member = image.member_ref(type_ref, &method.name, &signature);
     tokens.insert_method(
         &method.declaring_type,
-        &method.name,
+        &crate::tokens::conversion_key_name(&method.name, &method.return_type),
         &method.parameters,
         member,
     );
@@ -2814,7 +2869,18 @@ fn mark_external_value_types(model: &Model, tokens: &mut Tokens) {
 }
 
 fn mint_named_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut Tokens) {
-    if !matches!(ty, TypeSymbol::Named(_)) || tokens.type_token(ty).is_some() {
+    if let TypeSymbol::Array { element, .. }
+    | TypeSymbol::Pointer(element)
+    | TypeSymbol::ByRef(element) = ty
+    {
+        mint_named_type_token(element, image, tokens);
+        return;
+    }
+    let needs_ref = matches!(
+        ty,
+        TypeSymbol::Named(_) | TypeSymbol::Special(SpecialType::Decimal)
+    );
+    if !needs_ref || tokens.type_token(ty).is_some() {
         return;
     }
     if let Some((namespace, name)) = split_type_name(ty) {
@@ -2834,7 +2900,11 @@ fn mint_signature_type(
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
 ) {
-    if !matches!(syntactic, TypeSymbol::Named(_)) || tokens.type_token(syntactic).is_some() {
+    let needs_ref = matches!(
+        syntactic,
+        TypeSymbol::Named(_) | TypeSymbol::Special(SpecialType::Decimal)
+    );
+    if !needs_ref || tokens.type_token(syntactic).is_some() {
         return;
     }
     if let Some((namespace, name)) = split_type_name(&binder.resolve_type(syntactic)) {
@@ -2908,6 +2978,36 @@ fn mint_value_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut
             tokens.insert_type(ty, token);
         }
     }
+}
+
+/// Mints System.Decimal's `(int lo, int mid, int hi, bool isNegative, byte scale)` constructor --
+/// how a decimal literal is built, since System.Decimal has no CIL constant form.
+fn mint_decimal_ctor(image: &mut ImageBuilder, tokens: &mut Tokens) {
+    let decimal_ty = TypeSymbol::Special(SpecialType::Decimal);
+    let params = [
+        TypeSymbol::Special(SpecialType::Int32),
+        TypeSymbol::Special(SpecialType::Int32),
+        TypeSymbol::Special(SpecialType::Int32),
+        TypeSymbol::Special(SpecialType::Boolean),
+        TypeSymbol::Special(SpecialType::Byte),
+    ];
+    if tokens.method(&decimal_ty, ".ctor", &params).is_some() {
+        return;
+    }
+    mint_value_type_token(&decimal_ty, image, tokens);
+    let Some(parent) = tokens.type_token(&decimal_ty) else {
+        return;
+    };
+    let Ok(param_sigs) = params
+        .iter()
+        .map(|ty| type_sig(tokens, ty))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return;
+    };
+    let signature = method_signature(true, &param_sigs, &TypeSig::Void);
+    let ctor = image.member_ref(parent, ".ctor", &signature);
+    tokens.insert_method(&decimal_ty, ".ctor", &params, ctor);
 }
 
 /// Splits a named type into `(namespace, name)`, e.g. `System.Console` -> `("System",
@@ -3060,6 +3160,11 @@ fn declares_instance_constructor(declaration: &TypeDecl) -> bool {
 /// of its `TypeDef` token; array types come later.
 fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitError> {
     let special = match ty {
+        TypeSymbol::Special(SpecialType::Decimal) => {
+            return tokens.type_token(ty).map(TypeSig::ValueType).ok_or(
+                crate::EmitError::Unsupported("System.Decimal has no metadata token in a signature"),
+            );
+        }
         TypeSymbol::Special(special) => special,
         TypeSymbol::Named(_) if tokens.is_struct(ty) || tokens.is_enum(ty) => {
             return tokens.type_token(ty).map(TypeSig::ValueType).ok_or(

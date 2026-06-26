@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.WeakReference
+#if LAMELLA_SURFACE_GC
 namespace System
 {
     public class WeakReference
@@ -31,3 +32,4 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] private static void WriteWeakCell(object cell, object target) { }
     }
 }
+#endif

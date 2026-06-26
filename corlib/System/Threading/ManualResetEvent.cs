@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Threading.ManualResetEvent
+#if LAMELLA_SURFACE_WAIT_HANDLES
 namespace System.Threading
 {
     public sealed class ManualResetEvent : WaitHandle
@@ -20,3 +21,4 @@ namespace System.Threading
         }
     }
 }
+#endif

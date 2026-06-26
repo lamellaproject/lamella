@@ -3,6 +3,7 @@
 use crate::interp::{Session, Vm};
 use crate::module::{AttrValue, Module};
 use crate::net::{Interest, NetResult};
+use crate::tls::{TlsStack, VerifyMode};
 use crate::object::{Object, ObjectRef, decode_string};
 use crate::trap::Trap;
 use crate::value::Value;
@@ -3755,6 +3756,324 @@ pub fn socket_udp_recv_from(
         }
         NetResult::Error => Ok(Some(Value::Int32(SOCK_ERROR))),
     }
+}
+
+/// `Dns.ResolveHost(string host, byte[] buffer, int[] lengths)`: resolves `host` to its IP addresses,
+/// writing address `i`'s network-order bytes at `buffer[i*16 ..]` and its byte length (4 = IPv4 /
+/// 16 = IPv6) into `lengths[i]`, and returning the address count (>= 1) or -1 on failure.
+/// `lengths.Length` caps the count (the managed side sizes both arrays at 16 bytes per slot). The
+/// managed `Dns` builds an `IPAddress[]`, so BOTH families and multiple addresses surface.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `host` is not a string or the buffers are not arrays.
+pub fn dns_resolve_host(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let host = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let Some(&Value::Object(buffer)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(lengths)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let addresses = match vm.net_backend() {
+        Some(backend) => backend.resolve(&host),
+        None => alloc::vec::Vec::new(),
+    };
+    if addresses.is_empty() {
+        return Ok(Some(Value::Int32(-1)));
+    }
+    let capacity = vm.heap_mut().array_len(lengths).unwrap_or(0);
+    let count = addresses.len().min(capacity);
+    for (i, address) in addresses.iter().take(count).enumerate() {
+        for (j, &octet) in address.iter().enumerate() {
+            vm.heap_mut()
+                .array_set(buffer, i * 16 + j, Value::Int32(i32::from(octet)));
+        }
+        vm.heap_mut()
+            .array_set(lengths, i, Value::Int32(address.len() as i32));
+    }
+    Ok(Some(Value::Int32(count as i32)))
+}
+
+
+/// Returned by a TLS intrinsic when the operation failed or no backend is installed.
+const TLS_ERROR: i32 = -1;
+/// Returned by `tls_read_plain` when the peer has closed (no more plaintext).
+const TLS_CLOSED: i32 = -2;
+
+/// Reads an entire managed `byte[]` into a Rust vector for the seam.
+fn read_whole_array(vm: &mut Vm, array: ObjectRef) -> alloc::vec::Vec<u8> {
+    let len = vm.heap_mut().array_len(array).unwrap_or(0);
+    let mut bytes = alloc::vec![0u8; len];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        if let Some(Value::Int32(byte)) = vm.heap_mut().array_get(array, i) {
+            *slot = byte as u8;
+        }
+    }
+    bytes
+}
+
+/// Reads a managed `byte[]` segment `[offset, offset+count)` into a Rust vector for the seam.
+fn read_byte_segment(
+    vm: &mut Vm,
+    array: ObjectRef,
+    offset: usize,
+    count: usize,
+) -> alloc::vec::Vec<u8> {
+    let mut buf = alloc::vec![0u8; count];
+    for (i, slot) in buf.iter_mut().enumerate() {
+        if let Some(Value::Int32(byte)) = vm.heap_mut().array_get(array, offset + i) {
+            *slot = byte as u8;
+        }
+    }
+    buf
+}
+
+/// Writes `bytes` into a managed `byte[]` starting at `offset`.
+fn write_byte_segment(vm: &mut Vm, array: ObjectRef, offset: usize, bytes: &[u8]) {
+    for (i, &byte) in bytes.iter().enumerate() {
+        vm.heap_mut()
+            .array_set(array, offset + i, Value::Int32(i32::from(byte)));
+    }
+}
+
+/// `TlsNative.ClientConfig(int stack, int verifyMode, byte[] rootsPem)`: builds a client config
+/// (engine + trust policy; `rootsPem` may be null). Returns the config handle (>= 0) or `TLS_ERROR`.
+pub fn tls_client_config(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(stack)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(verify)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let roots = match args.get(2) {
+        Some(&Value::Object(array)) => Some(read_whole_array(vm, array)),
+        _ => None,
+    };
+    let result = match vm.tls_backend() {
+        Some(backend) => backend.client_config(
+            TlsStack::from_i32(stack),
+            VerifyMode::from_i32(verify),
+            roots.as_deref(),
+        ),
+        None => return Ok(Some(Value::Int32(TLS_ERROR))),
+    };
+    Ok(Some(Value::Int32(result.map_or(TLS_ERROR, |h| h as i32))))
+}
+
+/// `TlsNative.ServerConfig(int stack, byte[] pfx, string password)`: builds a server config from a
+/// PKCS#12 identity. Returns the config handle (>= 0) or `TLS_ERROR`.
+pub fn tls_server_config(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(stack)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(pfx_array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let password = string_value(vm, args.get(2)).unwrap_or_default();
+    let pfx = read_whole_array(vm, pfx_array);
+    let result = match vm.tls_backend() {
+        Some(backend) => backend.server_config(TlsStack::from_i32(stack), &pfx, &password),
+        None => return Ok(Some(Value::Int32(TLS_ERROR))),
+    };
+    Ok(Some(Value::Int32(result.map_or(TLS_ERROR, |h| h as i32))))
+}
+
+/// `TlsNative.ClientNew(int config, string hostname)`: starts a client session (SNI = hostname).
+/// Returns the session handle (>= 0) or `TLS_ERROR`.
+pub fn tls_client_new(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(config)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let hostname = string_value(vm, args.get(1)).unwrap_or_default();
+    let result = match vm.tls_backend() {
+        Some(backend) => backend.client_new(config as u32, &hostname),
+        None => return Ok(Some(Value::Int32(TLS_ERROR))),
+    };
+    Ok(Some(Value::Int32(result.map_or(TLS_ERROR, |h| h as i32))))
+}
+
+/// `TlsNative.ServerNew(int config)`: starts a server session. Returns the handle (>= 0) or `TLS_ERROR`.
+pub fn tls_server_new(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(config)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let result = match vm.tls_backend() {
+        Some(backend) => backend.server_new(config as u32),
+        None => return Ok(Some(Value::Int32(TLS_ERROR))),
+    };
+    Ok(Some(Value::Int32(result.map_or(TLS_ERROR, |h| h as i32))))
+}
+
+/// `TlsNative.Process(int tls)`: advances the session state machine. Returns the state
+/// (`0` handshaking, `1` established, `2` closed, `3` error), or `TLS_ERROR` with no backend.
+pub fn tls_process(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let state = match vm.tls_backend() {
+        Some(backend) => backend.process(handle).as_i32(),
+        None => TLS_ERROR,
+    };
+    Ok(Some(Value::Int32(state)))
+}
+
+/// `TlsNative.WantsWrite(int tls)`: `1` if outgoing ciphertext is queued, else `0`.
+pub fn tls_wants_write(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let wants = match vm.tls_backend() {
+        Some(backend) => backend.wants_write(handle),
+        None => false,
+    };
+    Ok(Some(Value::Int32(i32::from(wants))))
+}
+
+/// `TlsNative.WriteTls(int tls, byte[] buf, int offset, int count)`: drains up to `count` bytes of
+/// outgoing ciphertext into `buf` at `offset`. Returns the byte count written.
+pub fn tls_write_tls(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(offset)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(count)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let mut out = alloc::vec![0u8; count];
+    let n = match vm.tls_backend() {
+        Some(backend) => backend.write_tls(handle, &mut out),
+        None => return Ok(Some(Value::Int32(0))),
+    };
+    write_byte_segment(vm, array, offset, &out[..n]);
+    Ok(Some(Value::Int32(n as i32)))
+}
+
+/// `TlsNative.ReadTls(int tls, byte[] buf, int offset, int count)`: feeds `count` bytes of received
+/// ciphertext from `buf` at `offset`. Returns how many bytes the engine consumed.
+pub fn tls_read_tls(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(offset)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(count)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let input = read_byte_segment(vm, array, offset, count);
+    let n = match vm.tls_backend() {
+        Some(backend) => backend.read_tls(handle, &input),
+        None => return Ok(Some(Value::Int32(0))),
+    };
+    Ok(Some(Value::Int32(n as i32)))
+}
+
+/// `TlsNative.ReadPlain(int tls, byte[] buf, int offset, int count)`: reads up to `count` bytes of
+/// decrypted application data into `buf` at `offset`. Returns the byte count (`0` = none yet),
+/// `TLS_CLOSED` when the peer closed, or `TLS_ERROR` with no backend.
+pub fn tls_read_plain(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(offset)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(count)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let mut out = alloc::vec![0u8; count];
+    let result = match vm.tls_backend() {
+        Some(backend) => backend.read_plain(handle, &mut out),
+        None => return Ok(Some(Value::Int32(TLS_ERROR))),
+    };
+    match result {
+        Some(n) => {
+            write_byte_segment(vm, array, offset, &out[..n]);
+            Ok(Some(Value::Int32(n as i32)))
+        }
+        None => Ok(Some(Value::Int32(TLS_CLOSED))),
+    }
+}
+
+/// `TlsNative.WritePlain(int tls, byte[] buf, int offset, int count)`: queues `count` bytes of
+/// application data to encrypt. Returns how many bytes were accepted.
+pub fn tls_write_plain(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(offset)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(count)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let input = read_byte_segment(vm, array, offset, count);
+    let n = match vm.tls_backend() {
+        Some(backend) => backend.write_plain(handle, &input),
+        None => return Ok(Some(Value::Int32(0))),
+    };
+    Ok(Some(Value::Int32(n as i32)))
+}
+
+/// `TlsNative.PeerCert(int tls, byte[] buf)`: writes the peer's end-entity certificate (DER) into
+/// `buf` when it fits, returning its full DER length (`0` = none). A caller probes with a large
+/// buffer; if the return exceeds it, re-call with a bigger one (the engine wrote nothing).
+pub fn tls_peer_cert(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let cap = vm.heap_mut().array_len(array).unwrap_or(0);
+    let mut out = alloc::vec![0u8; cap];
+    let der_len = match vm.tls_backend() {
+        Some(backend) => backend.peer_cert(handle, &mut out),
+        None => return Ok(Some(Value::Int32(0))),
+    };
+    if der_len > 0 && der_len <= cap {
+        write_byte_segment(vm, array, 0, &out[..der_len]);
+    }
+    Ok(Some(Value::Int32(der_len as i32)))
+}
+
+/// `TlsNative.CloseTls(int tls)`: closes the session and releases its handle.
+pub fn tls_close(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    if let Some(backend) = vm.tls_backend() {
+        backend.close(handle);
+    }
+    Ok(None)
+}
+
+/// `TlsNative.DefaultStack()`: the TLS stack the managed `SslStream` selects when a program does not
+/// request one (`0` = rustls, `1` = mbedTLS) -- the host's runtime choice. `0` with no backend.
+pub fn tls_default_stack(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let stack = match vm.tls_backend() {
+        Some(backend) => backend.default_stack(),
+        None => 0,
+    };
+    Ok(Some(Value::Int32(stack)))
 }
 
 /// `System.Threading.Monitor.EnterLock(object)`: acquires the per-object lock for the running

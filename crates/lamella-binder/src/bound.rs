@@ -41,6 +41,10 @@ pub struct FieldReference {
     pub ty: TypeSymbol,
     /// Whether the field is `static`.
     pub is_static: bool,
+    /// Whether the field is `readonly` (`initonly`). Its address may not be taken with
+    /// `ldsflda`/`ldflda` outside a constructor, so a value-type method call on a readonly field
+    /// copies it to a temp first.
+    pub is_readonly: bool,
     /// The field's accessibility.
     pub accessibility: Accessibility,
     /// The compile-time constant value of a `const` field or enum member, so emission folds
@@ -440,6 +444,15 @@ impl Binder {
                 }
             }
         }
+        if let TypeSymbol::Array { element, rank } = ty {
+            return TypeSymbol::Array {
+                element: Box::new(self.resolve_named_type(element, span)),
+                rank: *rank,
+            };
+        }
+        if let TypeSymbol::Pointer(element) = ty {
+            return TypeSymbol::Pointer(Box::new(self.resolve_named_type(element, span)));
+        }
         resolve_type(&self.world, ty, &mut self.diagnostics, span)
     }
 
@@ -580,6 +593,20 @@ impl Binder {
         }
         if expr.ty == *target || expr.ty.is_error() || target.is_error() {
             return expr;
+        }
+        if matches!(target, TypeSymbol::Special(SpecialType::Decimal))
+            && !matches!(expr.ty, TypeSymbol::Special(SpecialType::Decimal))
+        {
+            if let Some(method) = self.user_conversion(&expr.ty, target, "op_Implicit") {
+                return BoundExpr {
+                    ty: target.clone(),
+                    kind: BoundExprKind::Call {
+                        callee: Box::new(error_expr()),
+                        arguments: alloc::vec![expr],
+                        method: Some(method),
+                    },
+                };
+            }
         }
         if converts(&self.model, &expr.ty, target) {
             let conversion = self.conversion_kind(&expr.ty, target);
@@ -1006,6 +1033,7 @@ impl Binder {
                     name: name.into(),
                     ty: ty.clone(),
                     is_static: false,
+                    is_readonly: false,
                     accessibility: Accessibility::Public,
                     constant: None,
                 }),
@@ -1755,22 +1783,23 @@ impl Binder {
             } = &target_expr.kind
             {
                 let bound_receiver = self.bind_expression(receiver);
-                let is_indexer = !bound_receiver.ty.is_error()
-                    && !matches!(
+                let setter = if bound_receiver.ty.is_error()
+                    || matches!(
                         bound_receiver.ty,
                         TypeSymbol::Array { .. } | TypeSymbol::Special(SpecialType::String)
-                    )
-                    && !self
-                        .methods_in_chain(&bound_receiver.ty, "set_Item")
-                        .is_empty();
-                if is_indexer {
+                    ) {
+                    None
+                } else {
+                    self.indexer_accessor(&bound_receiver.ty, "set_", arguments.len() + 1)
+                };
+                if let Some(setter) = setter {
                     let mut args: Vec<BoundExpr> = arguments
                         .iter()
                         .map(|argument| self.bind_expression(argument))
                         .collect();
                     args.push(self.bind_expression(value_expr));
                     return self
-                        .bind_indexer_call(bound_receiver, "set_Item", args, span)
+                        .bind_indexer_call(bound_receiver, &setter, args, span)
                         .unwrap_or_else(error_expr);
                 }
             }
@@ -1874,6 +1903,23 @@ impl Binder {
                 ty: delegate_ty,
             };
         }
+        if !target.ty.is_error() && !value.ty.is_error() {
+            if let Some(binary_op) = compound_binary_operator(operator) {
+                if binary_result_type(binary_op, &target.ty, &value.ty).is_none() {
+                    if let Some(call) = self.bind_user_binary_operator(binary_op, &target, &value) {
+                        let assigned = self.convert(call, &target.ty);
+                        return BoundExpr {
+                            ty: target.ty.clone(),
+                            kind: BoundExprKind::Assignment {
+                                operator: AssignmentOperator::Assign,
+                                target: Box::new(target),
+                                value: Box::new(assigned),
+                            },
+                        };
+                    }
+                }
+            }
+        }
         if !target.ty.is_error() && !is_lvalue(&target) {
             self.diagnostics
                 .push(Diagnostic::new(DiagnosticKind::NotAssignable, target_span));
@@ -1947,6 +1993,7 @@ impl Binder {
                             name: name.into(),
                             ty: ty.clone(),
                             is_static: true,
+                            is_readonly: false,
                             accessibility: Accessibility::Public,
                             constant: Some(integer_literal(constant)),
                         }),
@@ -2313,7 +2360,7 @@ impl Binder {
         if receiver.ty.is_error() {
             return error_expr();
         }
-        if self.methods_in_chain(&receiver.ty, "get_Item").is_empty() {
+        let Some(getter) = self.indexer_accessor(&receiver.ty, "get_", indices.len()) else {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::CannotIndex {
                     type_name: receiver.ty.to_string().into(),
@@ -2321,8 +2368,8 @@ impl Binder {
                 span,
             ));
             return error_expr();
-        }
-        self.bind_indexer_call(receiver, "get_Item", indices, span)
+        };
+        self.bind_indexer_call(receiver, &getter, indices, span)
             .unwrap_or_else(error_expr)
     }
 
@@ -2418,7 +2465,15 @@ impl Binder {
             TypeSymbol::Error
         } else {
             if !real_error {
-                if let Some(constructors) = self
+                if arguments.is_empty() && self.is_value_type(&target_ty) {
+                    constructor = Some(MethodReference {
+                        declaring_type: target_ty.clone(),
+                        name: ".ctor".into(),
+                        parameters: Vec::new(),
+                        return_type: TypeSymbol::Special(SpecialType::Void),
+                        is_static: false,
+                    });
+                } else if let Some(constructors) = self
                     .type_info_of(&target_ty)
                     .map(|info| info.constructors.clone())
                 {
@@ -2720,6 +2775,7 @@ impl Binder {
                     name: field.name.clone(),
                     ty: self.resolve_type(&field.ty),
                     is_static: field.is_static,
+                    is_readonly: field.is_readonly,
                     accessibility: field.accessibility,
                     constant: field.constant.clone(),
                 });
@@ -2935,6 +2991,38 @@ impl Binder {
                 .any(|symbol| self.defined_symbols.contains(symbol))
     }
 
+    /// The name of an indexer accessor on `ty` (or a base): a `prefix`-named method (`get_`/`set_`)
+    /// taking `arity` parameters. A C# indexer defaults to `Item` (`get_Item`/`set_Item`) but a
+    /// `[IndexerName]` renames it -- String and StringBuilder use `Chars`. A regular property
+    /// accessor never has parameters (a getter takes 0, a setter 1), so matching the index arity
+    /// (read = indices, write = indices + the value) finds the indexer, not a plain property. The
+    /// first match walking the chain (most-derived first) wins.
+    fn indexer_accessor(&self, ty: &TypeSymbol, prefix: &str, arity: usize) -> Option<Box<str>> {
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut pending = alloc::vec![member_lookup_type(ty)];
+        while let Some(current_ty) = pending.pop() {
+            if visited.contains(&current_ty) {
+                continue;
+            }
+            visited.push(current_ty.clone());
+            let Some(info) = self.type_info_of(&current_ty) else {
+                continue;
+            };
+            for method in &info.methods {
+                if method.parameters.len() == arity && method.name.starts_with(prefix) {
+                    return Some(method.name.clone());
+                }
+            }
+            for base in &info.bases {
+                pending.push(base.clone());
+            }
+            if let Some(base) = &info.base {
+                pending.push(base.clone());
+            }
+        }
+        None
+    }
+
     fn methods_in_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
         let mut methods: Vec<MethodSymbol> = Vec::new();
         let mut visited: Vec<TypeSymbol> = Vec::new();
@@ -2948,7 +3036,11 @@ impl Binder {
                 continue;
             };
             for method in info.methods_named(name) {
-                if !methods.iter().any(|kept| kept.parameters == method.parameters) {
+                let conversion_operator = matches!(name, "op_Implicit" | "op_Explicit");
+                if !methods.iter().any(|kept| {
+                    kept.parameters == method.parameters
+                        && (!conversion_operator || kept.return_type == method.return_type)
+                }) {
                     methods.push(method.clone());
                 }
             }
@@ -3412,7 +3504,7 @@ pub fn literal_int_value(literal: &Literal) -> Option<i64> {
         Literal::Integer { value, .. } => Some(*value as i64),
         Literal::Character(unit) => Some(i64::from(*unit)),
         Literal::Boolean(b) => Some(i64::from(*b)),
-        Literal::Real { .. } | Literal::String(_) | Literal::Null => None,
+        Literal::Real { .. } | Literal::Decimal { .. } | Literal::String(_) | Literal::Null => None,
     }
 }
 
@@ -3801,10 +3893,7 @@ fn binary_numeric_promotion(left: SpecialType, right: SpecialType) -> Option<Spe
     }
     let has = |special: SpecialType| left == special || right == special;
     Some(if has(Decimal) {
-        if has(Double) || has(Single) {
-            return None;
-        }
-        Decimal
+        return None;
     } else if has(Double) {
         Double
     } else if has(Single) {
@@ -3854,6 +3943,7 @@ fn unary_result_type(operator: UnaryOperator, operand: &TypeSymbol) -> Option<Ty
             .then_some(TypeSymbol::Special(unary_numeric_promote(special))),
         UnaryOperator::Minus => match special {
             UInt64 => None,
+            SpecialType::Decimal => None,
             UInt32 => Some(TypeSymbol::Special(Int64)),
             other if other.is_numeric() => Some(TypeSymbol::Special(unary_numeric_promote(other))),
             _ => None,
@@ -3899,6 +3989,7 @@ fn literal_type(literal: &Literal) -> TypeSymbol {
             RealSuffix::Decimal => SpecialType::Decimal,
             RealSuffix::Double | RealSuffix::None => SpecialType::Double,
         },
+        Literal::Decimal { .. } => SpecialType::Decimal,
         Literal::Character(_) => SpecialType::Char,
         Literal::String(_) => SpecialType::String,
         Literal::Boolean(_) => SpecialType::Boolean,

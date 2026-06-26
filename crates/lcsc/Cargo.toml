@@ -9,11 +9,16 @@ description = "The Lamella C# compiler driver: source files to a managed assembl
 
 # The compiler driver is a host CLI, so std is allowed here (unlike the no_std
 # front-end libraries). It reads files, decodes them the way csc does, compiles,
-# and reports diagnostics; no external dependencies.
+# and reports diagnostics.
 [dependencies]
 lamella-syntax = { path = "../lamella-syntax" }
 lamella-assemble = { path = "../lamella-assemble" }
 lamella-metadata = { path = "../lamella-metadata" }
+
+# GetACP, for the host's default ANSI code page when decoding a non-Unicode source. windows-sys
+# (not the `windows` crate) per project convention; Windows-only.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Globalization"] }
 
 [lints]
 workspace = true

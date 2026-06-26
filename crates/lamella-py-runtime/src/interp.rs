@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use lamella_gc::Ref;
-use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Const, Op, UnaryOp};
+use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Const, ExcEntry, Op, UnaryOp};
 
 use crate::object::{InlineCache, ObjectModel};
 use crate::trap::Trap;
@@ -212,7 +212,18 @@ pub fn run(
     args: &[Value],
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
-    exec(code, functions, args, model, 0)
+    exec(code, functions, args, model, 0, false)
+}
+
+/// Runs the module body (the top-level statements). Its local bindings mirror into the module
+/// globals as they happen, so a function reaches a top-level name (a class, a global) by
+/// `LoadGlobal`. Run this before invoking module functions.
+pub fn run_module(
+    body: &CodeObject,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+) -> Result<Value, Trap> {
+    exec(body, functions, &[], model, 0, true)
 }
 
 /// Executes one function activation at call depth `depth` (0 for the entry). [`Op::Call`]
@@ -223,12 +234,88 @@ pub fn run(
 /// ran mid-call would not see the suspended caller frames. The typed/recursive corpus
 /// allocates nothing during a call, so this is not exercised -- a frame-chain root walk
 /// covers it once allocation can occur inside a call.
+/// One op's control-flow outcome: fall through to the next op, or return `value` from the
+/// function. A jump just mutates `ip` and falls through with [`Flow::Next`].
+enum Flow {
+    Next,
+    Return(Value),
+}
+
+/// The innermost `exc_table` entry whose protected range covers op `ip`, or `None`. Entries
+/// are emitted innermost-first, so the first cover is the tightest handler.
+fn find_handler(exc_table: &[ExcEntry], ip: u32) -> Option<ExcEntry> {
+    exc_table.iter().copied().find(|e| e.start <= ip && ip < e.end)
+}
+
+/// Dispatches a call of `callee` with `args` -- the unified callable protocol shared by the
+/// `Call` op, builtins that invoke dunders, and dunder dispatch. `depth` is the callee's call
+/// depth. Handles module functions, builtins, bound str/Python methods, and instantiating a class.
+pub(crate) fn call_value(
+    callee: Value,
+    args: &[Value],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if let Some(index) = callee.as_function_index() {
+        let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
+        exec(code, functions, args, model, depth, false)
+    } else if let Some(id) = callee.as_builtin_id() {
+        crate::builtins::call_builtin(id, args, functions, model, depth)
+    } else if model.is_bound_method(callee) {
+        model.call_bound_method(callee, args)
+    } else if model.is_py_bound(callee) {
+        let func = model.bound_func(callee);
+        let index = func.as_function_index().ok_or(Trap::TypeError)?;
+        let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
+        let mut method_args = Vec::with_capacity(args.len() + 1);
+        method_args.push(model.bound_self(callee));
+        method_args.extend_from_slice(args);
+        exec(code, functions, &method_args, model, depth, false)
+    } else if model.is_class(callee) {
+        let instance = model.new_object(callee)?;
+        if let Some(init) = model.find_init(callee) {
+            let index = init.as_function_index().ok_or(Trap::TypeError)?;
+            let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
+            let mut init_args = Vec::with_capacity(args.len() + 1);
+            init_args.push(instance);
+            init_args.extend_from_slice(args);
+            exec(code, functions, &init_args, model, depth, false)?;
+        }
+        Ok(instance)
+    } else {
+        Err(Trap::TypeError)
+    }
+}
+
+/// The iterator over `value`: a class instance's `__iter__` (the result iterated if it is not
+/// already an iterator), else the built-in iterator. Shared by `GetIter`, `iter()`, and the
+/// builtins that collect an iterable.
+pub(crate) fn iterator_for(
+    value: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if let Some(iter_method) = model.find_dunder(value, "__iter__") {
+        let result = call_value(iter_method, &[], functions, model, depth)?;
+        if model.is_iter(result) {
+            Ok(result)
+        } else {
+            model.new_iter(result)
+        }
+    } else {
+        model.new_iter(value)
+    }
+}
+
 fn exec(
     code: &CodeObject,
     functions: &[CodeObject],
     args: &[Value],
     model: &mut ObjectModel,
     depth: usize,
+    is_module: bool,
 ) -> Result<Value, Trap> {
     if depth > MAX_CALL_DEPTH {
         return Err(Trap::RecursionError);
@@ -243,11 +330,14 @@ fn exec(
     let mut caches = Vec::with_capacity(code.cache_count);
     caches.resize(code.cache_count, InlineCache::empty());
 
+    let mut active_exception: Option<Value> = None;
     let mut ip = 0usize;
     loop {
+        let faulting_ip = ip as u32;
         let op = *code.ops.get(ip).ok_or(Trap::Malformed)?;
         ip += 1;
-        match op {
+        let flow = (|| -> Result<Flow, Trap> {
+            match op {
             Op::LoadConst(idx) => {
                 let c = code.consts.get(idx as usize).ok_or(Trap::Malformed)?;
                 let value = match c {
@@ -263,13 +353,21 @@ fn exec(
             Op::StoreFast(idx) => {
                 let value = frame.pop()?;
                 frame.store_local(idx as usize, value)?;
+                if is_module {
+                    let name = code.local_names.get(idx as usize).ok_or(Trap::Malformed)?;
+                    model.set_global(name, value);
+                }
             }
             Op::LoadGlobal(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
                 let value = if let Some(index) = functions.iter().position(|f| f.name == *name) {
                     Value::function_ref(index as u32)
+                } else if let Some(global) = model.get_global(name) {
+                    global
                 } else if let Some(id) = crate::builtins::builtin_id(name) {
                     Value::builtin_ref(id)
+                } else if let Some(class) = model.exception_class(name) {
+                    class
                 } else {
                     return Err(Trap::NameError);
                 };
@@ -298,9 +396,20 @@ fn exec(
             Op::Compare(cmpop) => {
                 let rhs = frame.pop()?;
                 let lhs = frame.pop()?;
-                let result = match model.py_compare(cmpop, lhs, rhs)? {
-                    Some(value) => value,
-                    None => compare(cmpop, lhs, rhs)?,
+                let eq_method = if matches!(cmpop, CmpOp::Eq | CmpOp::Ne) {
+                    model.find_dunder(lhs, "__eq__")
+                } else {
+                    None
+                };
+                let result = if let Some(eq_method) = eq_method {
+                    let outcome = call_value(eq_method, &[rhs], functions, model, depth + 1)?;
+                    let equal = model.py_truthy(outcome)?.unwrap_or(true);
+                    Value::from_bool(if matches!(cmpop, CmpOp::Ne) { !equal } else { equal })
+                } else {
+                    match model.py_compare(cmpop, lhs, rhs)? {
+                        Some(value) => value,
+                        None => compare(cmpop, lhs, rhs)?,
+                    }
                 };
                 frame.push(result);
             }
@@ -314,6 +423,56 @@ fn exec(
                 let upper = frame.pop()?;
                 let lower = frame.pop()?;
                 frame.push(model.new_slice(lower, upper, step)?);
+            }
+            Op::BuildList(count) => {
+                let mut elems = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    elems.push(frame.pop()?);
+                }
+                elems.reverse();
+                frame.push(model.new_list(elems)?);
+            }
+            Op::BuildTuple(count) => {
+                let mut elems = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    elems.push(frame.pop()?);
+                }
+                elems.reverse();
+                frame.push(model.new_tuple(elems)?);
+            }
+            Op::BuildDict(count) => {
+                let mut pairs = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    let value = frame.pop()?;
+                    let key = frame.pop()?;
+                    pairs.push((key, value));
+                }
+                pairs.reverse();
+                frame.push(model.new_dict(pairs)?);
+            }
+            Op::Setitem => {
+                let index = frame.pop()?;
+                let container = frame.pop()?;
+                let value = frame.pop()?;
+                model.py_setitem(container, index, value)?;
+            }
+            Op::Contains { negate } => {
+                let container = frame.pop()?;
+                let element = frame.pop()?;
+                let result = model.py_contains(container, element)? ^ negate;
+                frame.push(Value::from_bool(result));
+            }
+            Op::GetIter => {
+                let iterable = frame.pop()?;
+                let iterator = iterator_for(iterable, functions, model, depth + 1)?;
+                frame.push(iterator);
+            }
+            Op::ForIter(target) => {
+                let iterator = frame.pop()?;
+                match model.py_next(iterator)? {
+                    Some(value) => frame.push(value),
+                    None => ip = target as usize,
+                }
             }
             Op::PopTop => {
                 frame.pop()?;
@@ -339,20 +498,133 @@ fn exec(
                 }
                 call_args.reverse();
                 let callee = frame.pop()?;
-                let result = if let Some(index) = callee.as_function_index() {
-                    let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-                    exec(callee_code, functions, &call_args, model, depth + 1)?
-                } else if let Some(id) = callee.as_builtin_id() {
-                    crate::builtins::call_builtin(id, &call_args, model)?
-                } else if model.is_bound_method(callee) {
-                    model.call_bound_method(callee, &call_args)?
-                } else {
-                    return Err(Trap::TypeError);
-                };
+                let result = call_value(callee, &call_args, functions, model, depth + 1)?;
                 frame.push(result);
             }
-            Op::Return => {
-                return frame.pop();
+            Op::Return => return Ok(Flow::Return(frame.pop()?)),
+            Op::Raise(argc) => {
+                let exception = if argc == 2 {
+                    let _cause = frame.pop()?;
+                    let value = frame.pop()?;
+                    model.raise_value(value)?
+                } else if argc == 1 {
+                    let value = frame.pop()?;
+                    model.raise_value(value)?
+                } else {
+                    match active_exception {
+                        Some(active) => active,
+                        None => {
+                            let class =
+                                model.exception_class("RuntimeError").ok_or(Trap::Malformed)?;
+                            model.new_object(class)?
+                        }
+                    }
+                };
+                model.set_pending_exception(exception);
+                return Err(Trap::Raised);
+            }
+            Op::MatchExc => {
+                let exc_type = frame.pop()?;
+                let active = active_exception.ok_or(Trap::Malformed)?;
+                frame.push(Value::from_bool(model.exception_isinstance(active, exc_type)));
+            }
+            Op::LoadExc => {
+                let active = active_exception.ok_or(Trap::Malformed)?;
+                frame.push(active);
+            }
+            Op::PopExcept => {
+                active_exception = None;
+            }
+            Op::Reraise => {
+                let active = active_exception.ok_or(Trap::Malformed)?;
+                model.set_pending_exception(active);
+                return Err(Trap::Raised);
+            }
+            Op::MakeFunction(name_idx) => {
+                let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                let index = functions
+                    .iter()
+                    .position(|f| f.name == *name)
+                    .ok_or(Trap::NameError)?;
+                frame.push(Value::function_ref(index as u32));
+            }
+            Op::BuildClass => {
+                let namespace = frame.pop()?;
+                let base = frame.pop()?;
+                let name = frame.pop()?;
+                frame.push(model.new_class(name, base, namespace)?);
+            }
+            Op::SetAttr { name, cache: _ } => {
+                let object = frame.pop()?;
+                let value = frame.pop()?;
+                if !model.is_instance(object) {
+                    return Err(Trap::AttributeError);
+                }
+                let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
+                model.py_setattr_instance(object, attr, value)?;
+            }
+            Op::DeleteFast(idx) => {
+                frame.store_local(idx as usize, Value::UNBOUND)?;
+            }
+            Op::UnpackSequence(count) => {
+                let value = frame.pop()?;
+                let elements = model.unpack_sequence(value, count as usize)?;
+                for &element in elements.iter().rev() {
+                    frame.push(element);
+                }
+            }
+            Op::ListAppend => {
+                let value = frame.pop()?;
+                let list = frame.pop()?;
+                model.list_append(list, value)?;
+            }
+            Op::SetAdd => {
+                let value = frame.pop()?;
+                let set = frame.pop()?;
+                model.set_add(set, value)?;
+            }
+            Op::DictInsert => {
+                let value = frame.pop()?;
+                let key = frame.pop()?;
+                let dict = frame.pop()?;
+                model.py_setitem(dict, key, value)?;
+            }
+            Op::LoadSuper(name_idx) => {
+                let class_name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                let class = model.get_global(class_name).ok_or(Trap::NameError)?;
+                let self_value = frame.load_local(0)?;
+                frame.push(model.new_super(class, self_value)?);
+            }
+            Op::BuildSet(count) => {
+                let mut elements = Vec::with_capacity(count as usize);
+                for _ in 0..count {
+                    elements.push(frame.pop()?);
+                }
+                elements.reverse();
+                frame.push(model.new_set(elements)?);
+            }
+            }
+            Ok(Flow::Next)
+        })();
+        match flow {
+            Ok(Flow::Next) => {}
+            Ok(Flow::Return(value)) => return Ok(value),
+            Err(trap) => {
+                let exception = match model.take_pending_exception() {
+                    Some(exception) => exception,
+                    None => match model.trap_to_exception(trap) {
+                        Some(exception) => exception,
+                        None => return Err(trap),
+                    },
+                };
+                if let Some(entry) = find_handler(&code.exc_table, faulting_ip) {
+                    frame.stack.truncate(entry.depth as usize);
+                    active_exception = Some(exception);
+                    ip = entry.target as usize;
+                } else {
+                    model.set_pending_exception(exception);
+                    return Err(trap);
+                }
             }
         }
     }
@@ -395,6 +667,7 @@ mod tests {
             names,
             ops,
             cache_count,
+            exc_table: Vec::new(),
         }
     }
 
@@ -476,6 +749,163 @@ mod tests {
         );
         let mut model = no_objects();
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Overflow));
+    }
+
+    #[test]
+    fn try_except_catches_a_raised_exception() {
+        use Op::*;
+        let mut code = code(
+            0,
+            0,
+            vec![Const::Int(99)],
+            vec![String::from("IndexError")],
+            0,
+            vec![LoadGlobal(0), Raise(1), PopExcept, LoadConst(0), Return],
+        );
+        code.exc_table = vec![ExcEntry {
+            start: 0,
+            end: 2,
+            target: 2,
+            depth: 0,
+        }];
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let result = run(&code, &[], &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(99));
+    }
+
+    #[test]
+    fn uncaught_exception_escapes_with_its_type() {
+        use Op::*;
+        let code = code(
+            0,
+            0,
+            Vec::new(),
+            vec![String::from("ValueError")],
+            0,
+            vec![LoadGlobal(0), Raise(1)],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        let exc = model.take_pending_exception().unwrap();
+        assert_eq!(model.exception_type_name(exc), Some("ValueError"));
+    }
+
+    #[test]
+    fn unpack_sequence_assigns_in_order() {
+        use Op::*;
+        let code = code(
+            2,
+            0,
+            vec![Const::Int(10), Const::Int(20)],
+            Vec::new(),
+            0,
+            vec![
+                LoadConst(0),
+                LoadConst(1),
+                BuildTuple(2),
+                UnpackSequence(2),
+                StoreFast(0),
+                StoreFast(1),
+                LoadFast(0),
+                LoadFast(1),
+                Binary(BinOp::Sub),
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model).unwrap().as_fixnum(), Some(-10));
+    }
+
+    #[test]
+    fn unpack_sequence_length_mismatch_is_value_error() {
+        use Op::*;
+        let code = code(
+            2,
+            0,
+            vec![Const::Int(1), Const::Int(2), Const::Int(3)],
+            Vec::new(),
+            0,
+            vec![
+                LoadConst(0),
+                LoadConst(1),
+                LoadConst(2),
+                BuildTuple(3),
+                UnpackSequence(2),
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::ValueError));
+    }
+
+    #[test]
+    fn list_comprehension_ops() {
+        use Op::*;
+        let code = code(
+            3,
+            0,
+            vec![Const::Int(1), Const::Int(2), Const::Int(3), Const::Int(2)],
+            Vec::new(),
+            0,
+            vec![
+                BuildList(0), StoreFast(0),
+                LoadConst(0), LoadConst(1), LoadConst(2), BuildList(3), GetIter, StoreFast(2),
+                LoadFast(2), ForIter(17), StoreFast(1),
+                LoadFast(0), LoadFast(1), LoadConst(3), Binary(BinOp::Mul), ListAppend,
+                Jump(8),
+                LoadFast(0), Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let result = run(&code, &[], &[], &mut model).unwrap();
+        assert_eq!(model.repr(result), "[2, 4, 6]");
+    }
+
+    #[test]
+    fn set_comprehension_ops() {
+        use Op::*;
+        let code = code(
+            3,
+            0,
+            vec![Const::Int(1), Const::Int(2), Const::Int(3)],
+            Vec::new(),
+            0,
+            vec![
+                BuildSet(0), StoreFast(0),
+                LoadConst(0), LoadConst(0), LoadConst(1), LoadConst(2), LoadConst(2), BuildList(5),
+                GetIter, StoreFast(2),
+                LoadFast(2), ForIter(17), StoreFast(1),
+                LoadFast(0), LoadFast(1), SetAdd,
+                Jump(10),
+                LoadFast(0), Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let result = run(&code, &[], &[], &mut model).unwrap();
+        assert_eq!(model.repr(result), "{1, 2, 3}");
+    }
+
+    #[test]
+    fn dict_comprehension_ops() {
+        use Op::*;
+        let code = code(
+            3,
+            0,
+            vec![Const::Int(1), Const::Int(2), Const::Int(3)],
+            Vec::new(),
+            0,
+            vec![
+                BuildDict(0), StoreFast(0),
+                LoadConst(0), LoadConst(1), LoadConst(2), BuildList(3), GetIter, StoreFast(2),
+                LoadFast(2), ForIter(18), StoreFast(1),
+                LoadFast(0), LoadFast(1), LoadFast(1), LoadFast(1), Binary(BinOp::Mul), DictInsert,
+                Jump(8),
+                LoadFast(0), Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let result = run(&code, &[], &[], &mut model).unwrap();
+        assert_eq!(model.repr(result), "{1: 1, 2: 4, 3: 9}");
     }
 
     #[test]
@@ -632,13 +1062,22 @@ mod tests {
         let r = run(&fact, core::slice::from_ref(&fact), &[Value::fixnum(5).unwrap()], &mut model).unwrap();
         assert_eq!(r.as_fixnum(), Some(120));
 
-        let mut loop_fn = code(0, 0, Vec::new(), vec![String::from("loop_fn")], 0,
-            vec![LoadGlobal(0), Call(0), Return]);
-        loop_fn.name = String::from("loop_fn");
-        assert_eq!(
-            run(&loop_fn, core::slice::from_ref(&loop_fn), &[], &mut model),
-            Err(Trap::RecursionError)
-        );
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                use Op::*;
+                let mut model = no_objects();
+                let mut loop_fn = code(0, 0, Vec::new(), vec![String::from("loop_fn")], 0,
+                    vec![LoadGlobal(0), Call(0), Return]);
+                loop_fn.name = String::from("loop_fn");
+                assert_eq!(
+                    run(&loop_fn, core::slice::from_ref(&loop_fn), &[], &mut model),
+                    Err(Trap::RecursionError)
+                );
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]

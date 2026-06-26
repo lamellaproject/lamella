@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Threading.Monitor
+#if LAMELLA_SURFACE_THREADS
 namespace System.Threading
 {
     public static class Monitor
@@ -29,3 +30,4 @@ namespace System.Threading
         [Lamella.Runtime.RuntimeProvided] private static void PulseAllLock(object obj) { }
     }
 }
+#endif

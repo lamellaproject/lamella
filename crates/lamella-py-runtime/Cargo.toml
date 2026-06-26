@@ -14,6 +14,9 @@ lamella-gc = { path = "../lamella-gc" }
 # The shared bytecode contract (single source of truth): the interpreter executes
 # what the front end emits, so both depend on this one definition of the bytecode.
 lamella-py-bytecode = { path = "../lamella-py-bytecode" }
+# The shared Unicode Character Database properties: str predicates (isalpha/isspace/...)
+# classify code points exactly as CPython, from one tree-shakeable table.
+lamella-unicode = { path = "../lamella-unicode" }
 
 [dev-dependencies]
 # The front end (lexer/parser/compiler), used ONLY by the `interp-run` example to turn

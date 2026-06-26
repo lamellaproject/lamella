@@ -1111,6 +1111,22 @@ pub enum Literal {
     Boolean(bool),
     /// The null literal.
     Null,
+    /// A `decimal` (`m`-suffixed) literal, stored EXACTLY as its 96-bit integer mantissa
+    /// (`lo`/`mid`/`hi`, value = mantissa x 10^-`scale`), since `f64` cannot represent every
+    /// decimal (e.g. `0.1m`) and the scale (`0.10m` vs `0.1m`) must be preserved. `negative` is
+    /// set only by folding a unary minus on a literal (`-2.5m`); a bare literal is non-negative.
+    Decimal {
+        /// Bits 0..32 of the 96-bit mantissa.
+        lo: u32,
+        /// Bits 32..64 of the mantissa.
+        mid: u32,
+        /// Bits 64..96 of the mantissa.
+        hi: u32,
+        /// The power-of-ten scale (0..=28).
+        scale: u8,
+        /// Whether the value is negated (from folding `-<literal>`).
+        negative: bool,
+    },
 }
 
 /// A prefix unary operator (14.6).

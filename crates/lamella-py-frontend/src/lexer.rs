@@ -5,15 +5,28 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// One piece of an f-string: literal text (escapes already resolved), or the raw source
+/// of a `{expression}` replacement field (the parser re-parses it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FStringPart {
+    /// Literal text between replacement fields.
+    Literal(String),
+    /// The raw source text of a `{expression}` replacement field.
+    Expr(String),
+}
+
 /// A lexical token kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tok {
     /// A decimal integer literal.
     Int(i64),
     /// A short string literal -- its decoded value, with escape sequences resolved.
-    /// Single-line `'...'` and `"..."` are handled; triple-quoted and prefixed
-    /// (`r`/`b`/`f`) strings are outside this subset.
+    /// Single-line `'...'` and `"..."` are handled; triple-quoted and `r`/`b`-prefixed
+    /// strings are outside this subset.
     Str(String),
+    /// A single-line f-string `f"..."` split into literal text and raw replacement-field
+    /// expressions; the parser re-parses the fields and desugars to `str()` + concatenation.
+    FString(Vec<FStringPart>),
     /// An identifier that is not a keyword.
     Name(String),
     /// A reserved keyword that exists in Python but is outside this subset
@@ -50,6 +63,18 @@ pub enum Tok {
     KwFor,
     /// `in`
     KwIn,
+    /// `try`
+    KwTry,
+    /// `except`
+    KwExcept,
+    /// `finally`
+    KwFinally,
+    /// `raise`
+    KwRaise,
+    /// `as`
+    KwAs,
+    /// `class`
+    KwClass,
     /// `break`
     KwBreak,
     /// `continue`
@@ -131,6 +156,10 @@ pub enum Tok {
     LBracket,
     /// `]`
     RBracket,
+    /// `{`
+    LBrace,
+    /// `}`
+    RBrace,
 
     /// The end of a logical line.
     Newline,
@@ -360,6 +389,8 @@ impl Lexer {
         let c = self.peek().expect("lex_token called at end of input");
         if c.is_ascii_digit() {
             self.lex_number()
+        } else if (c == 'f' || c == 'F') && matches!(self.peek2(), Some('\'' | '"')) {
+            self.lex_fstring()
         } else if c == '_' || c.is_ascii_alphabetic() {
             self.lex_name();
             Ok(())
@@ -520,6 +551,94 @@ impl Lexer {
         Ok(())
     }
 
+    /// Lex a single-line f-string `f"..."` / `f'...'` (the `f`/`F` not yet consumed):
+    /// literal text (escapes resolved, `{{`/`}}` -> `{`/`}`) interspersed with `{expr}`
+    /// replacement fields whose raw source is captured for the parser. Format specs,
+    /// conversions, `=`-debug, and raw/triple-quoted f-strings are out of subset.
+    fn lex_fstring(&mut self) -> Result<(), LexError> {
+        self.pos += 1;
+        let quote = self.peek().expect("lex_fstring called at a quote");
+        self.pos += 1;
+        let mut parts = Vec::new();
+        let mut literal = String::new();
+        loop {
+            match self.peek() {
+                None | Some('\n') | Some('\r') => return Err(self.err("unterminated f-string")),
+                Some(c) if c == quote => {
+                    self.pos += 1;
+                    if !literal.is_empty() {
+                        parts.push(FStringPart::Literal(literal));
+                    }
+                    self.push(Tok::FString(parts));
+                    return Ok(());
+                }
+                Some('{') if self.peek2() == Some('{') => {
+                    literal.push('{');
+                    self.pos += 2;
+                }
+                Some('}') if self.peek2() == Some('}') => {
+                    literal.push('}');
+                    self.pos += 2;
+                }
+                Some('{') => {
+                    if !literal.is_empty() {
+                        parts.push(FStringPart::Literal(core::mem::take(&mut literal)));
+                    }
+                    self.pos += 1;
+                    let raw = self.scan_fstring_expr(quote)?;
+                    parts.push(FStringPart::Expr(raw));
+                }
+                Some('}') => {
+                    return Err(self.err("single '}' in an f-string (double it as '}}' for a literal)"));
+                }
+                Some('\\') => {
+                    self.pos += 1;
+                    self.lex_string_escape(&mut literal)?;
+                }
+                Some(c) => {
+                    literal.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// Capture the raw source of a replacement field, from just after `{` to the matching
+    /// `}` (tracking `()`/`[]`/`{}` nesting). First light does not handle a `}` inside a
+    /// string within the field.
+    fn scan_fstring_expr(&mut self, quote: char) -> Result<String, LexError> {
+        let mut raw = String::new();
+        let mut depth = 0i32;
+        loop {
+            match self.peek() {
+                None | Some('\n') | Some('\r') => {
+                    return Err(self.err("unterminated f-string expression"));
+                }
+                Some(c) if c == quote && depth == 0 => {
+                    return Err(self.err("f-string expression runs into the closing quote"));
+                }
+                Some('}') if depth == 0 => {
+                    self.pos += 1;
+                    return Ok(raw);
+                }
+                Some(c @ ('(' | '[' | '{')) => {
+                    depth += 1;
+                    raw.push(c);
+                    self.pos += 1;
+                }
+                Some(c @ (')' | ']' | '}')) => {
+                    depth -= 1;
+                    raw.push(c);
+                    self.pos += 1;
+                }
+                Some(c) => {
+                    raw.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
     /// Lex an integer literal per the Language Reference (2.4.4): a decimal digit run
     /// (no leading zeros on a non-zero value), or a base-prefixed `0x`/`0o`/`0b`
     /// literal. In every base, `_` separators are permitted only between digits (or
@@ -640,9 +759,14 @@ impl Lexer {
             "True" => Tok::KwTrue,
             "False" => Tok::KwFalse,
             "None" => Tok::KwNone,
-            "as" | "assert" | "async" | "await" | "class" | "del" | "except" | "finally"
-            | "from" | "global" | "import" | "is" | "lambda" | "nonlocal" | "raise"
-            | "try" | "with" | "yield" => Tok::Reserved(name),
+            "try" => Tok::KwTry,
+            "except" => Tok::KwExcept,
+            "finally" => Tok::KwFinally,
+            "raise" => Tok::KwRaise,
+            "as" => Tok::KwAs,
+            "class" => Tok::KwClass,
+            "assert" | "async" | "await" | "del" | "from" | "global" | "import" | "is"
+            | "lambda" | "nonlocal" | "with" | "yield" => Tok::Reserved(name),
             _ => Tok::Name(name),
         };
         self.push(kind);
@@ -694,12 +818,14 @@ impl Lexer {
             ')' => (Tok::RParen, 1),
             '[' => (Tok::LBracket, 1),
             ']' => (Tok::RBracket, 1),
+            '{' => (Tok::LBrace, 1),
+            '}' => (Tok::RBrace, 1),
             other => return Err(self.err(format!("unexpected character {other:?}"))),
         };
         self.pos += width;
-        if matches!(kind, Tok::LParen | Tok::LBracket) {
+        if matches!(kind, Tok::LParen | Tok::LBracket | Tok::LBrace) {
             self.bracket_depth += 1;
-        } else if matches!(kind, Tok::RParen | Tok::RBracket) {
+        } else if matches!(kind, Tok::RParen | Tok::RBracket | Tok::RBrace) {
             self.bracket_depth = self.bracket_depth.saturating_sub(1);
         }
         self.push(kind);
@@ -927,11 +1053,11 @@ mod tests {
     #[test]
     fn out_of_subset_keywords_are_reserved_not_names() {
         assert_eq!(
-            kinds("lambda x class\n"),
+            kinds("lambda x import\n"),
             vec![
                 Tok::Reserved("lambda".into()),
                 Tok::Name("x".into()),
-                Tok::Reserved("class".into()),
+                Tok::Reserved("import".into()),
                 Tok::Newline,
                 Tok::Eof,
             ]

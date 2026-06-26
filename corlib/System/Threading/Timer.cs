@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Threading.Timer
+#if LAMELLA_SURFACE_THREADS
 namespace System.Threading
 {
     public sealed class Timer : IDisposable
@@ -61,3 +62,4 @@ namespace System.Threading
         }
     }
 }
+#endif

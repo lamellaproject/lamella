@@ -299,12 +299,20 @@ fn emit_array_creation(
             ));
         }
         out.push(Instruction::new(Opcode::Newarr, Operand::Token(element_token)));
-        let store = stelem_opcode(element)?;
+        let by_address = tokens.is_struct(element)
+            || tokens.is_enum(element)
+            || matches!(&**element, TypeSymbol::Special(SpecialType::Decimal));
         for (index, value) in elements.iter().enumerate() {
             out.push(Instruction::simple(Opcode::Dup));
             out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(index as i32)));
-            emit_expression(value, frame, tokens, out)?;
-            out.push(Instruction::simple(store));
+            if by_address {
+                out.push(Instruction::new(Opcode::Ldelema, Operand::Token(element_token)));
+                emit_expression(value, frame, tokens, out)?;
+                out.push(Instruction::new(Opcode::Stobj, Operand::Token(element_token)));
+            } else {
+                emit_expression(value, frame, tokens, out)?;
+                out.push(Instruction::simple(stelem_opcode(element)?));
+            }
         }
         return Ok(());
     }
@@ -371,7 +379,10 @@ fn emit_element_load(
         out.push(Instruction::new(Opcode::Callvirt, Operand::Token(token)));
         return Ok(());
     }
-    if tokens.is_struct(element_ty) || tokens.is_enum(element_ty) {
+    if tokens.is_struct(element_ty)
+        || tokens.is_enum(element_ty)
+        || matches!(element_ty, TypeSymbol::Special(SpecialType::Decimal))
+    {
         let token = tokens
             .type_token(element_ty)
             .ok_or(EmitError::Unsupported("array element type has no token"))?;
@@ -423,7 +434,10 @@ pub(crate) fn emit_element_store(
     }
     emit_expression(receiver, frame, tokens, out)?;
     emit_expression(&indices[0], frame, tokens, out)?;
-    if tokens.is_struct(element_ty) || tokens.is_enum(element_ty) {
+    if tokens.is_struct(element_ty)
+        || tokens.is_enum(element_ty)
+        || matches!(element_ty, TypeSymbol::Special(SpecialType::Decimal))
+    {
         let token = tokens
             .type_token(element_ty)
             .ok_or(EmitError::Unsupported("array element type has no token"))?;
@@ -612,7 +626,14 @@ fn emit_call(
         }
     }
     let token = tokens
-        .method(&method.declaring_type, &method.name, &method.parameters)
+        .method(
+            &method.declaring_type,
+            &crate::tokens::conversion_key_name(&method.name, &method.return_type),
+            &method.parameters,
+        )
+        .or_else(|| {
+            tokens.method(&method.declaring_type, &method.name, &method.parameters)
+        })
         .ok_or(EmitError::Unsupported(
             "call to a method outside this module",
         ))?;
@@ -856,7 +877,7 @@ pub(crate) fn is_value_type(ty: &TypeSymbol, tokens: &Tokens) -> bool {
     match ty {
         TypeSymbol::Special(special) => !matches!(
             special,
-            SpecialType::Object | SpecialType::String | SpecialType::Void
+            SpecialType::Object | SpecialType::String | SpecialType::Void | SpecialType::Null
         ),
         _ => tokens.is_struct(ty) || tokens.is_enum(ty),
     }
@@ -917,7 +938,7 @@ fn emit_conversion(
 }
 
 /// The `conv.*` opcode that produces a value of the numeric `target` type.
-fn numeric_conversion(target: &TypeSymbol) -> Result<Opcode, EmitError> {
+pub(crate) fn numeric_conversion(target: &TypeSymbol) -> Result<Opcode, EmitError> {
     let TypeSymbol::Special(special) = target else {
         return Err(EmitError::Unsupported(
             "numeric conversion to a non-primitive",
@@ -1002,18 +1023,29 @@ pub(crate) fn emit_value_type_receiver(
             field: Some(field),
             ..
         } if field.constant.is_none() => {
-            if tokens.is_struct(&container.ty) {
-                emit_value_type_receiver(container, frame, tokens, out)?;
-            } else {
-                emit_expression(container, frame, tokens, out)?;
-            }
             let token =
                 tokens
                     .field(&field.declaring_type, &field.name)
                     .ok_or(EmitError::Unsupported(
                         "address of a field outside this module",
                     ))?;
-            out.push(Instruction::new(Opcode::Ldflda, Operand::Token(token)));
+            if field.is_static {
+                if field.is_readonly {
+                    out.push(Instruction::new(Opcode::Ldsfld, Operand::Token(token)));
+                    let slot = frame.reserve_local(&receiver.ty);
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+                    out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
+                } else {
+                    out.push(Instruction::new(Opcode::Ldsflda, Operand::Token(token)));
+                }
+            } else {
+                if tokens.is_struct(&container.ty) {
+                    emit_value_type_receiver(container, frame, tokens, out)?;
+                } else {
+                    emit_expression(container, frame, tokens, out)?;
+                }
+                out.push(Instruction::new(Opcode::Ldflda, Operand::Token(token)));
+            }
             Ok(())
         }
         BoundExprKind::This | BoundExprKind::Base => {
@@ -1253,10 +1285,35 @@ fn emit_literal(
                 }
                 _ => {
                     return Err(EmitError::Unsupported(
-                        "decimal literals are not lowered yet",
+                        "a real literal of a non-float type",
                     ));
                 }
             }
+        }
+        Literal::Decimal {
+            lo,
+            mid,
+            hi,
+            scale,
+            negative,
+        } => {
+            let decimal_ty = TypeSymbol::Special(SpecialType::Decimal);
+            let ctor_params = [
+                TypeSymbol::Special(SpecialType::Int32),
+                TypeSymbol::Special(SpecialType::Int32),
+                TypeSymbol::Special(SpecialType::Int32),
+                TypeSymbol::Special(SpecialType::Boolean),
+                TypeSymbol::Special(SpecialType::Byte),
+            ];
+            let token = tokens.method(&decimal_ty, ".ctor", &ctor_params).ok_or(
+                EmitError::Unsupported("the System.Decimal constructor was not minted"),
+            )?;
+            out.push(load_i4(*lo as i32));
+            out.push(load_i4(*mid as i32));
+            out.push(load_i4(*hi as i32));
+            out.push(load_i4(i32::from(*negative)));
+            out.push(load_i4(i32::from(*scale)));
+            out.push(Instruction::new(Opcode::Newobj, Operand::Token(token)));
         }
     }
     Ok(())

@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Decimal
+#if LAMELLA_SURFACE_DECIMAL
 namespace System
 {
     public struct Decimal : IComparable, IFormattable
@@ -337,3 +338,4 @@ namespace System
         }
     }
 }
+#endif

@@ -334,6 +334,27 @@ pub enum Inst {
         /// The argument values, in order (placed in the C ABI's argument registers).
         args: Vec<ValueId>,
     },
+    /// A P/Invoke call to an unmanaged `[DllImport]` function -- the CIL `call` of an external method.
+    /// Carries the import symbol name; a pre-pass interns it into the module's extern table and rewrites
+    /// this to a [`Inst::CallNative`] (the same C-ABI boundary the own-linker resolves). Blittable
+    /// arguments pass directly; non-blittable marshaling (strings, by-ref, structs) layers on later.
+    PInvoke {
+        /// The unmanaged import symbol (the `DllImport` entry point name).
+        import: Box<str>,
+        /// The argument values, in order (the C ABI's argument registers).
+        args: Vec<ValueId>,
+    },
+    /// Invokes a single-cast delegate -- the CIL `Delegate::Invoke`. Loads the delegate's `_methodPtr`
+    /// (offset 4) and calls it indirectly, passing the delegate's `_target` (offset 0) as the implicit
+    /// first argument WHEN it is non-null (an instance-method delegate) and omitting it when null (a
+    /// static-method delegate); the dispatch branches on `_target` at run time. A safepoint; the result
+    /// is the call's return value. (Multicast -- iterating an invocation list -- layers on top later.)
+    InvokeDelegate {
+        /// The delegate object (`_target` at offset 0, `_methodPtr` at offset 4).
+        delegate: ValueId,
+        /// The explicit arguments (Invoke's signature params), in order.
+        args: Vec<ValueId>,
+    },
     /// A `castclass` base-pointer chain scan: walks `args[0]` (the object's TypeDesc address) up the
     /// base_ptr@12 chain looking for `args[1]` (the target type's TypeDesc address). The result is 1 if
     /// the target is found (the cast holds) or 0 if the chain ends first; the front end feeds it into the
@@ -520,6 +541,16 @@ pub enum Inst {
     TypeDescAddr {
         /// The type whose TypeDesc address this is.
         handle: TypeHandle,
+    },
+    /// The address of a TypeDesc whose words are given INLINE -- the object path's `Alloc` descriptor,
+    /// where the per-module descriptor table the flat path threads is not available. The backend emits
+    /// the words in a data pool and `adr`s their address (position-independent, no relocation). The
+    /// words are the GC ABI header + trace map: `[payload_size, nrefs, type_tag, base_ptr,
+    /// ref_offsets...]` (`type_tag`/`base_ptr` are `0` placeholders until the dispatch metadata is
+    /// threaded in). Result is that address (an `i32`).
+    TypeDescLiteral {
+        /// The descriptor words, in GC-ABI order.
+        words: Box<[u32]>,
     },
     /// Allocates a garbage-collected array of `length` elements of `element_size` bytes -- the
     /// CLI's `newarr`. The payload is `[u32 length][elements...]`; the result is an `ObjectRef`

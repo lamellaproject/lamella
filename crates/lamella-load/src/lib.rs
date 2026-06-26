@@ -40,7 +40,10 @@ use lamella_cil_runtime::intrinsics::{
     monitor_try_enter, monitor_wait, monitor_pulse, monitor_pulse_all,
     socket_connect_start, socket_connect_poll, socket_listen, socket_accept,
     socket_send, socket_recv, socket_local_port, socket_close,
-    socket_udp_bind, socket_udp_send_to, socket_udp_recv_from,
+    socket_udp_bind, socket_udp_send_to, socket_udp_recv_from, dns_resolve_host,
+    tls_client_config, tls_server_config, tls_client_new, tls_server_new, tls_process,
+    tls_wants_write, tls_write_tls, tls_read_tls, tls_read_plain, tls_write_plain, tls_peer_cert,
+    tls_close, tls_default_stack,
 };
 #[cfg(feature = "gc")]
 use lamella_cil_runtime::intrinsics::{gc_collect, weak_make_cell, weak_read_cell, weak_write_cell};
@@ -916,7 +919,11 @@ fn load_assembly(
                         {
                             static_field_ref_tokens.insert(*operand);
                         }
-                        Opcode::Ldtoken | Opcode::Constrained | Opcode::Box | Opcode::Initobj
+                        Opcode::Ldtoken
+                        | Opcode::Constrained
+                        | Opcode::Box
+                        | Opcode::Initobj
+                        | Opcode::Mkrefany
                             if matches!(operand.table(), TYPE_DEF | TYPE_REF | TYPE_SPEC) =>
                         {
                             ldtoken_type_tokens.insert(*operand);
@@ -1460,6 +1467,30 @@ fn bcl_intrinsic(
             "UdpBind" => return Some(socket_udp_bind),
             "UdpSendTo" => return Some(socket_udp_send_to),
             "UdpReceiveFrom" => return Some(socket_udp_recv_from),
+            _ => {}
+        }
+    }
+    if namespace == "System.Net" && type_name == "Dns" {
+        match method {
+            "ResolveHost" => return Some(dns_resolve_host),
+            _ => {}
+        }
+    }
+    if namespace == "System.Net.Security" && type_name == "TlsNative" {
+        match method {
+            "ClientConfig" => return Some(tls_client_config),
+            "ServerConfig" => return Some(tls_server_config),
+            "ClientNew" => return Some(tls_client_new),
+            "ServerNew" => return Some(tls_server_new),
+            "Process" => return Some(tls_process),
+            "WantsWrite" => return Some(tls_wants_write),
+            "WriteTls" => return Some(tls_write_tls),
+            "ReadTls" => return Some(tls_read_tls),
+            "ReadPlain" => return Some(tls_read_plain),
+            "WritePlain" => return Some(tls_write_plain),
+            "PeerCert" => return Some(tls_peer_cert),
+            "CloseTls" => return Some(tls_close),
+            "DefaultStack" => return Some(tls_default_stack),
             _ => {}
         }
     }

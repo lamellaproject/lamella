@@ -1,4 +1,5 @@
 // Lamella managed corlib (from scratch). -- System.Net.Sockets.Socket
+#if LAMELLA_SURFACE_NET
 namespace System.Net.Sockets
 {
     public class Socket
@@ -144,3 +145,4 @@ namespace System.Net.Sockets
         [Lamella.Runtime.RuntimeProvided] private static int UdpReceiveFrom(int handle, byte[] buffer, int offset, int count, byte[] senderAddr, int[] senderMeta) { return 0; }
     }
 }
+#endif

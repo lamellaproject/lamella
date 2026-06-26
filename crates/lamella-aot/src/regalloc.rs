@@ -78,13 +78,11 @@ impl Liveness {
             let mut live = self.live_out[b].clone();
             each_terminator_use(&block.terminator, |u| set(&mut live, u));
             for (result, inst) in block.insts.iter().rev() {
-                if matches!(
-                    inst,
-                    Inst::Call { .. } | Inst::CallVirtual { .. } | Inst::CallInterface { .. }
-                ) && live
-                    .iter()
-                    .enumerate()
-                    .any(|(v, &alive)| alive && v != result.index())
+                if is_safepoint(inst)
+                    && live
+                        .iter()
+                        .enumerate()
+                        .any(|(v, &alive)| alive && v != result.index())
                 {
                     return true;
                 }
@@ -162,6 +160,7 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 | Inst::CallInterface { args, .. }
                 | Inst::CastClassScan { args, .. }
                 | Inst::CallNative { args, .. }
+                | Inst::PInvoke { args, .. }
                 | Inst::PyIntrinsic { args, .. } => {
                     for arg in args {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
@@ -169,6 +168,12 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 }
                 Inst::CallIndirect { target, args } => {
                     mark(&mut lo, &mut hi, &mut defined, *target, ip);
+                    for arg in args {
+                        mark(&mut lo, &mut hi, &mut defined, *arg, ip);
+                    }
+                }
+                Inst::InvokeDelegate { delegate, args } => {
+                    mark(&mut lo, &mut hi, &mut defined, *delegate, ip);
                     for arg in args {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
@@ -215,6 +220,7 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *object, ip);
                 }
                 Inst::TypeDescAddr { .. } => {}
+                Inst::TypeDescLiteral { .. } => {}
                 Inst::CopyStruct { src } => {
                     mark(&mut lo, &mut hi, &mut defined, *src, ip);
                 }
@@ -420,6 +426,28 @@ pub fn allocate(intervals: &[Interval], reg_count: usize) -> Allocation {
 /// result is excluded: at the return it is in the result register, not yet a frame slot, and
 /// it was not a pre-existing root during any collection inside the call. Every call is treated
 /// as a safepoint (conservatively may-allocate), so the stack walk finds caller-frame roots.
+/// Whether an instruction is a SAFEPOINT -- a call or allocation that clobbers caller-saved registers
+/// and at which the collector may run. The spilling decision (`any_value_live_across_call` + the
+/// `has_calls` gate), the stack-map root set (`safepoint_roots`), and the live-across check MUST agree
+/// on this set: a value live across any of these has to be a stack-slot root, so naming it only here
+/// keeps the three from diverging (an object-path `Alloc`/P/Invoke lowers to `CallNative`, so omitting
+/// `CallNative` once silently left such roots in registers the stack map cannot describe).
+pub(crate) fn is_safepoint(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::Call { .. }
+            | Inst::CallVirtual { .. }
+            | Inst::CallInterface { .. }
+            | Inst::CallIndirect { .. }
+            | Inst::CallNative { .. }
+            | Inst::InvokeDelegate { .. }
+            | Inst::Alloc { .. }
+            | Inst::AllocArray { .. }
+            | Inst::AllocArray2D { .. }
+            | Inst::PyIntrinsic { .. }
+    )
+}
+
 pub(crate) fn safepoint_roots(
     func: &Function,
     value_types: &[MirType],
@@ -439,21 +467,20 @@ pub(crate) fn safepoint_roots(
             each_terminator_use(&block.terminator, |u| set(&mut alive, u));
             let mut per_inst: Vec<Option<Vec<ValueId>>> = vec![None; block.insts.len()];
             for (i, (result, inst)) in block.insts.iter().enumerate().rev() {
-                if matches!(
-                    inst,
-                    Inst::Call { .. }
-                        | Inst::CallVirtual { .. }
-                        | Inst::CallInterface { .. }
-                        | Inst::Alloc { .. }
-                        | Inst::AllocArray { .. }
-                        | Inst::PyIntrinsic { .. }
-                ) {
-                    let roots = alive
+                if is_safepoint(inst) {
+                    let mut roots: Vec<ValueId> = alive
                         .iter()
                         .enumerate()
                         .filter(|&(v, &a)| a && v != result.index() && is_root(v))
                         .map(|(v, _)| ValueId(v as u32))
                         .collect();
+                    if let Inst::InvokeDelegate { delegate, args } = inst {
+                        for v in core::iter::once(*delegate).chain(args.iter().copied()) {
+                            if is_root(v.index()) && !roots.contains(&v) {
+                                roots.push(v);
+                            }
+                        }
+                    }
                     per_inst[i] = Some(roots);
                 }
                 if let Some(slot) = alive.get_mut(result.index()) {
@@ -508,11 +535,16 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         | Inst::CallInterface { args, .. }
         | Inst::CastClassScan { args, .. }
         | Inst::CallNative { args, .. }
+        | Inst::PInvoke { args, .. }
         | Inst::PyIntrinsic { args, .. } => {
             args.iter().for_each(|a| f(*a));
         }
         Inst::CallIndirect { target, args } => {
             f(*target);
+            args.iter().for_each(|a| f(*a));
+        }
+        Inst::InvokeDelegate { delegate, args } => {
+            f(*delegate);
             args.iter().for_each(|a| f(*a));
         }
         Inst::FuncAddr { .. } => {}
@@ -543,6 +575,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::FieldAddr { base, .. } => f(*base),
         Inst::LoadTypeDesc { object } => f(*object),
         Inst::TypeDescAddr { .. } => {}
+        Inst::TypeDescLiteral { .. } => {}
         Inst::CopyStruct { src } => f(*src),
         Inst::SemihostWrite { .. } => {}
         Inst::WriteInt { value } => f(*value),

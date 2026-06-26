@@ -146,6 +146,23 @@ impl UnaryOp {
 /// dispatches and the lowering walks. The set is deliberately small and orthogonal
 /// for first light; it grows behind the version stamp as the language surface
 /// widens. Operand indices reference the owning [`CodeObject`]'s pools.
+///
+/// # Op-tag registry (single source of truth)
+///
+/// Every op's wire tag -- the leading `u8` in `encode_op` and the `decode` match -- is
+/// assigned here.
+///
+/// | tag(s) | ops | group |
+/// |-------:|-----|-------|
+/// |   0-13 | LoadConst, LoadFast, StoreFast, LoadGlobal, LoadAttr, Binary, Compare, PopTop, Jump, PopJumpIfFalse, Call, Return, Unary, Subscript | core |
+/// |  14-21 | BuildSlice, BuildList, BuildTuple, BuildDict, GetIter, ForIter, Setitem, Contains | containers + iteration |
+/// |  22-23 | (free) | |
+/// |  24-29 | Raise, MatchExc, LoadExc, PopExcept, Reraise, DeleteFast | exceptions |
+/// |  30-32 | MakeFunction, BuildClass, SetAttr | classes |
+/// |     33 | UnpackSequence | tuple-unpacking |
+/// |  34-36 | ListAppend, SetAdd, DictInsert | comprehensions |
+/// |     37 | LoadSuper | super() |
+/// |     38 | BuildSet | set literals |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -177,6 +194,77 @@ pub enum Op {
     /// omitted) and push `slice(lower, upper, step)`; the slice then feeds a `Subscript`.
     /// Used for `s[i:j]` / `s[i:j:k]`.
     BuildSlice,
+    /// Pop `count` values (pushed left to right) and push a new list of them. For a list
+    /// display `[a, b, c]`.
+    BuildList(u32),
+    /// Pop `count` values (pushed left to right) and push a new tuple. For `(a, b, c)`.
+    BuildTuple(u32),
+    /// Pop `count` key-value pairs (each pushed key then value, pairs left to right) and
+    /// push a new dict. For a dict display `{k: v, ...}`.
+    BuildDict(u32),
+    /// Pop an iterable and push an iterator over it (`iter(obj)`). For `for x in obj`.
+    GetIter,
+    /// Pop the iterator and advance it: on a value, push the value; on exhaustion, set the
+    /// instruction pointer to `target` (absolute). The loop reloads the iterator each pass
+    /// (it lives in a local), so the stack stays balanced. For `for x in obj`.
+    ForIter(u32),
+    /// Pop the index, then the container, then the value, and do `container[index] = value`
+    /// (a side-effecting store; nothing is pushed). For `c[i] = v` on a mutable container.
+    Setitem,
+    /// Pop the container, then the element, and push whether the container contains the
+    /// element. For the membership test `x in c` (`negate` flips it to `x not in c`).
+    Contains {
+        /// Whether this is `not in` (the boolean result is inverted).
+        negate: bool,
+    },
+    /// Raise an exception: `argc` 1 pops the exception value (a class is instantiated with
+    /// no arguments); `argc` 0 re-raises the active exception. For `raise`.
+    Raise(u8),
+    /// Pop a type and push whether the active exception is an instance of it -- the
+    /// `except E` type test.
+    MatchExc,
+    /// Push the active exception, to bind it in `except ... as name`.
+    LoadExc,
+    /// Clear the active-exception state once a handler has dealt with it.
+    PopExcept,
+    /// Re-raise the active exception (a handler chain ended with no matching clause).
+    Reraise,
+    /// Make local slot `slot` unbound (a `del`); a later `LoadFast` of it raises `NameError`.
+    /// Emitted for the `except ... as name` auto-deletion at the end of the handler.
+    DeleteFast(u32),
+    /// Push a function value for the Module function named `names[name]` -- a method, for a
+    /// class body.
+    MakeFunction(u32),
+    /// Pop the namespace dict, then the base, then the name, and push a new class object (a
+    /// type). For a `class` definition.
+    BuildClass,
+    /// Pop the object, then the value, and do `object.<names[name]> = value` (`cache` is the
+    /// inline-cache slot). For an attribute assignment `obj.attr = value`.
+    SetAttr {
+        /// The attribute name (index into the names pool).
+        name: u32,
+        /// The inline-cache slot.
+        cache: u32,
+    },
+    /// Pop a sequence and push its `count` elements in REVERSE, so following `StoreFast`s bind
+    /// the first element first. A length mismatch raises `ValueError`. For tuple-unpacking
+    /// (`a, b = expr` and `for a, b in iter`).
+    UnpackSequence(u32),
+    /// Pop the value, then the list, and append the value to the list (in place). For a list
+    /// comprehension.
+    ListAppend,
+    /// Pop the element, then the set, and add the element. For a set comprehension.
+    SetAdd,
+    /// Pop the value, then the key, then the dict, and insert `key -> value`. For a dict
+    /// comprehension.
+    DictInsert,
+    /// Push a super object bound to the enclosing class `names[name]` and the frame's first
+    /// local (`self`). For a no-arg `super()` in a method; a following `LoadAttr` finds the
+    /// base class's attribute bound to `self`.
+    LoadSuper(u32),
+    /// Pop `count` elements and push a new set (deduped). For a set literal `{a, b, c}`; a
+    /// set comprehension builds `BuildSet(0)` then `SetAdd`s.
+    BuildSet(u32),
     /// Pop the right operand then the left, and push `left <op> right`.
     Binary(BinOp),
     /// Pop the right operand then the left, and push the boolean `left <cmp> right`.
@@ -285,6 +373,24 @@ pub struct CodeObject {
     /// How many inline-cache slots a running frame allocates for this code: the count
     /// of cacheable sites (each [`Op::LoadAttr`]), numbered in ascending static order.
     pub cache_count: usize,
+    /// The exception table: covering `[start, end)` op ranges mapped to a handler op
+    /// index, innermost first. Empty for a function with no `try`. A raise searches it
+    /// for the tightest entry covering the faulting op; the try body itself costs nothing.
+    pub exc_table: Vec<ExcEntry>,
+}
+
+/// One entry in a [`CodeObject::exc_table`]: a protected op range and where to go when an
+/// exception is raised within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExcEntry {
+    /// First op index of the protected (try-body) range.
+    pub start: u32,
+    /// One past the last op index of the protected range (`[start, end)`).
+    pub end: u32,
+    /// The handler's op index -- where an in-range raise jumps.
+    pub target: u32,
+    /// The value-stack depth to truncate to before entering the handler.
+    pub depth: u32,
 }
 
 /// A compiled module: its top-level function definitions plus the code object for its
@@ -418,6 +524,65 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             put_u32(buf, *cache);
         }
         Op::BuildSlice => buf.push(14),
+        Op::BuildList(count) => {
+            buf.push(15);
+            put_u32(buf, *count);
+        }
+        Op::BuildTuple(count) => {
+            buf.push(16);
+            put_u32(buf, *count);
+        }
+        Op::BuildDict(count) => {
+            buf.push(17);
+            put_u32(buf, *count);
+        }
+        Op::GetIter => buf.push(18),
+        Op::ForIter(target) => {
+            buf.push(19);
+            put_u32(buf, *target);
+        }
+        Op::Setitem => buf.push(20),
+        Op::Contains { negate } => {
+            buf.push(21);
+            buf.push(*negate as u8);
+        }
+        Op::Raise(argc) => {
+            buf.push(24);
+            buf.push(*argc);
+        }
+        Op::MatchExc => buf.push(25),
+        Op::LoadExc => buf.push(26),
+        Op::PopExcept => buf.push(27),
+        Op::Reraise => buf.push(28),
+        Op::DeleteFast(slot) => {
+            buf.push(29);
+            put_u32(buf, *slot);
+        }
+        Op::MakeFunction(name) => {
+            buf.push(30);
+            put_u32(buf, *name);
+        }
+        Op::BuildClass => buf.push(31),
+        Op::SetAttr { name, cache } => {
+            buf.push(32);
+            put_u32(buf, *name);
+            put_u32(buf, *cache);
+        }
+        Op::UnpackSequence(count) => {
+            buf.push(33);
+            put_u32(buf, *count);
+        }
+        Op::ListAppend => buf.push(34),
+        Op::SetAdd => buf.push(35),
+        Op::DictInsert => buf.push(36),
+        Op::LoadSuper(name) => {
+            buf.push(37);
+            put_u32(buf, *name);
+        }
+        Op::BuildSet(count) => {
+            buf.push(38);
+            put_u32(buf, *count);
+        }
     }
 }
 
@@ -450,6 +615,13 @@ fn put_code_object(buf: &mut Vec<u8>, co: &CodeObject) {
     put_len(buf, co.ops.len());
     for op in &co.ops {
         put_op(buf, op);
+    }
+    put_len(buf, co.exc_table.len());
+    for e in &co.exc_table {
+        put_u32(buf, e.start);
+        put_u32(buf, e.end);
+        put_u32(buf, e.target);
+        put_u32(buf, e.depth);
     }
 }
 
@@ -591,6 +763,33 @@ impl<'a> Reader<'a> {
                 cache: self.u32()?,
             },
             14 => Op::BuildSlice,
+            15 => Op::BuildList(self.u32()?),
+            16 => Op::BuildTuple(self.u32()?),
+            17 => Op::BuildDict(self.u32()?),
+            18 => Op::GetIter,
+            19 => Op::ForIter(self.u32()?),
+            20 => Op::Setitem,
+            21 => Op::Contains {
+                negate: self.u8()? != 0,
+            },
+            24 => Op::Raise(self.u8()?),
+            25 => Op::MatchExc,
+            26 => Op::LoadExc,
+            27 => Op::PopExcept,
+            28 => Op::Reraise,
+            29 => Op::DeleteFast(self.u32()?),
+            30 => Op::MakeFunction(self.u32()?),
+            31 => Op::BuildClass,
+            32 => Op::SetAttr {
+                name: self.u32()?,
+                cache: self.u32()?,
+            },
+            33 => Op::UnpackSequence(self.u32()?),
+            34 => Op::ListAppend,
+            35 => Op::SetAdd,
+            36 => Op::DictInsert,
+            37 => Op::LoadSuper(self.u32()?),
+            38 => Op::BuildSet(self.u32()?),
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -633,6 +832,16 @@ impl<'a> Reader<'a> {
         for _ in 0..n_ops {
             ops.push(self.op()?);
         }
+        let n_exc = self.u32()? as usize;
+        let mut exc_table = Vec::with_capacity(n_exc);
+        for _ in 0..n_exc {
+            exc_table.push(ExcEntry {
+                start: self.u32()?,
+                end: self.u32()?,
+                target: self.u32()?,
+                depth: self.u32()?,
+            });
+        }
         Ok(CodeObject {
             name,
             params,
@@ -644,6 +853,7 @@ impl<'a> Reader<'a> {
             names,
             ops,
             cache_count,
+            exc_table,
         })
     }
 }
@@ -675,6 +885,12 @@ mod tests {
                 Op::PopTop,
             ],
             cache_count: 1,
+            exc_table: vec![ExcEntry {
+                start: 0,
+                end: 5,
+                target: 8,
+                depth: 0,
+            }],
         };
         Module {
             name: String::from("m"),
@@ -690,6 +906,7 @@ mod tests {
                 names: Vec::new(),
                 ops: vec![Op::LoadConst(0), Op::Return],
                 cache_count: 0,
+                exc_table: Vec::new(),
             },
         }
     }
@@ -721,6 +938,28 @@ mod tests {
             Op::Unary(UnaryOp::Neg),
             Op::Subscript { cache: 6 },
             Op::BuildSlice,
+            Op::BuildList(3),
+            Op::BuildTuple(2),
+            Op::BuildDict(1),
+            Op::GetIter,
+            Op::ForIter(7),
+            Op::Setitem,
+            Op::Contains { negate: true },
+            Op::Raise(1),
+            Op::MatchExc,
+            Op::LoadExc,
+            Op::PopExcept,
+            Op::Reraise,
+            Op::DeleteFast(2),
+            Op::MakeFunction(0),
+            Op::BuildClass,
+            Op::SetAttr { name: 0, cache: 7 },
+            Op::UnpackSequence(2),
+            Op::ListAppend,
+            Op::SetAdd,
+            Op::DictInsert,
+            Op::LoadSuper(3),
+            Op::BuildSet(2),
             Op::Return,
         ];
         let mut buf = Vec::new();

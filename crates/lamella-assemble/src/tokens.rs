@@ -21,6 +21,19 @@ fn method_key(declaring: &TypeSymbol, name: &str, parameters: &[TypeSymbol]) -> 
     key
 }
 
+/// The name to KEY a method by in the token map. `op_Implicit`/`op_Explicit` overload by RETURN
+/// type alone (System.Decimal's `op_Explicit(decimal)` -> int / long / double / ...), so the return
+/// type discriminates them here -- without it the overloads collide on `(declaring, name, params)`
+/// and a call emits whichever was minted last. The emitted MemberRef keeps the plain `name`; this
+/// only affects the lookup key. No other method overloads by return type.
+pub(crate) fn conversion_key_name(name: &str, return_type: &TypeSymbol) -> String {
+    let mut keyed = String::from(name);
+    if matches!(name, "op_Implicit" | "op_Explicit") {
+        let _ = write!(keyed, "\u{1}{return_type}");
+    }
+    keyed
+}
+
 /// A field's identity as a string key: `Declaring::Name` (fields do not overload).
 fn field_key(declaring: &TypeSymbol, name: &str) -> String {
     let mut key = String::new();
