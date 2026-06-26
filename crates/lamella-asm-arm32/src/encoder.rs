@@ -777,8 +777,12 @@ impl Encoder {
     /// Pads with a `NOP` if the next emission would not be 4-byte aligned, which
     /// a literal pool requires (the PC for a literal load is `Align(PC, 4)`).
     pub fn align_to_word(&mut self) {
-        if self.position() % 4 != 0 {
-            self.nop();
+        while self.position() % 4 != 0 {
+            if self.position() % 2 == 0 {
+                self.nop();
+            } else {
+                self.bytes.push(0);
+            }
         }
     }
 
@@ -1215,6 +1219,24 @@ mod tests {
         }
         enc.bind_label(target);
         assert_eq!(enc.finish(), Err(AssembleError::BranchOutOfRange { at: 0 }));
+    }
+
+    #[test]
+    fn align_to_word_recovers_from_an_odd_offset() {
+        let mut enc = Encoder::new();
+        let blob = enc.new_label();
+        enc.adr(Reg::R0, blob).unwrap();
+        enc.emit_bytes(&[1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        enc.align_to_word();
+        assert_eq!(
+            enc.position() % 4,
+            0,
+            "must reach a word boundary from an odd offset"
+        );
+        enc.bind_label(blob);
+        enc.emit_word(0xdead_beef);
+        enc.finish()
+            .expect("the ADR resolves to a word-aligned target");
     }
 
     #[test]

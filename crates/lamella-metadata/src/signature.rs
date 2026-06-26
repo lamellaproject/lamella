@@ -13,6 +13,11 @@ pub mod calling {
     pub const HAS_THIS: u8 = 0x20;
     /// The explicit-`this` flag: `this` is the first declared parameter.
     pub const EXPLICIT_THIS: u8 = 0x40;
+    /// The `vararg` calling convention (the low nibble of the leading byte): a method taking a
+    /// variable argument list (`__arglist`). Masked with [`CONVENTION_MASK`].
+    pub const VARARG: u8 = 0x05;
+    /// The mask for the calling-convention nibble (the low 4 bits of the leading byte).
+    pub const CONVENTION_MASK: u8 = 0x0F;
     /// The vararg-sentinel element type, separating fixed from vararg parameters.
     pub const SENTINEL: u8 = 0x41;
     /// The leading byte of a local-variable signature (II.23.2.6).
@@ -102,6 +107,15 @@ pub struct MethodSig {
     pub return_type: SigType,
     /// The parameter types, in order.
     pub parameters: Vec<SigType>,
+    /// Whether the calling convention is `vararg` (II.23.2.3) -- a method taking a variable
+    /// argument list (`__arglist`). A vararg `MethodDef` carries only the fixed parameters; a
+    /// vararg call-site `MemberRef` carries the fixed parameters, then a sentinel, then the
+    /// variable-argument types.
+    pub is_vararg: bool,
+    /// For a vararg call-site signature, the index in `parameters` at which the sentinel appeared --
+    /// the count of FIXED parameters (the remainder are the variable arguments). `None` if no
+    /// sentinel was present (a vararg `MethodDef`, or any non-vararg signature).
+    pub sentinel_index: Option<usize>,
 }
 
 impl From<ReadError> for SigError {
@@ -257,12 +271,15 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
     let convention = reader.read_u8()?;
     let has_this = convention & calling::HAS_THIS != 0;
     let explicit_this = convention & calling::EXPLICIT_THIS != 0;
+    let is_vararg = convention & calling::CONVENTION_MASK == calling::VARARG;
     let param_count = reader.read_compressed_u32()?;
     let return_type = read_type(&mut reader)?;
     let mut parameters = Vec::new();
+    let mut sentinel_index = None;
     while (parameters.len() as u32) < param_count {
         if reader.peek_u8()? == calling::SENTINEL {
             reader.read_u8()?;
+            sentinel_index = Some(parameters.len());
         }
         parameters.push(read_type(&mut reader)?);
     }
@@ -271,6 +288,8 @@ pub fn parse_method(blob: &[u8]) -> Result<MethodSig, SigError> {
         explicit_this,
         return_type,
         parameters,
+        is_vararg,
+        sentinel_index,
     })
 }
 

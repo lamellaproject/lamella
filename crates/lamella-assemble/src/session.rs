@@ -207,6 +207,7 @@ impl Session {
                 defined_symbols: BTreeSet::new(),
             };
             collect_into(&mut model, &unit);
+            model.canonicalize_signatures();
             model.link_bases();
         }
         model

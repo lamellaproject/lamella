@@ -135,6 +135,20 @@ fn qualified_type_name(namespace: &str, name: &str) -> alloc::string::String {
     }
 }
 
+/// A `const` field's folded value (14.16, like an enum member). An integral or `char` value --
+/// optionally negated -- folds via the enum-member path to an integer literal; a string, bool,
+/// real, or decimal literal folds directly. `None` for a non-literal initializer (a `const`
+/// *expression*, which v1 does not fold), so the field stays a runtime field at the use site.
+fn const_field_literal(expr: &Expr) -> Option<Literal> {
+    if let Some(value) = enum_member_value(expr) {
+        return Some(integer_literal(value));
+    }
+    match &expr.kind {
+        ExprKind::Literal(literal) => Some(literal.clone()),
+        _ => None,
+    }
+}
+
 /// Evaluates an enum member's value expression to its underlying integral value.
 /// The v1 forms are an integer or character literal, optionally negated; anything
 /// else yields `None`, and the caller continues the auto-increment.
@@ -183,11 +197,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let accessibility = access(modifiers);
                 for declarator in declarators {
                     let constant = if is_const {
-                        declarator
-                            .initializer
-                            .as_ref()
-                            .and_then(enum_member_value)
-                            .map(integer_literal)
+                        declarator.initializer.as_ref().and_then(const_field_literal)
                     } else {
                         None
                     };

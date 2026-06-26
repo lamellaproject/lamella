@@ -34,6 +34,15 @@ pub enum BuildError {
     /// A function could not be lowered to the ARM32 target.
     #[cfg(feature = "arm32")]
     LowerArm(arm32::LowerError),
+    /// A method's CIL body could not be lowered to MIR (e.g. an unsupported construct). Reported rather
+    /// than silently leaving the method an empty stub, which would miscompile the program -- a stubbed
+    /// `Main` returns nothing.
+    LowerCil {
+        /// The MethodDef row of the method whose body failed to lower.
+        rid: u32,
+        /// The CIL-lowering error.
+        error: cil::CilError,
+    },
 }
 
 /// Compiles a CIL assembly to native bytes for `target`. `target = "wasm"` emits a WebAssembly module
@@ -56,7 +65,7 @@ pub fn build(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
 pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let funcs = lower_assembly(&assembly, entry);
+    let funcs = lower_assembly(&assembly, entry)?;
     let exports = method_exports(&assembly, entry.is_some());
     let export_refs: Vec<(&str, u32)> = exports.iter().map(|(n, i)| (n.as_str(), *i)).collect();
     wasm::lower_module_with_exports(&funcs, &export_refs).map_err(BuildError::LowerWasm)
@@ -75,7 +84,7 @@ pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     };
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let funcs = lower_assembly(&assembly, entry);
+    let funcs = lower_assembly(&assembly, entry)?;
     let code = arm32::lower_module(&funcs).map_err(BuildError::LowerArm)?;
     let mut image = Vec::with_capacity(8 + code.len());
     image.extend_from_slice(&initial_sp.to_le_bytes());
@@ -103,7 +112,10 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
     };
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let (funcs, maps) = lower_assembly_debug(&assembly, entry);
+    let (funcs, maps, fails) = lower_assembly_debug(&assembly, entry);
+    if let Some((rid, error)) = fails.into_iter().next() {
+        return Err(BuildError::LowerCil { rid, error });
+    }
     let (code, method_lines) =
         arm32::lower_module_debug(&funcs, None, &maps).map_err(BuildError::LowerArm)?;
     let mut image = Vec::with_capacity(8 + code.len());
@@ -140,7 +152,7 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
 pub fn build_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let funcs = lower_assembly(&assembly, entry);
+    let funcs = lower_assembly(&assembly, entry)?;
     let names: Vec<alloc::string::String> =
         (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
@@ -252,8 +264,12 @@ fn startup(cctors: &[u32], entry_rid: u32) -> Function {
 
 /// Lowers an assembly's methods to a `Vec<Function>` keyed by MethodDef row. Index 0 is a trampoline
 /// to `entry` (if any) -- the `main` export -- or a stub. A method that does not lower stays a stub.
-fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Vec<Function> {
-    lower_assembly_debug(assembly, entry).0
+fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Result<Vec<Function>, BuildError> {
+    let (funcs, _maps, fails) = lower_assembly_debug(assembly, entry);
+    if let Some((rid, error)) = fails.into_iter().next() {
+        return Err(BuildError::LowerCil { rid, error });
+    }
+    Ok(funcs)
 }
 
 /// As [`lower_assembly`], but also returns each function's [`cil::CilSourceMap`] (rid-indexed, empty for
@@ -262,7 +278,11 @@ fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Vec<Function> {
 fn lower_assembly_debug(
     assembly: &Assembly,
     entry: Option<u32>,
-) -> (Vec<Function>, Vec<cil::CilSourceMap>) {
+) -> (
+    Vec<Function>,
+    Vec<cil::CilSourceMap>,
+    Vec<(u32, cil::CilError)>,
+) {
     let mut methods = Vec::new();
     let mut max_rid = entry.unwrap_or(0);
     for type_def in assembly.type_defs() {
@@ -280,6 +300,7 @@ fn lower_assembly_debug(
         funcs[0] = startup(&find_cctors(assembly), entry_rid);
     }
     let resolver = MetadataResolver::new(assembly);
+    let mut fails: Vec<(u32, cil::CilError)> = Vec::new();
     for (rid, method) in &methods {
         let Some(body) = method.body() else { continue };
         let signature = method.signature();
@@ -297,13 +318,15 @@ fn lower_assembly_debug(
             .iter()
             .map(|sig| mir_type(sig, assembly))
             .collect();
-        if let Ok((func, map)) = cil::lower_method_typed(&body, &resolver, &arg_types, &local_types)
-        {
-            funcs[*rid as usize] = func;
-            maps[*rid as usize] = map;
+        match cil::lower_method_typed(&body, &resolver, &arg_types, &local_types) {
+            Ok((func, map)) => {
+                funcs[*rid as usize] = func;
+                maps[*rid as usize] = map;
+            }
+            Err(error) => fails.push((*rid, error)),
         }
     }
-    (funcs, maps)
+    (funcs, maps, fails)
 }
 
 /// The embedding ABI's export list: `main` (the entry trampoline at index 0, if there is an entry)

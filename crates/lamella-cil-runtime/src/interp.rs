@@ -117,6 +117,10 @@ pub struct Vm {
     /// blocking) the managed `SslStream` drives over the socket layer. `None` until set (no TLS on
     /// this build); the embedder supplies it (the host with rustls / mbedTLS; a device with mbedTLS).
     tls_backend: Option<alloc::boxed::Box<dyn crate::tls::TlsBackend>>,
+    /// The native off-heap memory seam ([`crate::memory::MemoryBackend`]) -- `Marshal.AllocHGlobal`
+    /// + raw `Read*`/`Write*`. `None` until the embedder selects a backend (the Safe bounds-checked
+    /// block table or Real host pointers); Marshal ops then report no native memory on this build.
+    memory_backend: Option<alloc::boxed::Box<dyn crate::memory::MemoryBackend>>,
 }
 
 impl Vm {
@@ -391,6 +395,22 @@ impl Vm {
         self.tls_backend.as_deref_mut()
     }
 
+    /// Sets the native off-heap memory seam ([`crate::memory::MemoryBackend`]). The embedder selects
+    /// the mode at startup -- the Safe bounds-checked block table, or (Stage 2) Real host pointers;
+    /// without it, the `Marshal` intrinsics report no native memory on this build.
+    pub fn set_memory_backend(
+        &mut self,
+        backend: alloc::boxed::Box<dyn crate::memory::MemoryBackend>,
+    ) {
+        self.memory_backend = Some(backend);
+    }
+
+    /// The native off-heap memory seam, if set -- the `System.Runtime.InteropServices.Marshal`
+    /// intrinsics drive it.
+    pub fn memory_backend(&mut self) -> Option<&mut (dyn crate::memory::MemoryBackend + 'static)> {
+        self.memory_backend.as_deref_mut()
+    }
+
     /// Requests that the scheduler park the running thread on socket I/O (a socket op would block):
     /// register `socket` for `interest`, then wake when the reactor's poll reports it ready.
     pub fn request_block_on_io(&mut self, socket: u32, interest: crate::net::Interest) {
@@ -491,6 +511,14 @@ impl Vm {
         self.now_ticks
     }
 
+    /// The monotonic millisecond count truncated to `int` (wrapping like .NET's `Environment.TickCount`,
+    /// which starts near zero and wraps through `int.MinValue` after ~24.9 days). Zero without a clock
+    /// seam. Backs the `Environment.get_TickCount` intrinsic.
+    #[must_use]
+    pub fn tick_count(&self) -> i32 {
+        self.now_millis().unwrap_or(0) as i32
+    }
+
     /// Records `message` (a heap string) as `exception`'s message, for
     /// `Exception.Message`.
     pub fn set_exception_message(&mut self, exception: ObjectRef, message: ObjectRef) {
@@ -577,6 +605,18 @@ struct Frame {
     /// dropped with it on return, giving `stackalloc`'s lifetime. Empty for the common
     /// method that allocates none.
     buffers: Vec<Vec<u8>>,
+    /// The variadic-argument region, set when a vararg call site invoked this frame: where the
+    /// variable arguments begin in `args` and each one's type handle. `arglist` reads it to build a
+    /// `TypedReference` per variable argument; `None` for the common non-vararg method.
+    varargs: Option<VarargFrame>,
+}
+
+/// A vararg method frame's variadic region (set from the call site's [`crate::module::VarargSite`]).
+struct VarargFrame {
+    /// The `args` index at which the variable arguments begin (`this`? + fixed-parameter count).
+    start: u16,
+    /// Each variable argument's asm-folded type handle, in order.
+    types: alloc::vec::Vec<u64>,
 }
 
 /// What executing one instruction decided.
@@ -595,6 +635,18 @@ enum Flow {
         method: MethodId,
         /// The arguments taken from the caller's stack, in declaration order.
         args: Vec<Value>,
+    },
+    /// A vararg `call`: like [`Flow::Call`] but the call site passed variable arguments beyond the
+    /// callee's fixed parameters, so the pushed frame records its variadic region for `arglist`.
+    CallVararg {
+        /// The callee (the vararg method).
+        method: MethodId,
+        /// All arguments (`this`? + fixed + variable), taken from the caller's stack.
+        args: Vec<Value>,
+        /// The `args` index at which the variable arguments begin.
+        vararg_start: u16,
+        /// Each variable argument's asm-folded type handle, in order.
+        var_types: Vec<u64>,
     },
     /// `newobj` allocated an object and must run its constructor: push a ctor frame
     /// with `this` (the new `object`) ahead of `args`, then leave `object` on the
@@ -660,6 +712,9 @@ enum Flow {
     LoadObj {
         /// The location to read.
         location: Location,
+        /// The triggering opcode, so a narrow `ldind.i1`/`u1`/`i2`/`u2` re-narrows the loaded value
+        /// to its width (truncate + sign/zero-extend). `Ldobj` and the wide `ldind`s are no-ops.
+        opcode: Opcode,
     },
     /// `stobj`: store a value-type instance through a managed pointer to `location`.
     StoreObj {
@@ -740,7 +795,9 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
         match step(&mut frame, 0, &body.code, None, &mut vm, instruction)? {
             Flow::Next => {}
             Flow::Return(result) => return Ok(result),
-            Flow::Call { .. } => return Err(Trap::Unsupported(Opcode::Call)),
+            Flow::Call { .. } | Flow::CallVararg { .. } => {
+                return Err(Trap::Unsupported(Opcode::Call))
+            }
             Flow::NewObj { .. } | Flow::NewValueObj { .. } => {
                 return Err(Trap::Unsupported(Opcode::Newobj));
             }
@@ -1757,6 +1814,23 @@ impl Session {
                 }
                 None => Err(Trap::NoSuchMethod(method)),
             },
+            Flow::CallVararg {
+                method,
+                args,
+                vararg_start,
+                var_types,
+            } => {
+                if frames.len() >= MAX_CALL_DEPTH {
+                    return Err(Trap::CallStackOverflow);
+                }
+                let mut frame = new_frame(module, method, args)?;
+                frame.varargs = Some(VarargFrame {
+                    start: vararg_start,
+                    types: var_types,
+                });
+                frames.push(frame);
+                Ok(Status::Running)
+            }
             Flow::NewObj { ctor, object, args } => match module.method(ctor) {
                 Some(Method::Managed { .. }) => {
                     if frames.len() >= MAX_CALL_DEPTH {
@@ -1917,8 +1991,8 @@ impl Session {
                 write_location_value(frames, vm, location, value)?;
                 Ok(Status::Running)
             }
-            Flow::LoadObj { location } => {
-                let value = read_byref(frames, vm, location);
+            Flow::LoadObj { location, opcode } => {
+                let value = narrow_loaded_int(read_byref(frames, vm, location), opcode);
                 frames
                     .get_mut(current)
                     .ok_or(Trap::StackUnderflow)?
@@ -2094,6 +2168,29 @@ fn narrow_stored_int(value: Value, opcode: Opcode) -> Value {
     match (opcode, value) {
         (Opcode::StindI1 | Opcode::StindI2, Value::NativeInt(n)) => Value::Int32(n as i32),
         (_, value) => value,
+    }
+}
+
+/// Re-narrows the value a `ldind.i1`/`u1`/`i2`/`u2` loaded from a VALUE slot (a local / argument /
+/// field) to the opcode's width: truncate to the low 8 / 16 bits, then sign-extend (`.i1`/`.i2`) or
+/// zero-extend (`.u1`/`.u2`). For values C# already pre-narrowed (`conv.u1` etc.) this is idempotent;
+/// it only changes a hand-written-IL store of a value wider than the width (e.g. `stind.i1` of `0x1FF`
+/// then `ldind.i1` -> -1). The wide `ldind`s and `ldobj` pass the value through unchanged.
+fn narrow_loaded_int(value: Value, opcode: Opcode) -> Value {
+    let truncated = |n: i32| match opcode {
+        Opcode::LdindI1 => i32::from(n as i8),
+        Opcode::LdindU1 => i32::from(n as u8),
+        Opcode::LdindI2 => i32::from(n as i16),
+        Opcode::LdindU2 => i32::from(n as u16),
+        _ => n,
+    };
+    match opcode {
+        Opcode::LdindI1 | Opcode::LdindU1 | Opcode::LdindI2 | Opcode::LdindU2 => match value {
+            Value::Int32(n) => Value::Int32(truncated(n)),
+            Value::NativeInt(n) => Value::Int32(truncated(n as i32)),
+            other => other,
+        },
+        _ => value,
     }
 }
 
@@ -2815,6 +2912,18 @@ fn step(
             let method = module
                 .resolve(asm, token)
                 .ok_or(Trap::UnresolvedCall(token))?;
+            if let Some(site) = module.vararg_site(asm, token) {
+                let total = site.total_args;
+                let vararg_start = site.vararg_start;
+                let var_types = site.var_types.clone();
+                let args = frame.take_args(total)?;
+                return Ok(Flow::CallVararg {
+                    method,
+                    args,
+                    vararg_start,
+                    var_types,
+                });
+            }
             let arg_count = module
                 .method(method)
                 .ok_or(Trap::NoSuchMethod(method))?
@@ -3175,7 +3284,7 @@ fn step(
             }
         }
         Opcode::Ldobj => match frame.pop()? {
-            Value::ByRef(location) => return Ok(Flow::LoadObj { location }),
+            Value::ByRef(location) => return Ok(Flow::LoadObj { location, opcode }),
             other @ (Value::Struct(_) | Value::Object(_)) => frame.stack.push(other),
             Value::Null => return Err(Trap::NullReference),
             _ => return Err(Trap::TypeMismatch(Opcode::Ldobj)),
@@ -3230,7 +3339,7 @@ fn step(
                     .ok_or(Trap::NullReference)?;
                 frame.stack.push(stack_loaded_value(opcode, raw)?);
             }
-            Value::ByRef(location) => return Ok(Flow::LoadObj { location }),
+            Value::ByRef(location) => return Ok(Flow::LoadObj { location, opcode }),
             Value::Null => return Err(Trap::NullReference),
             _ => return Err(Trap::TypeMismatch(Opcode::LdindI4)),
         },
@@ -3469,7 +3578,15 @@ fn step(
                     location,
                     type_token,
                 } => {
-                    if type_token != asm_key(asm, token.0) {
+                    let expected = asm_key(asm, token.0);
+                    let matches = type_token == expected
+                        || matches!(
+                            module.and_then(|m| m
+                                .type_name_by_handle(type_token)
+                                .zip(m.type_name_by_handle(expected))),
+                            Some((actual, wanted)) if actual == wanted
+                        );
+                    if !matches {
                         return Err(Trap::InvalidCast);
                     }
                     frame.stack.push(Value::ByRef(location));
@@ -3485,7 +3602,22 @@ fn step(
             _ => return Err(Trap::TypeMismatch(Opcode::Refanytype)),
         },
         #[cfg(feature = "varargs")]
-        Opcode::Arglist => frame.stack.push(Value::NativeInt(0)),
+        Opcode::Arglist => {
+            let typedrefs: alloc::vec::Vec<Value> = match &frame.varargs {
+                Some(vararg) => (0..vararg.types.len())
+                    .map(|i| Value::TypedRef {
+                        location: Location::Arg {
+                            frame: frame_index,
+                            slot: vararg.start as usize + i,
+                        },
+                        type_token: vararg.types[i],
+                    })
+                    .collect(),
+                None => alloc::vec::Vec::new(),
+            };
+            let array = vm.heap_mut().alloc_array(typedrefs);
+            frame.stack.push(Value::Object(array));
+        }
 
         #[cfg(not(feature = "typed-references"))]
         op @ (Opcode::Mkrefany | Opcode::Refanyval | Opcode::Refanytype) => {
@@ -3493,6 +3625,44 @@ fn step(
         }
         #[cfg(not(feature = "varargs"))]
         Opcode::Arglist => return Err(Trap::Unsupported(Opcode::Arglist)),
+
+        Opcode::Initblk => {
+            let size = block_size(frame.pop()?)?;
+            let value = block_byte(frame.pop()?);
+            match frame.pop()? {
+                Value::ByRef(Location::Stack {
+                    frame: owner,
+                    buffer,
+                    offset,
+                }) if owner == frame_index => {
+                    frame.fill_stack(buffer, offset, value, size)?;
+                }
+                Value::Null => return Err(Trap::NullReference),
+                _ => return Err(Trap::Unsupported(Opcode::Initblk)),
+            }
+        }
+        Opcode::Cpblk => {
+            let size = block_size(frame.pop()?)?;
+            let source = frame.pop()?;
+            match (frame.pop()?, source) {
+                (
+                    Value::ByRef(Location::Stack {
+                        frame: dest_owner,
+                        buffer: dest_buffer,
+                        offset: dest_offset,
+                    }),
+                    Value::ByRef(Location::Stack {
+                        frame: src_owner,
+                        buffer: src_buffer,
+                        offset: src_offset,
+                    }),
+                ) if dest_owner == frame_index && src_owner == frame_index => {
+                    frame.copy_stack(dest_buffer, dest_offset, src_buffer, src_offset, size)?;
+                }
+                (Value::Null, _) | (_, Value::Null) => return Err(Trap::NullReference),
+                _ => return Err(Trap::Unsupported(Opcode::Cpblk)),
+            }
+        }
 
         other => return Err(Trap::Unsupported(other)),
     }
@@ -3515,6 +3685,7 @@ impl Frame {
             multicast: None,
             pending_constraint: None,
             buffers: Vec::new(),
+            varargs: None,
         }
     }
 
@@ -3620,6 +3791,63 @@ impl Frame {
         let slice = bytes.get_mut(start..end).ok_or(Trap::NullReference)?;
         slice.copy_from_slice(&value[..width]);
         Ok(())
+    }
+
+    /// `initblk`: sets `size` bytes of localloc buffer `buffer` from `offset` to `value`. A
+    /// wild-pointer trap if the range is out of bounds or the buffer does not exist.
+    fn fill_stack(&mut self, buffer: usize, offset: u32, value: u8, size: usize) -> Result<(), Trap> {
+        let bytes = self.buffers.get_mut(buffer).ok_or(Trap::NullReference)?;
+        let start = offset as usize;
+        let end = start.checked_add(size).ok_or(Trap::NullReference)?;
+        let slice = bytes.get_mut(start..end).ok_or(Trap::NullReference)?;
+        slice.iter_mut().for_each(|byte| *byte = value);
+        Ok(())
+    }
+
+    /// `cpblk`: copies `size` bytes between localloc buffers of this frame (the source read into a
+    /// temporary first, so an overlapping same-buffer copy is well-defined). A wild-pointer trap if
+    /// either range is out of bounds or a buffer does not exist.
+    fn copy_stack(
+        &mut self,
+        dest_buffer: usize,
+        dest_offset: u32,
+        src_buffer: usize,
+        src_offset: u32,
+        size: usize,
+    ) -> Result<(), Trap> {
+        let source = self.buffers.get(src_buffer).ok_or(Trap::NullReference)?;
+        let src_start = src_offset as usize;
+        let src_end = src_start.checked_add(size).ok_or(Trap::NullReference)?;
+        let temp = source
+            .get(src_start..src_end)
+            .ok_or(Trap::NullReference)?
+            .to_vec();
+        let dest = self.buffers.get_mut(dest_buffer).ok_or(Trap::NullReference)?;
+        let dest_start = dest_offset as usize;
+        let dest_end = dest_start.checked_add(size).ok_or(Trap::NullReference)?;
+        let slice = dest.get_mut(dest_start..dest_end).ok_or(Trap::NullReference)?;
+        slice.copy_from_slice(&temp);
+        Ok(())
+    }
+}
+
+/// The byte count of a `cpblk` / `initblk` (the `size` operand: a native int or int32, taken
+/// non-negative). An out-of-range or non-integer size is a type mismatch.
+fn block_size(value: Value) -> Result<usize, Trap> {
+    let count = match value {
+        Value::Int32(n) => i64::from(n),
+        Value::NativeInt(n) => n,
+        _ => return Err(Trap::TypeMismatch(Opcode::Cpblk)),
+    };
+    usize::try_from(count).map_err(|_| Trap::TypeMismatch(Opcode::Cpblk))
+}
+
+/// The fill byte of an `initblk` (the `value` operand: the low 8 bits of an int32 / native int).
+fn block_byte(value: Value) -> u8 {
+    match value {
+        Value::Int32(n) => n as u8,
+        Value::NativeInt(n) => n as u8,
+        _ => 0,
     }
 }
 
@@ -5658,13 +5886,12 @@ mod tests {
 
     #[cfg(feature = "varargs")]
     #[test]
-    fn arglist_pushes_a_placeholder_handle() {
+    fn arglist_with_no_varargs_pushes_an_empty_handle() {
         let result = run(vec![
             Instruction::simple(Opcode::Arglist),
-            Instruction::simple(Opcode::ConvI4),
             Instruction::simple(Opcode::Ret),
         ]);
-        assert_eq!(result, Ok(Some(Value::Int32(0))));
+        assert!(matches!(result, Ok(Some(Value::Object(_)))));
     }
 
     fn ret() -> Instruction {

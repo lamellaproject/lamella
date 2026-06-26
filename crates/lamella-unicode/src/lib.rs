@@ -1,12 +1,12 @@
 //! Language-neutral Unicode Character Database properties, as compact range tables.
 #![no_std]
 
+#[cfg(feature = "normalization")]
 extern crate alloc;
 
-use alloc::string::String;
-use alloc::vec::Vec;
 use core::cmp::Ordering;
 
+#[allow(dead_code)]
 mod tables;
 
 /// The Unicode version these tables are generated from (matches CPython 3.14.6's
@@ -228,10 +228,23 @@ fn lookup_triple(table: &[(u32, u32, u8)], cp: u32) -> Option<u8> {
         .map(|i| table[i].2)
 }
 
-/// A Unicode normalization form (UAX #15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NormalizationForm {
-    /// NFC -- canonical decomposition, then canonical composition.
+#[cfg(feature = "normalization")]
+pub use normalization::*;
+
+/// Unicode normalization (UAX #15): NFC/NFD/NFKC/NFKD over the canonical/compatibility
+/// decomposition, combining-class, and composition tables. The `normalization` feature tier --
+/// a categories-only consumer drops it (and `alloc`) entirely.
+#[cfg(feature = "normalization")]
+mod normalization {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    use super::{lookup_triple, tables};
+
+    /// A Unicode normalization form (UAX #15).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum NormalizationForm {
+        /// NFC -- canonical decomposition, then canonical composition.
     Nfc,
     /// NFD -- canonical decomposition.
     Nfd,
@@ -372,6 +385,7 @@ fn primary_composite(a: u32, b: u32) -> Option<u32> {
         .binary_search_by(|&(x, y, _)| (x, y).cmp(&(a, b)))
         .ok()?;
     Some(tables::COMPOSITION[i].2)
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +416,7 @@ mod tests {
         assert!(!is_xid_start(0x30) && is_xid_continue(0x30));
     }
 
+    #[cfg(feature = "normalization")]
     #[test]
     fn normalization_spot_checks() {
         use NormalizationForm::{Nfc, Nfd, Nfkc};

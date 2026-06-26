@@ -42,7 +42,7 @@ pub use statement::{
     BoundCatch, BoundDeclarator, BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection,
 };
 pub use symbols::{
-    Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo,
-    TypeKind,
+    Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, SignatureCanon,
+    TypeInfo, TypeKind,
 };
 pub use types::TypeSymbol;

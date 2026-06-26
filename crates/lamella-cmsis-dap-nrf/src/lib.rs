@@ -49,6 +49,93 @@ fn nvmc_wait<T: Transport>(dap: &mut Dap<T>) -> Result<(), DapError> {
     Err(DapError::Timeout("flash controller"))
 }
 
+/// Outcome of a successful flash deploy.
+#[derive(Debug, Clone, Copy)]
+pub struct FlashReport {
+    /// The target's DP IDCODE, read while connecting.
+    pub idcode: u32,
+    /// Bytes written to flash.
+    pub bytes: usize,
+    /// 32-bit words written (the image zero-padded up to a word).
+    pub words: usize,
+}
+
+/// A reason a flash deploy failed.
+#[derive(Debug)]
+pub enum FlashError {
+    /// A probe / debug-access error.
+    Dap(DapError),
+    /// Opening the probe failed (only from the `microbit` helper).
+    ProbeOpen(String),
+    /// A programmed word did not read back: flash verify failed at `word` (flash byte `word * 4`).
+    Verify {
+        word: usize,
+        expected: u32,
+        got: u32,
+    },
+}
+
+impl From<DapError> for FlashError {
+    fn from(e: DapError) -> Self {
+        FlashError::Dap(e)
+    }
+}
+
+/// Connect to the nRF51 over an open `dap`, erase the pages `image` spans, program it at `base`, verify
+/// it word-for-word, and reset to run it -- the whole deploy dance (connect / halt / erase / write /
+/// verify / reset) in one call instead of ~20 lines. The image is zero-padded up to a 32-bit word.
+pub fn flash_and_run<T: Transport>(
+    dap: &mut Dap<T>,
+    base: u32,
+    image: &[u8],
+) -> Result<FlashReport, FlashError> {
+    let words: Vec<u32> = image
+        .chunks(4)
+        .map(|c| {
+            let mut w = [0u8; 4];
+            w[..c.len()].copy_from_slice(c);
+            u32::from_le_bytes(w)
+        })
+        .collect();
+
+    dap.connect_swd()?;
+    let idcode = dap.read_idcode()?;
+    dap.init_mem()?;
+    dap.halt()?;
+
+    let pages = (words.len() * 4).div_ceil(0x400);
+    for page in 0..pages as u32 {
+        dap.erase_flash_page(base + page * 0x400)?;
+    }
+    dap.write_flash(base, &words)?;
+    for (i, &expected) in words.iter().enumerate() {
+        let got = dap.read_word(base + i as u32 * 4)?;
+        if got != expected {
+            return Err(FlashError::Verify {
+                word: i,
+                expected,
+                got,
+            });
+        }
+    }
+    dap.reset_and_run()?;
+    Ok(FlashReport {
+        idcode,
+        bytes: image.len(),
+        words: words.len(),
+    })
+}
+
+/// Open the BBC micro:bit's on-board CMSIS-DAP HID probe (VID 0x0d28, PID 0x0204) and
+/// [`flash_and_run`] `image` at flash 0 -- the one-call deploy for a connected micro:bit.
+#[cfg(feature = "microbit")]
+pub fn flash_microbit(image: &[u8]) -> Result<FlashReport, FlashError> {
+    let device = lamella_usbhid::Device::open(0x0d28, 0x0204, None)
+        .map_err(|e| FlashError::ProbeOpen(format!("{e:?}")))?;
+    let mut dap = Dap::new(device);
+    flash_and_run(&mut dap, 0x0, image)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

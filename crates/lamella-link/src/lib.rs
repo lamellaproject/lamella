@@ -4,7 +4,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -59,7 +59,7 @@ pub struct LinkedImage {
 /// laid out in order (4-byte aligned), every relocation's symbol is resolved to its definition, and
 /// the code is patched in place.
 pub fn link(objects: &[Object], entry: &str) -> Result<LinkedImage, LinkError> {
-    link_with_base(objects, entry, None)
+    link_with_base(objects, entry, None, &[])
 }
 
 /// Like [`link`], but with the virtual address `text_base` at which the linked `.text` will be
@@ -73,13 +73,30 @@ pub fn link_at_base(
     entry: &str,
     text_base: u32,
 ) -> Result<LinkedImage, LinkError> {
-    link_with_base(objects, entry, Some(text_base))
+    link_with_base(objects, entry, Some(text_base), &[])
+}
+
+/// Like [`link_at_base`], but also resolving `residents` -- `(name, absolute address)` of functions
+/// already present on the target (the on-board runtime) -- so the injected object's calls and data refs
+/// to those names land on their real addresses. This is the RAM-injection delivery (REPL-against-AOT,
+/// delivery-foundations.md scenario 5): the host links a snippet to the RAM buffer it will write, with
+/// the resident runtime's seams (`lamella_gc_alloc`, ...) resolved to the addresses it read from the
+/// board. The result runs correctly only when loaded at `text_base`. A resident in flash, beyond a Thumb
+/// `BL`'s +/-16 MB reach from a RAM buffer, is bridged automatically by an appended long-branch veneer.
+pub fn link_at_base_with_residents(
+    objects: &[Object],
+    entry: &str,
+    text_base: u32,
+    residents: &[(&str, u32)],
+) -> Result<LinkedImage, LinkError> {
+    link_with_base(objects, entry, Some(text_base), residents)
 }
 
 fn link_with_base(
     objects: &[Object],
     entry: &str,
     text_base: Option<u32>,
+    residents: &[(&str, u32)],
 ) -> Result<LinkedImage, LinkError> {
     let machine = link_machine(objects)?;
 
@@ -107,6 +124,42 @@ fn link_with_base(
         }
     }
 
+    if let Some(base) = text_base {
+        for &(name, addr) in residents {
+            if defined.iter().any(|(n, _, _)| n == name) {
+                return Err(LinkError::DuplicateSymbol(String::from(name)));
+            }
+            defined.push((
+                String::from(name),
+                normalized_value(machine, addr).wrapping_sub(base),
+                is_thumb_func(machine, addr),
+            ));
+        }
+    }
+
+    let mut veneers: BTreeMap<u32, u32> = BTreeMap::new();
+    if machine == Machine::Arm {
+        for (oi, obj) in objects.iter().enumerate() {
+            for r in &obj.relocations {
+                if r.kind != arm::R_ARM_THM_CALL {
+                    continue;
+                }
+                let name = &obj.symbols[r.symbol as usize].name;
+                let Some((target, _)) = resolve_sym(&defined, name) else {
+                    continue;
+                };
+                let site = bases[oi] + r.offset;
+                let addend = relocation_addend(&text, machine, site, r);
+                let delta = i64::from(target) + addend - i64::from(site);
+                if !thm_call_in_range(delta) && !veneers.contains_key(&target) {
+                    let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+                    let voff = emit_thumb_veneer(&mut text, base.wrapping_add(target) | 1);
+                    veneers.insert(target, voff);
+                }
+            }
+        }
+    }
+
     for (oi, obj) in objects.iter().enumerate() {
         for r in &obj.relocations {
             let site = bases[oi] + r.offset;
@@ -118,6 +171,7 @@ fn link_with_base(
                 &defined,
                 &obj.symbols,
                 r,
+                &veneers,
             )?;
         }
     }
@@ -151,7 +205,7 @@ pub fn link_with_archives(
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
     let included = include_on_demand(objects, archives);
-    link_with_base(&included, entry, text_base)
+    link_with_base(&included, entry, text_base, &[])
 }
 
 /// The explicit objects plus the archive members pulled on demand (see [`link_with_archives`]).
@@ -233,6 +287,7 @@ fn apply_relocation(
     defined: &[Defined],
     obj_syms: &[lamella_elf::ParsedSymbol],
     r: &ParsedRelocation,
+    veneers: &BTreeMap<u32, u32>,
 ) -> Result<(), LinkError> {
     if machine == Machine::RiscV && r.kind == riscv::R_RISCV_RELAX {
         return Ok(());
@@ -257,7 +312,18 @@ fn apply_relocation(
             other => Err(LinkError::UnsupportedRelocation(other)),
         },
         Machine::Arm => match r.kind {
-            arm::R_ARM_THM_CALL => encode_thm_call(text, site, target + addend - site_i),
+            arm::R_ARM_THM_CALL => {
+                let direct = target + addend - site_i;
+                if thm_call_in_range(direct) {
+                    encode_thm_call(text, site, direct)
+                } else {
+                    let voff = veneers
+                        .get(&(target as u32))
+                        .copied()
+                        .ok_or(LinkError::RelocationOutOfRange(site))?;
+                    encode_thm_call(text, site, i64::from(voff) + addend - site_i)
+                }
+            }
             arm::R_ARM_CALL => encode_arm_call(text, site, target + addend - site_i),
             arm::R_ARM_ABS32 => {
                 apply_abs32(text, site, text_base, target + addend, target_is_thumb)
@@ -390,6 +456,7 @@ fn link_gc_inner(
         }
     }
 
+    let no_veneers: BTreeMap<u32, u32> = BTreeMap::new();
     for fi in 0..funcs.len() {
         let Some(fbase) = new_offset[fi] else {
             continue;
@@ -408,6 +475,7 @@ fn link_gc_inner(
                 &defined,
                 &objects[*oi].symbols,
                 r,
+                &no_veneers,
             )?;
         }
     }
@@ -562,6 +630,29 @@ fn encode_thm_call(text: &mut [u8], site: u32, off: i64) -> Result<(), LinkError
     slot[0..2].copy_from_slice(&hw1.to_le_bytes());
     slot[2..4].copy_from_slice(&hw2.to_le_bytes());
     Ok(())
+}
+
+/// Whether a Thumb `BL` can reach `off` -- a halfword-even displacement within +/-16 MB.
+fn thm_call_in_range(off: i64) -> bool {
+    off % 2 == 0 && (-16_777_216..=16_777_214).contains(&off)
+}
+
+/// Appends an ARMv6-M long-branch VENEER to `text` (4-byte aligned) and returns its offset. A `BL` that
+/// cannot reach a far target instead reaches this trampoline, which loads the absolute `target` (Thumb
+/// bit set) and `bx`es to it. It preserves r0-r3 (the call's arguments -- only r0 is touched, saved and
+/// restored) and LR (so the callee returns straight to the original caller, never back here). `mov ip,
+/// r0` is used because `ldr ip, [pc]` (a high register) does not encode on ARMv6-M.
+fn emit_thumb_veneer(text: &mut Vec<u8>, target: u32) -> u32 {
+    align_to(text, 4);
+    let offset = text.len() as u32;
+    text.extend_from_slice(&[0x01, 0xB4]);
+    text.extend_from_slice(&[0x02, 0x48]);
+    text.extend_from_slice(&[0x84, 0x46]);
+    text.extend_from_slice(&[0x01, 0xBC]);
+    text.extend_from_slice(&[0x60, 0x47]);
+    text.extend_from_slice(&[0x00, 0xBF]);
+    text.extend_from_slice(&target.to_le_bytes());
+    offset
 }
 
 /// The signed byte offset currently encoded in the Thumb `BL` at `site` -- the implicit addend of a
@@ -744,6 +835,64 @@ mod tests {
             link(&[rebuilt(), leaf], "holder").unwrap_err(),
             LinkError::AbsoluteNeedsBase
         );
+    }
+
+    #[test]
+    fn resolves_a_resident_call_for_ram_injection() {
+        let snippet = || {
+            obj_arm(
+                &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
+                &[func("snippet", 1, 6), undef("lamella_gc_alloc")],
+                &[Relocation {
+                    offset: 0,
+                    symbol: 1,
+                    kind: arm::R_ARM_THM_CALL,
+                    addend: -4,
+                }],
+            )
+        };
+        let img = link_at_base_with_residents(
+            &[snippet()],
+            "snippet",
+            0x2000_0000,
+            &[("lamella_gc_alloc", 0x2000_0009)],
+        )
+        .unwrap();
+        assert_eq!(&img.text[0..4], &[0x00, 0xF0, 0x02, 0xF8]);
+        assert_eq!(
+            link_at_base(&[snippet()], "snippet", 0x2000_0000).unwrap_err(),
+            LinkError::UndefinedSymbol(String::from("lamella_gc_alloc"))
+        );
+    }
+
+    #[test]
+    fn a_far_resident_call_gets_a_veneer() {
+        let snippet = obj_arm(
+            &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
+            &[func("snippet", 1, 6), undef("lamella_gc_alloc")],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+        );
+        let img = link_at_base_with_residents(
+            &[snippet],
+            "snippet",
+            0x2000_0000,
+            &[("lamella_gc_alloc", 0x0800_0001)],
+        )
+        .unwrap();
+        assert_eq!(&img.text[0..4], &[0x00, 0xF0, 0x02, 0xF8]);
+        assert_eq!(
+            &img.text[8..20],
+            &[
+                0x01, 0xB4, 0x02, 0x48, 0x84, 0x46, 0x01, 0xBC, 0x60, 0x47, 0x00, 0xBF
+            ]
+        );
+        let literal = u32::from_le_bytes([img.text[20], img.text[21], img.text[22], img.text[23]]);
+        assert_eq!(literal, 0x0800_0001);
     }
 
     #[test]

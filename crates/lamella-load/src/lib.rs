@@ -25,7 +25,9 @@ use lamella_cil_runtime::intrinsics::{
     console_write_line, console_write_line_bool, console_write_line_char, console_write_line_empty,
     console_write_line_int32, console_write_line_int64, console_write_line_object,
     console_write_line_uint32, console_write_line_uint64, debug_write,
-    datetime_now_ticks, delegate_combine, delegate_remove, enum_format, enum_get_name,
+    datetime_now_ticks, delegate_combine, delegate_remove,
+    environment_get_variable, environment_processor_count, environment_tick_count,
+    enum_format, enum_get_name,
     enum_get_names, enum_get_values, enum_is_defined, enum_parse, exception_ctor,
     exception_get_message, int32_to_string, int64_to_string, interlocked_compare_exchange,
     md_array_address, md_array_get,
@@ -35,7 +37,7 @@ use lamella_cil_runtime::intrinsics::{
     string_concat_object3, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
     string_not_equals, string_substring, string_substring_len, type_from_handle, type_get_field,
-    type_get_method, type_get_name, type_get_property,
+    type_get_method, type_get_name, type_get_property, type_property_custom_attributes,
     thread_start, thread_join, thread_yield, thread_sleep, monitor_enter, monitor_exit,
     monitor_try_enter, monitor_wait, monitor_pulse, monitor_pulse_all,
     socket_connect_start, socket_connect_poll, socket_listen, socket_accept,
@@ -44,9 +46,15 @@ use lamella_cil_runtime::intrinsics::{
     tls_client_config, tls_server_config, tls_client_new, tls_server_new, tls_process,
     tls_wants_write, tls_write_tls, tls_read_tls, tls_read_plain, tls_write_plain, tls_peer_cert,
     tls_close, tls_default_stack,
+    marshal_alloc_hglobal, marshal_free_hglobal, marshal_read_byte, marshal_read_int16,
+    marshal_read_int32, marshal_read_int64, marshal_write_byte, marshal_write_int16,
+    marshal_write_int32, marshal_write_int64, marshal_size_of,
+    intptr_from_raw_value, intptr_to_raw_value,
 };
 #[cfg(feature = "gc")]
 use lamella_cil_runtime::intrinsics::{gc_collect, weak_make_cell, weak_read_cell, weak_write_cell};
+#[cfg(feature = "varargs")]
+use lamella_cil_runtime::intrinsics::{arg_iterator_cookie, arg_iterator_get, arg_iterator_remaining};
 #[cfg(feature = "finalizers")]
 use lamella_cil_runtime::intrinsics::{
     reregister_finalize, suppress_finalize, wait_for_pending_finalizers,
@@ -54,8 +62,10 @@ use lamella_cil_runtime::intrinsics::{
 #[cfg(feature = "NETMFv4_4")]
 use lamella_cil_runtime::intrinsics::{
     boolean_parse, char_is_digit, char_is_letter, char_is_letter_or_digit, char_is_lower,
-    activator_create_instance, assembly_get_type, field_get_value, field_set_value, member_get_type,
+    activator_create_instance, assembly_full_name, assembly_get_type, assembly_get_types,
+    field_get_value, field_set_value, member_get_type,
     method_invoke, method_is_abstract, method_is_final, method_is_public, method_is_static,
+    method_parameter_count, method_parameter_name, method_parameter_type,
     constructor_invoke, method_is_virtual, reflect_handle_equals, reflect_handle_not_equals,
     type_get_base_type, type_get_constructor,
     char_is_upper, char_is_white_space, char_to_lower, char_to_upper, collection_contains,
@@ -97,9 +107,9 @@ use lamella_cil_runtime::intrinsics::{
     math_cos_f64, math_exp_f64, math_log_f64, math_log10_f64, math_pow_f64, math_sin_f64,
     math_sqrt_f64, math_tan_f64,
 };
-use lamella_cil_runtime::module::{AttrValue, LoadedAttribute, asm_key};
+use lamella_cil_runtime::module::{AttrValue, LoadedAttribute, VarargSite, asm_key};
 #[cfg(feature = "NETMFv4_4")]
-use lamella_cil_runtime::module::{ReflectField, ReflectMethod, ReflectType};
+use lamella_cil_runtime::module::{MethodParam, ReflectField, ReflectMethod, ReflectType};
 use lamella_cil_runtime::{IntrinsicFn, MethodId, Module, TypeId, Value};
 
 const TYPE_REF: u8 = 0x01;
@@ -789,6 +799,21 @@ fn load_assembly(
             type_index.insert(type_name_key(name), type_id);
             module.bind_type_name(asm, Token::new(TYPE_DEF, type_row), name.name.into());
             module.bind_type_full_name(type_id, full_type_name(name));
+            #[cfg(feature = "NETMFv4_4")]
+            {
+                if name.name != "<Module>" {
+                    module.add_assembly_type(asm, asm_key(asm, Token::new(TYPE_DEF, type_row).0));
+                }
+                if module.assembly_name(asm).is_none() {
+                    let simple = assembly.assembly_name().unwrap_or("");
+                    module.bind_assembly_name(
+                        asm,
+                        alloc::format!(
+                            "{simple}, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null"
+                        ),
+                    );
+                }
+            }
             if let Some(kind) = primitive_value_kind(name.namespace, name.name) {
                 module.set_primitive_type_token(asm, Token::new(TYPE_DEF, type_row), &kind);
             }
@@ -924,6 +949,7 @@ fn load_assembly(
                         | Opcode::Box
                         | Opcode::Initobj
                         | Opcode::Mkrefany
+                        | Opcode::Refanyval
                             if matches!(operand.table(), TYPE_DEF | TYPE_REF | TYPE_SPEC) =>
                         {
                             ldtoken_type_tokens.insert(*operand);
@@ -1024,6 +1050,7 @@ fn load_assembly(
         module,
         asm,
         index,
+        type_index,
         resolve_external,
         &bcl_call_tokens,
     );
@@ -1104,6 +1131,7 @@ fn bind_bcl_calls(
     module: &mut Module,
     asm: u8,
     index: &NameIndex,
+    type_index: &TypeNameIndex,
     resolve_external: bool,
     tokens: &BTreeSet<Token>,
 ) {
@@ -1124,6 +1152,55 @@ fn bind_bcl_calls(
                 .map_or(0, |sig| sig.parameters.len() + usize::from(sig.has_this)),
         )
         .unwrap_or(u16::MAX);
+
+        if let Some(sig) = signature.as_ref() {
+            if let (true, Some(fixed)) = (sig.is_vararg, sig.sentinel_index) {
+                let target = match parent.table() {
+                    METHOD_DEF => module.resolve(asm, parent),
+                    TYPE_DEF | TYPE_REF => {
+                        let parent_type = if parent.table() == TYPE_DEF {
+                            assembly.type_def(parent.row()).and_then(|def| def.name())
+                        } else {
+                            assembly.type_ref(parent.row()).and_then(|reference| reference.name())
+                        };
+                        parent_type.and_then(|parent_type| {
+                            let key = name_key(
+                                assembly,
+                                parent_type.namespace,
+                                parent_type.name,
+                                method_name,
+                                &params[..fixed],
+                                Some(&sig.return_type),
+                            );
+                            index.get(&key).copied()
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(target) = target {
+                    let var_types: Vec<u64> = params[fixed..]
+                        .iter()
+                        .map(|param| {
+                            sigtype_to_type_handle(assembly, module, asm, param, type_index)
+                                .unwrap_or(0)
+                        })
+                        .collect();
+                    let total = usize::from(sig.has_this) + params.len();
+                    let vararg_start = usize::from(sig.has_this) + fixed;
+                    module.bind_token(asm, *token, target);
+                    module.bind_vararg_site(
+                        asm,
+                        *token,
+                        VarargSite {
+                            total_args: u16::try_from(total).unwrap_or(u16::MAX),
+                            vararg_start: u16::try_from(vararg_start).unwrap_or(0),
+                            var_types,
+                        },
+                    );
+                    continue;
+                }
+            }
+        }
 
         if method_name == ".ctor" {
             if let [SigType::Object, SigType::IntPtr] = params {
@@ -1414,15 +1491,44 @@ fn bcl_intrinsic(
             "get_IsFinal" => return Some(method_is_final),
             "get_IsVirtual" => return Some(method_is_virtual),
             "get_IsAbstract" => return Some(method_is_abstract),
+            "GetParameterCount" => return Some(method_parameter_count),
+            "GetParameterType" => return Some(method_parameter_type),
+            "GetParameterName" => return Some(method_parameter_name),
             _ => {}
         }
     }
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Reflection" && type_name == "Assembly" {
-        if method == "GetType" {
-            if let [SigType::String] = parameters_of(signature) {
+        match method {
+            "GetType" if matches!(parameters_of(signature), [SigType::String]) => {
                 return Some(assembly_get_type);
             }
+            "get_FullName" => return Some(assembly_full_name),
+            "GetTypes" => return Some(assembly_get_types),
+            _ => {}
+        }
+    }
+    if namespace == "System" && type_name == "IntPtr" {
+        match method {
+            "FromRawValue" => return Some(intptr_from_raw_value),
+            "ToRawValue" => return Some(intptr_to_raw_value),
+            _ => {}
+        }
+    }
+    if namespace == "System.Runtime.InteropServices" && type_name == "Marshal" {
+        match method {
+            "__AllocHGlobal" => return Some(marshal_alloc_hglobal),
+            "__FreeHGlobal" => return Some(marshal_free_hglobal),
+            "__ReadByte" => return Some(marshal_read_byte),
+            "__ReadInt16" => return Some(marshal_read_int16),
+            "__ReadInt32" => return Some(marshal_read_int32),
+            "__ReadInt64" => return Some(marshal_read_int64),
+            "__WriteByte" => return Some(marshal_write_byte),
+            "__WriteInt16" => return Some(marshal_write_int16),
+            "__WriteInt32" => return Some(marshal_write_int32),
+            "__WriteInt64" => return Some(marshal_write_int64),
+            "SizeOf" => return Some(marshal_size_of),
+            _ => {}
         }
     }
     if namespace == "System.Diagnostics"
@@ -1491,6 +1597,23 @@ fn bcl_intrinsic(
             "PeerCert" => return Some(tls_peer_cert),
             "CloseTls" => return Some(tls_close),
             "DefaultStack" => return Some(tls_default_stack),
+            _ => {}
+        }
+    }
+    #[cfg(feature = "varargs")]
+    if namespace == "System" && type_name == "ArgIteratorNative" {
+        match method {
+            "Cookie" => return Some(arg_iterator_cookie),
+            "RemainingCount" => return Some(arg_iterator_remaining),
+            "GetArg" => return Some(arg_iterator_get),
+            _ => {}
+        }
+    }
+    if namespace == "System" && type_name == "Environment" {
+        match method {
+            "get_TickCount" => return Some(environment_tick_count),
+            "get_ProcessorCount" => return Some(environment_processor_count),
+            "GetEnvironmentVariable" => return Some(environment_get_variable),
             _ => {}
         }
     }
@@ -1579,6 +1702,8 @@ fn bcl_intrinsic(
             [SigType::String] | [SigType::String, _] => Some(type_get_property),
             _ => None,
         },
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "GetPropertyCustomAttributes") => Some(type_property_custom_attributes),
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetConstructor") => match parameters_of(signature) {
             [SigType::SzArray(_)] => Some(type_get_constructor),
@@ -2099,15 +2224,38 @@ fn record_custom_attributes(
                         });
                         module.bind_method_attrs(handle, method_flags);
                         if let Some(method_sig) = method.signature() {
-                            if let Some(type_handle) = sigtype_to_type_handle(
+                            if let Some(return_handle) = sigtype_to_type_handle(
                                 assembly,
                                 module,
                                 asm,
                                 &method_sig.return_type,
                                 type_index,
                             ) {
-                                module.bind_member_type(handle, type_handle);
+                                module.bind_member_type(handle, return_handle);
                             }
+                            let mut names: Vec<String> = Vec::new();
+                            for param in method.params() {
+                                let sequence = param.sequence() as usize;
+                                if sequence >= 1 {
+                                    if names.len() < sequence {
+                                        names.resize(sequence, String::new());
+                                    }
+                                    names[sequence - 1] = String::from(param.name().unwrap_or(""));
+                                }
+                            }
+                            let params: Vec<MethodParam> = method_sig
+                                .parameters
+                                .iter()
+                                .enumerate()
+                                .map(|(index, sig_type)| MethodParam {
+                                    type_handle: sigtype_to_type_handle(
+                                        assembly, module, asm, sig_type, type_index,
+                                    )
+                                    .unwrap_or(0),
+                                    name: names.get(index).cloned().unwrap_or_default(),
+                                })
+                                .collect();
+                            module.bind_method_params(handle, params);
                         }
                     }
                 }

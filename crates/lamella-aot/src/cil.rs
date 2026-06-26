@@ -571,6 +571,7 @@ fn lower_with_source(
     let mut mir_blocks: Vec<BasicBlock> = Vec::with_capacity(blocks.len());
     let mut source_map: Vec<Vec<u32>> = Vec::with_capacity(blocks.len());
     let mut exit_locals: Vec<Vec<Option<ValueId>>> = vec![Vec::new(); blocks.len()];
+    let mut exit_stack: Vec<Vec<ValueId>> = vec![Vec::new(); blocks.len()];
     let original_block_count = blocks.len();
     let mut split_blocks: Vec<BasicBlock> = Vec::new();
     let mut propagate_fixups: Vec<usize> = Vec::new();
@@ -613,6 +614,38 @@ fn lower_with_source(
             let operand_count = trap_operand_types(&code[start], widths[start], resolver).len();
             for k in 0..operand_count {
                 stack.push(block_params[b][local_count + k]);
+            }
+        }
+        if b != 0
+            && handler_clause[b].is_none()
+            && trap_access[b].is_none()
+            && finally_handler[b].is_none()
+            && !finally_continuation[b]
+        {
+            if is_merge(b) {
+                let height = preds[b]
+                    .iter()
+                    .copied()
+                    .filter(|&p| p < b)
+                    .map(|p| exit_stack[p].len())
+                    .max()
+                    .unwrap_or(0);
+                for k in 0..height {
+                    let ty = preds[b]
+                        .iter()
+                        .copied()
+                        .filter(|&p| p < b)
+                        .find_map(|p| exit_stack[p].get(k).copied())
+                        .map(|v| value_types[v.index()])
+                        .unwrap_or(MirType::I32);
+                    let param = new_value(&mut value_types, ty);
+                    block_params[b].push(param);
+                    stack.push(param);
+                }
+            } else if let Some(&pred) = preds[b].first() {
+                if pred < b {
+                    stack = exit_stack[pred].clone();
+                }
             }
         }
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
@@ -786,7 +819,7 @@ fn lower_with_source(
                         &mut propagate_fixups,
                     )?
                 } else {
-                    let merge_args = merge_args(
+                    let mut args = merge_args(
                         is_merge(next),
                         local_count,
                         &locals,
@@ -794,9 +827,12 @@ fn lower_with_source(
                         &mut value_types,
                         &mut insts,
                     );
+                    if is_merge(next) {
+                        args.extend(stack.iter().copied());
+                    }
                     Terminator::Jump {
                         target: BlockId(next as u32),
-                        args: merge_args,
+                        args,
                     }
                 }
             }
@@ -812,6 +848,7 @@ fn lower_with_source(
         }
 
         exit_locals[b] = locals.clone();
+        exit_stack[b] = stack.clone();
         mir_blocks.push(BasicBlock {
             params: block_params[b].clone(),
             insts,
@@ -2426,6 +2463,7 @@ fn build_eh_leave(
         local_count,
         locals,
         local_types,
+        &[],
         value_types,
         split_blocks,
         block_count,
@@ -3337,7 +3375,7 @@ fn build_branch(
 
     match control_flow::branch_kind(inst.opcode) {
         Some(control_flow::BranchKind::Unconditional) => {
-            let args = merge_args(
+            let mut args = merge_args(
                 is_merge(target),
                 local_count,
                 locals,
@@ -3345,6 +3383,9 @@ fn build_branch(
                 value_types,
                 insts,
             );
+            if is_merge(target) {
+                args.extend(stack.iter().copied());
+            }
             Ok(Terminator::Jump {
                 target: BlockId(target as u32),
                 args,
@@ -3354,6 +3395,7 @@ fn build_branch(
             let other = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow)?;
             let (cond, if_true, if_false) =
                 build_condition(inst.opcode, target, other, stack, value_types, insts)?;
+            let stack_args: Vec<ValueId> = stack.clone();
             let mut split = |block: usize| {
                 split_edge_to_merge(
                     block,
@@ -3361,6 +3403,7 @@ fn build_branch(
                     local_count,
                     locals,
                     local_types,
+                    &stack_args,
                     value_types,
                     split_blocks,
                     block_count,
@@ -3409,6 +3452,7 @@ fn build_switch(
         return Err(CilError::BadOperand);
     };
     let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let stack_args: Vec<ValueId> = stack.clone();
 
     let default = block_of(fallthrough).ok_or(CilError::UnsupportedControlFlow)?;
     let mut not_matched = split_edge_to_merge(
@@ -3417,6 +3461,7 @@ fn build_switch(
         local_count,
         locals,
         local_types,
+        &stack_args,
         value_types,
         split_blocks,
         block_count,
@@ -3430,6 +3475,7 @@ fn build_switch(
             local_count,
             locals,
             local_types,
+            &stack_args,
             value_types,
             split_blocks,
             block_count,
@@ -3464,6 +3510,7 @@ fn build_switch(
         local_count,
         locals,
         local_types,
+        &stack_args,
         value_types,
         split_blocks,
         block_count,
@@ -3521,6 +3568,7 @@ fn split_edge_to_merge(
     local_count: usize,
     locals: &[Option<ValueId>],
     local_types: &[MirType],
+    stack: &[ValueId],
     value_types: &mut Vec<MirType>,
     split_blocks: &mut Vec<BasicBlock>,
     block_count: usize,
@@ -3529,7 +3577,7 @@ fn split_edge_to_merge(
         return block;
     }
     let mut insts: Vec<(ValueId, Inst)> = Vec::new();
-    let args = merge_args(
+    let mut args = merge_args(
         true,
         local_count,
         locals,
@@ -3537,6 +3585,7 @@ fn split_edge_to_merge(
         value_types,
         &mut insts,
     );
+    args.extend(stack.iter().copied());
     let index = block_count + split_blocks.len();
     split_blocks.push(BasicBlock {
         params: Vec::new(),

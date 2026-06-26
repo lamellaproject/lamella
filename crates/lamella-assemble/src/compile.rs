@@ -27,7 +27,7 @@ use lamella_syntax::ast::{
     TypeRef, UsingDirective, UsingKind, VariableDeclarator, explicit_interface_member_name,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
-use lamella_syntax::lexer::Normalization;
+use lamella_syntax::lexer::LexOptions;
 use lamella_syntax::parser::parse_compilation_unit_with;
 use lamella_syntax::span::Span;
 use lamella_token::Token;
@@ -180,13 +180,13 @@ pub fn compile_source(
         assembly_name,
         references,
         emit_debug,
-        Normalization::None,
+        LexOptions::default(),
     )
 }
 
-/// Like [`compile_source`], but compares identifiers per `normalization` (9.4.2): `None` keeps raw
-/// code points (the csc-matching default), `Nfc` folds to Unicode Normalization Form C (the
-/// ECMA-334 spec).
+/// Like [`compile_source`], but scans `source` under `options` (9.4.2): how identifiers are
+/// folded (`Normalization`) and whether the csc typed-reference operators (`__makeref`/
+/// `__refvalue`/`__reftype`) are recognized. The defaults match csc and strict ISO-1.
 pub fn compile_source_with(
     source: &str,
     source_path: &str,
@@ -194,9 +194,9 @@ pub fn compile_source_with(
     assembly_name: &str,
     references: &[Assembly],
     emit_debug: bool,
-    normalization: Normalization,
+    options: LexOptions,
 ) -> Compilation {
-    let parsed = parse_compilation_unit_with(source, normalization);
+    let parsed = parse_compilation_unit_with(source, options);
     let parse_diagnostics: Vec<Diagnostic> = parsed
         .diagnostics
         .iter()
@@ -256,13 +256,19 @@ fn compile(
 }
 
 /// The binder model for `unit` over its references: the reference types first,
-/// then the unit's own, with the base chain linked across both.
+/// then the unit's own, with single-part signature names canonicalized and the base chain
+/// linked across both. The canonicalize step matches the diagnostic path
+/// ([`bind_compilation_unit_with_references`], via the binder crate); without it a method
+/// parameter written as a single-part reference type (`void F(Type t)`, resolved through a
+/// `using`) stays unqualified and never matches a qualified argument, so the emit-time call
+/// resolution silently fails ("a call that did not resolve").
 fn reference_model(unit: &CompilationUnit, references: &[Assembly]) -> Model {
     let mut model = Model::new();
     for reference in references {
         load_assembly(&mut model, reference);
     }
     collect_into(&mut model, unit);
+    model.canonicalize_signatures();
     model.link_bases();
     model
 }
@@ -274,8 +280,9 @@ fn build_image(
     references: &[Assembly],
     debug: Option<(&str, &str)>,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
-    let mut tokens = assign_tokens(unit);
-    let mut binder = Binder::with_model(reference_model(unit, references));
+    let model = reference_model(unit, references);
+    let mut tokens = assign_tokens(unit, model.signature_canon());
+    let mut binder = Binder::with_model(model);
     binder.set_defined_symbols(unit.defined_symbols.clone());
     mark_external_value_types(binder.model(), &mut tokens);
     let mut image = ImageBuilder::new(module_name, assembly_name);
@@ -2608,6 +2615,22 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             tokens.insert_struct(&handle);
             mint_member_ref(&get_type_from_handle_reference(), image, tokens);
         }
+        BoundExprKind::MakeRef(operand) => {
+            mint_in_expr(operand, image, tokens);
+            mint_type_token(image, tokens, &operand.ty);
+        }
+        BoundExprKind::RefType(reference) => {
+            mint_in_expr(reference, image, tokens);
+            mint_type_token(image, tokens, &crate::expr::system_type_symbol());
+            let handle = crate::expr::runtime_type_handle_symbol();
+            mint_type_token(image, tokens, &handle);
+            tokens.insert_struct(&handle);
+            mint_member_ref(&get_type_from_handle_reference(), image, tokens);
+        }
+        BoundExprKind::RefValue { reference, target } => {
+            mint_in_expr(reference, image, tokens);
+            mint_type_token(image, tokens, target);
+        }
         _ => {}
     }
 }
@@ -2767,7 +2790,12 @@ fn mint_array_members(array_ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &
 }
 
 fn mint_type_token(image: &mut ImageBuilder, tokens: &mut Tokens, ty: &TypeSymbol) {
+    let canonical = tokens.canonical(ty);
+    let ty = &canonical;
     if tokens.type_token(ty).is_some() {
+        return;
+    }
+    if crate::expr::is_typed_reference(ty) {
         return;
     }
     let reference = match ty {
@@ -3159,6 +3187,8 @@ fn declares_instance_constructor(declaration: &TypeDecl) -> bool {
 /// Maps a bound type to its signature form. A named type resolves to the `Class`
 /// of its `TypeDef` token; array types come later.
 fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitError> {
+    let canonical = tokens.canonical(ty);
+    let ty = &canonical;
     let special = match ty {
         TypeSymbol::Special(SpecialType::Decimal) => {
             return tokens.type_token(ty).map(TypeSig::ValueType).ok_or(
@@ -3166,6 +3196,9 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
             );
         }
         TypeSymbol::Special(special) => special,
+        TypeSymbol::Named(_) if crate::expr::is_typed_reference(ty) => {
+            return Ok(TypeSig::TypedByRef);
+        }
         TypeSymbol::Named(_) if tokens.is_struct(ty) || tokens.is_enum(ty) => {
             return tokens.type_token(ty).map(TypeSig::ValueType).ok_or(
                 crate::EmitError::Unsupported("a value type outside this module in a signature"),
@@ -3220,9 +3253,12 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
 
 /// Walks the unit in emission order, assigning each method its `MethodDef` token
 /// (`1..`) so a body can name a forward call. The order must match the emission
-/// walk so the tokens line up with the rows `add_method` produces.
-fn assign_tokens(unit: &CompilationUnit) -> Tokens {
+/// walk so the tokens line up with the rows `add_method` produces. `canon` (from the binder
+/// model) is installed first so the single-part signature names this records key the same as the
+/// binder's qualified ones -- set before any insert, so look-ups (also canonicalized) agree.
+fn assign_tokens(unit: &CompilationUnit, canon: lamella_binder::SignatureCanon) -> Tokens {
     let mut tokens = Tokens::new();
+    tokens.set_canon(canon);
     let mut next_type = 1u32;
     let mut next_field = 0u32;
     let mut next_method = 0u32;
@@ -4287,6 +4323,27 @@ mod tests {
         let result = compile_unit(&unit, "c.dll", "c");
         assert!(!result.diagnostics.is_empty());
         assert!(result.image.is_none());
+    }
+
+    #[test]
+    fn a_call_taking_a_single_part_imported_type_resolves_at_emit() {
+        let unit = parse_compilation_unit(
+            "using N; namespace N { class Foo { } } \
+             class Program { static void F(Foo f) { } \
+             static int Main() { F(new Foo()); return 0; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "app.dll", "app");
+        assert!(
+            result.diagnostics.iter().all(|d| !d.is_error()),
+            "unexpected diagnostics: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.image.is_some(),
+            "the call must resolve and emit (emit_error: {:?})",
+            result.emit_error
+        );
     }
 
     #[test]

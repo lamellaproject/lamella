@@ -3,7 +3,7 @@
 use lamella_assemble::{LineMap, compile_source_with};
 use lamella_metadata::Assembly;
 use lamella_syntax::decode::decode_source;
-use lamella_syntax::lexer::Normalization;
+use lamella_syntax::lexer::{LexOptions, Normalization};
 use std::process::ExitCode;
 
 /// The parsed command line.
@@ -12,8 +12,9 @@ struct Options {
     output: Option<String>,
     references: Vec<String>,
     emit_debug: bool,
-    /// How identifiers are compared (9.4.2); `None` (raw, matching csc) by default.
-    normalization: Normalization,
+    /// The lexer dialect knobs (9.4.2): identifier folding and the csc typed-reference
+    /// operators. Both default off -- raw identifiers (matching csc) and strict ISO-1.
+    lex: LexOptions,
 }
 
 fn main() -> ExitCode {
@@ -43,7 +44,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut output = None;
     let mut references = Vec::new();
     let mut emit_debug = true;
-    let mut normalization = Normalization::None;
+    let mut lex = LexOptions::default();
     for arg in args {
         if let Some(path) = strip_option(arg, &["/reference:", "-r:", "--reference="]) {
             references.push(path.to_owned());
@@ -57,7 +58,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             arg.as_str(),
             "/normalize-identifiers" | "--normalize-identifiers"
         ) {
-            normalization = Normalization::Nfc;
+            lex.normalization = Normalization::Nfc;
+        } else if matches!(arg.as_str(), "/typedref" | "--typedref") {
+            lex.typedref = true;
         } else if arg.starts_with("/target:") || arg == "/nologo" {
         } else if arg.starts_with('-') || (arg.starts_with('/') && !arg[1..].contains('/')) {
             return Err(format!("unknown option '{arg}'\n{USAGE}"));
@@ -71,15 +74,17 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         output,
         references,
         emit_debug,
-        normalization,
+        lex,
     })
 }
 
 const USAGE: &str = "usage: lcsc <source.cs> [/out:<path>] [/reference:<dll>]... [/debug-] \
-     [/normalize-identifiers]\n\
+     [/normalize-identifiers] [/typedref]\n\
      compiles a single source file; multi-file compilation is a planned follow-up.\n\
      /normalize-identifiers folds identifiers to NFC per ECMA-334 9.4.2 (off by default, to \
-     match csc).";
+     match csc).\n\
+     /typedref enables csc's undocumented __makeref/__refvalue/__reftype operators (off by \
+     default; they are not in ECMA-334).";
 
 /// The first matching prefix's tail, if `arg` starts with one of `prefixes`.
 fn strip_option<'a>(arg: &'a str, prefixes: &[&str]) -> Option<&'a str> {
@@ -136,7 +141,7 @@ fn compile(options: &Options) -> Result<bool, String> {
         assembly,
         &references,
         options.emit_debug,
-        options.normalization,
+        options.lex,
     );
 
     let lines = LineMap::new(&text);

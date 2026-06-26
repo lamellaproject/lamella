@@ -244,6 +244,10 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
         | BoundExprKind::MethodGroup { receiver, .. } => collect_uses(receiver, used),
         BoundExprKind::Ref { operand, .. }
         | BoundExprKind::Dereference { operand } => collect_uses(operand, used),
+        BoundExprKind::MakeRef(operand) | BoundExprKind::RefType(operand) => {
+            collect_uses(operand, used);
+        }
+        BoundExprKind::RefValue { reference, .. } => collect_uses(reference, used),
         BoundExprKind::StackAlloc { count, .. } => collect_uses(count, used),
         BoundExprKind::Call {
             callee, arguments, ..
@@ -911,6 +915,18 @@ impl Analyzer<'_> {
             }
             BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
                 self.expression(inner, assigned, span);
+            }
+            BoundExprKind::MakeRef(operand) => {
+                self.expression(operand, assigned, span);
+                if let BoundExprKind::Local(name) = &operand.kind {
+                    assigned.insert(name.clone());
+                }
+            }
+            BoundExprKind::RefType(reference) => {
+                self.expression(reference, assigned, span);
+            }
+            BoundExprKind::RefValue { reference, .. } => {
+                self.expression(reference, assigned, span);
             }
             BoundExprKind::Conditional {
                 condition,

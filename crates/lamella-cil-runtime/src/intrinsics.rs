@@ -4461,6 +4461,114 @@ pub fn array_empty(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Opt
     Ok(Some(Value::Object(array)))
 }
 
+/// `Environment.get_TickCount()`: the monotonic millisecond count as `int` (the host clock seam),
+/// wrapping as .NET's does. Zero without a clock.
+///
+/// # Errors
+/// Never errors.
+pub fn environment_tick_count(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(vm.tick_count())))
+}
+
+/// `Environment.get_ProcessorCount()`: the available processor count -- 1 (the device default and the
+/// common embedded core count); a host build may report more once an environment seam is added.
+///
+/// # Errors
+/// Never errors.
+pub fn environment_processor_count(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(1)))
+}
+
+/// `Environment.GetEnvironmentVariable(string)`: an environment variable's value, or `null` when
+/// unset. A device has no environment, so this returns `null` (a host build can supply real values).
+///
+/// # Errors
+/// Never errors.
+pub fn environment_get_variable(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Null))
+}
+
+/// The handle (a heap array of prebuilt `TypedReference`s) + cursor index an `ArgIteratorNative`
+/// call carries: `args[0]` is the RuntimeArgumentHandle `arglist` produced, `args[1]` the cursor.
+#[cfg(feature = "varargs")]
+fn arg_iterator_handle(args: &[Value]) -> Result<(crate::object::ObjectRef, i32), Trap> {
+    let handle = match args.first() {
+        Some(&Value::Object(reference)) => reference,
+        Some(Value::Struct(fields)) => match fields.first() {
+            Some(&Value::Object(reference)) => reference,
+            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+        },
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let index = match args.get(1) {
+        Some(&Value::Int32(index)) => index,
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    Ok((handle, index))
+}
+
+/// `ArgIteratorNative.Cookie(RuntimeArgumentHandle)`: unwrap the handle `arglist` produced to the
+/// VES value ArgIterator stores (the prebuilt TypedReference array) -- identity, since the handle IS
+/// that array; the indirection exists only because C# cannot store a RuntimeArgumentHandle in a field.
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "varargs")]
+pub fn arg_iterator_cookie(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(args.first().cloned().unwrap_or(Value::Null)))
+}
+
+/// `ArgIteratorNative.RemainingCount(RuntimeArgumentHandle, int)`: the count of variable arguments
+/// not yet consumed -- the handle array's length minus the cursor (never negative).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the handle is not the `arglist` array.
+#[cfg(feature = "varargs")]
+pub fn arg_iterator_remaining(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (handle, index) = arg_iterator_handle(args)?;
+    let len = i32::try_from(vm.heap().array_len(handle).unwrap_or(0)).unwrap_or(i32::MAX);
+    Ok(Some(Value::Int32((len - index).max(0))))
+}
+
+/// `ArgIteratorNative.GetArg(RuntimeArgumentHandle, int)`: the `index`-th variable argument as the
+/// `TypedReference` `arglist` prebuilt (a managed pointer to its frame slot + its type handle).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the handle is not the `arglist` array or the index is out of range.
+#[cfg(feature = "varargs")]
+pub fn arg_iterator_get(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (handle, index) = arg_iterator_handle(args)?;
+    let usize_index = usize::try_from(index).map_err(|_| Trap::TypeMismatch(Opcode::Call))?;
+    vm.heap()
+        .array_get(handle, usize_index)
+        .map(Some)
+        .ok_or(Trap::TypeMismatch(Opcode::Call))
+}
+
 /// `System.Type.get_Name` (the `Name` property): the type's simple (unqualified) name --
 /// "Int32", "String", "Program". The receiver `this` is the `Type`, modeled as the type's
 /// asm-folded token; the loader recorded each `typeof`'d type's name under that key.
@@ -4874,6 +4982,347 @@ pub fn assembly_get_type(
     }))
 }
 
+/// `Assembly.get_FullName()`: the assembly's display name (the loader recorded it, keyed by the
+/// assembly id the receiver `this` handle carries in its high 32 bits).
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "NETMFv4_4")]
+pub fn assembly_full_name(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let asm = (reflect_handle(args.first()) as u64 >> 32) as u8;
+    let name = module.assembly_name(asm).unwrap_or("");
+    Ok(Some(alloc_str(vm, name)))
+}
+
+/// `Assembly.GetTypes()`: the assembly's declared types as a `Type[]` of their handles (the loader
+/// recorded them, the `<Module>` pseudo-type excluded). Empty if none recorded.
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "NETMFv4_4")]
+pub fn assembly_get_types(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let asm = (reflect_handle(args.first()) as u64 >> 32) as u8;
+    let elements: Vec<Value> = module
+        .assembly_types(asm)
+        .iter()
+        .map(|&handle| Value::NativeInt(handle as i64))
+        .collect();
+    let array = vm.heap_mut().alloc_array(elements);
+    Ok(Some(Value::Object(array)))
+}
+
+/// A raw native pointer argument (the managed `Marshal` methods pass `IntPtr.ToInt64()`, a `long`).
+fn marshal_ptr(args: &[Value], index: usize) -> u64 {
+    match args.get(index) {
+        Some(&Value::Int64(value)) => value as u64,
+        Some(&Value::Int32(value)) => value as u64,
+        Some(&Value::NativeInt(value)) => value as u64,
+        _ => 0,
+    }
+}
+
+/// An integer value argument (a byte / short / int / long to write), read from its slot.
+fn marshal_int(args: &[Value], index: usize) -> i64 {
+    match args.get(index) {
+        Some(&Value::Int64(value)) => value,
+        Some(&Value::Int32(value)) => i64::from(value),
+        _ => 0,
+    }
+}
+
+/// `Marshal.AllocHGlobal(long)`: allocate `size` zeroed off-heap bytes through the memory seam,
+/// returning the `IntPtr`-encoded base as a `long` (0 == `IntPtr.Zero`: failure or no backend).
+///
+/// # Errors
+/// Never errors (a missing backend yields 0).
+pub fn marshal_alloc_hglobal(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let size = marshal_int(args, 0).max(0) as u64;
+    let ptr = vm.memory_backend().map_or(0, |mem| mem.alloc(size));
+    Ok(Some(Value::Int64(ptr as i64)))
+}
+
+/// `Marshal.FreeHGlobal(long)`: free a block previously returned by [`marshal_alloc_hglobal`].
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_free_hglobal(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let ptr = marshal_ptr(args, 0);
+    if let Some(mem) = vm.memory_backend() {
+        mem.free(ptr);
+    }
+    Ok(None)
+}
+
+/// Reads `N` little-endian bytes at the pointer argument through the memory seam, zero-filling on an
+/// out-of-bounds / missing-backend read. Shared by the `Marshal.Read*` intrinsics.
+fn marshal_read<const N: usize>(vm: &mut Vm, args: &[Value]) -> [u8; N] {
+    let ptr = marshal_ptr(args, 0);
+    let mut buf = [0u8; N];
+    if let Some(mem) = vm.memory_backend() {
+        mem.read(ptr, &mut buf);
+    }
+    buf
+}
+
+/// Writes the little-endian `bytes` at the pointer argument through the memory seam (a no-op out of
+/// bounds / with no backend). Shared by the `Marshal.Write*` intrinsics.
+fn marshal_write(vm: &mut Vm, args: &[Value], bytes: &[u8]) {
+    let ptr = marshal_ptr(args, 0);
+    if let Some(mem) = vm.memory_backend() {
+        mem.write(ptr, bytes);
+    }
+}
+
+/// `Marshal.ReadByte(long)` -> the byte at `ptr` (an `Int32` slot).
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_read_byte(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(marshal_read::<1>(vm, args)[0]))))
+}
+
+/// `Marshal.ReadInt16(long)` -> the 16-bit value at `ptr` (an `Int32` slot).
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_read_int16(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(i16::from_le_bytes(marshal_read::<2>(vm, args))))))
+}
+
+/// `Marshal.ReadInt32(long)` -> the 32-bit value at `ptr`.
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_read_int32(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from_le_bytes(marshal_read::<4>(vm, args)))))
+}
+
+/// `Marshal.ReadInt64(long)` -> the 64-bit value at `ptr` (also backs `ReadIntPtr`).
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_read_int64(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int64(i64::from_le_bytes(marshal_read::<8>(vm, args)))))
+}
+
+/// `Marshal.WriteByte(long, byte)`: write the low byte of the value at `ptr`.
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_write_byte(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    marshal_write(vm, args, &[marshal_int(args, 1) as u8]);
+    Ok(None)
+}
+
+/// `Marshal.WriteInt16(long, short)`: write the 16-bit value (little-endian) at `ptr`.
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_write_int16(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    marshal_write(vm, args, &(marshal_int(args, 1) as i16).to_le_bytes());
+    Ok(None)
+}
+
+/// `Marshal.WriteInt32(long, int)`: write the 32-bit value (little-endian) at `ptr`.
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_write_int32(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    marshal_write(vm, args, &(marshal_int(args, 1) as i32).to_le_bytes());
+    Ok(None)
+}
+
+/// `Marshal.WriteInt64(long, long)`: write the 64-bit value (little-endian) at `ptr` (also backs
+/// `WriteIntPtr`).
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_write_int64(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    marshal_write(vm, args, &marshal_int(args, 1).to_le_bytes());
+    Ok(None)
+}
+
+/// `Marshal.SizeOf(Type)`: the unmanaged size in bytes of a primitive type (`int` -> 4, `long` -> 8,
+/// ...). 0 for a type whose unmanaged size is not modeled here.
+///
+/// # Errors
+/// Never errors.
+pub fn marshal_size_of(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = match args.first() {
+        Some(&Value::NativeInt(handle)) => handle as u64,
+        _ => return Ok(Some(Value::Int32(0))),
+    };
+    let size = module
+        .type_id_by_handle(handle)
+        .and_then(|type_id| module.type_full_name(type_id))
+        .map_or(0, primitive_marshal_size);
+    Ok(Some(Value::Int32(size)))
+}
+
+/// The unmanaged (marshaled) size of a primitive type by its full name, or 0 if not a modeled
+/// primitive. `IntPtr`/`UIntPtr` are 8 (this runtime models a 64-bit native int, matching the .NET 8
+/// oracle). The corpus avoids the .NET default-marshaling quirks (e.g. `bool` as a 4-byte `BOOL`).
+fn primitive_marshal_size(full_name: &str) -> i32 {
+    match full_name {
+        "System.Boolean" | "System.Byte" | "System.SByte" => 1,
+        "System.Char" | "System.Int16" | "System.UInt16" => 2,
+        "System.Int32" | "System.UInt32" | "System.Single" => 4,
+        "System.Int64" | "System.UInt64" | "System.Double" | "System.IntPtr" | "System.UIntPtr" => 8,
+        _ => 0,
+    }
+}
+
+/// `System.IntPtr.FromRawValue(long)`: the raw value as a native int. `IntPtr` is field-less and the
+/// VES carries its value as a [`Value::NativeInt`], so this just rewraps the integer. Backs
+/// `IntPtr.Zero` and Marshal's pointer wrapping.
+///
+/// # Errors
+/// Never errors.
+pub fn intptr_from_raw_value(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = match args.first() {
+        Some(&Value::Int64(v)) => v,
+        Some(&Value::Int32(v)) => i64::from(v),
+        Some(&Value::NativeInt(v)) => v,
+        _ => 0,
+    };
+    Ok(Some(Value::NativeInt(value)))
+}
+
+/// `System.IntPtr.ToRawValue(IntPtr)`: the native int's 64-bit value (a default / field-less `IntPtr`
+/// reads as 0). Backs `IntPtr.ToInt32`/`ToInt64` and Marshal's pointer unwrapping.
+///
+/// # Errors
+/// Never errors.
+pub fn intptr_to_raw_value(
+    _vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = match args.first() {
+        Some(&Value::NativeInt(v)) | Some(&Value::Int64(v)) => v,
+        Some(&Value::Int32(v)) => i64::from(v),
+        _ => 0,
+    };
+    Ok(Some(Value::Int64(value)))
+}
+
+/// `MethodBase.GetParameterCount()`: the number of parameters of the method handle `this` (the
+/// loader recorded them from the method signature).
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_parameter_count(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = reflect_handle(args.first());
+    let count = i32::try_from(module.method_params(handle as u64).len()).unwrap_or(i32::MAX);
+    Ok(Some(Value::Int32(count)))
+}
+
+/// `MethodBase.GetParameterType(int)`: the `index`-th parameter's type, as a `Type` handle (null if
+/// out of range). Backs `ParameterInfo.ParameterType`.
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_parameter_type(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = reflect_handle(args.first());
+    let index = match args.get(1) {
+        Some(&Value::Int32(index)) if index >= 0 => index as usize,
+        _ => return Ok(Some(Value::Null)),
+    };
+    Ok(Some(match module.method_params(handle as u64).get(index) {
+        Some(param) => Value::NativeInt(param.type_handle as i64),
+        None => Value::Null,
+    }))
+}
+
+/// `MethodBase.GetParameterName(int)`: the `index`-th parameter's declared name, as a string (empty
+/// if out of range or unnamed). Backs `ParameterInfo.Name`.
+///
+/// # Errors
+/// Never errors.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_parameter_name(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = reflect_handle(args.first());
+    let index = match args.get(1) {
+        Some(&Value::Int32(index)) if index >= 0 => index as usize,
+        _ => return Ok(Some(alloc_str(vm, ""))),
+    };
+    let name = module
+        .method_params(handle as u64)
+        .get(index)
+        .map_or("", |param| param.name.as_str());
+    Ok(Some(alloc_str(vm, name)))
+}
+
 /// The asm-folded handle a `Type` / `Assembly` reference argument carries (a native int), or 0 for
 /// null. Reflection references are token-only handles, so reference identity is handle equality.
 #[cfg(feature = "NETMFv4_4")]
@@ -5248,6 +5697,32 @@ fn instantiate_attribute(
             .run(module, vm)?;
     }
     Ok(instance)
+}
+
+/// `Type.GetPropertyCustomAttributes(string, bool)`: the custom attributes of the type's named
+/// property. The MANAGED `PropertyInfo` (built from the property's accessors, so it carries no
+/// Property token of its own) routes its `GetCustomAttributes` here; this resolves the loader-recorded
+/// `Property` token and reuses [`get_custom_attributes`]. An empty array if the property does not
+/// exist or has no attributes.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle; propagates an attribute ctor trap.
+pub fn type_property_custom_attributes(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(type_handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    match string_value(vm, args.get(1))
+        .and_then(|name| module.type_property_handle(type_handle as u64, &name))
+    {
+        Some(property_token) => {
+            get_custom_attributes(vm, module, &[Value::NativeInt(property_token as i64)])
+        }
+        None => Ok(Some(Value::Object(vm.heap_mut().alloc_array(Vec::new())))),
+    }
 }
 
 /// `System.Reflection.MemberInfo.GetCustomAttributes(bool)` (the base method `Type`,

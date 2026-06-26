@@ -102,7 +102,7 @@ fn const_value(c: &Const) -> Result<Value, Trap> {
 /// -- bignum promotion is not provided. `//` floors toward negative infinity
 /// and `%` takes the divisor's sign (with `x == (x // y) * y + (x % y)`, Python 3.14.6
 /// "Binary arithmetic operations"); a zero divisor raises `ZeroDivisionError`.
-fn binary(op: BinOp, a: Value, b: Value) -> Result<Value, Trap> {
+pub(crate) fn binary(op: BinOp, a: Value, b: Value) -> Result<Value, Trap> {
     let x = i128::from(a.as_int().ok_or(Trap::TypeError)?);
     let y = i128::from(b.as_int().ok_or(Trap::TypeError)?);
     let result: i128 = match op {
@@ -571,6 +571,13 @@ fn exec(
                 let elements = model.unpack_sequence(value, count as usize)?;
                 for &element in elements.iter().rev() {
                     frame.push(element);
+                }
+            }
+            Op::UnpackEx { before, after } => {
+                let value = frame.pop()?;
+                let targets = model.unpack_ex(value, before as usize, after as usize)?;
+                for &target in targets.iter().rev() {
+                    frame.push(target);
                 }
             }
             Op::ListAppend => {

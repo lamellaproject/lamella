@@ -10,9 +10,9 @@ use crate::ast::{
     UnaryOperator, UsingDirective, UsingKind, UsingResource, VariableDeclarator,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::lexer::{Normalization, Tokenized, tokenize, tokenize_with};
+use crate::lexer::{LexOptions, Tokenized, tokenize, tokenize_with};
 use crate::span::Span;
-use crate::token::{Keyword, Punctuator, Token, TokenKind};
+use crate::token::{Keyword, Punctuator, Token, TokenKind, TypedRefKeyword};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::vec::Vec;
@@ -73,20 +73,22 @@ pub struct ParsedCompilationUnit {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Lexes and parses `source` as a whole compilation unit (ECMA-334 1st ed, 16.1). Identifiers are
-/// not normalized (the csc-matching default); use [`parse_compilation_unit_with`] for 9.4.2 NFC.
+/// Lexes and parses `source` as a whole compilation unit (ECMA-334 1st ed, 16.1) under the
+/// default dialect (csc-matching, strict ISO-1); use [`parse_compilation_unit_with`] to pass
+/// [`LexOptions`] (NFC identifiers, the csc typed-reference operators).
 #[must_use]
 pub fn parse_compilation_unit(source: &str) -> ParsedCompilationUnit {
-    parse_compilation_unit_with(source, Normalization::None)
+    parse_compilation_unit_with(source, LexOptions::default())
 }
 
-/// Like [`parse_compilation_unit`], but folds identifiers per `normalization` (9.4.2).
+/// Like [`parse_compilation_unit`], but scans under `options`: identifier folding (9.4.2) and
+/// whether the csc typed-reference operators are recognized.
 #[must_use]
 pub fn parse_compilation_unit_with(
     source: &str,
-    normalization: Normalization,
+    options: LexOptions,
 ) -> ParsedCompilationUnit {
-    let mut parser = Parser::new(tokenize_with(source, normalization));
+    let mut parser = Parser::new(tokenize_with(source, options));
     let unit = parser.parse_compilation_unit();
     ParsedCompilationUnit {
         unit,
@@ -2194,6 +2196,43 @@ impl Parser {
                     Span::new(span.start, end),
                 )
             }
+            TokenKind::TypedRefKeyword(TypedRefKeyword::MakeRef) => {
+                self.bump();
+                let (inner, end) = self.parse_parenthesized_operand();
+                Expr::new(
+                    ExprKind::MakeRef(Box::new(inner)),
+                    Span::new(span.start, end),
+                )
+            }
+            TokenKind::TypedRefKeyword(TypedRefKeyword::RefType) => {
+                self.bump();
+                let (inner, end) = self.parse_parenthesized_operand();
+                Expr::new(
+                    ExprKind::RefType(Box::new(inner)),
+                    Span::new(span.start, end),
+                )
+            }
+            TokenKind::TypedRefKeyword(TypedRefKeyword::RefValue) => {
+                self.bump();
+                self.expect(
+                    Punctuator::OpenParen,
+                    DiagnosticKind::TokenExpected { expected: "(" },
+                );
+                let reference = self.parse_expression();
+                self.expect(
+                    Punctuator::Comma,
+                    DiagnosticKind::TokenExpected { expected: "," },
+                );
+                let target = self.parse_type();
+                let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                Expr::new(
+                    ExprKind::RefValue {
+                        reference: Box::new(reference),
+                        target,
+                    },
+                    Span::new(span.start, end),
+                )
+            }
             TokenKind::Identifier(name) => {
                 self.bump();
                 Expr::new(ExprKind::Name(name), span)
@@ -2691,6 +2730,11 @@ mod tests {
             ExprKind::Dereference(operand) => format!("(deref {})", dump(operand)),
             ExprKind::Checked(inner) => format!("(checked {})", dump(inner)),
             ExprKind::Unchecked(inner) => format!("(unchecked {})", dump(inner)),
+            ExprKind::MakeRef(operand) => format!("(makeref {})", dump(operand)),
+            ExprKind::RefType(operand) => format!("(reftype {})", dump(operand)),
+            ExprKind::RefValue { reference, target } => {
+                format!("(refvalue {} {})", dump(reference), dump_type(target))
+            }
             ExprKind::TypeTest {
                 operation,
                 operand,
@@ -3103,6 +3147,28 @@ mod tests {
     fn binary_operators_are_left_associative() {
         assert_eq!(tree("1 - 2 - 3"), "(- (- 1 2) 3)");
         assert_eq!(tree("a / b / c"), "(/ (/ a b) c)");
+    }
+
+    #[test]
+    fn typedref_operators_parse_only_under_the_knob() {
+        let typedref = LexOptions {
+            typedref: true,
+            ..LexOptions::default()
+        };
+        let parse = |source: &str| -> String {
+            let mut parser = Parser::new(tokenize_with(source, typedref));
+            let expr = parser.parse_expression();
+            assert!(
+                parser.diagnostics.is_empty(),
+                "unexpected diagnostics for {source:?}: {:?}",
+                parser.diagnostics
+            );
+            dump(&expr)
+        };
+        assert_eq!(parse("__makeref(x)"), "(makeref x)");
+        assert_eq!(parse("__reftype(tr)"), "(reftype tr)");
+        assert_eq!(parse("__refvalue(tr, int)"), "(refvalue tr int)");
+        assert_eq!(tree("__makeref(x)"), "(call __makeref x)");
     }
 
     #[test]

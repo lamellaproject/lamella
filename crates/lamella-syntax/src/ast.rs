@@ -132,6 +132,22 @@ pub enum ExprKind {
     Checked(Box<Expr>),
     /// An `unchecked ( expression )` (14.5.12), forcing overflow checking off.
     Unchecked(Box<Expr>),
+    /// A `__makeref ( variable )`: csc's typed-reference constructor (parsed only under
+    /// [`crate::lexer::LexOptions::typedref`]). The operand is a variable; the result is a
+    /// `System.TypedReference` pairing its address with its static type. Lowers to `mkrefany`.
+    MakeRef(Box<Expr>),
+    /// A `__reftype ( reference )`: the runtime `System.Type` of a typed reference. Lowers to
+    /// `refanytype` followed by `Type.GetTypeFromHandle`.
+    RefType(Box<Expr>),
+    /// A `__refvalue ( reference , type )`: the referent of a typed reference, viewed as `type`
+    /// and usable as an lvalue. Lowers to `refanyval <type>` (then a load, or a store when it is
+    /// an assignment target).
+    RefValue {
+        /// The typed-reference operand.
+        reference: Box<Expr>,
+        /// The asserted referent type.
+        target: TypeRef,
+    },
     /// An `is` or `as` type test (14.9.9, 14.9.10): the operand against a type.
     TypeTest {
         /// Whether this is `is` or `as`.

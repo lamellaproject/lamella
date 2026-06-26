@@ -33,6 +33,24 @@ const STR_SPLIT: u32 = 16;
 const STR_ISDECIMAL: u32 = 17;
 const STR_ISNUMERIC: u32 = 18;
 const STR_JOIN: u32 = 19;
+const STR_RFIND: u32 = 20;
+const STR_INDEX: u32 = 21;
+const STR_RINDEX: u32 = 22;
+const STR_CAPITALIZE: u32 = 23;
+const STR_TITLE: u32 = 24;
+const STR_SWAPCASE: u32 = 25;
+const STR_SPLITLINES: u32 = 26;
+const STR_REMOVEPREFIX: u32 = 27;
+const STR_REMOVESUFFIX: u32 = 28;
+const STR_ZFILL: u32 = 29;
+const STR_LJUST: u32 = 30;
+const STR_RJUST: u32 = 31;
+const STR_CENTER: u32 = 32;
+const STR_PARTITION: u32 = 33;
+const STR_RPARTITION: u32 = 34;
+const STR_EXPANDTABS: u32 = 35;
+const STR_ISASCII: u32 = 36;
+const STR_ISIDENTIFIER: u32 = 37;
 
 /// The id of the `str` method `name`, or `None` if `str` has no such method.
 fn str_method_id(name: &str) -> Option<u32> {
@@ -57,22 +75,79 @@ fn str_method_id(name: &str) -> Option<u32> {
         "isdecimal" => Some(STR_ISDECIMAL),
         "isnumeric" => Some(STR_ISNUMERIC),
         "join" => Some(STR_JOIN),
+        "rfind" => Some(STR_RFIND),
+        "index" => Some(STR_INDEX),
+        "rindex" => Some(STR_RINDEX),
+        "capitalize" => Some(STR_CAPITALIZE),
+        "title" => Some(STR_TITLE),
+        "swapcase" => Some(STR_SWAPCASE),
+        "splitlines" => Some(STR_SPLITLINES),
+        "removeprefix" => Some(STR_REMOVEPREFIX),
+        "removesuffix" => Some(STR_REMOVESUFFIX),
+        "zfill" => Some(STR_ZFILL),
+        "ljust" => Some(STR_LJUST),
+        "rjust" => Some(STR_RJUST),
+        "center" => Some(STR_CENTER),
+        "partition" => Some(STR_PARTITION),
+        "rpartition" => Some(STR_RPARTITION),
+        "expandtabs" => Some(STR_EXPANDTABS),
+        "isascii" => Some(STR_ISASCII),
+        "isidentifier" => Some(STR_ISIDENTIFIER),
         _ => None,
     }
 }
 
 const LIST_APPEND: u32 = 0;
 const LIST_POP: u32 = 1;
+const LIST_SORT: u32 = 2;
+const LIST_REVERSE: u32 = 3;
+const LIST_INSERT: u32 = 4;
+const LIST_REMOVE: u32 = 5;
+const LIST_INDEX: u32 = 6;
+const LIST_COUNT: u32 = 7;
+const LIST_EXTEND: u32 = 8;
+const LIST_CLEAR: u32 = 9;
+const LIST_COPY: u32 = 10;
 const DICT_GET: u32 = 0;
 const DICT_KEYS: u32 = 1;
 const DICT_VALUES: u32 = 2;
 const DICT_ITEMS: u32 = 3;
+const DICT_UPDATE: u32 = 4;
+const DICT_POP: u32 = 5;
+const DICT_SETDEFAULT: u32 = 6;
+const DICT_CLEAR: u32 = 7;
+const DICT_COPY: u32 = 8;
+const SET_UNION: u32 = 0;
+const SET_INTERSECTION: u32 = 1;
+const SET_DIFFERENCE: u32 = 2;
+const SET_SYMMETRIC_DIFFERENCE: u32 = 3;
+const SET_ISSUBSET: u32 = 4;
+const SET_ISSUPERSET: u32 = 5;
+const SET_ISDISJOINT: u32 = 6;
+const SET_COPY: u32 = 7;
+const SET_ADD: u32 = 8;
+const SET_DISCARD: u32 = 9;
+const SET_REMOVE: u32 = 10;
+const SET_CLEAR: u32 = 11;
+const SET_POP: u32 = 12;
+const SET_UPDATE: u32 = 13;
+const TUPLE_INDEX: u32 = 0;
+const TUPLE_COUNT: u32 = 1;
 
 /// The `list`-method id for `name`, or `None`.
 fn list_method_id(name: &str) -> Option<u32> {
     match name {
         "append" => Some(LIST_APPEND),
         "pop" => Some(LIST_POP),
+        "sort" => Some(LIST_SORT),
+        "reverse" => Some(LIST_REVERSE),
+        "insert" => Some(LIST_INSERT),
+        "remove" => Some(LIST_REMOVE),
+        "index" => Some(LIST_INDEX),
+        "count" => Some(LIST_COUNT),
+        "extend" => Some(LIST_EXTEND),
+        "clear" => Some(LIST_CLEAR),
+        "copy" => Some(LIST_COPY),
         _ => None,
     }
 }
@@ -84,6 +159,57 @@ fn dict_method_id(name: &str) -> Option<u32> {
         "keys" => Some(DICT_KEYS),
         "values" => Some(DICT_VALUES),
         "items" => Some(DICT_ITEMS),
+        "update" => Some(DICT_UPDATE),
+        "pop" => Some(DICT_POP),
+        "setdefault" => Some(DICT_SETDEFAULT),
+        "clear" => Some(DICT_CLEAR),
+        "copy" => Some(DICT_COPY),
+        _ => None,
+    }
+}
+
+/// The method id for a `set` method `name` -- the full mutable surface.
+fn set_method_id(name: &str) -> Option<u32> {
+    match name {
+        "union" => Some(SET_UNION),
+        "intersection" => Some(SET_INTERSECTION),
+        "difference" => Some(SET_DIFFERENCE),
+        "symmetric_difference" => Some(SET_SYMMETRIC_DIFFERENCE),
+        "issubset" => Some(SET_ISSUBSET),
+        "issuperset" => Some(SET_ISSUPERSET),
+        "isdisjoint" => Some(SET_ISDISJOINT),
+        "copy" => Some(SET_COPY),
+        "add" => Some(SET_ADD),
+        "discard" => Some(SET_DISCARD),
+        "remove" => Some(SET_REMOVE),
+        "clear" => Some(SET_CLEAR),
+        "pop" => Some(SET_POP),
+        "update" => Some(SET_UPDATE),
+        _ => None,
+    }
+}
+
+/// The method id for a `tuple` method `name` -- the immutable sequence queries.
+fn tuple_method_id(name: &str) -> Option<u32> {
+    match name {
+        "index" => Some(TUPLE_INDEX),
+        "count" => Some(TUPLE_COUNT),
+        _ => None,
+    }
+}
+
+/// The method id for a `frozenset` method `name` -- the read-only subset only (a frozenset is
+/// immutable, so `add`/`discard`/`pop`/... are not attributes).
+fn frozenset_method_id(name: &str) -> Option<u32> {
+    match name {
+        "union" => Some(SET_UNION),
+        "intersection" => Some(SET_INTERSECTION),
+        "difference" => Some(SET_DIFFERENCE),
+        "symmetric_difference" => Some(SET_SYMMETRIC_DIFFERENCE),
+        "issubset" => Some(SET_ISSUBSET),
+        "issuperset" => Some(SET_ISSUPERSET),
+        "isdisjoint" => Some(SET_ISDISJOINT),
+        "copy" => Some(SET_COPY),
         _ => None,
     }
 }
@@ -98,8 +224,8 @@ fn dict_method_id(name: &str) -> Option<u32> {
 /// on combining marks, superscript digits, CJK numerics, and the separator controls).
 fn str_predicate(method_id: u32, s: &str) -> bool {
     use lamella_unicode::{
-        general_category, is_lowercase, is_uppercase, is_white_space, numeric_level,
-        GeneralCategory,
+        general_category, is_lowercase, is_uppercase, is_white_space, is_xid_continue,
+        is_xid_start, numeric_level, GeneralCategory,
     };
     let is_titlecase = |cp: u32| general_category(cp) == GeneralCategory::TitlecaseLetter;
     match method_id {
@@ -143,6 +269,14 @@ fn str_predicate(method_id: u32, s: &str) -> bool {
             }
             cased
         }
+        STR_ISASCII => s.chars().all(|c| (c as u32) < 0x80),
+        STR_ISIDENTIFIER => match s.chars().next() {
+            None => false,
+            Some(first) => {
+                (first == '_' || is_xid_start(first as u32))
+                    && s.chars().skip(1).all(|c| is_xid_continue(c as u32))
+            }
+        },
         _ => false,
     }
 }
@@ -442,6 +576,8 @@ pub struct ObjectModel {
     set_type_id: u32,
     /// The GC type-descriptor id of a `super` object `[class, self]`; follows set.
     super_type_id: u32,
+    /// The GC type-descriptor id of a `frozenset` (an immutable set); shares the `sets` arena.
+    frozenset_type_id: u32,
     /// The built-in exception classes (name -> class object), built lazily on first use so a
     /// program that never touches exceptions never allocates them. `BaseException` down to the
     /// concrete leaves; a raised interpreter [`Trap`] instantiates the matching one.
@@ -551,6 +687,12 @@ impl ObjectModel {
             ref_offsets: Vec::new(),
             tagged_offsets: (0..2).map(|i| i * 4).collect(),
         });
+        let frozenset_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
         ObjectModel {
             heap: Heap::new(heap_capacity, descs),
             types,
@@ -571,6 +713,7 @@ impl ObjectModel {
             range_type_id,
             set_type_id,
             super_type_id,
+            frozenset_type_id,
             exception_classes: Vec::new(),
             pending_exception: None,
             globals: Vec::new(),
@@ -633,6 +776,9 @@ impl ObjectModel {
     /// caller falls back to the numeric path -- the one-source-of-truth dispatch both the
     /// interpreter and the AOT `py_binop` intrinsic consume.
     pub fn py_binary(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Result<Option<Value>, Trap> {
+        if self.is_set(lhs) || self.is_frozenset(lhs) {
+            return Ok(Some(self.set_binary_op(op, lhs, rhs)?));
+        }
         let a = self.str_value(lhs).map(String::from);
         let b = self.str_value(rhs).map(String::from);
         match (a, b) {
@@ -652,6 +798,9 @@ impl ObjectModel {
     /// `"a" == 1` is `False`, `"a" < 1` raises). `Ok(None)` when neither operand is an
     /// object, so the caller falls back to the numeric / identity path.
     pub fn py_compare(&self, op: CmpOp, lhs: Value, rhs: Value) -> Result<Option<Value>, Trap> {
+        if self.is_set(lhs) || self.is_frozenset(lhs) {
+            return Ok(Some(self.set_compare(op, lhs, rhs)?));
+        }
         match (self.str_value(lhs), self.str_value(rhs)) {
             (None, None) => Ok(None),
             (Some(a), Some(b)) => {
@@ -922,6 +1071,13 @@ impl ObjectModel {
             .and_then(|i| self.dicts.get(i))
     }
 
+    /// A clone of a dict's `(key, value)` pairs, if `value` is a dict (so a caller can rebuild
+    /// or copy the dict without holding a borrow on the model). `dict(other_dict)`.
+    #[must_use]
+    pub fn dict_entries(&self, value: Value) -> Option<Vec<(Value, Value)>> {
+        self.dict_value(value).cloned()
+    }
+
     /// Whether `value` is a `list`.
     #[must_use]
     pub fn is_list(&self, value: Value) -> bool {
@@ -977,8 +1133,9 @@ impl ObjectModel {
         Ok(Value::from_ref(reference))
     }
 
-    /// Allocates a `set` over `elements`, deduped by value equality, in first-seen order.
-    pub fn new_set(&mut self, elements: Vec<Value>) -> Result<Value, Trap> {
+    /// Allocates a `set`/`frozenset` over `elements`, deduped by value equality in first-seen
+    /// order, into the shared arena under `type_id`.
+    fn alloc_set(&mut self, elements: Vec<Value>, type_id: u32) -> Result<Value, Trap> {
         let mut deduped: Vec<Value> = Vec::new();
         for element in elements {
             if !deduped.iter().any(|e| self.key_eq(*e, element)) {
@@ -987,9 +1144,21 @@ impl ObjectModel {
         }
         let index = self.sets.len() as u32;
         self.sets.push(deduped);
-        let reference = self.heap.alloc(self.set_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.heap.alloc(type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
+    }
+
+    /// Allocates a `set` over `elements`, deduped by value equality, in first-seen order.
+    pub fn new_set(&mut self, elements: Vec<Value>) -> Result<Value, Trap> {
+        let type_id = self.set_type_id;
+        self.alloc_set(elements, type_id)
+    }
+
+    /// Allocates a `frozenset` over `elements` (an immutable set).
+    pub fn new_frozenset(&mut self, elements: Vec<Value>) -> Result<Value, Trap> {
+        let type_id = self.frozenset_type_id;
+        self.alloc_set(elements, type_id)
     }
 
     /// Whether `value` is a `set`.
@@ -998,10 +1167,19 @@ impl ObjectModel {
         self.container_slot(value, self.set_type_id).is_some()
     }
 
-    /// The elements if `value` is a `set`.
+    /// Whether `value` is a `frozenset`.
+    #[must_use]
+    pub fn is_frozenset(&self, value: Value) -> bool {
+        self.container_slot(value, self.frozenset_type_id).is_some()
+    }
+
+    /// The elements if `value` is a `set` or `frozenset` (both back onto the shared arena, so
+    /// every read op -- len, `in`, iteration, repr, truthiness -- works for either).
     fn set_value(&self, value: Value) -> Option<&Vec<Value>> {
-        self.container_slot(value, self.set_type_id)
-            .and_then(|i| self.sets.get(i))
+        let slot = self
+            .container_slot(value, self.set_type_id)
+            .or_else(|| self.container_slot(value, self.frozenset_type_id))?;
+        self.sets.get(slot)
     }
 
     /// Adds `value` to the set (a no-op if an equal element is present) -- `set.add` and the
@@ -1124,15 +1302,20 @@ impl ObjectModel {
             };
         }
         if let Some(elements) = self.set_value(value) {
+            let frozen = self.is_frozenset(value);
             if elements.is_empty() {
-                return String::from("set()");
+                return String::from(if frozen { "frozenset()" } else { "set()" });
             }
             let inner = elements
                 .iter()
                 .map(|&e| self.repr(e))
                 .collect::<Vec<_>>()
                 .join(", ");
-            return alloc::format!("{{{inner}}}");
+            return if frozen {
+                alloc::format!("frozenset({{{inner}}})")
+            } else {
+                alloc::format!("{{{inner}}}")
+            };
         }
         if let Some(entries) = self.dict_value(value) {
             let inner = entries
@@ -1609,6 +1792,33 @@ impl ObjectModel {
         Ok(elements)
     }
 
+    /// Unpacks an iterable for a starred target `a, *b, c = x`: the `before` head elements, then a
+    /// LIST of the middle (`len - before - after` elements), then the `after` tail elements, in
+    /// target order. Fewer than `before + after` elements is a `ValueError`. Works over any
+    /// iterable.
+    pub fn unpack_ex(
+        &mut self,
+        value: Value,
+        before: usize,
+        after: usize,
+    ) -> Result<Vec<Value>, Trap> {
+        let iterator = self.new_iter(value)?;
+        let mut elements = Vec::new();
+        while let Some(element) = self.py_next(iterator)? {
+            elements.push(element);
+        }
+        if elements.len() < before + after {
+            return Err(Trap::ValueError);
+        }
+        let middle_end = elements.len() - after;
+        let middle = self.new_list(elements[before..middle_end].to_vec())?;
+        let mut targets = Vec::with_capacity(before + 1 + after);
+        targets.extend_from_slice(&elements[..before]);
+        targets.push(middle);
+        targets.extend_from_slice(&elements[middle_end..]);
+        Ok(targets)
+    }
+
     /// The class name of an exception instance (`"IndexError"`, ...), for reporting an
     /// uncaught exception; `None` if `exc` is not a class instance with a `str` class name.
     #[must_use]
@@ -1690,6 +1900,18 @@ impl ObjectModel {
             let method_id = dict_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
+        if type_id == self.set_type_id {
+            let method_id = set_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.frozenset_type_id {
+            let method_id = frozenset_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.tuple_type_id {
+            let method_id = tuple_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
         if type_id == self.class_type_id {
             return self.find_in_class(obj, name).ok_or(Trap::AttributeError);
         }
@@ -1748,6 +1970,12 @@ impl ObjectModel {
         if self.is_dict(receiver) {
             return self.call_dict_method(receiver, method_id, args);
         }
+        if self.is_set(receiver) || self.is_frozenset(receiver) {
+            return self.call_set_method(receiver, method_id, args);
+        }
+        if self.is_tuple(receiver) {
+            return self.call_tuple_method(receiver, method_id, args);
+        }
         match method_id {
             STR_UPPER | STR_LOWER => {
                 if !args.is_empty() {
@@ -1790,16 +2018,21 @@ impl ObjectModel {
                 };
                 Ok(Value::from_bool(holds))
             }
-            STR_FIND => {
+            STR_FIND | STR_RFIND | STR_INDEX | STR_RINDEX => {
                 let (sub, start, end) = affix_and_bounds(args)?;
                 let s = self.str_value(receiver).ok_or(Trap::TypeError)?;
                 let sub = self.str_value(sub).ok_or(Trap::TypeError)?;
                 let (a, b) = normalize_bounds(start, end, s.chars().count() as i64);
                 let window = cp_slice(s, a, b);
-                let index = match window.find(sub) {
+                let from_right = method_id == STR_RFIND || method_id == STR_RINDEX;
+                let found = if from_right { window.rfind(sub) } else { window.find(sub) };
+                let index = match found {
                     Some(byte_offset) => a as i32 + window[..byte_offset].chars().count() as i32,
                     None => -1,
                 };
+                if index < 0 && (method_id == STR_INDEX || method_id == STR_RINDEX) {
+                    return Err(Trap::ValueError);
+                }
                 Value::fixnum(index).ok_or(Trap::Overflow)
             }
             STR_STRIP | STR_LSTRIP | STR_RSTRIP => {
@@ -1853,7 +2086,7 @@ impl ObjectModel {
                 Value::fixnum(window.matches(sub).count() as i32).ok_or(Trap::Overflow)
             }
             STR_ISDIGIT | STR_ISALPHA | STR_ISALNUM | STR_ISSPACE | STR_ISUPPER | STR_ISLOWER
-            | STR_ISDECIMAL | STR_ISNUMERIC => {
+            | STR_ISDECIMAL | STR_ISNUMERIC | STR_ISASCII | STR_ISIDENTIFIER => {
                 if !args.is_empty() {
                     return Err(Trap::TypeError);
                 }
@@ -1914,6 +2147,235 @@ impl ObjectModel {
                 };
                 self.new_str(&parts.join(&sep))
             }
+            STR_CAPITALIZE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let mut result = String::new();
+                let mut chars = s.chars();
+                if let Some(first) = chars.next() {
+                    result.extend(first.to_uppercase());
+                    result.extend(chars.flat_map(char::to_lowercase));
+                }
+                self.new_str(&result)
+            }
+            STR_TITLE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let mut result = String::new();
+                let mut prev_cased = false;
+                for c in s.chars() {
+                    let cased = c.is_alphabetic();
+                    if cased && !prev_cased {
+                        result.extend(c.to_uppercase());
+                    } else if cased {
+                        result.extend(c.to_lowercase());
+                    } else {
+                        result.push(c);
+                    }
+                    prev_cased = cased;
+                }
+                self.new_str(&result)
+            }
+            STR_SWAPCASE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let mut result = String::new();
+                for c in s.chars() {
+                    if c.is_uppercase() {
+                        result.extend(c.to_lowercase());
+                    } else if c.is_lowercase() {
+                        result.extend(c.to_uppercase());
+                    } else {
+                        result.push(c);
+                    }
+                }
+                self.new_str(&result)
+            }
+            STR_SPLITLINES => {
+                let keepends = match args {
+                    [] => false,
+                    [k] => self.py_truthy(*k)?.unwrap_or(false),
+                    _ => return Err(Trap::TypeError),
+                };
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let mut lines: Vec<String> = Vec::new();
+                let mut current = String::new();
+                let mut chars = s.chars().peekable();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\n' => {
+                            if keepends {
+                                current.push('\n');
+                            }
+                            lines.push(core::mem::take(&mut current));
+                        }
+                        '\r' => {
+                            let crlf = chars.peek() == Some(&'\n');
+                            if crlf {
+                                chars.next();
+                            }
+                            if keepends {
+                                current.push('\r');
+                                if crlf {
+                                    current.push('\n');
+                                }
+                            }
+                            lines.push(core::mem::take(&mut current));
+                        }
+                        _ => current.push(c),
+                    }
+                }
+                if !current.is_empty() {
+                    lines.push(current);
+                }
+                let mut elems = Vec::with_capacity(lines.len());
+                for line in &lines {
+                    elems.push(self.new_str(line)?);
+                }
+                self.new_list(elems)
+            }
+            STR_REMOVEPREFIX | STR_REMOVESUFFIX => {
+                let [affix] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let affix = String::from(self.str_value(*affix).ok_or(Trap::TypeError)?);
+                let result = if method_id == STR_REMOVEPREFIX {
+                    s.strip_prefix(&affix).unwrap_or(&s)
+                } else {
+                    s.strip_suffix(&affix).unwrap_or(&s)
+                };
+                self.new_str(result)
+            }
+            STR_ZFILL => {
+                let [width] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let width = width.as_int().ok_or(Trap::TypeError)?.max(0) as usize;
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let len = s.chars().count();
+                let result = if len >= width {
+                    s
+                } else {
+                    let pad = "0".repeat(width - len);
+                    let mut chars = s.chars();
+                    if matches!(s.chars().next(), Some('+' | '-')) {
+                        let sign = chars.next().unwrap_or('+');
+                        let mut r = String::new();
+                        r.push(sign);
+                        r.push_str(&pad);
+                        r.push_str(chars.as_str());
+                        r
+                    } else {
+                        let mut r = pad;
+                        r.push_str(&s);
+                        r
+                    }
+                };
+                self.new_str(&result)
+            }
+            STR_LJUST | STR_RJUST | STR_CENTER => {
+                let (width, fill) = match args {
+                    [w] => (w.as_int().ok_or(Trap::TypeError)?, ' '),
+                    [w, f] => {
+                        let fs = self.str_value(*f).ok_or(Trap::TypeError)?;
+                        let mut fc = fs.chars();
+                        match (fc.next(), fc.next()) {
+                            (Some(c), None) => (w.as_int().ok_or(Trap::TypeError)?, c),
+                            _ => return Err(Trap::TypeError),
+                        }
+                    }
+                    _ => return Err(Trap::TypeError),
+                };
+                let width = width.max(0) as usize;
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let len = s.chars().count();
+                if len >= width {
+                    return self.new_str(&s);
+                }
+                let pad = width - len;
+                let (left, right) = match method_id {
+                    STR_LJUST => (0, pad),
+                    STR_RJUST => (pad, 0),
+                    _ => {
+                        let left = pad / 2 + (pad & width & 1);
+                        (left, pad - left)
+                    }
+                };
+                let mut result = String::new();
+                for _ in 0..left {
+                    result.push(fill);
+                }
+                result.push_str(&s);
+                for _ in 0..right {
+                    result.push(fill);
+                }
+                self.new_str(&result)
+            }
+            STR_PARTITION | STR_RPARTITION => {
+                let [sep_val] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let sep = String::from(self.str_value(*sep_val).ok_or(Trap::TypeError)?);
+                if sep.is_empty() {
+                    return Err(Trap::ValueError);
+                }
+                let split = if method_id == STR_PARTITION {
+                    s.find(&sep)
+                } else {
+                    s.rfind(&sep)
+                };
+                let (before, mid, after) = match split {
+                    Some(byte) => (&s[..byte], sep.as_str(), &s[byte + sep.len()..]),
+                    None if method_id == STR_PARTITION => (s.as_str(), "", ""),
+                    None => ("", "", s.as_str()),
+                };
+                let parts = alloc::vec![
+                    self.new_str(before)?,
+                    self.new_str(mid)?,
+                    self.new_str(after)?,
+                ];
+                self.new_tuple(parts)
+            }
+            STR_EXPANDTABS => {
+                let tabsize = match args {
+                    [] => 8,
+                    [t] => t.as_int().ok_or(Trap::TypeError)?,
+                    _ => return Err(Trap::TypeError),
+                };
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let mut result = String::new();
+                let mut column: i64 = 0;
+                for c in s.chars() {
+                    match c {
+                        '\t' => {
+                            if tabsize > 0 {
+                                let spaces = tabsize - (column % tabsize);
+                                for _ in 0..spaces {
+                                    result.push(' ');
+                                }
+                                column += spaces;
+                            }
+                        }
+                        '\n' | '\r' => {
+                            result.push(c);
+                            column = 0;
+                        }
+                        _ => {
+                            result.push(c);
+                            column += 1;
+                        }
+                    }
+                }
+                self.new_str(&result)
+            }
             _ => Err(Trap::Malformed),
         }
     }
@@ -1948,6 +2410,80 @@ impl ObjectModel {
                     _ => return Err(Trap::TypeError),
                 };
                 Ok(self.seqs[index].remove(at))
+            }
+            LIST_SORT => {
+                let mut elements = core::mem::take(&mut self.seqs[index]);
+                let outcome = self.sort_values(&mut elements);
+                self.seqs[index] = elements;
+                outcome.map(|()| Value::NONE)
+            }
+            LIST_REVERSE => {
+                self.seqs[index].reverse();
+                Ok(Value::NONE)
+            }
+            LIST_INSERT => {
+                let [at, value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let len = self.seqs[index].len() as i64;
+                let mut i = at.as_int().ok_or(Trap::TypeError)?;
+                if i < 0 {
+                    i = (i + len).max(0);
+                }
+                let pos = i.min(len) as usize;
+                self.seqs[index].insert(pos, *value);
+                Ok(Value::NONE)
+            }
+            LIST_REMOVE => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                match self.seqs[index].iter().position(|e| self.key_eq(*e, *value)) {
+                    Some(p) => {
+                        self.seqs[index].remove(p);
+                        Ok(Value::NONE)
+                    }
+                    None => Err(Trap::ValueError),
+                }
+            }
+            LIST_INDEX => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                match self.seqs[index].iter().position(|e| self.key_eq(*e, *value)) {
+                    Some(p) => Value::fixnum(p as i32).ok_or(Trap::Overflow),
+                    None => Err(Trap::ValueError),
+                }
+            }
+            LIST_COUNT => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let n = self.seqs[index]
+                    .iter()
+                    .filter(|e| self.key_eq(**e, *value))
+                    .count();
+                Value::fixnum(n as i32).ok_or(Trap::Overflow)
+            }
+            LIST_EXTEND => {
+                let [iterable] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let iterator = self.new_iter(*iterable)?;
+                let mut items = Vec::new();
+                while let Some(item) = self.py_next(iterator)? {
+                    items.push(item);
+                }
+                self.seqs[index].extend(items);
+                Ok(Value::NONE)
+            }
+            LIST_CLEAR => {
+                self.seqs[index].clear();
+                Ok(Value::NONE)
+            }
+            LIST_COPY => {
+                let copy = self.seqs[index].clone();
+                self.new_list(copy)
             }
             _ => Err(Trap::AttributeError),
         }
@@ -1987,8 +2523,312 @@ impl ObjectModel {
                 }
                 self.new_list(items)
             }
+            DICT_UPDATE => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let pairs = if let Some(entries) = self.dict_entries(*other) {
+                    entries
+                } else {
+                    let iterator = self.new_iter(*other)?;
+                    let mut kv = Vec::new();
+                    while let Some(pair) = self.py_next(iterator)? {
+                        let parts = self.unpack_sequence(pair, 2)?;
+                        kv.push((parts[0], parts[1]));
+                    }
+                    kv
+                };
+                for (key, value) in pairs {
+                    match self.dicts[index].iter().position(|(k, _)| self.key_eq(*k, key)) {
+                        Some(slot) => self.dicts[index][slot].1 = value,
+                        None => self.dicts[index].push((key, value)),
+                    }
+                }
+                Ok(Value::NONE)
+            }
+            DICT_POP => {
+                let (key, default) = match args {
+                    [k] => (*k, None),
+                    [k, d] => (*k, Some(*d)),
+                    _ => return Err(Trap::TypeError),
+                };
+                match self.dicts[index].iter().position(|(k, _)| self.key_eq(*k, key)) {
+                    Some(slot) => Ok(self.dicts[index].remove(slot).1),
+                    None => default.ok_or(Trap::KeyError),
+                }
+            }
+            DICT_SETDEFAULT => {
+                let (key, default) = match args {
+                    [k] => (*k, Value::NONE),
+                    [k, d] => (*k, *d),
+                    _ => return Err(Trap::TypeError),
+                };
+                match self.dicts[index].iter().position(|(k, _)| self.key_eq(*k, key)) {
+                    Some(slot) => Ok(self.dicts[index][slot].1),
+                    None => {
+                        self.dicts[index].push((key, default));
+                        Ok(default)
+                    }
+                }
+            }
+            DICT_CLEAR => {
+                self.dicts[index].clear();
+                Ok(Value::NONE)
+            }
+            DICT_COPY => {
+                let copy = self.dicts[index].clone();
+                self.new_dict(copy)
+            }
             _ => Err(Trap::AttributeError),
         }
+    }
+
+    /// Collects any iterable into an owned `Vec` (a set/frozenset or list/tuple is cloned, else
+    /// the iterator protocol drives it) -- the argument side of the set operations.
+    fn collect_elements(&mut self, value: Value) -> Result<Vec<Value>, Trap> {
+        if let Some(elems) = self.set_value(value) {
+            return Ok(elems.clone());
+        }
+        if let Some(elems) = self.seq_value(value) {
+            return Ok(elems.clone());
+        }
+        let iterator = self.new_iter(value)?;
+        let mut elems = Vec::new();
+        while let Some(item) = self.py_next(iterator)? {
+            elems.push(item);
+        }
+        Ok(elems)
+    }
+
+    /// The union of `a` and `b`: `a`'s elements, then `b`'s new ones.
+    fn set_union_elems(&self, a: &[Value], b: &[Value]) -> Vec<Value> {
+        let mut result = a.to_vec();
+        for &e in b {
+            if !result.iter().any(|x| self.key_eq(*x, e)) {
+                result.push(e);
+            }
+        }
+        result
+    }
+
+    /// The elements of `a` that are (intersection) / are not (difference) also in `b`.
+    fn set_filter_elems(&self, a: &[Value], b: &[Value], keep_common: bool) -> Vec<Value> {
+        a.iter()
+            .copied()
+            .filter(|&x| b.iter().any(|&y| self.key_eq(x, y)) == keep_common)
+            .collect()
+    }
+
+    /// Whether every element of `a` is in `b` (`a` is a subset of `b`).
+    fn set_subset(&self, a: &[Value], b: &[Value]) -> bool {
+        a.iter().all(|&x| b.iter().any(|&y| self.key_eq(x, y)))
+    }
+
+    /// Whether `a` and `b` share no element.
+    fn set_disjoint(&self, a: &[Value], b: &[Value]) -> bool {
+        !a.iter().any(|&x| b.iter().any(|&y| self.key_eq(x, y)))
+    }
+
+    /// Dispatches a `tuple` method: `index(x)` (the first position, `ValueError` if absent) and
+    /// `count(x)` -- the immutable sequence reads over the shared arena.
+    fn call_tuple_method(&mut self, tuple: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
+        let index = self.container_slot(tuple, self.tuple_type_id).ok_or(Trap::TypeError)?;
+        let [value] = args else {
+            return Err(Trap::TypeError);
+        };
+        match method_id {
+            TUPLE_INDEX => match self.seqs[index].iter().position(|e| self.key_eq(*e, *value)) {
+                Some(p) => Value::fixnum(p as i32).ok_or(Trap::Overflow),
+                None => Err(Trap::ValueError),
+            },
+            TUPLE_COUNT => {
+                let n = self.seqs[index].iter().filter(|e| self.key_eq(**e, *value)).count();
+                Value::fixnum(n as i32).ok_or(Trap::Overflow)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a `set`/`frozenset` method. The algebra (union/intersection/difference/
+    /// symmetric_difference) returns a NEW set of the receiver's kind; the predicates
+    /// (issubset/issuperset/isdisjoint) a bool; the mutators (add/discard/remove/clear/pop/
+    /// update) act in place (only a mutable set reaches them). An argument is any iterable.
+    fn call_set_method(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        let frozen = self.is_frozenset(receiver);
+        match method_id {
+            SET_COPY => {
+                let elems = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                if frozen {
+                    self.new_frozenset(elems)
+                } else {
+                    self.new_set(elems)
+                }
+            }
+            SET_UNION | SET_INTERSECTION | SET_DIFFERENCE | SET_SYMMETRIC_DIFFERENCE => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                let b = self.collect_elements(*other)?;
+                let result = match method_id {
+                    SET_UNION => self.set_union_elems(&a, &b),
+                    SET_INTERSECTION => self.set_filter_elems(&a, &b, true),
+                    SET_DIFFERENCE => self.set_filter_elems(&a, &b, false),
+                    _ => {
+                        let mut r = self.set_filter_elems(&a, &b, false);
+                        r.extend(self.set_filter_elems(&b, &a, false));
+                        r
+                    }
+                };
+                if frozen {
+                    self.new_frozenset(result)
+                } else {
+                    self.new_set(result)
+                }
+            }
+            SET_ISSUBSET | SET_ISSUPERSET | SET_ISDISJOINT => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                let b = self.collect_elements(*other)?;
+                let result = match method_id {
+                    SET_ISSUBSET => self.set_subset(&a, &b),
+                    SET_ISSUPERSET => self.set_subset(&b, &a),
+                    _ => self.set_disjoint(&a, &b),
+                };
+                Ok(Value::from_bool(result))
+            }
+            SET_ADD => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                self.set_add(receiver, *value)?;
+                Ok(Value::NONE)
+            }
+            SET_DISCARD | SET_REMOVE => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let slot = self.container_slot(receiver, self.set_type_id).ok_or(Trap::TypeError)?;
+                match self.sets[slot].iter().position(|e| self.key_eq(*e, *value)) {
+                    Some(p) => {
+                        self.sets[slot].remove(p);
+                        Ok(Value::NONE)
+                    }
+                    None if method_id == SET_REMOVE => Err(Trap::KeyError),
+                    None => Ok(Value::NONE),
+                }
+            }
+            SET_CLEAR => {
+                let slot = self.container_slot(receiver, self.set_type_id).ok_or(Trap::TypeError)?;
+                self.sets[slot].clear();
+                Ok(Value::NONE)
+            }
+            SET_POP => {
+                let slot = self.container_slot(receiver, self.set_type_id).ok_or(Trap::TypeError)?;
+                if self.sets[slot].is_empty() {
+                    return Err(Trap::KeyError);
+                }
+                Ok(self.sets[slot].remove(0))
+            }
+            SET_UPDATE => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let b = self.collect_elements(*other)?;
+                let slot = self.container_slot(receiver, self.set_type_id).ok_or(Trap::TypeError)?;
+                for e in b {
+                    if !self.sets[slot].iter().any(|x| self.key_eq(*x, e)) {
+                        self.sets[slot].push(e);
+                    }
+                }
+                Ok(Value::NONE)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// `set <op> set` for the `| & - ^` operators (both operands must be sets/frozensets); the
+    /// result takes the LEFT operand's kind.
+    pub(crate) fn set_binary_op(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, Trap> {
+        let a_elems = self.set_value(a).ok_or(Trap::TypeError)?.clone();
+        let b_elems = self.set_value(b).ok_or(Trap::TypeError)?.clone();
+        let result = match op {
+            BinOp::BitOr => self.set_union_elems(&a_elems, &b_elems),
+            BinOp::BitAnd => self.set_filter_elems(&a_elems, &b_elems, true),
+            BinOp::Sub => self.set_filter_elems(&a_elems, &b_elems, false),
+            BinOp::BitXor => {
+                let mut r = self.set_filter_elems(&a_elems, &b_elems, false);
+                r.extend(self.set_filter_elems(&b_elems, &a_elems, false));
+                r
+            }
+            _ => return Err(Trap::TypeError),
+        };
+        if self.is_frozenset(a) {
+            self.new_frozenset(result)
+        } else {
+            self.new_set(result)
+        }
+    }
+
+    /// `set <cmp> other`: == / != by element equality (a non-set `other` simply compares unequal,
+    /// not an error); < <= > >= are (proper) subset/superset and require `other` to be a set.
+    pub(crate) fn set_compare(&self, op: CmpOp, a: Value, b: Value) -> Result<Value, Trap> {
+        let a_elems = self.set_value(a).ok_or(Trap::TypeError)?;
+        let b_set = self.set_value(b);
+        let value = match op {
+            CmpOp::Eq | CmpOp::Ne => {
+                let equal = match b_set {
+                    Some(b_elems) => {
+                        self.set_subset(a_elems, b_elems) && self.set_subset(b_elems, a_elems)
+                    }
+                    None => false,
+                };
+                if matches!(op, CmpOp::Ne) {
+                    !equal
+                } else {
+                    equal
+                }
+            }
+            CmpOp::Le => self.set_subset(a_elems, b_set.ok_or(Trap::TypeError)?),
+            CmpOp::Ge => self.set_subset(b_set.ok_or(Trap::TypeError)?, a_elems),
+            CmpOp::Lt => {
+                let b_elems = b_set.ok_or(Trap::TypeError)?;
+                self.set_subset(a_elems, b_elems) && !self.set_subset(b_elems, a_elems)
+            }
+            CmpOp::Gt => {
+                let b_elems = b_set.ok_or(Trap::TypeError)?;
+                self.set_subset(b_elems, a_elems) && !self.set_subset(a_elems, b_elems)
+            }
+        };
+        Ok(Value::from_bool(value))
+    }
+
+    /// Sorts `elements` in place by Python ordering: all-int numerically, all-str
+    /// lexicographically; a mixed or otherwise unorderable set is a `TypeError`. Shared by
+    /// `list.sort` and the `sorted` built-in.
+    pub(crate) fn sort_values(&self, elements: &mut [Value]) -> Result<(), Trap> {
+        if elements.iter().all(|e| e.as_int().is_some()) {
+            elements.sort_by_key(|e| e.as_int().unwrap_or(0));
+        } else if elements.iter().all(|e| self.str_value(*e).is_some()) {
+            let mut keyed: Vec<(String, Value)> = elements
+                .iter()
+                .map(|e| (String::from(self.str_value(*e).unwrap_or("")), *e))
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            for (slot, (_, value)) in keyed.into_iter().enumerate() {
+                elements[slot] = value;
+            }
+        } else {
+            return Err(Trap::TypeError);
+        }
+        Ok(())
     }
 }
 
@@ -2513,6 +3353,53 @@ mod tests {
         let empty = model.new_set(Vec::new()).unwrap();
         assert_eq!(model.repr(empty), "set()");
         assert_eq!(model.py_truthy(empty).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn frozenset_object() {
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let fs = model.new_frozenset(alloc::vec![n(1), n(2), n(2), n(3)]).unwrap();
+        assert!(model.is_frozenset(fs));
+        assert!(!model.is_set(fs));
+        assert_eq!(model.py_len(fs).unwrap().as_fixnum(), Some(3));
+        assert_eq!(model.repr(fs), "frozenset({1, 2, 3})");
+        assert!(model.py_contains(fs, n(2)).unwrap());
+        assert!(!model.py_contains(fs, n(7)).unwrap());
+        assert_eq!(model.py_truthy(fs).unwrap(), Some(true));
+        assert_eq!(model.set_add(fs, n(9)), Err(Trap::TypeError));
+        let empty = model.new_frozenset(Vec::new()).unwrap();
+        assert_eq!(model.repr(empty), "frozenset()");
+        assert_eq!(model.py_truthy(empty).unwrap(), Some(false));
+    }
+
+    #[test]
+    fn set_algebra() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let a = model.new_set(alloc::vec![n(1), n(2), n(3)]).unwrap();
+        let b = model.new_set(alloc::vec![n(3), n(4), n(5)]).unwrap();
+        let union = model.set_binary_op(BinOp::BitOr, a, b).unwrap();
+        assert_eq!(model.py_len(union).unwrap().as_fixnum(), Some(5));
+        let inter = model.set_binary_op(BinOp::BitAnd, a, b).unwrap();
+        assert_eq!(model.py_len(inter).unwrap().as_fixnum(), Some(1));
+        assert!(model.py_contains(inter, n(3)).unwrap());
+        let diff = model.set_binary_op(BinOp::Sub, a, b).unwrap();
+        assert_eq!(model.py_len(diff).unwrap().as_fixnum(), Some(2));
+        let symdiff = model.set_binary_op(BinOp::BitXor, a, b).unwrap();
+        assert_eq!(model.py_len(symdiff).unwrap().as_fixnum(), Some(4));
+        let a2 = model.new_set(alloc::vec![n(3), n(2), n(1)]).unwrap();
+        assert_eq!(model.set_compare(CmpOp::Eq, a, a2).unwrap(), Value::TRUE);
+        let one = model.new_set(alloc::vec![n(1)]).unwrap();
+        assert_eq!(model.set_compare(CmpOp::Lt, one, a).unwrap(), Value::TRUE);
+        assert_eq!(model.set_compare(CmpOp::Lt, a, a2).unwrap(), Value::FALSE);
+        let list = model.new_list(alloc::vec![n(1), n(2), n(3)]).unwrap();
+        assert_eq!(model.set_compare(CmpOp::Eq, a, list).unwrap(), Value::FALSE);
+        let fa = model.new_frozenset(alloc::vec![n(1)]).unwrap();
+        let fu = model.set_binary_op(BinOp::BitOr, fa, b).unwrap();
+        assert!(model.is_frozenset(fu));
+        assert_eq!(model.set_binary_op(BinOp::Add, a, b), Err(Trap::TypeError));
+        assert_eq!(model.set_compare(CmpOp::Lt, a, list), Err(Trap::TypeError));
     }
 
     #[test]

@@ -4,7 +4,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use lamella_binder::TypeSymbol;
+use lamella_binder::{SignatureCanon, TypeSymbol};
 use lamella_token::Token;
 
 /// A method's identity as a string key: `Declaring::Name(p0,p1,...)`.
@@ -67,6 +67,12 @@ pub struct Tokens {
     /// a plain `castclass` lowering yet (interface dispatch is an interpreter feature), so
     /// emission distinguishes them.
     interfaces: BTreeSet<String>,
+    /// Canonicalizes single-part signature names to their qualified form before keying, so a
+    /// parameter/field collected structurally as `StringBuilder` keys (and serializes) the same
+    /// as the binder's `System.Text.StringBuilder` -- a forward call resolved against the model's
+    /// qualified signature then finds the token the syntax-keyed pre-pass recorded. The default
+    /// (empty) canon is the identity, so a table built without one is unchanged.
+    canon: SignatureCanon,
 }
 
 impl Tokens {
@@ -76,48 +82,68 @@ impl Tokens {
         Tokens::default()
     }
 
+    /// Installs the signature canon (built from the binder model) that all keys are normalized
+    /// through. Set BEFORE any member is recorded, so inserts and look-ups key alike.
+    pub fn set_canon(&mut self, canon: SignatureCanon) {
+        self.canon = canon;
+    }
+
+    /// `ty` with single-part named types qualified, as every key is normalized. Emission
+    /// (`type_sig`, token minting) canonicalizes a syntax-derived type through this before it
+    /// branches on the type's shape, so e.g. a single-part `TypedReference` is recognized.
+    #[must_use]
+    pub(crate) fn canonical(&self, ty: &TypeSymbol) -> TypeSymbol {
+        self.canon.canonicalize(ty)
+    }
+
+    /// `parameters` each canonicalized, for a method key.
+    #[must_use]
+    fn canonical_params(&self, parameters: &[TypeSymbol]) -> Vec<TypeSymbol> {
+        parameters.iter().map(|ty| self.canonical(ty)).collect()
+    }
+
     /// Records `token` as the `TypeDef` of this type.
     pub fn insert_type(&mut self, ty: &TypeSymbol, token: Token) {
-        self.types.insert(type_key(ty), token);
+        self.types.insert(type_key(&self.canonical(ty)), token);
     }
 
     /// The `TypeDef` token for this type, if one was recorded.
     #[must_use]
     pub fn type_token(&self, ty: &TypeSymbol) -> Option<Token> {
-        self.types.get(&type_key(ty)).copied()
+        self.types.get(&type_key(&self.canonical(ty))).copied()
     }
 
     /// Records that this type is an enum (its signatures lower to the underlying type).
     pub fn insert_enum(&mut self, ty: &TypeSymbol) {
-        self.enums.insert(type_key(ty));
+        self.enums.insert(type_key(&self.canonical(ty)));
     }
 
     /// Whether this type is an enum declared in the module.
     #[must_use]
     pub fn is_enum(&self, ty: &TypeSymbol) -> bool {
-        self.enums.contains(&type_key(ty))
+        self.enums.contains(&type_key(&self.canonical(ty)))
     }
 
     /// Records that this type is a struct (a value type with `ValueType` signatures).
     pub fn insert_struct(&mut self, ty: &TypeSymbol) {
-        self.structs.insert(type_key(ty));
+        self.structs.insert(type_key(&self.canonical(ty)));
     }
 
     /// Whether this type is a struct (value type) declared in the module.
     #[must_use]
     pub fn is_struct(&self, ty: &TypeSymbol) -> bool {
-        self.structs.contains(&type_key(ty))
+        self.structs.contains(&type_key(&self.canonical(ty)))
     }
 
     /// Records that this type is an interface declared in the module.
     pub fn insert_interface(&mut self, ty: &TypeSymbol) {
-        self.interfaces.insert(type_key(ty));
+        self.interfaces.insert(type_key(&self.canonical(ty)));
     }
 
     /// Whether this type is an interface declared in the module.
     #[must_use]
     pub fn is_interface(&self, ty: &TypeSymbol) -> bool {
-        self.interfaces.contains(&type_key(ty))
+        self.interfaces.contains(&type_key(&self.canonical(ty)))
     }
 
     /// Records `token` as the method named by this identity.
@@ -129,7 +155,7 @@ impl Tokens {
         token: Token,
     ) {
         self.methods
-            .insert(method_key(declaring, name, parameters), token);
+            .insert(method_key(&self.canonical(declaring), name, &self.canonical_params(parameters)), token);
     }
 
     /// The token for the method with this identity, if one was recorded.
@@ -141,19 +167,19 @@ impl Tokens {
         parameters: &[TypeSymbol],
     ) -> Option<Token> {
         self.methods
-            .get(&method_key(declaring, name, parameters))
+            .get(&method_key(&self.canonical(declaring), name, &self.canonical_params(parameters)))
             .copied()
     }
 
     /// Records `token` as the field named by this identity.
     pub fn insert_field(&mut self, declaring: &TypeSymbol, name: &str, token: Token) {
-        self.fields.insert(field_key(declaring, name), token);
+        self.fields.insert(field_key(&self.canonical(declaring), name), token);
     }
 
     /// The token for the field with this identity, if one was recorded.
     #[must_use]
     pub fn field(&self, declaring: &TypeSymbol, name: &str) -> Option<Token> {
-        self.fields.get(&field_key(declaring, name)).copied()
+        self.fields.get(&field_key(&self.canonical(declaring), name)).copied()
     }
 
     /// Records the `ldstr` token for a UTF-16 string literal.

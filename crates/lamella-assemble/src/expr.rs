@@ -164,6 +164,11 @@ pub fn emit_expression(
         } => emit_conditional(condition, when_true, when_false, frame, tokens, out),
         BoundExprKind::TypeOf(target) => emit_typeof(target, tokens, out),
         BoundExprKind::SizeOf(target) => emit_sizeof(target, tokens, out),
+        BoundExprKind::MakeRef(operand) => emit_makeref(operand, frame, tokens, out),
+        BoundExprKind::RefType(reference) => emit_reftype(reference, frame, tokens, out),
+        BoundExprKind::RefValue { reference, target } => {
+            emit_refvalue(reference, target, frame, tokens, out)
+        }
         BoundExprKind::StackAlloc { element, count } => {
             emit_expression(count, frame, tokens, out)?;
             emit_sizeof(element, tokens, out)?;
@@ -1223,6 +1228,25 @@ pub(crate) fn stind_opcode(ty: &TypeSymbol) -> Opcode {
     }
 }
 
+/// Emits the load-through-a-byref instruction for a referent of type `element` (the managed
+/// pointer is already on the stack): `ldobj <token>` for a value type (struct/enum -- there is
+/// no `ldind` for one), else the width-appropriate `ldind`. The mirror of [`emit_byref_store`].
+pub(crate) fn emit_byref_load(
+    element: &TypeSymbol,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if tokens.is_struct(element) || tokens.is_enum(element) {
+        let token = tokens
+            .type_token(element)
+            .ok_or(EmitError::Unsupported("byref referent type has no token"))?;
+        out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
+    } else {
+        out.push(Instruction::simple(ldind_opcode(element)));
+    }
+    Ok(())
+}
+
 /// Emits the store-through-a-byref instruction for a referent of type `element` (the
 /// address and value are already on the stack): `stobj <token>` for a value type
 /// (struct/enum -- there is no `stind` for one), else the width-appropriate `stind`.
@@ -1383,6 +1407,67 @@ pub(crate) fn system_type_symbol() -> TypeSymbol {
 /// `System.RuntimeTypeHandle` -- the value `ldtoken` pushes for a type.
 pub(crate) fn runtime_type_handle_symbol() -> TypeSymbol {
     TypeSymbol::Named([Box::from("System"), Box::from("RuntimeTypeHandle")].into())
+}
+
+/// Whether `ty` is `System.TypedReference`, the special byref-like type whose signature element
+/// is `TYPEDBYREF` (it is not a value type named by a token).
+pub(crate) fn is_typed_reference(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Named(parts)
+        if parts.len() == 2 && &*parts[0] == "System" && &*parts[1] == "TypedReference")
+}
+
+/// Lowers `__makeref(variable)`: take the variable's address (a managed pointer), then
+/// `mkrefany <variable type>` pairs it with the type into a `TypedReference`.
+fn emit_makeref(
+    operand: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    emit_value_type_receiver(operand, frame, tokens, out)?;
+    let token = tokens
+        .type_token(&operand.ty)
+        .ok_or(EmitError::Unsupported("__makeref operand type has no token"))?;
+    out.push(Instruction::new(Opcode::Mkrefany, Operand::Token(token)));
+    Ok(())
+}
+
+/// Lowers `__refvalue(reference, T)` in value position: `refanyval <T>` recovers the managed
+/// pointer (trapping if the reference was not made over `T`), then it is loaded through.
+fn emit_refvalue(
+    reference: &BoundExpr,
+    target: &TypeSymbol,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    emit_expression(reference, frame, tokens, out)?;
+    let token = tokens
+        .type_token(target)
+        .ok_or(EmitError::Unsupported("__refvalue type has no token"))?;
+    out.push(Instruction::new(Opcode::Refanyval, Operand::Token(token)));
+    emit_byref_load(target, tokens, out)
+}
+
+/// Lowers `__reftype(reference)`: `refanytype` recovers the referent's type as a
+/// RuntimeTypeHandle, then `System.Type::GetTypeFromHandle` turns it into a `System.Type`.
+fn emit_reftype(
+    reference: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    emit_expression(reference, frame, tokens, out)?;
+    out.push(Instruction::simple(Opcode::Refanytype));
+    let method = tokens
+        .method(
+            &system_type_symbol(),
+            "GetTypeFromHandle",
+            &[runtime_type_handle_symbol()],
+        )
+        .ok_or(EmitError::Unsupported("Type::GetTypeFromHandle was not minted"))?;
+    out.push(Instruction::new(Opcode::Call, Operand::Token(method)));
+    Ok(())
 }
 
 /// Emits string value comparison: `call bool String::op_Equality(string, string)`,

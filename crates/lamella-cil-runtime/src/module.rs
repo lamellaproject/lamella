@@ -116,6 +116,16 @@ pub struct ReflectMethod {
     pub is_public: bool,
 }
 
+/// One parameter of a method, for `System.Reflection.ParameterInfo` (a `MethodBase.GetParameters`
+/// entry): the parameter's asm-folded type handle (its `ParameterType`) and its declared name.
+#[derive(Clone, Debug)]
+pub struct MethodParam {
+    /// The parameter's type as an asm-folded type handle (the `Type` `ParameterType` returns).
+    pub type_handle: u64,
+    /// The parameter's declared name (empty if the metadata records none).
+    pub name: String,
+}
+
 /// A declared reference type's runtime shape: the zero value of each instance field
 /// (one per declaration-order slot, copied when allocating an instance) and its
 /// virtual method table.
@@ -190,6 +200,21 @@ impl Method {
     }
 }
 
+/// The variable-argument info a vararg `call` site carries beyond the fixed parameters (II.23.2.1):
+/// what the interpreter threads to the callee so `arglist` / `System.ArgIterator` can walk the extra
+/// arguments. The fixed args are passed like any call; these describe the variadic tail.
+#[derive(Clone, Debug)]
+pub struct VarargSite {
+    /// The total stack arguments the call passes (`this`? + fixed + variable) -- the count to take
+    /// off the caller's evaluation stack (vs the callee's defined fixed-parameter count).
+    pub total_args: u16,
+    /// The callee-frame argument index at which the variable arguments begin (`this`? + fixed count).
+    pub vararg_start: u16,
+    /// The asm-folded type handle of each variable argument, in order -- so `arglist` builds a
+    /// correctly-typed `TypedReference` for each, the same handle `ldtoken` / `refanytype` carry.
+    pub var_types: Vec<u64>,
+}
+
 /// A collection of methods, the call tokens that name them, and the strings
 /// `ldstr` loads.
 #[derive(Clone, Default)]
@@ -232,6 +257,10 @@ pub struct Module {
     /// dispatching interface / abstract methods whose target has no vtable slot (and
     /// may have no resolvable body).
     call_targets: BTreeMap<u64, (String, u16)>,
+    /// A vararg `call` token mapped to its [`VarargSite`]: the variable-argument info the call
+    /// passes beyond the fixed parameters, so the interpreter takes the full stack-argument count
+    /// and threads the variable arguments to the callee for `arglist` / `ArgIterator`.
+    vararg_sites: BTreeMap<u64, VarargSite>,
     /// Explicit interface implementations (II.22.27 `MethodImpl`): the implementing body
     /// for a `(declaring TypeId, overridden method handle)` pair. The handle is the
     /// asm-folded token of the interface/virtual method named at the `callvirt` site (the
@@ -379,6 +408,15 @@ pub struct Module {
     /// Each type's methods in declaration order (the `Type.GetMethods` enumeration, constructors
     /// excluded), keyed by the type's asm-folded handle. The `NETMFv4_4` reflection tier only.
     type_methods: BTreeMap<u64, Vec<ReflectMethod>>,
+    /// Each method's parameters (`MethodBase.GetParameters` -> `ParameterInfo[]`), keyed by the
+    /// method's asm-folded handle. The `NETMFv4_4` reflection tier only.
+    method_params: BTreeMap<u64, Vec<MethodParam>>,
+    /// Each loaded assembly's display name (`Assembly.FullName`), keyed by its assembly id. The
+    /// `NETMFv4_4` reflection tier only.
+    assembly_names: BTreeMap<u8, String>,
+    /// Each loaded assembly's declared type handles (`Assembly.GetTypes`, `<Module>` excluded), keyed
+    /// by its assembly id. The `NETMFv4_4` reflection tier only.
+    assembly_types: BTreeMap<u8, Vec<u64>>,
     /// A member's type (a field's `FieldType` or a method's `ReturnType`) as the type's asm-folded
     /// handle, keyed by the member's asm-folded handle. The `NETMFv4_4` reflection tier only.
     member_type_handle: BTreeMap<u64, u64>,
@@ -1190,6 +1228,17 @@ impl Module {
             .map(|(key, count)| (key.as_str(), *count))
     }
 
+    /// Records a vararg `call` token's [`VarargSite`] in assembly `asm`.
+    pub fn bind_vararg_site(&mut self, asm: u8, token: Token, site: VarargSite) {
+        self.vararg_sites.insert(asm_key(asm, token.0), site);
+    }
+
+    /// A `call` token's [`VarargSite`] in assembly `asm`, if it is a vararg call site.
+    #[must_use]
+    pub fn vararg_site(&self, asm: u8, token: Token) -> Option<&VarargSite> {
+        self.vararg_sites.get(&asm_key(asm, token.0))
+    }
+
     /// Records an explicit interface implementation (II.22.27 `MethodImpl`): when `type_id`
     /// is the runtime type, a `callvirt` naming `decl_token` (the overridden interface /
     /// virtual method, in assembly `asm`) dispatches to `body`. The token is folded with its
@@ -1512,6 +1561,39 @@ impl Module {
         self.type_methods
             .get(&type_handle)
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// Records a method's parameters (for `MethodBase.GetParameters`), keyed by its asm-folded handle.
+    pub fn bind_method_params(&mut self, handle: u64, params: Vec<MethodParam>) {
+        self.method_params.insert(handle, params);
+    }
+
+    /// The parameters of the method whose asm-folded handle is `handle` (empty if none recorded).
+    #[must_use]
+    pub fn method_params(&self, handle: u64) -> &[MethodParam] {
+        self.method_params.get(&handle).map_or(&[], Vec::as_slice)
+    }
+
+    /// Records assembly `asm`'s display name (for `Assembly.FullName`).
+    pub fn bind_assembly_name(&mut self, asm: u8, name: String) {
+        self.assembly_names.insert(asm, name);
+    }
+
+    /// Assembly `asm`'s display name, if recorded.
+    #[must_use]
+    pub fn assembly_name(&self, asm: u8) -> Option<&str> {
+        self.assembly_names.get(&asm).map(String::as_str)
+    }
+
+    /// Appends a declared type handle to assembly `asm`'s type list (for `Assembly.GetTypes`).
+    pub fn add_assembly_type(&mut self, asm: u8, handle: u64) {
+        self.assembly_types.entry(asm).or_default().push(handle);
+    }
+
+    /// Assembly `asm`'s declared type handles in declaration order (`Assembly.GetTypes`).
+    #[must_use]
+    pub fn assembly_types(&self, asm: u8) -> &[u64] {
+        self.assembly_types.get(&asm).map_or(&[], Vec::as_slice)
     }
 
     /// Records the type of the member whose asm-folded handle is `handle` -- a field's `FieldType`

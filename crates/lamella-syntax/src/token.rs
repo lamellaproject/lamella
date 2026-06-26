@@ -193,6 +193,21 @@ spelled_enum! {
     }
 }
 
+spelled_enum! {
+    /// An undocumented csc typed-reference operator keyword. These three are NOT part of
+    /// ECMA-334; they are csc's own `__`-prefixed operators over `System.TypedReference`,
+    /// each lowering to an ECMA-335 typed-reference opcode (`mkrefany`/`refanyval`/
+    /// `refanytype`). The lexer recognizes them only when [`LexOptions::typedref`] is on
+    /// (the csc-parity knob); in strict ISO-1 mode they scan as ordinary identifiers.
+    ///
+    /// [`LexOptions::typedref`]: crate::lexer::LexOptions::typedref
+    pub enum TypedRefKeyword {
+        "__makeref" => MakeRef,
+        "__refvalue" => RefValue,
+        "__reftype" => RefType,
+    }
+}
+
 /// The type suffix on an integer literal (9.4.4.2), which constrains its type.
 /// The exact type (int, uint, long, or ulong) is chosen during binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -236,6 +251,12 @@ pub enum TokenKind {
     Identifier(Box<str>),
     /// A keyword (9.4.3).
     Keyword(Keyword),
+    /// One of the undocumented csc typed-reference operators (`__makeref`/`__refvalue`/
+    /// `__reftype`). Produced only in csc-parity mode ([`LexOptions::typedref`]); not an
+    /// ECMA-334 keyword, so it is a kind of its own rather than a [`Keyword`].
+    ///
+    /// [`LexOptions::typedref`]: crate::lexer::LexOptions::typedref
+    TypedRefKeyword(TypedRefKeyword),
     /// An operator or punctuator (9.4.5).
     Punctuator(Punctuator),
     /// An integer literal (9.4.4.2): its value and the type suffix that

@@ -211,6 +211,21 @@ impl Parser {
     /// as the target.
     fn parse_assign_or_expr(&mut self) -> Result<Stmt, ParseError> {
         let target_line = self.current_line();
+        if self.at(&Tok::Star) {
+            self.advance();
+            let first = self.parse_expr()?;
+            let mut targets = vec![self.target_name(first, target_line)?];
+            let mut star = Some(0);
+            self.parse_remaining_targets(&mut targets, &mut star, target_line)?;
+            self.expect(&Tok::Assign, "'=' in the starred assignment")?;
+            let value = self.parse_rhs_value()?;
+            self.expect_newline()?;
+            return Ok(Stmt::TupleAssign {
+                targets,
+                star,
+                value,
+            });
+        }
         let expr = self.parse_expr()?;
         if let Some(op) = aug_assign_op(self.peek()) {
             let target = self.target_name(expr, target_line)?;
@@ -295,22 +310,17 @@ impl Parser {
             }
             Tok::Comma => {
                 let mut targets = vec![self.target_name(expr, target_line)?];
-                while self.eat(&Tok::Comma) {
-                    if self.at(&Tok::Assign) {
-                        break;
-                    }
-                    let t = self.parse_expr()?;
-                    targets.push(self.target_name(t, target_line)?);
-                }
+                let mut star = None;
+                self.parse_remaining_targets(&mut targets, &mut star, target_line)?;
                 self.expect(&Tok::Assign, "'=' in the tuple-unpacking assignment")?;
                 let value = self.parse_rhs_value()?;
                 self.expect_newline()?;
-                if targets.len() < 2 {
+                if star.is_none() && targets.len() < 2 {
                     return Err(
                         self.error("a tuple-unpacking assignment needs two or more targets")
                     );
                 }
-                Ok(Stmt::TupleAssign { targets, value })
+                Ok(Stmt::TupleAssign { targets, star, value })
             }
             _ => {
                 self.expect_newline()?;
@@ -334,6 +344,31 @@ impl Parser {
             elems.push(self.parse_expr()?);
         }
         Ok(Expr::Tuple(elems))
+    }
+
+    /// Parse the rest of an assignment target list after the first target (the leading comma
+    /// not yet consumed), allowing one starred target `*name` and recording its index in
+    /// `star`.
+    fn parse_remaining_targets(
+        &mut self,
+        targets: &mut Vec<String>,
+        star: &mut Option<usize>,
+        line: u32,
+    ) -> Result<(), ParseError> {
+        while self.eat(&Tok::Comma) {
+            if self.at(&Tok::Assign) {
+                break;
+            }
+            if self.eat(&Tok::Star) {
+                if star.is_some() {
+                    return Err(self.error("only one starred target is allowed"));
+                }
+                *star = Some(targets.len());
+            }
+            let t = self.parse_expr()?;
+            targets.push(self.target_name(t, line)?);
+        }
+        Ok(())
     }
 
     /// Require an assignment target to be a bare name (attribute, subscript, and
@@ -398,6 +433,7 @@ impl Parser {
             let mut new_body = Vec::with_capacity(body.len() + 1);
             new_body.push(Stmt::TupleAssign {
                 targets,
+                star: None,
                 value: Expr::Name(tmp.clone()),
             });
             new_body.append(&mut body);
@@ -1437,10 +1473,11 @@ mod tests {
             Stmt::TupleAssign { .. }
         ));
         let m = parse_ok("a, b = 1, 2\n");
-        let Stmt::TupleAssign { targets, value } = &m.body[0] else {
+        let Stmt::TupleAssign { targets, star, value } = &m.body[0] else {
             panic!("expected a tuple assignment");
         };
         assert_eq!(targets, &["a", "b"]);
+        assert_eq!(*star, None);
         assert!(matches!(value, Expr::Tuple(_)));
         let f = parse_ok("for k, v in d:\n    pass\n");
         let Stmt::ForIter { body, .. } = &f.body[0] else {
@@ -1452,6 +1489,25 @@ mod tests {
             Stmt::ForIter { .. }
         ));
         assert!(parse_src("a, = x\n").is_err());
+    }
+
+    #[test]
+    fn starred_unpacking_parses() {
+        let cases = [
+            ("a, *b = seq\n", vec!["a", "b"], Some(1)),
+            ("a, *b, c = seq\n", vec!["a", "b", "c"], Some(1)),
+            ("*a, b = seq\n", vec!["a", "b"], Some(0)),
+            ("*a, = seq\n", vec!["a"], Some(0)),
+        ];
+        for (src, want_targets, want_star) in cases {
+            let m = parse_ok(src);
+            let Stmt::TupleAssign { targets, star, .. } = &m.body[0] else {
+                panic!("expected a starred assignment for {src:?}");
+            };
+            assert_eq!(targets, &want_targets);
+            assert_eq!(*star, want_star);
+        }
+        assert!(parse_src("a, *b, *c = seq\n").is_err());
     }
 
     #[test]

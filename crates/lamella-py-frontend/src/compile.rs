@@ -717,9 +717,15 @@ impl Compiler {
             }
             Stmt::Assign(assign) => self.compile_assign(assign),
             Stmt::MultiAssign { targets, value } => self.compile_multi_assign(targets, value),
-            Stmt::TupleAssign { targets, value } => {
+            Stmt::TupleAssign { targets, star, value } => {
                 self.compile_expr(value)?;
-                self.asm.emit(bc::Op::UnpackSequence(targets.len() as u32));
+                match star {
+                    None => self.asm.emit(bc::Op::UnpackSequence(targets.len() as u32)),
+                    Some(i) => self.asm.emit(bc::Op::UnpackEx {
+                        before: *i as u32,
+                        after: (targets.len() - 1 - i) as u32,
+                    }),
+                }
                 for target in targets {
                     let slot = self
                         .local_slot(target)
@@ -1850,6 +1856,14 @@ mod tests {
         assert!(func(&m, "f").ops.iter().any(|op| matches!(op, Op::UnpackSequence(2))));
         let g = compile_src("def f(d):\n    s = 0\n    for k, v in d:\n        s = s + v\n    return s\n").unwrap();
         assert!(func(&g, "f").ops.iter().any(|op| matches!(op, Op::UnpackSequence(2))));
+    }
+
+    #[test]
+    fn starred_assign_emits_unpack_ex() {
+        let m = compile_src("def f(p):\n    a, *b = p\n    return a\n").unwrap();
+        assert!(func(&m, "f").ops.iter().any(|op| matches!(op, Op::UnpackEx { before: 1, after: 0 })));
+        let m2 = compile_src("def f(p):\n    a, *b, c = p\n    return a\n").unwrap();
+        assert!(func(&m2, "f").ops.iter().any(|op| matches!(op, Op::UnpackEx { before: 1, after: 1 })));
     }
 
     #[test]

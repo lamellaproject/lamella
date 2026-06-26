@@ -985,7 +985,8 @@ fn lower_op(
         | bc::Op::SetAdd
         | bc::Op::DictInsert
         | bc::Op::LoadSuper(_)
-        | bc::Op::BuildSet(_) => {
+        | bc::Op::BuildSet(_)
+        | bc::Op::UnpackEx { .. } => {
             return Err(LowerError::DynamicOperation);
         }
         bc::Op::PopTop => {

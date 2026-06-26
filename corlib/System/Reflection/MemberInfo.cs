@@ -5,11 +5,11 @@ namespace System.Reflection
     {
         protected MemberInfo() { }
 
-        public string Name
+        public virtual string Name
         {
             [Lamella.Runtime.RuntimeProvided] get { return null; }
         }
 
-        [Lamella.Runtime.RuntimeProvided] public object[] GetCustomAttributes(bool inherit) { return null; }
+        [Lamella.Runtime.RuntimeProvided] public virtual object[] GetCustomAttributes(bool inherit) { return null; }
     }
 }

@@ -888,6 +888,16 @@ fn emit_statement_expression(
                 out.push(Instruction::simple(crate::expr::stind_opcode(&target.ty)));
                 return Ok(());
             }
+            if let BoundExprKind::RefValue { reference, target: referent } = &target.kind {
+                emit_expression(reference, frame, tokens, out)?;
+                let token = tokens.type_token(referent).ok_or(EmitError::Unsupported(
+                    "__refvalue type has no token",
+                ))?;
+                out.push(Instruction::new(Opcode::Refanyval, Operand::Token(token)));
+                emit_expression(value, frame, tokens, out)?;
+                crate::expr::emit_byref_store(referent, tokens, out)?;
+                return Ok(());
+            }
             if let BoundExprKind::PropertyAccess {
                 receiver,
                 declaring_type,

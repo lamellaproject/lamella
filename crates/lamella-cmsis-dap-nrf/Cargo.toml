@@ -12,6 +12,11 @@ workspace = true
 
 [dependencies]
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+lamella-usbhid = { path = "../lamella-usbhid", optional = true }
+
+[features]
+# `microbit` adds the one-call flash_microbit() helper, opening the micro:bit's on-board HID probe.
+microbit = ["dep:lamella-usbhid"]
 
 [dev-dependencies]
 # Tests drive a Dap against the shared probe-protocol mock; examples open a real probe.

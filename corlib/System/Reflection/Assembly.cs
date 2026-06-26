@@ -7,6 +7,13 @@ namespace System.Reflection
 
         [Lamella.Runtime.RuntimeProvided] public System.Type GetType(string name) { return null; }
 
+        public string FullName
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return null; }
+        }
+
+        [Lamella.Runtime.RuntimeProvided] public System.Type[] GetTypes() { return null; }
+
         [Lamella.Runtime.RuntimeProvided] public static bool operator ==(Assembly left, Assembly right) { return false; }
 
         [Lamella.Runtime.RuntimeProvided] public static bool operator !=(Assembly left, Assembly right) { return false; }

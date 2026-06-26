@@ -25,7 +25,7 @@ mbedtls = { version = "0.12", optional = true, features = ["ssl"] }
 # gates out the same bindings the interpreter does. The DEFAULT is the full desktop profile (the
 # differential's run-with-corlib runner = full ECMA-335 1st-ed compliance, incl. typed references);
 # a constrained target builds --no-default-features + an explicit subset.
-default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references"]
+default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory"]
 bcl = ["lamella-cil-runtime/bcl"]
 NETMFv4_4 = ["bcl", "lamella-cil-runtime/NETMFv4_4"]
 exceptions = ["lamella-cil-runtime/exceptions"]
@@ -41,6 +41,11 @@ typed-references = ["lamella-cil-runtime/typed-references"]
 varargs = ["typed-references", "lamella-cil-runtime/varargs"]
 # The floating-point transcendentals (Math.Sqrt/Sin/Pow/...), via libm. See lamella-cil-runtime.
 math-transcendental = ["NETMFv4_4", "float", "lamella-cil-runtime/math-transcendental"]
+# Host-only: compile the Real native-memory backend (the host allocator hands back real addresses --
+# P/Invoke-capable + the faithful AOT behavior) into run-with-corlib, and make Real the default mode.
+# OFF = the Safe bounds-checked block table only (a constrained target's compile-time gate, so the
+# unsafe path is never built). At runtime, LAMELLA_MEMORY_MODE=safe switches Real -> Safe.
+real-memory = []
 # Host-only, OPT-IN: compile the mbedTLS host TLS backend (the second desktop stack) into the
 # run-with-corlib example + the tls_seam conformance test. Requires libclang for the bindgen step.
 tls-mbedtls = ["dep:mbedtls"]

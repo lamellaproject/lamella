@@ -15,8 +15,9 @@ lamella-gc = { path = "../lamella-gc" }
 # what the front end emits, so both depend on this one definition of the bytecode.
 lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 # The shared Unicode Character Database properties: str predicates (isalpha/isspace/...)
-# classify code points exactly as CPython, from one tree-shakeable table.
-lamella-unicode = { path = "../lamella-unicode" }
+# classify code points exactly as CPython, from one tree-shakeable table. The str predicates use
+# only the categories tier, so opt out of `normalization` (and `alloc` in the crate).
+lamella-unicode = { path = "../lamella-unicode", default-features = false }
 
 [dev-dependencies]
 # The front end (lexer/parser/compiler), used ONLY by the `interp-run` example to turn

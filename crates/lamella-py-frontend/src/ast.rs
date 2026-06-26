@@ -234,8 +234,11 @@ pub enum Stmt {
     /// Tuple-unpacking assignment `a, b = expr` -- the value is a sequence whose elements
     /// bind to the targets in order. Flat targets only (nested `(a, (b, c))` is post-cut).
     TupleAssign {
-        /// The target names, in source order (two or more).
+        /// The target names, in source order.
         targets: Vec<String>,
+        /// The index of the starred target `*name`, if any (`a, *b, c` -> `Some(1)`); the
+        /// star binds a list of the leftover elements.
+        star: Option<usize>,
         /// The sequence value to unpack.
         value: Expr,
     },

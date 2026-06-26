@@ -72,9 +72,9 @@ fn decode_utf16(bytes: &[u8], big_endian: bool) -> String {
 }
 
 /// Decodes `bytes` in the given ANSI code page. Windows-1252 (the Western/US default) is
-/// hand-written; the other single-byte pages (1250-1258, 874) come from generated tables
-/// ([`crate::codepages`]). A page with no single-byte table -- notably the double-byte CJK pages
-/// (932/936/949/950, a Phase 3 addition) -- falls back to Windows-1252.
+/// hand-written; the other single-byte pages (1250-1258, 874) and the double-byte CJK pages
+/// (932 Shift-JIS, 936 GBK, 949 UHC, 950 Big5) come from generated tables ([`crate::codepages`]).
+/// A page with neither table falls back to Windows-1252.
 fn decode_code_page(bytes: &[u8], code_page: u16) -> String {
     if code_page != 1252 {
         if let Some(high) = crate::codepages::single_byte_high(code_page) {
@@ -89,8 +89,50 @@ fn decode_code_page(bytes: &[u8], code_page: u16) -> String {
                 })
                 .collect();
         }
+        if let Some(page) = crate::codepages::double_byte_page(code_page) {
+            return decode_double_byte(bytes, &page);
+        }
     }
     decode_windows_1252(bytes)
+}
+
+/// Decodes `bytes` in a double-byte CJK code page (932/936/949/950): a byte below `0x80` is
+/// ASCII; a high byte is either a single character or a LEAD byte, which pairs with the following
+/// trail byte and is looked up in the page's sorted double-byte map. A lead byte whose pair is not
+/// mapped, or one at end of input, yields U+FFFD (the input was not well-formed for this page).
+fn decode_double_byte(bytes: &[u8], page: &crate::codepages::DoubleBytePage) -> String {
+    let mut out = String::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte < 0x80 {
+            out.push(char::from(byte));
+            index += 1;
+            continue;
+        }
+        let first = page.first[(byte - 0x80) as usize];
+        if first == crate::codepages::LEAD {
+            match bytes.get(index + 1) {
+                Some(&trail) => {
+                    let key = (u16::from(byte) << 8) | u16::from(trail);
+                    let decoded = page
+                        .double
+                        .binary_search_by_key(&key, |&(pair, _)| pair)
+                        .map_or('\u{FFFD}', |found| page.double[found].1);
+                    out.push(decoded);
+                    index += 2;
+                }
+                None => {
+                    out.push('\u{FFFD}');
+                    index += 1;
+                }
+            }
+        } else {
+            out.push(char::from_u32(first).unwrap_or('\u{FFFD}'));
+            index += 1;
+        }
+    }
+    out
 }
 
 /// Decodes bytes in Windows-1252: ASCII below `0x80`, the divergent range from the
@@ -145,8 +187,16 @@ mod tests {
         let (text, encoding) = decode_source(&[b'x', 0x80], 1251);
         assert_eq!(text, "x\u{0402}");
         assert_eq!(encoding, Encoding::CodePage(1251));
-        let (fallback, enc) = decode_source(&[0x93], 932);
-        assert_eq!(fallback, "\u{201C}");
-        assert_eq!(enc, Encoding::CodePage(932));
+    }
+
+    #[test]
+    fn a_double_byte_cjk_code_page_decodes_lead_trail_pairs() {
+        let (text, encoding) = decode_source(&[b'A', 0x81, 0x40, 0xA1], 932);
+        assert_eq!(text, "A\u{3000}\u{FF61}");
+        assert_eq!(encoding, Encoding::CodePage(932));
+        assert_eq!(decode_source(&[0x81, 0x40], 936).0, "\u{4E02}");
+        assert_eq!(decode_source(&[0xA4, 0x40], 950).0, "\u{4E00}");
+        assert_eq!(decode_source(&[0x81], 932).0, "\u{FFFD}");
+        assert_eq!(decode_source(&[0x81, 0x21], 932).0, "\u{FFFD}");
     }
 }

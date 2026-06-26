@@ -2,7 +2,9 @@
 
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::span::Span;
-use crate::token::{IntegerSuffix, Keyword, Punctuator, RealSuffix, Token, TokenKind};
+use crate::token::{
+    IntegerSuffix, Keyword, Punctuator, RealSuffix, Token, TokenKind, TypedRefKeyword,
+};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
@@ -37,20 +39,50 @@ pub enum Normalization {
     Nfc,
 }
 
+/// The lexer-level dialect knobs, gathered so they thread through the front end as one
+/// value (and so a new knob is a field, not another parameter on every `*_with`).
+///
+/// [`Default`] is strict-ISO-meets-csc: identifiers are not normalized (matching the
+/// Roslyn/csc oracle) and the csc typed-reference operators are off (they are not in
+/// ECMA-334). The two knobs move independently of the oracle -- `normalization` toward
+/// the spec, `typedref` toward csc -- because each closes a different gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LexOptions {
+    /// How identifiers are folded for comparison (9.4.2).
+    pub normalization: Normalization,
+    /// Whether the undocumented csc operators `__makeref`/`__refvalue`/`__reftype` are
+    /// recognized as [`TypedRefKeyword`]s. Off in strict ISO-1 (they are not ECMA-334);
+    /// on for csc parity, where they lower to `mkrefany`/`refanyval`/`refanytype`.
+    pub typedref: bool,
+}
+
+impl LexOptions {
+    /// Options that fold identifiers per `normalization`, with every other knob default.
+    #[must_use]
+    pub fn with_normalization(normalization: Normalization) -> LexOptions {
+        LexOptions {
+            normalization,
+            ..LexOptions::default()
+        }
+    }
+}
+
 /// The token stream is a gap-free cover of the source: concatenating the text of
 /// every non-`EndOfFile` token reproduces the input, after the single trailing
 /// Control-Z removal of 9.3.1. Identifiers are NOT normalized (matching csc); use
 /// [`tokenize_with`] for the ECMA-334 9.4.2 NFC behaviour.
 #[must_use]
 pub fn tokenize(source: &str) -> Tokenized {
-    tokenize_with(source, Normalization::None)
+    tokenize_with(source, LexOptions::default())
 }
 
-/// Like [`tokenize`], but folds identifiers per `normalization` (9.4.2).
+/// Like [`tokenize`], but scans under `options` -- folding identifiers per its
+/// [`Normalization`] (9.4.2) and recognizing the csc typed-reference operators when
+/// [`LexOptions::typedref`] is set.
 #[must_use]
-pub fn tokenize_with(source: &str, normalization: Normalization) -> Tokenized {
+pub fn tokenize_with(source: &str, options: LexOptions) -> Tokenized {
     let mut lexer = Lexer::new(source);
-    lexer.normalization = normalization;
+    lexer.options = options;
     let mut tokens = Vec::new();
     loop {
         let token = lexer.next_token();
@@ -91,8 +123,9 @@ pub struct Lexer<'a> {
     /// The stack of open `#if`/`#region` constructs, innermost last (9.5.4). Its
     /// top decides whether source is currently being included or skipped.
     conditionals: Vec<Conditional>,
-    /// How to fold identifier names (9.4.2); `None` (raw code points) by default.
-    normalization: Normalization,
+    /// The dialect knobs: identifier folding (9.4.2) and whether the csc typed-reference
+    /// operators are recognized. Defaults to the csc-matching, strict-ISO settings.
+    options: LexOptions,
 }
 
 /// One open conditional construct: an `#if`/`#elif`/`#else`/`#endif` group or a
@@ -178,7 +211,7 @@ impl<'a> Lexer<'a> {
             seen_token: false,
             defined_symbols: BTreeSet::new(),
             conditionals: Vec::new(),
-            normalization: Normalization::None,
+            options: LexOptions::default(),
         }
     }
 
@@ -716,7 +749,7 @@ impl<'a> Lexer<'a> {
     /// An identifier's name, folded per the lexer's [`Normalization`] mode (9.4.2). ASCII is
     /// already in NFC, so it is returned unchanged regardless of mode.
     fn identifier_name(&self, text: &str) -> Box<str> {
-        match self.normalization {
+        match self.options.normalization {
             Normalization::None => text.into(),
             Normalization::Nfc => nfc_identifier(text),
         }
@@ -764,10 +797,22 @@ impl<'a> Lexer<'a> {
             Some(decoded) => decoded,
             None => &self.source[start..self.position],
         };
-        match Keyword::from_text(text) {
-            Some(keyword) => TokenKind::Keyword(keyword),
-            None => TokenKind::Identifier(self.identifier_name(text)),
+        if let Some(keyword) = Keyword::from_text(text) {
+            TokenKind::Keyword(keyword)
+        } else if let Some(operator) = self.typedref_keyword(text) {
+            TokenKind::TypedRefKeyword(operator)
+        } else {
+            TokenKind::Identifier(self.identifier_name(text))
         }
+    }
+
+    /// The typed-reference operator `text` names, but only in csc-parity mode
+    /// ([`LexOptions::typedref`]); `None` in strict ISO-1, where these scan as identifiers.
+    fn typedref_keyword(&self, text: &str) -> Option<TypedRefKeyword> {
+        self.options
+            .typedref
+            .then(|| TypedRefKeyword::from_text(text))
+            .flatten()
     }
 
     fn scan_verbatim(&mut self, start: usize) -> TokenKind {
@@ -1555,16 +1600,65 @@ mod tests {
             significant(tokenize("caf\u{00e9}"))
         );
         assert_eq!(
-            significant(tokenize_with("cafe\u{0301}", Normalization::Nfc)),
+            significant(tokenize_with(
+                "cafe\u{0301}",
+                LexOptions::with_normalization(Normalization::Nfc)
+            )),
             vec![ident("caf\u{00e9}")]
         );
         assert_eq!(
-            significant(tokenize_with("cafe\u{0301}", Normalization::Nfc)),
-            significant(tokenize_with("caf\u{00e9}", Normalization::Nfc))
+            significant(tokenize_with(
+                "cafe\u{0301}",
+                LexOptions::with_normalization(Normalization::Nfc)
+            )),
+            significant(tokenize_with(
+                "caf\u{00e9}",
+                LexOptions::with_normalization(Normalization::Nfc)
+            ))
         );
         assert_eq!(
-            significant(tokenize_with("plain", Normalization::Nfc)),
+            significant(tokenize_with(
+                "plain",
+                LexOptions::with_normalization(Normalization::Nfc)
+            )),
             vec![ident("plain")]
+        );
+    }
+
+    #[test]
+    fn typedref_operators_are_keywords_only_when_the_knob_is_on() {
+        let significant = |tokenized: Tokenized| -> Vec<TokenKind> {
+            tokenized
+                .tokens
+                .into_iter()
+                .map(|token| token.kind)
+                .filter(|kind| !kind.is_trivia() && *kind != TokenKind::EndOfFile)
+                .collect()
+        };
+        let typedref = LexOptions {
+            typedref: true,
+            ..LexOptions::default()
+        };
+        assert_eq!(significant(tokenize("__makeref")), vec![ident("__makeref")]);
+        assert_eq!(
+            significant(tokenize_with("__makeref", typedref)),
+            vec![TokenKind::TypedRefKeyword(TypedRefKeyword::MakeRef)]
+        );
+        assert_eq!(
+            significant(tokenize_with("__refvalue", typedref)),
+            vec![TokenKind::TypedRefKeyword(TypedRefKeyword::RefValue)]
+        );
+        assert_eq!(
+            significant(tokenize_with("__reftype", typedref)),
+            vec![TokenKind::TypedRefKeyword(TypedRefKeyword::RefType)]
+        );
+        assert_eq!(
+            significant(tokenize_with("__make", typedref)),
+            vec![ident("__make")]
+        );
+        assert_eq!(
+            significant(tokenize_with("@__makeref", typedref)),
+            vec![ident("__makeref")]
         );
     }
 

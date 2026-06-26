@@ -58,6 +58,9 @@ pub enum TypeSig {
     SzArray(Box<TypeSig>),
     /// A managed reference (`&`) to the referent type -- a `ref`/`out` parameter.
     ByRef(Box<TypeSig>),
+    /// `System.TypedReference` (II.23.1.16): the special typed-reference element, carried
+    /// inline with no token -- the type a `__makeref` result / a typed-reference local takes.
+    TypedByRef,
     /// An unmanaged pointer (`*`) to the pointee type -- an unsafe `T*` (II.23.2.12).
     Pointer(Box<TypeSig>),
     /// A `pinned` local (II.23.2.9): the GC must not move its referent. Only valid as a
@@ -107,6 +110,7 @@ fn encode_type(sig: &TypeSig, out: &mut Vec<u8>) {
             out.push(element::BYREF);
             encode_type(referent, out);
         }
+        TypeSig::TypedByRef => out.push(element::TYPEDBYREF),
         TypeSig::Pointer(pointee) => {
             out.push(element::PTR);
             encode_type(pointee, out);

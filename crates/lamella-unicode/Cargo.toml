@@ -11,6 +11,18 @@ description = "Language-neutral Unicode Character Database properties (from UCD 
 # properties, numeric type, XID) shared by the Python str predicates, the C# BCL, and the C#
 # lexer -- each derives its own surface. No dependencies; no_std. Per-property tables are
 # separate statics so an unused property is dropped by the linker.
+
+# Layered tiers, feature-gated so each consumer links only its slice. The base `categories` tier
+# (general category + the derived predicates) is always compiled; the heavier tiers are opt-in.
+[features]
+default = ["normalization"]
+# Unicode normalization (NFC/NFD/NFKC/NFKD) -- the C# BCL String.Normalize + Python PEP 3131.
+normalization = []
+# CLDR-root UCA collation sort keys for full-tier String.Compare/CompareTo (C# BCL,
+# StringComparison.InvariantCulture). RESERVED tier: the collation module + its (large) tables
+# compile only when this feature is enabled, so non-collation consumers never link them.
+collation = []
+
 [dependencies]
 
 [lints]

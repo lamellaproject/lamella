@@ -3733,6 +3733,16 @@ pub fn lower_object(
             section: lamella_elf::SymbolSection::Undefined,
         });
     }
+    if let Some(&entry_off) = offsets.first() {
+        symbols.push(lamella_elf::Symbol {
+            name: "lamella_main",
+            value: entry_off | 1,
+            size: 0,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::Func,
+            section: lamella_elf::SymbolSection::Text,
+        });
+    }
     let mut relocations: Vec<lamella_elf::Relocation> = Vec::with_capacity(assembled.relocs.len());
     for r in &assembled.relocs {
         let (kind, addend) = match r.kind {

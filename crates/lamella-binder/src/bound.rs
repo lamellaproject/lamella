@@ -255,6 +255,21 @@ pub enum BoundExprKind {
     TypeOf(TypeSymbol),
     /// A `sizeof(T)` (III.4.25): the byte size of `T` as an `int`.
     SizeOf(TypeSymbol),
+    /// A `__makeref(variable)` (csc typed-reference operator): its type is
+    /// `System.TypedReference`. Emits the operand's address then `mkrefany <operand type>`.
+    MakeRef(Box<BoundExpr>),
+    /// A `__reftype(reference)`: the runtime `System.Type` of a typed reference. Emits
+    /// `refanytype` then `Type.GetTypeFromHandle`, so its type is `System.Type`.
+    RefType(Box<BoundExpr>),
+    /// A `__refvalue(reference, T)`: the referent of a typed reference, viewed as `T` and
+    /// usable as an lvalue (its type is `T`). Emits `refanyval <T>` then a load, or a store
+    /// through the recovered pointer when it is an assignment target.
+    RefValue {
+        /// The typed-reference operand.
+        reference: Box<BoundExpr>,
+        /// The asserted referent type (`refanyval` names it; it is the expression's type).
+        target: TypeSymbol,
+    },
     /// A `stackalloc T[count]` (unsafe): a `T*` to `count * sizeof(T)` stack bytes.
     StackAlloc {
         /// The element type.
@@ -1336,6 +1351,35 @@ impl Binder {
                 BoundExpr {
                     kind: BoundExprKind::SizeOf(target_ty),
                     ty: TypeSymbol::Special(SpecialType::Int32),
+                }
+            }
+            ExprKind::MakeRef(operand) => {
+                let operand = self.bind_expression(operand);
+                if !operand.ty.is_error() && !is_lvalue(&operand) {
+                    self.diagnostics
+                        .push(Diagnostic::new(DiagnosticKind::NotAssignable, expr.span));
+                }
+                BoundExpr {
+                    kind: BoundExprKind::MakeRef(Box::new(operand)),
+                    ty: typed_reference(),
+                }
+            }
+            ExprKind::RefType(reference) => {
+                let reference = self.bind_expression(reference);
+                BoundExpr {
+                    kind: BoundExprKind::RefType(Box::new(reference)),
+                    ty: system_type(),
+                }
+            }
+            ExprKind::RefValue { reference, target } => {
+                let reference = self.bind_expression(reference);
+                let target_ty = self.resolve_named_type(&bind_type(target), target.span);
+                BoundExpr {
+                    kind: BoundExprKind::RefValue {
+                        reference: Box::new(reference),
+                        target: target_ty.clone(),
+                    },
+                    ty: target_ty,
                 }
             }
             ExprKind::StackAlloc { element, count } => {
@@ -3780,6 +3824,13 @@ fn system_type() -> TypeSymbol {
     TypeSymbol::Named([Box::from("System"), Box::from("Type")].into())
 }
 
+/// `System.TypedReference` -- the type of a `__makeref` result and the operand of `__reftype`
+/// and `__refvalue`. A special byref-like value type; its signature element is `TYPEDBYREF`,
+/// so emission encodes it specially rather than as a value type named by a token.
+fn typed_reference() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("System"), Box::from("TypedReference")].into())
+}
+
 /// `System.Array`, whose members (Length, GetLength, ...) an array's member access
 /// resolves against.
 fn system_array() -> TypeSymbol {
@@ -3828,6 +3879,7 @@ fn is_lvalue(expr: &BoundExpr) -> bool {
             | BoundExprKind::PropertyAccess { .. }
             | BoundExprKind::ElementAccess { .. }
             | BoundExprKind::Dereference { .. }
+            | BoundExprKind::RefValue { .. }
     )
 }
 

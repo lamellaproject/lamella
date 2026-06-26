@@ -376,51 +376,81 @@ impl Model {
     /// two namespaces is left untouched for the using-aware use-site resolver. Run on the
     /// complete model (references + source) before `link_bases`, so the base chain links canonical.
     pub fn canonicalize_signatures(&mut self) {
-        let mut canon: BTreeMap<String, Option<TypeSymbol>> = BTreeMap::new();
-        for (namespace, type_name) in self.types.keys() {
-            match canon.get_mut(type_name.as_str()) {
-                Some(slot) => *slot = None,
-                None => {
-                    canon.insert(type_name.clone(), Some(symbol_from_key(namespace, type_name)));
-                }
-            }
-        }
+        let canon = self.signature_canon();
         for info in self.types.values_mut() {
             for base in &mut info.bases {
-                canonicalize_type(base, &canon);
+                *base = canon.canonicalize(base);
             }
             for field in &mut info.fields {
-                canonicalize_type(&mut field.ty, &canon);
+                field.ty = canon.canonicalize(&field.ty);
             }
             for property in &mut info.properties {
-                canonicalize_type(&mut property.ty, &canon);
+                property.ty = canon.canonicalize(&property.ty);
             }
             for event in &mut info.events {
-                canonicalize_type(&mut event.ty, &canon);
+                event.ty = canon.canonicalize(&event.ty);
             }
             for method in &mut info.methods {
-                canonicalize_type(&mut method.return_type, &canon);
+                method.return_type = canon.canonicalize(&method.return_type);
                 for parameter in &mut method.parameters {
-                    canonicalize_type(parameter, &canon);
+                    *parameter = canon.canonicalize(parameter);
                 }
             }
         }
     }
-}
 
-/// Canonicalizes a single signature type in place (see [`Model::canonicalize_signatures`]):
-/// an unambiguous single-part named type becomes its full symbol; arrays and pointers recurse
-/// into their element type; everything else is left as is.
-fn canonicalize_type(ty: &mut TypeSymbol, canon: &BTreeMap<String, Option<TypeSymbol>>) {
-    match ty {
-        TypeSymbol::Named(parts) if parts.len() == 1 => {
-            if let Some(Some(full)) = canon.get(parts[0].as_ref()) {
-                *ty = full.clone();
+    /// The unambiguous simple-name -> full-symbol canon over every known type (references plus
+    /// source), reusable for canonicalizing single-part signature names without rebuilding the
+    /// map. See [`SignatureCanon`]; this is the map [`canonicalize_signatures`] applies.
+    #[must_use]
+    pub fn signature_canon(&self) -> SignatureCanon {
+        let mut map: BTreeMap<String, Option<TypeSymbol>> = BTreeMap::new();
+        for (namespace, type_name) in self.types.keys() {
+            match map.get_mut(type_name.as_str()) {
+                Some(slot) => *slot = None,
+                None => {
+                    map.insert(type_name.clone(), Some(symbol_from_key(namespace, type_name)));
+                }
             }
         }
-        TypeSymbol::Array { element, .. } => canonicalize_type(element, canon),
-        TypeSymbol::Pointer(inner) => canonicalize_type(inner, canon),
-        _ => {}
+        SignatureCanon { map }
+    }
+}
+
+/// The unambiguous simple-name -> full-symbol map of [`Model::signature_canon`], so a single-part
+/// named type can be canonicalized to its qualified form repeatedly without rebuilding the map.
+/// An ambiguous name (declared in two namespaces) maps to `None` and is left for the use-site
+/// resolver. The emit side ([`crate`] consumers) keeps one to canonicalize the syntax-derived
+/// signature names it keys tokens and serializes signatures by, so they match the binder's
+/// qualified symbols.
+#[derive(Debug, Clone, Default)]
+pub struct SignatureCanon {
+    map: BTreeMap<String, Option<TypeSymbol>>,
+}
+
+impl SignatureCanon {
+    /// Rewrites a single-part named type to its unambiguous qualified symbol, recursing into
+    /// arrays, pointers, and byrefs; every other type (predefined, already-qualified, ambiguous)
+    /// is returned unchanged.
+    #[must_use]
+    pub fn canonicalize(&self, ty: &TypeSymbol) -> TypeSymbol {
+        match ty {
+            TypeSymbol::Named(parts) if parts.len() == 1 => match self.map.get(parts[0].as_ref()) {
+                Some(Some(full)) => full.clone(),
+                _ => ty.clone(),
+            },
+            TypeSymbol::Array { element, rank } => TypeSymbol::Array {
+                element: alloc::boxed::Box::new(self.canonicalize(element)),
+                rank: *rank,
+            },
+            TypeSymbol::Pointer(inner) => {
+                TypeSymbol::Pointer(alloc::boxed::Box::new(self.canonicalize(inner)))
+            }
+            TypeSymbol::ByRef(inner) => {
+                TypeSymbol::ByRef(alloc::boxed::Box::new(self.canonicalize(inner)))
+            }
+            other => other.clone(),
+        }
     }
 }
 

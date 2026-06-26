@@ -142,15 +142,17 @@ impl UnaryOp {
     }
 }
 
+
 /// One bytecode instruction -- the decoded, in-memory form the interpreter
 /// dispatches and the lowering walks. The set is deliberately small and orthogonal
 /// for first light; it grows behind the version stamp as the language surface
 /// widens. Operand indices reference the owning [`CodeObject`]'s pools.
 ///
-/// # Op-tag registry (single source of truth)
+/// # Op-tag registry
 ///
-/// Every op's wire tag -- the leading `u8` in `encode_op` and the `decode` match -- is
-/// assigned here.
+/// The wire tag for each op -- the leading `u8` in `encode_op` and the matching `decode`
+/// arm. The binary encoding is stable and versioned; a reader rejects an unknown tag. Tags
+/// 22 and 23 are unused (a historical gap).
 ///
 /// | tag(s) | ops | group |
 /// |-------:|-----|-------|
@@ -163,6 +165,7 @@ impl UnaryOp {
 /// |  34-36 | ListAppend, SetAdd, DictInsert | comprehensions |
 /// |     37 | LoadSuper | super() |
 /// |     38 | BuildSet | set literals |
+/// |     39 | UnpackEx | starred unpacking |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -265,6 +268,16 @@ pub enum Op {
     /// Pop `count` elements and push a new set (deduped). For a set literal `{a, b, c}`; a
     /// set comprehension builds `BuildSet(0)` then `SetAdd`s.
     BuildSet(u32),
+    /// Pop a sequence and unpack it for a starred target `a, *b, c = seq`: push (reversed, so
+    /// the following `StoreFast`s take them left-to-right) the `before` head elements, then a
+    /// LIST of the middle (`len - before - after` elements), then the `after` tail elements.
+    /// Requires `len >= before + after`, else `ValueError`. For `a, *b = seq`.
+    UnpackEx {
+        /// The number of targets before the star.
+        before: u32,
+        /// The number of targets after the star.
+        after: u32,
+    },
     /// Pop the right operand then the left, and push `left <op> right`.
     Binary(BinOp),
     /// Pop the right operand then the left, and push the boolean `left <cmp> right`.
@@ -583,6 +596,11 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(38);
             put_u32(buf, *count);
         }
+        Op::UnpackEx { before, after } => {
+            buf.push(39);
+            put_u32(buf, *before);
+            put_u32(buf, *after);
+        }
     }
 }
 
@@ -790,6 +808,10 @@ impl<'a> Reader<'a> {
             36 => Op::DictInsert,
             37 => Op::LoadSuper(self.u32()?),
             38 => Op::BuildSet(self.u32()?),
+            39 => Op::UnpackEx {
+                before: self.u32()?,
+                after: self.u32()?,
+            },
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -960,6 +982,7 @@ mod tests {
             Op::DictInsert,
             Op::LoadSuper(3),
             Op::BuildSet(2),
+            Op::UnpackEx { before: 1, after: 1 },
             Op::Return,
         ];
         let mut buf = Vec::new();
