@@ -28,8 +28,9 @@ fn line_col(source: &str, offset: usize) -> (u32, u32) {
 }
 
 /// Splits the references buffer (`[u32 count]` then `count` x `[u32 len][bytes]`) into
-/// the individual assembly byte slices; stops at the first malformed length.
-fn split_refs(refs: &[u8]) -> Vec<&[u8]> {
+/// the individual assembly byte slices; stops at the first malformed length. Shared with
+/// the REPL ABI, which packs its compile references the same way.
+pub(crate) fn split_refs(refs: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let Some(count) = refs
         .get(0..4)
@@ -333,6 +334,17 @@ mod tests {
             .collect();
         assert!(labels.contains(&"Count"), "got {labels:?}");
         assert!(labels.contains(&"Area"), "got {labels:?}");
+    }
+
+    #[test]
+    fn a_compiled_program_propagates_its_exit_code() {
+        let payload = compile(b"class Program { static int Main() { int a = 2; int b = 3; return a + b; } }", &0u32.to_le_bytes());
+        let json_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let image_len = u32::from_le_bytes(payload[4 + json_len..8 + json_len].try_into().unwrap()) as usize;
+        assert!(image_len > 0, "expected an emitted image");
+        let image = &payload[8 + json_len..8 + json_len + image_len];
+        let result = crate::run_bytes(image);
+        assert_eq!(result.exit_code, 5, "Main's `return 2 + 3` must exit 5, not {}", result.exit_code);
     }
 
     #[test]

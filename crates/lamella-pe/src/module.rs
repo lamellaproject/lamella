@@ -551,6 +551,41 @@ impl ImageBuilder {
         Token::new(table::METHOD_DEF, row)
     }
 
+    /// Adds a P/Invoke `MethodDef` (RVA 0, no body) -- `flags` carry `PinvokeImpl` (II.23.1.10), and
+    /// the matching [`ImplMap`](Self::add_impl_map) names the native entry point. II.15.5. The
+    /// MethodImplAttributes set `PreserveSig` (0x0080), the C# `[DllImport]` default: the native
+    /// return is used as-is. Without it the CLR treats the return as an HRESULT and shuffles it
+    /// (so e.g. an `int` result is lost).
+    pub fn add_pinvoke_method(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {
+        self.add_bodyless_method(name, signature, flags, 0x0080)
+    }
+
+    /// Adds a `ModuleRef` row (II.22.31) naming an unmanaged module (a DLL), returning its token --
+    /// the `ImportScope` a P/Invoke's `ImplMap` points at. Not deduplicated; one per `[DllImport]`.
+    pub fn add_module_ref(&mut self, name: &str) -> Token {
+        let name = self.strings.intern(name);
+        let row = self.tables.add_row(table::MODULE_REF, alloc::vec![Column::StringRef(name)]);
+        Token::new(table::MODULE_REF, row)
+    }
+
+    /// Adds an `ImplMap` row (II.22.22): the P/Invoke mapping for `method` (a MethodDef). `flags` is
+    /// the `MappingFlags` (II.23.1.8: char set / calling convention / SetLastError), `import_name`
+    /// the native entry-point name, `scope` the `ModuleRef` of the DLL. The table is sorted by
+    /// `MemberForwarded`, so callers add rows in increasing method-row order.
+    pub fn add_impl_map(&mut self, method: Token, flags: u16, import_name: &str, scope: Token) {
+        let import_name = self.strings.intern(import_name);
+        self.tables.mark_sorted(table::IMPL_MAP);
+        self.tables.add_row(
+            table::IMPL_MAP,
+            alloc::vec![
+                Column::U16(flags),
+                Column::Coded(CodedIndex::MemberForwarded, method),
+                Column::StringRef(import_name),
+                Column::Index(table::MODULE_REF, scope.row()),
+            ],
+        );
+    }
+
     /// Records that `class` (a `TypeDef`) implements `interface` (a `TypeDef`/`TypeRef`)
     /// via an `InterfaceImpl` row (II.22.23).
     pub fn add_interface_impl(&mut self, class: Token, interface: Token) {

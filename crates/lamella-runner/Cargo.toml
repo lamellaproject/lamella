@@ -1,0 +1,27 @@
+[package]
+name = "lamella-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The wireline debug + REPL RUNNER core, shared by the host reference runner, the browser (wasm) runner, and the on-device firmware: run_program (load the managed corlib + run a program + capture its output) + the tier-0 serve_one request handler + the host driver helpers, over the lamella-wire Transport seam. no_std + alloc so it rides onto a microcontroller."
+
+[dependencies]
+lamella-wire = { path = "../lamella-wire" }
+lamella-cil-runtime = { path = "../lamella-cil-runtime" }
+# The interpreter + loader the runner runs the corlib on. The runner is the DEVICE crate, so it controls
+# the constrained-profile knobs: it pulls the BCL surface features it needs but lets `debug-names` be
+# dropped (--no-default-features) for a non-debug device build (saves ~300 KB of resident Strings).
+lamella-load = { path = "../lamella-load", default-features = false, features = [
+    "NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs",
+] }
+lamella-metadata = { path = "../lamella-metadata" }
+
+[features]
+# Source-level debugger names (forwarded to the loader). Default on; a constrained device build drops it.
+default = ["debug-names"]
+debug-names = ["lamella-load/debug-names"]
+
+[lints]
+workspace = true

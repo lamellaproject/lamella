@@ -866,7 +866,7 @@ fn load_assembly(
                     }
                 }
             }
-            let Some(body) = method.body() else {
+            let Some((body, raw_il)) = method.body_and_bytes() else {
                 if method.is_runtime_impl() {
                     let signature = method.signature();
                     let intrinsic = type_def.name().and_then(|declaring| {
@@ -977,7 +977,7 @@ fn load_assembly(
                     }
                 }
             }
-            let id = module.add_method(asm, body, arg_count(&method));
+            let id = module.add_method(asm, raw_il.to_vec().into_boxed_slice(), arg_count(&method));
             module.bind_token(asm, token, id);
             module.set_method_type(id, type_id);
             if let Some(declaring) = type_def.name() {
@@ -993,28 +993,31 @@ fn load_assembly(
                     id,
                 );
             }
-            let qualified = match type_def.name() {
-                Some(declaring) if !declaring.namespace.is_empty() => {
-                    alloc::format!("{}.{}.{}", declaring.namespace, declaring.name, name)
+            #[cfg(feature = "debug-names")]
+            {
+                let qualified = match type_def.name() {
+                    Some(declaring) if !declaring.namespace.is_empty() => {
+                        alloc::format!("{}.{}.{}", declaring.namespace, declaring.name, name)
+                    }
+                    Some(declaring) => alloc::format!("{}.{}", declaring.name, name),
+                    None => name.clone(),
+                };
+                let mut arg_names = Vec::new();
+                if !method.is_static() {
+                    arg_names.push(String::from("this"));
                 }
-                Some(declaring) => alloc::format!("{}.{}", declaring.name, name),
-                None => name.clone(),
-            };
-            let mut arg_names = Vec::new();
-            if !method.is_static() {
-                arg_names.push(String::from("this"));
-            }
-            let mut declared = alloc::vec![String::new(); params.len()];
-            for param in method.params() {
-                if let Ok(slot) = usize::try_from(param.sequence().wrapping_sub(1)) {
-                    if let (Some(entry), Some(param_name)) = (declared.get_mut(slot), param.name())
-                    {
-                        *entry = String::from(param_name);
+                let mut declared = alloc::vec![String::new(); params.len()];
+                for param in method.params() {
+                    if let Ok(slot) = usize::try_from(param.sequence().wrapping_sub(1)) {
+                        if let (Some(entry), Some(param_name)) = (declared.get_mut(slot), param.name())
+                        {
+                            *entry = String::from(param_name);
+                        }
                     }
                 }
+                arg_names.extend(declared);
+                module.set_method_debug(id, qualified, arg_names);
             }
-            arg_names.extend(declared);
-            module.set_method_debug(id, qualified, arg_names);
             if name == ".cctor" {
                 module.add_static_ctor(id);
             }

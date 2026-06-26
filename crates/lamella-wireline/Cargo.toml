@@ -1,0 +1,35 @@
+[package]
+name = "lamella-wireline"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Host side of the wireline debug + REPL channel: a serial (USB-CDC / UART) Transport over lamella-wire, and the tier-0 host-stateless REPL -- the host compiles a submission and the target runs the CIL + returns its output. The reference runner runs in-process for host-side testing; the same runner core flashes onto a device behind the wire."
+
+[dependencies]
+# The no_std runner core (run_program / serve_one / RunResult / repl), shared with the on-device firmware;
+# it pulls in the interpreter stack (lamella-load / -cil-runtime / -metadata) transitively.
+lamella-runner = { path = "../lamella-runner" }
+lamella-wire = { path = "../lamella-wire" }
+# Host-only: the serial carrier for the USB-CDC / UART transport. OPTIONAL + behind the `serial`
+# feature, so a WASM build (Lamella Studio / a Web-Worker carrier) compiles the carrier-neutral REPL
+# core -- run_program + the driver + the protocol -- without it.
+serialport = { version = "4", optional = true }
+
+[features]
+# The serial (USB-CDC / UART) transport. Default ON for a host build; a wasm32 build turns it off
+# (--no-default-features) and supplies its own Transport (a Worker / in-process channel).
+default = ["serial", "repl-host"]
+serial = ["dep:serialport"]
+# The host REPL front-end: the interactive engine + the csc compile driver + the `lamella-repl` bin.
+# Pure std (it spawns `dotnet csc`), no extra deps; a wasm build leaves it off (the browser compiles
+# in-process via lamella-wasm), keeping the carrier-neutral REPL core.
+repl-host = []
+
+# (The interactive REPL CLI now lives in the dedicated `lamella-repl` crate; the former
+# `lamella-repl` bin here was a duplicate of that binary name -- removed on merge to avoid a
+# target collision. lamella-wireline remains the host library the CLI builds on.)
+
+[lints]
+workspace = true

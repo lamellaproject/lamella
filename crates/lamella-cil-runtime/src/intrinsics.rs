@@ -6928,7 +6928,7 @@ mod tests {
         let hello: Vec<u16> = "Hello, World".encode_utf16().collect();
         module.bind_string(0, string_token, &hello);
 
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             MethodBodyImage {
                 max_stack: 8,

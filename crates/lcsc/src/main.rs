@@ -61,6 +61,8 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             lex.normalization = Normalization::Nfc;
         } else if matches!(arg.as_str(), "/typedref" | "--typedref") {
             lex.typedref = true;
+        } else if matches!(arg.as_str(), "/native-interop" | "--native-interop") {
+            lex.native_interop = true;
         } else if arg.starts_with("/target:") || arg == "/nologo" {
         } else if arg.starts_with('-') || (arg.starts_with('/') && !arg[1..].contains('/')) {
             return Err(format!("unknown option '{arg}'\n{USAGE}"));
@@ -79,12 +81,14 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 }
 
 const USAGE: &str = "usage: lcsc <source.cs> [/out:<path>] [/reference:<dll>]... [/debug-] \
-     [/normalize-identifiers] [/typedref]\n\
+     [/normalize-identifiers] [/typedref] [/native-interop]\n\
      compiles a single source file; multi-file compilation is a planned follow-up.\n\
      /normalize-identifiers folds identifiers to NFC per ECMA-334 9.4.2 (off by default, to \
      match csc).\n\
      /typedref enables csc's undocumented __makeref/__refvalue/__reftype operators (off by \
-     default; they are not in ECMA-334).";
+     default; they are not in ECMA-334).\n\
+     /native-interop enables [DllImport] P/Invoke (off by default; pure-managed targets \
+     do not need it).";
 
 /// The first matching prefix's tail, if `arg` starts with one of `prefixes`.
 fn strip_option<'a>(arg: &'a str, prefixes: &[&str]) -> Option<&'a str> {

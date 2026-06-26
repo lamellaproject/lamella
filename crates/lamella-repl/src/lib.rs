@@ -1,4 +1,4 @@
-//! A host-PC C# REPL on the lamella interpreter, bootstrap-compiled with csc.
+//! A host-PC C# REPL on the lamella interpreter.
 
 use lamella_load::{DeltaContext, load, load_bootstrap, load_delta, load_library};
 use lamella_metadata::Assembly;
@@ -16,14 +16,14 @@ use std::{env, fs};
 /// success or a diagnostic/trap message on failure.
 ///
 /// The pipeline is: wrap the line as a `WriteLine` of the expression, write it to
-/// a temp `.cs`, compile it with csc into a temp `.dll`, then load + run that on a
-/// fresh interpreter and return [`Vm::output_string`]. A csc failure returns its
+/// a temp `.cs`, compile it into a temp `.dll`, then load + run that on a
+/// fresh interpreter and return [`Vm::output_string`]. A compile failure returns its
 /// diagnostics as `Err`; an interpreter trap returns the trap text as `Err`. Temp
 /// files are removed before returning, on every path.
 ///
 /// # Errors
 ///
-/// Returns `Err` when csc cannot be located, when compilation fails (the csc
+/// Returns `Err` when the compiler cannot be located, when compilation fails (the compiler
 /// diagnostics), when the produced assembly cannot be read or loaded, or when the
 /// interpreter traps while running it.
 pub fn eval(source_line: &str) -> Result<String, String> {
@@ -337,8 +337,8 @@ const REPL_CTOR_NAME: &str = "<repl>.__Repl..ctor";
 /// re-emit+migrate that lets REFERENCE-typed state (a `string`/array/object) survive across
 /// submissions.
 ///
-/// This is the runtime half of the incremental REPL model (`docs/repl-incremental-model.md`),
-/// prototyped against hand-authored IL deltas while the compiler builds the matching emit. The
+/// This is the runtime half of the incremental REPL model, prototyped against hand-authored IL
+/// deltas while the compiler builds the matching emit. The
 /// session loads an empty `__Repl` bootstrap ONCE and creates one instance of it; each
 /// [`IncrementalSession::submit`] loads a SEPARATE delta assembly that references `__Repl` and
 /// its prior fields by name (a TypeRef + FieldRefs, no `__Repl` TypeDef) and carries one
@@ -567,7 +567,7 @@ enum Submission {
     Expression { body: String },
 }
 
-/// A stateful host-PC C# REPL built on the csc bootstrap: declarations persist across
+/// A stateful host-PC C# REPL: declarations persist across
 /// submissions, so `int x = 5;` then `x * 2` prints `10`.
 ///
 /// ```no_run
@@ -588,10 +588,10 @@ struct ReplState {
 }
 
 impl ReplSession {
-    /// Creates a stateful REPL session, discovering the csc toolchain up front.
+    /// Creates a stateful REPL session, discovering the compiler toolchain up front.
     ///
     /// # Errors
-    /// Returns `Err` if csc / the reference pack cannot be located (so a caller can
+    /// Returns `Err` if the compiler / the reference pack cannot be located (so a caller can
     /// skip-with-note exactly as the stateless tests do).
     pub fn new() -> Result<ReplSession, String> {
         let tools = Toolchain::discover()?;
@@ -613,7 +613,7 @@ impl ReplSession {
     /// migrated by slot into each newly emitted instance.
     ///
     /// # Errors
-    /// Returns `Err` if csc rejects the emitted program (its diagnostics), the produced
+    /// Returns `Err` if the compiler rejects the emitted program (its diagnostics), the produced
     /// assembly cannot be read / loaded, the emitted `__Repl` is missing its expected
     /// members, or the interpreter traps running `__Submit`.
     pub fn submit(&mut self, line: &str) -> Result<String, String> {
@@ -1004,12 +1004,12 @@ impl LiteralScan {
 
 /// Whether an accumulated multi-line submission looks COMPLETE and ready to run, used by the
 /// interactive `--session` loop to decide between submitting and showing a continuation prompt.
-/// This is a surface heuristic (the real arbiter is csc), tuned so the common cases never strand
+/// This is a surface heuristic (the real arbiter is the compiler), tuned so the common cases never strand
 /// the user: a blank line in the loop force-submits regardless of what this returns.
 ///
 /// `text` is complete when, ignoring string/char literals:
 /// - every `()`, `[]`, `{}` is balanced (and none closed before it opened -- an over-closed line
-///   is treated as complete so its csc error surfaces rather than trapping the user), and the
+///   is treated as complete so its compiler error surfaces rather than trapping the user), and the
 ///   scan did not end inside a literal; and
 /// - either the trimmed text ends with `;` or `}` (a finished statement or block), or it is a
 ///   bare expression -- one that neither begins with a body-requiring keyword (`if`, `for`,

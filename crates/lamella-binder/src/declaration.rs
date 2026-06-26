@@ -2,7 +2,7 @@
 //! clauses 16-18).
 
 use crate::bind::bind_type;
-use crate::bound::integer_literal;
+use crate::bound::{integer_literal, literal_int_value};
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::symbols::{
@@ -14,9 +14,9 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
-    AttributeArgument, AttributeSection, CompilationUnit, Expr, ExprKind, Literal, Member,
-    Modifier, NamespaceMember, QualifiedName, TypeDecl, TypeKind as SyntaxTypeKind, UnaryOperator,
-    explicit_interface_member_name,
+    AttributeArgument, AttributeSection, BinaryOperator, CompilationUnit, Expr, ExprKind, Literal,
+    Member, Modifier, NamespaceMember, QualifiedName, TypeDecl, TypeKind as SyntaxTypeKind,
+    UnaryOperator, explicit_interface_member_name,
 };
 
 /// Builds the [`Model`] of every type and member declared in `unit`.
@@ -140,13 +140,66 @@ fn qualified_type_name(namespace: &str, name: &str) -> alloc::string::String {
 /// real, or decimal literal folds directly. `None` for a non-literal initializer (a `const`
 /// *expression*, which v1 does not fold), so the field stays a runtime field at the use site.
 fn const_field_literal(expr: &Expr) -> Option<Literal> {
-    if let Some(value) = enum_member_value(expr) {
-        return Some(integer_literal(value));
-    }
     match &expr.kind {
         ExprKind::Literal(literal) => Some(literal.clone()),
+        ExprKind::Parenthesized(inner) => const_field_literal(inner),
+        ExprKind::Unary { operator, operand } => {
+            fold_const_unary(*operator, &const_field_literal(operand)?)
+        }
+        ExprKind::Binary { operator, left, right } => {
+            fold_const_binary(*operator, &const_field_literal(left)?, &const_field_literal(right)?)
+        }
         _ => None,
     }
+}
+
+/// Folds a unary operator applied to an already-folded constant operand (14.6).
+fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Option<Literal> {
+    match operator {
+        UnaryOperator::Plus => Some(operand.clone()),
+        UnaryOperator::Minus => Some(integer_literal(literal_int_value(operand)?.checked_neg()?)),
+        UnaryOperator::Complement => Some(integer_literal(!literal_int_value(operand)?)),
+        UnaryOperator::Not => match operand {
+            Literal::Boolean(value) => Some(Literal::Boolean(!value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Folds a binary operator applied to two already-folded constant operands (14.7-14.12). Integer
+/// arithmetic uses checked ops, so an overflow or a divide-by-zero declines to fold (it is not a
+/// constant value); string `+` concatenates. Operands are treated as `i64`, so a `const` whose type
+/// or value needs the operand's own width (e.g. a `uint` expression near `u32::MAX`) is not folded.
+fn fold_const_binary(operator: BinaryOperator, left: &Literal, right: &Literal) -> Option<Literal> {
+    use BinaryOperator as Op;
+    if let (Op::Add, Literal::String(left), Literal::String(right)) = (operator, left, right) {
+        let mut units = left.to_vec();
+        units.extend_from_slice(right);
+        return Some(Literal::String(units.into()));
+    }
+    let (left, right) = (literal_int_value(left)?, literal_int_value(right)?);
+    let value = match operator {
+        Op::Multiply => left.checked_mul(right)?,
+        Op::Divide => left.checked_div(right)?,
+        Op::Modulo => left.checked_rem(right)?,
+        Op::Add => left.checked_add(right)?,
+        Op::Subtract => left.checked_sub(right)?,
+        Op::LeftShift => left.checked_shl(u32::try_from(right).ok()?)?,
+        Op::RightShift => left.checked_shr(u32::try_from(right).ok()?)?,
+        Op::BitwiseAnd => left & right,
+        Op::BitwiseXor => left ^ right,
+        Op::BitwiseOr => left | right,
+        Op::LessThan => return Some(Literal::Boolean(left < right)),
+        Op::GreaterThan => return Some(Literal::Boolean(left > right)),
+        Op::LessThanOrEqual => return Some(Literal::Boolean(left <= right)),
+        Op::GreaterThanOrEqual => return Some(Literal::Boolean(left >= right)),
+        Op::Equal => return Some(Literal::Boolean(left == right)),
+        Op::NotEqual => return Some(Literal::Boolean(left != right)),
+        Op::LogicalAnd => return Some(Literal::Boolean(left != 0 && right != 0)),
+        Op::LogicalOr => return Some(Literal::Boolean(left != 0 || right != 0)),
+    };
+    Some(integer_literal(value))
 }
 
 /// Evaluates an enum member's value expression to its underlying integral value.

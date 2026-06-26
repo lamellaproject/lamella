@@ -1,0 +1,13 @@
+[package]
+name = "lamella-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The Lamella wireline debug + REPL protocol: byte framing, a versioned HELLO handshake (version ranges + capability flags), and a carrier-agnostic Transport seam. Shared by the host front-ends and the on-device debug agent; no_std + alloc so it rides onto a microcontroller."
+
+[dependencies]
+
+[lints]
+workspace = true

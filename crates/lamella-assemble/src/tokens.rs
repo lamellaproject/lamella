@@ -73,6 +73,9 @@ pub struct Tokens {
     /// qualified signature then finds the token the syntax-keyed pre-pass recorded. The default
     /// (empty) canon is the identity, so a table built without one is unchanged.
     canon: SignatureCanon,
+    /// Whether unmanaged native interop is enabled (the off-by-default `native_interop` knob). When
+    /// set, a `[DllImport]` extern method emits an `ImplMap` (P/Invoke); when clear, it is rejected.
+    native_interop: bool,
 }
 
 impl Tokens {
@@ -86,6 +89,17 @@ impl Tokens {
     /// through. Set BEFORE any member is recorded, so inserts and look-ups key alike.
     pub fn set_canon(&mut self, canon: SignatureCanon) {
         self.canon = canon;
+    }
+
+    /// Enables unmanaged native interop (the `native_interop` knob) for this emit.
+    pub fn set_native_interop(&mut self, enabled: bool) {
+        self.native_interop = enabled;
+    }
+
+    /// Whether unmanaged native interop is enabled (so a `[DllImport]` method emits an `ImplMap`).
+    #[must_use]
+    pub(crate) fn native_interop(&self) -> bool {
+        self.native_interop
     }
 
     /// `ty` with single-part named types qualified, as every key is normalized. Emission

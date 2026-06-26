@@ -31,3 +31,5 @@ lamella-ir = { path = "../lamella-ir" }
 # The deploy-alloc example links a C# object against a Rust GC-seed object (the object-path deploy).
 lamella-elf = { path = "../lamella-elf" }
 lamella-link = { path = "../lamella-link" }
+# The deploy-firmware example uses the one-call CIL -> flashable image pipeline.
+lamella-firmware = { path = "../lamella-firmware" }

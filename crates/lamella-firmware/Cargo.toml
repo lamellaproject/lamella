@@ -1,0 +1,13 @@
+[package]
+name = "lamella-firmware"
+version = "0.1.0"
+edition = "2021"
+description = "Composes the Lamella AOT compiler and linker into a flashable bare-metal image."
+
+[dependencies]
+lamella-aot = { path = "../lamella-aot", features = ["arm32"] }
+lamella-elf = { path = "../lamella-elf" }
+lamella-link = { path = "../lamella-link" }
+
+[lints]
+workspace = true

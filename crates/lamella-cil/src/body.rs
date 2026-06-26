@@ -190,6 +190,16 @@ impl fmt::Display for BodyError {
 /// Returns a [`BodyError`] for a truncated or malformed header, code, or
 /// exception section.
 pub fn read_method_body(bytes: &[u8]) -> Result<MethodBodyImage, BodyError> {
+    read_method_body_sized(bytes).map(|(body, _)| body)
+}
+
+/// Like [`read_method_body`], but also returns the body's total byte length (header + CIL + any
+/// exception section). A caller can use the length to slice the exact raw body region out of an
+/// assembly -- e.g. to store the raw bytes and re-decode the body lazily on first use.
+///
+/// # Errors
+/// Returns a [`BodyError`] for a truncated or malformed header, code, or exception section.
+pub fn read_method_body_sized(bytes: &[u8]) -> Result<(MethodBodyImage, usize), BodyError> {
     let first = *bytes.first().ok_or(BodyError::UnexpectedEnd)?;
     let (header_len, max_stack, init_locals, local_var_sig, code_size, more_sections) =
         match first & FORMAT_MASK {
@@ -203,20 +213,23 @@ pub fn read_method_body(bytes: &[u8]) -> Result<MethodBodyImage, BodyError> {
         .ok_or(BodyError::UnexpectedEnd)?;
     let (code, offsets) = codec::decode_with_offsets(code_bytes)?;
 
-    let handlers = if more_sections {
+    let (handlers, total_len) = if more_sections {
         let section_start = round_up_to_4(header_len.saturating_add(code_size));
         read_sections(bytes, section_start, &offsets, code_size as u32)?
     } else {
-        Vec::new()
+        (Vec::new(), header_len.saturating_add(code_size))
     };
 
-    Ok(MethodBodyImage {
-        max_stack,
-        init_locals,
-        local_var_sig,
-        code: code.into_boxed_slice(),
-        handlers: handlers.into_boxed_slice(),
-    })
+    Ok((
+        MethodBodyImage {
+            max_stack,
+            init_locals,
+            local_var_sig,
+            code: code.into_boxed_slice(),
+            handlers: handlers.into_boxed_slice(),
+        },
+        total_len,
+    ))
 }
 
 type FatHeader = (usize, u16, bool, Option<Token>, usize, bool);
@@ -245,7 +258,7 @@ fn read_sections(
     mut pos: usize,
     offsets: &[u32],
     code_size: u32,
-) -> Result<Vec<EhClause>, BodyError> {
+) -> Result<(Vec<EhClause>, usize), BodyError> {
     let mut handlers = Vec::new();
     loop {
         let kind = *bytes.get(pos).ok_or(BodyError::UnexpectedEnd)?;
@@ -277,12 +290,12 @@ fn read_sections(
         for clause in clauses.chunks_exact(clause_len) {
             handlers.push(read_clause(clause, fat, offsets, code_size)?);
         }
+        let section_end = pos + data_size;
         if kind & SECT_MORE_SECTS == 0 {
-            break;
+            return Ok((handlers, section_end));
         }
-        pos = round_up_to_4(pos + data_size);
+        pos = round_up_to_4(section_end);
     }
-    Ok(handlers)
 }
 
 fn read_clause(
@@ -491,6 +504,9 @@ mod tests {
             bytes,
             "byte round-trip"
         );
+        let (sized, len) = read_method_body_sized(&bytes).expect("sized read");
+        assert_eq!(&sized, image, "sized structure round-trip");
+        assert_eq!(len, bytes.len(), "exact body length");
     }
 
     #[test]

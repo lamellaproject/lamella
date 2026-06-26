@@ -521,7 +521,8 @@ impl Debugger {
             Stop::Breakpoint => events.push(("stopped", Some(stopped("breakpoint")))),
             Stop::Step => events.push(("stopped", Some(stopped("step")))),
             Stop::Done => {
-                events.push(("exited", Some(json!({ "exitCode": 0 }))));
+                let exit_code = self.backend.exit_code();
+                events.push(("exited", Some(json!({ "exitCode": exit_code }))));
                 events.push(("terminated", None));
             }
             Stop::Running => {}
@@ -775,7 +776,7 @@ mod tests {
         let hi: Vec<u16> = "hi".encode_utf16().collect();
         let string_token = Token(0x7000_0001);
         module.bind_string(0, string_token, &hi);
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             body(vec![
                 Instruction::new(Opcode::Ldstr, Operand::Token(string_token)),
@@ -823,10 +824,14 @@ mod tests {
             Message::Response(r) if r.success));
         let out = dbg.handle(&request(2, "continue", None));
         assert!(matches!(&out[0], Message::Response(r) if r.success));
-        assert!(
-            out.iter()
-                .any(|m| matches!(m, Message::Event(e) if e.event == "exited"))
-        );
+        let exited = out
+            .iter()
+            .find_map(|m| match m {
+                Message::Event(e) if e.event == "exited" => Some(e),
+                _ => None,
+            })
+            .expect("an exited event");
+        assert_eq!(exited.body.as_ref().expect("exited body")["exitCode"], json!(5));
         assert!(
             out.iter()
                 .any(|m| matches!(m, Message::Event(e) if e.event == "terminated"))
@@ -1203,7 +1208,7 @@ mod tests {
         let hi: Vec<u16> = "hi".encode_utf16().collect();
         let string_token = Token(0x7000_0001);
         module.bind_string(0, string_token, &hi);
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             body(vec![
                 Instruction::new(Opcode::Ldstr, Operand::Token(string_token)),
@@ -1301,7 +1306,7 @@ mod tests {
 
     fn call_program() -> (Module, u32) {
         let mut module = Module::new();
-        let add = module.add_method(
+        let add = module.add_method_image(
             0,
             body(vec![
                 Instruction::simple(Opcode::Ldarg0),
@@ -1313,7 +1318,7 @@ mod tests {
         );
         let add_token = Token(0x0600_0002);
         module.bind_token(0, add_token, add);
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             body(vec![
                 Instruction::simple(Opcode::LdcI42),

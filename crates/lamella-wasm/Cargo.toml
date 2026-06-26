@@ -29,6 +29,11 @@ lamella-aot = { path = "../lamella-aot", optional = true }
 # The py feature pulls in the Python front end + runtime for the in-page Python runner.
 lamella-py-frontend = { path = "../lamella-py-frontend", optional = true }
 lamella-py-runtime = { path = "../lamella-py-runtime", optional = true }
+# The repl feature pulls in the carrier-neutral tier-0 REPL engine for the in-page C# REPL. Its
+# default features (the serial carrier + the csc `repl-host` front end) are host-only and not
+# wasm-buildable, so take only the carrier-neutral core (--no-default-features); this crate supplies
+# the compiler (over `compile`) and uses the engine's in-process LoopbackLink for the run side.
+lamella-wireline = { path = "../lamella-wireline", optional = true, default-features = false }
 
 [features]
 # Adds the lamella_selftest export (embeds a fixture) so a wasm host can validate
@@ -52,6 +57,10 @@ aot = ["dep:lamella-aot"]
 # Adds the in-page Python runner (lamella_py_run: Python source -> compile + run main() -> rendered
 # result + diagnostics) so Studio compiles + runs the user's Python client-side. Off by default.
 py = ["dep:lamella-py-frontend", "dep:lamella-py-runtime"]
+# Adds the in-page stateful C# REPL (lamella_repl_new/eval/reset) over lamella-wireline's
+# carrier-neutral tier-0 REPL engine, so Studio runs the SAME read-compile-eval-print engine the
+# CLI does. Pulls in `compile` (the in-wasm compiler the REPL's compile seam wraps). Off by default.
+repl = ["dep:lamella-wireline", "compile"]
 
 [lints]
 workspace = true

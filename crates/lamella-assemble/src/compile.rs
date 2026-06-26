@@ -44,6 +44,7 @@ const METHOD_STATIC: u16 = 0x0010;
 const METHOD_VIRTUAL: u16 = 0x0040;
 const METHOD_HIDEBYSIG: u16 = 0x0080;
 const METHOD_NEWSLOT: u16 = 0x0100;
+const METHOD_PINVOKE_IMPL: u16 = 0x2000;
 const METHOD_FINAL: u16 = 0x0020;
 const METHOD_ABSTRACT: u16 = 0x0400;
 const INTERFACE_FLAGS: u32 = 0x0000_0001 | 0x0000_0020 | 0x0000_0080;
@@ -137,7 +138,7 @@ pub fn compile_unit_with_references(
     assembly_name: &str,
     references: &[Assembly],
 ) -> Compilation {
-    compile(unit, module_name, assembly_name, references, None)
+    compile(unit, module_name, assembly_name, references, None, false)
 }
 
 /// Like [`compile_unit_with_references`], but also emits a standalone Portable PDB
@@ -158,6 +159,7 @@ pub fn compile_unit_with_debug(
         assembly_name,
         references,
         Some((source, source_path)),
+        false,
     )
 }
 
@@ -213,7 +215,14 @@ pub fn compile_source_with(
         };
     }
     let debug = emit_debug.then_some((source, source_path));
-    let mut compiled = compile(&parsed.unit, module_name, assembly_name, references, debug);
+    let mut compiled = compile(
+        &parsed.unit,
+        module_name,
+        assembly_name,
+        references,
+        debug,
+        options.native_interop,
+    );
     if !parse_diagnostics.is_empty() {
         let mut diagnostics = parse_diagnostics;
         diagnostics.append(&mut compiled.diagnostics);
@@ -228,6 +237,7 @@ fn compile(
     assembly_name: &str,
     references: &[Assembly],
     debug: Option<(&str, &str)>,
+    native_interop: bool,
 ) -> Compilation {
     let diagnostics: Vec<Diagnostic> = bind_compilation_unit_with_references(unit, references)
         .iter()
@@ -241,7 +251,7 @@ fn compile(
             emit_error: None,
         };
     }
-    match build_image(unit, module_name, assembly_name, references, debug) {
+    match build_image(unit, module_name, assembly_name, references, debug, native_interop) {
         Ok((image, pdb)) => Compilation {
             diagnostics,
             image: Some(image),
@@ -281,9 +291,11 @@ fn build_image(
     assembly_name: &str,
     references: &[Assembly],
     debug: Option<(&str, &str)>,
+    native_interop: bool,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let model = reference_model(unit, references);
     let mut tokens = assign_tokens(unit, model.signature_canon());
+    tokens.set_native_interop(native_interop);
     let mut binder = Binder::with_model(model);
     binder.set_defined_symbols(unit.defined_symbols.clone());
     mark_external_value_types(binder.model(), &mut tokens);
@@ -1352,6 +1364,19 @@ fn emit_type(
                     *entry_point = Some(token);
                 }
             }
+            Member::Method {
+                modifiers,
+                return_type,
+                name,
+                parameters,
+                body: None,
+                attributes,
+                ..
+            } if find_dll_import(name, attributes).is_some() => {
+                emit_pinvoke_method(
+                    image, tokens, modifiers, name, return_type, parameters, attributes,
+                )?;
+            }
             Member::Operator {
                 modifiers,
                 return_type,
@@ -1823,6 +1848,105 @@ fn byref_flags(parameters: &[Parameter]) -> Vec<bool> {
             )
         })
         .collect()
+}
+
+/// The data a `[DllImport]` attribute carries: the unmanaged library, the native entry-point name
+/// (defaulting to the method's own name), and the `ImplMap` MappingFlags (II.23.1.8).
+struct DllImport {
+    library: String,
+    entry_point: String,
+    mapping_flags: u16,
+}
+
+/// Reads a `[DllImport("lib", EntryPoint = "...")]` among a method's attributes. CharSet /
+/// CallingConvention / SetLastError are not read yet -- the default MappingFlags (Winapi calling
+/// convention; the runtime marshals strings as the platform default) suffice for a first P/Invoke.
+fn find_dll_import(method_name: &str, attributes: &[AttributeSection]) -> Option<DllImport> {
+    for section in attributes {
+        for attribute in &section.attributes {
+            let last = attribute.name.parts.last()?;
+            if &**last != "DllImport" && &**last != "DllImportAttribute" {
+                continue;
+            }
+            let library = attribute.arguments.iter().find_map(|argument| match argument {
+                AttributeArgument::Positional(expr) => string_literal_value(expr),
+                AttributeArgument::Named { .. } => None,
+            })?;
+            let entry_point = attribute
+                .arguments
+                .iter()
+                .find_map(|argument| match argument {
+                    AttributeArgument::Named { name, value } if &**name == "EntryPoint" => {
+                        string_literal_value(value)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| String::from(method_name));
+            return Some(DllImport {
+                library,
+                entry_point,
+                mapping_flags: 0x0102,
+            });
+        }
+    }
+    None
+}
+
+/// The text of a string-literal expression (a `[DllImport]` library / entry point), else `None`.
+fn string_literal_value(expr: &Expr) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Literal(Literal::String(units)) => Some(String::from_utf16_lossy(units)),
+        _ => None,
+    }
+}
+
+/// Emits a `[DllImport]` extern method as a P/Invoke (II.15.5): a body-less `MethodDef` carrying
+/// `PinvokeImpl`, a `ModuleRef` for the library, and an `ImplMap` naming the entry point. Gated on
+/// the `native_interop` knob -- off (pure-managed / NETMF) rejects it rather than emit an unmanaged
+/// boundary the target cannot honor.
+fn emit_pinvoke_method(
+    image: &mut ImageBuilder,
+    tokens: &Tokens,
+    modifiers: &[Modifier],
+    name: &str,
+    return_type: &TypeRef,
+    parameters: &[Parameter],
+    attributes: &[AttributeSection],
+) -> Result<(), crate::EmitError> {
+    let Some(dll_import) = find_dll_import(name, attributes) else {
+        return Err(crate::EmitError::Unsupported(
+            "an extern method without a [DllImport] is not lowered",
+        ));
+    };
+    if !tokens.native_interop() {
+        return Err(crate::EmitError::Unsupported(
+            "[DllImport] (P/Invoke) needs native interop, which is off -- pass lcsc /native-interop",
+        ));
+    }
+    let parameter_sigs: Vec<TypeSig> = parameters
+        .iter()
+        .map(|parameter| {
+            let base = type_sig(tokens, &bind_type(&parameter.ty))?;
+            Ok(
+                if matches!(
+                    parameter.modifier,
+                    Some(ParameterModifier::Ref | ParameterModifier::Out)
+                ) {
+                    TypeSig::ByRef(Box::new(base))
+                } else {
+                    base
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, crate::EmitError>>()?;
+    let return_sig = type_sig(tokens, &bind_type(return_type))?;
+    let signature = method_signature(false, &parameter_sigs, &return_sig);
+    let flags =
+        member_visibility(modifiers) | METHOD_STATIC | METHOD_HIDEBYSIG | METHOD_PINVOKE_IMPL;
+    let method = image.add_pinvoke_method(name, &signature, flags);
+    let module_ref = image.add_module_ref(&dll_import.library);
+    image.add_impl_map(method, dll_import.mapping_flags, &dll_import.entry_point, module_ref);
+    Ok(())
 }
 
 /// Emits an explicit constructor as an instance `.ctor`. A class constructor chains to
@@ -3411,8 +3535,12 @@ fn collect_tokens(
                             parameters,
                             body,
                             explicit_interface,
+                            attributes,
                             ..
-                        } if body.is_some() || is_interface => {
+                        } if body.is_some()
+                            || is_interface
+                            || find_dll_import(name, attributes).is_some() =>
+                        {
                             *next_method += 1;
                             let params: Vec<TypeSymbol> =
                                 parameters.iter().map(|p| bind_type(&p.ty)).collect();

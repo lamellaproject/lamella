@@ -76,6 +76,10 @@ pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 /// the entry's trampoline at code offset 0, behind a minimal vector table (initial SP, then a reset
 /// vector pointing at that trampoline, Thumb bit set). The entry method IS the program -- it should
 /// loop forever, since an embedded reset handler never returns.
+///
+/// This is the flat, linker-free fast path: it cannot resolve external or cross-object calls, so float
+/// helpers, the GC seam, P/Invoke, and `CallNative` are unavailable. For the full object pipeline, build
+/// the device image through `lamella-firmware`'s `build_cortex_m_image` (object lowering + link).
 #[cfg(feature = "arm32")]
 pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     let initial_sp: u32 = match target {
@@ -256,29 +260,30 @@ fn stub() -> Function {
 /// plain trampoline. Eager static init before `main` is spec-compliant for the `beforefieldinit`
 /// types the C# compiler emits for field initializers; precise lazy (before-first-access) init is a
 /// follow-on.
-fn startup(cctors: &[u32], entry_rid: u32) -> Function {
-    let mut insts = Vec::with_capacity(cctors.len() + 1);
-    for (i, &cctor) in cctors.iter().enumerate() {
-        insts.push((
-            ValueId(i as u32),
-            Inst::Call {
-                callee: cctor,
-                args: Vec::new(),
-            },
-        ));
-    }
-    let result = ValueId(cctors.len() as u32);
-    insts.push((
-        result,
-        Inst::Call {
-            callee: entry_rid,
-            args: Vec::new(),
-        },
-    ));
+fn startup(init: Option<u32>, cctors: &[u32], entry_rid: u32) -> Function {
+    let callees: Vec<u32> = init
+        .into_iter()
+        .chain(cctors.iter().copied())
+        .chain(core::iter::once(entry_rid))
+        .collect();
+    let insts: Vec<(ValueId, Inst)> = callees
+        .iter()
+        .enumerate()
+        .map(|(i, &callee)| {
+            (
+                ValueId(i as u32),
+                Inst::Call {
+                    callee,
+                    args: Vec::new(),
+                },
+            )
+        })
+        .collect();
+    let result = ValueId((callees.len() - 1) as u32);
     Function {
         params: Vec::new(),
         ret: Some(MirType::I32),
-        value_types: vec![MirType::I32; cctors.len() + 1],
+        value_types: vec![MirType::I32; callees.len()],
         entry: BlockId(0),
         blocks: vec![BasicBlock {
             params: Vec::new(),
@@ -286,6 +291,27 @@ fn startup(cctors: &[u32], entry_rid: u32) -> Function {
             terminator: Some(Terminator::Return(Some(result))),
         }],
     }
+}
+
+/// The `MethodDef` rid of the method this assembly exports under native-seam name `export` (its
+/// `[UnmanagedCallersOnly]` EntryPoint, or its own name), if any -- e.g. `lamella_time_init`, which the
+/// startup chains in ahead of the `.cctor`s.
+fn find_native_export(assembly: &Assembly, export: &str) -> Option<u32> {
+    let marked = assembly.unmanaged_callers_only();
+    if marked.is_empty() {
+        return None;
+    }
+    for type_def in assembly.type_defs() {
+        for method in type_def.methods() {
+            let rid = method.rid();
+            if let Some(entry_point) = marked.get(&rid) {
+                if entry_point.as_deref().or_else(|| method.name()) == Some(export) {
+                    return Some(rid);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Lowers an assembly's methods to a `Vec<Function>` keyed by MethodDef row. Index 0 is a trampoline
@@ -323,7 +349,11 @@ fn lower_assembly_debug(
         .map(|_| cil::CilSourceMap(Vec::new()))
         .collect();
     if let Some(entry_rid) = entry {
-        funcs[0] = startup(&find_cctors(assembly), entry_rid);
+        funcs[0] = startup(
+            find_native_export(assembly, "lamella_time_init"),
+            &find_cctors(assembly),
+            entry_rid,
+        );
     }
     let resolver = MetadataResolver::new(assembly);
     let mut fails: Vec<(u32, cil::CilError)> = Vec::new();
@@ -412,21 +442,28 @@ mod tests {
 
     #[test]
     fn startup_runs_cctors_before_main() {
-        let f = startup(&[5, 7], 3);
-        let callees: Vec<u32> = f.blocks[0]
-            .insts
-            .iter()
-            .filter_map(|(_, inst)| match inst {
-                Inst::Call { callee, .. } => Some(*callee),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(callees, vec![5, 7, 3], "each .cctor, then Main");
+        let f = startup(None, &[5, 7], 3);
+        let callees = |g: &Function| -> Vec<u32> {
+            g.blocks[0]
+                .insts
+                .iter()
+                .filter_map(|(_, inst)| match inst {
+                    Inst::Call { callee, .. } => Some(*callee),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(callees(&f), vec![5, 7, 3], "each .cctor, then Main");
         assert!(matches!(
             f.blocks[0].terminator,
             Some(Terminator::Return(Some(_)))
         ));
-        assert_eq!(startup(&[], 3).blocks[0].insts.len(), 1);
+        assert_eq!(startup(None, &[], 3).blocks[0].insts.len(), 1);
+        assert_eq!(
+            callees(&startup(Some(9), &[5, 7], 3)),
+            vec![9, 5, 7, 3],
+            "init hook, then .cctors, then Main"
+        );
         assert!(lamella_ir::verify(&f).is_ok());
     }
 

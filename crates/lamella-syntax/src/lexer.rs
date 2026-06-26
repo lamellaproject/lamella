@@ -60,6 +60,12 @@ pub struct LexOptions {
     /// predates it is rejected with a `Feature requires C# N` diagnostic instead of munching as
     /// the 1.0 tokens it would otherwise split into (so the error names the feature, not `=` `>`).
     pub version: LanguageVersion,
+    /// Whether unmanaged native interop is enabled: `[DllImport]` P/Invoke (an `ImplMap`), and later
+    /// explicit `[StructLayout]`/`[FieldOffset]` and `[MarshalAs]`. Off by default -- pure-managed
+    /// code (and the NETMFv4_4 profile) does not need it, so a constrained target stays free of an
+    /// unmanaged boundary it cannot honor; on for AOT mixed (managed + native) scenarios. When off,
+    /// those attributes are rejected rather than emitted as inert metadata.
+    pub native_interop: bool,
 }
 
 impl LexOptions {

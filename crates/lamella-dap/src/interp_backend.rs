@@ -8,7 +8,7 @@ use lamella_debug_backend::{
 };
 use lamella_metadata::PortablePdb;
 use lamella_token::Token;
-use lamella_cil_runtime::{Method, MethodId, Module, Session, Status, Value, Vm};
+use lamella_cil_runtime::{MethodId, Module, Session, Status, Value, Vm};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The `MethodDef` metadata table tag, for rebuilding a method token to map a PDB
@@ -39,6 +39,19 @@ pub struct InterpreterBackend {
     /// the next `resume` steps off it before running on. False at launch -- so a
     /// breakpoint on the entry instruction fires rather than being stepped over.
     at_reported_breakpoint: bool,
+    /// The program's exit code: the entry method's `int` return (else 0), captured when the
+    /// session reports `Status::Done`. Reported in the adapter's `exited` event, so a debug run
+    /// surfaces the real exit code (not a hardcoded 0).
+    exit_code: i32,
+}
+
+/// The process exit code an entry method's return maps to: its `int` return, or 0 for a `void` (or
+/// non-`int`) entry -- matching the non-debug run path's convention (`run_bytes`, `run-with-corlib`).
+fn exit_code_of(returned: &Option<Value>) -> i32 {
+    match returned {
+        Some(Value::Int32(code)) => *code,
+        _ => 0,
+    }
 }
 
 impl InterpreterBackend {
@@ -56,6 +69,7 @@ impl InterpreterBackend {
             method_rid: BTreeMap::new(),
             seq_boundaries: BTreeMap::new(),
             at_reported_breakpoint: false,
+            exit_code: 0,
         }
     }
 
@@ -93,6 +107,7 @@ impl InterpreterBackend {
             method_rid,
             seq_boundaries,
             at_reported_breakpoint: false,
+            exit_code: 0,
         }
     }
 
@@ -110,12 +125,10 @@ impl InterpreterBackend {
         }
     }
 
-    /// The CIL of a loaded method, or `None` for an intrinsic or unknown method.
+    /// The CIL of a loaded method, or `None` for an intrinsic or unknown method. Decodes the body
+    /// lazily on first access (shared with the interpreter's own lazy decode).
     fn method_code(&self, method: u32) -> Option<&[Instruction]> {
-        match self.module.method(method)? {
-            Method::Managed { body, .. } => Some(&body.code[..]),
-            Method::Intrinsic { .. } => None,
-        }
+        self.module.method_body(method).map(|body| &body.code[..])
     }
 
     /// The CIL byte offset of each instruction in `method` (index -> offset), recomputed
@@ -172,6 +185,7 @@ impl DebugBackend for InterpreterBackend {
             vm,
             module,
             at_reported_breakpoint,
+            exit_code,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
@@ -180,7 +194,10 @@ impl DebugBackend for InterpreterBackend {
         if *at_reported_breakpoint && session.is_at_breakpoint() {
             *at_reported_breakpoint = false;
             match session.step(module, vm) {
-                Ok(Status::Done(_)) => return Stop::Done,
+                Ok(Status::Done(value)) => {
+                    *exit_code = exit_code_of(&value);
+                    return Stop::Done;
+                }
                 Ok(_) => {}
                 Err(trap) => return Stop::Fault(format!("{trap}")),
             }
@@ -190,7 +207,10 @@ impl DebugBackend for InterpreterBackend {
                 *at_reported_breakpoint = true;
                 Stop::Breakpoint
             }
-            Ok(Status::Done(_)) => Stop::Done,
+            Ok(Status::Done(value)) => {
+                *exit_code = exit_code_of(&value);
+                Stop::Done
+            }
             Err(trap) => Stop::Fault(format!("{trap}")),
         }
     }
@@ -201,6 +221,7 @@ impl DebugBackend for InterpreterBackend {
             vm,
             module,
             at_reported_breakpoint,
+            exit_code,
             ..
         } = self;
         let Some(session) = session.as_mut() else {
@@ -208,7 +229,10 @@ impl DebugBackend for InterpreterBackend {
         };
         *at_reported_breakpoint = false;
         match session.step(module, vm) {
-            Ok(Status::Done(_)) => Stop::Done,
+            Ok(Status::Done(value)) => {
+                *exit_code = exit_code_of(&value);
+                Stop::Done
+            }
             Ok(Status::Running | Status::Paused) if session.is_at_breakpoint() => {
                 *at_reported_breakpoint = true;
                 Stop::Breakpoint
@@ -216,6 +240,10 @@ impl DebugBackend for InterpreterBackend {
             Ok(Status::Running | Status::Paused) => Stop::Step,
             Err(trap) => Stop::Fault(format!("{trap}")),
         }
+    }
+
+    fn exit_code(&self) -> i32 {
+        self.exit_code
     }
 
     fn depth(&self) -> usize {

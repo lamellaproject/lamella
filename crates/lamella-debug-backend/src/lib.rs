@@ -45,6 +45,13 @@ pub trait DebugBackend {
         true
     }
 
+    /// The program's exit code once it has run to completion ([`Stop::Done`]): the entry method's
+    /// `int` return, or 0 for a `void`/non-`int` entry. The adapter reports it in the `exited` event.
+    /// The default (0) suits a backend that does not track an exit code (e.g. a device that only halts).
+    fn exit_code(&self) -> i32 {
+        0
+    }
+
     /// Runs a callee the current step descended into to its return, instead of the adapter
     /// single-stepping through it -- so `next`/`stepOut` skip a call at full speed rather than
     /// instruction by instruction (which is slow on a device, and hangs on a long loop). The

@@ -758,7 +758,16 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_sp(Reg::R1, slot(*value))
                 .map_err(|_| LowerError::TooManyValues)?;
-            emit_sized_store(enc, Reg::R1, Reg::R0, *width)?;
+            if *width == 8 {
+                enc.str_imm(Reg::R1, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R1, slot(*value) + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R1, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                emit_sized_store(enc, Reg::R1, Reg::R0, *width)?;
+            }
         }
         Inst::Load {
             address,
@@ -767,7 +776,14 @@ fn lower_spilled_inst(
         } => {
             enc.ldr_sp(Reg::R0, slot(*address))
                 .map_err(|_| LowerError::TooManyValues)?;
-            emit_sized_load(enc, Reg::R0, Reg::R0, *width, *signed)?;
+            if *width == 8 {
+                enc.ldr_imm(Reg::R1, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R0, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                emit_sized_load(enc, Reg::R0, Reg::R0, *width, *signed)?;
+            }
         }
         Inst::CopyBlock { dst, src, size } => {
             enc.ldr_sp(Reg::R0, slot(*dst))

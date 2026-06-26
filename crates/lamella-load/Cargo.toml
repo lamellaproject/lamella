@@ -25,7 +25,7 @@ mbedtls = { version = "0.12", optional = true, features = ["ssl"] }
 # gates out the same bindings the interpreter does. The DEFAULT is the full desktop profile (the
 # differential's run-with-corlib runner = full ECMA-335 1st-ed compliance, incl. typed references);
 # a constrained target builds --no-default-features + an explicit subset.
-default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory"]
+default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory", "debug-names"]
 bcl = ["lamella-cil-runtime/bcl"]
 NETMFv4_4 = ["bcl", "lamella-cil-runtime/NETMFv4_4"]
 exceptions = ["lamella-cil-runtime/exceptions"]
@@ -49,6 +49,11 @@ real-memory = []
 # Host-only, OPT-IN: compile the mbedTLS host TLS backend (the second desktop stack) into the
 # run-with-corlib example + the tls_seam conformance test. Requires libclang for the bindgen step.
 tls-mbedtls = ["dep:mbedtls"]
+# Source-level debugger names: the loader records each method's qualified name + argument names (for
+# the DAP backend / Session::this). Default ON (dev + the debugger); a constrained, non-debug profile
+# omits it -- for the full corlib that drops ~300 KB of resident Strings, with only graceful loss of
+# debugger name display. Nothing functional depends on the names.
+debug-names = []
 
 [dev-dependencies]
 # Host-only: the reactor's readiness poll for the run-with-corlib example's NetBackend (sockets).

@@ -2309,18 +2309,12 @@ fn new_frame(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, T
 /// The CIL of a managed method -- looked up per advance now that a frame no longer
 /// borrows it. Errors if `id` names an intrinsic or no method.
 fn method_code(module: &Module, id: MethodId) -> Result<&[Instruction], Trap> {
-    match module.method(id) {
-        Some(Method::Managed { body, .. }) => Ok(&body.code[..]),
-        _ => Err(Trap::NoSuchMethod(id)),
-    }
+    module.method_body(id).map(|body| &body.code[..]).ok_or(Trap::NoSuchMethod(id))
 }
 
 /// The exception-handling clauses of a managed method.
 fn method_handlers(module: &Module, id: MethodId) -> Result<&[EhClause], Trap> {
-    match module.method(id) {
-        Some(Method::Managed { body, .. }) => Ok(&body.handlers[..]),
-        _ => Err(Trap::NoSuchMethod(id)),
-    }
+    module.method_body(id).map(|body| &body.handlers[..]).ok_or(Trap::NoSuchMethod(id))
 }
 
 /// A reserved type id for objects whose type is external to this module: a runtime-fault
@@ -5248,7 +5242,7 @@ mod tests {
     #[test]
     fn static_call_adds_two_arguments() {
         let mut module = Module::new();
-        let add = module.add_method(
+        let add = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
@@ -5258,7 +5252,7 @@ mod tests {
             ]),
             2,
         );
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
@@ -5279,7 +5273,7 @@ mod tests {
     #[test]
     fn recursion_sums_one_to_n_across_frames() {
         let mut module = Module::new();
-        let sum = module.add_method(
+        let sum = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
@@ -5308,7 +5302,7 @@ mod tests {
     #[test]
     fn an_unbound_call_token_traps() {
         let mut module = Module::new();
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![Instruction::new(
                 Opcode::Call,
@@ -5325,7 +5319,7 @@ mod tests {
     #[test]
     fn runaway_recursion_traps_instead_of_crashing() {
         let mut module = Module::new();
-        let loop_method = module.add_method(
+        let loop_method = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::Call, Operand::Token(SELF_TOKEN)),
@@ -5344,7 +5338,7 @@ mod tests {
     #[test]
     fn session_single_steps_and_inspects_the_stack() {
         let mut module = Module::new();
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
@@ -5379,7 +5373,7 @@ mod tests {
     #[test]
     fn set_arg_and_set_local_edit_a_live_frame() {
         let mut module = Module::new();
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
@@ -5402,7 +5396,7 @@ mod tests {
     #[test]
     fn session_pauses_at_a_breakpoint() {
         let mut module = Module::new();
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
@@ -5432,7 +5426,7 @@ mod tests {
     #[test]
     fn session_exposes_the_call_stack_at_a_breakpoint() {
         let mut module = Module::new();
-        let add = module.add_method(
+        let add = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
@@ -5442,7 +5436,7 @@ mod tests {
             ]),
             2,
         );
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
@@ -5483,7 +5477,7 @@ mod tests {
         let counter = module.add_type(vec![Value::Int32(0)]);
         module.bind_field(0, count_field, 0);
 
-        let ctor = module.add_method(
+        let ctor = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
@@ -5496,7 +5490,7 @@ mod tests {
         module.set_method_type(ctor, counter);
         module.bind_token(0, ctor_token, ctor);
 
-        let inc = module.add_method(
+        let inc = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
@@ -5512,7 +5506,7 @@ mod tests {
         module.set_method_type(inc, counter);
         module.bind_token(0, inc_token, inc);
 
-        let get = module.add_method(
+        let get = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::Ldarg0),
@@ -5524,7 +5518,7 @@ mod tests {
         module.set_method_type(get, counter);
         module.bind_token(0, get_token, get);
 
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::LdcI4S, Operand::Int8(10)),
@@ -5588,7 +5582,7 @@ mod tests {
             Instruction::simple(Opcode::Add),
             Instruction::simple(Opcode::Ret),
         ]);
-        let main = module.add_method(0, method(code), 0);
+        let main = module.add_method_image(0, method(code), 0);
 
         assert_eq!(
             super::run(&module, &mut Vm::new(), main, Vec::new()),
@@ -5601,7 +5595,7 @@ mod tests {
         let elem = Token(0x0100_0005);
         let mut module = Module::new();
         module.bind_array_default(0, elem, Value::Int32(0));
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::simple(Opcode::LdcI42),
@@ -5627,13 +5621,13 @@ mod tests {
         let base = module.add_type(vec![]);
         let derived = module.add_type(vec![]);
 
-        let base_speak = module.add_method(
+        let base_speak = module.add_method_image(
             0,
             method(vec![Instruction::simple(Opcode::LdcI41), ret()]),
             1,
         );
         module.set_method_type(base_speak, base);
-        let derived_speak = module.add_method(
+        let derived_speak = module.add_method_image(
             0,
             method(vec![Instruction::simple(Opcode::LdcI42), ret()]),
             1,
@@ -5645,12 +5639,12 @@ mod tests {
         module.bind_method_slot(base_speak, 0);
         module.bind_method_slot(derived_speak, 0);
 
-        let ctor = module.add_method(0, method(vec![ret()]), 1);
+        let ctor = module.add_method_image(0, method(vec![ret()]), 1);
         module.set_method_type(ctor, derived);
         module.bind_token(0, ctor_token, ctor);
         module.bind_token(0, speak_token, base_speak);
 
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::Newobj, Operand::Token(ctor_token)),
@@ -5673,7 +5667,7 @@ mod tests {
 
         let mut module = Module::new();
         module.bind_static_field(0, field, Value::Int32(0));
-        let bump = module.add_method(
+        let bump = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::Ldsfld, Operand::Token(field)),
@@ -5685,7 +5679,7 @@ mod tests {
             0,
         );
         module.bind_token(0, bump_token, bump);
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::Call, Operand::Token(bump_token)),
@@ -5730,11 +5724,11 @@ mod tests {
         module.set_type_is_value_type(vt, true);
         module.bind_type_token(0, box_token, vt);
         module.bind_type_token(0, test_token, vt);
-        let ctor = module.add_method(0, method(vec![ret()]), 1);
+        let ctor = module.add_method_image(0, method(vec![ret()]), 1);
         module.set_method_type(ctor, vt);
         module.bind_token(0, vt_ctor, ctor);
         module.mark_value_type_ctor(0, vt_ctor);
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::Newobj, Operand::Token(vt_ctor)),
@@ -5761,10 +5755,10 @@ mod tests {
         let a = module.add_type(vec![]);
         let b = module.add_type(vec![]);
         module.bind_type_token(0, b_token, b);
-        let ctor = module.add_method(0, method(vec![ret()]), 1);
+        let ctor = module.add_method_image(0, method(vec![ret()]), 1);
         module.set_method_type(ctor, a);
         module.bind_token(0, a_ctor, ctor);
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::Newobj, Operand::Token(a_ctor)),
@@ -5781,10 +5775,10 @@ mod tests {
         let e_ctor = Token(0x0600_0050);
         let mut module = Module::new();
         let e = module.add_type(vec![]);
-        let ctor = module.add_method(0, method(vec![ret()]), 1);
+        let ctor = module.add_method_image(0, method(vec![ret()]), 1);
         module.set_method_type(ctor, e);
         module.bind_token(0, e_ctor, ctor);
-        let main = module.add_method(
+        let main = module.add_method_image(
             0,
             method(vec![
                 Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
@@ -5809,7 +5803,7 @@ mod tests {
         #[test]
         fn refvalue_round_trips_the_value_through_a_typedref() {
             let mut module = Module::new();
-            let main = module.add_method(
+            let main = module.add_method_image(
                 0,
                 method(vec![
                     Instruction::simple(Opcode::LdcI45),
@@ -5831,7 +5825,7 @@ mod tests {
         #[test]
         fn refvalue_with_a_mismatched_type_throws() {
             let mut module = Module::new();
-            let main = module.add_method(
+            let main = module.add_method_image(
                 0,
                 method(vec![
                     Instruction::simple(Opcode::LdcI45),
@@ -5853,7 +5847,7 @@ mod tests {
         #[test]
         fn reftype_yields_the_referent_type_handle() {
             let mut module = Module::new();
-            let main = module.add_method(
+            let main = module.add_method_image(
                 0,
                 method(vec![
                     Instruction::simple(Opcode::LdcI45),
@@ -5903,7 +5897,7 @@ mod tests {
 
         fn call_program() -> (Module, MethodId, MethodId) {
             let mut module = Module::new();
-            let add = module.add_method(
+            let add = module.add_method_image(
                 0,
                 method(vec![
                     Instruction::simple(Opcode::Ldarg0),
@@ -5914,7 +5908,7 @@ mod tests {
                 2,
             );
             module.bind_token(0, ADD_TOKEN, add);
-            let main = module.add_method(
+            let main = module.add_method_image(
                 0,
                 method(vec![
                     Instruction::simple(Opcode::LdcI42),
@@ -6037,10 +6031,10 @@ mod tests {
             let mut module = Module::new();
             let c = module.add_type(vec![Value::Int32(0)]);
             module.bind_field(0, v_field, 0);
-            let ctor = module.add_method(0, method(vec![ret()]), 1);
+            let ctor = module.add_method_image(0, method(vec![ret()]), 1);
             module.set_method_type(ctor, c);
             module.bind_token(0, ctor_token, ctor);
-            let read = module.add_method(
+            let read = module.add_method_image(
                 0,
                 method(vec![
                     Instruction::simple(Opcode::Ldarg0),
@@ -6052,7 +6046,7 @@ mod tests {
             module.set_method_type(read, c);
             module.bind_token(0, read_token, read);
             module.set_method_debug(read, "C.Read".into(), alloc::vec!["this".into()]);
-            let main = module.add_method(
+            let main = module.add_method_image(
                 0,
                 method(vec![
                     Instruction::new(Opcode::Newobj, Operand::Token(ctor_token)),
@@ -6084,7 +6078,7 @@ mod tests {
                 .alloc_instance(0, alloc::vec![Value::Int32(7), Value::Null]);
 
             let mut module = Module::new();
-            let main = module.add_method(0, method(vec![ret()]), 0);
+            let main = module.add_method_image(0, method(vec![ret()]), 0);
             let session = Session::new(&module, main, Vec::new()).unwrap();
 
             assert!(session.expand(&vm, &Value::Int32(5)).is_empty());
@@ -6111,10 +6105,10 @@ mod tests {
             let e_ctor = Token(0x0600_00B1);
             let mut module = Module::new();
             let e = module.add_type(vec![]);
-            let ctor = module.add_method(0, method(vec![ret()]), 1);
+            let ctor = module.add_method_image(0, method(vec![ret()]), 1);
             module.set_method_type(ctor, e);
             module.bind_token(0, e_ctor, ctor);
-            let main = module.add_method(
+            let main = module.add_method_image(
                 0,
                 method(vec![
                     Instruction::new(Opcode::Newobj, Operand::Token(e_ctor)),
@@ -6147,7 +6141,7 @@ mod tests {
             let catch_type = Token(0x0100_00C2);
             let mut module = Module::new();
             let e = module.add_type(vec![]);
-            let ctor = module.add_method(0, method(vec![ret()]), 1);
+            let ctor = module.add_method_image(0, method(vec![ret()]), 1);
             module.set_method_type(ctor, e);
             module.bind_token(0, e_ctor, ctor);
             let mut body = method(vec![
@@ -6163,7 +6157,7 @@ mod tests {
                 kind: EhKind::Catch(catch_type),
             }]
             .into_boxed_slice();
-            let main = module.add_method(0, body, 0);
+            let main = module.add_method_image(0, body, 0);
 
             let mut vm = Vm::new();
             let mut session = Session::new(&module, main, Vec::new()).unwrap();

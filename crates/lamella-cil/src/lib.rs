@@ -12,7 +12,7 @@ pub mod opcode;
 
 pub use body::{
     BodyError, EhClause, EhKind, InstructionRange, MethodBodyImage, read_method_body,
-    write_method_body,
+    read_method_body_sized, write_method_body,
 };
 pub use codec::{
     DecodeError, EncodeError, decode, decode_with_offsets, encode, encode_with_offsets,

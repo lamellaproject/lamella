@@ -540,6 +540,7 @@ dependencies = [
  "lamella-asm-arm32",
  "lamella-cmsis-dap",
  "lamella-elf",
+ "lamella-firmware",
  "lamella-ir",
  "lamella-link",
  "lamella-py-frontend",
@@ -588,6 +589,15 @@ dependencies = [
 [[package]]
 name = "lamella-elf"
 version = "0.0.0"
+
+[[package]]
+name = "lamella-firmware"
+version = "0.1.0"
+dependencies = [
+ "lamella-aot",
+ "lamella-elf",
+ "lamella-link",
+]
 
 [[package]]
 name = "lamella-gc"
@@ -672,6 +682,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-runner"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil-runtime",
+ "lamella-load",
+ "lamella-metadata",
+ "lamella-wire",
+]
+
+[[package]]
 name = "lamella-syntax"
 version = "0.0.0"
 dependencies = [
@@ -715,6 +735,7 @@ dependencies = [
  "lamella-py-frontend",
  "lamella-py-runtime",
  "lamella-syntax",
+ "lamella-wireline",
  "serde_json",
 ]
 
@@ -726,9 +747,7 @@ version = "0.0.0"
 name = "lamella-wireline"
 version = "0.0.0"
 dependencies = [
- "lamella-cil-runtime",
- "lamella-load",
- "lamella-metadata",
+ "lamella-runner",
  "lamella-wire",
  "serialport",
 ]

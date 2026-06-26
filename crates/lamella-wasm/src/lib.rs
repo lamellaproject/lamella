@@ -9,6 +9,8 @@ pub mod compile;
 pub mod dap;
 #[cfg(feature = "py")]
 pub mod py;
+#[cfg(feature = "repl")]
+pub mod repl;
 
 use lamella_load::load;
 use lamella_metadata::Assembly;

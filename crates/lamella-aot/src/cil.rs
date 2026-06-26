@@ -998,7 +998,8 @@ fn stind(
 }
 
 /// Lowers a `ldind.{i,u}{1,2,4}`: `value = *(addr)`, a `width`-byte load sign- or zero-extended to
-/// i32 per `signed` (the address is on top; the loaded value replaces it).
+/// i32 per `signed` (the address is on top; the loaded value replaces it). A `width`-8 load (`ldind.i8`)
+/// yields a full i64.
 fn ldind(
     value_types: &mut Vec<MirType>,
     stack: &mut Vec<ValueId>,
@@ -1007,7 +1008,12 @@ fn ldind(
     signed: bool,
 ) -> Result<(), CilError> {
     let address = stack.pop().ok_or(CilError::StackUnderflow)?;
-    let result = new_value(value_types, MirType::I32);
+    let result_type = if width == 8 {
+        MirType::I64
+    } else {
+        MirType::I32
+    };
+    let result = new_value(value_types, result_type);
     insts.push((
         result,
         Inst::Load {
@@ -1380,11 +1386,13 @@ fn apply_value_op(
         Opcode::StindI1 => stind(value_types, stack, insts, 1)?,
         Opcode::StindI2 => stind(value_types, stack, insts, 2)?,
         Opcode::StindI4 => stind(value_types, stack, insts, 4)?,
+        Opcode::StindI8 => stind(value_types, stack, insts, 8)?,
         Opcode::LdindI1 => ldind(value_types, stack, insts, 1, true)?,
         Opcode::LdindU1 => ldind(value_types, stack, insts, 1, false)?,
         Opcode::LdindI2 => ldind(value_types, stack, insts, 2, true)?,
         Opcode::LdindU2 => ldind(value_types, stack, insts, 2, false)?,
         Opcode::LdindI4 | Opcode::LdindU4 => ldind(value_types, stack, insts, 4, false)?,
+        Opcode::LdindI8 => ldind(value_types, stack, insts, 8, false)?,
         Opcode::Cpblk => {
             let size = stack.pop().ok_or(CilError::StackUnderflow)?;
             let src = stack.pop().ok_or(CilError::StackUnderflow)?;

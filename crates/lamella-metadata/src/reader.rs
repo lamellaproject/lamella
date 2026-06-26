@@ -17,7 +17,7 @@ use crate::signature::{
     parse_type,
 };
 use crate::tables::{TableError, TablesHeader, table};
-use lamella_cil::{EhKind, MethodBodyImage, instruction_offsets, read_method_body};
+use lamella_cil::{EhKind, MethodBodyImage, instruction_offsets, read_method_body, read_method_body_sized};
 use lamella_token::Token;
 
 impl From<TableError> for MetadataError {
@@ -1463,6 +1463,39 @@ impl<'a> Method<'a> {
         }
         let offset = PeImage::parse(file).ok()?.rva_to_offset(rva).ok()?;
         read_method_body(file.get(offset..)?).ok()
+    }
+
+    /// The method's raw CIL body bytes -- the exact region [`body`](Self::body) decodes (header + CIL +
+    /// any exception section), or `None` for a bodyless method / a bare metadata image. A caller can
+    /// store these and re-decode the body lazily with [`lamella_cil::read_method_body`], which is the
+    /// foundation for keeping the corlib's bodies compact in RAM until a method is actually called.
+    #[must_use]
+    pub fn body_bytes(&self) -> Option<&'a [u8]> {
+        let file = self.assembly.file?;
+        let rva = self.rva();
+        if rva == 0 {
+            return None;
+        }
+        let offset = PeImage::parse(file).ok()?.rva_to_offset(rva).ok()?;
+        let rest = file.get(offset..)?;
+        let (_, len) = read_method_body_sized(rest).ok()?;
+        rest.get(..len)
+    }
+
+    /// The method's decoded body AND its raw bytes in a single decode -- so a loader can scan the
+    /// decoded form (for token binding) yet store the compact raw bytes for lazy re-decoding, without
+    /// decoding the body twice. `None` for a bodyless method / a bare metadata image.
+    #[must_use]
+    pub fn body_and_bytes(&self) -> Option<(MethodBodyImage, &'a [u8])> {
+        let file = self.assembly.file?;
+        let rva = self.rva();
+        if rva == 0 {
+            return None;
+        }
+        let offset = PeImage::parse(file).ok()?.rva_to_offset(rva).ok()?;
+        let rest = file.get(offset..)?;
+        let (body, len) = read_method_body_sized(rest).ok()?;
+        Some((body, rest.get(..len)?))
     }
 
     /// The method's local-variable types, resolving the body's local-variable

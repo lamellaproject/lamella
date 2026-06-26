@@ -8,7 +8,8 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use lamella_cil::MethodBodyImage;
+use core::cell::OnceCell;
+use lamella_cil::{MethodBodyImage, read_method_body};
 use lamella_token::Token;
 
 /// An index identifying a [`Method`] within a [`Module`].
@@ -173,10 +174,14 @@ pub type IntrinsicFn = fn(&mut Vm, &Module, &[Value]) -> Result<Option<Value>, T
 /// intrinsic it invokes directly.
 #[derive(Clone)]
 pub enum Method {
-    /// Managed CIL: the decoded body and its argument count.
+    /// Managed CIL: the method's RAW body bytes, a lazily-decoded body cache, and its argument count.
+    /// The body is decoded from `raw_il` on FIRST execution and cached in `decoded` -- so only methods
+    /// actually CALLED pay the (memory-heavy) decode, not every method in a loaded assembly.
     Managed {
-        /// The method's decoded CIL body.
-        body: MethodBodyImage,
+        /// The raw CIL body bytes (header + code + any exception section), kept compact in RAM.
+        raw_il: Box<[u8]>,
+        /// The decoded body, produced lazily from `raw_il` on first use (see [`Module::method_body`]).
+        decoded: OnceCell<MethodBodyImage>,
         /// How many arguments the method takes (a resolved signature replaces this
         /// once `lamella-metadata` is wired in).
         arg_count: u16,
@@ -197,6 +202,19 @@ impl Method {
         match self {
             Method::Managed { arg_count, .. } | Method::Intrinsic { arg_count, .. } => *arg_count,
         }
+    }
+}
+
+/// An empty method body -- the lazy-decode fallback for the (in practice unreachable) case where a body
+/// the loader already decoded once fails to re-decode. Running it traps at once (`FellThroughEnd`)
+/// rather than producing wrong results.
+fn empty_body() -> MethodBodyImage {
+    MethodBodyImage {
+        max_stack: 0,
+        init_locals: false,
+        local_var_sig: None,
+        code: Vec::new().into_boxed_slice(),
+        handlers: Vec::new().into_boxed_slice(),
     }
 }
 
@@ -494,9 +512,19 @@ impl Module {
         Module::default()
     }
 
-    /// Adds a managed method belonging to assembly `asm` and returns its [`MethodId`].
-    pub fn add_method(&mut self, asm: u8, body: MethodBodyImage, arg_count: u16) -> MethodId {
-        self.push(asm, Method::Managed { body, arg_count })
+    /// Adds a managed method belonging to assembly `asm` (storing its RAW CIL bytes for lazy decoding)
+    /// and returns its [`MethodId`].
+    pub fn add_method(&mut self, asm: u8, raw_il: Box<[u8]>, arg_count: u16) -> MethodId {
+        self.push(asm, Method::Managed { raw_il, decoded: OnceCell::new(), arg_count })
+    }
+
+    /// Adds a managed method from an already-DECODED body, pre-populating the lazy cache -- a
+    /// convenience for callers (and tests) that build a [`MethodBodyImage`] directly rather than
+    /// holding the method's raw bytes. The body runs as-is, with no encode/decode round-trip.
+    pub fn add_method_image(&mut self, asm: u8, body: MethodBodyImage, arg_count: u16) -> MethodId {
+        let decoded = OnceCell::new();
+        let _ = decoded.set(body);
+        self.push(asm, Method::Managed { raw_il: Vec::new().into_boxed_slice(), decoded, arg_count })
     }
 
     /// Adds a native intrinsic belonging to assembly `asm` and returns its [`MethodId`].
@@ -553,6 +581,135 @@ impl Module {
     #[must_use]
     pub fn method(&self, id: MethodId) -> Option<&Method> {
         self.methods.get(id as usize)
+    }
+
+    /// The decoded body of a managed method, decoded LAZILY from its raw CIL bytes on first call and
+    /// cached -- so an uncalled method never pays the decode (the resident-memory win for a large
+    /// loaded corlib). `None` for an intrinsic or unknown method.
+    ///
+    /// This is the **`on_use`** level of the `code_loading` knob (decode on first use, the
+    /// constrained-target default). [`Module::preload_bodies`] is the **`preload`** level (decode
+    /// everything up front). The third level, **`in_place`** (execute CIL straight from flash, decoding
+    /// nothing into RAM), needs the borrow-from-flash work and is not wired yet.
+    #[must_use]
+    pub fn method_body(&self, id: MethodId) -> Option<&MethodBodyImage> {
+        match self.method(id)? {
+            Method::Managed { raw_il, decoded, .. } => {
+                Some(decoded.get_or_init(|| read_method_body(raw_il).unwrap_or_else(|_| empty_body())))
+            }
+            Method::Intrinsic { .. } => None,
+        }
+    }
+
+    /// Eagerly decode every managed method's body, populating the lazy cache up front -- the
+    /// **`preload`** level of the `code_loading` knob. Trades RAM (all bodies resident) for speed: no
+    /// per-method decode the first time it runs (no runtime decode jitter), suited to a RAM-rich host
+    /// or a latency-sensitive target. The default is `on_use` (lazy, see [`Module::method_body`]);
+    /// pick `preload` only where the memory is available. Returns how many bodies were decoded.
+    pub fn preload_bodies(&self) -> usize {
+        (0..self.methods.len())
+            .filter(|&index| self.method_body(index as MethodId).is_some())
+            .count()
+    }
+
+    /// A rough per-structure breakdown of the module's resident heap (content + per-entry header
+    /// bytes), for LOCALIZING the load footprint -- the Phase-2 metadata-skeleton work. Approximate;
+    /// the relative sizes are what matter (which structure to lean first).
+    #[must_use]
+    pub fn heap_report(&self) -> Vec<(&'static str, usize)> {
+        let str_entry = |s: &str| s.len() + 40;
+        let methods = self
+            .methods
+            .iter()
+            .map(|method| match method {
+                Method::Managed { raw_il, .. } => raw_il.len() + 24,
+                Method::Intrinsic { .. } => 8,
+            })
+            .sum();
+        let sig_methods = self
+            .types
+            .iter()
+            .flat_map(|info| info.sig_methods.keys().chain(info.sig_methods_nonvirtual.keys()))
+            .map(|key| str_entry(key))
+            .sum();
+        let vtables = self
+            .types
+            .iter()
+            .map(|info| {
+                info.vtable.len() * 4
+                    + info.field_defaults.len() * core::mem::size_of::<Value>()
+                    + info.interfaces.len() * 4
+            })
+            .sum();
+        let vtable_slot_keys = self.vtable_slot_keys.values().flatten().map(|(key, _)| str_entry(key)).sum();
+        let method_debug = self
+            .method_debug
+            .values()
+            .map(|debug| debug.name.len() + 24 + debug.args.iter().map(|arg| arg.len() + 24).sum::<usize>())
+            .sum();
+        let by_name = self
+            .type_methods_by_name
+            .keys()
+            .chain(self.type_fields_by_name.keys())
+            .chain(self.type_properties_by_name.keys())
+            .map(|(_, name)| str_entry(name))
+            .sum();
+        let call_targets = self.call_targets.values().map(|(key, _)| str_entry(key)).sum();
+        let strings = self.strings.values().map(|text| text.len() * 2 + 24).sum();
+        let custom_attrs = self.custom_attributes.values().map(|attrs| attrs.len() * 32 + 16).sum();
+        let type_names = self
+            .type_names
+            .values()
+            .chain(self.type_full_names.values())
+            .map(|name| name.len() + 40)
+            .sum();
+        let method_structs = self.methods.len() * core::mem::size_of::<Method>();
+        let token_maps = (self.by_token.len()
+            + self.method_type.len()
+            + self.field_slots.len()
+            + self.field_types.len()
+            + self.array_defaults.len()
+            + self.array_element_sizes.len()
+            + self.method_slots.len()
+            + self.static_fields.len()
+            + self.type_tokens.len()
+            + self.type_handles.len()
+            + self.vararg_sites.len()
+            + self.explicit_overrides.len()
+            + self.delegate_invokes.len()
+            + self.finalizers.len()
+            + self.enum_widths.len()
+            + self.md_array_ctors.len()
+            + self.string_builder_ctors.len()
+            + self.list_ctors.len()
+            + self.type_sizes.len()
+            + self.catch_type_tags.len()
+            + self.value_type_ctors.len()
+            + self.delegate_ctors.len()
+            + self.enum_wide.len()
+            + self.enum_flags.len()
+            + self.object_type_tokens.len()
+            + self.string_type_tokens.len())
+            * 48;
+        let data = self.method_asm.len()
+            + self.static_defaults.len() * core::mem::size_of::<Value>()
+            + self.field_rva_data.values().map(|bytes| bytes.len() + 24).sum::<usize>()
+            + self.enum_constants.values().flat_map(|map| map.values()).map(|name| name.len() + 40).sum::<usize>();
+        Vec::from([
+            ("methods (raw IL)", methods),
+            ("method structs (inline: Box+OnceCell+u16)", method_structs),
+            ("token->id maps/sets (~26 BTreeMaps)", token_maps),
+            ("types.sig_methods+nonvirtual (String keys)", sig_methods),
+            ("types.vtable+field_defaults", vtables),
+            ("vtable_slot_keys", vtable_slot_keys),
+            ("method_debug (debugger names)", method_debug),
+            ("type_*_by_name indexes", by_name),
+            ("call_targets", call_targets),
+            ("strings (ldstr UTF-16)", strings),
+            ("custom_attributes", custom_attrs),
+            ("type_names+full_names", type_names),
+            ("data (asm/static/rva/enum)", data),
+        ])
     }
 
     /// The number of declared reference types in the module -- the global [`TypeId`]
@@ -1704,6 +1861,26 @@ mod tests {
         assert_eq!(module.arg_name(0, 3), None);
         assert_eq!(module.method_name(1), None);
         assert_eq!(module.arg_name(1, 0), None);
+    }
+
+    #[test]
+    fn raw_bodies_decode_lazily_and_under_preload() {
+        use lamella_cil::{Instruction, Opcode, write_method_body};
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: Vec::from([Instruction::simple(Opcode::Ret)]).into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let raw = write_method_body(&body).expect("encode").into_boxed_slice();
+        let mut module = Module::new();
+        let id = module.add_method(0, raw, 0);
+
+        assert_eq!(module.preload_bodies(), 1, "one managed body decoded");
+        let decoded = module.method_body(id).expect("a managed body");
+        assert_eq!(decoded.code.len(), 1);
+        assert_eq!(decoded.code[0].opcode, Opcode::Ret);
     }
 
     #[test]
