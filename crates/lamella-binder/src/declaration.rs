@@ -3,6 +3,7 @@
 
 use crate::bind::{bind_type, parameter_symbol};
 use crate::bound::{coerce_constant, integer_literal, literal_int_value};
+use lamella_syntax::token::IntegerSuffix;
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::symbols::{
@@ -199,7 +200,16 @@ fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<L
 pub(crate) fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Option<Literal> {
     match operator {
         UnaryOperator::Plus => Some(operand.clone()),
-        UnaryOperator::Minus => Some(integer_literal(literal_int_value(operand)?.checked_neg()?)),
+        UnaryOperator::Minus => match operand {
+            Literal::Integer {
+                value: 9_223_372_036_854_775_808,
+                suffix: IntegerSuffix::None,
+            } => Some(Literal::Integer {
+                value: 9_223_372_036_854_775_808,
+                suffix: IntegerSuffix::Long,
+            }),
+            _ => Some(integer_literal(literal_int_value(operand)?.checked_neg()?)),
+        },
         UnaryOperator::Complement => Some(integer_literal(!literal_int_value(operand)?)),
         UnaryOperator::Not => match operand {
             Literal::Boolean(value) => Some(Literal::Boolean(!value)),

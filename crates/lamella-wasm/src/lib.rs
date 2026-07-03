@@ -13,7 +13,6 @@ pub mod py;
 pub mod repl;
 
 use lamella_load::load;
-use lamella_metadata::Assembly;
 use lamella_cil_runtime::{Value, Vm, run};
 
 /// A diagnostic surfaced to the embedder. For Tier 1 these are runtime issues
@@ -48,14 +47,9 @@ pub struct RunResult {
 /// input: malformed bytes become a diagnostic.
 #[must_use]
 pub fn run_bytes(assembly_bytes: &[u8]) -> RunResult {
-    let assembly = match Assembly::read(assembly_bytes) {
+    let assembly = match lamella_metadata::Assembly::read(assembly_bytes) {
         Ok(assembly) => assembly,
-        Err(error) => {
-            return failure(
-                "LAMELLA-IMAGE",
-                format!("could not read assembly: {error:?}"),
-            );
-        }
+        Err(error) => return failure("LAMELLA-PARSE", format!("{error:?}")),
     };
     let program = match load(&assembly) {
         Ok(program) => program,

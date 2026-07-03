@@ -102,6 +102,69 @@ impl ReplLink for SerialLink {
     }
 }
 
+/// The serial [`ReplLink`] for a PE-less target (`Capabilities::BAKED_IMAGE`): each
+/// submission's compiled PE is loaded + BAKED host-side into a self-contained image, and
+/// the image crosses the wire. The compile seam stays PE-in, so the same engine +
+/// [`ReplCompiler`] drive either link; only the target's advertised capability differs.
+#[cfg(all(feature = "serial", feature = "baked"))]
+pub struct BakedSerialLink {
+    transport: crate::SerialTransport,
+    timeout: core::time::Duration,
+}
+
+#[cfg(all(feature = "serial", feature = "baked"))]
+impl BakedSerialLink {
+    /// Open the serial port, HELLO the target, and require the baked-image capability.
+    ///
+    /// # Errors
+    /// [`TransportError::Carrier`] if the port cannot be opened; [`TransportError::Closed`]
+    /// if the handshake times out or the target does not run baked images.
+    pub fn open(
+        path: &str,
+        baud: u32,
+        timeout: core::time::Duration,
+    ) -> Result<Self, TransportError> {
+        use lamella_wire::Capabilities;
+        let mut transport = crate::SerialTransport::open(path, baud)?;
+        let session = crate::hello_blocking(
+            &mut transport,
+            0,
+            Capabilities(Capabilities::BAKED_IMAGE),
+            timeout,
+        )?;
+        if !session.caps.has(Capabilities::BAKED_IMAGE) {
+            return Err(TransportError::Closed);
+        }
+        Ok(Self { transport, timeout })
+    }
+}
+
+#[cfg(all(feature = "serial", feature = "baked"))]
+impl ReplLink for BakedSerialLink {
+    fn run(&mut self, seq: u16, program: &[u8]) -> Result<RunResult, TransportError> {
+        let image = match bake_program(program) {
+            Ok(image) => image,
+            Err(reason) => return Ok(RunResult { exit: -1, stdout: reason }),
+        };
+        crate::eval_image_blocking(&mut self.transport, seq, &image, self.timeout)
+    }
+}
+
+/// Load a compiled program app-only (the intrinsic-path load -- the PE-less target's BCL
+/// surface) and bake it to one self-contained image.
+#[cfg(all(feature = "serial", feature = "baked"))]
+fn bake_program(program: &[u8]) -> Result<Vec<u8>, String> {
+    let program: &'static [u8] = Box::leak(program.to_vec().into_boxed_slice());
+    let assembly = lamella_metadata::Assembly::read(program)
+        .map_err(|error| format!("program does not parse: {error:?}"))?;
+    let loaded =
+        lamella_load::load(&assembly).map_err(|error| format!("program load: {error}"))?;
+    let mut module = loaded.module;
+    module
+        .write_baked(Some(loaded.entry))
+        .map_err(|error| format!("bake: {error:?}"))
+}
+
 /// How a submission folds into the session transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -281,7 +344,7 @@ impl Repl {
     /// [`ReplError`] if the toolchain or the link fails. A source-level compile failure is the
     /// non-error [`Outcome::CompileError`].
     pub fn eval(&mut self, submission: &str) -> Result<Outcome, ReplError> {
-        let trimmed = submission.trim();
+        let trimmed = submission.trim().trim_start_matches('\u{feff}').trim();
         if trimmed.is_empty() {
             return Ok(Outcome::Empty);
         }

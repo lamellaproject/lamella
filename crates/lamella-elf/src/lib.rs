@@ -84,6 +84,12 @@ pub enum SymbolType {
     Func,
 }
 
+/// The prefix on a canonical type-descriptor's data symbol name (`__lamella_typedesc_<handle>`). The AOT
+/// backend NAMES descriptor symbols with it and the linker's gc-sections COLLECTS them by it (a descriptor
+/// unreachable from the entry is dropped, so its vtable relocations cannot pin an otherwise-trimmed
+/// method).
+pub const TYPE_DESC_PREFIX: &str = "__lamella_typedesc_";
+
 /// Where a symbol is defined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolSection {

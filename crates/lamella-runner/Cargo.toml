@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The wireline debug + REPL RUNNER core, shared by the host reference runner, the browser (wasm) runner, and the on-device firmware: run_program (load the managed corlib + run a program + capture its output) + the tier-0 serve_one request handler + the host driver helpers, over the lamella-wire Transport seam. no_std + alloc so it rides onto a microcontroller."
+description = "The wireline debug + REPL RUNNER core, shared by the host reference runner, the browser (wasm) runner, and the on-device firmware: run_program (load the managed corlib + run a program + capture its output) + the serve_one request handler + the host driver helpers, over the lamella-wire Transport seam. no_std + alloc so it rides onto a microcontroller."
 
 [dependencies]
 lamella-wire = { path = "../lamella-wire" }
@@ -26,6 +26,11 @@ lamella-token = { path = "../lamella-token" }
 # Source-level debugger names (forwarded to the loader). Default on; a constrained device build drops it.
 default = ["debug-names"]
 debug-names = ["lamella-load/debug-names"]
+# RUN_IMAGE support: boot + run a baked flash image (Module::from_baked) as the runner's execution
+# path -- the PE-less constrained-target story. Forwards the loader's code-in-place (XIP) knob, which
+# pins the load API to Assembly<'static>; run_program then leaks its per-call inputs, matching the
+# one-image-per-process host pattern. The host DRIVER half (send_image / RUN_IMAGE) is unconditional.
+baked-image = ["lamella-load/code-in-place"]
 
 [lints]
 workspace = true

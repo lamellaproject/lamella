@@ -16,3 +16,4 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 [dev-dependencies]
 # Tests drive a Dap against the shared probe-protocol mock.
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }
+lamella-usbhid = { path = "../lamella-usbhid" }

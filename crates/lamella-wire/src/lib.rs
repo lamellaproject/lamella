@@ -189,6 +189,9 @@ impl Capabilities {
     pub const REPL_SOURCE: u32 = 1 << 6;
     /// Evaluate against an AOT-deployed target.
     pub const AOT_ATTACH: u32 = 1 << 7;
+    /// Run a host-BAKED flash image (`RUN_IMAGE`) -- a PE-less constrained target sets this
+    /// instead of [`Capabilities::REPL_RUN`]; the host bakes each submission and ships the image.
+    pub const BAKED_IMAGE: u32 = 1 << 8;
 
     /// Whether this set includes `flag`.
     #[must_use]

@@ -6,7 +6,6 @@ use core::cell::RefCell;
 
 use lamella_dap::{Debugger, Message};
 use lamella_load::load;
-use lamella_metadata::Assembly;
 
 use crate::abi::result_buffer;
 
@@ -18,7 +17,7 @@ thread_local! {
 /// Loads a program and starts a debug session, returning a 1-based handle, or 0 on
 /// a load failure.
 fn create(bytes: &[u8], pdb: Option<Vec<u8>>) -> u32 {
-    let Ok(assembly) = Assembly::read(bytes) else {
+    let Ok(assembly) = lamella_metadata::Assembly::read(bytes) else {
         return 0;
     };
     let Ok(program) = load(&assembly) else {

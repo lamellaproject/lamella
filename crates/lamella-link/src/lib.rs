@@ -104,9 +104,16 @@ pub fn link_at_base_gc(
     link_with_base(&trimmed, entry, Some(text_base), &[])
 }
 
-/// Function-level `--gc-sections`: builds the cross-object call/reference graph from `entry`, keeps the
-/// reachable functions (plus all data), and rebuilds each object re-laid-out with its symbols and
-/// relocations remapped -- so unused functions, and the undefined externs only they referenced, drop out.
+/// Re-exported from [`lamella_elf`] so the backend that NAMES descriptor symbols and the linker that
+/// COLLECTS them here share ONE prefix. A descriptor unreachable from the entry is dropped (so its vtable
+/// relocations cannot pin an otherwise-trimmed method); other data is retained wholesale.
+pub use lamella_elf::TYPE_DESC_PREFIX;
+
+/// Function-level `--gc-sections`: builds the cross-object reference graph from `entry` -- following each
+/// reached symbol's relocations, a function's calls AND a data symbol's references (e.g. a type
+/// descriptor's vtable entries and base pointer) -- keeps the reachable functions, reachable descriptors,
+/// and all other data, then rebuilds each object re-laid-out with its symbols and relocations remapped, so
+/// unused functions/descriptors and the undefined externs only they referenced drop out.
 pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
     let mut defs: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     for (oi, obj) in objects.iter().enumerate() {
@@ -128,9 +135,6 @@ pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
         };
         let obj = &objects[oi];
         let sym = &obj.symbols[si];
-        if sym.kind != SymbolType::Func {
-            continue;
-        }
         let start = sym.value & !1;
         let end = start + sym.size;
         for r in &obj.relocations {
@@ -148,8 +152,9 @@ pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
     out
 }
 
-/// Rebuilds `obj` keeping only reachable functions (plus all data), re-laid-out. A referenced symbol not
-/// among the kept ones stays an undefined extern (the linker resolves it, or errors if genuinely missing).
+/// Rebuilds `obj` keeping only reachable functions and reachable descriptors (plus all other data),
+/// re-laid-out. A referenced symbol not among the kept ones stays an undefined extern (the linker resolves
+/// it, or errors if genuinely missing).
 fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
     let mut kept: Vec<usize> = (0..obj.symbols.len())
         .filter(|&i| {
@@ -157,7 +162,8 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
             s.defined
                 && s.size > 0
                 && !s.name.is_empty()
-                && (reachable.contains(&s.name) || s.kind != SymbolType::Func)
+                && (reachable.contains(&s.name)
+                    || (s.kind != SymbolType::Func && !s.name.starts_with(TYPE_DESC_PREFIX)))
         })
         .collect();
     kept.sort_by_key(|&i| obj.symbols[i].value & !1);
@@ -966,6 +972,17 @@ mod tests {
         }
     }
 
+    fn data(name: &'static str, value: u32, size: u32) -> Symbol<'static> {
+        Symbol {
+            name,
+            value,
+            size,
+            binding: Binding::Global,
+            kind: SymbolType::NoType,
+            section: SymbolSection::Text,
+        }
+    }
+
     #[test]
     fn resolves_an_arm_thumb_call_across_two_objects() {
         let caller = obj_arm(
@@ -1013,6 +1030,51 @@ mod tests {
         assert!(defined.contains(&"keep"), "a reached function is kept");
         assert!(!defined.contains(&"unused0"), "an unreached function is dropped");
         assert!(!defined.contains(&"unused1"), "an unreached library function is dropped");
+    }
+
+    #[test]
+    fn gc_sections_follows_a_reached_descriptor_and_drops_unreached_ones() {
+        let obj = obj_arm(
+            &[0u8; 16],
+            &[
+                func("f0", 1, 4),
+                func("m", 5, 2),
+                func("dead", 7, 2),
+                data("__lamella_typedesc_1", 8, 4),
+                data("__lamella_typedesc_2", 12, 4),
+            ],
+            &[
+                Relocation { offset: 0, symbol: 3, kind: arm::R_ARM_ABS32, addend: 0 },
+                Relocation { offset: 8, symbol: 1, kind: arm::R_ARM_ABS32, addend: 0 },
+                Relocation { offset: 12, symbol: 2, kind: arm::R_ARM_ABS32, addend: 0 },
+            ],
+        );
+        let trimmed = garbage_collect(&[obj], "f0");
+        let defined: Vec<&str> = trimmed
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(defined.contains(&"f0"), "the entry is kept");
+        assert!(defined.contains(&"__lamella_typedesc_1"), "a reached descriptor is kept");
+        assert!(defined.contains(&"m"), "a method reached only through a descriptor's reloc is kept");
+        assert!(!defined.contains(&"__lamella_typedesc_2"), "an unreached descriptor is dropped");
+        assert!(!defined.contains(&"dead"), "a method only an unreached descriptor referenced drops out");
+    }
+
+    #[test]
+    fn gc_sections_keeps_non_descriptor_data_wholesale() {
+        let obj = obj_arm(&[0u8; 8], &[func("f0", 1, 4), data("rodata_blob", 4, 4)], &[]);
+        let trimmed = garbage_collect(&[obj], "f0");
+        let defined: Vec<&str> = trimmed
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(defined.contains(&"f0"), "the entry is kept");
+        assert!(defined.contains(&"rodata_blob"), "unreached non-descriptor data is kept wholesale");
     }
 
     #[test]

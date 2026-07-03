@@ -64,7 +64,7 @@ pub fn emit_expression(
             }
             BinaryOperator::LogicalOr => emit_short_circuit(left, right, true, frame, tokens, out),
             _ => {
-                if emit_pointer_arithmetic(*operator, left, right, frame, tokens, out)? {
+                if emit_pointer_arithmetic(*operator, left, right, *checked, frame, tokens, out)? {
                     return Ok(());
                 }
                 emit_expression(left, frame, tokens, out)?;
@@ -156,6 +156,16 @@ pub fn emit_expression(
         } => emit_property_load(receiver, declaring_type, name, frame, tokens, out),
         BoundExprKind::This | BoundExprKind::Base => {
             out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
+            if is_value_type(&expr.ty, tokens) {
+                if tokens.is_struct(&expr.ty) || tokens.is_enum(&expr.ty) {
+                    let token = tokens
+                        .type_token(&expr.ty)
+                        .ok_or(EmitError::Unsupported("a value-type `this` with no token"))?;
+                    out.push(Instruction::new(Opcode::Ldobj, Operand::Token(token)));
+                } else {
+                    out.push(Instruction::simple(ldind_opcode(&expr.ty)));
+                }
+            }
             Ok(())
         }
         BoundExprKind::ObjectCreation {
@@ -1022,7 +1032,27 @@ fn emit_cast(
         return Ok(());
     }
     if matches!(to, TypeSymbol::Pointer(_)) {
+        match from {
+            TypeSymbol::Pointer(_) => {}
+            TypeSymbol::Special(
+                SpecialType::UInt32 | SpecialType::UInt64 | SpecialType::UInt16 | SpecialType::Byte,
+            ) => out.push(Instruction::simple(Opcode::ConvU)),
+            _ => out.push(Instruction::simple(Opcode::ConvI)),
+        }
         return Ok(());
+    }
+    if matches!(from, TypeSymbol::Pointer(_)) {
+        if let TypeSymbol::Special(target) = to {
+            let opcode = match target {
+                SpecialType::UInt64 | SpecialType::Int64 => Opcode::ConvU8,
+                SpecialType::UInt32 => Opcode::ConvU4,
+                SpecialType::Int32 => Opcode::ConvI4,
+                _ => return Err(EmitError::Unsupported("this pointer cast is not lowered")),
+            };
+            out.push(Instruction::simple(opcode));
+            return Ok(());
+        }
+        return Err(EmitError::Unsupported("this pointer cast is not lowered"));
     }
     if is_value_type(to, tokens) && !is_value_type(from, tokens) {
         let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
@@ -1295,7 +1325,8 @@ pub(crate) fn emit_value_type_receiver(
             Ok(())
         }
         BoundExprKind::This | BoundExprKind::Base => {
-            emit_expression(receiver, frame, tokens, out)
+            out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
+            Ok(())
         }
         BoundExprKind::ElementAccess {
             receiver: array,
@@ -1613,7 +1644,7 @@ fn emit_typeof(
 /// Lowers `sizeof(T)`: a struct/enum emits the `sizeof` opcode over its token (the runtime
 /// computes the size from the shared value-type layout); a primitive is its constant byte
 /// size (csc likewise folds `sizeof(primitive)`).
-fn emit_sizeof(
+pub(crate) fn emit_sizeof(
     target: &TypeSymbol,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1755,10 +1786,23 @@ pub(crate) fn emit_string_equality(
 /// `p + n` / `n + p` push the pointer then `n * sizeof(T)` and `add`; `p - n` does the same
 /// with `sub`; `p - q` subtracts the pointers and divides by `sizeof(T)` (the element
 /// count). The integer is scaled by the element size, exactly as `p[i]` is.
+/// Widens a pointer-arithmetic offset to native width before it joins the address math
+/// (18.5.6): an unsigned offset zero-extends (`conv.u`), a signed one sign-extends
+/// (`conv.i`). Without this a 32-bit unsigned offset >= 2^31 would ride the i4 add
+/// sign-extended and land 4 GB away on a 64-bit host.
+fn widen_pointer_offset(offset_ty: &TypeSymbol, out: &mut Vec<Instruction>) {
+    let opcode = match offset_ty {
+        TypeSymbol::Special(SpecialType::UInt32 | SpecialType::UInt64) => Opcode::ConvU,
+        _ => Opcode::ConvI,
+    };
+    out.push(Instruction::simple(opcode));
+}
+
 fn emit_pointer_arithmetic(
     operator: BinaryOperator,
     left: &BoundExpr,
     right: &BoundExpr,
+    checked: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1778,6 +1822,7 @@ fn emit_pointer_arithmetic(
             };
             emit_expression(pointer, frame, tokens, out)?;
             emit_expression(offset, frame, tokens, out)?;
+            widen_pointer_offset(&offset.ty, out);
             emit_sizeof(&element, tokens, out)?;
             out.push(Instruction::simple(Opcode::Mul));
             out.push(Instruction::simple(Opcode::Add));
@@ -1790,16 +1835,23 @@ fn emit_pointer_arithmetic(
                 emit_expression(left, frame, tokens, out)?;
                 emit_expression(right, frame, tokens, out)?;
                 out.push(Instruction::simple(Opcode::Sub));
+                out.push(Instruction::simple(Opcode::ConvI8));
                 emit_sizeof(&element, tokens, out)?;
+                out.push(Instruction::simple(Opcode::ConvI8));
                 out.push(Instruction::simple(Opcode::Div));
                 return Ok(true);
             }
             if let Some(element) = pointer_element(&left.ty) {
                 emit_expression(left, frame, tokens, out)?;
                 emit_expression(right, frame, tokens, out)?;
+                widen_pointer_offset(&right.ty, out);
                 emit_sizeof(&element, tokens, out)?;
                 out.push(Instruction::simple(Opcode::Mul));
-                out.push(Instruction::simple(Opcode::Sub));
+                out.push(Instruction::simple(if checked {
+                    Opcode::SubOvfUn
+                } else {
+                    Opcode::Sub
+                }));
                 return Ok(true);
             }
             Ok(false)

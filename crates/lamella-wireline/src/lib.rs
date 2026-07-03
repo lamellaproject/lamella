@@ -1,8 +1,13 @@
 //! The HOST side of the wireline debug + REPL channel:
 
-pub use lamella_runner::{RunResult, repl, run_program, send_program, serve_one, try_recv_result};
+pub use lamella_runner::{
+    RunResult, debug, repl, run_program, send_image, send_program, serve_one, try_recv_result,
+};
 
 pub mod engine;
+
+#[cfg(feature = "debug-backend")]
+pub mod debug_backend;
 
 #[cfg(feature = "serial")]
 use lamella_wire::{Frame, FrameReader, Transport, TransportError, encode_frame};
@@ -19,6 +24,7 @@ use std::time::{Duration, Instant};
 pub struct SerialTransport {
     port: Box<dyn SerialPort>,
     reader: FrameReader,
+    baud: u32,
 }
 
 #[cfg(feature = "serial")]
@@ -29,11 +35,13 @@ impl SerialTransport {
     /// # Errors
     /// [`TransportError::Carrier`] if the port cannot be opened.
     pub fn open(path: &str, baud: u32) -> Result<Self, TransportError> {
-        let port = serialport::new(path, baud)
+        let mut port = serialport::new(path, baud)
             .timeout(Duration::from_millis(50))
             .open()
             .map_err(|_| TransportError::Carrier)?;
-        Ok(Self { port, reader: FrameReader::new() })
+        port.write_data_terminal_ready(true).map_err(|_| TransportError::Carrier)?;
+        port.write_request_to_send(true).ok();
+        Ok(Self { port, reader: FrameReader::new(), baud })
     }
 }
 
@@ -41,8 +49,14 @@ impl SerialTransport {
 impl Transport for SerialTransport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
         let frame = encode_frame(msg_type, seq, payload);
-        self.port.write_all(&frame).map_err(|_| TransportError::Carrier)?;
-        self.port.flush().map_err(|_| TransportError::Carrier)?;
+        let wire_ms = 100 + (frame.len() as u64 * 10 * 1000) / u64::from(self.baud.max(1));
+        self.port.set_timeout(Duration::from_millis(wire_ms)).ok();
+        let written = self
+            .port
+            .write_all(&frame)
+            .and_then(|()| self.port.flush());
+        self.port.set_timeout(Duration::from_millis(50)).ok();
+        written.map_err(|_| TransportError::Carrier)?;
         Ok(())
     }
 
@@ -58,6 +72,43 @@ impl Transport for SerialTransport {
     }
 }
 
+/// Host driver, blocking: HELLO the target and return the negotiated session (the chosen
+/// version + the capability INTERSECTION). `host_caps` is what this host offers -- check
+/// the result's caps to pick the PE ([`send_program`]) vs baked ([`send_image`]) path.
+///
+/// # Errors
+/// [`TransportError::Closed`] on timeout or a version `NAK`; otherwise a carrier error.
+#[cfg(feature = "serial")]
+pub fn hello_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    host_caps: lamella_wire::Capabilities,
+    timeout: Duration,
+) -> Result<lamella_wire::Negotiated, TransportError> {
+    use lamella_wire::{Hello, HelloAck, PROTOCOL_VERSION, ProtocolRange, host_finish, msg};
+    let hello = Hello {
+        range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+        caps: host_caps,
+    };
+    transport.send(msg::HELLO, seq, &hello.encode())?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        while let Some(frame) = transport.poll()? {
+            match frame.msg_type {
+                msg::HELLO_ACK if frame.seq == seq => {
+                    if let Some(ack) = HelloAck::decode(&frame.payload) {
+                        return Ok(host_finish(&ack, host_caps));
+                    }
+                }
+                msg::NAK if frame.seq == seq => return Err(TransportError::Closed),
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Err(TransportError::Closed)
+}
+
 /// Host driver, blocking convenience for a real (concurrent) target: send the program, then poll for
 /// its result until `timeout`. The target runs the runner loop concurrently.
 ///
@@ -71,6 +122,30 @@ pub fn eval_blocking(
     timeout: Duration,
 ) -> Result<RunResult, TransportError> {
     send_program(transport, seq, program)?;
+    await_result(transport, seq, timeout)
+}
+
+/// [`eval_blocking`]'s twin for a PE-less target: send a BAKED image, wait for its result.
+///
+/// # Errors
+/// [`TransportError::Closed`] on timeout; otherwise a carrier [`TransportError`].
+#[cfg(feature = "serial")]
+pub fn eval_image_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    image: &[u8],
+    timeout: Duration,
+) -> Result<RunResult, TransportError> {
+    send_image(transport, seq, image)?;
+    await_result(transport, seq, timeout)
+}
+
+#[cfg(feature = "serial")]
+fn await_result(
+    transport: &mut impl Transport,
+    seq: u16,
+    timeout: Duration,
+) -> Result<RunResult, TransportError> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(result) = try_recv_result(transport, seq)? {

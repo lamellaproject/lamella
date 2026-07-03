@@ -670,11 +670,17 @@ fn emit_statement(
         BoundStmtKind::Labeled { label, body } => {
             let id = labels.named_label(label);
             labels.place(id, out);
+            out.push(Instruction::simple(Opcode::Nop));
             emit_statement(body, frame, tokens, labels, out)?;
         }
         BoundStmtKind::Goto(label) => {
             let id = labels.named_label(label);
-            labels.branch(Opcode::Br, id, out);
+            let opcode = if labels.epilogue.is_some() {
+                Opcode::Leave
+            } else {
+                Opcode::Br
+            };
+            labels.branch(opcode, id, out);
         }
         BoundStmtKind::GotoCase(value) => {
             let target = labels.switches.last().and_then(|switch| {
@@ -1152,6 +1158,32 @@ pub(crate) fn emit_compound(
             Ok(())
         }
         BoundExprKind::ElementAccess { receiver, indices } if indices.len() == 1 => {
+            if matches!(receiver.ty, TypeSymbol::Pointer(_)) {
+                emit_expression(receiver, frame, tokens, out)?;
+                emit_expression(&indices[0], frame, tokens, out)?;
+                crate::expr::emit_sizeof(&target.ty, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Mul));
+                out.push(Instruction::simple(Opcode::Add));
+                let address = frame.reserve_local(&receiver.ty);
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(address)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(address)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(address)));
+                out.push(Instruction::simple(crate::expr::ldind_opcode(&target.ty)));
+                if leave == Leave::Old {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
+                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                if leave == Leave::New {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
+                out.push(Instruction::simple(crate::expr::stind_opcode(&target.ty)));
+                if let Some(slot) = kept {
+                    out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+                }
+                return Ok(());
+            }
             emit_expression(receiver, frame, tokens, out)?;
             let array = frame.reserve_local(&receiver.ty);
             out.push(Instruction::new(Opcode::Stloc, Operand::Variable(array)));

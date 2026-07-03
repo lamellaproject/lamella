@@ -480,6 +480,16 @@ impl<'a> Assembly<'a> {
         &self.image
     }
 
+    /// The whole assembly file buffer this was read from, if it was read via [`Assembly::read`]
+    /// (as opposed to constructed from an already-parsed image). The `#Strings`, `#US`, and method
+    /// IL slices the reader hands out are sub-slices of this buffer, so a consumer can record a
+    /// slice's position as a byte offset (`slice.as_ptr() - file.as_ptr()`) and resolve it later
+    /// against an owned copy of these bytes.
+    #[must_use]
+    pub fn file(&self) -> Option<&'a [u8]> {
+        self.file
+    }
+
     /// The parsed tables.
     #[must_use]
     pub fn tables(&self) -> &Tables<'a> {

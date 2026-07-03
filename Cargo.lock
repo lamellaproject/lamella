@@ -552,6 +552,7 @@ name = "lamella-cmsis-dap-sam"
 version = "0.0.0"
 dependencies = [
  "lamella-cmsis-dap",
+ "lamella-usbhid",
 ]
 
 [[package]]
@@ -751,6 +752,8 @@ name = "lamella-wireline"
 version = "0.0.0"
 dependencies = [
  "lamella-assemble",
+ "lamella-debug-backend",
+ "lamella-load",
  "lamella-metadata",
  "lamella-runner",
  "lamella-wire",

@@ -21,6 +21,12 @@ serialport = { version = "4", optional = true }
 # (No csc: it resolves BCL types against the .NET reference assemblies, not Microsoft's compiler.)
 lamella-assemble = { path = "../lamella-assemble", optional = true }
 lamella-metadata = { path = "../lamella-metadata", optional = true }
+# The `baked` link's host-side bake step (load the submission's PE, write the flash image).
+# Already in the tree via lamella-runner; declared so the link can name its API.
+lamella-load = { path = "../lamella-load", optional = true, default-features = false }
+# The debug seam (the DebugBackend trait, a dependency-free leaf): WirelineBackend
+# implements it over the wire's debug channel, so lamella-dap drives a DEVICE unchanged.
+lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 
 [features]
 # The serial (USB-CDC / UART) transport. Default ON for a host build; a wasm32 build turns it off
@@ -32,6 +38,14 @@ serial = ["dep:serialport"]
 # present). A wasm build leaves this off (the browser compiles in-process via lamella-wasm), keeping
 # the carrier-neutral core.
 repl-host = ["dep:lamella-assemble", "dep:lamella-metadata"]
+# The baked-image link for PE-less targets (Capabilities::BAKED_IMAGE): each submission's
+# compiled PE is loaded + baked host-side and the IMAGE crosses the wire (BakedSerialLink,
+# eval_image_blocking). Forwards the runner's baked-image knob (which pins loads to
+# Assembly<'static>; the link leaks one buffer per evaluation, the accepted host pattern).
+baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata"]
+# WirelineBackend: the lamella-debug-backend seam over the wire's debug channel (serial
+# carrier). IL-level in v0 (opaque addresses = (method_id, offset)).
+debug-backend = ["serial", "dep:lamella-debug-backend"]
 
 # (The interactive REPL CLI now lives in the dedicated `lamella-repl` crate; the former
 # `lamella-repl` bin here was a duplicate of that binary name -- removed on merge to avoid a

@@ -1187,7 +1187,7 @@ impl Binder {
         self.current_type = Some(enclosing.clone());
         self.enter_scope();
         for (name, ty) in parameters {
-            self.declare_local(name, ty.clone());
+            self.declare_local(name, self.resolve_type(ty));
         }
         let arguments: Vec<BoundExpr> = initializer
             .arguments
@@ -2264,6 +2264,26 @@ impl Binder {
         if !target.ty.is_error() && !value.ty.is_error() {
             if let Some(binary_op) = compound_binary_operator(operator) {
                 if binary_result_type(binary_op, &target.ty, &value.ty).is_none() {
+                    if let Some(result_ty) = self.enum_binary_result(binary_op, &target.ty, &value.ty) {
+                        let binary = BoundExpr {
+                            kind: BoundExprKind::Binary {
+                                operator: binary_op,
+                                left: Box::new(target.clone()),
+                                right: Box::new(value),
+                                checked: self.checked_context,
+                            },
+                            ty: result_ty,
+                        };
+                        let assigned = self.convert(binary, &target.ty);
+                        return BoundExpr {
+                            ty: target.ty.clone(),
+                            kind: BoundExprKind::Assignment {
+                                operator: AssignmentOperator::Assign,
+                                target: Box::new(target),
+                                value: Box::new(assigned),
+                            },
+                        };
+                    }
                     if let Some(call) = self.bind_user_binary_operator(binary_op, &target, &value) {
                         let assigned = self.convert(call, &target.ty);
                         return BoundExpr {

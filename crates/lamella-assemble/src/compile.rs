@@ -2378,24 +2378,28 @@ fn emit_constructor(
         leading_body: 0,
     });
     let mut prologue = match initializer {
-        Some(init) => binder
-            .bind_constructor_chain(enclosing, &params, init)
-            .map(|(method, arguments)| {
-                let ctor = tokens
-                    .method(&method.declaring_type, ".ctor", &method.parameters)
-                    .unwrap_or_else(|| {
-                        mint_member_ref(&method, image, tokens);
-                        tokens
-                            .method(&method.declaring_type, ".ctor", &method.parameters)
-                            .unwrap_or_else(|| image.object_ctor())
-                    });
-                ConstructorPrologue {
-                    ctor,
-                    arguments,
-                    leading_body: 0,
-                }
-            })
-            .or_else(base_prologue),
+        Some(init) => Some(
+            binder
+                .bind_constructor_chain(enclosing, &params, init)
+                .map(|(method, arguments)| {
+                    let ctor = tokens
+                        .method(&method.declaring_type, ".ctor", &method.parameters)
+                        .unwrap_or_else(|| {
+                            mint_member_ref(&method, image, tokens);
+                            tokens
+                                .method(&method.declaring_type, ".ctor", &method.parameters)
+                                .unwrap_or_else(|| image.object_ctor())
+                        });
+                    ConstructorPrologue {
+                        ctor,
+                        arguments,
+                        leading_body: 0,
+                    }
+                })
+                .ok_or(crate::EmitError::Unsupported(
+                    "a constructor initializer chain that did not resolve",
+                ))?,
+        ),
         None => base_prologue(),
     };
     let chains_to_this = matches!(
@@ -2445,7 +2449,7 @@ fn emit_destructor(
     let void = TypeSymbol::Special(SpecialType::Void);
     let bound = binder.bind_method(Some(enclosing.clone()), "Finalize", void.clone(), &[], body);
     let bound = wrap_finalizer(bound, &base_finalizer_reference(base_class, tokens));
-    emit_bound_body(
+    let finalize = emit_bound_body(
         image,
         tokens,
         "Finalize",
@@ -2458,6 +2462,23 @@ fn emit_destructor(
         None,
         debug,
     )?;
+    let class = tokens
+        .type_token(enclosing)
+        .ok_or(crate::EmitError::Unsupported(
+            "a destructor on a type with no metadata token",
+        ))?;
+    let object = TypeSymbol::Special(SpecialType::Object);
+    let declaration = match tokens.method(&object, "Finalize", &[]) {
+        Some(token) => token,
+        None => {
+            let signature = method_signature(true, &[], &type_sig(tokens, &void)?);
+            let type_ref = image.type_ref("System", "Object");
+            let member_token = image.member_ref(type_ref, "Finalize", &signature);
+            tokens.insert_method(&object, "Finalize", &[], member_token);
+            member_token
+        }
+    };
+    image.add_method_impl(class, finalize, declaration);
     Ok(())
 }
 

@@ -369,7 +369,6 @@ fn lower_spilled_inst(
     sym_pool: &mut Vec<(Label, u32)>,
     strings: &mut Vec<(Label, Box<[u8]>)>,
     string_blobs: &mut Vec<(Label, Box<[u16]>)>,
-    desc_pool: &mut Vec<(Label, Box<[u32]>, Box<[u32]>)>,
     value_types: &[MirType],
     slot: &impl Fn(ValueId) -> u16,
     inst: &Inst,
@@ -574,10 +573,10 @@ fn lower_spilled_inst(
             enc.adds_imm8(Reg::R0, 1)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::TypeDescLiteral { words, vtable } => {
+        Inst::TypeDescLiteral { handle, .. } => {
             let label = enc.new_label();
-            desc_pool.push((label, words.clone(), vtable.clone()));
-            enc.adr(Reg::R0, label)
+            sym_pool.push((label, DESC_SYMBOL_FLAG | *handle));
+            enc.ldr_literal(Reg::R0, label)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::CallIndirect { target, args, .. } => {
@@ -1907,7 +1906,6 @@ fn lower_spilled_into(
     let mut string_blobs: Vec<(Label, Box<[u16]>)> = Vec::new();
     let mut type_descs: Vec<(Label, Box<[u32]>)> = Vec::new();
     let mut type_desc_labels: Vec<(lamella_ir::TypeHandle, Label)> = Vec::new();
-    let mut desc_pool: Vec<(Label, Box<[u32]>, Box<[u32]>)> = Vec::new();
     if has_calls {
         enc.push_registers(saved_mask, true);
     }
@@ -2279,7 +2277,6 @@ fn lower_spilled_into(
                 &mut sym_pool,
                 &mut strings,
                 &mut string_blobs,
-                &mut desc_pool,
                 &func.value_types,
                 &slot,
                 inst,
@@ -2393,18 +2390,6 @@ fn lower_spilled_into(
         for (entry, func) in sym_pool {
             enc.bind_label(entry);
             enc.data_word_symbol(func);
-        }
-    }
-    if !desc_pool.is_empty() {
-        enc.align_to_word();
-        for (entry, words, vtable) in desc_pool {
-            for (k, &func_index) in vtable.iter().enumerate().rev() {
-                enc.data_word_symbol_reldesc(func_index, -(4 + 4 * k as i32));
-            }
-            enc.bind_label(entry);
-            for &word in words.iter() {
-                enc.emit_word(word);
-            }
         }
     }
     for (entry, text) in strings {
@@ -3504,6 +3489,11 @@ pub fn lower_module_py(
 /// `__aeabi_*`, a P/Invoke entry, a `py_*` helper) rather than an intra-module function index. The
 /// backend ORs it in at the call site; `lower_object` decodes it to the extern symbol's ELF index.
 const EXTERN_SYMBOL_FLAG: u32 = 0x8000_0000;
+/// A backend symbol whose low bits are a TYPE HANDLE, not a function index -- an object-path reference to
+/// the type's canonical descriptor symbol (`__lamella_typedesc_<handle>`). `lower_object_inner` resolves it
+/// to the descriptor's symbol-table index. Bit 30, distinct from `EXTERN_SYMBOL_FLAG`; type tokens are well
+/// under 2^30, so the handle never collides with the flag.
+const DESC_SYMBOL_FLAG: u32 = 0x4000_0000;
 
 /// The `__aeabi_*` soft-float helper for a float arithmetic `Binary` op, keyed by the operand type;
 /// `None` for an integer op (a different type) or a non-arithmetic op. ARM AAPCS soft-float passes
@@ -3634,6 +3624,7 @@ fn lower_runtime_calls(
                 insts.push((
                     typedesc,
                     Inst::TypeDescLiteral {
+                        handle: handle.0,
                         words: words.into_boxed_slice(),
                         vtable,
                     },
@@ -3861,6 +3852,36 @@ fn lower_object_inner(
             }
         }
     }
+    let mut desc_syms: Vec<(u32, Label, u32, u32)> = Vec::new();
+    {
+        let mut seen = alloc::collections::BTreeSet::new();
+        for func in funcs {
+            for block in &func.blocks {
+                for (_, inst) in &block.insts {
+                    if let Inst::TypeDescLiteral {
+                        handle,
+                        words,
+                        vtable,
+                    } = inst
+                    {
+                        if !seen.insert(*handle) {
+                            continue;
+                        }
+                        enc.align_to_word();
+                        let vtable_label = enc.new_label();
+                        enc.bind_label(vtable_label);
+                        for (k, &func_index) in vtable.iter().enumerate().rev() {
+                            enc.data_word_symbol_reldesc(func_index, -(4 + 4 * k as i32));
+                        }
+                        for &word in words.iter() {
+                            enc.emit_word(word);
+                        }
+                        desc_syms.push((*handle, vtable_label, vtable.len() as u32, words.len() as u32));
+                    }
+                }
+            }
+        }
+    }
     let assembled = enc.finish().map_err(|_| LowerError::CodeTooLarge)?;
     let offsets: Vec<u32> = func_labels
         .iter()
@@ -3869,6 +3890,10 @@ fn lower_object_inner(
     for entry in &mut stack_maps {
         entry.return_pc = assembled.label_position_by_id(entry.return_pc).unwrap_or(0);
     }
+    let desc_positions: Vec<u32> = desc_syms
+        .iter()
+        .map(|(_, label, _, _)| assembled.label_position(*label).unwrap_or(0))
+        .collect();
     let mut text = assembled.bytes;
     let mut symbols: Vec<lamella_elf::Symbol> = (0..funcs.len())
         .map(|i| {
@@ -3905,6 +3930,24 @@ fn lower_object_inner(
             });
         }
     }
+    let desc_names: Vec<alloc::string::String> = desc_syms
+        .iter()
+        .map(|(h, _, _, _)| alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, h))
+        .collect();
+    let mut desc_index: alloc::collections::BTreeMap<u32, (u32, i32)> =
+        alloc::collections::BTreeMap::new();
+    for (i, (handle, _vtable_label, vtable_len, words_len)) in desc_syms.iter().enumerate() {
+        let pos = desc_positions[i];
+        desc_index.insert(*handle, (symbols.len() as u32, (*vtable_len as i32) * 4));
+        symbols.push(lamella_elf::Symbol {
+            name: desc_names[i].as_str(),
+            value: pos,
+            size: (vtable_len + words_len) * 4,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        });
+    }
     let mut relocations: Vec<lamella_elf::Relocation> = Vec::with_capacity(assembled.relocs.len());
     for r in &assembled.relocs {
         let (kind, addend) = match r.kind {
@@ -3915,16 +3958,18 @@ fn lower_object_inner(
             }
             _ => return Err(LowerError::CallUnsupported),
         };
-        let symbol = if r.symbol & EXTERN_SYMBOL_FLAG != 0 {
-            funcs.len() as u32 + (r.symbol & !EXTERN_SYMBOL_FLAG)
+        let (symbol, final_addend) = if r.symbol & EXTERN_SYMBOL_FLAG != 0 {
+            (funcs.len() as u32 + (r.symbol & !EXTERN_SYMBOL_FLAG), addend)
+        } else if r.symbol & DESC_SYMBOL_FLAG != 0 {
+            desc_index[&(r.symbol & !DESC_SYMBOL_FLAG)]
         } else {
-            r.symbol
+            (r.symbol, addend)
         };
         relocations.push(lamella_elf::Relocation {
             offset: r.at,
             symbol,
             kind,
-            addend,
+            addend: final_addend,
         });
     }
     if emit_entry && !stack_maps.is_empty() {
@@ -6418,7 +6463,7 @@ mod tests {
                 .iter()
                 .flat_map(|b| b.insts.clone())
                 .find_map(|(_, i)| match i {
-                    Inst::TypeDescLiteral { words, vtable } => Some((words, vtable)),
+                    Inst::TypeDescLiteral { words, vtable, .. } => Some((words, vtable)),
                     _ => None,
                 })
                 .expect("the alloc emits a TypeDescLiteral")

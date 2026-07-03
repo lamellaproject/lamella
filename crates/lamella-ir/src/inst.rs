@@ -576,14 +576,17 @@ pub enum Inst {
         /// The type whose TypeDesc address this is.
         handle: TypeHandle,
     },
-    /// The address of a TypeDesc whose words are given INLINE -- the object path's `Alloc` descriptor,
-    /// where the per-module descriptor table the flat path threads is not available. The backend emits
-    /// the words in a data pool and `adr`s their address (position-independent, no relocation). The
-    /// words are the GC ABI header + trace map: `[payload_size, nrefs, type_tag, base_ptr,
-    /// ref_offsets...]` (`base_ptr` is a `0` placeholder until the base chain is threaded in). The
-    /// `vtable` is laid as TypeDesc-relative slots BEFORE the descriptor, so `callvirt` dispatches
-    /// through it on the linked device path. Result is the descriptor's address (an `i32`).
+    /// The address of a type's canonical TypeDesc on the object/linked path, identified by `handle`. The
+    /// backend emits ONE named descriptor symbol per type (`__lamella_typedesc_<handle>`), laid once per
+    /// object, and references it here by an absolute relocation -- so every `new` of a type shares one
+    /// descriptor (box / type-identity compare by address), and a program can reference a descriptor that
+    /// another assembly defines. The `words` are the GC ABI header + trace map: `[payload_size, nrefs,
+    /// type_tag, base_ptr, ref_offsets...]` (`base_ptr` is a `0` placeholder until the base chain is
+    /// threaded in). The `vtable` is laid as TypeDesc-relative slots BEFORE the descriptor, so `callvirt`
+    /// dispatches through it on the linked device path. Result is the descriptor's address (an `i32`).
     TypeDescLiteral {
+        /// The type handle -- the descriptor's identity, deduplicated to one symbol per type per object.
+        handle: u32,
         /// The descriptor words, in GC-ABI order.
         words: Box<[u32]>,
         /// The type's vtable as this-module function indices in slot order. The backend lays them as

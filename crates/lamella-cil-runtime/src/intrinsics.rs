@@ -3129,8 +3129,10 @@ pub fn delegate_combine(
     Ok(Some(Value::Object(reference)))
 }
 
-/// `System.Delegate.Remove(source, value)`: `source`'s invocation list with `value`'s
-/// invocations removed (the `-=` operator); null if nothing remains.
+/// `System.Delegate.Remove(source, value)`: `source`'s invocation list with the LAST
+/// occurrence of `value`'s list -- matched as one contiguous run, not entry-by-entry --
+/// removed (the `-=` operator). No match returns `source` unchanged; an emptied list is
+/// null. (`d -= H` on `[H, H]` leaves `[H]`: one occurrence, exactly .NET's semantics.)
 ///
 /// # Errors
 /// Never errors.
@@ -3139,11 +3141,20 @@ pub fn delegate_remove(
     _module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
+    let source_value = args.first().cloned().unwrap_or(Value::Null);
+    let mut invocations = delegate_list(vm, args.first());
     let removed = delegate_list(vm, args.get(1));
-    let invocations: Vec<(Value, u32)> = delegate_list(vm, args.first())
-        .into_iter()
-        .filter(|entry| !removed.contains(entry))
-        .collect();
+    if removed.is_empty() || removed.len() > invocations.len() {
+        return Ok(Some(source_value));
+    }
+    let window = removed.len();
+    let Some(start) = (0..=invocations.len() - window)
+        .rev()
+        .find(|&start| invocations[start..start + window] == removed[..])
+    else {
+        return Ok(Some(source_value));
+    };
+    invocations.drain(start..start + window);
     if invocations.is_empty() {
         return Ok(Some(Value::Null));
     }
