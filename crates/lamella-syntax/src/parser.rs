@@ -459,13 +459,18 @@ impl Parser {
     /// by an identifier (the variable name). The type is parsed speculatively and
     /// rolled back, diagnostics included, if it turns out to be an expression.
     fn parse_declaration_or_expression_statement(&mut self, start: u32) -> Stmt {
+        if self.current_keyword() == Some(Keyword::Const) {
+            self.bump();
+            let ty = self.parse_type();
+            return self.parse_local_declaration(start, ty, true);
+        }
         let saved_position = self.position;
         let saved_diagnostics = self.diagnostics.len();
         let ty = self.parse_type();
         if !matches!(ty.kind, TypeRefKind::Error)
             && matches!(self.current().kind, TokenKind::Identifier(_))
         {
-            return self.parse_local_declaration(start, ty);
+            return self.parse_local_declaration(start, ty, false);
         }
         self.position = saved_position;
         self.diagnostics.truncate(saved_diagnostics);
@@ -505,11 +510,15 @@ impl Parser {
 
     /// Parses the declarators and terminator of a local declaration, given its
     /// already-parsed type (15.5.1).
-    fn parse_local_declaration(&mut self, start: u32, ty: TypeRef) -> Stmt {
+    fn parse_local_declaration(&mut self, start: u32, ty: TypeRef, is_const: bool) -> Stmt {
         let declarators = self.parse_variable_declarators();
         let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         Stmt::new(
-            StmtKind::LocalDeclaration { ty, declarators },
+            StmtKind::LocalDeclaration {
+                ty,
+                declarators,
+                is_const,
+            },
             Span::new(start, end),
         )
     }
@@ -997,10 +1006,17 @@ impl Parser {
     fn parse_attribute_section(&mut self) -> AttributeSection {
         let start = self.current().span.start;
         self.bump();
-        let target = if matches!(self.current().kind, TokenKind::Identifier(_))
-            && self.next_is(Punctuator::Colon)
-        {
-            let (target, _) = self.expect_identifier();
+        let target = if self.next_is(Punctuator::Colon)
+            && matches!(
+                self.current().kind,
+                TokenKind::Identifier(_) | TokenKind::Keyword(_)
+            ) {
+            let target: Box<str> = match &self.current().kind {
+                TokenKind::Keyword(keyword) => keyword.as_str().into(),
+                TokenKind::Identifier(text) => text.clone(),
+                _ => unreachable!(),
+            };
+            self.bump();
             self.bump();
             Some(target)
         } else {
@@ -1453,6 +1469,7 @@ impl Parser {
                 break;
             }
             let accessor_start = self.current().span.start;
+            let attributes = self.parse_attribute_sections();
             let is_getter = match self.current_identifier_text() {
                 Some("get") => true,
                 Some("set") => false,
@@ -1468,6 +1485,7 @@ impl Parser {
                 (None, end)
             };
             let accessor = Accessor {
+                attributes,
                 body,
                 span: Span::new(accessor_start, accessor_end),
             };
@@ -1578,6 +1596,7 @@ impl Parser {
                 break;
             }
             let accessor_start = self.current().span.start;
+            let attributes = self.parse_attribute_sections();
             let is_adder = match self.current_identifier_text() {
                 Some("add") => true,
                 Some("remove") => false,
@@ -1593,6 +1612,7 @@ impl Parser {
                 (None, end)
             };
             let accessor = Accessor {
+                attributes,
                 body,
                 span: Span::new(accessor_start, accessor_end),
             };
@@ -2931,8 +2951,13 @@ mod tests {
             }
             StmtKind::Empty => String::from("(empty)"),
             StmtKind::Expression(expr) => format!("(expr {})", dump(expr)),
-            StmtKind::LocalDeclaration { ty, declarators } => {
-                let mut text = format!("(local {}", dump_type(ty));
+            StmtKind::LocalDeclaration {
+                ty,
+                declarators,
+                is_const,
+            } => {
+                let mut text =
+                    format!("(local{} {}", if *is_const { " const" } else { "" }, dump_type(ty));
                 for declarator in declarators {
                     match &declarator.initializer {
                         Some(initializer) => {

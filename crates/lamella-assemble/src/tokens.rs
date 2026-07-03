@@ -4,7 +4,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
-use lamella_binder::{SignatureCanon, TypeSymbol};
+use lamella_binder::{SignatureCanon, SpecialType, TypeSymbol};
 use lamella_token::Token;
 
 /// A method's identity as a string key: `Declaring::Name(p0,p1,...)`.
@@ -59,6 +59,9 @@ pub struct Tokens {
     /// The enum types declared in this module, by key. Their signatures lower to the
     /// underlying integer type (v1: `int32`), so they need no `TypeDef` token.
     enums: BTreeSet<String>,
+    /// Each enum's underlying integral type, by key. An enum-member constant loads at this
+    /// width, so a `long`/`ulong`-backed member keeps a value past 32 bits (21.4).
+    enum_underlying: BTreeMap<String, SpecialType>,
     /// The struct (value) types declared in this module, by key. Their signatures are
     /// `ValueType` of the type's token, and a value-type local is addressed via
     /// `ldloca` for field access.
@@ -67,6 +70,11 @@ pub struct Tokens {
     /// a plain `castclass` lowering yet (interface dispatch is an interpreter feature), so
     /// emission distinguishes them.
     interfaces: BTreeSet<String>,
+    /// The methods declared with a virtual vtable slot (`virtual`/`override`/`abstract`), by
+    /// method key. A method group over such a method converts to a delegate through the
+    /// object's runtime type (`ldvirtftn`, III.4.18), so an override is honored; a non-virtual
+    /// method binds the exact method (`ldftn`).
+    virtual_methods: BTreeSet<String>,
     /// Canonicalizes single-part signature names to their qualified form before keying, so a
     /// parameter/field collected structurally as `StringBuilder` keys (and serializes) the same
     /// as the binder's `System.Text.StringBuilder` -- a forward call resolved against the model's
@@ -138,6 +146,22 @@ impl Tokens {
         self.enums.contains(&type_key(&self.canonical(ty)))
     }
 
+    /// Records an enum's underlying integral type, so an enum-member constant loads at the
+    /// declared width (21.4).
+    pub fn insert_enum_underlying(&mut self, ty: &TypeSymbol, underlying: SpecialType) {
+        self.enum_underlying
+            .insert(type_key(&self.canonical(ty)), underlying);
+    }
+
+    /// An enum's underlying integral type, if recorded; `None` for a non-enum or an enum
+    /// whose underlying type was not tracked (treated as the default `int`).
+    #[must_use]
+    pub(crate) fn enum_underlying(&self, ty: &TypeSymbol) -> Option<SpecialType> {
+        self.enum_underlying
+            .get(&type_key(&self.canonical(ty)))
+            .copied()
+    }
+
     /// Records that this type is a struct (a value type with `ValueType` signatures).
     pub fn insert_struct(&mut self, ty: &TypeSymbol) {
         self.structs.insert(type_key(&self.canonical(ty)));
@@ -158,6 +182,37 @@ impl Tokens {
     #[must_use]
     pub fn is_interface(&self, ty: &TypeSymbol) -> bool {
         self.interfaces.contains(&type_key(&self.canonical(ty)))
+    }
+
+    /// Records that the method with this identity occupies a virtual vtable slot, so a
+    /// delegate over it dispatches through the receiver's runtime type (III.4.18).
+    pub fn insert_virtual_method(
+        &mut self,
+        declaring: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) {
+        self.virtual_methods.insert(method_key(
+            &self.canonical(declaring),
+            name,
+            &self.canonical_params(parameters),
+        ));
+    }
+
+    /// Whether the method with this identity is virtual (so a delegate over it emits
+    /// `ldvirtftn` rather than `ldftn`).
+    #[must_use]
+    pub(crate) fn is_virtual_method(
+        &self,
+        declaring: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) -> bool {
+        self.virtual_methods.contains(&method_key(
+            &self.canonical(declaring),
+            name,
+            &self.canonical_params(parameters),
+        ))
     }
 
     /// Records `token` as the method named by this identity.

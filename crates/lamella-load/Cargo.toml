@@ -54,6 +54,19 @@ tls-mbedtls = ["dep:mbedtls"]
 # omits it -- for the full corlib that drops ~300 KB of resident Strings, with only graceful loss of
 # debugger name display. Nothing functional depends on the names.
 debug-names = []
+# Execute-in-place (XIP) foundation: forwards to lamella-cil-runtime/flash-image so the loader borrows
+# each method's raw CIL as a `&'static [u8]` from the flash PE (see RawCil) instead of copying it into
+# an owned Box. Off by default (the owned copy; non-XIP builds are byte-identical). On => the borrow;
+# the load API then requires an `Assembly<'static>` (device flash ROM, or a host `Box::leak`), a bound
+# threaded uniformly through the `FlashLifetime` seam.
+flash-image = ["lamella-cil-runtime/flash-image"]
+# The code_loading knob's two non-default levels, forwarded so a profile can pick the level at the
+# loader crate. preload: decode every body at load, hold it resident (deterministic, RAM-rich).
+# in_place (XIP): decode one instruction per step straight from the flash-resident code bytes --
+# zero decoded-body RAM, ip a CIL byte offset; implies flash-image (the body must be a flash
+# slice). Default (both off) = on_use lazy decode. See lamella-cil-runtime.
+code-preload = ["lamella-cil-runtime/code-preload"]
+code-in-place = ["lamella-cil-runtime/code-in-place", "flash-image"]
 
 [dev-dependencies]
 # Host-only: the reactor's readiness poll for the run-with-corlib example's NetBackend (sockets).

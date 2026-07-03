@@ -312,12 +312,18 @@ pub enum StmtKind {
     /// expression is one allowed as a statement (a call, assignment, increment,
     /// decrement, or object creation).
     Expression(Expr),
-    /// A local variable declaration `type declarators ;` (15.5.1).
+    /// A local variable declaration `type declarators ;` (15.5.1), or a local
+    /// constant declaration `const type declarators ;` when `is_const` (15.5.1
+    /// declares a local constant whose value is a constant expression, 14.15).
     LocalDeclaration {
         /// The declared type, shared by every declarator.
         ty: TypeRef,
         /// The declared variables, in order.
         declarators: Vec<VariableDeclarator>,
+        /// Whether a leading `const` modifier made this a local constant declaration:
+        /// each declarator's initializer is a constant expression folded at compile
+        /// time, and the name has no storage.
+        is_const: bool,
     },
     /// A `return` statement, with its optional value (15.9.4).
     Return(Option<Expr>),
@@ -1018,6 +1024,8 @@ pub enum ConstructorInitializerKind {
 /// abstract or interface property, a bare `;` (so the body is `None`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accessor {
+    /// The attributes on the accessor itself (17.6.2 accessor-declarations).
+    pub attributes: Vec<AttributeSection>,
     /// The accessor body, or `None` if it was a bare `;`.
     pub body: Option<Stmt>,
     /// The byte range the accessor covers.

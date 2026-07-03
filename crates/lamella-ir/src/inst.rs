@@ -85,6 +85,16 @@ pub enum ConvKind {
     /// Convert a signed `int32` to a 32-bit float (`conv.r4` from an integer), exact for
     /// magnitudes below 2^24. The soft form on a no-FPU target.
     IntToFloat32,
+    /// Truncate a 64-bit float toward zero to a signed `int32` (`conv.i4` from an `R8`). wasm has a
+    /// native truncate; a no-FPU ARM target needs the aeabi soft helper (a follow-on, not yet wired).
+    Float64ToInt,
+    /// Reinterpret an `int32` as an `ObjectRef` -- a no-op at the machine level (both are one word), a
+    /// pure retype so a computed integer can stand in for a reference. `isinst` uses it to fold a
+    /// branchless `matched ? object : null` mask (an `int32`) into the reference result.
+    IntToRef,
+    /// Reinterpret an `ObjectRef` as an `int32` -- the inverse no-op of [`ConvKind::IntToRef`], so a
+    /// reference can enter integer (bitmask) arithmetic. `isinst` masks the object pointer this way.
+    RefToInt,
 }
 
 impl ConvKind {
@@ -94,11 +104,14 @@ impl ConvKind {
     pub fn result_type(self) -> MirType {
         match self {
             ConvKind::IntToFloat32 => MirType::F32,
+            ConvKind::IntToRef => MirType::ObjectRef,
             ConvKind::SignExtend8
             | ConvKind::ZeroExtend8
             | ConvKind::SignExtend16
             | ConvKind::ZeroExtend16
-            | ConvKind::Float32ToInt => MirType::I32,
+            | ConvKind::Float32ToInt
+            | ConvKind::Float64ToInt
+            | ConvKind::RefToInt => MirType::I32,
         }
     }
 }
@@ -294,6 +307,9 @@ pub enum Inst {
         slot: u32,
         /// The argument values, in order; `args[0]` is the receiver (`this`).
         args: Vec<ValueId>,
+        /// Whether the callee returns a value (false for a `void` method). A signature-checked
+        /// target (wasm `call_indirect`) needs the exact result arity; an untyped `blx` ignores it.
+        returns_value: bool,
     },
     /// A `callvirt` on an INTERFACE method, dispatched through the receiver's interface table. The
     /// implementation is found by matching `tag` (the interface-method identity) in the receiver
@@ -303,6 +319,8 @@ pub enum Inst {
         tag: u32,
         /// The argument values, in order; `args[0]` is the receiver (`this`).
         args: Vec<ValueId>,
+        /// Whether the callee returns a value (false for a `void` method); see [`Inst::CallVirtual`].
+        returns_value: bool,
     },
     /// The ADDRESS of a function of the program (a code pointer), named by index -- the CIL `ldftn`,
     /// the substrate for delegates and callbacks. The result is an `i32` raw address (the target's
@@ -312,6 +330,17 @@ pub enum Inst {
         /// The index of the referenced function within the program.
         func: u32,
     },
+    /// The virtual function pointer for a `ldvirtftn` -- like [`Inst::FuncAddr`], but the target is
+    /// resolved through the object's vtable at run time (the slot's entry off its `obj-4` TypeDesc, as
+    /// [`Inst::CallVirtual`] dispatches), so a delegate created from a virtual method binds the override
+    /// for the object's RUNTIME type. The result is the same `i32` code pointer `FuncAddr` yields (the
+    /// Thumb bit set on ARM), consumed by a delegate's method field or an [`Inst::CallIndirect`].
+    VirtualFuncAddr {
+        /// The object whose runtime-type vtable resolves the pointer (`ldvirtftn` pops it).
+        object: ValueId,
+        /// The method's vtable slot.
+        slot: u32,
+    },
     /// An INDIRECT call through a code pointer in `target` (the CIL `calli`, and the engine of a
     /// delegate's `Invoke`): passes `args` in the ABI's argument registers and calls `target`.
     /// Produces the callee's return value, like [`Inst::Call`], and is a safepoint.
@@ -320,6 +349,8 @@ pub enum Inst {
         target: ValueId,
         /// The argument values, in order (placed in the ABI's argument registers).
         args: Vec<ValueId>,
+        /// Whether the callee returns a value (false for a `void` target); see [`Inst::CallVirtual`].
+        returns_value: bool,
     },
     /// A call to an EXTERNAL native symbol named by `symbol` -- a `u32` index into the module's
     /// extern-symbol table (`__aeabi_fadd`, a `[DllImport]` entry point, a `py_*` helper). The
@@ -354,6 +385,9 @@ pub enum Inst {
         delegate: ValueId,
         /// The explicit arguments (Invoke's signature params), in order.
         args: Vec<ValueId>,
+        /// Whether `Invoke` returns a value (false for an `Action`-style void delegate); see
+        /// [`Inst::CallVirtual`].
+        returns_value: bool,
     },
     /// A `castclass` base-pointer chain scan: walks `args[0]` (the object's TypeDesc address) up the
     /// base_ptr@12 chain looking for `args[1]` (the target type's TypeDesc address). The result is 1 if
@@ -546,11 +580,17 @@ pub enum Inst {
     /// where the per-module descriptor table the flat path threads is not available. The backend emits
     /// the words in a data pool and `adr`s their address (position-independent, no relocation). The
     /// words are the GC ABI header + trace map: `[payload_size, nrefs, type_tag, base_ptr,
-    /// ref_offsets...]` (`type_tag`/`base_ptr` are `0` placeholders until the dispatch metadata is
-    /// threaded in). Result is that address (an `i32`).
+    /// ref_offsets...]` (`base_ptr` is a `0` placeholder until the base chain is threaded in). The
+    /// `vtable` is laid as TypeDesc-relative slots BEFORE the descriptor, so `callvirt` dispatches
+    /// through it on the linked device path. Result is the descriptor's address (an `i32`).
     TypeDescLiteral {
         /// The descriptor words, in GC-ABI order.
         words: Box<[u32]>,
+        /// The type's vtable as this-module function indices in slot order. The backend lays them as
+        /// `R_LAMELLA_REL_DESC` slots before the descriptor (slot `k` at `desc - 4 - k*4`, holding
+        /// `method_entry - desc`), so dispatch reads `desc + slot + 1`. Empty when the type has no
+        /// virtual methods.
+        vtable: Box<[u32]>,
     },
     /// Allocates a garbage-collected array of `length` elements of `element_size` bytes -- the
     /// CLI's `newarr`. The payload is `[u32 length][elements...]`; the result is an `ObjectRef`

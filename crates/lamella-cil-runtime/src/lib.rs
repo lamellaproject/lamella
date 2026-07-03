@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod exception;
 pub mod interp;
 #[cfg(feature = "bcl")]
+pub mod intrinsic_registry;
 pub mod intrinsics;
 pub mod memory;
 pub mod module;

@@ -249,6 +249,30 @@ namespace System
             return -1;
         }
 
+        public int IndexOf(string value)
+        {
+            return IndexOf(value, 0);
+        }
+
+        public int IndexOf(string value, int startIndex)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            int n = this.Length;
+            int m = value.Length;
+            if (startIndex < 0 || startIndex > n) throw new ArgumentOutOfRangeException("startIndex");
+            if (m == 0) return startIndex;
+            for (int i = startIndex; i <= n - m; i++)
+            {
+                bool match = true;
+                for (int j = 0; j < m; j++)
+                {
+                    if (this[i + j] != value[j]) { match = false; break; }
+                }
+                if (match) return i;
+            }
+            return -1;
+        }
+
         public int IndexOfAny(char[] anyOf)
         {
             if ((object)anyOf == null) throw new ArgumentNullException("anyOf");

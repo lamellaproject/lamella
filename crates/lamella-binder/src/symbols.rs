@@ -396,6 +396,11 @@ impl Model {
                     *parameter = canon.canonicalize(parameter);
                 }
             }
+            for constructor in &mut info.constructors {
+                for parameter in &mut constructor.parameters {
+                    *parameter = canon.canonicalize(parameter);
+                }
+            }
         }
     }
 
@@ -429,16 +434,34 @@ pub struct SignatureCanon {
 }
 
 impl SignatureCanon {
-    /// Rewrites a single-part named type to its unambiguous qualified symbol, recursing into
-    /// arrays, pointers, and byrefs; every other type (predefined, already-qualified, ambiguous)
-    /// is returned unchanged.
+    /// Rewrites a single-part named type to its unambiguous qualified symbol, folds a
+    /// `System` built-in to its special form -- so `System.String` written out and the
+    /// `string` keyword are ONE type (4.1.4), whether the built-in comes from a reference
+    /// or a corlib-style compilation's own source -- and recurses into arrays, pointers,
+    /// and byrefs. Every other type (ambiguous, unknown) is returned unchanged.
     #[must_use]
     pub fn canonicalize(&self, ty: &TypeSymbol) -> TypeSymbol {
         match ty {
-            TypeSymbol::Named(parts) if parts.len() == 1 => match self.map.get(parts[0].as_ref()) {
-                Some(Some(full)) => full.clone(),
-                _ => ty.clone(),
-            },
+            TypeSymbol::Named(parts) => {
+                let qualified = if parts.len() == 1 {
+                    match self.map.get(parts[0].as_ref()) {
+                        Some(Some(full)) => full.clone(),
+                        _ => ty.clone(),
+                    }
+                } else {
+                    ty.clone()
+                };
+                if let TypeSymbol::Named(qualified_parts) = &qualified {
+                    if let [namespace, name] = &qualified_parts[..] {
+                        if let Some(special) =
+                            crate::reference::special_for_named(namespace, name)
+                        {
+                            return TypeSymbol::Special(special);
+                        }
+                    }
+                }
+                qualified
+            }
             TypeSymbol::Array { element, rank } => TypeSymbol::Array {
                 element: alloc::boxed::Box::new(self.canonicalize(element)),
                 rank: *rank,

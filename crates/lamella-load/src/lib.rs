@@ -10,11 +10,15 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 
-use lamella_cil::{EhKind, Opcode, Operand};
+use lamella_cil::{Opcode, Operand};
+#[cfg(feature = "exceptions")]
+use lamella_cil::EhKind;
 use lamella_metadata::{
     Assembly, AttrArg, ConstantValue, Method, MethodSig, SigType, TargetLayout, TypeName,
-    decode_custom_attribute, exception_tag_for_name,
+    decode_custom_attribute,
 };
+#[cfg(feature = "exceptions")]
+use lamella_metadata::exception_tag_for_name;
 use lamella_token::Token;
 use lamella_cil_runtime::intrinsics::{
     array_clone, array_empty, array_get_value, array_set_value, boolean_to_string,
@@ -36,8 +40,7 @@ use lamella_cil_runtime::intrinsics::{
     initialize_array, get_custom_attributes, string_concat, string_concat_object2,
     string_concat_object3, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
-    string_not_equals, string_substring, string_substring_len, type_from_handle, type_get_field,
-    type_get_method, type_get_name, type_get_property, type_property_custom_attributes,
+    string_not_equals, string_substring, string_substring_len, type_from_handle, type_get_name,
     thread_start, thread_join, thread_yield, thread_sleep, monitor_enter, monitor_exit,
     monitor_try_enter, monitor_wait, monitor_pulse, monitor_pulse_all,
     socket_connect_start, socket_connect_poll, socket_listen, socket_accept,
@@ -83,31 +86,34 @@ use lamella_cil_runtime::intrinsics::{
     string_last_index_of_char, string_pad_left, string_pad_right, string_remove,
     string_replace_char, string_replace_string, string_split_char, string_starts_with,
     string_to_char_array, string_to_lower, string_to_upper, string_trim, type_get_assembly,
-    type_get_fields, type_get_full_name, type_get_methods, type_get_namespace, type_is_abstract,
+    type_get_field, type_get_fields, type_get_full_name, type_get_method, type_get_methods,
+    type_get_namespace, type_get_property, type_is_abstract,
     type_is_array, type_is_class,
     type_is_enum, type_is_interface, type_is_not_public, type_is_public, type_is_value_type,
 };
+#[cfg(feature = "NETMFv4_4")]
+use lamella_cil_runtime::intrinsics::type_property_custom_attributes;
 #[cfg(feature = "float")]
 use lamella_cil_runtime::intrinsics::{
     console_write_double, console_write_line_double, console_write_line_single, console_write_single,
-    convert_to_int32_double, decimal_from_double, decimal_to_double, double_to_exponential,
-    double_to_fixed,
-    double_to_string, math_abs_f64, math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64,
-    math_round_f64, math_sign_f64, math_truncate_f64, single_parse, single_to_exponential,
-    single_to_fixed,
-    single_to_string,
+    decimal_from_double, decimal_to_double, double_to_exponential, double_to_fixed, double_to_string,
+    single_parse, single_to_exponential, single_to_fixed, single_to_string,
 };
 #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
 use lamella_cil_runtime::intrinsics::{
     bitconverter_double_to_int64_bits, bitconverter_int32_bits_to_single,
-    bitconverter_int64_bits_to_double, bitconverter_single_to_int32_bits,
+    bitconverter_int64_bits_to_double, bitconverter_single_to_int32_bits, convert_to_int32_double,
+    math_abs_f64, math_ceiling_f64, math_floor_f64, math_max_f64, math_min_f64, math_round_f64,
+    math_sign_f64, math_truncate_f64,
 };
 #[cfg(feature = "math-transcendental")]
 use lamella_cil_runtime::intrinsics::{
     math_cos_f64, math_exp_f64, math_log_f64, math_log10_f64, math_pow_f64, math_sin_f64,
     math_sqrt_f64, math_tan_f64,
 };
-use lamella_cil_runtime::module::{AttrValue, LoadedAttribute, VarargSite, asm_key};
+use lamella_cil_runtime::module::{
+    AttrValue, BoxedPrimitive, LoadedAttribute, RawCil, VarargSite, asm_key,
+};
 #[cfg(feature = "NETMFv4_4")]
 use lamella_cil_runtime::module::{MethodParam, ReflectField, ReflectMethod, ReflectType};
 use lamella_cil_runtime::{IntrinsicFn, MethodId, Module, TypeId, Value};
@@ -289,6 +295,30 @@ fn canonical_sig_type(namespace: &str, name: &str) -> Option<SigType> {
     })
 }
 
+/// The assembly a load entry point reads from. Its PE bytes must outlive the built [`Module`] so the
+/// loader can bind method CIL; by default any borrow will do, but under `flash-image` (XIP) the bytes
+/// must be `'static` -- borrowed straight from the flash-resident image (device flash ROM, or a host
+/// `Box::leak`) so the raw CIL is never copied into RAM (see [`RawCil`]). Baking the `'static` into
+/// this one alias keeps every load signature uniform across both builds; only this definition changes,
+/// so a non-XIP build is byte-identical and the `'pe` parameter simply goes unused under XIP.
+#[cfg(not(feature = "flash-image"))]
+pub type SourceAssembly<'pe> = Assembly<'pe>;
+/// The `flash-image` (XIP) form: the PE bytes are `'static` so method CIL can be borrowed from flash.
+/// See the default form above for the full rationale.
+#[cfg(feature = "flash-image")]
+pub type SourceAssembly<'pe> = Assembly<'static>;
+
+/// Materializes one method's raw CIL for [`Module::add_method`]: an owned `Box` copy of the PE bytes
+/// by default, or -- under `flash-image` -- a zero-copy `&'static` borrow of the flash-resident PE.
+#[cfg(not(feature = "flash-image"))]
+fn raw_cil(bytes: &[u8]) -> RawCil {
+    bytes.to_vec().into_boxed_slice()
+}
+#[cfg(feature = "flash-image")]
+fn raw_cil(bytes: &'static [u8]) -> RawCil {
+    bytes
+}
+
 /// Builds a runnable [`Program`] from `assembly`.
 ///
 /// Every method with a body is added and bound to its MethodDef token (methods
@@ -300,7 +330,35 @@ fn canonical_sig_type(namespace: &str, name: &str) -> Option<SigType> {
 /// # Errors
 /// [`LoadError::NoEntryPoint`] if the assembly names no entry point, or
 /// [`LoadError::EntryHasNoBody`] if that token has no loadable body.
-pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
+pub fn load<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, LoadError> {
+    if assembly.image().entry_point_token() == 0 {
+        return Err(LoadError::NoEntryPoint);
+    }
+    let mut module = Module::new();
+    let mut index = NameIndex::new();
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    let entry = load_assembly(
+        &mut module,
+        assembly,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        false,
+    );
+    let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
+    module.freeze();
+    Ok(Program { module, entry })
+}
+
+/// [`load`] WITHOUT the final freeze -- the bake pipeline's entry: the reachability trim
+/// must scrub the still-mutable builders (so every frozen table and pool shrinks), and
+/// [`Module::write_baked`] freezes afterwards. A module this returns is NOT ready to run.
+///
+/// # Errors
+/// As [`load`].
+pub fn load_unfrozen<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, LoadError> {
     if assembly.image().entry_point_token() == 0 {
         return Err(LoadError::NoEntryPoint);
     }
@@ -325,7 +383,7 @@ pub fn load(assembly: &Assembly) -> Result<Program, LoadError> {
 /// types + methods exactly as [`load`] does but WITHOUT requiring -- or running -- an entry point.
 /// The REPL emits a `/target:library` session class and invokes a named method by id (never an
 /// entry), so this lets it load that image directly instead of carrying an unused dummy `Main`.
-pub fn load_library(assembly: &Assembly) -> Result<Module, LoadError> {
+pub fn load_library<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Module, LoadError> {
     Ok(load_bootstrap(assembly).0)
 }
 
@@ -336,7 +394,7 @@ pub fn load_library(assembly: &Assembly) -> Result<Module, LoadError> {
 /// declared type's base `System.Object::.ctor`, or the `<repl>.__Repl` the delta references. (The
 /// static-field index is internal to one assembly's load and not needed across deltas.)
 #[must_use]
-pub fn load_bootstrap(assembly: &Assembly) -> (Module, NameIndex, TypeNameIndex) {
+pub fn load_bootstrap<'pe>(assembly: &SourceAssembly<'pe>) -> (Module, NameIndex, TypeNameIndex) {
     let mut module = Module::new();
     let mut index = NameIndex::new();
     let mut type_index = TypeNameIndex::new();
@@ -350,6 +408,7 @@ pub fn load_bootstrap(assembly: &Assembly) -> (Module, NameIndex, TypeNameIndex)
         &mut field_index,
         false,
     );
+    module.freeze();
     (module, index, type_index)
 }
 
@@ -505,10 +564,10 @@ impl fmt::Display for DeltaError {
 /// [`DeltaError::NoSubmitMethod`] / [`DeltaError::SubmitHasNoBody`] if the delta carries no
 /// runnable `Submit$N`; [`DeltaError::UntypedFieldRef`] if a new `__Repl` field's `MemberRef` has
 /// no signature to size it from.
-pub fn load_delta(
+pub fn load_delta<'pe>(
     module: &mut Module,
     context: &mut DeltaContext,
-    delta: &Assembly,
+    delta: &SourceAssembly<'pe>,
 ) -> Result<DeltaInfo, DeltaError> {
     let mut submit_row: Option<u32> = None;
     let mut method_row: u32 = 0;
@@ -674,7 +733,48 @@ fn bind_delta_field(
 /// # Errors
 /// [`LoadError::NoEntryPoint`] if the program names no entry point, or
 /// [`LoadError::EntryHasNoBody`] if the program's entry-point token has no loadable body.
-pub fn load_with_corlib(corlib: &Assembly, program: &Assembly) -> Result<Program, LoadError> {
+pub fn load_with_corlib<'c, 'p>(
+    corlib: &SourceAssembly<'c>,
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LoadError> {
+    if program.image().entry_point_token() == 0 {
+        return Err(LoadError::NoEntryPoint);
+    }
+    let mut module = Module::new();
+    let mut index = NameIndex::new();
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    load_assembly(
+        &mut module,
+        corlib,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    let entry = load_assembly(
+        &mut module,
+        program,
+        1,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
+    module.freeze();
+    Ok(Program { module, entry })
+}
+
+/// [`load_with_corlib`] WITHOUT the final freeze -- see [`load_unfrozen`].
+///
+/// # Errors
+/// As [`load_with_corlib`].
+pub fn load_with_corlib_unfrozen<'c, 'p>(
+    corlib: &SourceAssembly<'c>,
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LoadError> {
     if program.image().entry_point_token() == 0 {
         return Err(LoadError::NoEntryPoint);
     }
@@ -716,9 +816,9 @@ pub fn load_with_corlib(corlib: &Assembly, program: &Assembly) -> Result<Program
 /// `MemberRef` is first looked up in `index` (so a call to a corlib-defined method binds to
 /// the corlib's [`MethodId`]); only an unindexed member falls through to a Rust intrinsic.
 /// Every method this assembly defines (managed-body or `runtime`) is inserted into `index`.
-fn load_assembly(
+fn load_assembly<'pe>(
     module: &mut Module,
-    assembly: &Assembly,
+    assembly: &SourceAssembly<'pe>,
     asm: u8,
     index: &mut NameIndex,
     type_index: &mut TypeNameIndex,
@@ -738,6 +838,7 @@ fn load_assembly(
     let mut static_field_ref_tokens = BTreeSet::new();
     let mut ldtoken_type_tokens = BTreeSet::new();
     let mut type_test_tokens = BTreeSet::new();
+    let mut box_tokens = BTreeSet::new();
     let mut generic_call_tokens = BTreeSet::new();
     let mut value_type_method_rows: BTreeSet<u32> = BTreeSet::new();
     let mut string_builder_ctor_rows: BTreeMap<u32, u16> = BTreeMap::new();
@@ -866,47 +967,47 @@ fn load_assembly(
                     }
                 }
             }
-            let Some((body, raw_il)) = method.body_and_bytes() else {
-                if method.is_runtime_impl() {
+            let runtime_supplied =
+                method.is_runtime_impl() || has_runtime_provided_attribute(assembly, token);
+            let intrinsic = runtime_supplied
+                .then(|| {
                     let signature = method.signature();
-                    let intrinsic = type_def.name().and_then(|declaring| {
-                        bcl_intrinsic(
+                    type_def.name().and_then(|declaring| {
+                        bcl_intrinsic(declaring.namespace, declaring.name, &name, signature.as_ref())
+                    })
+                })
+                .flatten();
+            if let Some(func) = intrinsic {
+                let id = module.add_intrinsic(asm, func, arg_count(&method));
+                module.bind_token(asm, token, id);
+                module.set_method_type(id, type_id);
+                if let Some(declaring) = type_def.name() {
+                    index.insert(
+                        name_key(
+                            assembly,
                             declaring.namespace,
                             declaring.name,
                             &name,
-                            signature.as_ref(),
-                        )
-                    });
-                    if let Some(func) = intrinsic {
-                        let id = module.add_intrinsic(asm, func, arg_count(&method));
-                        module.bind_token(asm, token, id);
-                        module.set_method_type(id, type_id);
-                        if let Some(declaring) = type_def.name() {
-                            index.insert(
-                                name_key(
-                                    assembly,
-                                    declaring.namespace,
-                                    declaring.name,
-                                    &name,
-                                    &params,
-                                    return_type.as_ref(),
-                                ),
-                                id,
-                            );
-                        }
-                        if method.flags() & METHOD_VIRTUAL != 0 {
-                            virtuals.push(VirtualMethod {
-                                id,
-                                name: name.clone(),
-                                params: params.clone(),
-                                newslot: method.flags() & METHOD_NEWSLOT != 0,
-                            });
-                        }
-                        if token.0 == entry_token {
-                            entry = Some(id);
-                        }
-                    }
+                            &params,
+                            return_type.as_ref(),
+                        ),
+                        id,
+                    );
                 }
+                if method.flags() & METHOD_VIRTUAL != 0 {
+                    virtuals.push(VirtualMethod {
+                        id,
+                        name: name.clone(),
+                        params: params.clone(),
+                        newslot: method.flags() & METHOD_NEWSLOT != 0,
+                    });
+                }
+                if token.0 == entry_token {
+                    entry = Some(id);
+                }
+                continue;
+            }
+            let Some((body, raw_il)) = method.body_and_bytes() else {
                 continue;
             };
             for instruction in body.code.iter() {
@@ -955,6 +1056,7 @@ fn load_assembly(
                             ldtoken_type_tokens.insert(*operand);
                             if matches!(instruction.opcode, Opcode::Box) {
                                 type_test_tokens.insert(*operand);
+                                box_tokens.insert(*operand);
                             }
                         }
                         Opcode::Castclass | Opcode::Isinst | Opcode::Box => {
@@ -977,7 +1079,7 @@ fn load_assembly(
                     }
                 }
             }
-            let id = module.add_method(asm, raw_il.to_vec().into_boxed_slice(), arg_count(&method));
+            let id = module.add_method(asm, raw_cil(raw_il), arg_count(&method));
             module.bind_token(asm, token, id);
             module.set_method_type(id, type_id);
             if let Some(declaring) = type_def.name() {
@@ -1058,6 +1160,7 @@ fn load_assembly(
         &bcl_call_tokens,
     );
     bind_array_defaults(assembly, module, asm, type_index, &newarr_tokens);
+    bind_box_primitives(assembly, module, asm, &box_tokens);
     bind_generic_calls(assembly, module, asm, &generic_call_tokens);
     mark_value_type_ctors(module, asm, &newobj_tokens, &value_type_method_rows);
     mark_same_assembly_ctors(
@@ -1689,6 +1792,7 @@ fn bcl_intrinsic(
         ("Type", "op_Equality") => Some(reflect_handle_equals),
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "op_Inequality") => Some(reflect_handle_not_equals),
+        #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetField") => match parameters_of(signature) {
             [SigType::String] | [SigType::String, _] => Some(type_get_field),
             _ => None,
@@ -1697,10 +1801,12 @@ fn bcl_intrinsic(
         ("Type", "GetFields") => Some(type_get_fields),
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetMethods") => Some(type_get_methods),
+        #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetMethod") => match parameters_of(signature) {
             [SigType::String] | [SigType::String, _] => Some(type_get_method),
             _ => None,
         },
+        #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetProperty") => match parameters_of(signature) {
             [SigType::String] | [SigType::String, _] => Some(type_get_property),
             _ => None,
@@ -1787,22 +1893,22 @@ fn bcl_intrinsic(
             [] => Some(datetime_now_ticks),
             _ => None,
         },
-        #[cfg(feature = "float")]
+        #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
         ("BitConverter", "DoubleToInt64Bits") => match parameters_of(signature) {
             [SigType::R8] => Some(bitconverter_double_to_int64_bits),
             _ => None,
         },
-        #[cfg(feature = "float")]
+        #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
         ("BitConverter", "Int64BitsToDouble") => match parameters_of(signature) {
             [SigType::I8] => Some(bitconverter_int64_bits_to_double),
             _ => None,
         },
-        #[cfg(feature = "float")]
+        #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
         ("BitConverter", "SingleToInt32Bits") => match parameters_of(signature) {
             [SigType::R4] => Some(bitconverter_single_to_int32_bits),
             _ => None,
         },
-        #[cfg(feature = "float")]
+        #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
         ("BitConverter", "Int32BitsToSingle") => match parameters_of(signature) {
             [SigType::I4] => Some(bitconverter_int32_bits_to_single),
             _ => None,
@@ -1898,6 +2004,43 @@ fn bind_array_defaults(
                 }
             }
         }
+    }
+}
+
+/// Records, for each `box` operand type token naming `System.Boolean` or `System.Char`, the
+/// [`BoxedPrimitive`] display kind -- so a boxed `bool`/`char` displays as `"True"`/`"False"` or
+/// its character rather than the raw `Int32` the stack collapses both into. The kind comes from the
+/// operand's metadata NAME ([`Assembly::type_token_name`]), which resolves even for a corlib
+/// `TypeRef` the runtime never loads (the incremental REPL's case); no other boxed type is recorded
+/// (a plain integer, enum, or struct box keeps its normal display path).
+fn bind_box_primitives(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    tokens: &BTreeSet<Token>,
+) {
+    for token in tokens {
+        if let Some(kind) = assembly
+            .type_token_name(*token)
+            .and_then(|name| box_primitive_kind(name.namespace, name.name))
+        {
+            module.bind_box_primitive(asm, *token, kind);
+        }
+    }
+}
+
+/// The [`BoxedPrimitive`] display kind of a boxed `System` primitive type name, or `None` for any
+/// type whose boxed display already matches its underlying `Int32` (every other integer primitive)
+/// or is handled elsewhere. Only `Boolean` and `Char` differ from the raw integer, so only they are
+/// classified.
+fn box_primitive_kind(namespace: &str, name: &str) -> Option<BoxedPrimitive> {
+    if namespace != "System" {
+        return None;
+    }
+    match name {
+        "Boolean" => Some(BoxedPrimitive::Boolean),
+        "Char" => Some(BoxedPrimitive::Char),
+        _ => None,
     }
 }
 
@@ -2059,7 +2202,6 @@ fn bind_type_names(
 /// name through the type index (to the corlib type); a same-assembly class/struct uses its folded
 /// `TypeDef` token; a cross-assembly `TypeRef` resolves by name. Arrays / pointers / by-refs are not
 /// modeled as `Type` handles yet (`None`).
-#[cfg(feature = "NETMFv4_4")]
 fn sigtype_to_type_handle(
     assembly: &Assembly,
     module: &Module,
@@ -2120,7 +2262,7 @@ fn record_custom_attributes(
     assembly: &Assembly,
     module: &mut Module,
     asm: u8,
-    type_index: &TypeNameIndex,
+    #[cfg_attr(not(feature = "NETMFv4_4"), allow(unused_variables))] type_index: &TypeNameIndex,
 ) {
     for (local_index, type_def) in assembly.type_defs().enumerate() {
         let type_token = Token::new(TYPE_DEF, (local_index + 1) as u32);
@@ -2174,25 +2316,23 @@ fn record_custom_attributes(
         #[cfg(feature = "NETMFv4_4")]
         let mut reflect_fields = Vec::new();
         for field in type_def.fields() {
+            let handle = asm_key(asm, field.token().0);
+            record_target_attributes(assembly, module, asm, handle, field.token());
+            #[cfg(feature = "NETMFv4_4")]
             if let Some(name) = field.name() {
-                let handle = asm_key(asm, field.token().0);
                 module.bind_type_field_name(type_handle, name, handle);
-                record_target_attributes(assembly, module, asm, handle, field.token());
-                #[cfg(feature = "NETMFv4_4")]
-                {
-                    module.bind_type_name(asm, field.token(), String::from(name));
-                    let field_flags = field.flags();
-                    reflect_fields.push(ReflectField {
-                        handle,
-                        is_static: field_flags & 0x0010 != 0,
-                        is_public: field_flags & 0x0007 == 0x0006,
-                    });
-                    if let Some(field_sig) = field.signature() {
-                        if let Some(type_handle) =
-                            sigtype_to_type_handle(assembly, module, asm, &field_sig, type_index)
-                        {
-                            module.bind_member_type(handle, type_handle);
-                        }
+                module.bind_type_name(asm, field.token(), String::from(name));
+                let field_flags = field.flags();
+                reflect_fields.push(ReflectField {
+                    handle,
+                    is_static: field_flags & 0x0010 != 0,
+                    is_public: field_flags & 0x0007 == 0x0006,
+                });
+                if let Some(field_sig) = field.signature() {
+                    if let Some(type_handle) =
+                        sigtype_to_type_handle(assembly, module, asm, &field_sig, type_index)
+                    {
+                        module.bind_member_type(handle, type_handle);
                     }
                 }
             }
@@ -2202,64 +2342,62 @@ fn record_custom_attributes(
         #[cfg(feature = "NETMFv4_4")]
         let mut reflect_methods = Vec::new();
         for method in type_def.methods() {
+            let token = Token::new(METHOD_DEF, method.rid());
+            let handle = asm_key(asm, token.0);
+            record_target_attributes(assembly, module, asm, handle, token);
+            #[cfg(feature = "NETMFv4_4")]
             if let Some(name) = method.name() {
-                let token = Token::new(METHOD_DEF, method.rid());
-                let handle = asm_key(asm, token.0);
                 module.bind_type_method_name(type_handle, name, handle);
-                record_target_attributes(assembly, module, asm, handle, token);
-                #[cfg(feature = "NETMFv4_4")]
-                {
-                    module.bind_type_name(asm, token, String::from(name));
-                    if name == ".ctor" {
-                        let param_count = parameters_of(method.signature().as_ref()).len();
-                        module.bind_type_ctor_overload(type_handle, handle, param_count);
-                        if param_count == 0 {
-                            if let Some(ctor) = module.resolve_by_handle(handle) {
-                                module.bind_type_ctor(type_handle, ctor);
-                            }
+                module.bind_type_name(asm, token, String::from(name));
+                if name == ".ctor" {
+                    let param_count = parameters_of(method.signature().as_ref()).len();
+                    module.bind_type_ctor_overload(type_handle, handle, param_count);
+                    if param_count == 0 {
+                        if let Some(ctor) = module.resolve_by_handle(handle) {
+                            module.bind_type_ctor(type_handle, ctor);
                         }
-                    } else if name != ".cctor" {
-                        let method_flags = method.flags();
-                        reflect_methods.push(ReflectMethod {
-                            handle,
-                            is_static: method_flags & 0x0010 != 0,
-                            is_public: method_flags & 0x0007 == 0x0006,
-                        });
-                        module.bind_method_attrs(handle, method_flags);
-                        if let Some(method_sig) = method.signature() {
-                            if let Some(return_handle) = sigtype_to_type_handle(
-                                assembly,
-                                module,
-                                asm,
-                                &method_sig.return_type,
-                                type_index,
-                            ) {
-                                module.bind_member_type(handle, return_handle);
-                            }
-                            let mut names: Vec<String> = Vec::new();
-                            for param in method.params() {
-                                let sequence = param.sequence() as usize;
-                                if sequence >= 1 {
-                                    if names.len() < sequence {
-                                        names.resize(sequence, String::new());
-                                    }
-                                    names[sequence - 1] = String::from(param.name().unwrap_or(""));
+                    }
+                } else if name != ".cctor" {
+                    let method_flags = method.flags();
+                    reflect_methods.push(ReflectMethod {
+                        handle,
+                        is_static: method_flags & 0x0010 != 0,
+                        is_public: method_flags & 0x0007 == 0x0006,
+                    });
+                    module.bind_method_attrs(handle, method_flags);
+                    if let Some(method_sig) = method.signature() {
+                        if let Some(return_handle) = sigtype_to_type_handle(
+                            assembly,
+                            module,
+                            asm,
+                            &method_sig.return_type,
+                            type_index,
+                        ) {
+                            module.bind_member_type(handle, return_handle);
+                        }
+                        let mut names: Vec<String> = Vec::new();
+                        for param in method.params() {
+                            let sequence = param.sequence() as usize;
+                            if sequence >= 1 {
+                                if names.len() < sequence {
+                                    names.resize(sequence, String::new());
                                 }
+                                names[sequence - 1] = String::from(param.name().unwrap_or(""));
                             }
-                            let params: Vec<MethodParam> = method_sig
-                                .parameters
-                                .iter()
-                                .enumerate()
-                                .map(|(index, sig_type)| MethodParam {
-                                    type_handle: sigtype_to_type_handle(
-                                        assembly, module, asm, sig_type, type_index,
-                                    )
-                                    .unwrap_or(0),
-                                    name: names.get(index).cloned().unwrap_or_default(),
-                                })
-                                .collect();
-                            module.bind_method_params(handle, params);
                         }
+                        let params: Vec<MethodParam> = method_sig
+                            .parameters
+                            .iter()
+                            .enumerate()
+                            .map(|(index, sig_type)| MethodParam {
+                                type_handle: sigtype_to_type_handle(
+                                    assembly, module, asm, sig_type, type_index,
+                                )
+                                .unwrap_or(0),
+                                name: names.get(index).cloned().unwrap_or_default(),
+                            })
+                            .collect();
+                        module.bind_method_params(handle, params);
                     }
                 }
             }
@@ -2267,10 +2405,11 @@ fn record_custom_attributes(
         #[cfg(feature = "NETMFv4_4")]
         module.bind_type_methods(type_handle, reflect_methods);
         for property in type_def.properties() {
+            let handle = asm_key(asm, property.token().0);
+            record_target_attributes(assembly, module, asm, handle, property.token());
+            #[cfg(feature = "NETMFv4_4")]
             if let Some(name) = property.name() {
-                let handle = asm_key(asm, property.token().0);
                 module.bind_type_property_name(type_handle, name, handle);
-                record_target_attributes(assembly, module, asm, handle, property.token());
             }
         }
     }
@@ -2645,7 +2784,7 @@ fn resolve_base_fields(
         return BaseFields::Local(base_local);
     }
     match module.type_field_defaults(global) {
-        Some(defaults) => BaseFields::Extern(defaults.to_vec()),
+        Some(defaults) => BaseFields::Extern(defaults),
         None => BaseFields::None,
     }
 }
@@ -2756,6 +2895,22 @@ fn has_flags_attribute(assembly: &Assembly, type_token: Token) -> bool {
             .resolve_method(attribute.constructor)
             .and_then(|ctor| ctor.declaring_type)
             .is_some_and(|name| name.namespace == "System" && name.name == "FlagsAttribute")
+    })
+}
+
+/// Whether the method `method_token` carries `[Lamella.Runtime.RuntimeProvided]` -- the managed
+/// corlib's marker for a method whose (empty) body is a placeholder for a native runtime intrinsic
+/// (`Console.WriteLine`, `Buffer.BlockCopyInternal`, `Marshal.__ReadByte`, ...). The loader binds
+/// such a method to its [`bcl_intrinsic`] instead of running the placeholder body. Mirrors
+/// [`has_flags_attribute`]; the attribute type is defined by the corlib itself.
+fn has_runtime_provided_attribute(assembly: &Assembly, method_token: Token) -> bool {
+    assembly.custom_attributes(method_token).any(|attribute| {
+        assembly
+            .resolve_method(attribute.constructor)
+            .and_then(|ctor| ctor.declaring_type)
+            .is_some_and(|name| {
+                name.namespace == "Lamella.Runtime" && name.name == "RuntimeProvidedAttribute"
+            })
     })
 }
 
@@ -3322,14 +3477,14 @@ mod extended {
         match parameters_of(signature) {
             [SigType::I4] => Some(math_abs_int32),
             [SigType::I8] => Some(math_abs_int64),
-            #[cfg(feature = "float")]
+            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
             [SigType::R8] => Some(math_abs_f64),
             _ => None,
         }
     }
 
     /// A unary `double -> double` `Math` overload (`Floor` / `Ceiling` / `Truncate` / `Round`).
-    #[cfg(feature = "float")]
+    #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
     fn math_unary_f64_overload(
         intrinsic: IntrinsicFn,
         signature: Option<&MethodSig>,
@@ -3355,14 +3510,15 @@ mod extended {
         }
     }
 
-    /// The double `Math.Max` / `Math.Min` intrinsics, present only with `float`.
-    #[cfg(feature = "float")]
+    /// The double `Math.Max` / `Math.Min` intrinsics, present only with `float` (and, since they live
+    /// in the NETMFv4_4 `extended` module, only with reflection on).
+    #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
     const MATH_MAX_F64: Option<IntrinsicFn> = Some(math_max_f64);
-    #[cfg(not(feature = "float"))]
+    #[cfg(not(all(feature = "NETMFv4_4", feature = "float")))]
     const MATH_MAX_F64: Option<IntrinsicFn> = None;
-    #[cfg(feature = "float")]
+    #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
     const MATH_MIN_F64: Option<IntrinsicFn> = Some(math_min_f64);
-    #[cfg(not(feature = "float"))]
+    #[cfg(not(all(feature = "NETMFv4_4", feature = "float")))]
     const MATH_MIN_F64: Option<IntrinsicFn> = None;
 
     /// `Math.Sign(int)` / `Sign(long)` -- both return an `int`.
@@ -3370,7 +3526,7 @@ mod extended {
         match parameters_of(signature) {
             [SigType::I4] => Some(math_sign_int32),
             [SigType::I8] => Some(math_sign_int64),
-            #[cfg(feature = "float")]
+            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
             [SigType::R8] => Some(math_sign_f64),
             _ => None,
         }
@@ -3651,13 +3807,13 @@ mod extended {
                 math_binary_overload(math_min_int32, math_min_int64, MATH_MIN_F64, signature)
             }
             ("Math", "Sign") => math_sign_overload(signature),
-            #[cfg(feature = "float")]
+            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Floor") => math_unary_f64_overload(math_floor_f64, signature),
-            #[cfg(feature = "float")]
+            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Ceiling") => math_unary_f64_overload(math_ceiling_f64, signature),
-            #[cfg(feature = "float")]
+            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Truncate") => math_unary_f64_overload(math_truncate_f64, signature),
-            #[cfg(feature = "float")]
+            #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
             ("Math", "Round") => math_unary_f64_overload(math_round_f64, signature),
             #[cfg(feature = "math-transcendental")]
             ("Math", "Sqrt") => math_unary_f64_overload(math_sqrt_f64, signature),
@@ -3693,7 +3849,7 @@ mod extended {
             ("Boolean", "Parse") => one_string_overload(boolean_parse, signature),
             ("Convert", "ToInt32") => match parameters_of(signature) {
                 [SigType::String] => Some(int32_parse),
-                #[cfg(feature = "float")]
+                #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
                 [SigType::R8] => Some(convert_to_int32_double),
                 _ => None,
             },

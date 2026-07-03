@@ -1,7 +1,9 @@
 //! Statement binding (ECMA-334 1st ed, clause 15).
 
 use crate::bind::bind_type;
-use crate::bound::{Binder, BoundExpr, BoundExprKind, MethodReference, literal_int_value};
+use crate::bound::{
+    Binder, BoundExpr, BoundExprKind, MethodReference, constant_int_value, constant_literal_value,
+};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
@@ -179,6 +181,8 @@ pub enum BoundSwitchLabel {
     Case(i64),
     /// `case "string":` -- a string constant (UTF-16), matched by value.
     CaseString(Box<[u16]>),
+    /// `case null:` -- the null reference, matched against a `string` governing value.
+    CaseNull,
     /// `default:`.
     Default,
 }
@@ -229,7 +233,17 @@ impl Binder {
                     BoundStmtKind::Expression(bound)
                 }
             }
-            StmtKind::LocalDeclaration { ty, declarators } => self.bind_local(ty, declarators),
+            StmtKind::LocalDeclaration {
+                ty,
+                declarators,
+                is_const,
+            } => {
+                if *is_const {
+                    self.bind_const_local(ty, declarators)
+                } else {
+                    self.bind_local(ty, declarators)
+                }
+            }
             StmtKind::If {
                 condition,
                 then_branch,
@@ -280,7 +294,8 @@ impl Binder {
             } => {
                 let collection = self.bind_expression(collection);
                 let element_type = self.resolve_named_type(&bind_type(ty), ty.span);
-                let enumerable = if matches!(collection.ty, TypeSymbol::Array { .. }) {
+                let single_dimension_array = matches!(collection.ty, TypeSymbol::Array { rank: 1, .. });
+                let enumerable = if single_dimension_array {
                     None
                 } else {
                     self.bind_for_each_enumerable(ty.span, &element_type, name, collection.clone(), body)
@@ -327,6 +342,7 @@ impl Binder {
                 self.enter_switch();
                 let mut seen_values: Vec<i64> = Vec::new();
                 let mut seen_strings: Vec<Box<[u16]>> = Vec::new();
+                let mut seen_null = false;
                 let mut seen_default = false;
                 let mut bound_sections = Vec::with_capacity(sections.len());
                 for section in sections {
@@ -346,6 +362,13 @@ impl Binder {
                             }
                             BoundSwitchLabel::CaseString(text) => {
                                 seen_strings.push(text.clone());
+                                None
+                            }
+                            BoundSwitchLabel::CaseNull if seen_null => {
+                                Some(Box::<str>::from("case null"))
+                            }
+                            BoundSwitchLabel::CaseNull => {
+                                seen_null = true;
                                 None
                             }
                             BoundSwitchLabel::Default if seen_default => {
@@ -408,10 +431,18 @@ impl Binder {
                 body,
             } => self.bind_fixed(ty, name, init, body),
             StmtKind::Checked(inner) => {
-                BoundStmtKind::Checked(Box::new(self.bind_statement(inner)))
+                let saved = self.checked_context;
+                self.checked_context = true;
+                let bound = self.bind_statement(inner);
+                self.checked_context = saved;
+                BoundStmtKind::Checked(Box::new(bound))
             }
             StmtKind::Unchecked(inner) => {
-                BoundStmtKind::Unchecked(Box::new(self.bind_statement(inner)))
+                let saved = self.checked_context;
+                self.checked_context = false;
+                let bound = self.bind_statement(inner);
+                self.checked_context = saved;
+                BoundStmtKind::Unchecked(Box::new(bound))
             }
             StmtKind::Labeled { label, statement } => BoundStmtKind::Labeled {
                 label: label.clone(),
@@ -424,7 +455,7 @@ impl Binder {
                 if let ExprKind::Literal(Literal::String(text)) = &expr.kind {
                     BoundStmtKind::GotoCaseString(text.clone())
                 } else {
-                    match case_constant(expr).or_else(|| self.enum_case_value(expr)) {
+                    match self.case_label_value(expr) {
                         Some(value) => BoundStmtKind::GotoCase(value),
                         None => BoundStmtKind::Error,
                     }
@@ -450,7 +481,10 @@ impl Binder {
                 if let ExprKind::Literal(Literal::String(text)) = &expr.kind {
                     return BoundSwitchLabel::CaseString(text.clone());
                 }
-                match case_constant(expr).or_else(|| self.enum_case_value(expr)) {
+                if let ExprKind::Literal(Literal::Null) = &expr.kind {
+                    return BoundSwitchLabel::CaseNull;
+                }
+                match self.case_label_value(expr) {
                     Some(value) => BoundSwitchLabel::Case(value),
                     None => {
                         self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, expr.span));
@@ -461,18 +495,15 @@ impl Binder {
         }
     }
 
-    /// The underlying value of a case label that names an enum member (or any
-    /// constant field), by binding it and reading the field's constant. `None` when
-    /// the expression is not a constant member access.
-    fn enum_case_value(&mut self, expr: &Expr) -> Option<i64> {
+    /// A `case`/`goto case` label's constant value (15.7.2): the label is bound and folded as a
+    /// constant expression (14.15) -- an integer/char/enum constant, or any arithmetic, cast, or
+    /// member reference over them. `None` when it is not a constant integer, which the caller
+    /// reports as `CS0150`. Locals a folded label references are recorded so the unused-local
+    /// check is not misled.
+    fn case_label_value(&mut self, expr: &Expr) -> Option<i64> {
         let bound = self.bind_expression(expr);
         self.record_case_label_uses(&bound);
-        match &bound.kind {
-            BoundExprKind::FieldAccess {
-                field: Some(field), ..
-            } => field.constant.as_ref().and_then(literal_int_value),
-            _ => None,
-        }
+        constant_int_value(&bound)
     }
 
     fn bind_catch(&mut self, catch: &CatchClause) -> BoundCatch {
@@ -514,8 +545,19 @@ impl Binder {
                 alloc::vec!["System".into(), "Collections".into(), "IEnumerator".into()];
             TypeSymbol::Named(parts.into_boxed_slice())
         };
-        let move_next = self.resolve_instance_method(&ienumerator, "MoveNext", span)?;
-        let get_current = self.resolve_instance_method(&ienumerator, "get_Current", span)?;
+        let pattern_move_next = self
+            .resolve_instance_method(&enumerator_type, "MoveNext", span)
+            .filter(|method| {
+                matches!(method.return_type, TypeSymbol::Special(SpecialType::Boolean))
+            });
+        let pattern_current = self.resolve_property_getter(&enumerator_type, "Current", span);
+        let (move_next, get_current) = match (pattern_move_next, pattern_current) {
+            (Some(move_next), Some(get_current)) => (move_next, get_current),
+            _ => (
+                self.resolve_instance_method(&ienumerator, "MoveNext", span)?,
+                self.resolve_property_getter(&ienumerator, "Current", span)?,
+            ),
+        };
 
         let enumerator: Box<str> = format!("<enumerator>{}", span.start).into();
         let call = |receiver: BoundExpr, method: MethodReference| -> BoundExpr {
@@ -776,6 +818,31 @@ impl Binder {
         };
         let mut finally_stmts: alloc::vec::Vec<BoundStmt> = Vec::new();
         for (index, (name, resource_ty)) in resources.iter().enumerate().rev() {
+            if self.is_value_type(resource_ty) {
+                if let Some(dispose) = self.resolve_instance_method(resource_ty, "Dispose", span) {
+                    finally_stmts.push(BoundStmt {
+                        kind: BoundStmtKind::Expression(BoundExpr {
+                            kind: BoundExprKind::Call {
+                                callee: Box::new(BoundExpr {
+                                    kind: BoundExprKind::MethodGroup {
+                                        receiver: Box::new(BoundExpr {
+                                            kind: BoundExprKind::Local(name.clone()),
+                                            ty: resource_ty.clone(),
+                                        }),
+                                        name: dispose.name.clone(),
+                                    },
+                                    ty: TypeSymbol::Error,
+                                }),
+                                arguments: Vec::new(),
+                                method: Some(dispose.clone()),
+                            },
+                            ty: dispose.return_type.clone(),
+                        }),
+                        span,
+                    });
+                }
+                continue;
+            }
             let disposable: Box<str> = format!("<dispose>{}_{}", span.start, index).into();
             let disposable_ref = || BoundExpr {
                 kind: BoundExprKind::Local(disposable.clone()),
@@ -942,12 +1009,12 @@ impl Binder {
             }
             let initializer = declarator.initializer.as_ref().map(|expr| {
                 if matches!(&expr.kind, ExprKind::ArrayInitializer(_)) {
-                    let elements = self.bind_array_initializer(expr, &declared);
+                    let (lengths, elements) = match self.bind_rectangular_array(expr, &declared) {
+                        Some(rectangular) => rectangular,
+                        None => (Vec::new(), self.bind_array_initializer(expr, &declared)),
+                    };
                     return BoundExpr {
-                        kind: BoundExprKind::ArrayCreation {
-                            lengths: Vec::new(),
-                            elements,
-                        },
+                        kind: BoundExprKind::ArrayCreation { lengths, elements },
                         ty: declared.clone(),
                     };
                 }
@@ -967,41 +1034,61 @@ impl Binder {
         }
     }
 
+    /// Binds a local constant declaration `const T x = value;` (15.5.1): each initializer is a
+    /// constant expression (14.15) folded at compile time and bound to the name, which then reads
+    /// as that constant. A local constant has no storage, so the declaration emits nothing (an
+    /// empty statement). A non-constant initializer is `CS0150`.
+    fn bind_const_local(
+        &mut self,
+        ty: &TypeRef,
+        declarators: &[VariableDeclarator],
+    ) -> BoundStmtKind {
+        let declared = self.resolve_named_type(&bind_type(ty), ty.span);
+        for declarator in declarators {
+            if self.local_in_current_scope(&declarator.name) {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::DuplicateLocal {
+                        name: declarator.name.clone(),
+                    },
+                    declarator.span,
+                ));
+            } else if self.local_in_enclosing_scope(&declarator.name) {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::LocalShadowsEnclosing {
+                        name: declarator.name.clone(),
+                    },
+                    declarator.span,
+                ));
+            }
+            let value = declarator.initializer.as_ref().map(|expr| {
+                let bound = self.bind_expression(expr);
+                self.check_assignable(&bound, &declared, declarator.span);
+                self.convert(bound, &declared)
+            });
+            match value.as_ref().and_then(constant_literal_value) {
+                Some(folded) => self.declare_const_local(&declarator.name, folded, declared.clone()),
+                None => {
+                    self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, declarator.span));
+                    self.declare_local(&declarator.name, declared.clone());
+                }
+            }
+        }
+        BoundStmtKind::Empty
+    }
+
     fn bind_condition(&mut self, condition: &Expr) -> BoundExpr {
         let bound = self.bind_expression(condition);
-        self.check_convertible(
-            &bound.ty,
-            &TypeSymbol::Special(SpecialType::Boolean),
-            condition.span,
-        );
+        let boolean = TypeSymbol::Special(SpecialType::Boolean);
+        if bound.ty.is_error() || self.converts(&bound.ty, &boolean) {
+            return bound;
+        }
+        if let Some(call) = self.bind_operator_true(&bound) {
+            return call;
+        }
+        self.report_no_implicit_conversion(&bound.ty, &boolean, condition.span);
         bound
     }
 
-    /// Reports `CS0029` if `source` has no implicit conversion to `target`. Error
-    /// types are skipped so a failure does not cascade.
-    fn check_convertible(&mut self, source: &TypeSymbol, target: &TypeSymbol, span: Span) {
-        if source.is_error() || target.is_error() {
-            return;
-        }
-        if !self.converts(source, target) {
-            self.report_no_implicit_conversion(source, target, span);
-        }
-    }
-}
-
-/// Evaluates a `case` label's constant expression to an integral/char value. Only
-/// the v1 constant forms are recognized: integer and character literals, and a
-/// negated one. Anything else (a non-constant, or an unsupported form) is `None`.
-fn case_constant(expr: &Expr) -> Option<i64> {
-    match &expr.kind {
-        ExprKind::Literal(Literal::Integer { value, .. }) => i64::try_from(*value).ok(),
-        ExprKind::Literal(Literal::Character(unit)) => Some(i64::from(*unit)),
-        ExprKind::Unary {
-            operator: UnaryOperator::Minus,
-            operand,
-        } => case_constant(operand).map(|value| -value),
-        _ => None,
-    }
 }
 
 /// A span to anchor a section-level diagnostic on: its first `case` constant, else

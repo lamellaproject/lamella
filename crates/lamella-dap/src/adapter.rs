@@ -39,6 +39,10 @@ pub struct Debugger {
     /// run-time "N inactive" note fires only when that count changes -- not on every continue.
     last_inactive_note: usize,
     out_seq: i64,
+    /// The Debug Console REPL, built on the first `evaluate` so a session that never uses the
+    /// console pays nothing. See [`crate::repl_eval`].
+    #[cfg(feature = "interpreter")]
+    repl: Option<crate::repl_eval::ReplCell>,
 }
 
 /// Per-breakpoint behavior for a source breakpoint: a hit-count condition and/or a logpoint
@@ -127,6 +131,8 @@ impl Debugger {
             breakpoint_meta: Vec::new(),
             last_inactive_note: 0,
             out_seq: 0,
+            #[cfg(feature = "interpreter")]
+            repl: None,
         }
     }
 
@@ -230,6 +236,11 @@ impl Debugger {
             "setBreakpoints" => (true, Some(self.set_source_breakpoints(request))),
             "setInstructionBreakpoints" => (true, Some(self.set_instruction_breakpoints(request))),
             "disassemble" => (true, Some(self.disassemble(request))),
+            #[cfg(feature = "interpreter")]
+            "evaluate" => (
+                true,
+                Some(crate::repl_eval::evaluate(&mut self.repl, arg_str(request, "expression"))),
+            ),
             "disconnect" => (true, None),
             _ => (false, None),
         };
@@ -544,6 +555,12 @@ impl Debugger {
             events.push((
                 "output",
                 Some(json!({ "category": "stdout", "output": text })),
+            ));
+        }
+        if let Some(text) = self.backend.take_debug_output() {
+            events.push((
+                "output",
+                Some(json!({ "category": "console", "output": text })),
             ));
         }
     }

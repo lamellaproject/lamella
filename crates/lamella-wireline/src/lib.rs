@@ -3,8 +3,6 @@
 pub use lamella_runner::{RunResult, repl, run_program, send_program, serve_one, try_recv_result};
 
 pub mod engine;
-#[cfg(feature = "repl-host")]
-pub mod compile;
 
 #[cfg(feature = "serial")]
 use lamella_wire::{Frame, FrameReader, Transport, TransportError, encode_frame};

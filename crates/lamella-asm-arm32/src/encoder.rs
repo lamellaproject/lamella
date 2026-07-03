@@ -42,6 +42,12 @@ pub enum RelocKind {
     /// PC-relative offset split as S:I1:I2:imm10:imm11 with the J1/J2 swizzle
     /// (Armv6-M ARM (DDI 0419E), A6.7.13), reach about +/-16 MB.
     ThumbCall,
+    /// A 32-bit data word holding `S + A - P` -- a signed relative reference to a symbol, WITHOUT the
+    /// Thumb-bit forcing an absolute code pointer carries. A vtable slot uses it: the value is a
+    /// method's entry relative to its type descriptor, resolved by the linker so it survives
+    /// `--gc-sections` re-layout (a baked [`Encoder::data_word_diff`] would not). See
+    /// [`Encoder::data_word_symbol_reldesc`].
+    RelDesc32,
 }
 
 /// A reference to an externally defined symbol, left for the link step.
@@ -56,6 +62,10 @@ pub struct Reloc {
     pub kind: RelocKind,
     /// The backend-assigned symbol the site refers to.
     pub symbol: u32,
+    /// The relocation addend `A` in the link-step calculation. Zero for the call/absolute forms (whose
+    /// addend a `SHT_REL`-style consumer takes from the instruction field); a [`RelocKind::RelDesc32`]
+    /// carries its constant here (the slot's fixed distance from its type descriptor).
+    pub addend: i32,
 }
 
 /// Why an encode could not be completed.
@@ -853,6 +863,7 @@ impl Encoder {
             at,
             kind: RelocKind::ThumbCall,
             symbol,
+            addend: 0,
         });
         self.emit_thumb32(0xF000, 0xD000);
     }
@@ -888,6 +899,24 @@ impl Encoder {
             at,
             kind: RelocKind::Abs32,
             symbol,
+            addend: 0,
+        });
+        self.bytes.extend_from_slice(&[0; 4]);
+    }
+
+    /// Emits a 32-bit data word holding `symbol + addend - here` -- a linker-resolved relative reference
+    /// ([`RelocKind::RelDesc32`]). Unlike [`Encoder::data_word_diff`] (baked at [`Encoder::finish`], so
+    /// wrong once `--gc-sections` re-lays-out the object) the offset is a real relocation the linker
+    /// applies to the FINAL layout. A vtable slot uses it to point at a method relative to its type
+    /// descriptor, with `addend` = the slot's fixed distance from that descriptor, so the stored value
+    /// resolves to `method_entry - type_desc` wherever the two land.
+    pub fn data_word_symbol_reldesc(&mut self, symbol: u32, addend: i32) {
+        let at = self.position();
+        self.relocs.push(Reloc {
+            at,
+            kind: RelocKind::RelDesc32,
+            symbol,
+            addend,
         });
         self.bytes.extend_from_slice(&[0; 4]);
     }
@@ -1008,6 +1037,7 @@ impl Encoder {
                         slot.copy_from_slice(&(base | (imm8 & 0x00FF)).to_le_bytes());
                     }
                 }
+                RelocKind::RelDesc32 => {}
                 RelocKind::ThumbCall => {
                     let off = i64::from(target) - (i64::from(*at) + 4);
                     if off % 2 != 0 || !(-16_777_216..=16_777_214).contains(&off) {
@@ -1449,7 +1479,8 @@ mod tests {
             [Reloc {
                 at: 0,
                 kind: RelocKind::Abs32,
-                symbol: 42
+                symbol: 42,
+                addend: 0
             }]
         );
     }
@@ -1466,7 +1497,25 @@ mod tests {
             [Reloc {
                 at: 2,
                 kind: RelocKind::ThumbCall,
-                symbol: 7
+                symbol: 7,
+                addend: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn reldesc_word_carries_its_addend() {
+        let mut enc = Encoder::new();
+        enc.data_word_symbol_reldesc(3, -8);
+        let out = enc.finish().unwrap();
+        assert_eq!(out.bytes, [0, 0, 0, 0]);
+        assert_eq!(
+            out.relocs,
+            [Reloc {
+                at: 0,
+                kind: RelocKind::RelDesc32,
+                symbol: 3,
+                addend: -8
             }]
         );
     }

@@ -16,6 +16,29 @@ use lamella_syntax::ast::{BinaryOperator, Literal, PostfixOperator, UnaryOperato
 pub enum EmitError {
     /// A construct the emitter does not handle yet, with a short reason.
     Unsupported(&'static str),
+    /// [`EmitError::Unsupported`] with the containing method named, so a compilation
+    /// large enough that the reason alone cannot locate the construct still points at it.
+    UnsupportedIn {
+        /// The unhandled construct.
+        reason: &'static str,
+        /// The method whose body carries it.
+        method: alloc::string::String,
+    },
+}
+
+impl EmitError {
+    /// This error carrying the containing method's name; an error already attributed
+    /// to a method keeps its original site.
+    #[must_use]
+    pub fn in_method(self, method: &str) -> EmitError {
+        match self {
+            EmitError::Unsupported(reason) => EmitError::UnsupportedIn {
+                reason,
+                method: alloc::string::String::from(method),
+            },
+            other => other,
+        }
+    }
 }
 
 /// Lowers `expr` to CIL, appending the instructions that leave its value on the
@@ -111,7 +134,7 @@ pub fn emit_expression(
                 out.push(Instruction::new(Opcode::Box, Operand::Token(token)));
                 Ok(())
             } else {
-                emit_conversion(*conversion, &expr.ty, out)
+                emit_conversion(*conversion, &operand.ty, &expr.ty, out)
             }
         }
         BoundExprKind::Cast { operand, checked } => {
@@ -327,6 +350,9 @@ fn emit_array_creation(
             .method(array_ty, ".ctor", &array_int_params(lengths.len()))
             .ok_or(EmitError::Unsupported("array .ctor was not minted"))?;
         out.push(Instruction::new(Opcode::Newobj, Operand::Token(ctor)));
+        if !elements.is_empty() {
+            emit_rectangular_initializer(array_ty, element, lengths, elements, frame, tokens, out)?;
+        }
         return Ok(());
     }
     let element_token = tokens
@@ -367,6 +393,65 @@ fn emit_array_creation(
     emit_expression(&lengths[0], frame, tokens, out)?;
     out.push(Instruction::new(Opcode::Newarr, Operand::Token(element_token)));
     Ok(())
+}
+
+/// Stores a rectangular array's initializer elements (19.6) with the new array already on
+/// the stack: each flattened element, in row-major order, is written through the array
+/// type's `Set` method at the multi-dimensional index its flat position decodes to. The
+/// array is left on the stack (each `Set` consumes a duplicate). The dimension lengths are
+/// read from the constant length expressions the constructor received.
+fn emit_rectangular_initializer(
+    array_ty: &TypeSymbol,
+    element: &TypeSymbol,
+    lengths: &[BoundExpr],
+    elements: &[BoundExpr],
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let dimensions = lengths
+        .iter()
+        .map(constant_length)
+        .collect::<Option<Vec<i32>>>()
+        .ok_or(EmitError::Unsupported(
+            "a rectangular array initializer needs constant dimension lengths",
+        ))?;
+    let mut set_params = array_int_params(lengths.len());
+    set_params.push(element.clone());
+    let set = tokens
+        .method(array_ty, "Set", &set_params)
+        .ok_or(EmitError::Unsupported("array Set was not minted"))?;
+    for (position, value) in elements.iter().enumerate() {
+        out.push(Instruction::simple(Opcode::Dup));
+        for index in row_major_indices(position, &dimensions) {
+            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(index)));
+        }
+        emit_expression(value, frame, tokens, out)?;
+        out.push(Instruction::new(Opcode::Call, Operand::Token(set)));
+    }
+    Ok(())
+}
+
+/// The multi-dimensional index a flat position decodes to in row-major order (last axis
+/// varying fastest, II.14.2), given each dimension's length.
+fn row_major_indices(position: usize, dimensions: &[i32]) -> Vec<i32> {
+    let mut indices = alloc::vec![0i32; dimensions.len()];
+    let mut remainder = position;
+    for axis in (0..dimensions.len()).rev() {
+        let size = (dimensions[axis].max(1)) as usize;
+        indices[axis] = (remainder % size) as i32;
+        remainder /= size;
+    }
+    indices
+}
+
+/// The constant `int32` value of an array-dimension length, when it is an integer literal
+/// (a rectangular initializer's inferred or constant lengths always are).
+fn constant_length(length: &BoundExpr) -> Option<i32> {
+    match &length.kind {
+        BoundExprKind::Literal(Literal::Integer { value, .. }) => i32::try_from(*value).ok(),
+        _ => None,
+    }
 }
 
 /// The `int32` parameter-key types of an array's `.ctor`/`Get`/`Set` (one per
@@ -582,7 +667,7 @@ fn emit_new(
         return Ok(());
     }
     for argument in arguments {
-        emit_expression(argument, frame, tokens, out)?;
+        emit_argument(argument, frame, tokens, out)?;
     }
     let token = tokens
         .method(
@@ -595,8 +680,26 @@ fn emit_new(
     Ok(())
 }
 
-/// Lowers `new D(method)`: push the target object (`ldnull` for a static target, else
-/// the receiver), the function pointer (`ldftn target`), then `newobj D::.ctor`.
+/// Pushes one call/creation argument: a `ref`/`out` argument pushes the variable's
+/// address (17.5.1), any other argument pushes its value.
+pub(crate) fn emit_argument(
+    argument: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if let BoundExprKind::Ref { operand, .. } = &argument.kind {
+        emit_ref_argument(operand, frame, tokens, out)
+    } else {
+        emit_expression(argument, frame, tokens, out)
+    }
+}
+
+/// Lowers `new D(method)`: push the target object (`ldnull` for a static target, else the
+/// receiver), the function pointer, then `newobj D::.ctor`. A virtual instance target reached
+/// through an object loads the pointer from the object's runtime type (`dup; ldvirtftn`,
+/// III.4.18), so an override is honored; a static, `base`-qualified, value-type, or non-virtual
+/// target binds the exact method named by the token (`ldftn`).
 fn emit_delegate_creation(
     delegate_type: &TypeSymbol,
     target: &lamella_binder::MethodReference,
@@ -605,19 +708,32 @@ fn emit_delegate_creation(
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
-    match receiver {
-        Some(receiver) => emit_expression(receiver, frame, tokens, out)?,
-        None => out.push(Instruction::simple(Opcode::Ldnull)),
-    }
     let target_token = tokens
         .method(&target.declaring_type, &target.name, &target.parameters)
         .ok_or(EmitError::Unsupported(
             "delegate target outside this module",
         ))?;
-    out.push(Instruction::new(
-        Opcode::Ldftn,
-        Operand::Token(target_token),
-    ));
+    let through_object = matches!(receiver, Some(r)
+        if !matches!(r.kind, BoundExprKind::Base) && !is_value_type(&r.ty, tokens));
+    let virtual_target = !target.is_static
+        && through_object
+        && tokens.is_virtual_method(&target.declaring_type, &target.name, &target.parameters);
+    match receiver {
+        Some(receiver) => emit_expression(receiver, frame, tokens, out)?,
+        None => out.push(Instruction::simple(Opcode::Ldnull)),
+    }
+    if virtual_target {
+        out.push(Instruction::simple(Opcode::Dup));
+        out.push(Instruction::new(
+            Opcode::Ldvirtftn,
+            Operand::Token(target_token),
+        ));
+    } else {
+        out.push(Instruction::new(
+            Opcode::Ldftn,
+            Operand::Token(target_token),
+        ));
+    }
     let ctor_token = tokens
         .method(delegate_type, ".ctor", &[])
         .ok_or(EmitError::Unsupported(
@@ -672,11 +788,7 @@ fn emit_call(
         }
     }
     for argument in arguments {
-        if let BoundExprKind::Ref { operand, .. } = &argument.kind {
-            emit_ref_argument(operand, frame, tokens, out)?;
-        } else {
-            emit_expression(argument, frame, tokens, out)?;
-        }
+        emit_argument(argument, frame, tokens, out)?;
     }
     let token = tokens
         .method(
@@ -833,7 +945,8 @@ fn emit_property_load(
         .ok_or(EmitError::Unsupported(
             "property getter outside this module",
         ))?;
-    let opcode = if is_static || value_type_receiver {
+    let is_base = matches!(receiver.kind, BoundExprKind::Base);
+    let opcode = if is_static || value_type_receiver || is_base {
         Opcode::Call
     } else {
         Opcode::Callvirt
@@ -875,7 +988,8 @@ pub(crate) fn emit_property_store(
         .ok_or(EmitError::Unsupported(
             "property setter outside this module",
         ))?;
-    let opcode = if is_static || value_type_receiver {
+    let is_base = matches!(receiver.kind, BoundExprKind::Base);
+    let opcode = if is_static || value_type_receiver || is_base {
         Opcode::Call
     } else {
         Opcode::Callvirt
@@ -910,7 +1024,7 @@ fn emit_cast(
     if matches!(to, TypeSymbol::Pointer(_)) {
         return Ok(());
     }
-    if matches!(from, TypeSymbol::Special(SpecialType::Object)) && is_value_type(to, tokens) {
+    if is_value_type(to, tokens) && !is_value_type(from, tokens) {
         let token = tokens.type_token(to).ok_or(EmitError::Unsupported(
             "unboxing to a value type with no metadata token",
         ))?;
@@ -939,12 +1053,21 @@ fn emit_cast(
         return Ok(());
     }
     if let TypeSymbol::Special(target) = to {
-        let unsigned_source = matches!(from, TypeSymbol::Special(source) if source.is_unsigned());
-        let opcode = match (checked, checked_overflow_conversion(*target, unsigned_source)) {
-            (true, Some(ovf)) => ovf,
-            _ => numeric_conversion(to)?,
-        };
-        out.push(Instruction::simple(opcode));
+        if checked {
+            let unsigned_source =
+                matches!(from, TypeSymbol::Special(source) if source.is_unsigned());
+            if let Some(ovf) = checked_overflow_conversion(*target, unsigned_source) {
+                out.push(Instruction::simple(ovf));
+                return Ok(());
+            }
+        }
+        return emit_numeric_conversion(from, to, out);
+    }
+    if is_value_type(from, tokens) {
+        let token = tokens.type_token(from).ok_or(EmitError::Unsupported(
+            "boxing to an interface with no metadata token",
+        ))?;
+        out.push(Instruction::new(Opcode::Box, Operand::Token(token)));
         return Ok(());
     }
     let to_reference = matches!(to, TypeSymbol::Array { .. })
@@ -1010,20 +1133,54 @@ fn canonical_name(ty: &TypeSymbol) -> Option<(String, String)> {
     }
 }
 
-/// Emits the instruction (if any) for a conversion whose target is `target`.
+/// Emits the instruction (if any) for a conversion from `from` to `target`.
 fn emit_conversion(
     conversion: ConversionKind,
+    from: &TypeSymbol,
     target: &TypeSymbol,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     match conversion {
-        ConversionKind::ImplicitNumeric => {
-            out.push(Instruction::simple(numeric_conversion(target)?));
-            Ok(())
-        }
+        ConversionKind::ImplicitNumeric => emit_numeric_conversion(from, target, out),
         ConversionKind::ImplicitReference => Ok(()),
         ConversionKind::Boxing => Err(EmitError::Unsupported("boxing (needs a metadata token)")),
     }
+}
+
+/// Emits the `conv.*` that produces numeric `target` from a value of numeric `source` on the
+/// stack. An unsigned source widens to a wider integer without sign extension (`uint` to `long`
+/// is `conv.u8`, III.3.19) and reaches a floating-point type through `conv.r.un` -- which reads
+/// the source integer as unsigned (III.3.31) -- before narrowing; a signed source, and any
+/// same-or-narrowing integral target, use the plain width-keyed `conv.*` (III.3.17).
+fn emit_numeric_conversion(
+    source: &TypeSymbol,
+    target: &TypeSymbol,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let unsigned_source = matches!(source, TypeSymbol::Special(s) if s.is_unsigned());
+    if unsigned_source {
+        if let TypeSymbol::Special(target) = target {
+            match target {
+                SpecialType::Int64 => {
+                    out.push(Instruction::simple(Opcode::ConvU8));
+                    return Ok(());
+                }
+                SpecialType::Single => {
+                    out.push(Instruction::simple(Opcode::ConvRUn));
+                    out.push(Instruction::simple(Opcode::ConvR4));
+                    return Ok(());
+                }
+                SpecialType::Double => {
+                    out.push(Instruction::simple(Opcode::ConvRUn));
+                    out.push(Instruction::simple(Opcode::ConvR8));
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+    }
+    out.push(Instruction::simple(numeric_conversion(target)?));
+    Ok(())
 }
 
 /// The `conv.*` opcode that produces a value of the numeric `target` type.
@@ -1358,10 +1515,14 @@ fn emit_literal(
 ) -> Result<(), EmitError> {
     match literal {
         Literal::Integer { value, .. } => {
-            if matches!(
+            let wide = matches!(
                 ty,
                 TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
-            ) {
+            ) || matches!(
+                tokens.enum_underlying(ty),
+                Some(SpecialType::Int64 | SpecialType::UInt64)
+            );
+            if wide {
                 out.push(Instruction::new(
                     Opcode::LdcI8,
                     Operand::Int64(*value as i64),

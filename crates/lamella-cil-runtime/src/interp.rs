@@ -2,7 +2,7 @@
 
 #[cfg(feature = "bcl")]
 use crate::module::IntrinsicFn;
-use crate::module::{Method, MethodId, Module, asm_key};
+use crate::module::{MethodId, MethodKind, Module, asm_key};
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
 use crate::value::{Location, Value};
@@ -473,6 +473,12 @@ impl Vm {
         String::from_utf16_lossy(&self.output)
     }
 
+    /// How many static slots are live (the cheap half of the seeding guard).
+    #[must_use]
+    pub fn statics_len(&self) -> usize {
+        self.statics.len()
+    }
+
     /// Initializes the static-field storage from `defaults` on first use; idempotent
     /// once sized, so it never clobbers values written by `stsfld`.
     pub fn init_statics(&mut self, defaults: &[Value]) {
@@ -612,6 +618,7 @@ struct Frame {
 }
 
 /// A vararg method frame's variadic region (set from the call site's [`crate::module::VarargSite`]).
+#[cfg_attr(not(feature = "varargs"), allow(dead_code))]
 struct VarargFrame {
     /// The `args` index at which the variable arguments begin (`this`? + fixed-parameter count).
     start: u16,
@@ -792,7 +799,7 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
     loop {
         let instruction = body.code.get(frame.ip).ok_or(Trap::FellThroughEnd)?;
         frame.ip += 1;
-        match step(&mut frame, 0, &body.code, None, &mut vm, instruction)? {
+        match step(&mut frame, 0, body.code.len(), None, &mut vm, instruction)? {
             Flow::Next => {}
             Flow::Return(result) => return Ok(result),
             Flow::Call { .. } | Flow::CallVararg { .. } => {
@@ -1716,9 +1723,23 @@ impl Session {
         let top = &mut frames[current];
         let asm = module.method_asm(top.method);
         let code = method_code(module, top.method)?;
-        let instruction = code.get(top.ip).ok_or(Trap::FellThroughEnd)?;
-        top.ip += 1;
-        let flow = match step(top, current, code, Some(module), vm, instruction) {
+        #[cfg(not(feature = "code-in-place"))]
+        let instruction = {
+            let fetched = code.get(top.ip).ok_or(Trap::FellThroughEnd)?;
+            top.ip += 1;
+            fetched
+        };
+        #[cfg(feature = "code-in-place")]
+        let fetched_in_place;
+        #[cfg(feature = "code-in-place")]
+        let instruction = {
+            let (decoded, next_ip) =
+                lamella_cil::decode_at(code, top.ip).map_err(|_| Trap::FellThroughEnd)?;
+            fetched_in_place = decoded;
+            top.ip = next_ip;
+            &fetched_in_place
+        };
+        let flow = match step(top, current, code.len(), Some(module), vm, instruction) {
             Ok(flow) => flow,
             #[cfg(feature = "exceptions")]
             Err(trap) => match catchable_fault(&trap, vm) {
@@ -1774,16 +1795,15 @@ impl Session {
                 frames.push(frame);
                 Ok(Status::Running)
             }
-            Flow::Call { method, args } => match module.method(method) {
-                Some(Method::Managed { .. }) => {
+            Flow::Call { method, args } => match module.method_kind(method) {
+                Some(MethodKind::Managed) => {
                     if frames.len() >= MAX_CALL_DEPTH {
                         return Err(Trap::CallStackOverflow);
                     }
                     frames.push(new_frame(module, method, args)?);
                     Ok(Status::Running)
                 }
-                Some(Method::Intrinsic { func, .. }) => {
-                    let func = *func;
+                Some(MethodKind::Intrinsic(func)) => {
                     let args = if is_compare_exchange(module, method) {
                         args
                     } else {
@@ -1831,8 +1851,8 @@ impl Session {
                 frames.push(frame);
                 Ok(Status::Running)
             }
-            Flow::NewObj { ctor, object, args } => match module.method(ctor) {
-                Some(Method::Managed { .. }) => {
+            Flow::NewObj { ctor, object, args } => match module.method_kind(ctor) {
+                Some(MethodKind::Managed) => {
                     if frames.len() >= MAX_CALL_DEPTH {
                         return Err(Trap::CallStackOverflow);
                     }
@@ -1844,8 +1864,7 @@ impl Session {
                     frames.push(frame);
                     Ok(Status::Running)
                 }
-                Some(Method::Intrinsic { func, .. }) => {
-                    let func = *func;
+                Some(MethodKind::Intrinsic(func)) => {
                     let mut full_args = Vec::with_capacity(args.len() + 1);
                     full_args.push(Value::Object(object));
                     full_args.extend(args);
@@ -1863,8 +1882,8 @@ impl Session {
                 ctor,
                 location,
                 args,
-            } => match module.method(ctor) {
-                Some(Method::Managed { .. }) => {
+            } => match module.method_kind(ctor) {
+                Some(MethodKind::Managed) => {
                     if frames.len() >= MAX_CALL_DEPTH {
                         return Err(Trap::CallStackOverflow);
                     }
@@ -1876,7 +1895,7 @@ impl Session {
                     frames.push(frame);
                     Ok(Status::Running)
                 }
-                Some(Method::Intrinsic { .. }) => {
+                Some(MethodKind::Intrinsic(_)) => {
                     let value = read_byref(frames, vm, location);
                     frames
                         .last_mut()
@@ -1899,7 +1918,7 @@ impl Session {
                     let frame = frames.last_mut().ok_or(Trap::StackUnderflow)?;
                     frame.stack.clear();
                     let leave_ip = frame.ip.saturating_sub(1);
-                    finallys_exited(handlers, leave_ip, target)
+                    finallys_exited(&handlers, leave_ip, target)
                 };
                 begin_finallys(frames, module, vm, finallys, AfterFinally::Goto(target))
             }
@@ -1927,7 +1946,7 @@ impl Session {
                         let method = frames.last().ok_or(Trap::StackUnderflow)?.method;
                         let handlers = method_handlers(module, method)?;
                         let finallys =
-                            finallys_inside(handlers, filter.fault_ip, filter.filter_try);
+                            finallys_inside(&handlers, filter.fault_ip, filter.filter_try);
                         begin_finallys(
                             frames,
                             module,
@@ -1975,8 +1994,7 @@ impl Session {
                     .ok_or(Trap::UnresolvedField(field))?;
                 let shape = module
                     .type_field_defaults(type_id)
-                    .ok_or(Trap::UnresolvedField(field))?
-                    .to_vec();
+                    .ok_or(Trap::UnresolvedField(field))?;
                 write_field_at(frames, vm, location, slot, &shape, value)?;
                 Ok(Status::Running)
             }
@@ -1985,7 +2003,7 @@ impl Session {
                     .type_id_of(asm, kind)
                     .and_then(|type_id| module.type_field_defaults(type_id))
                 {
-                    Some(defaults) => Value::Struct(defaults.to_vec().into_boxed_slice()),
+                    Some(defaults) => Value::Struct(defaults.into_boxed_slice()),
                     None => Value::Int32(0),
                 };
                 write_location_value(frames, vm, location, value)?;
@@ -2229,11 +2247,11 @@ fn read_enum_value(frame: &Frame, frame_index: usize, vm: &Vm, location: Locatio
 /// can be rendered as the constant name rather than the boxed value's text.
 #[cfg(feature = "bcl")]
 fn is_object_to_string(module: &Module, method: MethodId) -> bool {
-    if let Some(Method::Intrinsic { func, .. }) = module.method(method) {
-        core::ptr::fn_addr_eq(*func, crate::intrinsics::object_to_string as IntrinsicFn)
-    } else {
-        false
-    }
+    matches!(
+        module.method_kind(method),
+        Some(MethodKind::Intrinsic(func))
+            if core::ptr::fn_addr_eq(func, crate::intrinsics::object_to_string as IntrinsicFn)
+    )
 }
 
 /// Whether `method` is the `Interlocked.CompareExchange` intrinsic, so its first argument is
@@ -2241,14 +2259,14 @@ fn is_object_to_string(module: &Module, method: MethodId) -> bool {
 /// an ordinary intrinsic's by-ref argument. Always `false` without the `bcl` intrinsics.
 #[cfg(feature = "bcl")]
 fn is_compare_exchange(module: &Module, method: MethodId) -> bool {
-    if let Some(Method::Intrinsic { func, .. }) = module.method(method) {
-        core::ptr::fn_addr_eq(
-            *func,
-            crate::intrinsics::interlocked_compare_exchange as IntrinsicFn,
-        )
-    } else {
-        false
-    }
+    matches!(
+        module.method_kind(method),
+        Some(MethodKind::Intrinsic(func))
+            if core::ptr::fn_addr_eq(
+                func,
+                crate::intrinsics::interlocked_compare_exchange as IntrinsicFn,
+            )
+    )
 }
 
 #[cfg(not(feature = "bcl"))]
@@ -2300,21 +2318,39 @@ fn write_field_at(
 }
 
 fn new_frame(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
-    match module.method(id) {
-        Some(Method::Managed { .. }) => Ok(Frame::new(id, args)),
+    match module.method_kind(id) {
+        Some(MethodKind::Managed) => Ok(Frame::new(id, args)),
         _ => Err(Trap::NoSuchMethod(id)),
     }
 }
 
 /// The CIL of a managed method -- looked up per advance now that a frame no longer
 /// borrows it. Errors if `id` names an intrinsic or no method.
+///
+/// The view is the `code_loading` level's fetch source: decoded instructions (indexed by an
+/// instruction-count ip) by default, or -- under `code-in-place` -- the flash-resident code BYTES,
+/// decoded one instruction per step with the ip a CIL byte offset. `advance` is the only fetch
+/// site, and [`step`] moves ip/target/len around as opaque values, so both domains run the same
+/// dispatcher unchanged.
+#[cfg(not(feature = "code-in-place"))]
 fn method_code(module: &Module, id: MethodId) -> Result<&[Instruction], Trap> {
     module.method_body(id).map(|body| &body.code[..]).ok_or(Trap::NoSuchMethod(id))
 }
+#[cfg(feature = "code-in-place")]
+fn method_code(module: &Module, id: MethodId) -> Result<&'static [u8], Trap> {
+    module.method_code_bytes(id).ok_or(Trap::NoSuchMethod(id))
+}
 
-/// The exception-handling clauses of a managed method.
+/// The exception-handling clauses of a managed method. Region units match the active ip domain
+/// (instruction indices by default; CIL byte offsets under `code-in-place`), so the unwinder's
+/// membership tests and handler entries need no translation either way.
+#[cfg(not(feature = "code-in-place"))]
 fn method_handlers(module: &Module, id: MethodId) -> Result<&[EhClause], Trap> {
     module.method_body(id).map(|body| &body.handlers[..]).ok_or(Trap::NoSuchMethod(id))
+}
+#[cfg(feature = "code-in-place")]
+fn method_handlers(module: &Module, id: MethodId) -> Result<Vec<EhClause>, Trap> {
+    module.method_eh(id).ok_or(Trap::NoSuchMethod(id))
 }
 
 /// A reserved type id for objects whose type is external to this module: a runtime-fault
@@ -2475,7 +2511,7 @@ fn raise_from(
                     *type_token,
                     exception,
                 ) {
-                    let finallys = finallys_inside(handlers, fault_ip, clause.try_range);
+                    let finallys = finallys_inside(&handlers, fault_ip, clause.try_range);
                     return begin_finallys(
                         frames,
                         module,
@@ -2507,7 +2543,7 @@ fn raise_from(
             EhKind::Finally | EhKind::Fault => {}
         }
     }
-    let finallys = finallys_covering(handlers, fault_ip);
+    let finallys = finallys_covering(&handlers, fault_ip);
     begin_finallys(
         frames,
         module,
@@ -2670,7 +2706,7 @@ fn catch_matches(
 fn step(
     frame: &mut Frame,
     frame_index: usize,
-    code: &[Instruction],
+    code_len: usize,
     module: Option<&Module>,
     vm: &mut Vm,
     instruction: &Instruction,
@@ -2839,17 +2875,17 @@ fn step(
             frame.stack.push(Value::Int32(i32::from(result)));
         }
 
-        Opcode::Br | Opcode::BrS => frame.ip = branch_target(instruction, code.len())?,
+        Opcode::Br | Opcode::BrS => frame.ip = branch_target(instruction, code_len)?,
         Opcode::Brtrue | Opcode::BrtrueS => {
             let value = frame.pop()?;
             if value.is_truthy() {
-                frame.ip = branch_target(instruction, code.len())?;
+                frame.ip = branch_target(instruction, code_len)?;
             }
         }
         Opcode::Brfalse | Opcode::BrfalseS => {
             let value = frame.pop()?;
             if !value.is_truthy() {
-                frame.ip = branch_target(instruction, code.len())?;
+                frame.ip = branch_target(instruction, code_len)?;
             }
         }
         Opcode::Beq
@@ -2874,7 +2910,7 @@ fn step(
         | Opcode::BltUnS => {
             let (a, b) = frame.pop2()?;
             if compare(opcode, a, b)? {
-                frame.ip = branch_target(instruction, code.len())?;
+                frame.ip = branch_target(instruction, code_len)?;
             }
         }
         Opcode::Switch => {
@@ -2883,7 +2919,7 @@ fn step(
                 return Err(Trap::MalformedInstruction(Opcode::Switch));
             };
             if let Some(&target) = targets.get(index) {
-                if target as usize >= code.len() {
+                if target as usize >= code_len {
                     return Err(Trap::BranchOutOfRange(target));
                 }
                 frame.ip = target as usize;
@@ -2894,9 +2930,9 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldstr))?;
             let token = token_operand(instruction)?;
             let chars = module
-                .resolve_string(asm, token)
+                .resolve_string_le(asm, token)
                 .ok_or(Trap::UnresolvedString(token))?;
-            let reference = vm.heap_mut().alloc_string(chars);
+            let reference = vm.heap_mut().alloc_string_le(chars);
             frame.stack.push(Value::Object(reference));
         }
 
@@ -2919,9 +2955,8 @@ fn step(
                 });
             }
             let arg_count = module
-                .method(method)
-                .ok_or(Trap::NoSuchMethod(method))?
-                .arg_count();
+                .method_arg_count(method)
+                .ok_or(Trap::NoSuchMethod(method))?;
             let args = frame.take_args(arg_count)?;
             return Ok(Flow::Call { method, args });
         }
@@ -2960,9 +2995,8 @@ fn step(
                 None => {
                     let method = static_method.ok_or(Trap::UnresolvedCall(token))?;
                     module
-                        .method(method)
+                        .method_arg_count(method)
                         .ok_or(Trap::NoSuchMethod(method))?
-                        .arg_count()
                 }
             };
             let mut args = frame.take_args(arg_count)?;
@@ -3027,9 +3061,8 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Calli))?;
             let pointer = function_pointer(frame.pop()?)?;
             let arg_count = module
-                .method(pointer)
-                .ok_or(Trap::NoSuchMethod(pointer))?
-                .arg_count();
+                .method_arg_count(pointer)
+                .ok_or(Trap::NoSuchMethod(pointer))?;
             let args = frame.take_args(arg_count)?;
             return Ok(Flow::Call {
                 method: pointer,
@@ -3130,21 +3163,20 @@ fn step(
             let ctor = module
                 .resolve(asm, token)
                 .ok_or(Trap::UnresolvedCall(token))?;
-            let is_intrinsic = matches!(module.method(ctor), Some(Method::Intrinsic { .. }));
+            let is_intrinsic =
+                matches!(module.method_kind(ctor), Some(MethodKind::Intrinsic(_)));
             let (type_id, defaults) = if is_intrinsic {
                 (EXTERNAL_TYPE_ID, Vec::new())
             } else {
                 let type_id = module.method_type(ctor).ok_or(Trap::NoSuchMethod(ctor))?;
                 let defaults = module
                     .type_field_defaults(type_id)
-                    .ok_or(Trap::NoSuchMethod(ctor))?
-                    .to_vec();
+                    .ok_or(Trap::NoSuchMethod(ctor))?;
                 (type_id, defaults)
             };
             let param_count = module
-                .method(ctor)
+                .method_arg_count(ctor)
                 .ok_or(Trap::NoSuchMethod(ctor))?
-                .arg_count()
                 .saturating_sub(1);
             let args = frame.take_args(param_count)?;
             if module.is_value_type_ctor(asm, token) {
@@ -3247,7 +3279,9 @@ fn step(
             let slot = module
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
-            vm.init_statics(module.static_field_defaults());
+            if vm.statics_len() < module.static_field_count() {
+                vm.init_statics(&module.decode_static_defaults());
+            }
             frame.stack.push(Value::ByRef(Location::Static { slot }));
         }
         Opcode::Ldelema => {
@@ -3380,7 +3414,9 @@ fn step(
             let slot = module
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
-            vm.init_statics(module.static_field_defaults());
+            if vm.statics_len() < module.static_field_count() {
+                vm.init_statics(&module.decode_static_defaults());
+            }
             let value = vm.static_field(slot).ok_or(Trap::UnresolvedField(token))?;
             frame.stack.push(value);
         }
@@ -3391,7 +3427,9 @@ fn step(
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
             let value = frame.pop()?;
-            vm.init_statics(module.static_field_defaults());
+            if vm.statics_len() < module.static_field_count() {
+                vm.init_statics(&module.decode_static_defaults());
+            }
             vm.set_static_field(slot, value);
         }
 
@@ -3441,7 +3479,7 @@ fn step(
                     .type_id_of(asm, token)
                     .and_then(|type_id| module.type_field_defaults(type_id))
                     .map_or(Value::Null, |fields| {
-                        Value::Struct(fields.to_vec().into_boxed_slice())
+                        Value::Struct(fields.into_boxed_slice())
                     }),
             };
             let element_size = module.array_element_size(asm, token);
@@ -3521,7 +3559,7 @@ fn step(
         }
         #[cfg(feature = "exceptions")]
         Opcode::Leave | Opcode::LeaveS => {
-            return Ok(Flow::Leave(branch_target(instruction, code.len())?));
+            return Ok(Flow::Leave(branch_target(instruction, code_len)?));
         }
         #[cfg(feature = "exceptions")]
         Opcode::Endfinally => return Ok(Flow::EndFinally),
@@ -4583,7 +4621,7 @@ fn receiver_type_id(module: &Module, vm: &Vm, this: ObjectRef) -> Option<u32> {
 fn resolve_callvirt(
     module: &Module,
     static_method: Option<MethodId>,
-    sig_key: Option<&str>,
+    sig_key: Option<u32>,
     runtime_type: Option<u32>,
     explicit_override: Option<MethodId>,
 ) -> Option<MethodId> {

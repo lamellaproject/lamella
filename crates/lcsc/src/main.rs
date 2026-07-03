@@ -1,6 +1,6 @@
 //! `lcsc` -- the Lamella C# compiler driver.
 
-use lamella_assemble::{LineMap, compile_source_with};
+use lamella_assemble::{Diagnostic, LineMap, compile_source_with, compile_sources_with};
 use lamella_metadata::Assembly;
 use lamella_syntax::decode::decode_source;
 use lamella_syntax::lexer::{LexOptions, Normalization};
@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 /// The parsed command line.
 struct Options {
-    source: String,
+    sources: Vec<String>,
     output: Option<String>,
     references: Vec<String>,
     emit_debug: bool,
@@ -36,11 +36,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parses csc-style options. The first bare argument is the source file;
+/// Parses csc-style options. Bare arguments are the source files (one or more);
 /// `/reference:` (`-r:`) names a reference assembly, `/out:` the output, and
-/// `/debug-` suppresses the PDB (it is emitted by default).
+/// `/debug-` suppresses the PDB (it is emitted by default, single-source only).
 fn parse_args(args: &[String]) -> Result<Options, String> {
-    let mut source = None;
+    let mut sources = Vec::new();
     let mut output = None;
     let mut references = Vec::new();
     let mut emit_debug = true;
@@ -66,13 +66,15 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
         } else if arg.starts_with("/target:") || arg == "/nologo" {
         } else if arg.starts_with('-') || (arg.starts_with('/') && !arg[1..].contains('/')) {
             return Err(format!("unknown option '{arg}'\n{USAGE}"));
-        } else if source.replace(arg.to_owned()).is_some() {
-            return Err(format!("more than one source file given\n{USAGE}"));
+        } else {
+            sources.push(arg.to_owned());
         }
     }
-    let source = source.ok_or_else(|| String::from(USAGE))?;
+    if sources.is_empty() {
+        return Err(String::from(USAGE));
+    }
     Ok(Options {
-        source,
+        sources,
         output,
         references,
         emit_debug,
@@ -80,9 +82,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     })
 }
 
-const USAGE: &str = "usage: lcsc <source.cs> [/out:<path>] [/reference:<dll>]... [/debug-] \
+const USAGE: &str = "usage: lcsc <source.cs>... [/out:<path>] [/reference:<dll>]... [/debug-] \
      [/normalize-identifiers] [/typedref] [/native-interop]\n\
-     compiles a single source file; multi-file compilation is a planned follow-up.\n\
+     Several source files compile into one assembly (the PDB is single-source only).\n\
      /normalize-identifiers folds identifiers to NFC per ECMA-334 9.4.2 (off by default, to \
      match csc).\n\
      /typedref enables csc's undocumented __makeref/__refvalue/__reftype operators (off by \
@@ -112,10 +114,6 @@ fn host_ansi_code_page() -> u16 {
 /// Compiles per `options`, printing diagnostics. Returns whether an assembly was
 /// produced (no compile errors), or an `Err` for a usage/IO failure.
 fn compile(options: &Options) -> Result<bool, String> {
-    let bytes = std::fs::read(&options.source)
-        .map_err(|error| format!("cannot read '{}': {error}", options.source))?;
-    let (text, _encoding) = decode_source(&bytes, host_ansi_code_page());
-
     let reference_bytes = options
         .references
         .iter()
@@ -134,57 +132,97 @@ fn compile(options: &Options) -> Result<bool, String> {
     let output = options
         .output
         .clone()
-        .unwrap_or_else(|| replace_extension(&options.source, "dll"));
+        .unwrap_or_else(|| replace_extension(&options.sources[0], "dll"));
     let module = file_name(&output);
     let assembly = stem(module);
 
-    let result = compile_source_with(
-        &text,
-        &options.source,
-        module,
-        assembly,
-        &references,
-        options.emit_debug,
-        options.lex,
-    );
+    if let [source_path] = options.sources.as_slice() {
+        let bytes = std::fs::read(source_path)
+            .map_err(|error| format!("cannot read '{source_path}': {error}"))?;
+        let (text, _encoding) = decode_source(&bytes, host_ansi_code_page());
+        let result = compile_source_with(
+            &text,
+            source_path,
+            module,
+            assembly,
+            &references,
+            options.emit_debug,
+            options.lex,
+        );
+        print_diagnostics(source_path, &text, &result.diagnostics);
+        return match result.image {
+            Some(image) => {
+                std::fs::write(&output, &image)
+                    .map_err(|error| format!("cannot write '{output}': {error}"))?;
+                if let Some(pdb) = result.pdb {
+                    let pdb_path = replace_extension(&output, "pdb");
+                    std::fs::write(&pdb_path, &pdb)
+                        .map_err(|error| format!("cannot write '{pdb_path}': {error}"))?;
+                }
+                Ok(true)
+            }
+            None => {
+                if !result.diagnostics.iter().any(Diagnostic::is_error) {
+                    if let Some(error) = result.emit_error {
+                        println!("{source_path}: error: not lowered yet: {error:?}");
+                    }
+                }
+                Ok(false)
+            }
+        };
+    }
 
-    let lines = LineMap::new(&text);
-    for diagnostic in &result.diagnostics {
-        let (line, column) = lines.position(&text, diagnostic.span.start);
+    let texts = options
+        .sources
+        .iter()
+        .map(|path| {
+            let bytes =
+                std::fs::read(path).map_err(|error| format!("cannot read '{path}': {error}"))?;
+            Ok(decode_source(&bytes, host_ansi_code_page()).0)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let sources: Vec<(&str, &str)> = texts
+        .iter()
+        .zip(&options.sources)
+        .map(|(text, path)| (text.as_str(), path.as_str()))
+        .collect();
+    let result = compile_sources_with(&sources, module, assembly, &references, options.lex);
+    let mut any_error = false;
+    for ((text, path), diagnostics) in sources.iter().zip(&result.diagnostics) {
+        print_diagnostics(path, text, diagnostics);
+        any_error |= diagnostics.iter().any(Diagnostic::is_error);
+    }
+    match result.image {
+        Some(image) => {
+            std::fs::write(&output, &image)
+                .map_err(|error| format!("cannot write '{output}': {error}"))?;
+            Ok(true)
+        }
+        None => {
+            if !any_error {
+                if let Some(error) = result.emit_error {
+                    println!("{}: error: not lowered yet: {error:?}", options.sources[0]);
+                }
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Prints one source's diagnostics in csc's `path(line,col): severity CSxxxx:` form.
+fn print_diagnostics(path: &str, text: &str, diagnostics: &[Diagnostic]) {
+    let lines = LineMap::new(text);
+    for diagnostic in diagnostics {
+        let (line, column) = lines.position(text, diagnostic.span.start);
         let severity = if diagnostic.is_error() {
             "error"
         } else {
             "warning"
         };
         println!(
-            "{}({line},{column}): {severity} CS{:04}: {}",
-            options.source, diagnostic.code, diagnostic.message
+            "{path}({line},{column}): {severity} CS{:04}: {}",
+            diagnostic.code, diagnostic.message
         );
-    }
-
-    match result.image {
-        Some(image) => {
-            std::fs::write(&output, &image)
-                .map_err(|error| format!("cannot write '{output}': {error}"))?;
-            if let Some(pdb) = result.pdb {
-                let pdb_path = replace_extension(&output, "pdb");
-                std::fs::write(&pdb_path, &pdb)
-                    .map_err(|error| format!("cannot write '{pdb_path}': {error}"))?;
-            }
-            Ok(true)
-        }
-        None => {
-            if !result
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.is_error())
-            {
-                if let Some(error) = result.emit_error {
-                    println!("{}: error: not lowered yet: {error:?}", options.source);
-                }
-            }
-            Ok(false)
-        }
     }
 }
 
@@ -216,10 +254,17 @@ mod tests {
             String::from("/out:bin/App.dll"),
         ];
         let options = parse_args(&args).unwrap();
-        assert_eq!(options.source, "App.cs");
+        assert_eq!(options.sources, ["App.cs"]);
         assert_eq!(options.output.as_deref(), Some("bin/App.dll"));
         assert_eq!(options.references, ["a.dll"]);
         assert!(options.emit_debug);
+    }
+
+    #[test]
+    fn several_sources_compile_into_one_assembly() {
+        let args = [String::from("A.cs"), String::from("B.cs")];
+        let options = parse_args(&args).unwrap();
+        assert_eq!(options.sources, ["A.cs", "B.cs"]);
     }
 
     #[test]
@@ -229,9 +274,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_duplicate_source_is_a_usage_error() {
+    fn missing_source_is_a_usage_error() {
         assert!(parse_args(&[]).is_err());
-        assert!(parse_args(&[String::from("a.cs"), String::from("b.cs")]).is_err());
     }
 
     #[test]
@@ -245,7 +289,7 @@ mod tests {
     #[test]
     fn an_absolute_unix_path_is_a_source_file_not_an_option() {
         let options = parse_args(&[String::from("/home/me/Program.cs")]).unwrap();
-        assert_eq!(options.source, "/home/me/Program.cs");
+        assert_eq!(options.sources, ["/home/me/Program.cs"]);
         assert!(parse_args(&[String::from("/unsafe")]).is_err());
     }
 }

@@ -23,3 +23,13 @@ missing_docs = "warn"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# The device-image profile the size gate links with: smallest-code settings, panics abort
+# (the bare-metal shim provides the handler; no unwinder ships).
+[profile.flash]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

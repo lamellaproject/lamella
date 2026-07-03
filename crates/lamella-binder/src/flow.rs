@@ -747,17 +747,24 @@ impl Analyzer<'_> {
                 catches,
                 finally,
             } => {
-                self.statement(body, assigned.clone());
+                let mut end = self.statement(body, assigned.clone());
                 for catch in catches {
                     let mut catch_set = assigned.clone();
                     if let Some(name) = &catch.name {
                         catch_set.insert(name.clone());
                     }
-                    self.statement(&catch.body, catch_set);
+                    let reached = self.statement(&catch.body, catch_set);
+                    end = merge(end, reached);
                 }
                 match finally {
-                    Some(finally) => self.statement(finally, assigned),
-                    None => Flow::Reaches(assigned),
+                    Some(finally) => match (end, self.statement(finally, assigned)) {
+                        (Flow::Reaches(mut end), Flow::Reaches(finally)) => {
+                            end.extend(finally);
+                            Flow::Reaches(end)
+                        }
+                        _ => Flow::Exits,
+                    },
+                    None => end,
                 }
             }
             BoundStmtKind::Lock { expression, body } => {

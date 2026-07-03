@@ -18,6 +18,10 @@ lamella-load = { path = "../lamella-load", default-features = false, features = 
 ] }
 lamella-metadata = { path = "../lamella-metadata" }
 
+[dev-dependencies]
+# The run-with-corlib triage example names raw metadata tokens.
+lamella-token = { path = "../lamella-token" }
+
 [features]
 # Source-level debugger names (forwarded to the loader). Default on; a constrained device build drops it.
 default = ["debug-names"]

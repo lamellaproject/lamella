@@ -10,7 +10,7 @@ namespace System
         public int ToInt32() { return (int)ToRawValue(this); }
         public long ToInt64() { return ToRawValue(this); }
 
-        [Lamella.Runtime.RuntimeProvided] internal static IntPtr FromRawValue(long value) { return default(IntPtr); }
+        [Lamella.Runtime.RuntimeProvided] internal static IntPtr FromRawValue(long value) { return new IntPtr(); }
         [Lamella.Runtime.RuntimeProvided] internal static long ToRawValue(IntPtr value) { return 0; }
     }
 

@@ -239,7 +239,7 @@ fn token_type_symbol(assembly: &Assembly, token: Token) -> TypeSymbol {
 
 /// The [`SpecialType`] of a core BCL type named `System.<name>` (`Object`, `String`,
 /// or a numeric/`bool`/`char` primitive), or `None` for any other named type.
-fn special_for_named(namespace: &str, name: &str) -> Option<SpecialType> {
+pub(crate) fn special_for_named(namespace: &str, name: &str) -> Option<SpecialType> {
     if namespace != "System" {
         return None;
     }

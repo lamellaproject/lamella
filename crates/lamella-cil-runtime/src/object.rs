@@ -206,6 +206,16 @@ impl Heap {
         self.alloc(Object::Str(encode_string(chars)))
     }
 
+    /// Interns a string given as little-endian UTF-16 BYTES (the frozen `ldstr` pool's shape --
+    /// a flash slice needs no alignment to be read this way).
+    pub fn alloc_string_le(&mut self, bytes: &[u8]) -> ObjectRef {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        self.alloc_string(&units)
+    }
+
     /// The object `reference` names, if it is live.
     #[must_use]
     pub fn get(&self, reference: ObjectRef) -> Option<&Object> {

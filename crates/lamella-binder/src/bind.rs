@@ -2,7 +2,7 @@
 
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
-use lamella_syntax::ast::{TypeRef, TypeRefKind};
+use lamella_syntax::ast::{Parameter, ParameterModifier, TypeRef, TypeRefKind};
 
 /// Binds a syntactic type reference to a [`TypeSymbol`] (11.1).
 #[must_use]
@@ -11,12 +11,29 @@ pub fn bind_type(type_ref: &TypeRef) -> TypeSymbol {
         TypeRefKind::Predefined(predefined) => {
             TypeSymbol::Special(SpecialType::from_predefined(*predefined))
         }
-        TypeRefKind::Name(parts) => TypeSymbol::Named(parts.iter().cloned().collect()),
+        TypeRefKind::Name(parts) => {
+            TypeSymbol::Named(parts.iter().cloned().collect()).fold_builtin()
+        }
         TypeRefKind::Array { element, rank } => bind_type(element).into_array(*rank),
         TypeRefKind::Pointer(element) => {
             TypeSymbol::Pointer(alloc::boxed::Box::new(bind_type(element)))
         }
         TypeRefKind::Error => TypeSymbol::Error,
+    }
+}
+
+/// Binds a formal parameter to the type its SIGNATURE carries: a `ref`/`out` parameter
+/// is a byref (`T&`), distinct from `T` for overloading and duplicate-signature checks
+/// (ECMA-334 1st ed 10.6, 17.5.1; ECMA-335 II.23.2.10). A `params` array is its array
+/// type -- the modifier is not part of the signature (17.5.1.4).
+#[must_use]
+pub fn parameter_symbol(parameter: &Parameter) -> TypeSymbol {
+    let ty = bind_type(&parameter.ty);
+    match parameter.modifier {
+        Some(ParameterModifier::Ref | ParameterModifier::Out) => {
+            TypeSymbol::ByRef(alloc::boxed::Box::new(ty))
+        }
+        _ => ty,
     }
 }
 

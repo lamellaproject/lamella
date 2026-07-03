@@ -49,6 +49,10 @@ pub enum CallTarget {
     Internal(u32),
     /// A recognized BCL method, lowered to a backend intrinsic instead of a call.
     Intrinsic(Intrinsic),
+    /// A managed method in another assembly (a BCL/library method with no intrinsic lowering), by its
+    /// stable cross-assembly symbol -- lowered to an extern call the own linker resolves against the
+    /// library object that defines it. `None` on the flat (linker-free) path.
+    External(Box<str>),
 }
 
 /// A BCL method the AOT lowers specially rather than as a managed call.
@@ -377,7 +381,8 @@ fn lower_with_source(
         resolver.field_on_reference_type(op)
     });
     let preds = control_flow::predecessors(code, &blocks);
-    let (arg_count, local_count) = scan_slots(code);
+    let (used_args, local_count) = scan_slots(code);
+    let arg_count = used_args.max(arg_types.len());
 
     let block_of = |instr: usize| blocks.iter().position(|&(s, e)| instr >= s && instr < e);
     let is_merge = |b: usize| preds.get(b).is_some_and(|p| p.len() > 1);
@@ -1213,6 +1218,28 @@ fn apply_value_op(
             insts.push((result, Inst::FuncAddr { func }));
             stack.push(result);
         }
+        Opcode::Ldvirtftn => {
+            let object = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::I32);
+            if let Some(slot) = resolver.virtual_slot(&inst.operand) {
+                insts.push((
+                    result,
+                    Inst::VirtualFuncAddr {
+                        object,
+                        slot: slot as u32,
+                    },
+                ));
+            } else {
+                let info = resolver
+                    .resolve(&inst.operand)
+                    .ok_or(CilError::UnresolvedCall)?;
+                let CallTarget::Internal(func) = info.target else {
+                    return Err(CilError::UnresolvedCall);
+                };
+                insts.push((result, Inst::FuncAddr { func }));
+            }
+            stack.push(result);
+        }
         Opcode::LdcI4M1 => push_const(value_types, stack, insts, -1),
         Opcode::LdcI40 => push_const(value_types, stack, insts, 0),
         Opcode::LdcI41 => push_const(value_types, stack, insts, 1),
@@ -1263,6 +1290,21 @@ fn apply_value_op(
             ));
             stack.push(result);
         }
+        Opcode::LdcR8 => {
+            let Operand::Float64(v) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            let result = new_value(value_types, MirType::F64);
+            insts.push((
+                result,
+                Inst::ConstInt {
+                    ty: MirType::F64,
+                    value: v.to_bits() as i64,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::Volatile | Opcode::Unaligned | Opcode::Tail | Opcode::Readonly => {}
         Opcode::Add | Opcode::AddOvf | Opcode::AddOvfUn => {
             binary(value_types, stack, insts, BinOp::Add)?
         }
@@ -1289,15 +1331,10 @@ fn apply_value_op(
         Opcode::CltUn => compare(value_types, stack, insts, CmpOp::UnsignedLt)?,
         Opcode::Neg => {
             let x = stack.pop().ok_or(CilError::StackUnderflow)?;
-            let zero = new_value(value_types, MirType::I32);
-            insts.push((
-                zero,
-                Inst::ConstInt {
-                    ty: MirType::I32,
-                    value: 0,
-                },
-            ));
-            let result = new_value(value_types, MirType::I32);
+            let ty = value_types.get(x.index()).copied().unwrap_or(MirType::I32);
+            let zero = new_value(value_types, ty);
+            insts.push((zero, Inst::ConstInt { ty, value: 0 }));
+            let result = new_value(value_types, ty);
             insts.push((
                 result,
                 Inst::Binary {
@@ -1341,16 +1378,15 @@ fn apply_value_op(
         Opcode::ConvU8 | Opcode::ConvOvfU8 => widen(value_types, stack, insts, false)?,
         Opcode::ConvI4 | Opcode::ConvU4 | Opcode::ConvOvfI4 | Opcode::ConvOvfU4 => {
             let top = *stack.last().ok_or(CilError::StackUnderflow)?;
-            if value_types.get(top.index()) == Some(&MirType::F32) {
+            let float_kind = match value_types.get(top.index()) {
+                Some(MirType::F32) => Some(ConvKind::Float32ToInt),
+                Some(MirType::F64) => Some(ConvKind::Float64ToInt),
+                _ => None,
+            };
+            if let Some(kind) = float_kind {
                 let value = stack.pop().ok_or(CilError::StackUnderflow)?;
                 let result = new_value(value_types, MirType::I32);
-                insts.push((
-                    result,
-                    Inst::Convert {
-                        value,
-                        kind: ConvKind::Float32ToInt,
-                    },
-                ));
+                insts.push((result, Inst::Convert { value, kind }));
                 stack.push(result);
             } else {
                 narrow_to_i32(value_types, stack, insts)?;
@@ -1430,7 +1466,14 @@ fn apply_value_op(
                 args.reverse();
                 let delegate = stack.pop().ok_or(CilError::StackUnderflow)?;
                 let result = new_value(value_types, MirType::I32);
-                insts.push((result, Inst::InvokeDelegate { delegate, args }));
+                insts.push((
+                    result,
+                    Inst::InvokeDelegate {
+                        delegate,
+                        args,
+                        returns_value: has_result,
+                    },
+                ));
                 if has_result {
                     stack.push(result);
                 }
@@ -1611,10 +1654,12 @@ fn apply_value_op(
                         (Some(tag), _) => Inst::CallInterface {
                             tag,
                             args: call_args,
+                            returns_value: info.has_result,
                         },
                         (_, Some(slot)) => Inst::CallVirtual {
                             slot: slot as u32,
                             args: call_args,
+                            returns_value: info.has_result,
                         },
                         (None, None) => Inst::Call {
                             callee,
@@ -1622,6 +1667,19 @@ fn apply_value_op(
                         },
                     };
                     insts.push((result, call_inst));
+                    if info.has_result {
+                        stack.push(result);
+                    }
+                }
+                CallTarget::External(symbol) => {
+                    let result = new_value(value_types, info.result_type.unwrap_or(MirType::I32));
+                    insts.push((
+                        result,
+                        Inst::PInvoke {
+                            import: symbol,
+                            args: call_args,
+                        },
+                    ));
                     if info.has_result {
                         stack.push(result);
                     }
@@ -2034,7 +2092,9 @@ fn apply_value_op(
                         },
                     ));
                 }
-                CallTarget::Intrinsic(_) => return Err(CilError::UnresolvedCall),
+                CallTarget::Intrinsic(_) | CallTarget::External(_) => {
+                    return Err(CilError::UnresolvedCall);
+                }
             }
             stack.push(result_value);
         }
@@ -2081,6 +2141,89 @@ fn apply_value_op(
         Opcode::Castclass => {
             let object = stack.pop().ok_or(CilError::StackUnderflow)?;
             stack.push(object);
+        }
+        Opcode::Isinst => {
+            let object = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let handles = resolver.cast_subtype_handles(&inst.operand);
+            if handles.is_empty() {
+                return Err(CilError::Unsupported(inst.opcode));
+            }
+            let object_desc = new_value(value_types, MirType::I32);
+            insts.push((object_desc, Inst::LoadTypeDesc { object }));
+            let mut matched = new_value(value_types, MirType::I32);
+            insts.push((
+                matched,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ));
+            for handle in handles {
+                let subtype_desc = new_value(value_types, MirType::I32);
+                insts.push((subtype_desc, Inst::TypeDescAddr { handle }));
+                let eq = new_value(value_types, MirType::I32);
+                insts.push((
+                    eq,
+                    Inst::Compare {
+                        op: CmpOp::Eq,
+                        lhs: object_desc,
+                        rhs: subtype_desc,
+                    },
+                ));
+                let acc = new_value(value_types, MirType::I32);
+                insts.push((
+                    acc,
+                    Inst::Binary {
+                        op: BinOp::Or,
+                        lhs: matched,
+                        rhs: eq,
+                    },
+                ));
+                matched = acc;
+            }
+            let zero = new_value(value_types, MirType::I32);
+            insts.push((
+                zero,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ));
+            let mask = new_value(value_types, MirType::I32);
+            insts.push((
+                mask,
+                Inst::Binary {
+                    op: BinOp::Sub,
+                    lhs: zero,
+                    rhs: matched,
+                },
+            ));
+            let object_int = new_value(value_types, MirType::I32);
+            insts.push((
+                object_int,
+                Inst::Convert {
+                    value: object,
+                    kind: ConvKind::RefToInt,
+                },
+            ));
+            let masked = new_value(value_types, MirType::I32);
+            insts.push((
+                masked,
+                Inst::Binary {
+                    op: BinOp::And,
+                    lhs: object_int,
+                    rhs: mask,
+                },
+            ));
+            let result = new_value(value_types, MirType::ObjectRef);
+            insts.push((
+                result,
+                Inst::Convert {
+                    value: masked,
+                    kind: ConvKind::IntToRef,
+                },
+            ));
+            stack.push(result);
         }
         other => return Err(CilError::Unsupported(other)),
     }
@@ -4317,6 +4460,39 @@ mod tests {
     }
 
     #[test]
+    fn lowers_external_call_to_a_pinvoke() {
+        struct Ext;
+        impl CallResolver for Ext {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 0,
+                    has_result: true,
+                    result_type: Some(MirType::I32),
+                    target: CallTarget::External("MathLib.Answer.0".into()),
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::Call, Operand::None),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &Ext).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::PInvoke { import, .. } if &**import == "MathLib.Answer.0"
+        )));
+    }
+
+    #[test]
     fn lowers_rvalue_newobj() {
         struct Ctor;
         impl CallResolver for Ctor {
@@ -4602,6 +4778,33 @@ mod tests {
         };
         let func = lower_method(&body).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_float_neg_without_a_type_mismatch() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcR8, Operand::Float64(1.5)),
+                Instruction::simple(Opcode::Neg),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::F64));
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::ConstInt {
+                ty: MirType::F64,
+                value: 0
+            }
+        )));
     }
 
     #[test]
@@ -4959,7 +5162,73 @@ mod tests {
         );
         assert_eq!(func.ret, Some(MirType::I32));
         #[cfg(feature = "arm32")]
-        assert!(crate::arm32::lower_module_gc(&[func], 0x09).is_ok());
+        {
+            assert!(
+                matches!(
+                    crate::arm32::lower_module(&[func.clone()]),
+                    Err(crate::arm32::LowerError::CallUnsupported)
+                ),
+                "the flat path cannot box -- boxing requires the GC allocator"
+            );
+            let image = crate::arm32::lower_module_gc(&[func], 0x1234_ABCD)
+                .expect("the GC path lowers boxing");
+            let alloc_addr_le = 0x1234_ABCDu32.to_le_bytes();
+            assert!(
+                image.windows(4).any(|w| w == alloc_addr_le.as_slice()),
+                "the lamella_gc_alloc address is emitted as the Alloc call target"
+            );
+        }
+    }
+
+    #[test]
+    fn lowers_ldc_r8_and_ignores_no_op_prefixes() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Volatile),
+                Instruction::new(Opcode::LdcR8, Operand::Float64(2.5)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::F64));
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::ConstInt { ty: MirType::F64, value } if *value == 2.5f64.to_bits() as i64
+        )));
+    }
+
+    #[test]
+    fn lowers_double_to_int_conversion() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcR8, Operand::Float64(42.9)),
+                Instruction::simple(Opcode::ConvI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::I32));
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::Convert {
+                kind: ConvKind::Float64ToInt,
+                ..
+            }
+        )));
     }
 
     #[test]

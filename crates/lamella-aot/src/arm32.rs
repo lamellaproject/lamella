@@ -114,6 +114,7 @@ fn lower_inst(
     match inst {
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
         Inst::FuncAddr { .. }
+        | Inst::VirtualFuncAddr { .. }
         | Inst::CallIndirect { .. }
         | Inst::CallNative { .. }
         | Inst::InvokeDelegate { .. }
@@ -172,7 +173,10 @@ fn lower_inst(
             emit_sized_load(enc, assign(result), assign(*address), *width, *signed)?;
         }
         Inst::Convert { value, kind } => {
-            if matches!(kind, ConvKind::Float32ToInt | ConvKind::IntToFloat32) {
+            if matches!(
+                kind,
+                ConvKind::Float32ToInt | ConvKind::IntToFloat32 | ConvKind::Float64ToInt
+            ) {
                 return Err(LowerError::CallUnsupported);
             }
             extend_for(enc, assign(result), assign(*value), *kind)
@@ -263,7 +267,13 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
         ConvKind::ZeroExtend8 => enc.uxtb(rd, rm),
         ConvKind::SignExtend16 => enc.sxth(rd, rm),
         ConvKind::ZeroExtend16 => enc.uxth(rd, rm),
-        ConvKind::Float32ToInt | ConvKind::IntToFloat32 => Ok(()),
+        ConvKind::Float32ToInt | ConvKind::IntToFloat32 | ConvKind::Float64ToInt => Ok(()),
+        ConvKind::IntToRef | ConvKind::RefToInt => {
+            if rd != rm {
+                enc.mov_reg(rd, rm);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -359,7 +369,7 @@ fn lower_spilled_inst(
     sym_pool: &mut Vec<(Label, u32)>,
     strings: &mut Vec<(Label, Box<[u8]>)>,
     string_blobs: &mut Vec<(Label, Box<[u16]>)>,
-    desc_pool: &mut Vec<(Label, Box<[u32]>)>,
+    desc_pool: &mut Vec<(Label, Box<[u32]>, Box<[u32]>)>,
     value_types: &[MirType],
     slot: &impl Fn(ValueId) -> u16,
     inst: &Inst,
@@ -370,7 +380,7 @@ fn lower_spilled_inst(
     match inst {
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
         Inst::ConstInt {
-            ty: MirType::I64,
+            ty: MirType::I64 | MirType::F64,
             value,
         } => {
             load_const_word(enc, pool, Reg::R0, *value as u32)?;
@@ -542,13 +552,35 @@ fn lower_spilled_inst(
             enc.ldr_literal(Reg::R0, label)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::TypeDescLiteral { words } => {
+        Inst::VirtualFuncAddr { object, slot: vslot } => {
+            let entry_offset = vslot
+                .checked_mul(4)
+                .and_then(|x| x.checked_add(4))
+                .filter(|&offset| offset <= 255)
+                .ok_or(LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R0, slot(*object))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.subs_imm8(Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R0, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.mov_reg(Reg::R1, Reg::R0);
+            enc.subs_imm8(Reg::R1, entry_offset as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_imm(Reg::R1, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R0, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R0, 1)
+                .map_err(|_| LowerError::TooManyValues)?;
+        }
+        Inst::TypeDescLiteral { words, vtable } => {
             let label = enc.new_label();
-            desc_pool.push((label, words.clone()));
+            desc_pool.push((label, words.clone(), vtable.clone()));
             enc.adr(Reg::R0, label)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::CallIndirect { target, args } => {
+        Inst::CallIndirect { target, args, .. } => {
             enc.ldr_sp(Reg::R0, slot(*target))
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.mov_reg(Reg::R12, Reg::R0);
@@ -561,7 +593,7 @@ fn lower_spilled_inst(
             }
             return Ok(Some(return_pc));
         }
-        Inst::InvokeDelegate { delegate, args } => {
+        Inst::InvokeDelegate { delegate, args, .. } => {
             if args.len() > 3 {
                 return Err(LowerError::CallUnsupported);
             }
@@ -627,6 +659,7 @@ fn lower_spilled_inst(
         Inst::CallVirtual {
             slot: vtable_slot,
             args,
+            ..
         } => {
             let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
             let entry_offset = vtable_slot
@@ -659,7 +692,7 @@ fn lower_spilled_inst(
             }
             return Ok(Some(return_pc));
         }
-        Inst::CallInterface { tag, args } => {
+        Inst::CallInterface { tag, args, .. } => {
             let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
             enc.ldr_sp(Reg::R0, slot(receiver))
                 .map_err(|_| LowerError::TooManyValues)?;
@@ -909,6 +942,8 @@ fn lower_spilled_inst(
                 emit_f2i(enc)?;
             } else if matches!(kind, ConvKind::IntToFloat32) {
                 emit_i2f(enc)?;
+            } else if matches!(kind, ConvKind::Float64ToInt) {
+                return Err(LowerError::CallUnsupported);
             } else {
                 extend_for(enc, Reg::R0, Reg::R0, *kind).map_err(|_| LowerError::TooManyValues)?;
             }
@@ -1872,7 +1907,7 @@ fn lower_spilled_into(
     let mut string_blobs: Vec<(Label, Box<[u16]>)> = Vec::new();
     let mut type_descs: Vec<(Label, Box<[u32]>)> = Vec::new();
     let mut type_desc_labels: Vec<(lamella_ir::TypeHandle, Label)> = Vec::new();
-    let mut desc_pool: Vec<(Label, Box<[u32]>)> = Vec::new();
+    let mut desc_pool: Vec<(Label, Box<[u32]>, Box<[u32]>)> = Vec::new();
     if has_calls {
         enc.push_registers(saved_mask, true);
     }
@@ -2362,7 +2397,10 @@ fn lower_spilled_into(
     }
     if !desc_pool.is_empty() {
         enc.align_to_word();
-        for (entry, words) in desc_pool {
+        for (entry, words, vtable) in desc_pool {
+            for (k, &func_index) in vtable.iter().enumerate().rev() {
+                enc.data_word_symbol_reldesc(func_index, -(4 + 4 * k as i32));
+            }
             enc.bind_label(entry);
             for &word in words.iter() {
                 enc.emit_word(word);
@@ -2546,6 +2584,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::CallNative { .. }
                     | Inst::InvokeDelegate { .. }
                     | Inst::FuncAddr { .. }
+                    | Inst::VirtualFuncAddr { .. }
                     | Inst::TypeDescLiteral { .. }
                     | Inst::CopyBlock { .. }
                     | Inst::FillBlock { .. }
@@ -3489,6 +3528,17 @@ fn aeabi_float_helper(op: BinOp, operand_ty: Option<MirType>) -> Option<&'static
     }
 }
 
+/// The `__aeabi_*` soft-float helper for a float CONVERSION the no-FPU target does not do inline; `None`
+/// for a conversion lowered inline (the f32 ones via `emit_f2i`/`emit_i2f`) or an integer widen. Only
+/// `Float64ToInt` needs one -- `__aeabi_d2iz` truncates a double toward zero to a signed int; its single
+/// f64 argument arrives in `r0:r1`, which the C-ABI arg lowering already forms for a `CallNative`.
+fn aeabi_convert_helper(kind: ConvKind) -> Option<&'static str> {
+    match kind {
+        ConvKind::Float64ToInt => Some("__aeabi_d2iz"),
+        _ => None,
+    }
+}
+
 /// Interns `name` into the module's extern-symbol table, returning its index.
 fn intern_extern(externs: &mut Vec<alloc::string::String>, name: &str) -> u32 {
     if let Some(i) = externs.iter().position(|s| s == name) {
@@ -3534,7 +3584,11 @@ fn aeabi_float_compare(
 /// hard-float (VFP) target would lower it inline instead -- a later knob. A comparison whose CLI form
 /// is a negation (the unordered compares, `!=`) expands to the ordered helper plus a logical-not
 /// (`== 0`), which is why the instruction list is rebuilt rather than edited in place.
-fn lower_runtime_calls(func: &Function, externs: &mut Vec<alloc::string::String>) -> Function {
+fn lower_runtime_calls(
+    func: &Function,
+    externs: &mut Vec<alloc::string::String>,
+    descriptors: &[TypeMeta],
+) -> Function {
     let mut func = func.clone();
     for bi in 0..func.blocks.len() {
         let old = core::mem::take(&mut func.blocks[bi].insts);
@@ -3552,14 +3606,19 @@ fn lower_runtime_calls(func: &Function, externs: &mut Vec<alloc::string::String>
                 continue;
             }
             if let Inst::Alloc {
+                handle,
                 payload_size,
                 ref_offsets,
-                ..
             } = &inst
             {
                 let symbol = intern_extern(externs, "lamella_gc_alloc");
+                let meta = descriptors.iter().find(|m| m.handle == *handle);
+                let type_tag = meta.map_or(0, |m| m.type_tag);
+                let vtable: Box<[u32]> = meta
+                    .map(|m| m.vtable.clone().into_boxed_slice())
+                    .unwrap_or_default();
                 let mut words: Vec<u32> =
-                    alloc::vec![*payload_size, ref_offsets.len() as u32, 0, 0];
+                    alloc::vec![*payload_size, ref_offsets.len() as u32, type_tag, 0];
                 words.extend(ref_offsets.iter().copied());
                 let size = ValueId(func.value_types.len() as u32);
                 func.value_types.push(MirType::I32);
@@ -3576,6 +3635,7 @@ fn lower_runtime_calls(func: &Function, externs: &mut Vec<alloc::string::String>
                     typedesc,
                     Inst::TypeDescLiteral {
                         words: words.into_boxed_slice(),
+                        vtable,
                     },
                 ));
                 insts.push((
@@ -3586,6 +3646,19 @@ fn lower_runtime_calls(func: &Function, externs: &mut Vec<alloc::string::String>
                     },
                 ));
                 continue;
+            }
+            if let Inst::Convert { value, kind } = &inst {
+                if let Some(name) = aeabi_convert_helper(*kind) {
+                    let symbol = intern_extern(externs, name);
+                    insts.push((
+                        result,
+                        Inst::CallNative {
+                            symbol,
+                            args: alloc::vec![*value],
+                        },
+                    ));
+                    continue;
+                }
             }
             let plan = match &inst {
                 Inst::Binary { op, lhs, rhs } => {
@@ -3661,60 +3734,131 @@ pub fn lower_object(
     names: &[&str],
     extern_syms: &[&str],
 ) -> Result<Vec<u8>, LowerError> {
+    lower_object_inner(funcs, names, extern_syms, &[], true)
+}
+
+/// As [`lower_object`], but also emitting per-type VTABLES/TypeDescs from `descriptors` (the resolver's
+/// [`type_descriptors`](crate::resolver::MetadataResolver::type_descriptors)), so `callvirt`/`ldvirtftn`
+/// dispatch through the object's descriptor on the linked device path (not only the flat GC path). Each
+/// allocated type's descriptor gains its vtable, laid before it as `R_LAMELLA_REL_DESC` slots the linker
+/// resolves -- so dispatch works AND the references survive `--gc-sections` re-layout.
+pub fn lower_object_vtables(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+) -> Result<Vec<u8>, LowerError> {
+    lower_object_inner(funcs, names, extern_syms, descriptors, true)
+}
+
+/// As [`lower_object`], but for a LIBRARY object with no entry point: it omits the `lamella_main` entry
+/// symbol, so several library objects (a corlib, helpers) link alongside one program without a
+/// duplicate-symbol clash on the entry.
+pub fn lower_object_library(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+) -> Result<Vec<u8>, LowerError> {
+    lower_object_inner(funcs, names, extern_syms, &[], false)
+}
+
+/// As [`lower_object_library`], but emitting per-type vtables/TypeDescs from `descriptors` -- so a corlib
+/// (or helper) library object's allocating/virtual methods dispatch correctly once linked. The library
+/// twin of [`lower_object_vtables`].
+pub fn lower_object_library_vtables(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+) -> Result<Vec<u8>, LowerError> {
+    lower_object_inner(funcs, names, extern_syms, descriptors, false)
+}
+
+/// Verifies, prepares, and emits ONE function into `enc`. Extracted so a library object can DRY-RUN a
+/// method into a scratch encoder (tolerating one that does not lower) before emitting it for real.
+fn lower_one_func(
+    func: &Function,
+    enc: &mut Encoder,
+    func_labels: &[Label],
+    stack_maps: &mut Vec<StackMapEntry>,
+) -> Result<(), LowerError> {
+    if lamella_ir::verify(func).is_err() {
+        return Err(LowerError::NotWellFormed);
+    }
+    match prepare(func)? {
+        Assignment::Registers { regs, saved } => lower_into(
+            func,
+            enc,
+            &regs,
+            saved,
+            func_labels,
+            &[],
+            &mut Vec::new(),
+            stack_maps,
+            true,
+        ),
+        Assignment::Mixed {
+            homes,
+            saved,
+            frame,
+        } => lower_mixed_into(
+            func,
+            enc,
+            &homes,
+            saved,
+            frame,
+            func_labels,
+            &[],
+            &mut Vec::new(),
+            stack_maps,
+            true,
+        ),
+        Assignment::Spilled => lower_spilled_into(
+            func,
+            enc,
+            func_labels,
+            None,
+            PySupport::default(),
+            &[],
+            &mut Vec::new(),
+            stack_maps,
+            &[],
+            true,
+        ),
+    }
+}
+
+fn lower_object_inner(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+    emit_entry: bool,
+) -> Result<Vec<u8>, LowerError> {
     let mut externs: Vec<alloc::string::String> = extern_syms.iter().map(|s| (*s).into()).collect();
     let funcs: Vec<Function> = funcs
         .iter()
-        .map(|f| lower_runtime_calls(f, &mut externs))
+        .map(|f| lower_runtime_calls(f, &mut externs, descriptors))
         .collect();
     let funcs = funcs.as_slice();
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     let mut stack_maps: Vec<StackMapEntry> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
-        if lamella_ir::verify(func).is_err() {
-            return Err(LowerError::NotWellFormed);
-        }
         enc.bind_label(func_labels[index]);
-        match prepare(func)? {
-            Assignment::Registers { regs, saved } => lower_into(
-                func,
-                &mut enc,
-                &regs,
-                saved,
-                &func_labels,
-                &[],
-                &mut Vec::new(),
-                &mut stack_maps,
-                true,
-            )?,
-            Assignment::Mixed {
-                homes,
-                saved,
-                frame,
-            } => lower_mixed_into(
-                func,
-                &mut enc,
-                &homes,
-                saved,
-                frame,
-                &func_labels,
-                &[],
-                &mut Vec::new(),
-                &mut stack_maps,
-                true,
-            )?,
-            Assignment::Spilled => lower_spilled_into(
-                func,
-                &mut enc,
-                &func_labels,
-                None,
-                PySupport::default(),
-                &[],
-                &mut Vec::new(),
-                &mut stack_maps,
-                &[],
-                true,
-            )?,
+        if emit_entry {
+            lower_one_func(func, &mut enc, &func_labels, &mut stack_maps)?;
+        } else {
+            let mut scratch = Encoder::new();
+            let scratch_labels: Vec<Label> =
+                (0..funcs.len()).map(|_| scratch.new_label()).collect();
+            let mut scratch_maps = Vec::new();
+            if lower_one_func(func, &mut scratch, &scratch_labels, &mut scratch_maps).is_ok() {
+                lower_one_func(func, &mut enc, &func_labels, &mut stack_maps)
+                    .expect("a method that lowered in the dry run lowers for real");
+            } else {
+                enc.bx(Reg::LR);
+            }
         }
     }
     let assembled = enc.finish().map_err(|_| LowerError::CodeTooLarge)?;
@@ -3749,21 +3893,26 @@ pub fn lower_object(
             section: lamella_elf::SymbolSection::Undefined,
         });
     }
-    if let Some(&entry_off) = offsets.first() {
-        symbols.push(lamella_elf::Symbol {
-            name: "lamella_main",
-            value: entry_off | 1,
-            size: 0,
-            binding: lamella_elf::Binding::Global,
-            kind: lamella_elf::SymbolType::Func,
-            section: lamella_elf::SymbolSection::Text,
-        });
+    if emit_entry {
+        if let Some(&entry_off) = offsets.first() {
+            symbols.push(lamella_elf::Symbol {
+                name: "lamella_main",
+                value: entry_off | 1,
+                size: 0,
+                binding: lamella_elf::Binding::Global,
+                kind: lamella_elf::SymbolType::Func,
+                section: lamella_elf::SymbolSection::Text,
+            });
+        }
     }
     let mut relocations: Vec<lamella_elf::Relocation> = Vec::with_capacity(assembled.relocs.len());
     for r in &assembled.relocs {
         let (kind, addend) = match r.kind {
             lamella_asm_arm32::RelocKind::ThumbCall => (lamella_elf::arm::R_ARM_THM_CALL, -4),
             lamella_asm_arm32::RelocKind::Abs32 => (lamella_elf::arm::R_ARM_ABS32, 0),
+            lamella_asm_arm32::RelocKind::RelDesc32 => {
+                (lamella_elf::arm::R_LAMELLA_REL_DESC, r.addend)
+            }
             _ => return Err(LowerError::CallUnsupported),
         };
         let symbol = if r.symbol & EXTERN_SYMBOL_FLAG != 0 {
@@ -3778,7 +3927,7 @@ pub fn lower_object(
             addend,
         });
     }
-    if !stack_maps.is_empty() {
+    if emit_entry && !stack_maps.is_empty() {
         stack_maps.sort_by_key(|entry| entry.return_pc);
         let blob_offset = text.len() as u32;
         let blob = StackMaps(stack_maps).encode();
@@ -4045,6 +4194,33 @@ mod tests {
         assert!(
             bytes.windows(2).any(|w| w == [0x59, 0x41]),
             "ADCS (carry add) present"
+        );
+    }
+
+    #[test]
+    fn lowers_an_f64_constant_loading_both_words() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::F64),
+            value_types: vec![MirType::F64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::F64,
+                        value: 0x4018_0000_0000_0000,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(
+            bytes.windows(4).any(|w| w == [0x00, 0x00, 0x18, 0x40]),
+            "the high word 0x40180000 of the f64 constant is materialized (not just the low word)"
         );
     }
 
@@ -5993,6 +6169,7 @@ mod tests {
                         Inst::CallIndirect {
                             target: ValueId(0),
                             args: Vec::new(),
+                            returns_value: true,
                         },
                     ),
                 ],
@@ -6110,6 +6287,82 @@ mod tests {
     }
 
     #[test]
+    fn lower_object_lowers_double_to_int_via_aeabi_d2iz() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::F64, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::F64,
+                            value: 0x4045_0000_0000_0000,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::Float64ToInt,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "__aeabi_d2iz" && !s.defined),
+            "double->int emits an undefined __aeabi_d2iz extern"
+        );
+        assert!(
+            obj.relocations
+                .iter()
+                .any(|r| obj.symbols[r.symbol as usize].name == "__aeabi_d2iz"),
+            "a relocation targets __aeabi_d2iz"
+        );
+    }
+
+    #[test]
+    fn lower_object_lowers_ldvirtftn_to_a_vtable_load() {
+        let main = Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::VirtualFuncAddr {
+                        object: ValueId(0),
+                        slot: 2,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&main).is_ok());
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols.iter().any(|s| s.name == "main" && s.defined),
+            "ldvirtftn lowers to a defined function"
+        );
+        assert!(
+            obj.symbols.iter().all(|s| s.defined || s.name.is_empty()),
+            "no undefined externs -- the fn-pointer is computed from the object's vtable at run time"
+        );
+    }
+
+    #[test]
     fn lower_object_lowers_alloc_to_the_runtime_allocator() {
         let main = Function {
             params: Vec::new(),
@@ -6159,17 +6412,150 @@ mod tests {
                 terminator: Some(Terminator::Return(Some(ValueId(0)))),
             }],
         };
-        let lowered = lower_runtime_calls(&main, &mut Vec::new());
-        let words = lowered
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .find_map(|(_, i)| match i {
-                Inst::TypeDescLiteral { words } => Some(words.clone()),
-                _ => None,
-            })
-            .expect("the alloc emits a TypeDescLiteral");
+        let literal = |descriptors: &[TypeMeta]| {
+            lower_runtime_calls(&main, &mut Vec::new(), descriptors)
+                .blocks
+                .iter()
+                .flat_map(|b| b.insts.clone())
+                .find_map(|(_, i)| match i {
+                    Inst::TypeDescLiteral { words, vtable } => Some((words, vtable)),
+                    _ => None,
+                })
+                .expect("the alloc emits a TypeDescLiteral")
+        };
+        let (words, vtable) = literal(&[]);
         assert_eq!(&*words, &[12, 2, 0, 0, 0, 4]);
+        assert!(vtable.is_empty());
+        let descriptors = alloc::vec![TypeMeta {
+            handle: lamella_ir::TypeHandle(0),
+            type_tag: 0xABCD,
+            vtable: alloc::vec![3, 5],
+            itable: Vec::new(),
+            base: None,
+        }];
+        let (words, vtable) = literal(&descriptors);
+        assert_eq!(&*words, &[12, 2, 0xABCD, 0, 0, 4]);
+        assert_eq!(&*vtable, &[3, 5]);
+    }
+
+    #[test]
+    fn lower_object_vtables_emits_a_reldesc_slot_per_virtual() {
+        let allocates = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: lamella_ir::TypeHandle(1),
+                        payload_size: 4,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let speak = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 42,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let descriptors = alloc::vec![TypeMeta {
+            handle: lamella_ir::TypeHandle(1),
+            type_tag: 0x1234,
+            vtable: alloc::vec![1],
+            itable: Vec::new(),
+            base: None,
+        }];
+        let bytes =
+            lower_object_vtables(&[allocates, speak], &["f0", "f1"], &[], &descriptors).unwrap();
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let reldesc: Vec<&lamella_elf::ParsedRelocation> = obj
+            .relocations
+            .iter()
+            .filter(|r| r.kind == lamella_elf::arm::R_LAMELLA_REL_DESC)
+            .collect();
+        assert_eq!(
+            reldesc.len(),
+            1,
+            "the type's one vtable slot -> one relative-descriptor relocation"
+        );
+        assert_eq!(reldesc[0].addend, -4);
+        assert_eq!(
+            obj.symbols[reldesc[0].symbol as usize].name, "f1",
+            "the slot targets the virtual method's symbol"
+        );
+        let plain = lamella_elf::read_object(
+            &lower_object(
+                &[
+                    Function {
+                        params: Vec::new(),
+                        ret: Some(MirType::ObjectRef),
+                        value_types: vec![MirType::ObjectRef],
+                        entry: BlockId(0),
+                        blocks: vec![BasicBlock {
+                            params: Vec::new(),
+                            insts: vec![(
+                                ValueId(0),
+                                Inst::Alloc {
+                                    handle: lamella_ir::TypeHandle(1),
+                                    payload_size: 4,
+                                    ref_offsets: Vec::new().into_boxed_slice(),
+                                },
+                            )],
+                            terminator: Some(Terminator::Return(Some(ValueId(0)))),
+                        }],
+                    },
+                    stub_returning_int(),
+                ],
+                &["f0", "f1"],
+                &[],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !plain
+                .relocations
+                .iter()
+                .any(|r| r.kind == lamella_elf::arm::R_LAMELLA_REL_DESC),
+            "without descriptors, no vtable slots are emitted"
+        );
+    }
+
+    fn stub_returning_int() -> Function {
+        Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        }
     }
 
     #[test]
@@ -6306,6 +6692,7 @@ mod tests {
                     Inst::InvokeDelegate {
                         delegate: ValueId(0),
                         args: vec![ValueId(1)],
+                        returns_value: true,
                     },
                 )],
                 terminator: Some(Terminator::Return(Some(ValueId(2)))),

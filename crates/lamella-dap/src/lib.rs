@@ -5,6 +5,8 @@
 pub mod adapter;
 #[cfg(feature = "interpreter")]
 pub mod interp_backend;
+#[cfg(feature = "interpreter")]
+mod repl_eval;
 pub mod protocol;
 pub mod serve;
 

@@ -457,7 +457,23 @@ impl CallResolver for MetadataResolver<'_> {
             MethodKind::Reference if is_array_getlength(&method) => {
                 CallTarget::Intrinsic(Intrinsic::ArrayGetLength)
             }
-            MethodKind::Reference => return None,
+            MethodKind::Reference => {
+                let (namespace, type_name) = method
+                    .declaring_type
+                    .as_ref()
+                    .map_or(("", ""), |t| (t.namespace, t.name));
+                let name = method.name.unwrap_or("");
+                CallTarget::External(
+                    extern_method_symbol(
+                        namespace,
+                        type_name,
+                        name,
+                        &signature.parameters,
+                        &|token| self.assembly.type_token_name(token).map(|n| joined_full_name(&n)),
+                    )
+                    .into(),
+                )
+            }
         };
         Some(CallInfo {
             args,
@@ -971,12 +987,128 @@ fn mir_type(sig: &SigType, assembly: &Assembly, target: &TargetLayout) -> Option
         SigType::IntPtr | SigType::UIntPtr => MirType::NativeInt,
         SigType::Class(_) | SigType::Object | SigType::String => MirType::ObjectRef,
         SigType::SzArray(_) | SigType::Array { .. } => MirType::ObjectRef,
-        SigType::ValueType(token) => MirType::ValueType {
-            handle: TypeHandle(token.0),
-            size: assembly.value_type_layout(*token, target).ok()?.size,
+        SigType::ValueType(token) => match enum_underlying(assembly, *token, target) {
+            Some(underlying) => underlying,
+            None => MirType::ValueType {
+                handle: TypeHandle(token.0),
+                size: assembly.value_type_layout(*token, target).ok()?.size,
+            },
         },
         _ => return None,
     })
+}
+
+/// A type's dotted full name (`namespace.name`, or just `name` in the global namespace) -- what a
+/// `Class`/`ValueType` parameter contributes to an extern method symbol.
+pub(crate) fn joined_full_name(name: &TypeName) -> String {
+    if name.namespace.is_empty() {
+        name.name.into()
+    } else {
+        alloc::format!("{}.{}", name.namespace, name.name)
+    }
+}
+
+/// A stable cross-assembly symbol for a managed method -- its dotted full name plus an encoding of each
+/// parameter type, so every overload gets a distinct symbol. A primitive is one char; a `Class`/
+/// `ValueType` contributes its FULL TYPE NAME (`O<name>;` / `V<name>;`), so overloads differing only by
+/// a user-defined parameter type stay distinct; an array/byref/pointer is a marker plus its element's
+/// encoding. `type_full_name` resolves a type token to its dotted name (`None` -> "?", so the symbol is
+/// still stable if a token cannot be resolved). A cross-assembly extern call and the defining library
+/// object mangle identically, so the own linker pairs them: "System.Math.Max.ii" (int,int) vs ".ll"
+/// (long,long) vs "System.DateTime.op_Subtraction.VSystem.DateTime;VSystem.TimeSpan;".
+pub fn extern_method_symbol(
+    namespace: &str,
+    type_name: &str,
+    method: &str,
+    params: &[SigType],
+    type_full_name: &dyn Fn(Token) -> Option<String>,
+) -> String {
+    let mut codes = String::new();
+    for p in params {
+        encode_type(p, type_full_name, &mut codes);
+    }
+    if namespace.is_empty() {
+        alloc::format!("{type_name}.{method}.{codes}")
+    } else {
+        alloc::format!("{namespace}.{type_name}.{method}.{codes}")
+    }
+}
+
+/// Appends `sig`'s parameter encoding to `out` (see [`extern_method_symbol`]) -- one char for a
+/// primitive, a full type name for a `Class`/`ValueType` (terminated by `;`), and a marker plus a
+/// recursive element encoding for an array/byref/pointer. Injective: no primitive code is a digit, so an
+/// `Array`'s decimal rank ends unambiguously where its element encoding begins.
+fn encode_type(sig: &SigType, type_full_name: &dyn Fn(Token) -> Option<String>, out: &mut String) {
+    match sig {
+        SigType::Boolean => out.push('z'),
+        SigType::Char => out.push('c'),
+        SigType::I1 => out.push('b'),
+        SigType::U1 => out.push('B'),
+        SigType::I2 => out.push('s'),
+        SigType::U2 => out.push('S'),
+        SigType::I4 => out.push('i'),
+        SigType::U4 => out.push('I'),
+        SigType::I8 => out.push('l'),
+        SigType::U8 => out.push('L'),
+        SigType::R4 => out.push('f'),
+        SigType::R8 => out.push('d'),
+        SigType::String => out.push('q'),
+        SigType::Object => out.push('o'),
+        SigType::IntPtr => out.push('n'),
+        SigType::UIntPtr => out.push('N'),
+        SigType::TypedByRef => out.push('t'),
+        SigType::Class(token) => {
+            out.push('O');
+            out.push_str(&type_full_name(*token).unwrap_or_else(|| String::from("?")));
+            out.push(';');
+        }
+        SigType::ValueType(token) => {
+            out.push('V');
+            out.push_str(&type_full_name(*token).unwrap_or_else(|| String::from("?")));
+            out.push(';');
+        }
+        SigType::SzArray(element) => {
+            out.push('a');
+            encode_type(element, type_full_name, out);
+        }
+        SigType::Array { element, rank } => {
+            out.push('A');
+            out.push_str(&alloc::format!("{rank}"));
+            encode_type(element, type_full_name, out);
+        }
+        SigType::Pointer(element) => {
+            out.push('p');
+            encode_type(element, type_full_name, out);
+        }
+        SigType::ByRef(element) => {
+            out.push('r');
+            encode_type(element, type_full_name, out);
+        }
+        _ => out.push('x'),
+    }
+}
+
+/// If `token` names an enum (a value type whose base is `System.Enum`), the MirType of its underlying
+/// integer. An enum is erased to that integer for codegen, so its values are scalars, not structs.
+/// `None` for a non-enum value type (a real struct) or a token that is not a this-module `TypeDef`.
+pub(crate) fn enum_underlying(
+    assembly: &Assembly,
+    token: Token,
+    target: &TargetLayout,
+) -> Option<MirType> {
+    if token.table() != table::TYPE_DEF {
+        return None;
+    }
+    let type_def = assembly.type_def(token.row())?;
+    let base = assembly.type_token_name(type_def.extends())?;
+    if base.namespace != "System" || base.name != "Enum" {
+        return None;
+    }
+    let underlying = type_def
+        .fields()
+        .find(|field| !field.is_static())?
+        .signature()?;
+    mir_type(&underlying, assembly, target)
 }
 
 /// Lowers the given methods of an `assembly` to MIR as one module: a call from one of them
@@ -1146,5 +1278,68 @@ mod tests {
     fn decodes_a_user_string() {
         assert_eq!(decode_user_string(&[0x48, 0x00, 0x69, 0x00, 0x00]), "Hi");
     }
+
+    #[test]
+    fn extern_symbol_encodes_param_types_for_overloads() {
+        let none = |_t: Token| -> Option<String> { None };
+        assert_eq!(
+            extern_method_symbol("System", "Math", "Max", &[SigType::I4, SigType::I4], &none),
+            "System.Math.Max.ii"
+        );
+        assert_eq!(
+            extern_method_symbol("System", "Math", "Max", &[SigType::I8, SigType::I8], &none),
+            "System.Math.Max.ll"
+        );
+        assert_eq!(
+            extern_method_symbol("", "MathLib", "Answer", &[], &none),
+            "MathLib.Answer."
+        );
+    }
+
+    #[test]
+    fn extern_symbol_encodes_type_identity_of_reference_and_value_params() {
+        let names = |t: Token| match t.0 {
+            1 => Some(String::from("System.DateTime")),
+            2 => Some(String::from("System.TimeSpan")),
+            _ => None,
+        };
+        let dt = SigType::ValueType(Token(1));
+        let ts = SigType::ValueType(Token(2));
+        assert_eq!(
+            extern_method_symbol(
+                "System",
+                "DateTime",
+                "op_Subtraction",
+                &[dt.clone(), dt.clone()],
+                &names
+            ),
+            "System.DateTime.op_Subtraction.VSystem.DateTime;VSystem.DateTime;"
+        );
+        assert_eq!(
+            extern_method_symbol("System", "DateTime", "op_Subtraction", &[dt, ts], &names),
+            "System.DateTime.op_Subtraction.VSystem.DateTime;VSystem.TimeSpan;"
+        );
+        assert_eq!(
+            extern_method_symbol(
+                "System",
+                "Array",
+                "Sort",
+                &[SigType::SzArray(Box::new(SigType::I4))],
+                &names
+            ),
+            "System.Array.Sort.ai"
+        );
+        assert_eq!(
+            extern_method_symbol(
+                "System",
+                "Int32",
+                "TryParse",
+                &[SigType::String, SigType::ByRef(Box::new(SigType::I4))],
+                &names
+            ),
+            "System.Int32.TryParse.qri"
+        );
+    }
+
 
 }

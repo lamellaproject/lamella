@@ -1,7 +1,7 @@
 //! Runtime-native intrinsics: the Rust implementations a few BCL methods bind to.
 
 use crate::interp::{Session, Vm};
-use crate::module::{AttrValue, Module};
+use crate::module::{AttrValue, BoxedPrimitive, Module};
 use crate::net::{Interest, NetResult};
 use crate::tls::{TlsStack, VerifyMode};
 use crate::object::{Object, ObjectRef, decode_string};
@@ -3067,11 +3067,19 @@ pub fn string_concat_object3(
     Ok(Some(Value::Object(reference)))
 }
 
-/// Renders a boxed value type: an enum as its constant name (when the value is a known
-/// constant of that enum), otherwise the underlying value's text. The boxed `type_token` is
-/// the asm-folded handle (the assembly folded in at the `box` site), so the enum maps are
-/// queried by that handle directly.
+/// Renders a boxed value type: a `bool`/`char` by its true kind (`box` collapses both to
+/// [`Value::Int32`]), an enum as its constant name (when the value is a known constant of that
+/// enum), otherwise the underlying value's text. The boxed `type_token` is the asm-folded handle
+/// (the assembly folded in at the `box` site), so the primitive-kind and enum maps are queried by
+/// that handle directly -- no `TypeRef`-to-type resolution, which the incremental REPL (corlib not
+/// loaded in the runtime) cannot do at display time.
 fn boxed_text(module: &Module, type_token: u64, value: &Value) -> String {
+    if let (Some(kind), &Value::Int32(raw)) = (module.box_primitive_by_handle(type_token), value) {
+        return match kind {
+            BoxedPrimitive::Boolean => String::from(if raw != 0 { "True" } else { "False" }),
+            BoxedPrimitive::Char => String::from_utf16_lossy(&[raw as u16]),
+        };
+    }
     if let Some(integer) = enum_underlying(value) {
         if let Some(text) = module.enum_name_or_flags(type_token, integer, false) {
             return text;
@@ -4592,10 +4600,10 @@ pub fn type_get_name(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a type handle or names no recorded type.
 #[cfg(feature = "NETMFv4_4")]
-fn reflect_type_of<'m>(
-    module: &'m Module,
+fn reflect_type_of(
+    module: &Module,
     args: &[Value],
-) -> Result<&'m crate::module::ReflectType, Trap> {
+) -> Result<crate::module::ReflectType, Trap> {
     let Some(&Value::NativeInt(handle)) = args.first() else {
         return Err(Trap::TypeMismatch(Opcode::Callvirt));
     };
@@ -4613,7 +4621,7 @@ fn type_kind_bit(
     pick: impl Fn(&crate::module::ReflectType) -> bool,
 ) -> Result<Option<Value>, Trap> {
     let info = reflect_type_of(module, args)?;
-    Ok(Some(Value::Int32(i32::from(pick(info)))))
+    Ok(Some(Value::Int32(i32::from(pick(&info)))))
 }
 
 /// `System.Type.get_FullName` (`Type.FullName`): the type's `namespace.name`.
@@ -5316,10 +5324,8 @@ pub fn method_parameter_name(
         Some(&Value::Int32(index)) if index >= 0 => index as usize,
         _ => return Ok(Some(alloc_str(vm, ""))),
     };
-    let name = module
-        .method_params(handle as u64)
-        .get(index)
-        .map_or("", |param| param.name.as_str());
+    let params = module.method_params(handle as u64);
+    let name = params.get(index).map_or("", |param| param.name.as_str());
     Ok(Some(alloc_str(vm, name)))
 }
 
@@ -5490,8 +5496,8 @@ pub fn method_invoke(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Opt
         .resolve_by_handle(handle as u64)
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
     let arg_count = module
-        .method(method_id)
-        .map(|method| method.arg_count() as usize)
+        .method_arg_count(method_id)
+        .map(|count| count as usize)
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
     let mut params: Vec<Value> = Vec::new();
     if let Some(&Value::Object(array)) = args.get(2) {
@@ -5540,7 +5546,6 @@ pub fn activator_create_instance(
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
     let defaults = module
         .type_field_defaults(type_id)
-        .map(|fields| fields.to_vec())
         .unwrap_or_default();
     #[cfg(feature = "gc")]
     vm.suspend_collection();
@@ -5615,7 +5620,6 @@ pub fn constructor_invoke(
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
     let defaults = module
         .type_field_defaults(type_id)
-        .map(|fields| fields.to_vec())
         .unwrap_or_default();
     let mut params: Vec<Value> = Vec::new();
     if let Some(&Value::Object(array)) = args.get(1) {
@@ -5677,8 +5681,7 @@ fn instantiate_attribute(
 ) -> Result<ObjectRef, Trap> {
     let defaults = module
         .type_field_defaults(attribute.type_id)
-        .ok_or(Trap::NoSuchMethod(attribute.ctor))?
-        .to_vec();
+        .ok_or(Trap::NoSuchMethod(attribute.ctor))?;
     let instance = vm.heap_mut().alloc_instance(attribute.type_id, defaults);
     let mut ctor_args = Vec::with_capacity(attribute.positional.len() + 1);
     ctor_args.push(Value::Object(instance));
@@ -6765,6 +6768,7 @@ mod decimal_ops {
 
     /// Decodes the single-`Decimal` argument form (one `Value::Struct`): the `this` of a unary
     /// conversion like `op_Explicit(decimal) -> double`.
+    #[cfg(feature = "float")]
     pub fn one(args: &[Value]) -> Option<Dec> {
         dec_arg(args, 0)
     }
@@ -6969,6 +6973,45 @@ mod tests {
             console_write_line(&mut vm, &Module::new(), &[Value::Int32(7)]),
             Err(Trap::TypeMismatch(Opcode::Call))
         );
+    }
+
+    /// A boxed `bool`/`char` must display by its true kind, not the raw `Int32` the stack collapses
+    /// both into -- the REPL / `WriteLine(object)` display bug (`1 == 1` showed "1" not "True",
+    /// `(char)66` showed "66" not "B"). The kind is recorded per box-operand token by the loader;
+    /// here we bind it directly and drive the same `object_to_string` the REPL's display uses.
+    #[test]
+    fn boxed_bool_and_char_display_by_kind_not_raw_int() {
+        use crate::module::{BoxedPrimitive, asm_key};
+
+        fn render(module: &Module, vm: &mut Vm, handle: u64, value: Value) -> String {
+            let boxed = vm.heap_mut().alloc_boxed(handle, value);
+            match object_to_string(vm, module, &[Value::Object(boxed)]) {
+                Ok(Some(Value::Object(text))) => vm
+                    .heap()
+                    .as_string(text)
+                    .map(|units| String::from_utf16_lossy(&units))
+                    .unwrap_or_default(),
+                other => panic!("unexpected object_to_string result: {other:?}"),
+            }
+        }
+
+        let mut module = Module::new();
+        let bool_token = Token(0x0100_0001);
+        let char_token = Token(0x0100_0002);
+        let int_token = Token(0x0100_0003);
+        module.bind_box_primitive(0, bool_token, BoxedPrimitive::Boolean);
+        module.bind_box_primitive(0, char_token, BoxedPrimitive::Char);
+
+        let bool_handle = asm_key(0, bool_token.0);
+        let char_handle = asm_key(0, char_token.0);
+        let int_handle = asm_key(0, int_token.0);
+
+        let mut vm = Vm::new();
+        assert_eq!(render(&module, &mut vm, bool_handle, Value::Int32(1)), "True");
+        assert_eq!(render(&module, &mut vm, bool_handle, Value::Int32(0)), "False");
+        assert_eq!(render(&module, &mut vm, bool_handle, Value::Int32(2)), "True");
+        assert_eq!(render(&module, &mut vm, char_handle, Value::Int32(66)), "B");
+        assert_eq!(render(&module, &mut vm, int_handle, Value::Int32(5)), "5");
     }
 
     /// Encodes a `Decimal` value (`mantissa * 10^-scale`, mantissa <= 2^96-1) as the inline

@@ -1,7 +1,6 @@
 //! The Lamella debug-adapter server.
 
 use lamella_dap::{Debugger, serve};
-use lamella_metadata::Assembly;
 use std::{env, fs, io, path::Path, process};
 
 fn main() {
@@ -13,8 +12,8 @@ fn main() {
         eprintln!("cannot read {path}: {error}");
         process::exit(1);
     });
-    let assembly = Assembly::read(&bytes).unwrap_or_else(|error| {
-        eprintln!("cannot read metadata: {error:?}");
+    let assembly = lamella_metadata::Assembly::read(&bytes).unwrap_or_else(|error| {
+        eprintln!("cannot parse {path}: {error:?}");
         process::exit(1);
     });
     let program = lamella_load::load(&assembly).unwrap_or_else(|error| {

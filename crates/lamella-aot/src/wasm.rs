@@ -1,5 +1,6 @@
 //! The WebAssembly target code generator -- the third backend target, after ARM and RISC-V.
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -7,6 +8,8 @@ use lamella_asm_wasm::{BlockType, Func, FuncType, Limits, MemArg, Module, ValTyp
 use lamella_ir::{
     BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId,
 };
+
+use crate::resolver::TypeMeta;
 
 /// The base address of the read-only string-literal region in linear memory: it follows the
 /// static-field region, and the managed heap follows it. Addresses below it are reserved -- offset 0
@@ -41,6 +44,14 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
     lower_module(core::slice::from_ref(func))
 }
 
+/// As [`lower`], but for a single function with per-type vtables/TypeDescs (`descriptors`) available --
+/// so a program whose `Main` dispatches virtually or through a delegate lowers correctly. The
+/// vtable-aware single-function entry (mirrors [`lower_module_with_exports`]'s descriptors).
+pub fn lower_vtables(func: &Function, descriptors: &[TypeMeta]) -> Result<Vec<u8>, LowerError> {
+    let main_export: &[(&str, u32)] = &[("main", 0)];
+    lower_module_inner(core::slice::from_ref(func), main_export, false, descriptors)
+}
+
 /// Lowers a module of [`Function`]s to WebAssembly. Module order fixes call indices -- function 0
 /// is the entry and is exported as `main` for the host/JS to call; an `Inst::Call`'s `callee` is
 /// the callee's index in this slice (which is also its WebAssembly function index, as there are no
@@ -51,7 +62,7 @@ pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
     } else {
         &[("main", 0)]
     };
-    lower_module_inner(funcs, main_export, false)
+    lower_module_inner(funcs, main_export, false, &[])
 }
 
 /// Lowers a module, exporting each `(name, function_index)` in `exports` (the index is into `funcs`),
@@ -63,14 +74,16 @@ pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
 pub fn lower_module_with_exports(
     funcs: &[Function],
     exports: &[(&str, u32)],
+    descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, exports, true)
+    lower_module_inner(funcs, exports, true, descriptors)
 }
 
 fn lower_module_inner(
     funcs: &[Function],
     exports: &[(&str, u32)],
     with_allocator: bool,
+    descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
     let mut program: Vec<Function> = funcs.to_vec();
     let strings = layout_strings(&mut program);
@@ -84,10 +97,14 @@ fn lower_module_inner(
         }
     }
 
+    let (desc_segments, desc_addr, desc_end) =
+        layout_descriptors(&program, descriptors, strings.heap_base as u32);
+
     let mut module = Module::new();
-    let has_memory = uses_memory(&program) || !strings.segments.is_empty();
+    let has_memory =
+        uses_memory(&program) || !strings.segments.is_empty() || !desc_segments.is_empty();
     if has_memory {
-        let heap_base = strings.heap_base;
+        let heap_base = i64::from(desc_end.next_multiple_of(8));
         module.set_memory(Limits {
             min_pages: ((heap_base as u32).div_ceil(0x1_0000) + 1).max(HEAP_MIN_PAGES),
             max_pages: None,
@@ -97,10 +114,58 @@ fn lower_module_inner(
         for (offset, blob) in strings.segments {
             module.add_data(offset, blob);
         }
+        for (offset, blob) in desc_segments {
+            module.add_data(offset, blob);
+        }
     }
+
+    let mut sig_types: Vec<(FuncType, u32)> = Vec::new();
+    let mut needs_table = false;
+    for func in &program {
+        for (result, inst) in func.blocks.iter().flat_map(|b| &b.insts) {
+            match inst {
+                Inst::FuncAddr { .. } | Inst::VirtualFuncAddr { .. } => needs_table = true,
+                Inst::CallVirtual {
+                    args, returns_value, ..
+                }
+                | Inst::CallInterface {
+                    args, returns_value, ..
+                }
+                | Inst::CallIndirect {
+                    args, returns_value, ..
+                } => {
+                    needs_table = true;
+                    let result_ty = call_result_ty(*returns_value, *result, &func.value_types);
+                    let sig = call_site_type(args, result_ty, &func.value_types)?;
+                    intern_sig(&mut module, &mut sig_types, sig);
+                }
+                Inst::InvokeDelegate {
+                    args, returns_value, ..
+                } => {
+                    needs_table = true;
+                    let result_ty = call_result_ty(*returns_value, *result, &func.value_types);
+                    let without = call_site_type(args, result_ty, &func.value_types)?;
+                    let mut with = without.clone();
+                    with.params.insert(0, ValType::I32);
+                    intern_sig(&mut module, &mut sig_types, without);
+                    intern_sig(&mut module, &mut sig_types, with);
+                }
+                _ => {}
+            }
+        }
+    }
+    if needs_table {
+        module.enable_func_table();
+    }
+
+    let ctx = WasmCtx {
+        funcs: &program,
+        desc_addr,
+        sig_types,
+    };
     for func in &program {
         let type_index = module.add_type(func_type(func)?);
-        let body = lower_function(func, &program)?;
+        let body = lower_function(func, &ctx)?;
         module.add_function(type_index, body);
     }
     if with_allocator && has_memory {
@@ -420,7 +485,146 @@ fn uses_memory(funcs: &[Function]) -> bool {
 /// Lowers one function body: the value-to-local map (the entry block's parameters are the
 /// WebAssembly parameters at locals `0..n`; every other value gets a fresh local), then the
 /// structured control flow emitted from the dominator tree.
-fn lower_function(func: &Function, funcs: &[Function]) -> Result<Func, LowerError> {
+/// The module-level context threaded through function lowering: the program (a direct call's
+/// arity/result), each type's descriptor address (the Alloc header + `TypeDescAddr` value), and the
+/// interned indirect-call signatures (a call site's [`FuncType`] -> its module type index).
+struct WasmCtx<'a> {
+    funcs: &'a [Function],
+    desc_addr: BTreeMap<u32, i32>,
+    sig_types: Vec<(FuncType, u32)>,
+}
+
+impl WasmCtx<'_> {
+    /// The module type index for a `call_indirect` of signature `sig` (interned during module setup).
+    fn indirect_type(&self, sig: &FuncType) -> Result<u32, LowerError> {
+        self.sig_types
+            .iter()
+            .find(|(s, _)| s == sig)
+            .map(|(_, i)| *i)
+            .ok_or(LowerError::Unsupported)
+    }
+}
+
+/// The `call_indirect` signature of a call site: each argument's value type as a parameter, the call's
+/// result value type (if any) as the single result. `call_indirect` is signature-checked, so this must
+/// exactly match the target function's own type.
+fn call_site_type(
+    args: &[ValueId],
+    result_ty: Option<MirType>,
+    value_types: &[MirType],
+) -> Result<FuncType, LowerError> {
+    let mut params = Vec::with_capacity(args.len());
+    for &a in args {
+        params.push(valtype(
+            *value_types.get(a.index()).ok_or(LowerError::Unsupported)?,
+        )?);
+    }
+    let results = match result_ty {
+        Some(t) => alloc::vec![valtype(t)?],
+        None => Vec::new(),
+    };
+    Ok(FuncType { params, results })
+}
+
+/// The result type of an indirect call's signature: the result value's type when the callee returns a
+/// value, or `None` for a `void` callee (whose `call_indirect` signature must have no result). The
+/// result value carries a placeholder type even for `void`, so `returns_value` is the authority.
+fn call_result_ty(returns_value: bool, result: ValueId, value_types: &[MirType]) -> Option<MirType> {
+    if returns_value {
+        value_types.get(result.index()).copied()
+    } else {
+        None
+    }
+}
+
+/// Interns `sig` in the module's type section (for `call_indirect`) and records it with its index.
+fn intern_sig(module: &mut Module, sig_types: &mut Vec<(FuncType, u32)>, sig: FuncType) {
+    if sig_types.iter().any(|(s, _)| *s == sig) {
+        return;
+    }
+    let index = module.add_type(sig.clone());
+    sig_types.push((sig, index));
+}
+
+/// Lays each allocated or queried type's descriptor in linear memory from `base`. Per type the vtable
+/// (function = table indices) is laid BEFORE a fixed metadata block so slot `k` is `[desc - 4 - k*4]`,
+/// and `desc` (the address in the map -- the object header + `TypeDescAddr` value) points at:
+/// `[id @ desc+0][base_ptr @ desc+4][itable_count @ desc+8][(tag, funcref-index) @ desc+12 ...]`. The
+/// `base_ptr` is the base type's descriptor address (0 at the chain's end), which a `castclass`/`isinst`
+/// scan walks; the base types are added transitively so the whole chain is present. Returns the data
+/// segments, the `handle -> descriptor address` map, and the next free offset. Two passes: assign every
+/// descriptor an address, then lay the bytes (so a `base_ptr` can reference an address assigned later).
+fn layout_descriptors(
+    program: &[Function],
+    descriptors: &[TypeMeta],
+    base: u32,
+) -> (Vec<(u32, Vec<u8>)>, BTreeMap<u32, i32>, u32) {
+    let base_of = |h: u32| {
+        descriptors
+            .iter()
+            .find(|m| m.handle.0 == h)
+            .and_then(|m| m.base)
+            .map(|b| b.0)
+    };
+    let mut handles: Vec<u32> = Vec::new();
+    for (_, inst) in program
+        .iter()
+        .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
+    {
+        let handle = match inst {
+            Inst::Alloc { handle, .. } | Inst::TypeDescAddr { handle } => handle.0,
+            _ => continue,
+        };
+        if !handles.contains(&handle) {
+            handles.push(handle);
+        }
+    }
+    let mut i = 0;
+    while i < handles.len() {
+        if let Some(b) = base_of(handles[i]) {
+            if !handles.contains(&b) {
+                handles.push(b);
+            }
+        }
+        i += 1;
+    }
+
+    let mut map = BTreeMap::new();
+    let mut next = base;
+    for &handle in &handles {
+        let meta = descriptors.iter().find(|m| m.handle.0 == handle);
+        let vlen = meta.map(|m| m.vtable.len()).unwrap_or(0) as u32;
+        let ilen = meta.map(|m| m.itable.len()).unwrap_or(0) as u32;
+        map.insert(handle, (next + vlen * 4) as i32);
+        next += vlen * 4 + 12 + ilen * 8;
+    }
+
+    let mut segments = Vec::new();
+    for &handle in &handles {
+        let meta = descriptors.iter().find(|m| m.handle.0 == handle);
+        let vtable = meta.map(|m| m.vtable.as_slice()).unwrap_or(&[]);
+        let itable = meta.map(|m| m.itable.as_slice()).unwrap_or(&[]);
+        let desc_addr = map[&handle] as u32;
+        let base_ptr = base_of(handle)
+            .and_then(|b| map.get(&b).copied())
+            .unwrap_or(0) as u32;
+        let mut blob = Vec::with_capacity((vtable.len() + 3 + itable.len() * 2) * 4);
+        for &func_index in vtable.iter().rev() {
+            blob.extend_from_slice(&func_index.to_le_bytes());
+        }
+        blob.extend_from_slice(&handle.to_le_bytes());
+        blob.extend_from_slice(&base_ptr.to_le_bytes());
+        blob.extend_from_slice(&(itable.len() as u32).to_le_bytes());
+        for &(tag, func_index) in itable {
+            blob.extend_from_slice(&tag.to_le_bytes());
+            blob.extend_from_slice(&func_index.to_le_bytes());
+        }
+        segments.push((desc_addr - (vtable.len() as u32) * 4, blob));
+    }
+    (segments, map, next)
+}
+
+fn lower_function(func: &Function, ctx: &WasmCtx) -> Result<Func, LowerError> {
     let entry = &func.blocks[func.entry.index()];
     if entry.params.len() != func.params.len() {
         return Err(LowerError::ControlFlowUnsupported);
@@ -443,7 +647,7 @@ fn lower_function(func: &Function, funcs: &[Function]) -> Result<Func, LowerErro
     emit_tree(
         &cfg,
         func,
-        funcs,
+        ctx,
         &local_of,
         &mut body,
         &mut scopes,
@@ -647,7 +851,7 @@ fn intersect(mut a: usize, mut b: usize, idom: &[u32], rpo_index: &[u32]) -> usi
 fn emit_tree(
     cfg: &Cfg,
     func: &Function,
-    funcs: &[Function],
+    ctx: &WasmCtx,
     local_of: &[u32],
     body: &mut Func,
     scopes: &mut Vec<Scope>,
@@ -660,12 +864,12 @@ fn emit_tree(
             block: x,
         });
         let merges = cfg.merge_children(x);
-        emit_branches(cfg, func, funcs, local_of, body, scopes, x, &merges)?;
+        emit_branches(cfg, func, ctx, local_of, body, scopes, x, &merges)?;
         scopes.pop();
         body.end();
     } else {
         let merges = cfg.merge_children(x);
-        emit_branches(cfg, func, funcs, local_of, body, scopes, x, &merges)?;
+        emit_branches(cfg, func, ctx, local_of, body, scopes, x, &merges)?;
     }
     Ok(())
 }
@@ -677,7 +881,7 @@ fn emit_tree(
 fn emit_branches(
     cfg: &Cfg,
     func: &Function,
-    funcs: &[Function],
+    ctx: &WasmCtx,
     local_of: &[u32],
     body: &mut Func,
     scopes: &mut Vec<Scope>,
@@ -685,17 +889,17 @@ fn emit_branches(
     merges: &[BlockId],
 ) -> Result<(), LowerError> {
     match merges.split_last() {
-        None => emit_node(cfg, func, funcs, local_of, body, scopes, x),
+        None => emit_node(cfg, func, ctx, local_of, body, scopes, x),
         Some((&outer, rest)) => {
             body.block(BlockType::Empty);
             scopes.push(Scope {
                 kind: ScopeKind::Block,
                 block: outer,
             });
-            emit_branches(cfg, func, funcs, local_of, body, scopes, x, rest)?;
+            emit_branches(cfg, func, ctx, local_of, body, scopes, x, rest)?;
             scopes.pop();
             body.end();
-            emit_tree(cfg, func, funcs, local_of, body, scopes, outer)
+            emit_tree(cfg, func, ctx, local_of, body, scopes, outer)
         }
     }
 }
@@ -705,7 +909,7 @@ fn emit_branches(
 fn emit_node(
     cfg: &Cfg,
     func: &Function,
-    funcs: &[Function],
+    ctx: &WasmCtx,
     local_of: &[u32],
     body: &mut Func,
     scopes: &mut Vec<Scope>,
@@ -714,7 +918,7 @@ fn emit_node(
     let block = &func.blocks[x.index()];
     let local = |v: ValueId| local_of[v.index()];
     for (result, inst) in &block.insts {
-        lower_inst(body, &local, &func.value_types, funcs, *result, inst)?;
+        lower_inst(body, &local, &func.value_types, ctx, *result, inst)?;
     }
     match block.terminator.as_ref() {
         Some(Terminator::Return(value)) => {
@@ -729,7 +933,7 @@ fn emit_node(
             Ok(())
         }
         Some(Terminator::Jump { target, args }) => {
-            emit_edge(cfg, func, funcs, local_of, body, scopes, x, *target, args)
+            emit_edge(cfg, func, ctx, local_of, body, scopes, x, *target, args)
         }
         Some(Terminator::Branch {
             cond,
@@ -738,7 +942,7 @@ fn emit_node(
             if_false,
             false_args,
         }) => emit_cond_branch(
-            cfg, func, funcs, local_of, body, scopes, x, *cond, *if_true, true_args, *if_false,
+            cfg, func, ctx, local_of, body, scopes, x, *cond, *if_true, true_args, *if_false,
             false_args,
         ),
         None => Err(LowerError::ControlFlowUnsupported),
@@ -771,7 +975,7 @@ fn disposition(cfg: &Cfg, x: BlockId, t: BlockId) -> Disposition {
 fn emit_edge(
     cfg: &Cfg,
     func: &Function,
-    funcs: &[Function],
+    ctx: &WasmCtx,
     local_of: &[u32],
     body: &mut Func,
     scopes: &mut Vec<Scope>,
@@ -783,7 +987,7 @@ fn emit_edge(
     match disposition(cfg, x, target) {
         Disposition::BackEdge => body.br(depth_of(scopes, ScopeKind::Loop, target)?),
         Disposition::ForwardMerge => body.br(depth_of(scopes, ScopeKind::Block, target)?),
-        Disposition::Inline => emit_tree(cfg, func, funcs, local_of, body, scopes, target)?,
+        Disposition::Inline => emit_tree(cfg, func, ctx, local_of, body, scopes, target)?,
     }
     Ok(())
 }
@@ -796,7 +1000,7 @@ fn emit_edge(
 fn emit_cond_branch(
     cfg: &Cfg,
     func: &Function,
-    funcs: &[Function],
+    ctx: &WasmCtx,
     local_of: &[u32],
     body: &mut Func,
     scopes: &mut Vec<Scope>,
@@ -826,13 +1030,13 @@ fn emit_cond_branch(
         (Some(dt_depth), None) => {
             body.local_get(cond_local);
             body.br_if(dt_depth?);
-            emit_tree(cfg, func, funcs, local_of, body, scopes, if_false)
+            emit_tree(cfg, func, ctx, local_of, body, scopes, if_false)
         }
         (None, Some(df_depth)) => {
             body.local_get(cond_local);
             body.i32_eqz();
             body.br_if(df_depth?);
-            emit_tree(cfg, func, funcs, local_of, body, scopes, if_true)
+            emit_tree(cfg, func, ctx, local_of, body, scopes, if_true)
         }
         (None, None) => {
             body.local_get(cond_local);
@@ -841,9 +1045,9 @@ fn emit_cond_branch(
                 kind: ScopeKind::If,
                 block: x,
             });
-            emit_tree(cfg, func, funcs, local_of, body, scopes, if_true)?;
+            emit_tree(cfg, func, ctx, local_of, body, scopes, if_true)?;
             body.else_();
-            emit_tree(cfg, func, funcs, local_of, body, scopes, if_false)?;
+            emit_tree(cfg, func, ctx, local_of, body, scopes, if_false)?;
             scopes.pop();
             body.end();
             Ok(())
@@ -906,7 +1110,7 @@ fn lower_inst(
     body: &mut Func,
     local: &impl Fn(ValueId) -> u32,
     value_types: &[MirType],
-    funcs: &[Function],
+    ctx: &WasmCtx,
     result: ValueId,
     inst: &Inst,
 ) -> Result<(), LowerError> {
@@ -961,7 +1165,10 @@ fn lower_inst(
                 body.local_get(local(arg));
             }
             body.call(*callee);
-            let returns_value = funcs.get(*callee as usize).is_some_and(|f| f.ret.is_some());
+            let returns_value = ctx
+                .funcs
+                .get(*callee as usize)
+                .is_some_and(|f| f.ret.is_some());
             if returns_value {
                 body.local_set(local(result));
             }
@@ -998,9 +1205,20 @@ fn lower_inst(
             if !is_addressable(value_types, *base) {
                 return Err(LowerError::Unsupported);
             }
-            body.local_get(local(*base));
-            emit_typed_load(body, value_types[result.index()], *offset)?;
-            body.local_set(local(result));
+            if let MirType::ValueType { size, .. } = value_types[result.index()] {
+                emit_bump(body, size.next_multiple_of(8) as i32);
+                body.local_set(local(result));
+                for word in 0..size.div_ceil(4) {
+                    body.local_get(local(result));
+                    body.local_get(local(*base));
+                    body.i32_load(MemArg::new(4, *offset + word * 4));
+                    body.i32_store(MemArg::new(4, word * 4));
+                }
+            } else {
+                body.local_get(local(*base));
+                emit_typed_load(body, value_types[result.index()], *offset)?;
+                body.local_set(local(result));
+            }
         }
         Inst::FieldStore {
             base,
@@ -1010,9 +1228,18 @@ fn lower_inst(
             if !is_addressable(value_types, *base) {
                 return Err(LowerError::Unsupported);
             }
-            body.local_get(local(*base));
-            body.local_get(local(*value));
-            emit_typed_store(body, value_types[value.index()], *offset)?;
+            if let MirType::ValueType { size, .. } = value_types[value.index()] {
+                for word in 0..size.div_ceil(4) {
+                    body.local_get(local(*base));
+                    body.local_get(local(*value));
+                    body.i32_load(MemArg::new(4, word * 4));
+                    body.i32_store(MemArg::new(4, *offset + word * 4));
+                }
+            } else {
+                body.local_get(local(*base));
+                body.local_get(local(*value));
+                emit_typed_store(body, value_types[value.index()], *offset)?;
+            }
         }
         Inst::FieldAddr { base, offset } => {
             if !is_addressable(value_types, *base) {
@@ -1025,8 +1252,40 @@ fn lower_inst(
             }
             body.local_set(local(result));
         }
-        Inst::Alloc { payload_size, .. } => {
-            emit_bump(body, payload_size.next_multiple_of(8) as i32);
+        Inst::Alloc {
+            handle,
+            payload_size,
+            ..
+        } => {
+            let desc = ctx
+                .desc_addr
+                .get(&handle.0)
+                .copied()
+                .unwrap_or(handle.0 as i32);
+            emit_bump(body, (4 + payload_size.next_multiple_of(8)) as i32);
+            body.local_set(local(result));
+            body.local_get(local(result));
+            body.i32_const(desc);
+            body.i32_store(MemArg::new(4, 0));
+            body.local_get(local(result));
+            body.i32_const(4);
+            body.i32_add();
+            body.local_set(local(result));
+        }
+        Inst::TypeDescAddr { handle } => {
+            let desc = ctx
+                .desc_addr
+                .get(&handle.0)
+                .copied()
+                .unwrap_or(handle.0 as i32);
+            body.i32_const(desc);
+            body.local_set(local(result));
+        }
+        Inst::LoadTypeDesc { object } => {
+            body.local_get(local(*object));
+            body.i32_const(4);
+            body.i32_sub();
+            body.i32_load(MemArg::new(4, 0));
             body.local_set(local(result));
         }
         Inst::InitStruct => {
@@ -1148,6 +1407,192 @@ fn lower_inst(
             emit_2d_element_address(body, local, *array, *index0, *index1, *element_size);
             body.local_get(local(*value));
             emit_array_store(body, *element_size, value_types[value.index()])?;
+        }
+        Inst::FuncAddr { func } => {
+            body.i32_const(*func as i32);
+            body.local_set(local(result));
+        }
+        Inst::VirtualFuncAddr { object, slot } => {
+            let offset = i32::try_from(4 + slot * 4).map_err(|_| LowerError::Unsupported)?;
+            body.local_get(local(*object));
+            body.i32_const(4);
+            body.i32_sub();
+            body.i32_load(MemArg::new(4, 0));
+            body.i32_const(offset);
+            body.i32_sub();
+            body.i32_load(MemArg::new(4, 0));
+            body.local_set(local(result));
+        }
+        Inst::CallVirtual {
+            slot,
+            args,
+            returns_value,
+        } => {
+            let receiver = *args.first().ok_or(LowerError::Unsupported)?;
+            let offset = i32::try_from(4 + slot * 4).map_err(|_| LowerError::Unsupported)?;
+            let result_ty = call_result_ty(*returns_value, result, value_types);
+            let sig = call_site_type(args, result_ty, value_types)?;
+            let type_index = ctx.indirect_type(&sig)?;
+            for &arg in args.iter() {
+                body.local_get(local(arg));
+            }
+            body.local_get(local(receiver));
+            body.i32_const(4);
+            body.i32_sub();
+            body.i32_load(MemArg::new(4, 0));
+            body.i32_const(offset);
+            body.i32_sub();
+            body.i32_load(MemArg::new(4, 0));
+            body.call_indirect(type_index, 0);
+            if *returns_value {
+                body.local_set(local(result));
+            }
+        }
+        Inst::CallInterface {
+            tag,
+            args,
+            returns_value,
+        } => {
+            let receiver = *args.first().ok_or(LowerError::Unsupported)?;
+            let result_ty = call_result_ty(*returns_value, result, value_types);
+            let sig = call_site_type(args, result_ty, value_types)?;
+            let type_index = ctx.indirect_type(&sig)?;
+            let desc = body.add_local(ValType::I32);
+            let ptr = body.add_local(ValType::I32);
+            let count = body.add_local(ValType::I32);
+            let found = body.add_local(ValType::I32);
+            for &arg in args.iter() {
+                body.local_get(local(arg));
+            }
+            body.local_get(local(receiver));
+            body.i32_const(4);
+            body.i32_sub();
+            body.i32_load(MemArg::new(4, 0));
+            body.local_set(desc);
+            body.local_get(desc);
+            body.i32_load(MemArg::new(4, 8));
+            body.local_set(count);
+            body.local_get(desc);
+            body.i32_const(12);
+            body.i32_add();
+            body.local_set(ptr);
+            body.loop_(BlockType::Empty);
+            body.local_get(count);
+            body.i32_eqz();
+            body.if_(BlockType::Empty);
+            body.unreachable();
+            body.end();
+            body.local_get(ptr);
+            body.i32_load(MemArg::new(4, 0));
+            body.i32_const(*tag as i32);
+            body.i32_eq();
+            body.if_(BlockType::Empty);
+            body.local_get(ptr);
+            body.i32_load(MemArg::new(4, 4));
+            body.local_set(found);
+            body.else_();
+            body.local_get(ptr);
+            body.i32_const(8);
+            body.i32_add();
+            body.local_set(ptr);
+            body.local_get(count);
+            body.i32_const(1);
+            body.i32_sub();
+            body.local_set(count);
+            body.br(1);
+            body.end();
+            body.end();
+            body.local_get(found);
+            body.call_indirect(type_index, 0);
+            if *returns_value {
+                body.local_set(local(result));
+            }
+        }
+        Inst::CallIndirect {
+            target,
+            args,
+            returns_value,
+        } => {
+            let result_ty = call_result_ty(*returns_value, result, value_types);
+            let sig = call_site_type(args, result_ty, value_types)?;
+            let type_index = ctx.indirect_type(&sig)?;
+            for &arg in args.iter() {
+                body.local_get(local(arg));
+            }
+            body.local_get(local(*target));
+            body.call_indirect(type_index, 0);
+            if *returns_value {
+                body.local_set(local(result));
+            }
+        }
+        Inst::InvokeDelegate {
+            delegate,
+            args,
+            returns_value,
+        } => {
+            let result_ty = call_result_ty(*returns_value, result, value_types);
+            let without = call_site_type(args, result_ty, value_types)?;
+            let mut with = without.clone();
+            with.params.insert(0, ValType::I32);
+            let without_idx = ctx.indirect_type(&without)?;
+            let with_idx = ctx.indirect_type(&with)?;
+            let bt = match result_ty {
+                Some(t) => BlockType::Value(valtype(t)?),
+                None => BlockType::Empty,
+            };
+            body.local_get(local(*delegate));
+            body.i32_load(MemArg::new(4, 0));
+            body.if_(bt);
+            body.local_get(local(*delegate));
+            body.i32_load(MemArg::new(4, 0));
+            for &arg in args.iter() {
+                body.local_get(local(arg));
+            }
+            body.local_get(local(*delegate));
+            body.i32_load(MemArg::new(4, 4));
+            body.call_indirect(with_idx, 0);
+            body.else_();
+            for &arg in args.iter() {
+                body.local_get(local(arg));
+            }
+            body.local_get(local(*delegate));
+            body.i32_load(MemArg::new(4, 4));
+            body.call_indirect(without_idx, 0);
+            body.end();
+            if result_ty.is_some() {
+                body.local_set(local(result));
+            }
+        }
+        Inst::CastClassScan { args } => {
+            let start = *args.first().ok_or(LowerError::Unsupported)?;
+            let target = *args.get(1).ok_or(LowerError::Unsupported)?;
+            let cur = body.add_local(ValType::I32);
+            let res = body.add_local(ValType::I32);
+            body.local_get(local(start));
+            body.local_set(cur);
+            body.loop_(BlockType::Empty);
+            body.local_get(cur);
+            body.local_get(local(target));
+            body.i32_eq();
+            body.if_(BlockType::Empty);
+            body.i32_const(1);
+            body.local_set(res);
+            body.else_();
+            body.local_get(cur);
+            body.i32_load(MemArg::new(4, 4));
+            body.local_set(cur);
+            body.local_get(cur);
+            body.i32_eqz();
+            body.if_(BlockType::Empty);
+            body.i32_const(0);
+            body.local_set(res);
+            body.else_();
+            body.br(2);
+            body.end();
+            body.end();
+            body.end();
+            body.local_get(res);
+            body.local_set(local(result));
         }
         _ => return Err(LowerError::Unsupported),
     }
@@ -1447,6 +1892,8 @@ fn emit_convert(body: &mut Func, kind: ConvKind) -> Result<(), LowerError> {
         }
         ConvKind::Float32ToInt => body.i32_trunc_f32_s(),
         ConvKind::IntToFloat32 => body.f32_convert_i32_s(),
+        ConvKind::Float64ToInt => body.i32_trunc_f64_s(),
+        ConvKind::IntToRef | ConvKind::RefToInt => {}
     }
     Ok(())
 }
@@ -1883,6 +2330,428 @@ mod tests {
         let bytes = lower(&object_fields()).expect("object field access lowers to WASM");
         assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
         assert!(bytes.len() > 16);
+    }
+
+    /// A nested value-type field-access shape: a scalar-filled struct copied into a second struct by
+    /// value (a struct-valued `FieldStore`), then read back by value (a struct-valued `FieldLoad`) and
+    /// its fields summed -> 42. Exercises the struct-valued field-copy path a flat scalar load/store
+    /// cannot express -- the regression guard for the nested/boxed field-access lowering.
+    fn nested_struct_fields() -> Function {
+        let i32t = MirType::I32;
+        let vt = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(1),
+            size: 8,
+        };
+        let cint = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+        let scalar_store = |base, offset, value| Inst::FieldStore {
+            base,
+            offset,
+            value,
+        };
+        Function {
+            params: Vec::new(),
+            ret: Some(i32t),
+            value_types: alloc::vec![vt, i32t, i32t, i32t, i32t, vt, i32t, vt, i32t, i32t, i32t],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (ValueId(0), Inst::InitStruct),
+                    (ValueId(1), cint(40)),
+                    (ValueId(2), scalar_store(ValueId(0), 0, ValueId(1))),
+                    (ValueId(3), cint(2)),
+                    (ValueId(4), scalar_store(ValueId(0), 4, ValueId(3))),
+                    (ValueId(5), Inst::InitStruct),
+                    (ValueId(6), scalar_store(ValueId(5), 0, ValueId(0))),
+                    (
+                        ValueId(7),
+                        Inst::FieldLoad {
+                            base: ValueId(5),
+                            offset: 0,
+                        },
+                    ),
+                    (
+                        ValueId(8),
+                        Inst::FieldLoad {
+                            base: ValueId(7),
+                            offset: 0,
+                        },
+                    ),
+                    (
+                        ValueId(9),
+                        Inst::FieldLoad {
+                            base: ValueId(7),
+                            offset: 4,
+                        },
+                    ),
+                    (
+                        ValueId(10),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(8),
+                            rhs: ValueId(9),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(10)))),
+            }],
+        }
+    }
+
+    #[test]
+    fn lowers_struct_valued_field_access() {
+        let bytes =
+            lower(&nested_struct_fields()).expect("struct-valued field access lowers to WASM");
+        assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
+        assert!(uses_memory(&[nested_struct_fields()]));
+    }
+
+    /// The box/unbox type-check shape: allocate a boxed object (a type-id header + payload), read the
+    /// header back (`LoadTypeDesc`), and compare it to the type's descriptor (`TypeDescAddr`). Exercises
+    /// the flat-wasm boxing path -- the header write plus the two type-descriptor ops.
+    fn boxed_type_check() -> Function {
+        let i32t = MirType::I32;
+        Function {
+            params: Vec::new(),
+            ret: Some(i32t),
+            value_types: alloc::vec![MirType::ObjectRef, i32t, i32t, i32t],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(7),
+                            payload_size: 4,
+                            ref_offsets: alloc::vec![].into_boxed_slice(),
+                        },
+                    ),
+                    (ValueId(1), Inst::LoadTypeDesc { object: ValueId(0) }),
+                    (
+                        ValueId(2),
+                        Inst::TypeDescAddr {
+                            handle: lamella_ir::TypeHandle(7),
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::Compare {
+                            op: CmpOp::Eq,
+                            lhs: ValueId(1),
+                            rhs: ValueId(2),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(3)))),
+            }],
+        }
+    }
+
+    #[test]
+    fn lowers_boxed_type_check() {
+        let bytes = lower(&boxed_type_check()).expect("the boxing type-check lowers to WASM");
+        assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
+        assert!(uses_memory(&[boxed_type_check()]));
+    }
+
+    /// A `callvirt` lowers to a `call_indirect` through the funcref table: func0 allocates a type whose
+    /// vtable slot 0 is func1, then dispatches -- so the module gains a table section, an element
+    /// segment, and the indirect-call opcode (previously `CallVirtual` was `Unsupported`).
+    #[test]
+    fn lowers_a_callvirt_to_call_indirect() {
+        let caller = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(1),
+                            payload_size: 4,
+                            ref_offsets: alloc::vec![].into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::CallVirtual {
+                            slot: 0,
+                            args: alloc::vec![ValueId(0)],
+                            returns_value: true,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let target = Function {
+            params: alloc::vec![MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: alloc::vec![ValueId(0)],
+                insts: alloc::vec![(
+                    ValueId(1),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 42,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let descriptors = alloc::vec![TypeMeta {
+            handle: lamella_ir::TypeHandle(1),
+            type_tag: 0,
+            vtable: alloc::vec![1],
+            itable: Vec::new(),
+            base: None,
+        }];
+        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
+            .expect("the callvirt lowers to WASM");
+        assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
+        assert!(bytes.contains(&0x11), "the call_indirect opcode is emitted");
+        assert!(
+            bytes.windows(2).any(|w| w == [0x70, 0x00]),
+            "a funcref table is declared"
+        );
+    }
+
+    /// An interface `callvirt` lowers to an itable search + `call_indirect`: the descriptor carries the
+    /// `(tag, funcref-index)` pair in a data segment, and the module gains the indirect-call opcode
+    /// (previously `CallInterface` was `Unsupported` on wasm).
+    #[test]
+    fn lowers_a_callinterface_to_itable_search() {
+        const TAG: u32 = 0x8000_1234;
+        let caller = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(1),
+                            payload_size: 4,
+                            ref_offsets: alloc::vec![].into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::CallInterface {
+                            tag: TAG,
+                            args: alloc::vec![ValueId(0)],
+                            returns_value: true,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let target = Function {
+            params: alloc::vec![MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: alloc::vec![ValueId(0)],
+                insts: alloc::vec![(
+                    ValueId(1),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 42,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let descriptors = alloc::vec![TypeMeta {
+            handle: lamella_ir::TypeHandle(1),
+            type_tag: 0,
+            vtable: Vec::new(),
+            itable: alloc::vec![(TAG, 1)],
+            base: None,
+        }];
+        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
+            .expect("the interface call lowers to WASM");
+        assert!(bytes.contains(&0x11), "the call_indirect opcode is emitted");
+        assert!(
+            bytes.windows(4).any(|w| w == TAG.to_le_bytes()),
+            "the interface tag is laid in the itable data"
+        );
+    }
+
+    /// A `castclass`/`isinst` chain lowers (`CastClassScan` was `Unsupported`), and the descriptors are
+    /// laid with a base_ptr chain: allocating a Dog (handle 2, base Animal handle 1) and scanning toward
+    /// Animal lays BOTH descriptors -- Animal added transitively even though it is never allocated.
+    #[test]
+    fn lowers_a_castclass_chain_with_base_ptrs() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(2),
+                            payload_size: 4,
+                            ref_offsets: alloc::vec![].into_boxed_slice(),
+                        },
+                    ),
+                    (ValueId(1), Inst::LoadTypeDesc { object: ValueId(0) }),
+                    (
+                        ValueId(2),
+                        Inst::TypeDescAddr {
+                            handle: lamella_ir::TypeHandle(1),
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::CastClassScan {
+                            args: alloc::vec![ValueId(1), ValueId(2)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(3)))),
+            }],
+        };
+        let descriptors = alloc::vec![
+            TypeMeta {
+                handle: lamella_ir::TypeHandle(2),
+                type_tag: 0,
+                vtable: Vec::new(),
+                itable: Vec::new(),
+                base: Some(lamella_ir::TypeHandle(1)),
+            },
+            TypeMeta {
+                handle: lamella_ir::TypeHandle(1),
+                type_tag: 0,
+                vtable: Vec::new(),
+                itable: Vec::new(),
+                base: None,
+            },
+        ];
+        let bytes = lower_module_with_exports(&[main], &[("main", 0)], &descriptors)
+            .expect("the castclass chain lowers to WASM");
+        assert!(
+            bytes.windows(4).any(|w| w == 1u32.to_le_bytes()),
+            "Animal's descriptor (added transitively) is laid"
+        );
+        assert!(
+            bytes.windows(4).any(|w| w == 2u32.to_le_bytes()),
+            "Dog's descriptor is laid"
+        );
+    }
+
+    /// A VOID `callvirt` (`returns_value: false`) interns a no-result signature, so `call_indirect`
+    /// matches a `void` target -- previously the assumed i32 result trapped as a type mismatch.
+    #[test]
+    fn lowers_a_void_callvirt_to_a_void_signature() {
+        let caller = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(1),
+                            payload_size: 4,
+                            ref_offsets: alloc::vec![].into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::CallVirtual {
+                            slot: 0,
+                            args: alloc::vec![ValueId(0)],
+                            returns_value: false,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 42,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let target = Function {
+            params: alloc::vec![MirType::ObjectRef],
+            ret: None,
+            value_types: alloc::vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: alloc::vec![ValueId(0)],
+                insts: Vec::new(),
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        let descriptors = alloc::vec![TypeMeta {
+            handle: lamella_ir::TypeHandle(1),
+            type_tag: 0,
+            vtable: alloc::vec![1],
+            itable: Vec::new(),
+            base: None,
+        }];
+        let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
+            .expect("the void callvirt lowers to WASM");
+        assert!(
+            bytes.windows(4).any(|w| w == [0x60, 0x01, 0x7F, 0x00]),
+            "a void (i32)->() signature is interned for the call_indirect"
+        );
+    }
+
+    /// The `isinst` reinterpret round-trip lowers: an `ObjectRef` retyped to `i32` and back (the no-op
+    /// `RefToInt`/`IntToRef` conversions) so a reference can pass through integer mask arithmetic.
+    #[test]
+    fn lowers_reinterpret_round_trip() {
+        let func = Function {
+            params: alloc::vec![MirType::ObjectRef],
+            ret: Some(MirType::ObjectRef),
+            value_types: alloc::vec![MirType::ObjectRef, MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: alloc::vec![ValueId(0)],
+                insts: alloc::vec![
+                    (
+                        ValueId(1),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: lamella_ir::ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Convert {
+                            value: ValueId(1),
+                            kind: lamella_ir::ConvKind::IntToRef,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let bytes = lower(&func).expect("the reinterpret round-trip lowers to WASM");
+        assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
     }
 
     #[test]

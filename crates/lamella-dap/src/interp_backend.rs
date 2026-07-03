@@ -27,6 +27,8 @@ pub struct InterpreterBackend {
     breakpoints: Vec<(u32, u32)>,
     /// UTF-16 code units of console output already drained by [`Self::take_output`].
     output_sent: usize,
+    /// UTF-16 code units of debug-channel output already drained by [`Self::take_debug_output`].
+    debug_sent: usize,
     /// The standalone Portable PDB bytes, when source mapping is available.
     pdb: Option<Vec<u8>>,
     /// `MethodId` -> `MethodDef` rid: the reverse of the module's token binding, so a
@@ -65,6 +67,7 @@ impl InterpreterBackend {
             session: None,
             breakpoints: Vec::new(),
             output_sent: 0,
+            debug_sent: 0,
             pdb: None,
             method_rid: BTreeMap::new(),
             seq_boundaries: BTreeMap::new(),
@@ -103,6 +106,7 @@ impl InterpreterBackend {
             session: None,
             breakpoints: Vec::new(),
             output_sent: 0,
+            debug_sent: 0,
             pdb: Some(pdb_bytes),
             method_rid,
             seq_boundaries,
@@ -446,6 +450,17 @@ impl DebugBackend for InterpreterBackend {
         if output.len() > self.output_sent {
             let text = String::from_utf16_lossy(&output[self.output_sent..]);
             self.output_sent = output.len();
+            Some(text)
+        } else {
+            None
+        }
+    }
+
+    fn take_debug_output(&mut self) -> Option<String> {
+        let output = self.vm.debug_output();
+        if output.len() > self.debug_sent {
+            let text = String::from_utf16_lossy(&output[self.debug_sent..]);
+            self.debug_sent = output.len();
             Some(text)
         } else {
             None

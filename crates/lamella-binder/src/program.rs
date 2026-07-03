@@ -1,6 +1,6 @@
 //! Binding a whole compilation unit (ECMA-334 1st ed, clause 16).
 
-use crate::bind::bind_type;
+use crate::bind::{bind_type, parameter_symbol};
 use crate::bound::Binder;
 use crate::declaration::collect_into;
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
@@ -52,6 +52,34 @@ pub fn bind_compilation_unit_with_model(
     binder.into_diagnostics()
 }
 
+/// Binds several compilation units as ONE program (a multi-file compilation, 16.1):
+/// every unit's declared types enter one model first -- so each file names the others'
+/// types -- then each unit's bodies are bound against the whole. Returns one diagnostic
+/// list per unit, in order, so a driver attributes each to its own source file.
+#[must_use]
+pub fn bind_compilation_units_with_references(
+    units: &[CompilationUnit],
+    references: &[Assembly],
+) -> Vec<Vec<Diagnostic>> {
+    let mut model = Model::new();
+    for reference in references {
+        load_assembly(&mut model, reference);
+    }
+    for unit in units {
+        collect_into(&mut model, unit);
+    }
+    model.canonicalize_signatures();
+    model.link_bases();
+    let mut binder = Binder::with_model(model);
+    units
+        .iter()
+        .map(|unit| {
+            bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
+            binder.take_diagnostics()
+        })
+        .collect()
+}
+
 fn bind_namespace_body(
     binder: &mut Binder,
     usings: &[UsingDirective],
@@ -66,6 +94,14 @@ fn bind_namespace_body(
                 binder.import_alias(name, TypeSymbol::Named(target.parts.iter().cloned().collect()));
             }
         }
+    }
+    let mut prefix = String::new();
+    for part in namespace.split('.').filter(|part| !part.is_empty()) {
+        if !prefix.is_empty() {
+            prefix.push('.');
+        }
+        prefix.push_str(part);
+        binder.import_namespace(&prefix);
     }
     for member in members {
         match member {
@@ -111,9 +147,9 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         {
             let key = (
                 name.clone(),
-                bound_parameters(parameters)
-                    .into_iter()
-                    .map(|(_, ty)| ty)
+                parameters
+                    .iter()
+                    .map(parameter_symbol)
                     .collect::<alloc::vec::Vec<_>>(),
             );
             if seen_methods.contains(&key) {
@@ -240,6 +276,36 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                     );
                 }
             }
+            Member::Indexer {
+                ty,
+                parameters,
+                getter,
+                setter,
+                ..
+            } => {
+                let element = bind_type(ty);
+                let indices = bound_parameters(parameters);
+                if let Some(body) = getter.as_ref().and_then(|accessor| accessor.body.as_ref()) {
+                    binder.bind_method(
+                        Some(enclosing.clone()),
+                        "get_Item",
+                        element.clone(),
+                        &indices,
+                        body,
+                    );
+                }
+                if let Some(body) = setter.as_ref().and_then(|accessor| accessor.body.as_ref()) {
+                    let mut indices = indices.clone();
+                    indices.push((Box::from("value"), element.clone()));
+                    binder.bind_method(
+                        Some(enclosing.clone()),
+                        "set_Item",
+                        TypeSymbol::Special(SpecialType::Void),
+                        &indices,
+                        body,
+                    );
+                }
+            }
             Member::Field {
                 ty, declarators, ..
             } => {
@@ -290,7 +356,8 @@ fn bound_parameters(parameters: &[lamella_syntax::ast::Parameter]) -> Vec<(Box<s
         .collect()
 }
 
-/// A named-type symbol from a namespace (empty or dotted) and a simple name.
+/// A named-type symbol from a namespace (empty or dotted) and a simple name; a
+/// `System` built-in folds to its special form.
 fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
     let mut parts: Vec<Box<str>> = Vec::new();
     if !namespace.is_empty() {
@@ -299,7 +366,7 @@ fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
         }
     }
     parts.push(name.into());
-    TypeSymbol::Named(parts.into_boxed_slice())
+    TypeSymbol::Named(parts.into_boxed_slice()).fold_builtin()
 }
 
 /// Appends a (possibly dotted) namespace declaration name to the enclosing one.

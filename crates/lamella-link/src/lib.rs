@@ -92,6 +92,155 @@ pub fn link_at_base_with_residents(
     link_with_base(objects, entry, Some(text_base), residents)
 }
 
+/// As [`link_at_base`], but first runs function-level [`garbage_collect`] from `entry` -- dropping unused
+/// code so its undefined externs fall out and the image shrinks (e.g. linking a program against a whole
+/// corlib pulls only the reached methods).
+pub fn link_at_base_gc(
+    objects: &[Object],
+    entry: &str,
+    text_base: u32,
+) -> Result<LinkedImage, LinkError> {
+    let trimmed = garbage_collect(objects, entry);
+    link_with_base(&trimmed, entry, Some(text_base), &[])
+}
+
+/// Function-level `--gc-sections`: builds the cross-object call/reference graph from `entry`, keeps the
+/// reachable functions (plus all data), and rebuilds each object re-laid-out with its symbols and
+/// relocations remapped -- so unused functions, and the undefined externs only they referenced, drop out.
+pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
+    let mut defs: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for (oi, obj) in objects.iter().enumerate() {
+        for (si, s) in obj.symbols.iter().enumerate() {
+            if s.defined && s.binding != Binding::Local && !s.name.is_empty() {
+                defs.entry(s.name.as_str()).or_insert((oi, si));
+            }
+        }
+    }
+    let mut reachable: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<String> = Vec::new();
+    stack.push(String::from(entry));
+    while let Some(name) = stack.pop() {
+        if !reachable.insert(name.clone()) {
+            continue;
+        }
+        let Some(&(oi, si)) = defs.get(name.as_str()) else {
+            continue;
+        };
+        let obj = &objects[oi];
+        let sym = &obj.symbols[si];
+        if sym.kind != SymbolType::Func {
+            continue;
+        }
+        let start = sym.value & !1;
+        let end = start + sym.size;
+        for r in &obj.relocations {
+            if r.offset >= start && r.offset < end {
+                if let Some(target) = obj.symbols.get(r.symbol as usize) {
+                    stack.push(target.name.clone());
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(objects.len());
+    for obj in objects {
+        out.push(trim_object(obj, &reachable));
+    }
+    out
+}
+
+/// Rebuilds `obj` keeping only reachable functions (plus all data), re-laid-out. A referenced symbol not
+/// among the kept ones stays an undefined extern (the linker resolves it, or errors if genuinely missing).
+fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
+    let mut kept: Vec<usize> = (0..obj.symbols.len())
+        .filter(|&i| {
+            let s = &obj.symbols[i];
+            s.defined
+                && s.size > 0
+                && !s.name.is_empty()
+                && (reachable.contains(&s.name) || s.kind != SymbolType::Func)
+        })
+        .collect();
+    kept.sort_by_key(|&i| obj.symbols[i].value & !1);
+
+    let mut text: Vec<u8> = Vec::new();
+    let mut ranges: Vec<(u32, u32, u32)> = Vec::new();
+    let mut symbols: Vec<lamella_elf::ParsedSymbol> = Vec::new();
+    symbols.push(lamella_elf::ParsedSymbol {
+        name: String::new(),
+        value: 0,
+        size: 0,
+        binding: Binding::Local,
+        kind: SymbolType::NoType,
+        defined: false,
+    });
+    let mut index_of: BTreeMap<String, u32> = BTreeMap::new();
+    for &i in &kept {
+        let s = &obj.symbols[i];
+        let start = s.value & !1;
+        let end = start + s.size;
+        while text.len() % 4 != 0 {
+            text.push(0);
+        }
+        let new_start = text.len() as u32;
+        if let Some(slice) = obj.text.get(start as usize..end as usize) {
+            text.extend_from_slice(slice);
+        }
+        ranges.push((start, end, new_start));
+        index_of.insert(s.name.clone(), symbols.len() as u32);
+        symbols.push(lamella_elf::ParsedSymbol {
+            name: s.name.clone(),
+            value: new_start | (s.value & 1),
+            size: s.size,
+            binding: s.binding,
+            kind: s.kind,
+            defined: true,
+        });
+    }
+
+    let mut relocations: Vec<ParsedRelocation> = Vec::new();
+    for r in &obj.relocations {
+        let Some(&(old_start, _, new_start)) =
+            ranges.iter().find(|(a, b, _)| r.offset >= *a && r.offset < *b)
+        else {
+            continue;
+        };
+        let Some(target) = obj.symbols.get(r.symbol as usize) else {
+            continue;
+        };
+        let idx = match index_of.get(target.name.as_str()) {
+            Some(&i) => i,
+            None => {
+                let i = symbols.len() as u32;
+                symbols.push(lamella_elf::ParsedSymbol {
+                    name: target.name.clone(),
+                    value: 0,
+                    size: 0,
+                    binding: Binding::Global,
+                    kind: target.kind,
+                    defined: false,
+                });
+                index_of.insert(target.name.clone(), i);
+                i
+            }
+        };
+        relocations.push(ParsedRelocation {
+            offset: new_start + (r.offset - old_start),
+            symbol: idx,
+            kind: r.kind,
+            addend: r.addend,
+            implicit_addend: r.implicit_addend,
+        });
+    }
+
+    Object {
+        machine: obj.machine,
+        text,
+        text_align: obj.text_align.max(4),
+        symbols,
+        relocations,
+    }
+}
+
 fn link_with_base(
     objects: &[Object],
     entry: &str,
@@ -109,17 +258,30 @@ fn link_with_base(
     }
 
     let mut defined: Vec<Defined> = Vec::new();
+    let mut strong: BTreeSet<String> = BTreeSet::new();
     for (oi, obj) in objects.iter().enumerate() {
         for sym in &obj.symbols {
-            if sym.defined && sym.binding == Binding::Global && !sym.name.is_empty() {
-                if defined.iter().any(|(n, _, _)| *n == sym.name) {
-                    return Err(LinkError::DuplicateSymbol(sym.name.clone()));
+            if !sym.defined || sym.name.is_empty() || sym.binding == Binding::Local {
+                continue;
+            }
+            let addr = bases[oi] + normalized_value(machine, sym.value);
+            let thumb = is_thumb_func(machine, sym.value);
+            match defined.iter().position(|(n, _, _)| *n == sym.name) {
+                Some(pos) => {
+                    if sym.binding == Binding::Global {
+                        if strong.contains(&sym.name) {
+                            return Err(LinkError::DuplicateSymbol(sym.name.clone()));
+                        }
+                        defined[pos] = (sym.name.clone(), addr, thumb);
+                        strong.insert(sym.name.clone());
+                    }
                 }
-                defined.push((
-                    sym.name.clone(),
-                    bases[oi] + normalized_value(machine, sym.value),
-                    is_thumb_func(machine, sym.value),
-                ));
+                None => {
+                    defined.push((sym.name.clone(), addr, thumb));
+                    if sym.binding == Binding::Global {
+                        strong.insert(sym.name.clone());
+                    }
+                }
             }
         }
     }
@@ -241,7 +403,7 @@ fn undefined_symbols(objects: &[Object]) -> BTreeSet<String> {
     let mut referenced: BTreeSet<String> = BTreeSet::new();
     for o in objects {
         for s in &o.symbols {
-            if s.name.is_empty() || s.binding != Binding::Global {
+            if s.name.is_empty() || s.binding == Binding::Local {
                 continue;
             }
             if s.defined {
@@ -262,7 +424,7 @@ fn undefined_symbols(objects: &[Object]) -> BTreeSet<String> {
 fn defines_any(obj: &Object, undefined: &BTreeSet<String>) -> bool {
     obj.symbols
         .iter()
-        .any(|s| s.defined && s.binding == Binding::Global && undefined.contains(&s.name))
+        .any(|s| s.defined && s.binding != Binding::Local && undefined.contains(&s.name))
 }
 
 /// The single machine all `objects` target; the relocation set is selected from it. Errors if there
@@ -328,6 +490,7 @@ fn apply_relocation(
             arm::R_ARM_ABS32 => {
                 apply_abs32(text, site, text_base, target + addend, target_is_thumb)
             }
+            arm::R_LAMELLA_REL_DESC => encode_rel32(text, site, target + addend - site_i),
             other => Err(LinkError::UnsupportedRelocation(other)),
         },
     }
@@ -722,6 +885,19 @@ fn apply_abs32(
     encode_abs32(text, site, base + value, thumb)
 }
 
+/// Writes the signed 32-bit relative `value` (already `S + A - P`) at `site` as a plain little-endian
+/// word -- no Thumb-bit forcing and no `text_base` (the value is position-independent). The
+/// `R_LAMELLA_REL_DESC` vtable-slot twin of [`encode_abs32`].
+fn encode_rel32(text: &mut [u8], site: u32, value: i64) -> Result<(), LinkError> {
+    let word = value as u32;
+    let site = site as usize;
+    let slot = text
+        .get_mut(site..site + 4)
+        .ok_or(LinkError::RelocationOutOfRange(site as u32))?;
+    slot.copy_from_slice(&word.to_le_bytes());
+    Ok(())
+}
+
 /// Writes the absolute 32-bit `value` (already `text_base + S + A`) at `site`, ORing in `thumb` as
 /// the low bit (the ARM ELF `(S + A) | T`, RISC-V passes `false`). Overwrites the word (so a
 /// `SHT_REL` object's in-place addend is cleared after `relocation_addend` read it).
@@ -779,6 +955,17 @@ mod tests {
         }
     }
 
+    fn weak(name: &'static str, value: u32, size: u32) -> Symbol<'static> {
+        Symbol {
+            name,
+            value,
+            size,
+            binding: Binding::Weak,
+            kind: SymbolType::Func,
+            section: SymbolSection::Text,
+        }
+    }
+
     #[test]
     fn resolves_an_arm_thumb_call_across_two_objects() {
         let caller = obj_arm(
@@ -796,6 +983,82 @@ mod tests {
         assert_eq!(img.entry_offset, 0);
         assert_eq!(&img.text[0..4], &[0x00, 0xF0, 0x02, 0xF8]);
         assert!(img.symbols.iter().any(|(n, a)| n == "answer" && *a == 8));
+    }
+
+    #[test]
+    fn gc_sections_drops_unreached_functions() {
+        let main = obj_arm(
+            &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47, 0x70, 0x47],
+            &[func("f0", 1, 6), func("unused0", 7, 2), undef("keep")],
+            &[Relocation {
+                offset: 0,
+                symbol: 2,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+        );
+        let lib = obj_arm(
+            &[0x70, 0x47, 0x70, 0x47],
+            &[func("keep", 1, 2), func("unused1", 3, 2)],
+            &[],
+        );
+        let trimmed = garbage_collect(&[main, lib], "f0");
+        let defined: Vec<&str> = trimmed
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(defined.contains(&"f0"), "the entry is kept");
+        assert!(defined.contains(&"keep"), "a reached function is kept");
+        assert!(!defined.contains(&"unused0"), "an unreached function is dropped");
+        assert!(!defined.contains(&"unused1"), "an unreached library function is dropped");
+    }
+
+    #[test]
+    fn two_weak_definitions_resolve_without_conflict() {
+        let caller = obj_arm(
+            &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
+            &[func("caller", 1, 6), undef("helper")],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+        );
+        let weak_a = obj_arm(&[0x2A, 0x20, 0x70, 0x47], &[weak("helper", 1, 4)], &[]);
+        let weak_b = obj_arm(&[0x2B, 0x20, 0x70, 0x47], &[weak("helper", 1, 4)], &[]);
+        let img =
+            link(&[caller, weak_a, weak_b], "caller").expect("two weak defs resolve, no conflict");
+        assert!(img.symbols.iter().any(|(n, _)| n == "helper"), "weak helper defined");
+    }
+
+    #[test]
+    fn a_strong_definition_overrides_a_weak_one() {
+        let caller = obj_arm(
+            &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
+            &[func("caller", 1, 6), undef("helper")],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+        );
+        let weak_h = obj_arm(&[0x2A, 0x20, 0x70, 0x47], &[weak("helper", 1, 4)], &[]);
+        let strong_h = obj_arm(&[0x2B, 0x20, 0x70, 0x47], &[func("helper", 1, 4)], &[]);
+        let img = link(&[caller, weak_h, strong_h], "caller").expect("strong overrides weak");
+        let (_, addr) = img
+            .symbols
+            .iter()
+            .find(|(n, _)| n == "helper")
+            .expect("helper defined");
+        assert_eq!(
+            img.text[(*addr & !1) as usize],
+            0x2B,
+            "the strong (global) definition wins over the weak one"
+        );
     }
 
     #[test]

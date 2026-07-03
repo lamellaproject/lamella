@@ -51,7 +51,18 @@ namespace System
 
         public Guid(string g)
         {
-            this = Parse(g);
+            Guid parsed = Parse(g);
+            _a = parsed._a;
+            _b = parsed._b;
+            _c = parsed._c;
+            _d = parsed._d;
+            _e = parsed._e;
+            _f = parsed._f;
+            _g = parsed._g;
+            _h = parsed._h;
+            _i = parsed._i;
+            _j = parsed._j;
+            _k = parsed._k;
         }
 
         public byte[] ToByteArray()

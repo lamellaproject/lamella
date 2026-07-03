@@ -7,7 +7,7 @@ namespace System
         {
             if (IsCustom(format))
             {
-                return Custom(format, value < 0, true, value < 0 ? value : -value, 0.0);
+                return CustomInteger(format, value < 0, value < 0 ? value : -value);
             }
             char specifier = 'G';
             int precision = -1;
@@ -35,10 +35,18 @@ namespace System
             if (specifier == 'x') return Hex(value, nibbles, precision, false);
             if (specifier == 'N' || specifier == 'n') return Fixed(value, precision < 0 ? 2 : precision, true);
             if (specifier == 'F' || specifier == 'f') return Fixed(value, precision < 0 ? 2 : precision, false);
+            if (specifier == 'E' || specifier == 'e' || specifier == 'C' || specifier == 'c' || specifier == 'P' || specifier == 'p')
+            {
+                return FormatScaled(value, specifier, precision);
+            }
+            throw new FormatException("Format specifier was invalid.");
+        }
+
+        private static string FormatScaled(long value, char specifier, int precision)
+        {
             if (specifier == 'E' || specifier == 'e') return System.Double.ToExponential((double)value, precision < 0 ? 6 : precision, specifier == 'E');
             if (specifier == 'C' || specifier == 'c') return System.Double.Currency((double)value, precision < 0 ? 2 : precision);
-            if (specifier == 'P' || specifier == 'p') return System.Double.Percent((double)value, precision < 0 ? 2 : precision);
-            throw new FormatException("Format specifier was invalid.");
+            return System.Double.Percent((double)value, precision < 0 ? 2 : precision);
         }
 
         private static bool IsLetter(char c)
@@ -150,9 +158,22 @@ namespace System
             return false;
         }
 
-        internal static string Custom(string format, bool negative, bool isInteger, long negMag, double magnitude)
+        private sealed class CustomShape
         {
-            bool isZero = isInteger ? (negMag == 0) : (magnitude == 0.0);
+            internal string Section;
+            internal bool EmitSign;
+            internal bool HasPlaces;
+            internal bool Percent;
+            internal string Prefix;
+            internal string Suffix;
+            internal int MinInt;
+            internal bool Grouping;
+            internal int MaxFrac;
+            internal int MinFrac;
+        }
+
+        private static CustomShape ParseCustom(string format, bool negative, bool isZero)
+        {
             string[] sections = SplitSections(format);
             string section;
             bool emitSign;
@@ -161,6 +182,9 @@ namespace System
             else { section = sections[0]; emitSign = (sections.Length == 1) && negative; }
             if (section.Length == 0) { section = sections[0]; emitSign = negative; }
 
+            CustomShape shape = new CustomShape();
+            shape.Section = section;
+            shape.EmitSign = emitSign;
             int firstPlace = -1;
             int lastPlace = -1;
             for (int i = 0; i < section.Length; i++)
@@ -168,51 +192,64 @@ namespace System
                 char c = section[i];
                 if (c == '0' || c == '#') { if (firstPlace < 0) firstPlace = i; lastPlace = i; }
             }
-            bool percent = section.IndexOf('%') >= 0;
-            if (firstPlace < 0) return EmitLiterals(section);
-
-            string prefix = section.Substring(0, firstPlace);
-            string suffix = section.Substring(lastPlace + 1);
+            shape.Percent = section.IndexOf('%') >= 0;
+            if (firstPlace < 0)
+            {
+                shape.HasPlaces = false;
+                return shape;
+            }
+            shape.HasPlaces = true;
+            shape.Prefix = section.Substring(0, firstPlace);
+            shape.Suffix = section.Substring(lastPlace + 1);
             string middle = section.Substring(firstPlace, lastPlace - firstPlace + 1);
             int dot = middle.IndexOf('.');
             string intRegion = (dot < 0) ? middle : middle.Substring(0, dot);
             string fracRegion = (dot < 0) ? "" : middle.Substring(dot + 1);
-            int minInt = CountChar(intRegion, '0');
-            bool grouping = intRegion.IndexOf(',') >= 0;
-            int maxFrac = CountPlaceholders(fracRegion);
-            int minFrac = MinFracDigits(fracRegion);
+            shape.MinInt = CountChar(intRegion, '0');
+            shape.Grouping = intRegion.IndexOf(',') >= 0;
+            shape.MaxFrac = CountPlaceholders(fracRegion);
+            shape.MinFrac = MinFracDigits(fracRegion);
+            return shape;
+        }
 
+        internal static string CustomInteger(string format, bool negative, long negMag)
+        {
+            CustomShape shape = ParseCustom(format, negative, negMag == 0);
+            if (!shape.HasPlaces) return EmitLiterals(shape.Section);
+            long m = negMag;
+            if (shape.Percent) m = m * 100;
+            return AssembleCustom(shape, MagnitudeDecimal(m), Zeros(shape.MaxFrac));
+        }
+
+        internal static string CustomFloat(string format, bool negative, double magnitude)
+        {
+            CustomShape shape = ParseCustom(format, negative, magnitude == 0.0);
+            if (!shape.HasPlaces) return EmitLiterals(shape.Section);
+            double m = shape.Percent ? magnitude * 100.0 : magnitude;
+            string fixedText = System.Double.ToFixed(m, shape.MaxFrac);
+            int fdot = fixedText.IndexOf('.');
             string intDigits;
             string fracDigits;
-            if (isInteger)
-            {
-                long m = negMag;
-                if (percent) m = m * 100;
-                intDigits = MagnitudeDecimal(m);
-                fracDigits = Zeros(maxFrac);
-            }
-            else
-            {
-                double m = percent ? magnitude * 100.0 : magnitude;
-                string fixedText = System.Double.ToFixed(m, maxFrac);
-                int fdot = fixedText.IndexOf('.');
-                if (fdot < 0) { intDigits = fixedText; fracDigits = ""; }
-                else { intDigits = fixedText.Substring(0, fdot); fracDigits = fixedText.Substring(fdot + 1); }
-            }
+            if (fdot < 0) { intDigits = fixedText; fracDigits = ""; }
+            else { intDigits = fixedText.Substring(0, fdot); fracDigits = fixedText.Substring(fdot + 1); }
+            return AssembleCustom(shape, intDigits, fracDigits);
+        }
 
-            if (minInt == 0 && IsAllZero(intDigits)) intDigits = "";
-            else { while (intDigits.Length < minInt) intDigits = "0" + intDigits; }
-            if (grouping && intDigits.Length > 0) intDigits = Group(intDigits);
+        private static string AssembleCustom(CustomShape shape, string intDigits, string fracDigits)
+        {
+            if (shape.MinInt == 0 && IsAllZero(intDigits)) intDigits = "";
+            else { while (intDigits.Length < shape.MinInt) intDigits = "0" + intDigits; }
+            if (shape.Grouping && intDigits.Length > 0) intDigits = Group(intDigits);
             int keep = fracDigits.Length;
-            while (keep > minFrac && fracDigits[keep - 1] == '0') keep = keep - 1;
+            while (keep > shape.MinFrac && fracDigits[keep - 1] == '0') keep = keep - 1;
             if (keep < fracDigits.Length) fracDigits = fracDigits.Substring(0, keep);
 
             System.Text.StringBuilder result = new System.Text.StringBuilder();
-            if (emitSign) result.Append('-');
-            result.Append(EmitLiterals(prefix));
+            if (shape.EmitSign) result.Append('-');
+            result.Append(EmitLiterals(shape.Prefix));
             result.Append(intDigits);
             if (fracDigits.Length > 0) { result.Append('.'); result.Append(fracDigits); }
-            result.Append(EmitLiterals(suffix));
+            result.Append(EmitLiterals(shape.Suffix));
             return result.ToString();
         }
 

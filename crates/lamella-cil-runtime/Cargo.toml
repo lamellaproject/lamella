@@ -42,6 +42,23 @@ finalizers = ["gc"]
 # overloads). Off => the no-float tier: those opcodes trap and the float code is compiled out --
 # for the smallest targets that have no FPU and use no float. A capability-profile knob.
 float = []
+# Code loading (the `code_loading` capability knob), three levels over the one ManagedBody seam.
+# Default (both features OFF) = `on_use`: keep the raw CIL and decode a method body lazily on first
+# call, so an uncalled method never decodes -- lighter resident RAM and faster startup. `code-preload`
+# = `preload`: decode every body once at load and hold it resident for a direct per-instruction read,
+# where RAM is ample and deterministic timing matters. `code-in-place` = `in_place` (XIP): decode one
+# instruction per step straight from the flash-resident code bytes -- ZERO decoded-body RAM, the
+# instruction pointer a CIL byte offset -- paying per-step decode; requires `flash-image` (the body
+# must be a flash slice). The two features are mutually exclusive (compile_error otherwise).
+code-preload = []
+code-in-place = ["flash-image"]
+# Execute-in-place foundation (XIP): the loader borrows each method's raw CIL as a `&'static [u8]`
+# straight from the flash-resident PE instead of copying it into an owned `Box` (see `RawCil`), so the
+# raw IL costs zero RAM. Off (the default) => the owned copy, byte-identical to a non-XIP build. On =>
+# the borrow; requires the load API's `Assembly` to be `'static` (device flash ROM, or a host
+# `Box::leak`). Composes with `on_use` (lazy decode from flash) and underpins `code-in-place`
+# (decode per step from the slice, no decoded body ever resident).
+flash-image = []
 # String storage encoding (a developer knob; .NET UTF-16 String semantics hold either way).
 # Default (feature off) = UTF-16 (O(1) indexing). On = UTF-8 (~half the ASCII-text memory,
 # O(n) UTF-16 indexing; the well-formed tier -- WTF-8 surrogate parity is a future feature).

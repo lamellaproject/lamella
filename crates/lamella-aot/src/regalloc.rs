@@ -166,13 +166,16 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
                 }
-                Inst::CallIndirect { target, args } => {
+                Inst::CallIndirect { target, args, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *target, ip);
                     for arg in args {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
                 }
-                Inst::InvokeDelegate { delegate, args } => {
+                Inst::VirtualFuncAddr { object, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *object, ip);
+                }
+                Inst::InvokeDelegate { delegate, args, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *delegate, ip);
                     for arg in args {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
@@ -474,7 +477,7 @@ pub(crate) fn safepoint_roots(
                         .filter(|&(v, &a)| a && v != result.index() && is_root(v))
                         .map(|(v, _)| ValueId(v as u32))
                         .collect();
-                    if let Inst::InvokeDelegate { delegate, args } = inst {
+                    if let Inst::InvokeDelegate { delegate, args, .. } = inst {
                         for v in core::iter::once(*delegate).chain(args.iter().copied()) {
                             if is_root(v.index()) && !roots.contains(&v) {
                                 roots.push(v);
@@ -539,11 +542,11 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         | Inst::PyIntrinsic { args, .. } => {
             args.iter().for_each(|a| f(*a));
         }
-        Inst::CallIndirect { target, args } => {
+        Inst::CallIndirect { target, args, .. } => {
             f(*target);
             args.iter().for_each(|a| f(*a));
         }
-        Inst::InvokeDelegate { delegate, args } => {
+        Inst::InvokeDelegate { delegate, args, .. } => {
             f(*delegate);
             args.iter().for_each(|a| f(*a));
         }
@@ -574,6 +577,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         }
         Inst::FieldAddr { base, .. } => f(*base),
         Inst::LoadTypeDesc { object } => f(*object),
+        Inst::VirtualFuncAddr { object, .. } => f(*object),
         Inst::TypeDescAddr { .. } => {}
         Inst::TypeDescLiteral { .. } => {}
         Inst::CopyStruct { src } => f(*src),

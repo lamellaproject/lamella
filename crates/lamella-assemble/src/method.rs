@@ -201,6 +201,12 @@ pub struct ConstructorPrologue {
     pub ctor: Token,
     /// The bound chain arguments, in order.
     pub arguments: Vec<BoundExpr>,
+    /// How many leading statements of the body -- the instance field initializers
+    /// (17.11) -- to emit BEFORE this chain call, so a virtual method the base
+    /// constructor invokes observes the derived fields already assigned. Zero when the
+    /// constructor chains to `this(...)`, since the initializers run in the constructor
+    /// ultimately invoked, not here.
+    pub leading_body: usize,
 }
 
 /// Lowers a method body and reports its local types (for the local signature) and
@@ -252,14 +258,28 @@ fn lower(
     }
 
     let mut out = Vec::new();
-    if let Some(prologue) = prologue {
-        out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
-        for argument in &prologue.arguments {
-            emit_expression(argument, frame, tokens, &mut out)?;
+    match prologue {
+        Some(prologue) if prologue.leading_body > 0 => {
+            if let BoundStmtKind::Block(statements) = &body.kind {
+                let split = prologue.leading_body.min(statements.len());
+                for statement in &statements[..split] {
+                    emit_statement(statement, frame, tokens, &mut labels, &mut out)?;
+                }
+                emit_prologue(prologue, frame, tokens, &mut out)?;
+                for statement in &statements[split..] {
+                    emit_statement(statement, frame, tokens, &mut labels, &mut out)?;
+                }
+            } else {
+                emit_prologue(prologue, frame, tokens, &mut out)?;
+                emit_statement(body, frame, tokens, &mut labels, &mut out)?;
+            }
         }
-        out.push(Instruction::new(Opcode::Call, Operand::Token(prologue.ctor)));
+        Some(prologue) => {
+            emit_prologue(prologue, frame, tokens, &mut out)?;
+            emit_statement(body, frame, tokens, &mut labels, &mut out)?;
+        }
+        None => emit_statement(body, frame, tokens, &mut labels, &mut out)?,
     }
-    emit_statement(body, frame, tokens, &mut labels, &mut out)?;
 
     if let Some(Epilogue { label, return_slot }) = labels.epilogue {
         labels.place(label, &out);
@@ -276,6 +296,22 @@ fn lower(
     }
     labels.backpatch(&mut out);
     Ok((out, labels.points, labels.handlers))
+}
+
+/// Emits a constructor's chain call `ldarg.0; <arguments>; call ctor` -- the invocation of
+/// the base or sibling constructor a prologue records (17.11).
+fn emit_prologue(
+    prologue: &ConstructorPrologue,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
+    for argument in &prologue.arguments {
+        crate::expr::emit_argument(argument, frame, tokens, out)?;
+    }
+    out.push(Instruction::new(Opcode::Call, Operand::Token(prologue.ctor)));
+    Ok(())
 }
 
 /// Whether `stmt` contains a `try` anywhere, so the body needs a return epilogue.
@@ -517,6 +553,10 @@ fn emit_statement(
                             crate::expr::emit_string_equality(false, tokens, out)?;
                             labels.branch(Opcode::Brtrue, section_labels[index], out);
                         }
+                        BoundSwitchLabel::CaseNull => {
+                            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(temp)));
+                            labels.branch(Opcode::Brfalse, section_labels[index], out);
+                        }
                         BoundSwitchLabel::Default => default_label = Some(section_labels[index]),
                     }
                 }
@@ -534,6 +574,7 @@ fn emit_statement(
                         BoundSwitchLabel::CaseString(text) => {
                             switch_string_cases.push((text.clone(), section_labels[index]));
                         }
+                        BoundSwitchLabel::CaseNull => {}
                         BoundSwitchLabel::Default => {}
                     }
                 }
@@ -564,11 +605,16 @@ fn emit_statement(
             body,
             ..
         } => {
-            let TypeSymbol::Array { element, .. } = &collection.ty else {
+            let TypeSymbol::Array { element, rank } = &collection.ty else {
                 return Err(EmitError::Unsupported(
                     "foreach over a non-array collection is not lowered yet",
                 ));
             };
+            if *rank != 1 {
+                return Err(EmitError::Unsupported(
+                    "foreach over a rectangular array must be desugared before emission",
+                ));
+            }
             let array = frame.reserve_local(&collection.ty);
             let index = frame.reserve_local(&TypeSymbol::Special(SpecialType::Int32));
 

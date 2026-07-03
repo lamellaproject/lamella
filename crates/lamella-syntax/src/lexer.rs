@@ -209,15 +209,21 @@ struct PpExprErrors {
 impl<'a> Lexer<'a> {
     /// Creates a scanner over `source`.
     ///
-    /// A single trailing Control-Z (U+001A) is removed up front, as 9.3.1
-    /// requires. Because the result is a prefix of the original text, all byte
-    /// offsets still line up with the caller's source.
+    /// A single trailing Control-Z (U+001A) is removed up front, as 9.3.1 requires, and a
+    /// single leading byte-order mark (U+FEFF) is skipped -- neither is program
+    /// text. Control-Z trimming leaves a prefix; the BOM is skipped by starting the scan past
+    /// it rather than trimming, so either way all byte offsets still line up with the caller's.
     #[must_use]
     pub fn new(source: &'a str) -> Lexer<'a> {
         let source = source.strip_suffix('\u{001A}').unwrap_or(source);
+        let position = if source.starts_with('\u{FEFF}') {
+            '\u{FEFF}'.len_utf8()
+        } else {
+            0
+        };
         Lexer {
             source,
-            position: 0,
+            position,
             diagnostics: Vec::new(),
             line_start: true,
             seen_token: false,
@@ -1426,6 +1432,12 @@ mod tests {
             .into_iter()
             .map(|token| token.kind)
             .collect()
+    }
+
+    #[test]
+    fn a_leading_byte_order_mark_is_skipped() {
+        assert_eq!(kinds("\u{FEFF}class C { }"), kinds("class C { }"));
+        assert!(tokenize("\u{FEFF}class C { }").diagnostics.is_empty());
     }
 
     fn ident(text: &str) -> TokenKind {

@@ -215,7 +215,9 @@ pub fn read_method_body_sized(bytes: &[u8]) -> Result<(MethodBodyImage, usize), 
 
     let (handlers, total_len) = if more_sections {
         let section_start = round_up_to_4(header_len.saturating_add(code_size));
-        read_sections(bytes, section_start, &offsets, code_size as u32)?
+        read_sections(bytes, section_start, &|clause| {
+            resolve_clause(clause, &offsets, code_size as u32)
+        })?
     } else {
         (Vec::new(), header_len.saturating_add(code_size))
     };
@@ -230,6 +232,57 @@ pub fn read_method_body_sized(bytes: &[u8]) -> Result<(MethodBodyImage, usize), 
         },
         total_len,
     ))
+}
+
+/// A raw method body's layout, read WITHOUT decoding its instruction stream: where the code
+/// bytes sit, and the exception-handling clauses in BYTE-OFFSET form -- each region and
+/// `filter_start` holds CIL byte offsets exactly as the file encodes them, NOT the
+/// instruction-index form [`read_method_body`] produces.
+///
+/// This is the `code_loading = in_place` load shape: the code region stays where it is (a flash
+/// slice) and is decoded one instruction per step ([`crate::codec::decode_at`]), and the
+/// byte-form clauses compare directly against a byte instruction pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyLayout {
+    /// Where the instruction bytes begin, relative to the body's first byte.
+    pub code_offset: usize,
+    /// The instruction bytes' length.
+    pub code_len: usize,
+    /// The exception-handling clauses with byte-offset regions, in file order.
+    pub handlers: Vec<EhClause>,
+}
+
+/// Reads a method body's [`BodyLayout`] -- the header and any exception section, but never the
+/// instruction stream itself. Region boundaries cannot be validated against instruction starts
+/// here (that requires the very decode this avoids); the image is trusted as any
+/// execute-in-place code trusts its flash.
+///
+/// # Errors
+/// Returns a [`BodyError`] for a truncated or malformed header or exception section.
+pub fn read_body_layout(bytes: &[u8]) -> Result<BodyLayout, BodyError> {
+    let first = *bytes.first().ok_or(BodyError::UnexpectedEnd)?;
+    let (header_len, _, _, _, code_size, more_sections) = match first & FORMAT_MASK {
+        TINY_FORMAT => (1usize, 8u16, false, None, (first >> 2) as usize, false),
+        FAT_FORMAT => read_fat_header(bytes)?,
+        _ => return Err(BodyError::BadHeaderFormat { first_byte: first }),
+    };
+    if bytes
+        .get(header_len..header_len.saturating_add(code_size))
+        .is_none()
+    {
+        return Err(BodyError::UnexpectedEnd);
+    }
+    let handlers = if more_sections {
+        let section_start = round_up_to_4(header_len.saturating_add(code_size));
+        read_sections(bytes, section_start, &byte_clause)?.0
+    } else {
+        Vec::new()
+    };
+    Ok(BodyLayout {
+        code_offset: header_len,
+        code_len: code_size,
+        handlers,
+    })
 }
 
 type FatHeader = (usize, u16, bool, Option<Token>, usize, bool);
@@ -256,8 +309,7 @@ fn read_fat_header(bytes: &[u8]) -> Result<FatHeader, BodyError> {
 fn read_sections(
     bytes: &[u8],
     mut pos: usize,
-    offsets: &[u32],
-    code_size: u32,
+    make_clause: &dyn Fn(RawClause) -> Result<EhClause, BodyError>,
 ) -> Result<(Vec<EhClause>, usize), BodyError> {
     let mut handlers = Vec::new();
     loop {
@@ -288,7 +340,7 @@ fn read_sections(
             .get(pos + 4..pos + 4 + count * clause_len)
             .ok_or(BodyError::UnexpectedEnd)?;
         for clause in clauses.chunks_exact(clause_len) {
-            handlers.push(read_clause(clause, fat, offsets, code_size)?);
+            handlers.push(make_clause(read_raw_clause(clause, fat))?);
         }
         let section_end = pos + data_size;
         if kind & SECT_MORE_SECTS == 0 {
@@ -298,12 +350,18 @@ fn read_sections(
     }
 }
 
-fn read_clause(
-    clause: &[u8],
-    fat: bool,
-    offsets: &[u32],
-    code_size: u32,
-) -> Result<EhClause, BodyError> {
+/// One clause exactly as the file encodes it (II.24.4.6): byte offsets and lengths, with `last`
+/// the class token or filter offset depending on `flags`.
+struct RawClause {
+    flags: u32,
+    try_offset: u32,
+    try_len: u32,
+    handler_offset: u32,
+    handler_len: u32,
+    last: u32,
+}
+
+fn read_raw_clause(clause: &[u8], fat: bool) -> RawClause {
     let (flags, try_offset, try_len, handler_offset, handler_len, last) = if fat {
         (
             le32(clause, 0),
@@ -323,21 +381,66 @@ fn read_clause(
             le32(clause, 8),
         )
     };
-    let try_range = resolve_region(offsets, code_size, try_offset, try_len)?;
-    let handler_range = resolve_region(offsets, code_size, handler_offset, handler_len)?;
-    let kind = if flags & CLAUSE_FILTER != 0 {
-        EhKind::Filter {
-            filter_start: resolve_offset(offsets, code_size, last)?,
-        }
-    } else if flags & CLAUSE_FINALLY != 0 {
-        EhKind::Finally
-    } else if flags & CLAUSE_FAULT != 0 {
-        EhKind::Fault
-    } else if flags == 0 {
-        EhKind::Catch(Token(last))
+    RawClause {
+        flags,
+        try_offset,
+        try_len,
+        handler_offset,
+        handler_len,
+        last,
+    }
+}
+
+/// Classifies a raw clause's kind from its flags, mapping the `last` field through `filter` for
+/// a filter clause (the two resolutions differ: index form maps it to an instruction index, byte
+/// form keeps the offset).
+fn clause_kind(
+    clause: &RawClause,
+    filter: &dyn Fn(u32) -> Result<u32, BodyError>,
+) -> Result<EhKind, BodyError> {
+    if clause.flags & CLAUSE_FILTER != 0 {
+        Ok(EhKind::Filter {
+            filter_start: filter(clause.last)?,
+        })
+    } else if clause.flags & CLAUSE_FINALLY != 0 {
+        Ok(EhKind::Finally)
+    } else if clause.flags & CLAUSE_FAULT != 0 {
+        Ok(EhKind::Fault)
+    } else if clause.flags == 0 {
+        Ok(EhKind::Catch(Token(clause.last)))
     } else {
-        return Err(BodyError::BadClauseKind { flags });
+        Err(BodyError::BadClauseKind {
+            flags: clause.flags,
+        })
+    }
+}
+
+/// Resolves a raw clause's byte regions to instruction-index regions (the [`read_method_body`]
+/// form, matched to its decoded instruction list).
+fn resolve_clause(clause: RawClause, offsets: &[u32], code_size: u32) -> Result<EhClause, BodyError> {
+    let try_range = resolve_region(offsets, code_size, clause.try_offset, clause.try_len)?;
+    let handler_range =
+        resolve_region(offsets, code_size, clause.handler_offset, clause.handler_len)?;
+    let kind = clause_kind(&clause, &|last| resolve_offset(offsets, code_size, last))?;
+    Ok(EhClause {
+        try_range,
+        handler_range,
+        kind,
+    })
+}
+
+/// Keeps a raw clause's regions in byte-offset form (the [`read_body_layout`] form, matched to a
+/// byte instruction pointer).
+fn byte_clause(clause: RawClause) -> Result<EhClause, BodyError> {
+    let byte_region = |offset: u32, length: u32| -> Result<InstructionRange, BodyError> {
+        let end = offset
+            .checked_add(length)
+            .ok_or(BodyError::RegionNotAtBoundary { offset })?;
+        Ok(InstructionRange { start: offset, end })
     };
+    let try_range = byte_region(clause.try_offset, clause.try_len)?;
+    let handler_range = byte_region(clause.handler_offset, clause.handler_len)?;
+    let kind = clause_kind(&clause, &|offset| Ok(offset))?;
     Ok(EhClause {
         try_range,
         handler_range,
@@ -481,7 +584,7 @@ fn le32(bytes: &[u8], at: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instruction::Instruction;
+    use crate::instruction::{Instruction, Operand};
     use crate::opcode::Opcode;
     use alloc::vec;
 
@@ -597,9 +700,92 @@ mod tests {
         round_trip(&body(code, handlers));
     }
 
+    /// The byte-form layout must agree with the index-form image: the code region decodes to the
+    /// same instructions, and each byte-form clause maps to its index-form clause through the
+    /// instruction offsets table.
+    fn layout_matches_image(image: &MethodBodyImage) {
+        let bytes = write_method_body(image).expect("write");
+        let layout = read_body_layout(&bytes).expect("layout");
+        let code = &bytes[layout.code_offset..layout.code_offset + layout.code_len];
+        let (decoded, offsets) = codec::decode_with_offsets(code).expect("decode code region");
+        assert_eq!(decoded.as_slice(), image.code.as_ref(), "code region");
+        let byte_of = |index: u32| {
+            if index as usize == offsets.len() {
+                layout.code_len as u32
+            } else {
+                offsets[index as usize]
+            }
+        };
+        assert_eq!(layout.handlers.len(), image.handlers.len(), "clause count");
+        for (byte_form, index_form) in layout.handlers.iter().zip(image.handlers.iter()) {
+            assert_eq!(byte_form.try_range.start, byte_of(index_form.try_range.start));
+            assert_eq!(byte_form.try_range.end, byte_of(index_form.try_range.end));
+            assert_eq!(
+                byte_form.handler_range.start,
+                byte_of(index_form.handler_range.start)
+            );
+            assert_eq!(
+                byte_form.handler_range.end,
+                byte_of(index_form.handler_range.end)
+            );
+            match (&byte_form.kind, &index_form.kind) {
+                (
+                    EhKind::Filter { filter_start: byte },
+                    EhKind::Filter { filter_start: index },
+                ) => {
+                    assert_eq!(*byte, byte_of(*index), "filter start");
+                }
+                (byte_kind, index_kind) => assert_eq!(byte_kind, index_kind, "clause kind"),
+            }
+        }
+    }
+
+    #[test]
+    fn layout_reads_byte_form_clauses_without_decoding() {
+        let code = vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(7)),
+            Instruction::simple(Opcode::Nop),
+            Instruction::simple(Opcode::Nop),
+            Instruction::simple(Opcode::Nop),
+            Instruction::simple(Opcode::Nop),
+            Instruction::simple(Opcode::Ret),
+        ];
+        let handlers = vec![
+            EhClause {
+                try_range: InstructionRange { start: 0, end: 2 },
+                handler_range: InstructionRange { start: 2, end: 4 },
+                kind: EhKind::Catch(Token::new(0x01, 5)),
+            },
+            EhClause {
+                try_range: InstructionRange { start: 0, end: 2 },
+                handler_range: InstructionRange { start: 5, end: 6 },
+                kind: EhKind::Filter { filter_start: 4 },
+            },
+        ];
+        layout_matches_image(&body(code, handlers));
+    }
+
+    #[test]
+    fn layout_of_a_tiny_body_is_its_code_alone() {
+        let image = body(
+            vec![
+                Instruction::simple(Opcode::LdcI42),
+                Instruction::simple(Opcode::Ret),
+            ],
+            vec![],
+        );
+        let bytes = write_method_body(&image).unwrap();
+        let layout = read_body_layout(&bytes).expect("layout");
+        assert_eq!(layout.code_offset, 1, "tiny header is one byte");
+        assert_eq!(layout.code_len, bytes.len() - 1);
+        assert!(layout.handlers.is_empty());
+        layout_matches_image(&image);
+    }
+
     #[test]
     fn empty_input_is_an_error_not_a_panic() {
         assert_eq!(read_method_body(&[]), Err(BodyError::UnexpectedEnd));
+        assert_eq!(read_body_layout(&[]), Err(BodyError::UnexpectedEnd));
     }
 
     #[test]

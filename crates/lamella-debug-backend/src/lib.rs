@@ -171,6 +171,13 @@ pub trait DebugBackend {
     /// incrementally as `output` events). Interpreter: new console output. Device: new
     /// bytes from the target's UART / semihosting channel.
     fn take_output(&mut self) -> Option<String>;
+
+    /// Debug-channel output (the target's debug / trace channel) produced since the previous
+    /// call, kept separate from `take_output`'s program-console stream so a client can show them
+    /// apart. The default is `None`, for a target with no distinct debug channel.
+    fn take_debug_output(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// Why execution stopped after a `resume` or `step`.

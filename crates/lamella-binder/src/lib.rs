@@ -20,7 +20,7 @@ pub mod statement;
 pub mod symbols;
 pub mod types;
 
-pub use bind::bind_type;
+pub use bind::{bind_type, parameter_symbol};
 pub use complete::{
     Completion, CompletionKind, Hover, SignatureHelp, complete, hover, signature_help,
 };
@@ -34,6 +34,7 @@ pub use diagnostic::{Diagnostic, DiagnosticKind};
 pub use flow::{always_exits, check_definite_assignment};
 pub use program::{
     bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references,
+    bind_compilation_units_with_references,
 };
 pub use reference::load_assembly;
 pub use resolve::{TypeTable, resolve_type};

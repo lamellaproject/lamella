@@ -66,7 +66,7 @@ namespace System
             {
                 if (!IsFinite(value)) return value.ToString();
                 bool negativeValue = value < 0;
-                return NumberFormatter.Custom(format, negativeValue, false, 0, negativeValue ? -value : value);
+                return NumberFormatter.CustomFloat(format, negativeValue, negativeValue ? -value : value);
             }
             char specifier = 'G';
             int precision = -1;

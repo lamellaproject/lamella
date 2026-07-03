@@ -68,7 +68,9 @@ pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let funcs = lower_assembly(&assembly, entry)?;
     let exports = method_exports(&assembly, entry.is_some());
     let export_refs: Vec<(&str, u32)> = exports.iter().map(|(n, i)| (n.as_str(), *i)).collect();
-    wasm::lower_module_with_exports(&funcs, &export_refs).map_err(BuildError::LowerWasm)
+    let descriptors = MetadataResolver::new(&assembly).type_descriptors();
+    wasm::lower_module_with_exports(&funcs, &export_refs, &descriptors)
+        .map_err(BuildError::LowerWasm)
 }
 
 /// Compiles a CIL assembly to a flashable bare-metal image for a Cortex-M chip `target` (e.g.
@@ -159,7 +161,75 @@ pub fn build_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let funcs = lower_assembly(&assembly, entry)?;
     let names = object_symbol_names(&assembly, funcs.len());
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    arm32::lower_object(&funcs, &name_refs, &[]).map_err(BuildError::LowerArm)
+    let descriptors = MetadataResolver::new(&assembly).type_descriptors();
+    arm32::lower_object_vtables(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerArm)
+}
+
+/// AOT-lowers a whole assembly as a LINKABLE LIBRARY object (a corlib, a helper library): every public
+/// static method becomes a global symbol (named by `extern_method_symbol`) a program's extern call
+/// resolves against, and a method that does not lower yet becomes a STUB so the rest of the library
+/// still builds -- gaps are fixed iteratively. No entry/startup ([`arm32::lower_object_library`]).
+#[cfg(feature = "arm32")]
+pub fn build_library_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let (funcs, _maps, _fails) = lower_assembly_debug(&assembly, None);
+    let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
+    let names = library_symbol_names(&assembly, funcs.len(), &prefix);
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let descriptors = MetadataResolver::new(&assembly).type_descriptors();
+    arm32::lower_object_library_vtables(&funcs, &name_refs, &[], &descriptors)
+        .map_err(BuildError::LowerArm)
+}
+
+/// The per-function symbol names for [`build_library_object`]: a public static method takes its stable
+/// cross-assembly symbol (`extern_method_symbol`), so a program links its extern call against it; every
+/// other method keeps `f<rid>` (internal to the library).
+#[cfg(feature = "arm32")]
+fn library_symbol_names(
+    assembly: &Assembly,
+    count: usize,
+    prefix: &str,
+) -> Vec<alloc::string::String> {
+    let mut names: Vec<alloc::string::String> =
+        (0..count).map(|i| alloc::format!("{prefix}f{i}")).collect();
+    for type_def in assembly.type_defs() {
+        let Some(type_name) = type_def.name() else {
+            continue;
+        };
+        for method in type_def.methods() {
+            let rid = method.rid() as usize;
+            if rid >= names.len() {
+                continue;
+            }
+            if method.is_static() && method.flags() & 0x7 == 0x6 {
+                if let Some(method_name) = method.name() {
+                    let params = method.signature().map(|s| s.parameters).unwrap_or_default();
+                    names[rid] = crate::resolver::extern_method_symbol(
+                        type_name.namespace,
+                        type_name.name,
+                        method_name,
+                        &params,
+                        &|token| {
+                            assembly
+                                .type_token_name(token)
+                                .map(|n| crate::resolver::joined_full_name(&n))
+                        },
+                    );
+                }
+            }
+        }
+    }
+    let mut counts: alloc::collections::BTreeMap<alloc::string::String, u32> =
+        alloc::collections::BTreeMap::new();
+    for name in &names {
+        *counts.entry(name.clone()).or_insert(0) += 1;
+    }
+    for (rid, name) in names.iter_mut().enumerate() {
+        if counts.get(name.as_str()).copied().unwrap_or(0) > 1 {
+            *name = alloc::format!("{prefix}f{rid}");
+        }
+    }
+    names
 }
 
 /// The per-function symbol names for [`build_object`]: `f{rid}` by default (`f0` = the startup), but a
@@ -227,13 +297,19 @@ fn mir_type(sig: &SigType, assembly: &Assembly) -> MirType {
         | SigType::SzArray(_)
         | SigType::Array { .. } => MirType::ObjectRef,
         SigType::ValueType(token) => {
-            let size = assembly
-                .value_type_layout(*token, &TargetLayout::ilp32())
-                .map(|layout| layout.size)
-                .unwrap_or(0);
-            MirType::ValueType {
-                handle: TypeHandle(token.0),
-                size,
+            if let Some(underlying) =
+                crate::resolver::enum_underlying(assembly, *token, &TargetLayout::ilp32())
+            {
+                underlying
+            } else {
+                let size = assembly
+                    .value_type_layout(*token, &TargetLayout::ilp32())
+                    .map(|layout| layout.size)
+                    .unwrap_or(0);
+                MirType::ValueType {
+                    handle: TypeHandle(token.0),
+                    size,
+                }
             }
         }
         _ => MirType::I32,

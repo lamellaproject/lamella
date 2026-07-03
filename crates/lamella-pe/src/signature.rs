@@ -166,16 +166,25 @@ pub fn field_signature(field_type: &TypeSig) -> Vec<u8> {
 }
 
 /// Encodes a property signature (II.23.2.5): the `PROPERTY` convention (with the
-/// instance flag), zero index parameters, then the property type.
+/// instance flag), the count of index parameters, the property type, then the index
+/// parameter types. An ordinary property passes no index parameters; an indexer (17.8)
+/// passes the types of its index list.
 #[must_use]
-pub fn property_signature(has_this: bool, property_type: &TypeSig) -> Vec<u8> {
+pub fn property_signature(
+    has_this: bool,
+    index_params: &[TypeSig],
+    property_type: &TypeSig,
+) -> Vec<u8> {
     let mut out = vec![if has_this {
         PROPERTY | calling::HAS_THIS
     } else {
         PROPERTY
     }];
-    compress_u32(0, &mut out);
+    compress_u32(index_params.len() as u32, &mut out);
     encode_type(property_type, &mut out);
+    for parameter in index_params {
+        encode_type(parameter, &mut out);
+    }
     out
 }
 

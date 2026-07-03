@@ -34,6 +34,14 @@ pub mod arm {
     /// `R_ARM_CALL` -- an A32 (ARM-state) `BL`/`BLX` call: `((S + A) | T) - P`, a 24-bit signed
     /// word-scaled offset in bits[23:0].
     pub const R_ARM_CALL: u32 = 28;
+    /// A lamella-private 32-bit data relocation, `S + A - P` -- like `R_ARM_REL32` but WITHOUT the
+    /// interworking `| T` (Thumb-bit) forcing. It stores a signed, placement-invariant relative offset
+    /// into a data word. Its one use is a vtable slot: the value stored is `(method_entry - type_desc)`
+    /// (the addend absorbs `slot_addr - type_desc` so `S + A - P` reduces to `method_entry - type_desc`),
+    /// and the AOT dispatch code re-applies the Thumb bit at run time (`type_desc + slot + 1`), so the
+    /// stored value must stay Thumb-bit-free -- which `R_ARM_REL32`'s `| T` would spoil. Numbered in the
+    /// ARM ELF ABI private range (`R_ARM_PRIVATE_0` = 112), so it never clashes with a standard type.
+    pub const R_LAMELLA_REL_DESC: u32 = 112;
 }
 
 /// A target machine, selecting the ELF `e_machine`.
@@ -61,6 +69,10 @@ pub enum Binding {
     Local,
     /// `STB_GLOBAL` -- visible to the linker across objects.
     Global,
+    /// `STB_WEAK` -- a global definition a strong (global) one overrides, and which does not conflict
+    /// with another weak definition of the same name (the first wins). compiler_builtins emits its
+    /// `__aeabi_*` soft-float helpers this way.
+    Weak,
 }
 
 /// A symbol's type -- the low nibble of `st_info`.
@@ -142,7 +154,7 @@ pub fn write_relocatable_object(
                 final_index[i] = local_cursor;
                 local_cursor += 1;
             }
-            Binding::Global => {
+            Binding::Global | Binding::Weak => {
                 final_index[i] = global_cursor;
                 global_cursor += 1;
             }
@@ -164,6 +176,7 @@ pub fn write_relocatable_object(
             let bind: u8 = match sym.binding {
                 Binding::Local => 0,
                 Binding::Global => 1,
+                Binding::Weak => 2,
             };
             let typ: u8 = match sym.kind {
                 SymbolType::NoType => 0,
@@ -656,10 +669,10 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         let st_size = rd_u32(bytes, base + 8)?;
         let st_info = *bytes.get(base + 12).ok_or(ElfError::Truncated)?;
         let st_shndx = rd_u16(bytes, base + 14)?;
-        let binding = if st_info >> 4 == 1 {
-            Binding::Global
-        } else {
-            Binding::Local
+        let binding = match st_info >> 4 {
+            1 => Binding::Global,
+            2 => Binding::Weak,
+            _ => Binding::Local,
         };
         let kind = if st_info & 0xf == 2 {
             SymbolType::Func

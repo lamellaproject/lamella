@@ -85,15 +85,15 @@ namespace System
 
         private bool IsZero { get { return lo == 0 && mid == 0 && hi == 0; } }
 
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator +(Decimal d1, Decimal d2) { return default(Decimal); }
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator -(Decimal d1, Decimal d2) { return default(Decimal); }
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator *(Decimal d1, Decimal d2) { return default(Decimal); }
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator /(Decimal d1, Decimal d2) { return default(Decimal); }
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator %(Decimal d1, Decimal d2) { return default(Decimal); }
+        [Lamella.Runtime.RuntimeProvided] public static Decimal operator +(Decimal d1, Decimal d2) { return new Decimal(); }
+        [Lamella.Runtime.RuntimeProvided] public static Decimal operator -(Decimal d1, Decimal d2) { return new Decimal(); }
+        [Lamella.Runtime.RuntimeProvided] public static Decimal operator *(Decimal d1, Decimal d2) { return new Decimal(); }
+        [Lamella.Runtime.RuntimeProvided] public static Decimal operator /(Decimal d1, Decimal d2) { return new Decimal(); }
+        [Lamella.Runtime.RuntimeProvided] public static Decimal operator %(Decimal d1, Decimal d2) { return new Decimal(); }
 
         [Lamella.Runtime.RuntimeProvided] public static int Compare(Decimal d1, Decimal d2) { return 0; }
 
-        [Lamella.Runtime.RuntimeProvided] private static Decimal FromDouble(double value) { return default(Decimal); }
+        [Lamella.Runtime.RuntimeProvided] private static Decimal FromDouble(double value) { return new Decimal(); }
 
         [Lamella.Runtime.RuntimeProvided] private static double ToDouble(Decimal value) { return 0.0; }
 

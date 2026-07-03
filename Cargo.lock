@@ -565,6 +565,8 @@ dependencies = [
  "lamella-load",
  "lamella-metadata",
  "lamella-token",
+ "lamella-wire",
+ "lamella-wireline",
  "serde",
  "serde_json",
 ]
@@ -688,6 +690,7 @@ dependencies = [
  "lamella-cil-runtime",
  "lamella-load",
  "lamella-metadata",
+ "lamella-token",
  "lamella-wire",
 ]
 
@@ -747,6 +750,8 @@ version = "0.0.0"
 name = "lamella-wireline"
 version = "0.0.0"
 dependencies = [
+ "lamella-assemble",
+ "lamella-metadata",
  "lamella-runner",
  "lamella-wire",
  "serialport",

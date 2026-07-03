@@ -154,7 +154,7 @@ fn check_inst(
                 use_value(func, defined, arg, errors);
             }
         }
-        Inst::CallIndirect { target, args } => {
+        Inst::CallIndirect { target, args, .. } => {
             use_value(func, defined, *target, errors);
             for &arg in args {
                 use_value(func, defined, arg, errors);
@@ -170,13 +170,19 @@ fn check_inst(
                 use_value(func, defined, arg, errors);
             }
         }
-        Inst::InvokeDelegate { delegate, args } => {
+        Inst::InvokeDelegate { delegate, args, .. } => {
             use_value(func, defined, *delegate, errors);
             for &arg in args {
                 use_value(func, defined, arg, errors);
             }
         }
         Inst::FuncAddr { .. } => {
+            if let Some(r) = result_ty {
+                expect(MirType::I32, r, errors);
+            }
+        }
+        Inst::VirtualFuncAddr { object, .. } => {
+            use_value(func, defined, *object, errors);
             if let Some(r) = result_ty {
                 expect(MirType::I32, r, errors);
             }

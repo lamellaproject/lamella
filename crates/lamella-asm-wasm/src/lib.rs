@@ -293,6 +293,14 @@ impl Func {
         self.op(0x10);
         write_var_u32(&mut self.code, index);
     }
+    /// `call_indirect type table` -- pop a table index, then the arguments, and call the function the
+    /// funcref table `table` holds at that index, checked against signature `type_index` (core spec
+    /// 5.4.1). The indirect-call primitive behind function pointers, `callvirt`, and delegate `Invoke`.
+    pub fn call_indirect(&mut self, type_index: u32, table_index: u32) {
+        self.op(0x11);
+        write_var_u32(&mut self.code, type_index);
+        write_var_u32(&mut self.code, table_index);
+    }
 
 
     /// `drop` -- discard the top stack value. (Named `drop_` to avoid clashing with the `Drop`
@@ -853,6 +861,10 @@ pub struct Module {
     globals: Vec<Global>,
     exports: Vec<Export>,
     data: Vec<DataSegment>,
+    /// When set, `finish` emits a `funcref` table holding every function (table index == function
+    /// index) plus the active element segment that fills it -- the dispatch table `call_indirect` reads
+    /// for function pointers, virtual dispatch, and delegates.
+    func_table: bool,
 }
 
 impl Module {
@@ -918,6 +930,13 @@ impl Module {
         });
     }
 
+    /// Requests an identity `funcref` dispatch table: `finish` emits a table with one entry per function
+    /// (table index == function index) and the element segment filling it, so `call_indirect` can call
+    /// any function by its own index. Idempotent; call it whenever an indirect call is emitted.
+    pub fn enable_func_table(&mut self) {
+        self.func_table = true;
+    }
+
     /// Exports the linear memory under `name`.
     pub fn export_memory(&mut self, name: &str) {
         self.exports.push(Export {
@@ -973,6 +992,16 @@ impl Module {
             write_section(&mut out, 3, &s);
         }
 
+        let func_count = self.imported_funcs.len() as u32 + self.defined_funcs.len() as u32;
+        if self.func_table && func_count > 0 {
+            let mut s = Vec::new();
+            write_var_u32(&mut s, 1);
+            s.push(0x70);
+            s.push(0x00);
+            write_var_u32(&mut s, func_count);
+            write_section(&mut out, 4, &s);
+        }
+
         if let Some(limits) = self.memory {
             let mut s = Vec::new();
             write_var_u32(&mut s, 1);
@@ -1022,6 +1051,20 @@ impl Module {
                 write_var_u32(&mut s, export.index);
             }
             write_section(&mut out, 7, &s);
+        }
+
+        if self.func_table && func_count > 0 {
+            let mut s = Vec::new();
+            write_var_u32(&mut s, 1);
+            s.push(0x00);
+            s.push(0x41);
+            write_var_i32(&mut s, 0);
+            s.push(0x0B);
+            write_var_u32(&mut s, func_count);
+            for i in 0..func_count {
+                write_var_u32(&mut s, i);
+            }
+            write_section(&mut out, 9, &s);
         }
 
         if !self.bodies.is_empty() {
@@ -1144,6 +1187,46 @@ mod tests {
             0x0A, 0x09, 0x01, 0x07, 0x00, 0x41, 0x28, 0x41, 0x02, 0x6A, 0x0B,
         ];
         assert_eq!(bytes, expected);
+    }
+
+    /// An identity `funcref` table + its element segment + a `call_indirect`. Pins the table (id 4)
+    /// and element (id 9) section bytes and the indirect-call opcode, so a two-function module lays a
+    /// table of size 2 filled `[0, 1]` and calls through it.
+    #[test]
+    fn func_table_and_call_indirect_encode() {
+        let mut module = Module::new();
+        let ty = module.add_type(FuncType {
+            params: vec![],
+            results: vec![ValType::I32],
+        });
+        let mut target = Func::new(0);
+        target.i32_const(42);
+        target.end();
+        module.add_function(ty, target);
+        let mut main = Func::new(0);
+        main.i32_const(0);
+        main.call_indirect(ty, 0);
+        main.end();
+        let entry = module.add_function(ty, main);
+        module.enable_func_table();
+        module.export_func("main", entry);
+        let bytes = module.finish();
+
+        let table: &[u8] = &[0x04, 0x04, 0x01, 0x70, 0x00, 0x02];
+        assert!(
+            bytes.windows(table.len()).any(|w| w == table),
+            "the funcref table section is present"
+        );
+        let elem: &[u8] = &[0x09, 0x08, 0x01, 0x00, 0x41, 0x00, 0x0B, 0x02, 0x00, 0x01];
+        assert!(
+            bytes.windows(elem.len()).any(|w| w == elem),
+            "the element segment fills table[i] = i"
+        );
+        let ci: &[u8] = &[0x11, ty as u8, 0x00];
+        assert!(
+            bytes.windows(ci.len()).any(|w| w == ci),
+            "the call_indirect opcode is emitted"
+        );
     }
 
     #[test]

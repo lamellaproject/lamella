@@ -507,6 +507,21 @@ impl ImageBuilder {
         }
     }
 
+    /// Adds a `Param` row (II.22.33) for a method's return value: `Flags` 0, `Sequence` 0,
+    /// no name. Call immediately after the owning method's [`add_method`] and before any
+    /// later method, so the row falls inside this method's `ParamList` run; it is then the
+    /// `HasCustomAttribute` parent a `[return:]` attribute (ECMA-334 24) is attached to.
+    /// Returns its `Param` token.
+    ///
+    /// [`add_method`]: ImageBuilder::add_method
+    pub fn add_return_param(&mut self) -> Token {
+        let row = self.tables.add_row(
+            table::PARAM,
+            alloc::vec![Column::U16(0), Column::U16(0), Column::StringRef(0)],
+        );
+        Token::new(table::PARAM, row)
+    }
+
     /// Adds an abstract `MethodDef` (RVA 0, no body, IL impl) -- an interface method or
     /// an abstract class method. `flags` carries Abstract | Virtual.
     pub fn add_abstract_method(&mut self, name: &str, signature: &[u8], flags: u16) -> Token {

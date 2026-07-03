@@ -1,4 +1,4 @@
-//! A host-PC C# REPL on the lamella interpreter.
+//! A host-PC C# REPL on the lamella interpreter, compiled in-process with the project's own compiler (lcsc).
 
 use lamella_load::{DeltaContext, load, load_bootstrap, load_delta, load_library};
 use lamella_metadata::Assembly;
@@ -7,7 +7,6 @@ use lamella_cil_runtime::{MethodId, Module, ObjectRef, Vm, run};
 use std::path::{Path, PathBuf};
 
 pub use lamella_cil_runtime::Value;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
@@ -16,14 +15,14 @@ use std::{env, fs};
 /// success or a diagnostic/trap message on failure.
 ///
 /// The pipeline is: wrap the line as a `WriteLine` of the expression, write it to
-/// a temp `.cs`, compile it into a temp `.dll`, then load + run that on a
-/// fresh interpreter and return [`Vm::output_string`]. A compile failure returns its
+/// a temp `.cs`, compile it in-process with the project's own compiler (lcsc) into a temp `.dll`, then load + run that on a
+/// fresh interpreter and return [`Vm::output_string`]. A compiler failure returns its
 /// diagnostics as `Err`; an interpreter trap returns the trap text as `Err`. Temp
 /// files are removed before returning, on every path.
 ///
 /// # Errors
 ///
-/// Returns `Err` when the compiler cannot be located, when compilation fails (the compiler
+/// Returns `Err` when the reference pack cannot be located, when compilation fails (the compiler
 /// diagnostics), when the produced assembly cannot be read or loaded, or when the
 /// interpreter traps while running it.
 pub fn eval(source_line: &str) -> Result<String, String> {
@@ -38,12 +37,12 @@ fn eval_in(source_line: &str, tools: &Toolchain, work: &TempProgram) -> Result<S
     fs::write(&work.source, wrap_expression(source_line))
         .map_err(|error| format!("cannot write temp source {}: {error}", work.source.display()))?;
 
-    compile(tools, work, CompileTarget::Exe)?;
+    compile(tools, work)?;
 
     let bytes = fs::read(&work.assembly)
         .map_err(|error| format!("cannot read compiled assembly: {error}"))?;
-    let assembly =
-        Assembly::read(&bytes).map_err(|error| format!("cannot read metadata: {error:?}"))?;
+    let assembly = lamella_metadata::Assembly::read(&bytes)
+        .map_err(|error| format!("cannot parse compiled assembly: {error:?}"))?;
     let program = load(&assembly).map_err(|error| format!("cannot load: {error}"))?;
 
     let mut vm = Vm::new();
@@ -69,132 +68,88 @@ fn wrap_expression(source_line: &str) -> String {
     )
 }
 
-#[derive(Clone, Copy)]
-enum CompileTarget {
-    Exe,
-    Library,
-}
-
-impl CompileTarget {
-    fn switch(self) -> &'static str {
-        match self {
-            CompileTarget::Exe => "/target:exe",
-            CompileTarget::Library => "/target:library",
-        }
-    }
-}
-
-fn compile(tools: &Toolchain, work: &TempProgram, target: CompileTarget) -> Result<(), String> {
-    let mut command = Command::new(&tools.dotnet);
-    command
-        .arg(&tools.csc)
-        .args(["/nologo", "/nostdlib", target.switch()])
-        .arg(format!("/out:{}", work.assembly.display()));
-    for reference in &tools.references {
-        command.arg(format!("/reference:{}", reference.display()));
-    }
-    command.arg(&work.source);
-
-    let output = command
-        .output()
-        .map_err(|error| format!("cannot run csc ({}): {error}", tools.csc.display()))?;
-    if output.status.success() && work.assembly.exists() {
-        return Ok(());
-    }
-    let mut diagnostics = String::from_utf8_lossy(&output.stdout).into_owned();
-    diagnostics.push_str(&String::from_utf8_lossy(&output.stderr));
-    let diagnostics = diagnostics.trim_end();
-    if diagnostics.is_empty() {
-        Err(format!("csc failed with {}", output.status))
-    } else {
-        Err(diagnostics.to_owned())
-    }
+fn compile(tools: &Toolchain, work: &TempProgram) -> Result<(), String> {
+    let source = fs::read_to_string(&work.source)
+        .map_err(|error| format!("cannot read temp source {}: {error}", work.source.display()))?;
+    let references: Vec<Assembly> = tools
+        .references
+        .iter()
+        .filter_map(|bytes| Assembly::read(bytes).ok())
+        .collect();
+    let compilation =
+        lamella_assemble::compile_source(&source, &work.source.display().to_string(), "repl", "repl", &references, false);
+    let Some(image) = compilation.image else {
+        return Err(format_diagnostics(&compilation.diagnostics, compilation.emit_error));
+    };
+    fs::write(&work.assembly, &image).map_err(|error| {
+        format!("cannot write compiled assembly {}: {error}", work.assembly.display())
+    })
 }
 
 struct Toolchain {
-    dotnet: PathBuf,
-    csc: PathBuf,
-    references: Vec<PathBuf>,
+    references: Vec<Vec<u8>>,
 }
 
 impl Toolchain {
+    /// Sources the reference assemblies the compiler resolves the BCL against, corlib-first:
+    /// `LAMELLA_CORLIB` (an explicit Lamella corlib.dll -- fully self-hosted), else a `corlib.dll`
+    /// beside the executable or in the working directory, else the dev tree's built corlib
+    /// fixture, else a directory of reference assemblies named by `LAMELLA_REF_DIR`. The corlib
+    /// ships as source (`corlib/`), so a fresh checkout builds its own:
+    /// `lcsc corlib/*/*.cs /out:corlib.dll`.
     fn discover() -> Result<Toolchain, String> {
-        let csc = match env::var_os("LAMELLA_CSC") {
-            Some(path) => PathBuf::from(path),
-            None => latest_match(
-                "C:\\Program Files\\dotnet\\sdk",
-                &["Roslyn", "bincore", "csc.dll"],
-            )
-            .ok_or_else(|| {
-                "cannot find csc.dll under C:\\Program Files\\dotnet\\sdk; \
-                 set LAMELLA_CSC to its path"
-                    .to_owned()
-            })?,
-        };
-
-        let ref_dir = match env::var_os("LAMELLA_REF_DIR") {
-            Some(path) => PathBuf::from(path),
-            None => latest_match(
-                "C:\\Program Files\\dotnet\\packs\\Microsoft.NETCore.App.Ref",
-                &["ref", "net8.0"],
-            )
-            .ok_or_else(|| {
-                "cannot find the net8.0 reference pack under \
-                 C:\\Program Files\\dotnet\\packs\\Microsoft.NETCore.App.Ref; \
-                 set LAMELLA_REF_DIR to its directory"
-                    .to_owned()
-            })?,
-        };
-        let references = reference_dlls(&ref_dir)?;
-
-        let dotnet = env::var_os("LAMELLA_DOTNET")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("dotnet"));
-
-        Ok(Toolchain {
-            dotnet,
-            csc,
-            references,
-        })
+        if let Some(path) = env::var_os("LAMELLA_CORLIB") {
+            let path = PathBuf::from(path);
+            let bytes = fs::read(&path)
+                .map_err(|error| format!("cannot read LAMELLA_CORLIB {}: {error}", path.display()))?;
+            return Ok(Toolchain { references: vec![bytes] });
+        }
+        for candidate in local_corlib_candidates() {
+            if let Ok(bytes) = fs::read(&candidate) {
+                return Ok(Toolchain { references: vec![bytes] });
+            }
+        }
+        if let Some(dir) = env::var_os("LAMELLA_REF_DIR") {
+            let references = reference_dlls(&PathBuf::from(dir))?;
+            return Ok(Toolchain { references });
+        }
+        Err("no reference assemblies: set LAMELLA_CORLIB to a Lamella corlib.dll (build one from \
+             the shipped sources: `lcsc corlib/*/*.cs /out:corlib.dll`), put a corlib.dll beside \
+             the executable, or set LAMELLA_REF_DIR to a directory of reference assemblies"
+            .to_owned())
     }
 }
 
-fn reference_dlls(ref_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut references = Vec::new();
-    let entries = fs::read_dir(ref_dir)
-        .map_err(|error| format!("cannot read ref dir {}: {error}", ref_dir.display()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")) {
-            references.push(path);
+fn local_corlib_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("corlib.dll"));
         }
     }
-    if references.is_empty() {
-        return Err(format!(
-            "no reference assemblies (*.dll) found in {}",
-            ref_dir.display()
-        ));
-    }
-    references.sort();
-    Ok(references)
+    candidates.push(PathBuf::from("corlib.dll"));
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamella-load/tests/fixtures/corlib.dll"),
+    );
+    candidates
 }
 
-fn latest_match(root: &str, tail: &[&str]) -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = fs::read_dir(root)
-        .ok()?
+fn reference_dlls(ref_dir: &Path) -> Result<Vec<Vec<u8>>, String> {
+    let mut paths: Vec<PathBuf> = fs::read_dir(ref_dir)
+        .map_err(|error| format!("cannot read ref dir {}: {error}", ref_dir.display()))?
         .flatten()
         .map(|entry| entry.path())
-        .filter(|version_dir| {
-            let mut candidate = version_dir.clone();
-            candidate.extend(tail);
-            candidate.exists()
-        })
+        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
         .collect();
-    candidates.sort();
-    let version_dir = candidates.pop()?;
-    let mut full = version_dir;
-    full.extend(tail);
-    Some(full)
+    paths.sort();
+    let references: Vec<Vec<u8>> = paths
+        .iter()
+        .filter_map(|path| fs::read(path).ok())
+        .collect();
+    if references.is_empty() {
+        return Err(format!("no reference assemblies (*.dll) found in {}", ref_dir.display()));
+    }
+    Ok(references)
 }
 
 struct TempProgram {
@@ -567,7 +522,7 @@ enum Submission {
     Expression { body: String },
 }
 
-/// A stateful host-PC C# REPL: declarations persist across
+/// A stateful host-PC C# REPL built on the in-process compiler: declarations persist across
 /// submissions, so `int x = 5;` then `x * 2` prints `10`.
 ///
 /// ```no_run
@@ -588,10 +543,10 @@ struct ReplState {
 }
 
 impl ReplSession {
-    /// Creates a stateful REPL session, discovering the compiler toolchain up front.
+    /// Creates a stateful REPL session, loading the reference assemblies up front.
     ///
     /// # Errors
-    /// Returns `Err` if the compiler / the reference pack cannot be located (so a caller can
+    /// Returns `Err` when the reference pack cannot be located (so a caller can
     /// skip-with-note exactly as the stateless tests do).
     pub fn new() -> Result<ReplSession, String> {
         let tools = Toolchain::discover()?;
@@ -664,7 +619,7 @@ impl ReplSession {
         fs::write(&work.source, source).map_err(|error| {
             format!("cannot write temp source {}: {error}", work.source.display())
         })?;
-        compile(&self.tools, work, CompileTarget::Library)?;
+        compile(&self.tools, work)?;
 
         let bytes = fs::read(&work.assembly)
             .map_err(|error| format!("cannot read compiled assembly: {error}"))?;
@@ -1098,6 +1053,9 @@ fn format_diagnostics(
             Some(lamella_assemble::EmitError::Unsupported(reason)) => {
                 format!("submission not lowered yet: {reason}")
             }
+            Some(lamella_assemble::EmitError::UnsupportedIn { reason, method }) => {
+                format!("submission not lowered yet: {reason} (in {method})")
+            }
             None => "submission produced no delta and no diagnostics".to_owned(),
         };
     }
@@ -1113,7 +1071,7 @@ fn format_diagnostics(
 
 fn find_method(module: &Module, name: &str) -> Option<MethodId> {
     let mut id: MethodId = 0;
-    while module.method(id).is_some() {
+    while module.method_kind(id).is_some() {
         if module.method_name(id) == Some(name) {
             return Some(id);
         }
@@ -1138,7 +1096,7 @@ mod tests {
     #[test]
     fn evaluates_stateless_expressions() {
         if Toolchain::discover().is_err() {
-            eprintln!("skipping: csc/ref-pack not found on this host");
+            eprintln!("skipping: .NET reference pack not found on this host");
             return;
         }
         assert_eq!(eval("1 + 2 * 3").as_deref(), Ok("7\n"));
@@ -1149,11 +1107,12 @@ mod tests {
     #[test]
     fn reports_compile_errors_as_err() {
         if Toolchain::discover().is_err() {
-            eprintln!("skipping: csc/ref-pack not found on this host");
+            eprintln!("skipping: .NET reference pack not found on this host");
             return;
         }
         assert!(eval("nonexistent + 1").is_err());
     }
+
 
     fn expect_declaration(submission: Submission, message: &str) -> (Vec<(String, String)>, String) {
         match submission {
@@ -1280,7 +1239,7 @@ mod tests {
         let mut session = match ReplSession::new() {
             Ok(session) => session,
             Err(_) => {
-                eprintln!("skipping: csc/ref-pack not found on this host");
+                eprintln!("skipping: .NET reference pack not found on this host");
                 return;
             }
         };
@@ -1295,7 +1254,7 @@ mod tests {
         let mut session = match ReplSession::new() {
             Ok(session) => session,
             Err(_) => {
-                eprintln!("skipping: csc/ref-pack not found on this host");
+                eprintln!("skipping: .NET reference pack not found on this host");
                 return;
             }
         };
@@ -1311,7 +1270,7 @@ mod tests {
         let mut session = match ReplSession::new() {
             Ok(session) => session,
             Err(_) => {
-                eprintln!("skipping: csc/ref-pack not found on this host");
+                eprintln!("skipping: .NET reference pack not found on this host");
                 return;
             }
         };
@@ -1327,7 +1286,7 @@ mod tests {
         let mut session = match ReplSession::new() {
             Ok(session) => session,
             Err(_) => {
-                eprintln!("skipping: csc/ref-pack not found on this host");
+                eprintln!("skipping: .NET reference pack not found on this host");
                 return;
             }
         };
@@ -1340,8 +1299,6 @@ mod tests {
     fn emitted_class_has_no_main_entry_point() {
         let session = ReplSession {
             tools: Toolchain {
-                dotnet: PathBuf::new(),
-                csc: PathBuf::new(),
                 references: Vec::new(),
             },
             fields: vec![

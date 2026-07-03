@@ -417,7 +417,9 @@ fn local_type<'a>(body: &'a Stmt, name: &str) -> Option<&'a TypeRef> {
 /// Visits every `T name` local declaration in `stmt` (and nested blocks/loops).
 fn walk_locals<'a>(stmt: &'a Stmt, visit: &mut dyn FnMut(&'a TypeRef, &str)) {
     match &stmt.kind {
-        StmtKind::LocalDeclaration { ty, declarators } => {
+        StmtKind::LocalDeclaration {
+            ty, declarators, ..
+        } => {
             for declarator in declarators {
                 visit(ty, &declarator.name);
             }

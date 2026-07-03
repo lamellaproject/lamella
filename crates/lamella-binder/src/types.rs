@@ -22,11 +22,10 @@ pub enum TypeSymbol {
     /// An unsafe pointer type `T*` (III.1.1.5): a raw managed pointer to `element`.
     Pointer(Box<TypeSymbol>),
     /// A managed-pointer (`ref`/`out`) parameter type `T&` (III.1.1.4.2): the referent is
-    /// `element`. It arises only on a method signature's parameter -- an external method's
-    /// `ref`/`out` parameter, preserved from its metadata so the minted MemberRef encodes the
-    /// byref (without it `bool.TryParse(string, out bool)` would call `(string, bool)` and
-    /// MissingMethod). For argument matching it behaves like its referent (a `ref`/`out` argument
-    /// already supplies the address); only the signature distinguishes it.
+    /// `element`. It arises only on a method signature's parameter -- declared in source or
+    /// preserved from a referenced assembly's metadata -- so the signature encodes the byref
+    /// and overloading distinguishes the passing mode (10.6). The parameter's BODY use reads
+    /// and writes the referent through the address it holds.
     ByRef(Box<TypeSymbol>),
     /// A type that could not be resolved; emitted with a diagnostic so binding
     /// continues.
@@ -47,6 +46,23 @@ impl TypeSymbol {
             element: Box::new(self),
             rank,
         }
+    }
+
+    /// This symbol with a written-out `System` built-in folded to its special form:
+    /// `System.Int32` written in source and the `int` keyword are ONE type (4.1.4),
+    /// whether the built-in comes from a reference or from a corlib-style compilation's
+    /// own `System` declarations. Every constructor of a named symbol folds through
+    /// this, so the two spellings never diverge in comparisons.
+    #[must_use]
+    pub fn fold_builtin(self) -> TypeSymbol {
+        if let TypeSymbol::Named(parts) = &self {
+            if let [namespace, name] = &parts[..] {
+                if let Some(special) = crate::reference::special_for_named(namespace, name) {
+                    return TypeSymbol::Special(special);
+                }
+            }
+        }
+        self
     }
 
     /// Whether this is `void`.

@@ -125,6 +125,10 @@ impl<'a> Reader<'a> {
         Reader { code, pos: 0 }
     }
 
+    fn at(code: &'a [u8], pos: usize) -> Reader<'a> {
+        Reader { code, pos }
+    }
+
     fn at_end(&self) -> bool {
         self.pos >= self.code.len()
     }
@@ -220,6 +224,31 @@ pub fn decode_with_offsets(code: &[u8]) -> Result<(Vec<Instruction>, Vec<u32>), 
 
     resolve_targets(&mut instructions, &offsets)?;
     Ok((instructions, offsets))
+}
+
+/// Decodes the single instruction beginning at byte `offset` of `code`, returning it together
+/// with the byte offset of the next instruction.
+///
+/// Unlike [`decode`], the branch and `switch` operands stay ABSOLUTE BYTE OFFSETS into `code`
+/// (each relative displacement resolved against the following instruction), because no
+/// instruction list exists to index. This is the `code_loading = in_place` fetch: an interpreter
+/// executing a method straight from its flash-resident bytes keeps its instruction pointer as a
+/// byte offset and decodes one instruction per step, branching by assigning the operand's offset.
+///
+/// Whether a target lands on an instruction boundary cannot be validated here -- that requires
+/// walking the whole stream, which is what in-place execution avoids. A caller trusts the image
+/// the way any execute-in-place code trusts its flash; a wild target mis-decodes or errors on a
+/// later fetch, it never reads out of bounds.
+///
+/// # Errors
+/// [`DecodeError`] for an `offset` at or past the end of `code`, a truncated instruction, an
+/// undefined opcode, or a displacement that escapes the 4 GiB code range.
+pub fn decode_at(code: &[u8], offset: usize) -> Result<(Instruction, usize), DecodeError> {
+    let mut reader = Reader::at(code, offset);
+    let start = reader.offset();
+    let opcode = decode_opcode(&mut reader, start)?;
+    let operand = decode_operand(&mut reader, opcode, start)?;
+    Ok((Instruction { opcode, operand }, reader.pos))
 }
 
 fn decode_opcode(reader: &mut Reader<'_>, start: u32) -> Result<Opcode, DecodeError> {
@@ -667,6 +696,76 @@ mod tests {
             encode(&program),
             Err(EncodeError::TargetIndexOutOfRange { index: 9 })
         );
+    }
+
+    /// Walks `decode_at` across a stream and checks each instruction against the list
+    /// `decode_with_offsets` produced, mapping the list form's index targets through the offsets
+    /// table into `decode_at`'s byte-offset domain.
+    fn walk_matches_list(program: &[Instruction]) {
+        let bytes = encode(program).expect("encode");
+        let (list, offsets) = decode_with_offsets(&bytes).expect("decode");
+        let byte_of = |index: u32| offsets[index as usize];
+        let mut offset = 0usize;
+        let mut walked = 0usize;
+        while offset < bytes.len() {
+            let (instruction, next) = decode_at(&bytes, offset).expect("decode_at");
+            assert_eq!(offset as u32, offsets[walked], "instruction start offset");
+            let listed = &list[walked];
+            assert_eq!(instruction.opcode, listed.opcode, "opcode at {offset}");
+            match (&instruction.operand, &listed.operand) {
+                (Operand::Target(byte), Operand::Target(index)) => {
+                    assert_eq!(*byte, byte_of(*index), "branch target at {offset}");
+                }
+                (Operand::Switch(bytes_t), Operand::Switch(indices)) => {
+                    let mapped: Vec<u32> = indices.iter().map(|i| byte_of(*i)).collect();
+                    assert_eq!(bytes_t.as_ref(), mapped.as_slice(), "switch table at {offset}");
+                }
+                (walked_op, listed_op) => assert_eq!(walked_op, listed_op, "operand at {offset}"),
+            }
+            offset = next;
+            walked += 1;
+        }
+        assert_eq!(walked, list.len(), "every instruction walked");
+    }
+
+    #[test]
+    fn decode_at_walks_a_stream_in_byte_offsets() {
+        walk_matches_list(&[
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::new(Opcode::BrfalseS, Operand::Target(3)),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(1000)),
+            Instruction::new(Opcode::Br, Operand::Target(0)),
+            Instruction::new(Opcode::Ldarg, Operand::Variable(300)),
+            Instruction::new(Opcode::LdcR8, Operand::Float64(-0.5)),
+            Instruction::new(Opcode::Call, Operand::Token(Token(0x0600_0001))),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        walk_matches_list(&[
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::new(
+                Opcode::Switch,
+                Operand::Switch(vec![3, 0, 2].into_boxed_slice()),
+            ),
+            Instruction::simple(Opcode::Nop),
+            Instruction::simple(Opcode::Ret),
+        ]);
+    }
+
+    #[test]
+    fn decode_at_reports_the_end_and_truncation() {
+        let bytes = encode(&[
+            Instruction::new(Opcode::LdcI4, Operand::Int32(7)),
+            Instruction::simple(Opcode::Ret),
+        ])
+        .unwrap();
+        assert!(matches!(
+            decode_at(&bytes, bytes.len()),
+            Err(DecodeError::UnexpectedEnd { .. })
+        ));
+        assert!(matches!(
+            decode_at(&bytes[..3], 0),
+            Err(DecodeError::UnexpectedEnd { .. })
+        ));
     }
 
     #[test]

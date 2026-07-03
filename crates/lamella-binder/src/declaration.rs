@@ -1,8 +1,8 @@
 //! Collecting the types and members declared in source (ECMA-334 1st ed,
 //! clauses 16-18).
 
-use crate::bind::bind_type;
-use crate::bound::{integer_literal, literal_int_value};
+use crate::bind::{bind_type, parameter_symbol};
+use crate::bound::{coerce_constant, integer_literal, literal_int_value};
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::symbols::{
@@ -11,6 +11,7 @@ use crate::symbols::{
 };
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{
@@ -62,13 +63,15 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             info.base = Some(enum_base);
             let enum_ty = named_symbol(namespace, &declaration.name);
             let mut next_value: i64 = 0;
+            let mut prior: BTreeMap<Box<str>, i64> = BTreeMap::new();
             for member in &declaration.members {
                 let value = member
                     .value
                     .as_ref()
-                    .and_then(enum_member_value)
+                    .and_then(|expr| eval_enum_member(expr, &prior))
                     .unwrap_or(next_value);
                 next_value = value.wrapping_add(1);
+                prior.insert(member.name.clone(), value);
                 info.fields.push(FieldSymbol {
                     name: member.name.clone(),
                     ty: enum_ty.clone(),
@@ -88,7 +91,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 parameters: declaration
                     .parameters
                     .iter()
-                    .map(|p| bind_type(&p.ty))
+                    .map(parameter_symbol)
                     .collect(),
                 is_static: false,
                 is_params: has_params_array(&declaration.parameters),
@@ -135,26 +138,65 @@ fn qualified_type_name(namespace: &str, name: &str) -> alloc::string::String {
     }
 }
 
-/// A `const` field's folded value (14.16, like an enum member). An integral or `char` value --
-/// optionally negated -- folds via the enum-member path to an integer literal; a string, bool,
-/// real, or decimal literal folds directly. `None` for a non-literal initializer (a `const`
-/// *expression*, which v1 does not fold), so the field stays a runtime field at the use site.
+/// A `const` field's folded value (14.15). Its initializer is a constant expression with no
+/// name references (a field constant does not see other members here), so it folds through the
+/// shared evaluator with an empty lookup. `None` when it is not a constant expression, so the
+/// field stays a runtime field at the use site.
 fn const_field_literal(expr: &Expr) -> Option<Literal> {
+    fold_const(expr, &|_| None)
+}
+
+/// An enum member's underlying value (21.4): its initializer folded as a constant expression,
+/// with references to `prior` members resolved to their assigned values. `None` when the
+/// initializer is not a constant expression, so the caller continues the auto-increment.
+fn eval_enum_member(expr: &Expr, prior: &BTreeMap<Box<str>, i64>) -> Option<i64> {
+    let value = fold_const(expr, &|name| prior.get(name).copied().map(integer_literal))?;
+    literal_int_value(&value)
+}
+
+/// Folds a constant expression (14.15) to its [`Literal`] value: a literal, a parenthesized
+/// expression, a name resolved by `lookup` (an enum member; nothing for a field), a unary or
+/// binary operation, a numeric/char cast, or a conditional whose condition folds to a `bool`.
+/// `None` for anything not a compile-time constant.
+fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<Literal> {
     match &expr.kind {
         ExprKind::Literal(literal) => Some(literal.clone()),
-        ExprKind::Parenthesized(inner) => const_field_literal(inner),
+        ExprKind::Parenthesized(inner) => fold_const(inner, lookup),
+        ExprKind::Name(name) => lookup(name),
         ExprKind::Unary { operator, operand } => {
-            fold_const_unary(*operator, &const_field_literal(operand)?)
+            fold_const_unary(*operator, &fold_const(operand, lookup)?)
         }
-        ExprKind::Binary { operator, left, right } => {
-            fold_const_binary(*operator, &const_field_literal(left)?, &const_field_literal(right)?)
+        ExprKind::Binary {
+            operator,
+            left,
+            right,
+        } => fold_const_binary(
+            *operator,
+            &fold_const(left, lookup)?,
+            &fold_const(right, lookup)?,
+        ),
+        ExprKind::Cast { target, operand } => {
+            let operand = fold_const(operand, lookup)?;
+            match bind_type(target) {
+                TypeSymbol::Special(special) => coerce_constant(literal_int_value(&operand)?, special),
+                _ => None,
+            }
         }
+        ExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => match fold_const(condition, lookup)? {
+            Literal::Boolean(true) => fold_const(when_true, lookup),
+            Literal::Boolean(false) => fold_const(when_false, lookup),
+            _ => None,
+        },
         _ => None,
     }
 }
 
 /// Folds a unary operator applied to an already-folded constant operand (14.6).
-fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Option<Literal> {
+pub(crate) fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Option<Literal> {
     match operator {
         UnaryOperator::Plus => Some(operand.clone()),
         UnaryOperator::Minus => Some(integer_literal(literal_int_value(operand)?.checked_neg()?)),
@@ -171,7 +213,11 @@ fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Option<Litera
 /// arithmetic uses checked ops, so an overflow or a divide-by-zero declines to fold (it is not a
 /// constant value); string `+` concatenates. Operands are treated as `i64`, so a `const` whose type
 /// or value needs the operand's own width (e.g. a `uint` expression near `u32::MAX`) is not folded.
-fn fold_const_binary(operator: BinaryOperator, left: &Literal, right: &Literal) -> Option<Literal> {
+pub(crate) fn fold_const_binary(
+    operator: BinaryOperator,
+    left: &Literal,
+    right: &Literal,
+) -> Option<Literal> {
     use BinaryOperator as Op;
     if let (Op::Add, Literal::String(left), Literal::String(right)) = (operator, left, right) {
         let mut units = left.to_vec();
@@ -202,21 +248,6 @@ fn fold_const_binary(operator: BinaryOperator, left: &Literal, right: &Literal) 
     Some(integer_literal(value))
 }
 
-/// Evaluates an enum member's value expression to its underlying integral value.
-/// The v1 forms are an integer or character literal, optionally negated; anything
-/// else yields `None`, and the caller continues the auto-increment.
-fn enum_member_value(expr: &Expr) -> Option<i64> {
-    match &expr.kind {
-        ExprKind::Literal(Literal::Integer { value, .. }) => i64::try_from(*value).ok(),
-        ExprKind::Literal(Literal::Character(unit)) => Some(i64::from(*unit)),
-        ExprKind::Unary {
-            operator: UnaryOperator::Minus,
-            operand,
-        } => enum_member_value(operand).map(|value| -value),
-        _ => None,
-    }
-}
-
 /// Builds the [`TypeInfo`] for one type declaration, collecting its fields and
 /// methods.
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
@@ -225,7 +256,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     if matches!(declaration.kind, SyntaxTypeKind::Struct) {
         info.bases.push(named_symbol("System", "ValueType"));
     }
-    if matches!(declaration.kind, SyntaxTypeKind::Class) {
+    if matches!(declaration.kind, SyntaxTypeKind::Class)
+        && !(namespace == "System" && &*declaration.name == "Object")
+    {
         info.bases.push(named_symbol("System", "Object"));
     }
     let is_interface = matches!(declaration.kind, SyntaxTypeKind::Interface);
@@ -316,7 +349,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     None => name.clone(),
                 },
                 return_type: bind_type(return_type),
-                parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
+                parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: explicit_interface.is_none() && is_static(modifiers),
                 is_params: has_params_array(parameters),
                 accessibility: match explicit_interface {
@@ -333,7 +366,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             } => info.methods.push(MethodSymbol {
                 name: operator.method_name(parameters.len()).into(),
                 return_type: bind_type(return_type),
-                parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
+                parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: true,
                 is_params: false,
                 accessibility: Accessibility::Public,
@@ -347,7 +380,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             } => info.methods.push(MethodSymbol {
                 name: direction.method_name().into(),
                 return_type: bind_type(target),
-                parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
+                parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: true,
                 is_params: false,
                 accessibility: Accessibility::Public,
@@ -364,6 +397,42 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_static: is_static(modifiers),
                 accessibility: access(modifiers),
             }),
+            Member::Indexer {
+                modifiers,
+                ty,
+                parameters,
+                getter,
+                setter,
+                ..
+            } => {
+                let element = bind_type(ty);
+                let indices: Vec<TypeSymbol> = parameters.iter().map(parameter_symbol).collect();
+                let accessibility = access(modifiers);
+                if getter.is_some() {
+                    info.methods.push(MethodSymbol {
+                        name: "get_Item".into(),
+                        return_type: element.clone(),
+                        parameters: indices.clone(),
+                        is_static: false,
+                        is_params: has_params_array(parameters),
+                        accessibility,
+                        conditional: Vec::new(),
+                    });
+                }
+                if setter.is_some() {
+                    let mut parameters = indices;
+                    parameters.push(element);
+                    info.methods.push(MethodSymbol {
+                        name: "set_Item".into(),
+                        return_type: TypeSymbol::Special(SpecialType::Void),
+                        parameters,
+                        is_static: false,
+                        is_params: false,
+                        accessibility,
+                        conditional: Vec::new(),
+                    });
+                }
+            }
             Member::Constructor {
                 modifiers,
                 parameters,
@@ -387,7 +456,7 @@ fn constructor(parameters: &[lamella_syntax::ast::Parameter]) -> MethodSymbol {
     MethodSymbol {
         name: ".ctor".into(),
         return_type: TypeSymbol::Special(SpecialType::Void),
-        parameters: parameters.iter().map(|p| bind_type(&p.ty)).collect(),
+        parameters: parameters.iter().map(parameter_symbol).collect(),
         is_static: false,
         is_params: has_params_array(parameters),
         accessibility: Accessibility::Public,
@@ -430,7 +499,7 @@ fn has_params_array(parameters: &[lamella_syntax::ast::Parameter]) -> bool {
 }
 
 /// A named-type symbol from a namespace and simple name, e.g. `"A.B"` + `Color`
-/// gives `A.B.Color`.
+/// gives `A.B.Color`; a `System` built-in folds to its special form.
 fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
     let mut parts: alloc::vec::Vec<alloc::boxed::Box<str>> = alloc::vec::Vec::new();
     if !namespace.is_empty() {
@@ -439,7 +508,7 @@ fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
         }
     }
     parts.push(name.into());
-    TypeSymbol::Named(parts.into_boxed_slice())
+    TypeSymbol::Named(parts.into_boxed_slice()).fold_builtin()
 }
 
 fn map_kind(kind: SyntaxTypeKind) -> TypeKind {

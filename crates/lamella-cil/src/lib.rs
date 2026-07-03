@@ -11,11 +11,11 @@ pub mod instruction;
 pub mod opcode;
 
 pub use body::{
-    BodyError, EhClause, EhKind, InstructionRange, MethodBodyImage, read_method_body,
-    read_method_body_sized, write_method_body,
+    BodyError, BodyLayout, EhClause, EhKind, InstructionRange, MethodBodyImage, read_body_layout,
+    read_method_body, read_method_body_sized, write_method_body,
 };
 pub use codec::{
-    DecodeError, EncodeError, decode, decode_with_offsets, encode, encode_with_offsets,
+    DecodeError, EncodeError, decode, decode_at, decode_with_offsets, encode, encode_with_offsets,
     instruction_offsets,
 };
 pub use instruction::{Instruction, Operand};

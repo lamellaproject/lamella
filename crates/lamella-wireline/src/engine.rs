@@ -16,14 +16,15 @@ use std::time::Duration;
 pub enum CompileFailure {
     /// The compiler rejected the source; the text is the diagnostics to show the user.
     Diagnostics(String),
-    /// The compiler / toolchain itself failed (not a source error) -- e.g. the compiler could not be located.
+    /// The compiler itself failed (not a source error) -- e.g. its reference assemblies could not be
+    /// located.
     Toolchain(String),
 }
 
 /// Compiles a C# submission to a program assembly's bytes. This is the engine's COMPILE seam, the
-/// symmetric counterpart to [`ReplLink`]: a host supplies the host-side [`crate::compile::Compiler`];
-/// a browser host (Lamella Studio) supplies an in-process compiler over `lamella-wasm`. Because the
-/// engine is written against this trait (not a concrete compiler), the SAME [`Repl`] -- transcript
+/// symmetric counterpart to [`ReplLink`]: a host supplies an in-process compiler (the project's own,
+/// over `lamella-assemble`); a browser host (Lamella Studio) supplies one over `lamella-wasm`. Because
+/// the engine is written against this trait (not a concrete compiler), the SAME [`Repl`] -- transcript
 /// model, classification, suffix logic -- drives both, so the browser REPL is a faithful preview of the
 /// CLI one.
 pub trait ReplCompiler {
@@ -344,6 +345,109 @@ impl Repl {
     }
 }
 
+/// A [`ReplCompiler`] over the project's OWN compiler (`lamella-assemble`) -- no Microsoft
+/// compiler in the loop. It holds the reference-assembly bytes and re-reads them into borrowed
+/// `Assembly` views per submission (matching the browser's in-wasm compiler). This is the host
+/// compile seam the `lamella-repl` CLI and the DAP Debug Console both pass to [`Repl::new`].
+#[cfg(feature = "repl-host")]
+pub struct LcscCompiler {
+    references: Vec<Vec<u8>>,
+}
+
+#[cfg(feature = "repl-host")]
+impl LcscCompiler {
+    /// Sources the reference assemblies to bind against, corlib-first: `LAMELLA_CORLIB` (an
+    /// explicit Lamella corlib.dll -- fully self-hosted), else a `corlib.dll` beside the
+    /// executable or in the working directory, else the dev tree's built corlib fixture, else
+    /// every `*.dll` in the directory named by `LAMELLA_REF_DIR`. `Err` only when none is found;
+    /// a fresh checkout builds its own corlib from the shipped sources
+    /// (`lcsc corlib/*/*.cs /out:corlib.dll`).
+    pub fn discover() -> Result<LcscCompiler, String> {
+        if let Some(path) = std::env::var_os("LAMELLA_CORLIB") {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                format!(
+                    "cannot read LAMELLA_CORLIB {}: {error}",
+                    std::path::PathBuf::from(&path).display()
+                )
+            })?;
+            return Ok(LcscCompiler {
+                references: vec![bytes],
+            });
+        }
+        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("corlib.dll"));
+            }
+        }
+        candidates.push(std::path::PathBuf::from("corlib.dll"));
+        candidates.push(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../lamella-load/tests/fixtures/corlib.dll"),
+        );
+        for candidate in candidates {
+            if let Ok(bytes) = std::fs::read(&candidate) {
+                return Ok(LcscCompiler {
+                    references: vec![bytes],
+                });
+            }
+        }
+        if let Some(dir) = std::env::var_os("LAMELLA_REF_DIR") {
+            let dir = std::path::PathBuf::from(dir);
+            let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .map_err(|error| format!("cannot read LAMELLA_REF_DIR {}: {error}", dir.display()))?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
+                .collect();
+            paths.sort();
+            let references: Vec<Vec<u8>> =
+                paths.iter().filter_map(|path| std::fs::read(path).ok()).collect();
+            if !references.is_empty() {
+                return Ok(LcscCompiler { references });
+            }
+        }
+        Err("no reference assemblies: set LAMELLA_CORLIB to a Lamella corlib.dll (build one from \
+             the shipped sources: `lcsc corlib/*/*.cs /out:corlib.dll`), put a corlib.dll beside \
+             the executable, or set LAMELLA_REF_DIR to a directory of reference assemblies"
+            .to_owned())
+    }
+}
+
+#[cfg(feature = "repl-host")]
+impl ReplCompiler for LcscCompiler {
+    fn compile(&self, source: &str) -> Result<Vec<u8>, CompileFailure> {
+        let references: Vec<lamella_metadata::Assembly> = self
+            .references
+            .iter()
+            .filter_map(|bytes| lamella_metadata::Assembly::read(bytes).ok())
+            .collect();
+        let compiled =
+            lamella_assemble::compile_source(source, "Repl.cs", "__Repl", "__Repl", &references, false);
+        if let Some(image) = compiled.image {
+            return Ok(image);
+        }
+        if let Some(emit_error) = compiled.emit_error {
+            return Err(CompileFailure::Diagnostics(format!("{emit_error:?}")));
+        }
+        let mut text = String::new();
+        for diagnostic in &compiled.diagnostics {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let severity = if diagnostic.is_error() { "error" } else { "warning" };
+            text.push_str(&format!(
+                "CS{:04}: {severity}: {}",
+                diagnostic.code, diagnostic.message
+            ));
+        }
+        if text.is_empty() {
+            text.push_str("compilation produced no image");
+        }
+        Err(CompileFailure::Diagnostics(text))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,15 +512,16 @@ mod tests {
         assert_eq!(result.stdout, "hi\n");
     }
 
-    /// End-to-end through the real host toolchain -- ignored by default (needs the .NET SDK + ref assemblies, like the
-    /// differential). Run on demand: `cargo test -p lamella-wireline -- --ignored`. Gated on the host
-    /// compiler (`repl-host`).
+    /// End-to-end through the project's OWN in-process compiler (`lamella-assemble`) -- no Microsoft
+    /// compiler. Ignored by default: the compiler resolves the BCL against the .NET reference
+    /// assemblies (metadata), so the pack must be present, as for the differential. Run on demand:
+    /// `cargo test -p lamella-wireline --features repl-host -- --ignored`.
     #[cfg(feature = "repl-host")]
     #[test]
-    #[ignore = "needs the .NET SDK (the host compiler + ref assemblies); run with --ignored"]
+    #[ignore = "needs the .NET reference assemblies (the compiler resolves the BCL against them); run with --ignored"]
     fn end_to_end_repl_over_loopback() {
-        let Ok(compiler) = crate::compile::Compiler::discover() else {
-            eprintln!("skipping: no .NET toolchain");
+        let Ok(compiler) = LcscCompiler::discover() else {
+            eprintln!("skipping: no reference assemblies on this host");
             return;
         };
         let Some(corlib) = corlib() else { return };
@@ -443,4 +548,5 @@ mod tests {
         assert!(matches!(repl.eval("nonsense +").expect("eval"), Outcome::CompileError(_)));
         assert_eq!(repl.transcript().count(), 2);
     }
+
 }

@@ -350,7 +350,7 @@ pub struct Binder {
     /// Whether expressions are currently bound in a `checked` context (14.5.12),
     /// tracked as the binder descends so each arithmetic/cast node records whether
     /// emission should use the overflow-checking form. C# 1.0 defaults to unchecked.
-    checked_context: bool,
+    pub(crate) checked_context: bool,
     /// In REPL session mode, the name of the parameter standing in for the persistent
     /// `__Repl` instance (`s`). When set, an unqualified name that resolves to a member
     /// of the enclosing type reads through `s` (a parameter) instead of `this` -- the
@@ -372,6 +372,11 @@ pub struct Binder {
     /// The preprocessor symbols defined for this compilation (from `#define`), so a call to a
     /// `[Conditional("X")]` method with no `X` here is omitted (24.4.2). Empty by default.
     defined_symbols: alloc::collections::BTreeSet<Box<str>>,
+    /// Local constants in scope (15.5.1) mapped to their folded value and declared type: a
+    /// reference to one binds to its constant, not a variable load, and the declaration emits
+    /// nothing. Reset per method. Keyed by name; a local constant is also declared as a local
+    /// so a redeclaration is still `CS0128`/`CS0136`.
+    const_locals: BTreeMap<String, (Literal, TypeSymbol)>,
 }
 
 impl Binder {
@@ -499,11 +504,34 @@ impl Binder {
             || self.user_conversion(from, to, "op_Implicit").is_some()
     }
 
-    /// Whether `value` is assignable to `target`: it implicitly converts by type, or it
-    /// is a constant whose value fits a narrower integral `target` (13.1.7). Use this at
-    /// an assignment context that has the value expression, not just its type.
+    /// Whether the constant `value` is the integer `0` and `target` is an enum type -- the
+    /// implicit enumeration conversion (13.1.3), which lets `E e = 0;`. Restricted to a
+    /// genuine integer constant (not `char`/`bool`), matching the reference compiler.
+    fn enum_from_zero(&self, value: &BoundExpr, target: &TypeSymbol) -> bool {
+        matches!(
+            value.ty,
+            TypeSymbol::Special(
+                SpecialType::SByte
+                    | SpecialType::Byte
+                    | SpecialType::Int16
+                    | SpecialType::UInt16
+                    | SpecialType::Int32
+                    | SpecialType::UInt32
+                    | SpecialType::Int64
+                    | SpecialType::UInt64
+            )
+        ) && self.type_info_of(target).map(|info| info.kind) == Some(TypeKind::Enum)
+            && constant_int_value(value) == Some(0)
+    }
+
+    /// Whether `value` is assignable to `target`: it implicitly converts by type, it is a
+    /// constant whose value fits a narrower integral `target` (13.1.7), or it is the constant
+    /// `0` assigned to an enum (13.1.3). Use this at an assignment context that has the value
+    /// expression, not just its type.
     pub(crate) fn assignable(&self, value: &BoundExpr, target: &TypeSymbol) -> bool {
-        self.converts(&value.ty, target) || implicit_constant_conversion(value, target)
+        self.converts(&value.ty, target)
+            || implicit_constant_conversion(value, target)
+            || self.enum_from_zero(value, target)
     }
 
     /// Reports a failed conversion (`CS0266`/`CS0029`) at an assignment context unless
@@ -609,6 +637,12 @@ impl Binder {
         if expr.ty == *target || expr.ty.is_error() || target.is_error() {
             return expr;
         }
+        if self.enum_from_zero(&expr, target) {
+            return BoundExpr {
+                kind: BoundExprKind::Literal(integer_literal(0)),
+                ty: target.clone(),
+            };
+        }
         if matches!(target, TypeSymbol::Special(SpecialType::Decimal))
             && !matches!(expr.ty, TypeSymbol::Special(SpecialType::Decimal))
         {
@@ -678,6 +712,71 @@ impl Binder {
             .collect()
     }
 
+    /// Binds a rectangular array initializer `{{ .. }, { .. }}` (19.6): the leaf elements
+    /// flattened in row-major order and converted to the element type, paired with each
+    /// dimension's length, inferred from the initializer's shape (the sub-list count at each
+    /// level). `None` when `array_ty` is not a rank >= 2 array, so the caller keeps the
+    /// single-dimension path. The inferred lengths stand in for omitted (`new T[,]{...}`) and
+    /// bare (`T[,] a = {...}`) creations alike, and equal the written lengths otherwise.
+    pub(crate) fn bind_rectangular_array(
+        &mut self,
+        init: &Expr,
+        array_ty: &TypeSymbol,
+    ) -> Option<(Vec<BoundExpr>, Vec<BoundExpr>)> {
+        let TypeSymbol::Array { element, rank } = array_ty else {
+            return None;
+        };
+        let rank = *rank as usize;
+        if rank < 2 {
+            return None;
+        }
+        let element_ty = (**element).clone();
+        let mut dimensions = alloc::vec![0usize; rank];
+        let mut elements = Vec::new();
+        self.flatten_rectangular_level(init, 0, rank, &element_ty, &mut dimensions, &mut elements);
+        let lengths = dimensions
+            .into_iter()
+            .map(|length| BoundExpr {
+                kind: BoundExprKind::Literal(Literal::Integer {
+                    value: length as u64,
+                    suffix: IntegerSuffix::None,
+                }),
+                ty: TypeSymbol::Special(SpecialType::Int32),
+            })
+            .collect();
+        Some((lengths, elements))
+    }
+
+    /// Descends one nesting level of a rectangular initializer (19.6): fixes `dimensions[depth]`
+    /// from this level's sub-list count on first encounter, then recurses into each sub-list
+    /// until the leaf level (`depth + 1 == rank`), where each item is a bound, converted element.
+    fn flatten_rectangular_level(
+        &mut self,
+        init: &Expr,
+        depth: usize,
+        rank: usize,
+        element_ty: &TypeSymbol,
+        dimensions: &mut [usize],
+        elements: &mut Vec<BoundExpr>,
+    ) {
+        let ExprKind::ArrayInitializer(items) = &init.kind else {
+            return;
+        };
+        if dimensions[depth] == 0 {
+            dimensions[depth] = items.len();
+        }
+        if depth + 1 == rank {
+            for item in items {
+                let bound = self.bind_expression(item);
+                elements.push(self.convert(bound, element_ty));
+            }
+        } else {
+            for item in items {
+                self.flatten_rectangular_level(item, depth + 1, rank, element_ty, dimensions, elements);
+            }
+        }
+    }
+
     /// Converts `value` to the enclosing method's return type, for a `return`.
     pub(crate) fn convert_to_return_type(&self, value: BoundExpr) -> BoundExpr {
         match &self.current_method {
@@ -694,7 +793,8 @@ impl Binder {
             && as_special(to).is_some_and(SpecialType::is_numeric)
         {
             ConversionKind::ImplicitNumeric
-        } else if matches!(to, TypeSymbol::Special(SpecialType::Object)) && self.is_value_type(from)
+        } else if self.is_value_type(from)
+            && (matches!(to, TypeSymbol::Special(SpecialType::Object)) || self.is_interface(to))
         {
             ConversionKind::Boxing
         } else {
@@ -703,7 +803,7 @@ impl Binder {
     }
 
     /// Whether a type is a value type (boxed when converted to `object`).
-    fn is_value_type(&self, ty: &TypeSymbol) -> bool {
+    pub(crate) fn is_value_type(&self, ty: &TypeSymbol) -> bool {
         match ty {
             TypeSymbol::Special(
                 SpecialType::Object | SpecialType::String | SpecialType::Null,
@@ -718,6 +818,14 @@ impl Binder {
             | TypeSymbol::ByRef(_)
             | TypeSymbol::Error => false,
         }
+    }
+
+    /// Whether a type is an interface -- a value type boxes when converted to one (13.1.4).
+    fn is_interface(&self, ty: &TypeSymbol) -> bool {
+        matches!(
+            self.type_info_of(ty).map(|info| info.kind),
+            Some(TypeKind::Interface)
+        )
     }
 
     /// The result of `==`/`!=` when one operand is the null literal (14.9.6): the null type
@@ -755,6 +863,12 @@ impl Binder {
     #[must_use]
     pub fn into_diagnostics(self) -> Vec<Diagnostic> {
         self.diagnostics
+    }
+
+    /// Takes the diagnostics reported so far, leaving the binder empty -- so a
+    /// multi-unit compilation attributes each unit's diagnostics to its own file.
+    pub fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+        core::mem::take(&mut self.diagnostics)
     }
 
     /// Sets the enclosing type whose members an unqualified name and `this`
@@ -862,6 +976,7 @@ impl Binder {
         });
         self.enter_scope();
         self.case_label_uses.clear();
+        self.const_locals.clear();
         self.loop_depth = 0;
         self.switch_depth = 0;
         for (parameter, ty) in parameters {
@@ -938,6 +1053,7 @@ impl Binder {
         });
         self.enter_scope();
         self.case_label_uses.clear();
+        self.const_locals.clear();
         self.loop_depth = 0;
         self.switch_depth = 0;
 
@@ -945,7 +1061,9 @@ impl Binder {
         let mut new_fields = Vec::new();
         for statement in statements {
             match &statement.kind {
-                StmtKind::LocalDeclaration { ty, declarators } => {
+                StmtKind::LocalDeclaration {
+                    ty, declarators, ..
+                } => {
                     let field_ty = self.resolve_named_type(&bind_type(ty), ty.span);
                     for declarator in declarators {
                         let source: &str = &declarator.name;
@@ -1086,7 +1204,7 @@ impl Binder {
         };
         let constructors = self.type_info_of(&target)?.constructors.clone();
         let argument_types: Vec<TypeSymbol> =
-            arguments.iter().map(|argument| argument.ty.clone()).collect();
+            arguments.iter().map(argument_type).collect();
         let arg_constants: Vec<Option<i64>> =
             arguments.iter().map(constant_int_value).collect();
         let chosen =
@@ -1191,6 +1309,14 @@ impl Binder {
         }
     }
 
+    /// Declares a local constant (15.5.1): its name resolves to the folded `value` (a
+    /// constant load, not a variable read), and the name is also a local so a later
+    /// redeclaration is diagnosed. The declaration itself emits nothing.
+    pub(crate) fn declare_const_local(&mut self, name: &str, value: Literal, ty: TypeSymbol) {
+        self.declare_local(name, ty.clone());
+        self.const_locals.insert(name.into(), (value, ty));
+    }
+
     /// Looks a name up through the scope stack, innermost first.
     fn lookup_local(&self, name: &str) -> Option<&TypeSymbol> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
@@ -1244,10 +1370,6 @@ impl Binder {
                 extra_ranks,
                 initializer,
             } => {
-                let lengths = lengths
-                    .iter()
-                    .map(|length| self.bind_expression(length))
-                    .collect();
                 let mut ty = self.resolve_named_type(&bind_type(element), element.span);
                 if !ty.is_error() {
                     for &extra in extra_ranks.iter().rev() {
@@ -1255,6 +1377,19 @@ impl Binder {
                     }
                     ty = ty.into_array(*rank);
                 }
+                if let Some((lengths, elements)) = initializer
+                    .as_ref()
+                    .and_then(|init| self.bind_rectangular_array(init, &ty))
+                {
+                    return BoundExpr {
+                        kind: BoundExprKind::ArrayCreation { lengths, elements },
+                        ty,
+                    };
+                }
+                let lengths = lengths
+                    .iter()
+                    .map(|length| self.bind_expression(length))
+                    .collect();
                 let elements = initializer
                     .as_ref()
                     .map(|init| self.bind_array_initializer(init, &ty))
@@ -1465,14 +1600,23 @@ impl Binder {
         if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual)
             && !left.ty.is_error()
             && !right.ty.is_error()
-            && self
-                .type_info_of(&left.ty)
-                .is_some_and(|info| info.kind == TypeKind::Struct)
         {
-            if let Some(call) = self.bind_user_binary_operator(operator, &left, &right) {
-                return call;
+            let left_kind = self.type_info_of(&left.ty).map(|info| info.kind);
+            let right_kind = self.type_info_of(&right.ty).map(|info| info.kind);
+            if matches!(left_kind, Some(TypeKind::Struct | TypeKind::Class))
+                || matches!(right_kind, Some(TypeKind::Struct | TypeKind::Class))
+            {
+                if let Some(call) = self.bind_user_binary_operator(operator, &left, &right) {
+                    return call;
+                }
+            }
+            if matches!(left_kind, Some(TypeKind::Delegate))
+                && matches!(right_kind, Some(TypeKind::Delegate))
+            {
+                return self.bind_delegate_equality(operator, left, right);
             }
         }
+        let (left, right) = self.adjust_binary_constant(operator, left, right);
         let ty = if left.ty.is_error() || right.ty.is_error() {
             TypeSymbol::Error
         } else if let Some(result) = self.enum_binary_result(operator, &left.ty, &right.ty) {
@@ -1501,6 +1645,9 @@ impl Binder {
             && matches!(ty, TypeSymbol::Special(SpecialType::String))
         {
             (self.to_concat_operand(left), self.to_concat_operand(right))
+        } else if let Some(common) = binary_operand_promotion(operator, &left.ty, &right.ty) {
+            let target = TypeSymbol::Special(common);
+            (self.convert(left, &target), self.convert(right, &target))
         } else {
             (left, right)
         };
@@ -1513,6 +1660,49 @@ impl Binder {
             },
             ty,
         }
+    }
+
+    /// Applies a binary operator's constant expression conversion (13.1.7): when one operand is
+    /// `uint` and the other a fitting `int` constant, the constant is `uint` too, so the operation
+    /// stays unsigned rather than promoting `uint op <signed>` to `long` (14.2.6.2). `uint` is the
+    /// only case that diverges -- every other unsigned type already promotes to itself or to `int`.
+    /// Any other operand pair is returned unchanged, so numeric promotion proceeds as before.
+    fn adjust_binary_constant(
+        &self,
+        operator: BinaryOperator,
+        left: BoundExpr,
+        right: BoundExpr,
+    ) -> (BoundExpr, BoundExpr) {
+        use BinaryOperator as Op;
+        if !matches!(
+            operator,
+            Op::Add
+                | Op::Subtract
+                | Op::Multiply
+                | Op::Divide
+                | Op::Modulo
+                | Op::LessThan
+                | Op::GreaterThan
+                | Op::LessThanOrEqual
+                | Op::GreaterThanOrEqual
+                | Op::Equal
+                | Op::NotEqual
+                | Op::BitwiseAnd
+                | Op::BitwiseOr
+                | Op::BitwiseXor
+        ) {
+            return (left, right);
+        }
+        let uint = TypeSymbol::Special(SpecialType::UInt32);
+        if is_uint(&left.ty) && int_constant_fits(&right, SpecialType::UInt32) {
+            let right = self.convert(right, &uint);
+            return (left, right);
+        }
+        if is_uint(&right.ty) && int_constant_fits(&left, SpecialType::UInt32) {
+            let left = self.convert(left, &uint);
+            return (left, right);
+        }
+        (left, right)
     }
 
     /// A string-concatenation operand in `String.Concat` argument form: a string stays a
@@ -1542,11 +1732,13 @@ impl Binder {
                 resolve_overload(&self.model, &candidates, &argument_types, &[])
             {
                 let declaring_type = self.declaring_type_in_chain(owner, name, &method.parameters);
+                let left_arg = self.convert(left.clone(), &method.parameters[0]);
+                let right_arg = self.convert(right.clone(), &method.parameters[1]);
                 return Some(BoundExpr {
                     ty: method.return_type.clone(),
                     kind: BoundExprKind::Call {
                         callee: Box::new(error_expr()),
-                        arguments: alloc::vec![left.clone(), right.clone()],
+                        arguments: alloc::vec![left_arg, right_arg],
                         method: Some(MethodReference {
                             declaring_type,
                             name: name.into(),
@@ -1559,6 +1751,42 @@ impl Binder {
             }
         }
         None
+    }
+
+    /// Lowers `==` / `!=` on two delegate operands to a call of `System.Delegate`'s
+    /// `op_Equality` / `op_Inequality` (14.9.8). Delegate equality is value equality -- two
+    /// delegates are equal when their invocation lists are the same length and pairwise
+    /// equal (same target and method) -- so it cannot be a reference `ceq`. The operands are
+    /// derived delegate types passed where `System.Delegate` is expected (an implicit
+    /// reference conversion the emitter needs no instruction for).
+    fn bind_delegate_equality(
+        &self,
+        operator: BinaryOperator,
+        left: BoundExpr,
+        right: BoundExpr,
+    ) -> BoundExpr {
+        let delegate_base = TypeSymbol::Named([Box::from("System"), Box::from("Delegate")].into());
+        let accessor = if matches!(operator, BinaryOperator::Equal) {
+            "op_Equality"
+        } else {
+            "op_Inequality"
+        };
+        let bool_type = TypeSymbol::Special(SpecialType::Boolean);
+        let method = MethodReference {
+            declaring_type: delegate_base.clone(),
+            name: accessor.into(),
+            parameters: alloc::vec![delegate_base.clone(), delegate_base],
+            return_type: bool_type.clone(),
+            is_static: true,
+        };
+        BoundExpr {
+            kind: BoundExprKind::Call {
+                callee: Box::new(error_expr()),
+                arguments: alloc::vec![left, right],
+                method: Some(method),
+            },
+            ty: bool_type,
+        }
     }
 
     /// Whether `ty` is an enum type declared in the model.
@@ -1581,14 +1809,22 @@ impl Binder {
         right: &TypeSymbol,
     ) -> Option<TypeSymbol> {
         use BinaryOperator as Op;
-        if !self.is_enum_type_pair(left, right) {
-            return None;
+        if self.is_enum_type_pair(left, right) {
+            return match operator {
+                Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor => Some(left.clone()),
+                Op::LessThan | Op::GreaterThan | Op::LessThanOrEqual | Op::GreaterThanOrEqual => {
+                    Some(TypeSymbol::Special(SpecialType::Boolean))
+                }
+                _ => None,
+            };
         }
+        let integral =
+            |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(special) if is_integral(*special));
         match operator {
-            Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor => Some(left.clone()),
-            Op::LessThan | Op::GreaterThan | Op::LessThanOrEqual | Op::GreaterThanOrEqual => {
-                Some(TypeSymbol::Special(SpecialType::Boolean))
+            Op::Add | Op::Subtract if self.is_enum_type(left) && integral(right) => {
+                Some(left.clone())
             }
+            Op::Add if self.is_enum_type(right) && integral(left) => Some(right.clone()),
             _ => None,
         }
     }
@@ -1600,6 +1836,40 @@ impl Binder {
         span: Span,
     ) -> BoundExpr {
         let operand = self.bind_expression(operand_expr);
+        if operator == UnaryOperator::Minus
+            && matches!(
+                &operand.kind,
+                BoundExprKind::Literal(Literal::Integer {
+                    value: 9_223_372_036_854_775_808,
+                    suffix: IntegerSuffix::None,
+                })
+            )
+        {
+            return BoundExpr {
+                kind: BoundExprKind::Literal(Literal::Integer {
+                    value: 9_223_372_036_854_775_808,
+                    suffix: IntegerSuffix::Long,
+                }),
+                ty: TypeSymbol::Special(SpecialType::Int64),
+            };
+        }
+        if operator == UnaryOperator::Minus
+            && matches!(
+                &operand.kind,
+                BoundExprKind::Literal(Literal::Integer {
+                    value: 2_147_483_648,
+                    suffix: IntegerSuffix::None,
+                })
+            )
+        {
+            return BoundExpr {
+                kind: BoundExprKind::Literal(Literal::Integer {
+                    value: (-2_147_483_648i64) as u64,
+                    suffix: IntegerSuffix::None,
+                }),
+                ty: TypeSymbol::Special(SpecialType::Int32),
+            };
+        }
         let ty = if operand.ty.is_error() {
             TypeSymbol::Error
         } else if operator == UnaryOperator::Complement && self.is_enum_type(&operand.ty) {
@@ -1656,6 +1926,35 @@ impl Binder {
                     method: Some(MethodReference {
                         declaring_type,
                         name: name.into(),
+                        parameters: method.parameters,
+                        return_type: method.return_type,
+                        is_static: true,
+                    }),
+                },
+            });
+        }
+        None
+    }
+
+    /// Applies a type's user-defined `operator true` to `operand`, giving the `bool` a boolean
+    /// expression needs (14.11.2). `None` when the type declares no `op_True`, so the caller
+    /// falls back to the ordinary conversion-to-`bool` requirement.
+    pub(crate) fn bind_operator_true(&mut self, operand: &BoundExpr) -> Option<BoundExpr> {
+        let candidates = self.methods_in_chain(&operand.ty, "op_True");
+        let argument_types = [operand.ty.clone()];
+        if let OverloadResult::Resolved(method) =
+            resolve_overload(&self.model, &candidates, &argument_types, &[])
+        {
+            let declaring_type =
+                self.declaring_type_in_chain(&operand.ty, "op_True", &method.parameters);
+            return Some(BoundExpr {
+                ty: method.return_type.clone(),
+                kind: BoundExprKind::Call {
+                    callee: Box::new(error_expr()),
+                    arguments: alloc::vec![operand.clone()],
+                    method: Some(MethodReference {
+                        declaring_type,
+                        name: "op_True".into(),
                         parameters: method.parameters,
                         return_type: method.return_type,
                         is_static: true,
@@ -1885,7 +2184,22 @@ impl Binder {
                 ));
             }
         }
-        let mut value = self.bind_expression(value_expr);
+        let mut value = if operator == AssignmentOperator::Assign
+            && matches!(&value_expr.kind, ExprKind::ArrayInitializer(_))
+            && matches!(target.ty, TypeSymbol::Array { .. })
+        {
+            let declared = target.ty.clone();
+            let (lengths, elements) = match self.bind_rectangular_array(value_expr, &declared) {
+                Some(rectangular) => rectangular,
+                None => (Vec::new(), self.bind_array_initializer(value_expr, &declared)),
+            };
+            BoundExpr {
+                kind: BoundExprKind::ArrayCreation { lengths, elements },
+                ty: declared,
+            }
+        } else {
+            self.bind_expression(value_expr)
+        };
         if matches!(
             operator,
             AssignmentOperator::Add | AssignmentOperator::Subtract
@@ -2158,10 +2472,8 @@ impl Binder {
                 let chosen = if has_method_group {
                     self.resolve_with_method_groups(&name, &receiver_ty, &candidates, &arguments, span)
                 } else {
-                    let argument_types: Vec<TypeSymbol> = arguments
-                        .iter()
-                        .map(|argument| argument.ty.clone())
-                        .collect();
+                    let argument_types: Vec<TypeSymbol> =
+                        arguments.iter().map(argument_type).collect();
                     let arg_constants: Vec<Option<i64>> =
                         arguments.iter().map(constant_int_value).collect();
                     self.resolve_call(
@@ -2346,7 +2658,11 @@ impl Binder {
                 candidate.parameters.len() == arguments.len()
                     && arguments.iter().zip(&candidate.parameters).all(
                         |(argument, parameter)| {
-                            if matches!(argument.kind, BoundExprKind::MethodGroup { .. }) {
+                            if matches!(argument.kind, BoundExprKind::Ref { .. })
+                                || matches!(parameter, TypeSymbol::ByRef(_))
+                            {
+                                argument_type(argument) == *parameter
+                            } else if matches!(argument.kind, BoundExprKind::MethodGroup { .. }) {
                                 self.type_info_of(parameter)
                                     .is_some_and(|info| info.kind == TypeKind::Delegate)
                             } else {
@@ -2433,7 +2749,7 @@ impl Binder {
         }
         let candidates = self.methods_in_chain(&receiver.ty, accessor);
         let argument_types: Vec<TypeSymbol> =
-            arguments.iter().map(|argument| argument.ty.clone()).collect();
+            arguments.iter().map(argument_type).collect();
         let arg_constants: Vec<Option<i64>> =
             arguments.iter().map(constant_int_value).collect();
         let method = self.resolve_call(
@@ -2531,7 +2847,7 @@ impl Binder {
                         )
                     } else {
                         let argument_types: Vec<TypeSymbol> =
-                            arguments.iter().map(|argument| argument.ty.clone()).collect();
+                            arguments.iter().map(argument_type).collect();
                         let arg_constants: Vec<Option<i64>> =
                             arguments.iter().map(constant_int_value).collect();
                         self.check_constructor(
@@ -2845,6 +3161,57 @@ impl Binder {
         MemberResolution::NoSuchMember(ty.to_string())
     }
 
+    /// Resolves a simple name against the STATIC members of the current type's enclosing types
+    /// (14.5.2): a nested type sees its enclosing types' static fields, constants, and properties
+    /// by simple name, at any depth. Instance members of an enclosing type are not in scope (there
+    /// is no enclosing-instance `this`). `None` when no enclosing type provides the name.
+    fn resolve_enclosing_static(&self, name: &str) -> Option<BoundExpr> {
+        let enclosing_of = |ty: &TypeSymbol| {
+            self.type_info_of(ty)
+                .and_then(|info| info.enclosing.as_deref())
+                .map(named_symbol_from_dotted)
+        };
+        let mut enclosing = self.current_type.as_ref().and_then(enclosing_of);
+        while let Some(ty) = enclosing {
+            let type_reference = || {
+                Box::new(BoundExpr {
+                    kind: BoundExprKind::TypeReference(ty.clone()),
+                    ty: ty.clone(),
+                })
+            };
+            match self.resolve_member(&ty, name) {
+                MemberResolution::Field(field) if field.is_static => {
+                    return Some(BoundExpr {
+                        ty: field.ty.clone(),
+                        kind: BoundExprKind::FieldAccess {
+                            receiver: type_reference(),
+                            name: name.into(),
+                            field: Some(field),
+                        },
+                    });
+                }
+                MemberResolution::Property {
+                    declaring_type,
+                    ty: property_ty,
+                    is_static: true,
+                    ..
+                } => {
+                    return Some(BoundExpr {
+                        kind: BoundExprKind::PropertyAccess {
+                            receiver: type_reference(),
+                            declaring_type,
+                            name: name.into(),
+                        },
+                        ty: property_ty,
+                    });
+                }
+                _ => {}
+            }
+            enclosing = enclosing_of(&ty);
+        }
+        None
+    }
+
     /// The model entry for a named type, if any.
     fn type_info_of(&self, ty: &TypeSymbol) -> Option<&TypeInfo> {
         self.model.get_by_symbol(ty)
@@ -3012,6 +3379,39 @@ impl Binder {
         })
     }
 
+    /// Resolves a readable instance property's `get_<name>` getter on `ty` (14.5.4): the
+    /// accessor method when the model records one directly, else one synthesized from the
+    /// property symbol -- a source-declared property is modeled as a `PropertySymbol` without
+    /// a separate accessor method, yet its getter is emitted under `get_<name>`. `None` when
+    /// `ty` has no such readable instance property. Used to bind the `Current` of the
+    /// enumerator pattern (15.8.4) whether the enumerator is source- or reference-declared.
+    pub(crate) fn resolve_property_getter(
+        &mut self,
+        ty: &TypeSymbol,
+        name: &str,
+        span: Span,
+    ) -> Option<MethodReference> {
+        let getter = format!("get_{name}");
+        if let Some(method) = self.resolve_instance_method(ty, &getter, span) {
+            return Some(method);
+        }
+        match self.resolve_member(ty, name) {
+            MemberResolution::Property {
+                declaring_type,
+                ty: property_ty,
+                is_static: false,
+                ..
+            } => Some(MethodReference {
+                declaring_type,
+                name: getter.into(),
+                parameters: Vec::new(),
+                return_type: property_ty,
+                is_static: false,
+            }),
+            _ => None,
+        }
+    }
+
     /// Whether a bound call is to a `[Conditional("X")]` method none of whose symbols are
     /// defined here -- so the call statement is omitted whole (24.4.2), arguments and all. The
     /// method's `conditional` is recovered from the model by the resolved overload.
@@ -3139,6 +3539,12 @@ impl Binder {
     /// variable or parameter; anything else is `CS0103` (field, type, and
     /// namespace lookup arrive with the declaration model).
     fn bind_name(&mut self, name: &str, span: Span) -> BoundExpr {
+        if let Some((value, ty)) = self.const_locals.get(name) {
+            return BoundExpr {
+                kind: BoundExprKind::Literal(value.clone()),
+                ty: ty.clone(),
+            };
+        }
         if let Some(ty) = self.lookup_local(name) {
             return BoundExpr {
                 kind: BoundExprKind::Local(name.into()),
@@ -3185,6 +3591,9 @@ impl Binder {
                     };
                 }
                 MemberResolution::NoSuchMember(_) | MemberResolution::Unknown => {}
+            }
+            if let Some(bound) = self.resolve_enclosing_static(name) {
+                return bound;
             }
         }
         if let Some(target) = self.alias_target(name) {
@@ -3379,6 +3788,39 @@ fn binary_result_type(
     }
 }
 
+/// The common numeric type both operands are converted to under binary numeric promotion
+/// (14.2.6.2), for the operators where it applies -- so [`Binder::bind_binary`] can insert the
+/// widening conversions the emitter lowers (ECMA-335 requires both operands of `add`/`ceq` to
+/// share a type, so `r8` + `i4` cannot be mixed). `None` for string concatenation, the shift operators, the logical
+/// operators, and any non-numeric operand pair -- which promote differently or not at all and are
+/// handled in `bind_binary` directly.
+fn binary_operand_promotion(
+    operator: BinaryOperator,
+    left: &TypeSymbol,
+    right: &TypeSymbol,
+) -> Option<SpecialType> {
+    use BinaryOperator as Op;
+    let (left, right) = (as_special(left)?, as_special(right)?);
+    match operator {
+        Op::Add if left == SpecialType::String || right == SpecialType::String => None,
+        Op::Add
+        | Op::Subtract
+        | Op::Multiply
+        | Op::Divide
+        | Op::Modulo
+        | Op::LessThan
+        | Op::GreaterThan
+        | Op::LessThanOrEqual
+        | Op::GreaterThanOrEqual
+        | Op::Equal
+        | Op::NotEqual => binary_numeric_promotion(left, right),
+        Op::BitwiseAnd | Op::BitwiseOr | Op::BitwiseXor => (is_integral(left) && is_integral(right))
+            .then(|| binary_numeric_promotion(left, right))
+            .flatten(),
+        Op::LeftShift | Op::RightShift | Op::LogicalAnd | Op::LogicalOr => None,
+    }
+}
+
 /// The outcome of looking a member up on a type.
 /// How a member-access receiver was written, for the static/instance check.
 #[derive(Clone, Copy)]
@@ -3513,18 +3955,109 @@ fn implicit_constant_conversion(expr: &BoundExpr, target: &TypeSymbol) -> bool {
     }
 }
 
-/// The compile-time value of a constant integer expression: an integer literal, or a
-/// member access that folded to a constant (a `const` field, an enum member, a
-/// predefined `MaxValue`/`MinValue`). `None` for a non-constant expression.
-fn constant_int_value(expr: &BoundExpr) -> Option<i64> {
+/// Whether `ty` is `uint` -- the only unsigned type whose binary numeric promotion with a
+/// signed operand widens to `long`, so a fitting `int` constant is instead retyped `uint` (13.1.7).
+fn is_uint(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Special(SpecialType::UInt32))
+}
+
+/// Whether `expr` is an `int` constant whose value fits the unsigned integral `target`
+/// (13.1.7 constant expression conversion, as applied by a binary operator's overload resolution).
+fn int_constant_fits(expr: &BoundExpr, target: SpecialType) -> bool {
+    matches!(expr.ty, TypeSymbol::Special(SpecialType::Int32))
+        && constant_int_value(expr).is_some_and(|value| constant_fits(value, target))
+}
+
+/// The compile-time value of a constant integer expression (14.15): an integer or
+/// character literal, a member access that folded to a constant (a `const` field, an
+/// enum member, a predefined `MaxValue`/`MinValue`), a `+`/`-` on one, or -- through the
+/// full constant evaluator -- an arithmetic/bitwise operation, a cast, or a conditional.
+/// `None` for a non-constant expression (or a `bool`/`string` constant, which is not an
+/// integer). Case labels, the constant-expression conversions, and overload resolution
+/// all fold through this.
+pub(crate) fn constant_int_value(expr: &BoundExpr) -> Option<i64> {
     match &expr.kind {
         BoundExprKind::Literal(Literal::Integer { value, .. }) => i64::try_from(*value).ok(),
+        BoundExprKind::Literal(Literal::Character(unit)) => Some(i64::from(*unit)),
+        BoundExprKind::Literal(Literal::Boolean(value)) => Some(i64::from(*value)),
         BoundExprKind::FieldAccess {
             field: Some(field), ..
         } => field.constant.as_ref().and_then(literal_int_value),
         BoundExprKind::Unary { operator, operand } => match operator {
             UnaryOperator::Plus => constant_int_value(operand),
             UnaryOperator::Minus => constant_int_value(operand)?.checked_neg(),
+            _ => None,
+        },
+        BoundExprKind::Binary { .. }
+        | BoundExprKind::Cast { .. }
+        | BoundExprKind::Conditional { .. } => match constant_literal_value(expr)? {
+            Literal::Integer { value, .. } => Some(value as i64),
+            Literal::Character(unit) => Some(i64::from(unit)),
+            Literal::Boolean(value) => Some(i64::from(value)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Coerces a constant integer `value` to the integral or `char` type `target`, wrapping to
+/// the target's width (14.15 over a numeric/char cast, unchecked). `None` for a non-integral
+/// target (a floating or decimal cast is not folded).
+pub(crate) fn coerce_constant(value: i64, target: SpecialType) -> Option<Literal> {
+    use SpecialType as S;
+    Some(match target {
+        S::SByte => integer_literal(i64::from(value as i8)),
+        S::Byte => integer_literal(i64::from(value as u8)),
+        S::Int16 => integer_literal(i64::from(value as i16)),
+        S::UInt16 => integer_literal(i64::from(value as u16)),
+        S::Int32 => integer_literal(i64::from(value as i32)),
+        S::UInt32 => integer_literal(i64::from(value as u32)),
+        S::Int64 | S::UInt64 => integer_literal(value),
+        S::Char => Literal::Character(value as u16),
+        _ => return None,
+    })
+}
+
+/// The compile-time constant value of a bound expression as a [`Literal`] (14.15), the full
+/// evaluator: a literal, a folded `const`/enum member access, an implicit conversion of a
+/// constant, a unary or binary operation, a numeric/char cast, or a conditional whose
+/// condition folds to a `bool`. `None` for anything not a constant expression. Unlike
+/// [`constant_int_value`] this keeps the value's kind (so a `bool`, `char`, or `string`
+/// constant round-trips), for a local constant's stored value.
+pub(crate) fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
+    use crate::declaration::{fold_const_binary, fold_const_unary};
+    match &expr.kind {
+        BoundExprKind::Literal(literal) => Some(literal.clone()),
+        BoundExprKind::FieldAccess {
+            field: Some(field), ..
+        } => field.constant.clone(),
+        BoundExprKind::Conversion { operand, .. } => constant_literal_value(operand),
+        BoundExprKind::Unary { operator, operand } => {
+            fold_const_unary(*operator, &constant_literal_value(operand)?)
+        }
+        BoundExprKind::Binary {
+            operator,
+            left,
+            right,
+            ..
+        } => fold_const_binary(
+            *operator,
+            &constant_literal_value(left)?,
+            &constant_literal_value(right)?,
+        ),
+        BoundExprKind::Cast { operand, .. } => match &expr.ty {
+            TypeSymbol::Special(target) => {
+                coerce_constant(literal_int_value(&constant_literal_value(operand)?)?, *target)
+            }
+            _ => None,
+        },
+        BoundExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => match constant_literal_value(condition)? {
+            Literal::Boolean(true) => constant_literal_value(when_true),
+            Literal::Boolean(false) => constant_literal_value(when_false),
             _ => None,
         },
         _ => None,
@@ -3586,17 +4119,33 @@ enum OverloadResult {
     },
 }
 
+/// The type an argument carries into overload resolution (14.4.2.1): a `ref`/`out`
+/// argument is a byref (`T&`), so it matches only a parameter of the identical
+/// passing mode and type; any other argument contributes its expression type.
+fn argument_type(argument: &BoundExpr) -> TypeSymbol {
+    if matches!(argument.kind, BoundExprKind::Ref { .. }) {
+        TypeSymbol::ByRef(Box::new(argument.ty.clone()))
+    } else {
+        argument.ty.clone()
+    }
+}
+
 /// Whether an argument -- its type `arg_ty`, plus `arg_const` (its compile-time integer value
 /// when it is a constant) -- is applicable to parameter `param`: a standard implicit conversion,
 /// or the implicit constant-expression conversion (13.1.7) for an `int`/`long` constant whose
 /// value fits an integral parameter (so `Set(0x518, m)` binds when `Set` takes `uint`).
+/// A byref (`ref`/`out`) argument or parameter applies only with the identical passing
+/// mode and type on the other side (14.4.2.1) -- no conversion crosses a byref boundary.
 fn arg_applicable(
     model: &Model,
     arg_ty: &TypeSymbol,
     arg_const: Option<i64>,
     param: &TypeSymbol,
 ) -> bool {
-    if converts(model, arg_ty, param) {
+    if matches!(arg_ty, TypeSymbol::ByRef(_)) || matches!(param, TypeSymbol::ByRef(_)) {
+        return arg_ty == param;
+    }
+    if converts(model, arg_ty, param) || user_implicit_converts(model, arg_ty, param) {
         return true;
     }
     matches!(
@@ -3606,6 +4155,23 @@ fn arg_applicable(
         TypeSymbol::Special(target) => arg_const.is_some_and(|value| constant_fits(value, *target)),
         _ => false,
     }
+}
+
+/// Whether a user-defined implicit conversion (`op_Implicit`) takes `from` to `to` (17.9.3): a
+/// one-parameter operator declared on either type. An argument with such a conversion to its
+/// parameter is applicable (14.4.2.1). Conversion operators are not inherited, so the direct
+/// members of each type suffice.
+fn user_implicit_converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    [from, to].into_iter().any(|owner| {
+        model.get_by_symbol(owner).is_some_and(|info| {
+            info.methods.iter().any(|method| {
+                &*method.name == "op_Implicit"
+                    && method.parameters.len() == 1
+                    && &method.parameters[0] == from
+                    && &method.return_type == to
+            })
+        })
+    })
 }
 
 /// Chooses the overload for a call (14.4.2): the unique best among the applicable candidates,

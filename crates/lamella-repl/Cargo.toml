@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "A host-PC C# REPL that bootstrap-compiles each line with csc and runs it on the lamella interpreter."
+description = "A host-PC C# REPL that compiles each line and runs it on the lamella interpreter."
 
 # The REPL driver is a host CLI, so std is allowed here. It writes a temp source
 # file, shells out to csc, then loads and runs the resulting assembly on the
