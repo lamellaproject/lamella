@@ -40,6 +40,23 @@ const METHOD_DEF: u8 = 0x06;
 const PUBLIC_CLASS: u32 = 0x0000_0001;
 const PUBLIC_STRUCT: u32 = 0x0000_0001 | 0x0000_0008 | 0x0000_0100;
 const TYPE_ABSTRACT: u32 = 0x0000_0080;
+const TYPE_SEALED: u32 = 0x0000_0100;
+
+/// The Nested* visibility bits (II.23.1.15) for a nested type, from its declared accessibility.
+/// A nested type is PRIVATE by default (10.5.1); the explicit `private` lands here too.
+fn nested_visibility(modifiers: &[Modifier]) -> u32 {
+    if modifiers.contains(&Modifier::Public) {
+        0x0000_0002
+    } else if modifiers.contains(&Modifier::Protected) && modifiers.contains(&Modifier::Internal) {
+        0x0000_0007
+    } else if modifiers.contains(&Modifier::Protected) {
+        0x0000_0004
+    } else if modifiers.contains(&Modifier::Internal) {
+        0x0000_0005
+    } else {
+        0x0000_0003
+    }
+}
 const METHOD_PUBLIC: u16 = 0x0006;
 const METHOD_PRIVATE: u16 = 0x0001;
 const METHOD_STATIC: u16 = 0x0010;
@@ -202,6 +219,7 @@ pub fn compile_source_with(
     emit_debug: bool,
     options: LexOptions,
 ) -> Compilation {
+    let native_interop = options.native_interop;
     let parsed = parse_compilation_unit_with(source, options);
     let parse_diagnostics: Vec<Diagnostic> = parsed
         .diagnostics
@@ -223,7 +241,7 @@ pub fn compile_source_with(
         assembly_name,
         references,
         debug,
-        options.native_interop,
+        native_interop,
     );
     if !parse_diagnostics.is_empty() {
         let mut diagnostics = parse_diagnostics;
@@ -299,8 +317,9 @@ pub fn compile_sources_with(
     let mut diagnostics: Vec<Vec<Diagnostic>> = Vec::with_capacity(sources.len());
     let mut units: Vec<CompilationUnit> = Vec::with_capacity(sources.len());
     let mut syntax_error = false;
+    let native_interop = options.native_interop;
     for (source, _path) in sources {
-        let parsed = parse_compilation_unit_with(source, options);
+        let parsed = parse_compilation_unit_with(source, options.clone());
         let parse_diagnostics: Vec<Diagnostic> = parsed
             .diagnostics
             .iter()
@@ -340,7 +359,7 @@ pub fn compile_sources_with(
         assembly_name,
         references,
         None,
-        options.native_interop,
+        native_interop,
     ) {
         Ok((image, _pdb)) => MultiCompilation {
             diagnostics,
@@ -1208,20 +1227,22 @@ fn emit_interface(
             parameters,
             getter,
             setter,
+            attributes,
             ..
         } = member
         {
+            let name = indexer_name(attributes);
             let element = type_sig(tokens, &bind_type(ty))?;
             let indices: Vec<TypeSig> = parameters
                 .iter()
                 .map(|parameter| type_sig(tokens, &bind_type(&parameter.ty)))
                 .collect::<Result<_, _>>()?;
             let property =
-                image.add_property("Item", &property_signature(true, &indices, &element), 0);
+                image.add_property(&name, &property_signature(true, &indices, &element), 0);
             if getter.is_some() {
                 let signature = method_signature(true, &indices, &element);
                 let token = image.add_abstract_method(
-                    "get_Item",
+                    &accessor_name("get_", &name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
                 );
@@ -1232,7 +1253,7 @@ fn emit_interface(
                 signature_params.push(element.clone());
                 let signature = method_signature(true, &signature_params, &TypeSig::Void);
                 let token = image.add_abstract_method(
-                    "set_Item",
+                    &accessor_name("set_", &name),
                     &signature,
                     IFACE_METHOD_FLAGS | SPECIAL_NAME,
                 );
@@ -1513,7 +1534,7 @@ fn emit_type(
         (base_token, PUBLIC_CLASS)
     };
     let (metadata_namespace, mut flags) = if nested_in.is_some() {
-        ("", (flags & !0x0000_0007) | 0x0000_0002)
+        ("", (flags & !0x0000_0007) | nested_visibility(&declaration.modifiers))
     } else {
         let visibility = if declaration.modifiers.contains(&Modifier::Public) {
             0x0000_0001
@@ -1524,6 +1545,9 @@ fn emit_type(
     };
     if declaration.modifiers.contains(&Modifier::Abstract) {
         flags |= TYPE_ABSTRACT;
+    }
+    if declaration.modifiers.contains(&Modifier::Static) {
+        flags |= TYPE_ABSTRACT | TYPE_SEALED;
     }
     let type_token = image.add_type(metadata_namespace, &declaration.name, base, flags);
     if let Some(enclosing_full) = &nested_in {
@@ -1554,7 +1578,6 @@ fn emit_type(
             interface_tokens.push(token);
         }
     }
-    let implements_interface = !interface_tokens.is_empty();
     for interface in interface_tokens {
         image.add_interface_impl(type_token, interface);
     }
@@ -1593,7 +1616,10 @@ fn emit_type(
             }
         }
     }
-    if !is_struct && !declares_instance_constructor(declaration) {
+    if !is_struct
+        && !declares_instance_constructor(declaration)
+        && !declaration.modifiers.contains(&Modifier::Static)
+    {
         let base_ctor = if is_system_object {
             None
         } else {
@@ -1662,7 +1688,6 @@ fn emit_type(
                     return_type,
                     parameters,
                     body,
-                    implements_interface,
                     explicit_interface.as_ref(),
                     debug,
                 )?;
@@ -1718,7 +1743,6 @@ fn emit_type(
                     return_type,
                     parameters,
                     body,
-                    implements_interface,
                     None,
                     debug,
                 )?;
@@ -1741,7 +1765,6 @@ fn emit_type(
                     target,
                     parameters,
                     body,
-                    implements_interface,
                     None,
                     debug,
                 )?;
@@ -1813,7 +1836,6 @@ fn emit_type(
                 name,
                 getter.as_ref(),
                 setter.as_ref(),
-                implements_interface,
                 explicit_interface.as_ref(),
                 debug,
             )?;
@@ -1826,6 +1848,7 @@ fn emit_type(
             parameters,
             getter,
             setter,
+            attributes,
             ..
         } = member
         {
@@ -1834,12 +1857,12 @@ fn emit_type(
                 binder,
                 tokens,
                 &enclosing,
+                &indexer_name(attributes),
                 modifiers,
                 ty,
                 parameters,
                 getter.as_ref(),
                 setter.as_ref(),
-                implements_interface,
                 debug,
             )?;
             first_property.get_or_insert(property);
@@ -1870,7 +1893,6 @@ fn emit_type(
                     &declarator.name,
                     &event_ty,
                     is_static,
-                    implements_interface,
                     debug,
                 )?;
                 emit_attributes(image, binder, tokens, event, attributes);
@@ -1926,11 +1948,15 @@ fn emit_event(
     name: &str,
     event_ty: &TypeSymbol,
     is_static: bool,
-    implements_interface: bool,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let void = TypeSymbol::Special(SpecialType::Void);
-    let flags = if implements_interface && !is_static {
+    let interface_impl = binder.member_implements_interface(
+        enclosing,
+        &accessor_name("add_", name),
+        &[event_ty.clone()],
+    );
+    let flags = if interface_impl && !is_static {
         METHOD_PUBLIC
             | METHOD_VIRTUAL
             | METHOD_NEWSLOT
@@ -2120,7 +2146,6 @@ fn emit_one_method(
     return_type: &TypeRef,
     parameters: &[Parameter],
     body: &Stmt,
-    interface_impl: bool,
     explicit_interface: Option<&TypeRef>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
@@ -2174,7 +2199,13 @@ fn emit_one_method(
         if is_virtual {
             flags |= METHOD_NEWSLOT;
         }
-    } else if interface_impl && !is_static {
+    } else if !is_static
+        && binder.member_implements_interface(
+            enclosing,
+            name,
+            &params.iter().map(|(_, ty)| ty.clone()).collect::<Vec<_>>(),
+        )
+    {
         flags |= METHOD_VIRTUAL | METHOD_NEWSLOT | METHOD_FINAL | METHOD_HIDEBYSIG;
     }
     emit_method_body(
@@ -2767,36 +2798,12 @@ fn emit_property(
     name: &str,
     getter: Option<&lamella_syntax::ast::Accessor>,
     setter: Option<&lamella_syntax::ast::Accessor>,
-    implements_interface: bool,
     explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let property_ty = bind_type(ty);
     let is_static = explicit_interface.is_none() && modifiers.contains(&Modifier::Static);
-    let flags = if explicit_interface.is_some() {
-        METHOD_PRIVATE
-            | METHOD_VIRTUAL
-            | METHOD_FINAL
-            | METHOD_NEWSLOT
-            | METHOD_HIDEBYSIG
-            | SPECIAL_NAME
-    } else if implements_interface && !is_static && !modifiers.contains(&Modifier::Abstract) {
-        METHOD_PUBLIC
-            | METHOD_VIRTUAL
-            | METHOD_NEWSLOT
-            | METHOD_FINAL
-            | METHOD_HIDEBYSIG
-            | SPECIAL_NAME
-    } else {
-        let mut flags = METHOD_PUBLIC | SPECIAL_NAME;
-        if is_static {
-            flags |= METHOD_STATIC;
-        } else {
-            flags |= slot_flags(modifiers);
-        }
-        flags
-    };
-    let is_abstract = (flags & METHOD_ABSTRACT) != 0;
+    let is_abstract = modifiers.contains(&Modifier::Abstract);
 
     let property_name = match explicit_interface {
         Some(interface) => explicit_interface_member_name(interface, name),
@@ -2808,6 +2815,15 @@ fn emit_property(
 
     if let Some(getter) = getter {
         let accessor = accessor_name("get_", name);
+        let flags = property_accessor_flags(
+            binder,
+            enclosing,
+            modifiers,
+            is_static,
+            explicit_interface.is_some(),
+            &accessor,
+            &[],
+        );
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let token = if let Some(body) = &getter.body {
             let token = emit_method_body(
@@ -2833,6 +2849,15 @@ fn emit_property(
     }
     if let Some(setter) = setter {
         let accessor = accessor_name("set_", name);
+        let flags = property_accessor_flags(
+            binder,
+            enclosing,
+            modifiers,
+            is_static,
+            explicit_interface.is_some(),
+            &accessor,
+            &[property_ty.clone()],
+        );
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let params = [(Box::from("value"), property_ty.clone())];
         let token = if let Some(body) = &setter.body {
@@ -2868,6 +2893,48 @@ fn emit_property(
     Ok(property)
 }
 
+/// The method flags for a property/indexer accessor `accessor` (`get_X`/`set_X`) with `params`.
+/// An explicit-interface accessor is a private sealed virtual (20.4.1). Otherwise it is a sealed
+/// virtual (`public virtual final newslot`) only when it implicitly implements an interface member
+/// -- its name + signature match one -- so an accessor implementing nothing stays non-virtual even
+/// on an interface-implementing type (its vtable-slot flags follow its own modifiers).
+fn property_accessor_flags(
+    binder: &Binder,
+    enclosing: &TypeSymbol,
+    modifiers: &[Modifier],
+    is_static: bool,
+    explicit: bool,
+    accessor: &str,
+    params: &[TypeSymbol],
+) -> u16 {
+    if explicit {
+        METHOD_PRIVATE
+            | METHOD_VIRTUAL
+            | METHOD_FINAL
+            | METHOD_NEWSLOT
+            | METHOD_HIDEBYSIG
+            | SPECIAL_NAME
+    } else if !is_static
+        && !modifiers.contains(&Modifier::Abstract)
+        && binder.member_implements_interface(enclosing, accessor, params)
+    {
+        METHOD_PUBLIC
+            | METHOD_VIRTUAL
+            | METHOD_NEWSLOT
+            | METHOD_FINAL
+            | METHOD_HIDEBYSIG
+            | SPECIAL_NAME
+    } else {
+        let mut flags = METHOD_PUBLIC | SPECIAL_NAME;
+        if is_static {
+            flags |= METHOD_STATIC;
+        } else {
+            flags |= slot_flags(modifiers);
+        }
+        flags
+    }
+}
+
 /// Emits an indexer (17.8) as the property `Item` whose signature carries the index
 /// parameters, with `get_Item(indices)` / `set_Item(indices, value)` `specialname` accessors
 /// and their `MethodSemantics`. The accessors take the vtable-slot flags of the indexer's
@@ -2880,12 +2947,12 @@ fn emit_indexer(
     binder: &mut Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
+    name: &str,
     modifiers: &[Modifier],
     ty: &lamella_syntax::ast::TypeRef,
     parameters: &[Parameter],
     getter: Option<&lamella_syntax::ast::Accessor>,
     setter: Option<&lamella_syntax::ast::Accessor>,
-    implements_interface: bool,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let element_ty = bind_type(ty);
@@ -2893,34 +2960,30 @@ fn emit_indexer(
         .iter()
         .map(|parameter| (parameter.name.clone(), bind_type(&parameter.ty)))
         .collect();
-    let flags = if implements_interface && !modifiers.contains(&Modifier::Abstract) {
-        METHOD_PUBLIC
-            | METHOD_VIRTUAL
-            | METHOD_NEWSLOT
-            | METHOD_FINAL
-            | METHOD_HIDEBYSIG
-            | SPECIAL_NAME
-    } else {
-        METHOD_PUBLIC | SPECIAL_NAME | slot_flags(modifiers)
-    };
-    let is_abstract = (flags & METHOD_ABSTRACT) != 0;
+    let is_abstract = modifiers.contains(&Modifier::Abstract);
+    let index_param_types: Vec<TypeSymbol> =
+        index_params.iter().map(|(_, ty)| ty.clone()).collect();
     let index_sigs: Vec<TypeSig> = index_params
         .iter()
         .map(|(_, ty)| type_sig(tokens, ty))
         .collect::<Result<_, _>>()?;
     let element_sig = type_sig(tokens, &element_ty)?;
     let property =
-        image.add_property("Item", &property_signature(true, &index_sigs, &element_sig), 0);
+        image.add_property(name, &property_signature(true, &index_sigs, &element_sig), 0);
     let void = TypeSymbol::Special(SpecialType::Void);
     if let Some(getter) = getter {
+        let getter_name = accessor_name("get_", name);
+        let flags = property_accessor_flags(
+            binder, enclosing, modifiers, false, false, &getter_name, &index_param_types,
+        );
         let token = if let Some(body) = &getter.body {
             Some(emit_method_body(
-                image, binder, tokens, enclosing, "get_Item", &element_ty, &index_params, &[],
+                image, binder, tokens, enclosing, &getter_name, &element_ty, &index_params, &[],
                 body, false, flags, None, debug,
             )?)
         } else if is_abstract {
             let signature = method_signature(true, &index_sigs, &element_sig);
-            Some(image.add_abstract_method("get_Item", &signature, flags))
+            Some(image.add_abstract_method(&getter_name, &signature, flags))
         } else {
             None
         };
@@ -2932,16 +2995,22 @@ fn emit_indexer(
     if let Some(setter) = setter {
         let mut params = index_params.clone();
         params.push((Box::from("value"), element_ty.clone()));
+        let setter_name = accessor_name("set_", name);
+        let mut setter_param_types = index_param_types.clone();
+        setter_param_types.push(element_ty.clone());
+        let flags = property_accessor_flags(
+            binder, enclosing, modifiers, false, false, &setter_name, &setter_param_types,
+        );
         let token = if let Some(body) = &setter.body {
             Some(emit_method_body(
-                image, binder, tokens, enclosing, "set_Item", &void, &params, &[],
+                image, binder, tokens, enclosing, &setter_name, &void, &params, &[],
                 body, false, flags, None, debug,
             )?)
         } else if is_abstract {
             let mut signature_params = index_sigs.clone();
             signature_params.push(element_sig.clone());
             let signature = method_signature(true, &signature_params, &TypeSig::Void);
-            Some(image.add_abstract_method("set_Item", &signature, flags))
+            Some(image.add_abstract_method(&setter_name, &signature, flags))
         } else {
             None
         };
@@ -2951,6 +3020,29 @@ fn emit_indexer(
         }
     }
     Ok(property)
+}
+
+/// The name a `[System.Runtime.CompilerServices.IndexerName("X")]` gives an indexer's accessors
+/// (`get_X`/`set_X`), its `DefaultMember`, and its Property row. Defaults to `"Item"` (17.8) when
+/// the attribute is absent -- as on String's indexer (`get_Chars`) and StringBuilder's.
+fn indexer_name(attributes: &[AttributeSection]) -> String {
+    for section in attributes {
+        for attribute in &section.attributes {
+            let Some(last) = attribute.name.parts.last() else {
+                continue;
+            };
+            if &**last != "IndexerName" && &**last != "IndexerNameAttribute" {
+                continue;
+            }
+            if let Some(name) = attribute.arguments.iter().find_map(|argument| match argument {
+                AttributeArgument::Positional(expr) => string_literal_value(expr),
+                AttributeArgument::Named { .. } => None,
+            }) {
+                return name;
+            }
+        }
+    }
+    String::from("Item")
 }
 
 /// Emits `[System.Reflection.DefaultMemberAttribute("Item")]` on a type that declares an
@@ -2964,12 +3056,12 @@ fn emit_default_member_attribute(
     type_token: Token,
     members: &[Member],
 ) {
-    if !members
-        .iter()
-        .any(|member| matches!(member, Member::Indexer { .. }))
-    {
+    let Some(name) = members.iter().find_map(|member| match member {
+        Member::Indexer { attributes, .. } => Some(indexer_name(attributes)),
+        _ => None,
+    }) else {
         return;
-    }
+    };
     let declaring = TypeSymbol::Named(
         [
             Box::from("System"),
@@ -2993,7 +3085,7 @@ fn emit_default_member_attribute(
         return;
     };
     let mut blob = alloc::vec![0x01u8, 0x00];
-    encode_ser_string("Item", &mut blob);
+    encode_ser_string(&name, &mut blob);
     blob.extend_from_slice(&0u16.to_le_bytes());
     image.add_custom_attribute(type_token, constructor, &blob);
 }
@@ -3255,6 +3347,7 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
             mint_type_token(image, tokens, element);
             mint_references(body, image, tokens);
         }
+        BoundStmtKind::Labeled { body, .. } => mint_references(body, image, tokens),
         _ => {}
     }
 }
@@ -4246,7 +4339,11 @@ fn collect_tokens(
                         }
                     }
                 }
-                if !is_struct && !is_interface && !declares_instance_constructor(declaration) {
+                if !is_struct
+                    && !is_interface
+                    && !declares_instance_constructor(declaration)
+                    && !declaration.modifiers.contains(&Modifier::Static)
+                {
                     *next_method += 1;
                     tokens.insert_method(
                         &declaring,

@@ -44,7 +44,8 @@ repl-host = ["dep:lamella-assemble", "dep:lamella-metadata"]
 # Assembly<'static>; the link leaks one buffer per evaluation, the accepted host pattern).
 baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata"]
 # WirelineBackend: the lamella-debug-backend seam over the wire's debug channel (serial
-# carrier). IL-level in v0 (opaque addresses = (method_id, offset)).
+# carrier). A code location crosses the seam as an opaque address packing the wire's
+# (method_id, offset) pair.
 debug-backend = ["serial", "dep:lamella-debug-backend"]
 
 # (The interactive REPL CLI now lives in the dedicated `lamella-repl` crate; the former

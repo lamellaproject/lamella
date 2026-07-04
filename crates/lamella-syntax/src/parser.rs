@@ -1787,6 +1787,7 @@ impl Parser {
             parameters,
             getter,
             setter,
+            attributes: Vec::new(),
             span: Span::new(start, end),
         }
     }
@@ -3181,7 +3182,7 @@ mod tests {
             ..LexOptions::default()
         };
         let parse = |source: &str| -> String {
-            let mut parser = Parser::new(tokenize_with(source, typedref));
+            let mut parser = Parser::new(tokenize_with(source, typedref.clone()));
             let expr = parser.parse_expression();
             assert!(
                 parser.diagnostics.is_empty(),

@@ -121,6 +121,19 @@ pub struct Vm {
     /// + raw `Read*`/`Write*`. `None` until the embedder selects a backend (the Safe bounds-checked
     /// block table or Real host pointers); Marshal ops then report no native memory on this build.
     memory_backend: Option<alloc::boxed::Box<dyn crate::memory::MemoryBackend>>,
+    /// The volatile MMIO seam ([`Lamella.Hardware.Mmio`]) -- a C# peripheral driver's register
+    /// access. The no_std core does no raw pointer I/O itself (it forbids `unsafe`); the embedder
+    /// installs these (a device firmware with `write_volatile`/`read_volatile` at the real address;
+    /// a host harness that wants real access). `None` falls back to the host simulated register
+    /// file below, so a driver runs + is verifiable off-device with no seam installed.
+    mmio_write_fn: Option<fn(u32, u32)>,
+    mmio_read_fn: Option<fn(u32) -> u32>,
+    /// A simulated MMIO register file, HOST-ONLY: the default `Mmio` target when no seam is
+    /// installed, so a driver can be exercised and its register writes verified off-device. On a
+    /// device build (`target_os = "none"`) this field does not exist -- MMIO with no seam is a
+    /// no-op (the firmware is expected to install the real-register seam at boot).
+    #[cfg(not(target_os = "none"))]
+    mmio_sim: BTreeMap<u32, u32>,
 }
 
 impl Vm {
@@ -409,6 +422,49 @@ impl Vm {
     /// intrinsics drive it.
     pub fn memory_backend(&mut self) -> Option<&mut (dyn crate::memory::MemoryBackend + 'static)> {
         self.memory_backend.as_deref_mut()
+    }
+
+    /// Installs the volatile MMIO seam (a device firmware supplies `write_volatile`/`read_volatile`
+    /// at the real register address; the no_std core does no raw pointer I/O itself). Once set,
+    /// `Mmio.Write32`/`Read32` route here instead of the host simulated register file.
+    pub fn set_mmio(&mut self, write: fn(u32, u32), read: fn(u32) -> u32) {
+        self.mmio_write_fn = Some(write);
+        self.mmio_read_fn = Some(read);
+    }
+
+    /// A `Mmio.Write32`: the installed volatile seam if any, else the HOST simulated register file
+    /// (a no-op on a device build with no seam installed).
+    pub fn mmio_write(&mut self, address: u32, value: u32) {
+        if let Some(write) = self.mmio_write_fn {
+            write(address, value);
+            return;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            self.mmio_sim.insert(address, value);
+        }
+    }
+
+    /// A `Mmio.Read32`: the installed volatile seam if any, else the HOST simulated register file
+    /// (0 on a device build with no seam installed).
+    #[must_use]
+    pub fn mmio_read(&self, address: u32) -> u32 {
+        if let Some(read) = self.mmio_read_fn {
+            return read(address);
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            return self.mmio_sim.get(&address).copied().unwrap_or(0);
+        }
+        #[cfg(target_os = "none")]
+        0
+    }
+
+    /// The HOST simulated MMIO register file, for a test/harness to inspect what a driver wrote.
+    #[cfg(not(target_os = "none"))]
+    #[must_use]
+    pub fn mmio_sim(&self) -> &BTreeMap<u32, u32> {
+        &self.mmio_sim
     }
 
     /// Requests that the scheduler park the running thread on socket I/O (a socket op would block):

@@ -65,7 +65,7 @@ pub fn build(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
 pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let funcs = lower_assembly(&assembly, entry)?;
+    let funcs = lower_assembly(&assembly, entry, None)?;
     let exports = method_exports(&assembly, entry.is_some());
     let export_refs: Vec<(&str, u32)> = exports.iter().map(|(n, i)| (n.as_str(), *i)).collect();
     let descriptors = MetadataResolver::new(&assembly).type_descriptors();
@@ -90,7 +90,7 @@ pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
     };
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let funcs = lower_assembly(&assembly, entry)?;
+    let funcs = lower_assembly(&assembly, entry, None)?;
     let code = arm32::lower_module(&funcs).map_err(BuildError::LowerArm)?;
     let mut image = Vec::with_capacity(8 + code.len());
     image.extend_from_slice(&initial_sp.to_le_bytes());
@@ -118,7 +118,7 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
     };
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
     let entry = find_main(&assembly);
-    let (funcs, maps, fails) = lower_assembly_debug(&assembly, entry);
+    let (funcs, maps, fails) = lower_assembly_debug(&assembly, entry, None);
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(BuildError::LowerCil { rid, error });
     }
@@ -156,12 +156,36 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
 /// driver/examples own the link step); the `hosted-csharp-arm` example links + runs the result.
 #[cfg(feature = "arm32")]
 pub fn build_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+    build_object_inner(cil, None)
+}
+
+/// As [`build_object`], but with the REFERENCED assembly (corlib) attached for cross-assembly
+/// vtable-slot agreement: a program type extending a referenced base numbers its slots INCLUDING the
+/// base's inherited virtuals (as the referenced assembly numbers them itself), an inherited slot is an
+/// extern vtable entry the linker resolves against [`build_library_object`]'s export of it, and a
+/// `callvirt` naming a referenced method (a `MemberRef`, e.g. `object.GetHashCode()` on a base-typed
+/// receiver) dispatches through that shared slot instead of static-devirtualizing.
+#[cfg(feature = "arm32")]
+pub fn build_object_with_corlib(cil: &[u8], corlib: &[u8]) -> Result<Vec<u8>, BuildError> {
+    build_object_inner(cil, Some(corlib))
+}
+
+#[cfg(feature = "arm32")]
+fn build_object_inner(cil: &[u8], corlib: Option<&[u8]>) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let reference = match corlib {
+        Some(bytes) => Some(Assembly::read(bytes).map_err(|_| BuildError::Parse)?),
+        None => None,
+    };
     let entry = find_main(&assembly);
-    let funcs = lower_assembly(&assembly, entry)?;
+    let funcs = lower_assembly(&assembly, entry, reference.as_ref())?;
     let names = object_symbol_names(&assembly, funcs.len());
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let descriptors = MetadataResolver::new(&assembly).type_descriptors();
+    let mut resolver = MetadataResolver::new(&assembly);
+    if let Some(reference) = reference.as_ref() {
+        resolver = resolver.with_reference(reference);
+    }
+    let descriptors = resolver.type_descriptors();
     arm32::lower_object_vtables(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerArm)
 }
 
@@ -172,7 +196,7 @@ pub fn build_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 #[cfg(feature = "arm32")]
 pub fn build_library_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
-    let (funcs, _maps, _fails) = lower_assembly_debug(&assembly, None);
+    let (funcs, _maps, _fails) = lower_assembly_debug(&assembly, None, None);
     let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
     let names = library_symbol_names(&assembly, funcs.len(), &prefix);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
@@ -182,8 +206,10 @@ pub fn build_library_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 }
 
 /// The per-function symbol names for [`build_library_object`]: a public static method takes its stable
-/// cross-assembly symbol (`extern_method_symbol`), so a program links its extern call against it; every
-/// other method keeps `f<rid>` (internal to the library).
+/// cross-assembly symbol (`extern_method_symbol`), so a program links its extern call against it; a
+/// public VIRTUAL instance method likewise, so a program type inheriting it fills the vtable slot with
+/// an extern entry the linker resolves here (cross-assembly dispatch of a never-overridden base
+/// virtual, e.g. `System.Object.ToString.`); every other method keeps `f<rid>` (internal).
 #[cfg(feature = "arm32")]
 fn library_symbol_names(
     assembly: &Assembly,
@@ -201,7 +227,7 @@ fn library_symbol_names(
             if rid >= names.len() {
                 continue;
             }
-            if method.is_static() && method.flags() & 0x7 == 0x6 {
+            if (method.is_static() || method.is_virtual()) && method.flags() & 0x7 == 0x6 {
                 if let Some(method_name) = method.name() {
                     let params = method.signature().map(|s| s.parameters).unwrap_or_default();
                     names[rid] = crate::resolver::extern_method_symbol(
@@ -392,8 +418,14 @@ fn find_native_export(assembly: &Assembly, export: &str) -> Option<u32> {
 
 /// Lowers an assembly's methods to a `Vec<Function>` keyed by MethodDef row. Index 0 is a trampoline
 /// to `entry` (if any) -- the `main` export -- or a stub. A method that does not lower stays a stub.
-fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Result<Vec<Function>, BuildError> {
-    let (funcs, _maps, fails) = lower_assembly_debug(assembly, entry);
+/// `reference` is the referenced assembly (corlib) for cross-assembly vtable-slot agreement, or `None`
+/// for this-assembly-relative numbering.
+fn lower_assembly<'a>(
+    assembly: &'a Assembly<'a>,
+    entry: Option<u32>,
+    reference: Option<&'a Assembly<'a>>,
+) -> Result<Vec<Function>, BuildError> {
+    let (funcs, _maps, fails) = lower_assembly_debug(assembly, entry, reference);
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(BuildError::LowerCil { rid, error });
     }
@@ -403,9 +435,10 @@ fn lower_assembly(assembly: &Assembly, entry: Option<u32>) -> Result<Vec<Functio
 /// As [`lower_assembly`], but also returns each function's [`cil::CilSourceMap`] (rid-indexed, empty for
 /// the trampoline and the stub gaps) -- so the SAME image build()'s chip path produces also carries debug
 /// info, and a debugger's line tables match the flashed layout by construction.
-fn lower_assembly_debug(
-    assembly: &Assembly,
+fn lower_assembly_debug<'a>(
+    assembly: &'a Assembly<'a>,
     entry: Option<u32>,
+    reference: Option<&'a Assembly<'a>>,
 ) -> (
     Vec<Function>,
     Vec<cil::CilSourceMap>,
@@ -431,7 +464,10 @@ fn lower_assembly_debug(
             entry_rid,
         );
     }
-    let resolver = MetadataResolver::new(assembly);
+    let resolver = match reference {
+        Some(reference) => MetadataResolver::new(assembly).with_reference(reference),
+        None => MetadataResolver::new(assembly),
+    };
     let mut fails: Vec<(u32, cil::CilError)> = Vec::new();
     for (rid, method) in &methods {
         let Some(body) = method.body() else { continue };

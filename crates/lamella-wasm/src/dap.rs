@@ -166,9 +166,9 @@ mod tests {
             br#"{"type":"request","seq":1,"command":"initialize"}"#,
         );
         assert!(init.contains(r#""command":"initialize""#));
-        assert!(init.contains(r#""event":"initialized""#));
 
-        reply_text(handle, br#"{"type":"request","seq":2,"command":"launch"}"#);
+        let launched = reply_text(handle, br#"{"type":"request","seq":2,"command":"launch"}"#);
+        assert!(launched.contains(r#""event":"initialized""#));
         let ran = reply_text(
             handle,
             br#"{"type":"request","seq":3,"command":"continue"}"#,

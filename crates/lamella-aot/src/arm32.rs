@@ -2381,15 +2381,13 @@ fn lower_spilled_into(
     if !pool.is_empty() {
         enc.align_to_word();
         for (entry, value) in pool {
-            enc.bind_label(entry);
-            enc.emit_word(value);
+            enc.pool_word(entry, value);
         }
     }
     if !sym_pool.is_empty() {
         enc.align_to_word();
         for (entry, func) in sym_pool {
-            enc.bind_label(entry);
-            enc.data_word_symbol(func);
+            enc.pool_word_symbol(entry, func);
         }
     }
     for (entry, text) in strings {
@@ -2443,8 +2441,11 @@ fn lower_spilled_into(
             .map(|(handle, _)| *handle)
             .and_then(|handle| vtables.iter().find(|m| m.handle == handle));
         if let Some(meta) = meta {
-            for &func_index in meta.vtable.iter().rev() {
-                if let Some(&label) = func_labels.get(func_index as usize) {
+            for slot in meta.vtable.iter().rev() {
+                let crate::resolver::VtableEntry::Func(func_index) = slot else {
+                    continue;
+                };
+                if let Some(&label) = func_labels.get(*func_index as usize) {
                     enc.data_word_diff(entry, label);
                 }
             }
@@ -2864,8 +2865,7 @@ fn lower_into(
     if !pool.is_empty() {
         enc.align_to_word();
         for (entry, value) in pool {
-            enc.bind_label(entry);
-            enc.emit_word(value);
+            enc.pool_word(entry, value);
         }
     }
     Ok(())
@@ -3040,8 +3040,7 @@ fn lower_mixed_into(
     if !pool.is_empty() {
         enc.align_to_word();
         for (entry, value) in pool {
-            enc.bind_label(entry);
-            enc.emit_word(value);
+            enc.pool_word(entry, value);
         }
     }
     Ok(())
@@ -3240,7 +3239,7 @@ pub struct LineTable(pub Vec<(u32, u32)>);
 /// paired with its [`LineTable`], so a native PC maps to a method, then a CIL offset, then source.
 pub type MethodLineTables = Vec<(u32, LineTable)>;
 
-pub use crate::resolver::TypeMeta;
+pub use crate::resolver::{TypeMeta, VtableEntry};
 
 impl LineTable {
     /// The CIL byte offset whose native code contains `offset` -- the last entry at or
@@ -3539,6 +3538,28 @@ fn intern_extern(externs: &mut Vec<alloc::string::String>, name: &str) -> u32 {
     }
 }
 
+/// A type's vtable as the function-index-or-extern-marker words the object path lays before its
+/// descriptor: a this-module slot is its function index, an inherited referenced-assembly slot is
+/// `EXTERN_SYMBOL_FLAG | <interned extern>` (carried through `TypeDescLiteral` to the vtable relocation,
+/// like a `CallNative` target). Empty for a type with no descriptor entry.
+fn descriptor_vtable(
+    meta: Option<&TypeMeta>,
+    externs: &mut Vec<alloc::string::String>,
+) -> Box<[u32]> {
+    meta.map(|m| {
+        m.vtable
+            .iter()
+            .map(|entry| match entry {
+                crate::resolver::VtableEntry::Func(index) => *index,
+                crate::resolver::VtableEntry::Extern(symbol) => {
+                    EXTERN_SYMBOL_FLAG | intern_extern(externs, symbol)
+                }
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 /// The `__aeabi_*cmp*` soft-float comparison helper for a float `Compare`, with whether its result
 /// must be INVERTED, keyed by the operand type; `None` for an integer compare. The EABI helpers are
 /// ORDERED (0 for NaN): `fcmplt/le/gt/ge/eq`. The CLI's unordered compares (`clt.un` etc.) and `!=`
@@ -3604,9 +3625,7 @@ fn lower_runtime_calls(
                 let symbol = intern_extern(externs, "lamella_gc_alloc");
                 let meta = descriptors.iter().find(|m| m.handle == *handle);
                 let type_tag = meta.map_or(0, |m| m.type_tag);
-                let vtable: Box<[u32]> = meta
-                    .map(|m| m.vtable.clone().into_boxed_slice())
-                    .unwrap_or_default();
+                let vtable = descriptor_vtable(meta, externs);
                 let mut words: Vec<u32> =
                     alloc::vec![*payload_size, ref_offsets.len() as u32, type_tag, 0];
                 words.extend(ref_offsets.iter().copied());
@@ -3634,6 +3653,20 @@ fn lower_runtime_calls(
                     Inst::CallNative {
                         symbol,
                         args: alloc::vec![size, typedesc],
+                    },
+                ));
+                continue;
+            }
+            if let Inst::TypeDescAddr { handle } = &inst {
+                let meta = descriptors.iter().find(|m| m.handle == *handle);
+                let type_tag = meta.map_or(0, |m| m.type_tag);
+                let vtable = descriptor_vtable(meta, externs);
+                insts.push((
+                    result,
+                    Inst::TypeDescLiteral {
+                        handle: handle.0,
+                        words: alloc::vec![0, 0, type_tag, 0].into_boxed_slice(),
+                        vtable,
                     },
                 ));
                 continue;
@@ -3836,6 +3869,7 @@ fn lower_object_inner(
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     let mut stack_maps: Vec<StackMapEntry> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
+        enc.align_to_word();
         enc.bind_label(func_labels[index]);
         if emit_entry {
             lower_one_func(func, &mut enc, &func_labels, &mut stack_maps)?;
@@ -3852,9 +3886,11 @@ fn lower_object_inner(
             }
         }
     }
-    let mut desc_syms: Vec<(u32, Label, u32, u32)> = Vec::new();
+    let code_end_label = enc.new_label();
+    enc.bind_label(code_end_label);
+    let mut desc_syms: Vec<(u32, Label, u32, u32, u32)> = Vec::new();
     {
-        let mut seen = alloc::collections::BTreeSet::new();
+        let mut chosen: Vec<(u32, &[u32], &[u32])> = Vec::new();
         for func in funcs {
             for block in &func.blocks {
                 for (_, inst) in &block.insts {
@@ -3864,22 +3900,92 @@ fn lower_object_inner(
                         vtable,
                     } = inst
                     {
-                        if !seen.insert(*handle) {
-                            continue;
+                        let rank = |w: &[u32], v: &[u32]| {
+                            (w.len(), w.first().copied().unwrap_or(0), v.len())
+                        };
+                        match chosen.iter_mut().find(|(h, _, _)| h == handle) {
+                            Some(slot) => {
+                                if rank(words, vtable) > rank(slot.1, slot.2) {
+                                    slot.1 = words;
+                                    slot.2 = vtable;
+                                }
+                            }
+                            None => chosen.push((*handle, words, vtable)),
                         }
-                        enc.align_to_word();
-                        let vtable_label = enc.new_label();
-                        enc.bind_label(vtable_label);
-                        for (k, &func_index) in vtable.iter().enumerate().rev() {
-                            enc.data_word_symbol_reldesc(func_index, -(4 + 4 * k as i32));
-                        }
-                        for &word in words.iter() {
-                            enc.emit_word(word);
-                        }
-                        desc_syms.push((*handle, vtable_label, vtable.len() as u32, words.len() as u32));
                     }
                 }
             }
+        }
+        let itable_of = |handle: u32| -> Vec<(u32, u32)> {
+            descriptors
+                .iter()
+                .find(|m| m.handle.0 == handle)
+                .map(|m| m.itable.clone())
+                .unwrap_or_default()
+        };
+        let mut emit: Vec<(u32, Vec<u32>, Vec<u32>, Vec<(u32, u32)>)> = chosen
+            .iter()
+            .map(|(h, w, v)| (*h, w.to_vec(), v.to_vec(), itable_of(*h)))
+            .collect();
+        let mut i = 0;
+        while i < emit.len() {
+            let handle = emit[i].0;
+            if let Some(base) = descriptors
+                .iter()
+                .find(|m| m.handle.0 == handle)
+                .and_then(|m| m.base)
+            {
+                if !emit.iter().any(|(h, ..)| *h == base.0) {
+                    let tag = descriptors
+                        .iter()
+                        .find(|m| m.handle == base)
+                        .map_or(0, |m| m.type_tag);
+                    emit.push((base.0, alloc::vec![0, 0, tag, 0], Vec::new(), Vec::new()));
+                }
+            }
+            i += 1;
+        }
+        for (handle, words, vtable, itable) in &emit {
+            enc.align_to_word();
+            let vtable_label = enc.new_label();
+            enc.bind_label(vtable_label);
+            for (k, &func_index) in vtable.iter().enumerate().rev() {
+                enc.data_word_symbol_reldesc(func_index, -(4 + 4 * k as i32));
+            }
+            let base = descriptors
+                .iter()
+                .find(|m| m.handle.0 == *handle)
+                .and_then(|m| m.base);
+            for (idx, &word) in words.iter().enumerate() {
+                match base {
+                    Some(base_handle)
+                        if idx == 3 && emit.iter().any(|(h, ..)| *h == base_handle.0) =>
+                    {
+                        enc.data_word_symbol_reldesc(DESC_SYMBOL_FLAG | base_handle.0, 12);
+                    }
+                    _ => enc.emit_word(word),
+                }
+            }
+            let itable_words = if itable.is_empty() {
+                0
+            } else {
+                1 + 2 * itable.len() as u32
+            };
+            if !itable.is_empty() {
+                enc.emit_word(itable.len() as u32);
+                let words_bytes = words.len() as i32 * 4;
+                for (i, &(tag, func_index)) in itable.iter().enumerate() {
+                    enc.emit_word(tag);
+                    enc.data_word_symbol_reldesc(func_index, words_bytes + 8 + 8 * i as i32);
+                }
+            }
+            desc_syms.push((
+                *handle,
+                vtable_label,
+                vtable.len() as u32,
+                words.len() as u32,
+                itable_words,
+            ));
         }
     }
     let assembled = enc.finish().map_err(|_| LowerError::CodeTooLarge)?;
@@ -3887,17 +3993,20 @@ fn lower_object_inner(
         .iter()
         .map(|&l| assembled.label_position(l).unwrap_or(0))
         .collect();
+    let code_end = assembled
+        .label_position(code_end_label)
+        .unwrap_or(assembled.bytes.len() as u32);
     for entry in &mut stack_maps {
         entry.return_pc = assembled.label_position_by_id(entry.return_pc).unwrap_or(0);
     }
     let desc_positions: Vec<u32> = desc_syms
         .iter()
-        .map(|(_, label, _, _)| assembled.label_position(*label).unwrap_or(0))
+        .map(|(_, label, ..)| assembled.label_position(*label).unwrap_or(0))
         .collect();
     let mut text = assembled.bytes;
     let mut symbols: Vec<lamella_elf::Symbol> = (0..funcs.len())
         .map(|i| {
-            let end = offsets.get(i + 1).copied().unwrap_or(text.len() as u32);
+            let end = offsets.get(i + 1).copied().unwrap_or(code_end);
             lamella_elf::Symbol {
                 name: names[i],
                 value: offsets[i] | 1,
@@ -3932,17 +4041,19 @@ fn lower_object_inner(
     }
     let desc_names: Vec<alloc::string::String> = desc_syms
         .iter()
-        .map(|(h, _, _, _)| alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, h))
+        .map(|(h, ..)| alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, h))
         .collect();
     let mut desc_index: alloc::collections::BTreeMap<u32, (u32, i32)> =
         alloc::collections::BTreeMap::new();
-    for (i, (handle, _vtable_label, vtable_len, words_len)) in desc_syms.iter().enumerate() {
+    for (i, (handle, _vtable_label, vtable_len, words_len, itable_words)) in
+        desc_syms.iter().enumerate()
+    {
         let pos = desc_positions[i];
         desc_index.insert(*handle, (symbols.len() as u32, (*vtable_len as i32) * 4));
         symbols.push(lamella_elf::Symbol {
             name: desc_names[i].as_str(),
             value: pos,
-            size: (vtable_len + words_len) * 4,
+            size: (vtable_len + words_len + itable_words) * 4,
             binding: lamella_elf::Binding::Global,
             kind: lamella_elf::SymbolType::NoType,
             section: lamella_elf::SymbolSection::Text,
@@ -3961,7 +4072,8 @@ fn lower_object_inner(
         let (symbol, final_addend) = if r.symbol & EXTERN_SYMBOL_FLAG != 0 {
             (funcs.len() as u32 + (r.symbol & !EXTERN_SYMBOL_FLAG), addend)
         } else if r.symbol & DESC_SYMBOL_FLAG != 0 {
-            desc_index[&(r.symbol & !DESC_SYMBOL_FLAG)]
+            let (index, vtable_bytes) = desc_index[&(r.symbol & !DESC_SYMBOL_FLAG)];
+            (index, vtable_bytes + addend)
         } else {
             (r.symbol, addend)
         };
@@ -5743,7 +5855,7 @@ mod tests {
             &[TypeMeta {
                 handle: lamella_ir::TypeHandle(1),
                 type_tag: tag,
-                vtable: vec![1],
+                vtable: vec![VtableEntry::Func(1)],
                 itable: vec![(iface_tag, 1)],
                 base: None,
             }],
@@ -6474,7 +6586,7 @@ mod tests {
         let descriptors = alloc::vec![TypeMeta {
             handle: lamella_ir::TypeHandle(0),
             type_tag: 0xABCD,
-            vtable: alloc::vec![3, 5],
+            vtable: alloc::vec![VtableEntry::Func(3), VtableEntry::Func(5)],
             itable: Vec::new(),
             base: None,
         }];
@@ -6523,7 +6635,7 @@ mod tests {
         let descriptors = alloc::vec![TypeMeta {
             handle: lamella_ir::TypeHandle(1),
             type_tag: 0x1234,
-            vtable: alloc::vec![1],
+            vtable: alloc::vec![VtableEntry::Func(1)],
             itable: Vec::new(),
             base: None,
         }];
@@ -6581,6 +6693,210 @@ mod tests {
                 .any(|r| r.kind == lamella_elf::arm::R_LAMELLA_REL_DESC),
             "without descriptors, no vtable slots are emitted"
         );
+    }
+
+    #[test]
+    fn lower_object_emits_an_extern_vtable_slot_for_an_inherited_base_virtual() {
+        let allocates = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: lamella_ir::TypeHandle(1),
+                        payload_size: 4,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let descriptors = alloc::vec![TypeMeta {
+            handle: lamella_ir::TypeHandle(1),
+            type_tag: 0x1234,
+            vtable: alloc::vec![
+                VtableEntry::Extern("System.Object.ToString.".into()),
+                VtableEntry::Func(1),
+            ],
+            itable: Vec::new(),
+            base: None,
+        }];
+        let bytes = lower_object_vtables(
+            &[allocates, stub_returning_int()],
+            &["f0", "f1"],
+            &[],
+            &descriptors,
+        )
+        .unwrap();
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let slot_target = |addend: i32| {
+            obj.relocations
+                .iter()
+                .find(|r| r.kind == lamella_elf::arm::R_LAMELLA_REL_DESC && r.addend == addend)
+                .map(|r| &obj.symbols[r.symbol as usize])
+                .expect("the vtable slot's relocation exists")
+        };
+        let inherited = slot_target(-4);
+        assert_eq!(inherited.name, "System.Object.ToString.");
+        assert!(
+            !inherited.defined,
+            "the inherited slot's implementation is UNDEFINED here -- the linker resolves it \
+             against the library object exporting the referenced method"
+        );
+        assert_eq!(slot_target(-8).name, "f1");
+    }
+
+    #[test]
+    fn lower_object_typedescaddr_shares_the_alloc_canonical_descriptor() {
+        let handle = lamella_ir::TypeHandle(0x0200_0005);
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle,
+                            payload_size: 8,
+                            ref_offsets: alloc::vec![4].into_boxed_slice(),
+                        },
+                    ),
+                    (ValueId(1), Inst::TypeDescAddr { handle }),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let descriptors = alloc::vec![TypeMeta {
+            handle,
+            type_tag: 0xAB,
+            vtable: Vec::new(),
+            itable: Vec::new(),
+            base: None,
+        }];
+        let bytes = lower_object_vtables(&[func], &["f0"], &[], &descriptors).unwrap();
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let desc_name = alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle.0);
+        let descs: Vec<&lamella_elf::ParsedSymbol> = obj
+            .symbols
+            .iter()
+            .filter(|s| s.name == desc_name && s.defined)
+            .collect();
+        assert_eq!(descs.len(), 1, "the alloc and the type-test share ONE descriptor");
+        assert_eq!(descs[0].size, 20, "the alloc's richer header wins the dedup");
+        let desc_index = obj.symbols.iter().position(|s| s.name == desc_name).unwrap() as u32;
+        let refs = obj
+            .relocations
+            .iter()
+            .filter(|r| r.kind == lamella_elf::arm::R_ARM_ABS32 && r.symbol == desc_index)
+            .count();
+        assert!(
+            refs >= 2,
+            "both the alloc and the TypeDescAddr reference the canonical descriptor (got {refs})"
+        );
+    }
+
+    #[test]
+    fn lower_object_lays_the_base_ptr_chain_and_synthesizes_ancestors() {
+        let derived = lamella_ir::TypeHandle(0x0200_0004);
+        let mid = lamella_ir::TypeHandle(0x0200_0003);
+        let base = lamella_ir::TypeHandle(0x0200_0002);
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: derived,
+                        payload_size: 4,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let descriptors = alloc::vec![
+            TypeMeta { handle: derived, type_tag: 0xD1, vtable: Vec::new(), itable: Vec::new(), base: Some(mid) },
+            TypeMeta { handle: mid, type_tag: 0xD2, vtable: Vec::new(), itable: Vec::new(), base: Some(base) },
+            TypeMeta { handle: base, type_tag: 0xD3, vtable: Vec::new(), itable: Vec::new(), base: None },
+        ];
+        let bytes = lower_object_vtables(&[func], &["f0"], &[], &descriptors).unwrap();
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let name = |h: lamella_ir::TypeHandle| alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, h.0);
+        for h in [derived, mid, base] {
+            assert!(
+                obj.symbols.iter().any(|s| s.name == name(h) && s.defined),
+                "descriptor for {:#x} (an allocated type or its synthesized ancestor) is laid",
+                h.0
+            );
+        }
+        let chain: Vec<&str> = obj
+            .relocations
+            .iter()
+            .filter(|r| r.kind == lamella_elf::arm::R_LAMELLA_REL_DESC)
+            .map(|r| obj.symbols[r.symbol as usize].name.as_str())
+            .collect();
+        assert_eq!(chain.len(), 2, "Derived->Mid and Mid->Base, and Base->Object terminates at 0");
+        assert!(chain.contains(&name(mid).as_str()), "Derived's base_ptr targets Mid");
+        assert!(chain.contains(&name(base).as_str()), "Mid's base_ptr targets Base");
+    }
+
+    #[test]
+    fn lower_object_emits_the_itable_for_interface_dispatch() {
+        let handle = lamella_ir::TypeHandle(0x0200_0006);
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle,
+                        payload_size: 4,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let descriptors = alloc::vec![TypeMeta {
+            handle,
+            type_tag: 0x55,
+            vtable: Vec::new(),
+            itable: alloc::vec![(0xCAFE, 1)],
+            base: None,
+        }];
+        let bytes =
+            lower_object_vtables(&[func, stub_returning_int()], &["f0", "f1"], &[], &descriptors)
+                .unwrap();
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let desc = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle.0))
+            .expect("the descriptor is laid");
+        assert_eq!(desc.size, 28, "the descriptor symbol spans vtable + words + itable");
+        let f1 = obj.symbols.iter().position(|s| s.name == "f1").unwrap() as u32;
+        let slot = obj
+            .relocations
+            .iter()
+            .find(|r| r.kind == lamella_elf::arm::R_LAMELLA_REL_DESC && r.symbol == f1)
+            .expect("the itable method slot's relocation targets the implementation");
+        assert_eq!(slot.addend, 24);
     }
 
     fn stub_returning_int() -> Function {
@@ -6919,6 +7235,64 @@ mod tests {
             &obj.text[off..off + 2],
             &[0x2A, 0x20],
             "answer's post-relaxation offset must point to `movs r0, #42`"
+        );
+    }
+
+    #[test]
+    fn lower_object_islands_a_literal_heavy_function_past_the_pool_reach() {
+        const N: i64 = 400;
+        let mut value_types = vec![MirType::I32];
+        let mut insts = vec![(
+            ValueId(0),
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: 0,
+            },
+        )];
+        let mut next = 1u32;
+        let mut acc = ValueId(0);
+        for i in 0..N {
+            let c = ValueId(next);
+            next += 1;
+            value_types.push(MirType::I32);
+            insts.push((
+                c,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 100_003 + i * 7919,
+                },
+            ));
+            let sum = ValueId(next);
+            next += 1;
+            value_types.push(MirType::I32);
+            insts.push((
+                sum,
+                Inst::Binary {
+                    op: BinOp::Add,
+                    lhs: acc,
+                    rhs: c,
+                },
+            ));
+            acc = sum;
+        }
+        let big = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types,
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts,
+                terminator: Some(Terminator::Return(Some(acc))),
+            }],
+        };
+        let bytes = lower_object(&[big], &["big"], &[])
+            .expect("a literal-heavy body islands its pool instead of erroring CodeTooLarge");
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        assert!(
+            obj.text.len() > 1020,
+            "the body must overrun the ~1 KB literal reach for islanding to matter (text {})",
+            obj.text.len()
         );
     }
 }

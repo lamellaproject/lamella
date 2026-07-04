@@ -87,6 +87,64 @@ pub mod debug {
     }
 }
 
+/// Wireline message types for PERSISTENT deploy (write a baked image to the target's flash
+/// so it boots on reset), in the 0x20 REPL range beside [`repl::RUN_IMAGE`].
+pub mod deploy {
+    /// Host -> target: write a baked image to the persistent flash region and keep it, so
+    /// the target boots it on the next reset / power-cycle. Payload = the image bytes.
+    /// Answered by [`DEPLOY_RESULT`]. (Run-from-RAM stays [`super::repl::RUN_IMAGE`]; this
+    /// is the durable "deploy the app" mode.)
+    pub const DEPLOY_IMAGE: u8 = 0x23;
+    /// Host -> target: erase the persistent image (un-deploy), so the next boot serves
+    /// instead of running an app. Answered by [`DEPLOY_RESULT`].
+    pub const DEPLOY_CLEAR: u8 = 0x24;
+    /// Target -> host: `ok(u8)` -- 1 if the flash write verified (or the clear succeeded),
+    /// 0 on a flash fault.
+    pub const DEPLOY_RESULT: u8 = 0x25;
+    /// Host -> target: write one CHUNK of a baked image to flash. Payload =
+    /// `offset(u32 LE) | total(u32 LE) | chunk bytes`. Chunks arrive in ascending offset order;
+    /// the target erases the region on the first chunk (`offset == 0`, sized from `total`) and
+    /// writes each chunk straight to flash -- so an image larger than one 64 KB wire frame deploys
+    /// without ever holding it whole in RAM. Each chunk is answered by [`DEPLOY_RESULT`]; the final
+    /// chunk's reply is the deploy's overall result.
+    pub const DEPLOY_CHUNK: u8 = 0x26;
+}
+
+/// The persistent-image flash region a deploy-capable target owns. The generic runner
+/// drives the deploy protocol against this seam; the erase/write primitives are
+/// device-specific (each MCU's flash controller differs), so the firmware implements them.
+#[cfg(feature = "baked-image")]
+pub trait FlashSink {
+    /// The image region as a `'static` slice -- where a deployed image is written, and
+    /// where the boot path reads `Module::from_baked` from. May be longer than any stored
+    /// image; `from_baked` reads the true length from the image header.
+    fn image_slice(&self) -> &'static [u8];
+    /// Erase enough of the region to invalidate any stored image (its fingerprint), so a
+    /// subsequent boot finds none.
+    fn erase(&mut self);
+    /// Erase, then program `image` into the region. Returns whether a readback verified.
+    fn program(&mut self, image: &[u8]) -> bool;
+    /// Program one CHUNK of a larger image: write `chunk` at `offset` within the region, having
+    /// erased enough of the region for `total` bytes on the first chunk (`offset == 0`). Returns
+    /// whether the chunk read back. The default is unsupported (a target that never receives an
+    /// image larger than one wire frame need not implement it); a roomy target overrides it to
+    /// stream a corlib-baked image to flash a frame at a time.
+    fn program_chunk(&mut self, offset: usize, chunk: &[u8], total: usize) -> bool {
+        let _ = (offset, chunk, total);
+        false
+    }
+}
+
+/// How a [`run_deployed`] app run ended.
+#[cfg(feature = "baked-image")]
+pub enum Deployed {
+    /// The app ran to completion or trapped -- nothing is listening now; serve.
+    Completed(RunResult),
+    /// A host sent `HELLO` mid-run: the app was aborted and the host acknowledged; the
+    /// firmware should enter its serve loop where the host's next command lands.
+    Interrupted,
+}
+
 /// The result of running a program on the target: its process exit code and captured console output.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunResult {
@@ -143,6 +201,8 @@ pub fn run_program(corlib_bytes: &[u8], program_bytes: &[u8]) -> RunResult {
         Err(error) => return failure(&format!("load failed: {error}")),
     };
     let mut vm = Vm::default();
+    #[cfg(target_os = "none")]
+    vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     let outcome = run(&loaded.module, &mut vm, loaded.entry, Vec::new());
     let exit = match outcome {
@@ -155,6 +215,30 @@ pub fn run_program(corlib_bytes: &[u8], program_bytes: &[u8]) -> RunResult {
 
 fn failure(reason: &str) -> RunResult {
     RunResult { exit: -1, stdout: reason.to_string() }
+}
+
+/// Answers a `HELLO` with this baked target's honest advertisement (or a `NAK` on a
+/// version mismatch). A malformed `HELLO` is dropped; the host times out and retries.
+#[cfg(feature = "baked-image")]
+fn hello_reply(
+    transport: &mut impl Transport,
+    frame: &lamella_wire::Frame,
+) -> Result<(), TransportError> {
+    use lamella_wire::{Capabilities, Hello, PROTOCOL_VERSION, ProtocolRange, msg, target_respond};
+    let range = ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION };
+    let caps = Capabilities(
+        Capabilities::BAKED_IMAGE
+            | Capabilities::DEBUG_BASIC
+            | Capabilities::BREAKPOINTS
+            | Capabilities::STEPPING,
+    );
+    match Hello::decode(&frame.payload) {
+        Some(hello) => match target_respond(&hello, range, caps) {
+            Ok(ack) => transport.send(msg::HELLO_ACK, frame.seq, &ack.encode()),
+            Err(nak) => transport.send(msg::NAK, frame.seq, &nak.encode()),
+        },
+        None => Ok(()),
+    }
 }
 
 /// How a [`run_debug_session`] resume leg ended.
@@ -274,6 +358,8 @@ pub fn run_debug_session(
         }
     };
     let mut vm = Vm::default();
+    #[cfg(target_os = "none")]
+    vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     let mut session = match Session::new(&module, entry, Vec::new()) {
         Ok(session) => session,
@@ -387,6 +473,10 @@ pub fn run_debug_session(
                 transport.send(debug::DBG_ACK, frame.seq, &[])?;
                 return Ok(());
             }
+            lamella_wire::msg::HELLO => {
+                hello_reply(transport, &frame)?;
+                return Ok(());
+            }
             _ => {}
         }
     }
@@ -409,6 +499,8 @@ pub fn run_image(image: Vec<u8>) -> RunResult {
         return failure("image records no entry point");
     };
     let mut vm = Vm::default();
+    #[cfg(target_os = "none")]
+    vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     let outcome = run(&module, &mut vm, entry, Vec::new());
     let exit = match outcome {
@@ -430,27 +522,26 @@ pub fn run_image(image: Vec<u8>) -> RunResult {
 /// Propagates a [`TransportError`] from the carrier.
 #[cfg(feature = "baked-image")]
 pub fn serve_one_baked(transport: &mut impl Transport) -> Result<bool, TransportError> {
-    use lamella_wire::{Capabilities, Hello, PROTOCOL_VERSION, ProtocolRange, msg, target_respond};
     let Some(frame) = transport.poll()? else {
         return Ok(false);
     };
+    serve_frame_baked(transport, frame)?;
+    Ok(true)
+}
+
+/// Handle one already-polled frame on a baked-image target: `HELLO` -> `HELLO_ACK`,
+/// `RUN_IMAGE` -> run-from-RAM + `RUN_RESULT`, `DBG_IMAGE` -> a debug session. Anything
+/// else (e.g. `RUN_PROGRAM`: this target is PE-less) is consumed -- the host learns the
+/// supported surface from the `HELLO_ACK` capabilities. Split out so a deploy-capable
+/// serve loop can dispatch the deploy messages itself and delegate the rest here.
+#[cfg(feature = "baked-image")]
+fn serve_frame_baked(
+    transport: &mut impl Transport,
+    frame: lamella_wire::Frame,
+) -> Result<(), TransportError> {
+    use lamella_wire::msg;
     match frame.msg_type {
-        msg::HELLO => {
-            let range = ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION };
-            let caps = Capabilities(
-                Capabilities::BAKED_IMAGE
-                    | Capabilities::DEBUG_BASIC
-                    | Capabilities::BREAKPOINTS
-                    | Capabilities::STEPPING,
-            );
-            match Hello::decode(&frame.payload) {
-                Some(hello) => match target_respond(&hello, range, caps) {
-                    Ok(ack) => transport.send(msg::HELLO_ACK, frame.seq, &ack.encode())?,
-                    Err(nak) => transport.send(msg::NAK, frame.seq, &nak.encode())?,
-                },
-                None => {}
-            }
-        }
+        msg::HELLO => hello_reply(transport, &frame)?,
         repl::RUN_IMAGE => {
             let result = run_image(frame.payload);
             transport.send(repl::RUN_RESULT, frame.seq, &result.encode())?;
@@ -460,7 +551,99 @@ pub fn serve_one_baked(transport: &mut impl Transport) -> Result<bool, Transport
         }
         _ => {}
     }
+    Ok(())
+}
+
+/// Serve one pending request on a DEPLOY-capable baked-image target: `DEPLOY_IMAGE`
+/// programs the image into `flash` and keeps it (boots on reset); `DEPLOY_CLEAR` erases
+/// it; every other frame is delegated to [`serve_frame_baked`]. A device firmware's serve
+/// loop is this call in a loop (plus its own arena reset between requests).
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+pub fn serve_one_deploy(
+    transport: &mut impl Transport,
+    flash: &mut impl FlashSink,
+) -> Result<bool, TransportError> {
+    let Some(frame) = transport.poll()? else {
+        return Ok(false);
+    };
+    match frame.msg_type {
+        deploy::DEPLOY_IMAGE => {
+            let ok = flash.program(&frame.payload);
+            transport.send(deploy::DEPLOY_RESULT, frame.seq, &[u8::from(ok)])?;
+        }
+        deploy::DEPLOY_CLEAR => {
+            flash.erase();
+            transport.send(deploy::DEPLOY_RESULT, frame.seq, &[1])?;
+        }
+        deploy::DEPLOY_CHUNK => {
+            let payload = &frame.payload;
+            let ok = if payload.len() >= 8 {
+                let offset = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                let total = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+                flash.program_chunk(offset, &payload[8..], total)
+            } else {
+                false
+            };
+            transport.send(deploy::DEPLOY_RESULT, frame.seq, &[u8::from(ok)])?;
+        }
+        _ => serve_frame_baked(transport, frame)?,
+    }
     Ok(true)
+}
+
+/// Run a DEPLOYED baked image (booted from flash) at full speed, staying interruptible: it
+/// drives the interpreter session in bounded bursts and polls the wire between them, so a
+/// host that sends `HELLO` always takes the board back within a burst -- guaranteed,
+/// because an interpreted app cannot execute without the firmware stepping it (there is no
+/// "app masks interrupts and spins" failure mode a native deployment has). A trap or a
+/// completed run returns [`Deployed::Completed`]; a `HELLO` returns [`Deployed::Interrupted`]
+/// (acknowledged), and the firmware then serves the host's next command.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+pub fn run_deployed(
+    transport: &mut impl Transport,
+    module: &lamella_cil_runtime::Module,
+    entry: lamella_cil_runtime::MethodId,
+) -> Result<Deployed, TransportError> {
+    use lamella_cil_runtime::{Session, Status};
+    use lamella_wire::msg;
+    let mut vm = Vm::default();
+    #[cfg(target_os = "none")]
+    vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
+    vm.set_memory_backend(Box::new(SafeMemory::new()));
+    let mut session = match Session::new(module, entry, Vec::new()) {
+        Ok(session) => session,
+        Err(trap) => {
+            return Ok(Deployed::Completed(failure(&format!("session: {trap:?}"))));
+        }
+    };
+    loop {
+        for _ in 0..4096 {
+            match session.step(module, &mut vm) {
+                Ok(Status::Done(value)) => {
+                    return Ok(Deployed::Completed(run_result_of(&vm, &value)));
+                }
+                Err(trap) => {
+                    return Ok(Deployed::Completed(RunResult {
+                        exit: 70,
+                        stdout: format!("{}TRAP: {trap:?}", String::from_utf16_lossy(vm.output())),
+                    }));
+                }
+                Ok(_) => {}
+            }
+        }
+        if let Some(frame) = transport.poll()? {
+            if frame.msg_type == msg::HELLO {
+                hello_reply(transport, &frame)?;
+                return Ok(Deployed::Interrupted);
+            }
+        }
+    }
 }
 
 /// The runner's request handler: if a [`repl::RUN_PROGRAM`] is pending, run it (against `corlib_bytes`)
@@ -691,5 +874,110 @@ mod tests {
         let result = RunResult::decode(&done.payload[9..]).expect("a run result tail");
         assert_eq!(result.exit, 7);
         assert_eq!(result.stdout, "hi\n");
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_hello_mid_debug_session_ends_it_for_the_new_host() {
+        use lamella_wire::{Capabilities, Hello, MemTransport, PROTOCOL_VERSION, ProtocolRange, msg};
+
+        let Ok(program) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-wireline/tests/fixtures/hello.exe"
+        )) else {
+            return;
+        };
+        let program: &'static [u8] = Box::leak(program.into_boxed_slice());
+        let assembly = Assembly::read(program).expect("fixture parses");
+        let loaded = lamella_load::load(&assembly).expect("fixture loads");
+        let mut module = loaded.module;
+        let image = module.write_baked(Some(loaded.entry)).expect("fixture bakes");
+
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        driver.send(debug::DBG_IMAGE, 1, &image).unwrap();
+        let hello = Hello {
+            range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+            caps: Capabilities(Capabilities::BAKED_IMAGE),
+        };
+        driver.send(msg::HELLO, 2, &hello.encode()).unwrap();
+        send_image(&mut driver, 3, &image).unwrap();
+        runner.feed(&driver.take_sent());
+
+        assert!(serve_one_baked(&mut runner).unwrap(), "the stale debug session served + ended");
+        assert!(serve_one_baked(&mut runner).unwrap(), "the fresh RUN_IMAGE served");
+        driver.feed(&runner.take_sent());
+
+        let entry = driver.poll().unwrap().expect("the stale session's entry stop");
+        assert_eq!(entry.msg_type, debug::EVT_STOPPED);
+        let ack = driver.poll().unwrap().expect("the successor's HELLO_ACK");
+        assert_eq!(ack.msg_type, msg::HELLO_ACK);
+        let result = try_recv_result(&mut driver, 3).unwrap().expect("a fresh run result");
+        assert_eq!(result.exit, 7);
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[derive(Default)]
+    struct MockFlash {
+        data: Vec<u8>,
+    }
+
+    #[cfg(feature = "baked-image")]
+    impl FlashSink for MockFlash {
+        fn image_slice(&self) -> &'static [u8] {
+            &[]
+        }
+        fn erase(&mut self) {
+            self.data.clear();
+        }
+        fn program(&mut self, image: &[u8]) -> bool {
+            self.data = image.to_vec();
+            true
+        }
+        fn program_chunk(&mut self, offset: usize, chunk: &[u8], total: usize) -> bool {
+            if offset == 0 {
+                self.data = vec![0xff; total];
+            }
+            if offset + chunk.len() > self.data.len() {
+                return false;
+            }
+            self.data[offset..offset + chunk.len()].copy_from_slice(chunk);
+            true
+        }
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn chunked_deploy_reassembles_an_over_64k_image() {
+        use lamella_wire::MemTransport;
+
+        let image: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let total = image.len();
+        let chunk_len = 32_768usize;
+        let mut sink = MockFlash::default();
+
+        let mut offset = 0;
+        let mut seq = 0u16;
+        while offset < total {
+            let end = (offset + chunk_len).min(total);
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&(offset as u32).to_le_bytes());
+            payload.extend_from_slice(&(total as u32).to_le_bytes());
+            payload.extend_from_slice(&image[offset..end]);
+
+            let mut driver = MemTransport::new();
+            let mut runner = MemTransport::new();
+            driver.send(deploy::DEPLOY_CHUNK, seq, &payload).unwrap();
+            runner.feed(&driver.take_sent());
+            assert!(serve_one_deploy(&mut runner, &mut sink).unwrap(), "the target handled a chunk");
+            driver.feed(&runner.take_sent());
+            let ack = driver.poll().unwrap().expect("a chunk ack");
+            assert_eq!(ack.msg_type, deploy::DEPLOY_RESULT);
+            assert_eq!(ack.payload, vec![1], "the chunk verified");
+
+            offset = end;
+            seq += 1;
+        }
+        assert_eq!(sink.data, image, "the reassembled image matches the original");
     }
 }

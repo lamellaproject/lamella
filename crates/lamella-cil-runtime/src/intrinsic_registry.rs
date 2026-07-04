@@ -255,6 +255,8 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     (0x7E7FC5C5, md_array_set),
     #[cfg(feature = "NETMFv4_4")]
     (0x46FDE575, member_get_type),
+    (0x09BB783D, mmio_read32),
+    (0xF37A3AFA, mmio_write32),
     #[cfg(feature = "NETMFv4_4")]
     (0xD83F0EA5, method_invoke),
     #[cfg(feature = "NETMFv4_4")]

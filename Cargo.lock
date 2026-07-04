@@ -556,6 +556,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-cmsis-dap-stm32"
+version = "0.0.0"
+dependencies = [
+ "lamella-cmsis-dap",
+ "lamella-usbhid",
+]
+
+[[package]]
 name = "lamella-dap"
 version = "0.0.0"
 dependencies = [
@@ -643,6 +651,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-mmio"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-pe"
 version = "0.0.0"
 dependencies = [
@@ -691,6 +703,7 @@ dependencies = [
  "lamella-cil-runtime",
  "lamella-load",
  "lamella-metadata",
+ "lamella-mmio",
  "lamella-token",
  "lamella-wire",
 ]

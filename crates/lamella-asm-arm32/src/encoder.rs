@@ -128,6 +128,13 @@ pub struct Encoder {
     /// entry relative to its type descriptor, so the image works wherever it is loaded).
     diffs: Vec<(u32, u32, u32)>,
     relocs: Vec<Reloc>,
+    /// Label ids of literal-pool words emitted via [`Encoder::pool_word`] /
+    /// [`Encoder::pool_word_symbol`] -- each a self-contained 4-byte datum a PC-relative `ldr`
+    /// loads. If such a word ends up beyond its load's ~1 KB reach, [`Encoder::finish`] relocates a
+    /// copy into a nearer branch-over island (see [`Encoder::island_far_literal`]). Other
+    /// `ThumbLdrLit8` targets -- an `adr` to a string or a multi-word descriptor -- are NOT listed
+    /// here and are never split this way.
+    pool_literals: Vec<u32>,
 }
 
 use crate::cond::Cond;
@@ -921,52 +928,149 @@ impl Encoder {
         self.bytes.extend_from_slice(&[0; 4]);
     }
 
-    /// Grows any conditional branch whose +/-256-byte reach is exceeded into the two-halfword
-    /// inverted-skip form (ARMv6-M has no wide `B<c>`): `B<!cond>` over a following `B`, which
-    /// reaches +/-2 KB. Inserting the extra halfword shifts every later label and reference, so a
-    /// grown branch can push another out of range -- the pass repeats until all are in range. Each
-    /// conditional branch grows at most once (it then has the wider reach), so this terminates.
-    fn relax_conditional_branches(&mut self) -> Result<(), AssembleError> {
-        loop {
-            let mut grew = false;
-            for idx in 0..self.fixups.len() {
-                let (at, kind, label_id) = self.fixups[idx];
-                if kind != RelocKind::ThumbBranchCond8 {
-                    continue;
-                }
-                let target = match self.labels.get(label_id as usize) {
-                    Some(Some(offset)) => *offset,
-                    _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
-                };
-                let offset = i64::from(target) - (i64::from(at) + 4);
-                if (-256..=254).contains(&offset) && offset % 2 == 0 {
-                    continue;
-                }
-                let insert = (at + 2) as usize;
-                self.bytes.splice(insert..insert, [0x00, 0xE0, 0x00, 0xBF]);
-                for slot in self.labels.iter_mut().flatten() {
-                    if *slot >= at + 2 {
-                        *slot += 4;
-                    }
-                }
-                for (fixup_at, _, _) in &mut self.fixups {
-                    if *fixup_at >= at + 2 {
-                        *fixup_at += 4;
-                    }
-                }
-                for reloc in &mut self.relocs {
-                    if reloc.at >= at + 2 {
-                        reloc.at += 4;
-                    }
-                }
-                self.fixups[idx].1 = RelocKind::ThumbBranchCond8Long;
-                grew = true;
-                break;
-            }
-            if !grew {
-                return Ok(());
+    /// Emits a 4-byte literal-pool word bound to `label` and holding `value`, marked ISLANDABLE: if
+    /// `label` ends up beyond the ~1 KB reach of its PC-relative `ldr`, [`Encoder::finish`] moves a
+    /// copy of the word into a nearer branch-over island and re-points the load. This is the bind +
+    /// [`Encoder::emit_word`] a literal pool already does, plus the islandability record -- so a
+    /// large function's early loads still reach their constants instead of hard-erroring.
+    pub fn pool_word(&mut self, label: Label, value: u32) {
+        self.bind_label(label);
+        self.pool_literals.push(label.0);
+        self.emit_word(value);
+    }
+
+    /// Like [`Encoder::pool_word`] but the word holds the address of an external `symbol` (an
+    /// `Abs32` reloc the link step fills), for a function-pointer or type-descriptor pool entry. The
+    /// word is islandable too; islanding replicates the relocation onto the relocated copy.
+    pub fn pool_word_symbol(&mut self, label: Label, symbol: u32) {
+        self.bind_label(label);
+        self.pool_literals.push(label.0);
+        self.data_word_symbol(symbol);
+    }
+
+    /// Inserts `insert` bytes at byte offset `at`, shifting every later reference -- any bound
+    /// label, fixup, relocation, or diff at offset >= `at` -- forward by `insert.len()`. The shared
+    /// building block for growing the image mid-stream: branch relaxation splices a halfword-pair,
+    /// literal islanding splices a branch-over datum, and both must move everything after the seam.
+    fn splice_in(&mut self, at: u32, insert: &[u8]) {
+        let grow = insert.len() as u32;
+        let pos = at as usize;
+        self.bytes.splice(pos..pos, insert.iter().copied());
+        for slot in self.labels.iter_mut().flatten() {
+            if *slot >= at {
+                *slot += grow;
             }
         }
+        for (fixup_at, _, _) in &mut self.fixups {
+            if *fixup_at >= at {
+                *fixup_at += grow;
+            }
+        }
+        for reloc in &mut self.relocs {
+            if reloc.at >= at {
+                reloc.at += grow;
+            }
+        }
+        for (diff_at, _, _) in &mut self.diffs {
+            if *diff_at >= at {
+                *diff_at += grow;
+            }
+        }
+    }
+
+    /// Runs branch relaxation and literal-pool islanding to a JOINT fixpoint before the fixups are
+    /// resolved. Each grows the image -- a widened conditional branch splices a halfword-pair, an
+    /// islanded literal splices a branch-over datum -- which shifts later references and can push
+    /// another branch or load out of reach, so the two co-iterate until neither must move. Each
+    /// conditional branch widens at most once (it then has the wider reach) and each pool word
+    /// islands at most once (its copy then sits a few bytes from the load), so this terminates.
+    fn relax(&mut self) -> Result<(), AssembleError> {
+        loop {
+            if self.widen_far_conditional_branch()? {
+                continue;
+            }
+            if self.island_far_literal()? {
+                continue;
+            }
+            return Ok(());
+        }
+    }
+
+    /// Grows the first conditional branch whose +/-256-byte reach is exceeded into the two-halfword
+    /// inverted-skip form (ARMv6-M has no wide `B<c>`): `B<!cond>` over a following `B`, which
+    /// reaches +/-2 KB. Returns whether one grew; the caller re-checks from the top because the
+    /// spliced halfword shifts every later reference and can push another branch out of range.
+    fn widen_far_conditional_branch(&mut self) -> Result<bool, AssembleError> {
+        for idx in 0..self.fixups.len() {
+            let (at, kind, label_id) = self.fixups[idx];
+            if kind != RelocKind::ThumbBranchCond8 {
+                continue;
+            }
+            let target = match self.labels.get(label_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+            };
+            let offset = i64::from(target) - (i64::from(at) + 4);
+            if (-256..=254).contains(&offset) && offset % 2 == 0 {
+                continue;
+            }
+            self.splice_in(at + 2, &[0x00, 0xE0, 0x00, 0xBF]);
+            self.fixups[idx].1 = RelocKind::ThumbBranchCond8Long;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Relocates the first islandable literal-pool word (see [`Encoder::pool_word`]) that lies
+    /// beyond its PC-relative load's ~1 KB reach into a branch-over island placed right after the
+    /// load -- a point execution reaches, from which the copy is a few bytes ahead and so back in
+    /// range -- and re-points the load's label at the copy. Returns whether one moved.
+    ///
+    /// The island is `B over` (which skips the datum), word-align padding, then the 4-byte copy.
+    /// The original word is left where it was as harmless dead data: nothing loads it any more (its
+    /// label now names the copy), and a relocation that rode on it is replicated onto the live copy
+    /// while the orphaned one merely patches unread bytes. Only marked words move -- an `adr` to a
+    /// string or multi-word descriptor is never split this way and still hard-errors in
+    /// [`Encoder::finish`] if it is out of reach.
+    fn island_far_literal(&mut self) -> Result<bool, AssembleError> {
+        for idx in 0..self.fixups.len() {
+            let (at, kind, label_id) = self.fixups[idx];
+            if kind != RelocKind::ThumbLdrLit8 || !self.pool_literals.contains(&label_id) {
+                continue;
+            }
+            let target = match self.labels.get(label_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+            };
+            let pc = (at + 4) & !3u32;
+            if target >= pc && target - pc <= 1020 {
+                continue;
+            }
+            let word = match self.bytes.get(target as usize..target as usize + 4) {
+                Some(b) => [b[0], b[1], b[2], b[3]],
+                None => return Err(AssembleError::BranchOutOfRange { at }),
+            };
+            let carried = self.relocs.iter().find(|r| r.at == target).copied();
+            let ins = at + 2;
+            let pad = (4 - ((ins + 2) & 3)) & 3;
+            let mut island = Vec::with_capacity((6 + pad) as usize);
+            island.extend_from_slice(&0xE000u16.to_le_bytes());
+            island.resize(island.len() + pad as usize, 0);
+            island.extend_from_slice(&word);
+            let word_site = ins + 2 + pad;
+            let over = ins + island.len() as u32;
+            self.splice_in(ins, &island);
+            self.labels[label_id as usize] = Some(word_site);
+            let over_label = self.new_label();
+            self.labels[over_label.0 as usize] = Some(over);
+            self.fixups.push((ins, RelocKind::ThumbBranch11, over_label.0));
+            if let Some(mut r) = carried {
+                r.at = word_site;
+                self.relocs.push(r);
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Resolves every internal label reference and returns the finished image
@@ -977,7 +1081,7 @@ impl Encoder {
     /// Returns [`AssembleError::UnboundLabel`] if any referenced label was never
     /// bound.
     pub fn finish(mut self) -> Result<Assembled, AssembleError> {
-        self.relax_conditional_branches()?;
+        self.relax()?;
         let branch_offset =
             |at: u32, target: u32, min: i64, max: i64| -> Result<u16, AssembleError> {
                 let offset = i64::from(target) - (i64::from(at) + 4);
@@ -1325,6 +1429,78 @@ mod tests {
         enc.emit_word(0xDEAD_BEEF);
         let out = enc.finish().unwrap();
         assert_eq!(&out.bytes[0..2], &[0x00, 0xA1]);
+    }
+
+    /// The offset a resolved `LDR` (literal) at `site` reads from -- `Align(site + 4, 4) + imm8 * 4`.
+    fn ldr_literal_target(bytes: &[u8], site: usize) -> usize {
+        let instr = u16::from_le_bytes([bytes[site], bytes[site + 1]]);
+        assert_eq!(instr & 0xF800, 0x4800, "the site is an LDR (literal)");
+        let imm8 = (instr & 0x00FF) as usize;
+        assert!(imm8 * 4 <= 1020, "the resolved load is within its ~1 KB reach");
+        ((site + 4) & !3) + imm8 * 4
+    }
+
+    #[test]
+    fn a_far_literal_pool_word_islands_within_reach() {
+        let mut enc = Encoder::new();
+        let pool = enc.new_label();
+        enc.ldr_literal(Reg::R0, pool).unwrap();
+        for _ in 0..600 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.pool_word(pool, 0xDEAD_BEEF);
+        let out = enc.finish().expect("the far pool word islands rather than erroring");
+        let addr = ldr_literal_target(&out.bytes, 0);
+        assert_eq!(
+            &out.bytes[addr..addr + 4],
+            &0xDEAD_BEEFu32.to_le_bytes(),
+            "the load resolves to an in-reach copy holding the constant"
+        );
+    }
+
+    #[test]
+    fn a_far_symbol_pool_word_islands_and_replicates_its_relocation() {
+        let mut enc = Encoder::new();
+        let pool = enc.new_label();
+        enc.ldr_literal(Reg::R0, pool).unwrap();
+        for _ in 0..600 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.pool_word_symbol(pool, 7);
+        let out = enc.finish().expect("the far symbol pool word islands");
+        let addr = ldr_literal_target(&out.bytes, 0) as u32;
+        assert!(
+            out.relocs
+                .iter()
+                .any(|r| r.at == addr && r.symbol == 7 && r.kind == RelocKind::Abs32),
+            "the relocation is replicated onto the islanded copy the load reads"
+        );
+    }
+
+    #[test]
+    fn islanding_and_branch_relaxation_reach_a_joint_fixpoint() {
+        let mut enc = Encoder::new();
+        let pool = enc.new_label();
+        let target = enc.new_label();
+        enc.ldr_literal(Reg::R0, pool).unwrap();
+        enc.b_cond(Cond::Eq, target);
+        for _ in 0..600 {
+            enc.nop();
+        }
+        enc.bind_label(target);
+        enc.align_to_word();
+        enc.pool_word(pool, 0x1234_5678);
+        let out = enc
+            .finish()
+            .expect("the branch relaxes and the literal islands together");
+        let addr = ldr_literal_target(&out.bytes, 0);
+        assert_eq!(
+            &out.bytes[addr..addr + 4],
+            &0x1234_5678u32.to_le_bytes(),
+            "the load still resolves to its constant after both grew the image"
+        );
     }
 
     #[test]

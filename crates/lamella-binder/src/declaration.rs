@@ -139,12 +139,12 @@ fn qualified_type_name(namespace: &str, name: &str) -> alloc::string::String {
     }
 }
 
-/// A `const` field's folded value (14.15). Its initializer is a constant expression with no
-/// name references (a field constant does not see other members here), so it folds through the
-/// shared evaluator with an empty lookup. `None` when it is not a constant expression, so the
-/// field stays a runtime field at the use site.
-fn const_field_literal(expr: &Expr) -> Option<Literal> {
-    fold_const(expr, &|_| None)
+/// A `const` field's folded value (14.15): its constant-expression initializer, with a reference
+/// to a `prior` const field (declared earlier in the same type) resolved to that field's value --
+/// so `const B = A;` and `const C = A + 1;` fold, not just literal arithmetic. `None` when it is
+/// not a compile-time constant, so the field stays a runtime field at the use site.
+fn const_field_literal(expr: &Expr, prior: &BTreeMap<Box<str>, Literal>) -> Option<Literal> {
+    fold_const(expr, &|name| prior.get(name).cloned())
 }
 
 /// An enum member's underlying value (21.4): its initializer folded as a constant expression,
@@ -279,6 +279,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             accessibility_of(modifiers)
         }
     };
+    let mut prior_consts: BTreeMap<Box<str>, Literal> = BTreeMap::new();
     for member in &declaration.members {
         match member {
             Member::Field {
@@ -293,10 +294,16 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let accessibility = access(modifiers);
                 for declarator in declarators {
                     let constant = if is_const {
-                        declarator.initializer.as_ref().and_then(const_field_literal)
+                        declarator
+                            .initializer
+                            .as_ref()
+                            .and_then(|init| const_field_literal(init, &prior_consts))
                     } else {
                         None
                     };
+                    if let Some(literal) = &constant {
+                        prior_consts.insert(declarator.name.clone(), literal.clone());
+                    }
                     info.fields.push(FieldSymbol {
                         name: declarator.name.clone(),
                         ty: field_ty.clone(),
@@ -447,29 +454,42 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 modifiers,
                 parameters,
                 ..
-            } if !is_static(modifiers) => info.constructors.push(constructor(parameters)),
+            } if !is_static(modifiers) => {
+                info.constructors
+                    .push(constructor(parameters, access(modifiers)))
+            }
             _ => {}
         }
     }
     let has_parameterless = info.constructors.iter().any(|c| c.parameters.is_empty());
     match info.kind {
-        TypeKind::Struct if !has_parameterless => info.constructors.push(constructor(&[])),
-        TypeKind::Class if info.constructors.is_empty() => info.constructors.push(constructor(&[])),
+        TypeKind::Struct if !has_parameterless => {
+            info.constructors.push(constructor(&[], Accessibility::Public))
+        }
+        TypeKind::Class
+            if info.constructors.is_empty()
+                && !declaration.modifiers.contains(&Modifier::Static) =>
+        {
+            info.constructors.push(constructor(&[], Accessibility::Public))
+        }
         _ => {}
     }
     info
 }
 
-/// A constructor symbol from its parameters. The return type is unused (a `new`
-/// expression takes the created type), so it is left as `void`.
-fn constructor(parameters: &[lamella_syntax::ast::Parameter]) -> MethodSymbol {
+/// A constructor symbol from its parameters and declared accessibility. The return type is
+/// unused (a `new` expression takes the created type), so it is left as `void`.
+fn constructor(
+    parameters: &[lamella_syntax::ast::Parameter],
+    accessibility: Accessibility,
+) -> MethodSymbol {
     MethodSymbol {
         name: ".ctor".into(),
         return_type: TypeSymbol::Special(SpecialType::Void),
         parameters: parameters.iter().map(parameter_symbol).collect(),
         is_static: false,
         is_params: has_params_array(parameters),
-        accessibility: Accessibility::Public,
+        accessibility,
         conditional: Vec::new(),
     }
 }

@@ -609,8 +609,15 @@ fn layout_descriptors(
             .and_then(|b| map.get(&b).copied())
             .unwrap_or(0) as u32;
         let mut blob = Vec::with_capacity((vtable.len() + 3 + itable.len() * 2) * 4);
-        for &func_index in vtable.iter().rev() {
-            blob.extend_from_slice(&func_index.to_le_bytes());
+        for slot in vtable.iter().rev() {
+            let index = match slot {
+                crate::resolver::VtableEntry::Func(index) => *index,
+                crate::resolver::VtableEntry::Extern(_) => {
+                    debug_assert!(false, "extern vtable slot on the wasm path");
+                    0
+                }
+            };
+            blob.extend_from_slice(&index.to_le_bytes());
         }
         blob.extend_from_slice(&handle.to_le_bytes());
         blob.extend_from_slice(&base_ptr.to_le_bytes());
@@ -2508,7 +2515,7 @@ mod tests {
         let descriptors = alloc::vec![TypeMeta {
             handle: lamella_ir::TypeHandle(1),
             type_tag: 0,
-            vtable: alloc::vec![1],
+            vtable: alloc::vec![crate::resolver::VtableEntry::Func(1)],
             itable: Vec::new(),
             base: None,
         }];
@@ -2708,7 +2715,7 @@ mod tests {
         let descriptors = alloc::vec![TypeMeta {
             handle: lamella_ir::TypeHandle(1),
             type_tag: 0,
-            vtable: alloc::vec![1],
+            vtable: alloc::vec![crate::resolver::VtableEntry::Func(1)],
             itable: Vec::new(),
             base: None,
         }];

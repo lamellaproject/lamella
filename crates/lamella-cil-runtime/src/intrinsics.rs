@@ -5209,6 +5209,37 @@ pub fn marshal_write_int64(
     Ok(None)
 }
 
+/// A 32-bit unsigned intrinsic argument. A C# `uint` is an ECMA I4 slot, so it arrives as an
+/// `Int32` (a wider `Int64`/`IntPtr` slot is also accepted); its bit pattern is the address/value.
+fn mmio_u32(args: &[Value], index: usize) -> u32 {
+    match args.get(index) {
+        Some(&Value::Int32(value)) => value as u32,
+        Some(&Value::Int64(value)) => value as u32,
+        _ => 0,
+    }
+}
+
+/// `Lamella.Hardware.Mmio.Write32(uint address, uint value)`: a VOLATILE 32-bit store to a
+/// memory-mapped hardware register -- the register-access seam a C# peripheral driver (e.g.
+/// `System.Device.Gpio`) crosses. The core stays unsafe-free: [`Vm::mmio_write`] routes to the
+/// embedder's volatile-store seam on a device, or the host simulated register file for testing.
+///
+/// # Errors
+/// Never errors.
+pub fn mmio_write32(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    vm.mmio_write(mmio_u32(args, 0), mmio_u32(args, 1));
+    Ok(None)
+}
+
+/// `Lamella.Hardware.Mmio.Read32(uint address) -> uint`: a VOLATILE 32-bit load from a
+/// memory-mapped hardware register (the read counterpart of [`mmio_write32`]).
+///
+/// # Errors
+/// Never errors.
+pub fn mmio_read32(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(vm.mmio_read(mmio_u32(args, 0)) as i32)))
+}
+
 /// `Marshal.SizeOf(Type)`: the unmanaged size in bytes of a primitive type (`int` -> 4, `long` -> 8,
 /// ...). 0 for a type whose unmanaged size is not modeled here.
 ///

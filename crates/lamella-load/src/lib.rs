@@ -53,6 +53,7 @@ use lamella_cil_runtime::intrinsics::{
     marshal_read_int32, marshal_read_int64, marshal_write_byte, marshal_write_int16,
     marshal_write_int32, marshal_write_int64, marshal_size_of,
     intptr_from_raw_value, intptr_to_raw_value,
+    mmio_read32, mmio_write32,
 };
 #[cfg(feature = "gc")]
 use lamella_cil_runtime::intrinsics::{gc_collect, weak_make_cell, weak_read_cell, weak_write_cell};
@@ -764,6 +765,109 @@ pub fn load_with_corlib<'c, 'p>(
     );
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     module.freeze();
+    Ok(Program { module, entry })
+}
+
+/// Like [`load_with_corlib`] but loads an extra LIBRARY assembly (e.g. `System.Device.Gpio`)
+/// between corlib and the program: corlib -> asm 0, library -> asm 1, program -> asm 2. The
+/// program's cross-assembly references to the library -- a `newobj` of a library type, a virtual
+/// call into a library base a program type overrides, a static call -- resolve by name through the
+/// shared indices, exactly as a two-assembly load resolves a program's references to corlib. This
+/// is the deploy shape for a driver stack: the corlib, one (or more) device-API assemblies, and
+/// the app.
+///
+/// # Errors
+/// [`LoadError::NoEntryPoint`] if the program names no entry point;
+/// [`LoadError::EntryHasNoBody`] if the entry-point token has no loadable body.
+pub fn load_with_corlib_and_library<'c, 'l, 'p>(
+    corlib: &SourceAssembly<'c>,
+    library: &SourceAssembly<'l>,
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LoadError> {
+    if program.image().entry_point_token() == 0 {
+        return Err(LoadError::NoEntryPoint);
+    }
+    let mut module = Module::new();
+    let mut index = NameIndex::new();
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    load_assembly(
+        &mut module,
+        corlib,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    load_assembly(
+        &mut module,
+        library,
+        1,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    let entry = load_assembly(
+        &mut module,
+        program,
+        2,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
+    module.freeze();
+    Ok(Program { module, entry })
+}
+
+/// [`load_with_corlib_and_library`] WITHOUT the final freeze -- for baking (`write_baked`), which
+/// needs the unfrozen module. See [`load_unfrozen`].
+///
+/// # Errors
+/// As [`load_with_corlib_and_library`].
+pub fn load_with_corlib_and_library_unfrozen<'c, 'l, 'p>(
+    corlib: &SourceAssembly<'c>,
+    library: &SourceAssembly<'l>,
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LoadError> {
+    if program.image().entry_point_token() == 0 {
+        return Err(LoadError::NoEntryPoint);
+    }
+    let mut module = Module::new();
+    let mut index = NameIndex::new();
+    let mut type_index = TypeNameIndex::new();
+    let mut field_index = FieldNameIndex::new();
+    load_assembly(
+        &mut module,
+        corlib,
+        0,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    load_assembly(
+        &mut module,
+        library,
+        1,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    let entry = load_assembly(
+        &mut module,
+        program,
+        2,
+        &mut index,
+        &mut type_index,
+        &mut field_index,
+        true,
+    );
+    let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     Ok(Program { module, entry })
 }
 
@@ -1634,6 +1738,13 @@ fn bcl_intrinsic(
             "__WriteInt32" => return Some(marshal_write_int32),
             "__WriteInt64" => return Some(marshal_write_int64),
             "SizeOf" => return Some(marshal_size_of),
+            _ => {}
+        }
+    }
+    if namespace == "Lamella.Hardware" && type_name == "Mmio" {
+        match method {
+            "Read32" => return Some(mmio_read32),
+            "Write32" => return Some(mmio_write32),
             _ => {}
         }
     }
@@ -2564,8 +2675,8 @@ fn enum_underlying_element_type(assembly: &Assembly, reflection_name: &str) -> u
 /// Splits an attribute blob's reflection type name into `(namespace, name)` for resolution: a
 /// `typeof(X)` / enum argument serializes the type's reflection name (e.g. `"Color"`,
 /// `"Foo.Bar"`). The namespace is everything before the LAST `.`; a name with no `.` is in the
-/// global namespace. (Assembly-qualified names and nested-type `+` separators are not produced by
-/// the reflection corpus and are left to a follow-on.)
+/// global namespace. (Assembly-qualified names and nested-type `+` separators are not
+/// recognized.)
 fn split_reflection_name(reflection_name: &str) -> (&str, &str) {
     match reflection_name.rfind('.') {
         Some(dot) => (&reflection_name[..dot], &reflection_name[dot + 1..]),
@@ -2577,7 +2688,7 @@ fn split_reflection_name(reflection_name: &str) -> (&str, &str) {
 /// stores: an integer at its width, a string's UTF-16 units, a resolved `Type` handle for a
 /// `typeof(X)` argument (the asm-folded `TypeDef` token of a same-assembly `X`, which is exactly
 /// the handle `typeof(X)` pushes at runtime; `0` for a type this assembly does not define -- a
-/// cross-assembly `typeof`, a follow-on), or null. The interpreter turns these into runtime
+/// cross-assembly `typeof`), or null. The interpreter turns these into runtime
 /// values when it instantiates the attribute.
 fn attr_arg_to_value(argument: &AttrArg, assembly: &Assembly, asm: u8) -> AttrValue {
     match argument {

@@ -9,23 +9,33 @@ description = "The wireline debug + REPL RUNNER core, shared by the host referen
 
 [dependencies]
 lamella-wire = { path = "../lamella-wire" }
-lamella-cil-runtime = { path = "../lamella-cil-runtime" }
-# The interpreter + loader the runner runs the corlib on. The runner is the DEVICE crate, so it controls
-# the constrained-profile knobs: it pulls the BCL surface features it needs but lets `debug-names` be
-# dropped (--no-default-features) for a non-debug device build (saves ~300 KB of resident Strings).
-lamella-load = { path = "../lamella-load", default-features = false, features = [
-    "NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs",
-] }
+# The runner is the DEVICE crate, so it controls the BCL surface as a profile knob (below): the
+# interpreter + loader take NO surface by default here -- a profile feature forwards exactly the
+# tier the target needs, so a 16 KB part links the kernel floor and a roomy part the full NETMF set.
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+lamella-load = { path = "../lamella-load", default-features = false }
 lamella-metadata = { path = "../lamella-metadata" }
+# The volatile MMIO primitive the interpreter's Lamella.Hardware.Mmio seam installs on device (so
+# a C# GPIO/peripheral driver reaches real registers). Unused on the host (which uses the sim).
+lamella-mmio = { path = "../lamella-mmio" }
 
 [dev-dependencies]
-# The run-with-corlib triage example names raw metadata tokens.
 lamella-token = { path = "../lamella-token" }
 
 [features]
 # Source-level debugger names (forwarded to the loader). Default on; a constrained device build drops it.
-default = ["debug-names"]
+default = ["profile-full", "debug-names"]
 debug-names = ["lamella-load/debug-names"]
+# The BCL surface tier (pick ONE). profile-full = the desktop / roomy-device NETMF surface (the host
+# reference runner + the SAME54/L476 serve firmwares). profile-minimal = the kernel-tier floor
+# (intrinsic BCL + exceptions + GC, no float / math / finalizers / varargs) for the tightest parts
+# (micro:bit v1, 256 KB flash) so the interpreter leaves room for a deployed image.
+profile-full = [
+    "lamella-load/NETMFv4_4", "lamella-load/exceptions", "lamella-load/float", "lamella-load/gc",
+    "lamella-load/finalizers", "lamella-load/math-transcendental", "lamella-load/typed-references",
+    "lamella-load/varargs",
+]
+profile-minimal = ["lamella-load/bcl", "lamella-load/exceptions", "lamella-load/gc"]
 # RUN_IMAGE support: boot + run a baked flash image (Module::from_baked) as the runner's execution
 # path -- the PE-less constrained-target story. Forwards the loader's code-in-place (XIP) knob, which
 # pins the load API to Assembly<'static>; run_program then leaks its per-call inputs, matching the

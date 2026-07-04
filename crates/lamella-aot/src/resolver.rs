@@ -21,6 +21,12 @@ use crate::cil::{
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
 pub struct MetadataResolver<'a> {
     assembly: &'a Assembly<'a>,
+    /// The REFERENCED assembly (corlib) for cross-assembly vtable-slot agreement: with it, a type
+    /// extending a referenced base numbers its slots INCLUDING the base's inherited virtuals (as the
+    /// referenced assembly itself numbers them), and a `callvirt` on a `MemberRef` resolves to that
+    /// shared slot. Without it, numbering stays this-assembly-relative (self-consistent, but a
+    /// referenced type's virtual dispatched on a this-assembly object static-devirtualizes).
+    reference: Option<&'a Assembly<'a>>,
     /// For module lowering: each callee's `MethodDef` rid paired with its function index in
     /// the module. Empty for single-method lowering, where a call keeps its rid (a one-
     /// function lowering does not dispatch internal calls anyway).
@@ -33,8 +39,18 @@ impl<'a> MetadataResolver<'a> {
     pub fn new(assembly: &'a Assembly<'a>) -> MetadataResolver<'a> {
         MetadataResolver {
             assembly,
+            reference: None,
             rid_to_index: Vec::new(),
         }
+    }
+
+    /// Attaches the referenced assembly (corlib), enabling cross-assembly slot numbering: inherited
+    /// referenced-base virtuals occupy their referenced-assembly slots (filled with extern entries a
+    /// library object exports), and `virtual_slot` resolves a `MemberRef` against that numbering.
+    #[must_use]
+    pub fn with_reference(mut self, reference: &'a Assembly<'a>) -> MetadataResolver<'a> {
+        self.reference = Some(reference);
+        self
     }
 
     /// Wraps an assembly to resolve calls among the methods of a module: `method_rids` are
@@ -49,6 +65,7 @@ impl<'a> MetadataResolver<'a> {
             .collect();
         MetadataResolver {
             assembly,
+            reference: None,
             rid_to_index,
         }
     }
@@ -148,30 +165,28 @@ impl<'a> MetadataResolver<'a> {
         false
     }
 
-    /// The vtable of a type, slot by slot: each entry is `(name, parameter types, the MethodDef rid of
-    /// the most-derived implementation)`. Built ECMA-335 / `lamella-load::build_vtables`-style so the
-    /// AOT and interpreter agree on slots: walk this-module bases root-first, inheriting their slots; a
-    /// virtual whose `newslot` flag (II.23.1.10) is clear and whose NAME + PARAMETER TYPES match an
-    /// inherited slot REPLACES it (an override), otherwise it APPENDS in MethodDef order. The base walk
-    /// is bounded against a malformed cyclic `extends`. (BCL base virtuals are not slotted -- the
-    /// resolver is single-assembly -- so numbering is user-hierarchy-relative, which native dispatch is
-    /// self-consistent with; matching the interpreter's absolute numbering is the mixed-mode bridge.)
-    fn vtable_methods(&self, type_def: TypeDef<'a>) -> Vec<(Option<&'a str>, Vec<SigType>, u32)> {
-        let mut chain = Vec::new();
-        let mut current = Some(type_def);
-        for _ in 0..64 {
-            let Some(td) = current else {
-                break;
-            };
-            chain.push(td);
-            let base = td.extends();
-            current = if base.table() == table::TYPE_DEF && base.row() != 0 {
-                self.assembly.type_def(base.row())
-            } else {
-                None
-            };
+    /// The vtable of a type, slot by slot. Built ECMA-335 / `lamella-load::build_vtables`-style so the
+    /// AOT and interpreter agree on slots: walk the bases root-first, inheriting their slots; a virtual
+    /// whose `newslot` flag (II.23.1.10) is clear and whose NAME + PARAMETER IDENTITY match an inherited
+    /// slot REPLACES it (an override), otherwise it APPENDS in MethodDef order. With a
+    /// [`with_reference`](Self::with_reference) assembly attached, a root whose `extends` names a
+    /// referenced type seeds the referenced base chain's virtuals FIRST -- numbered exactly as that
+    /// assembly numbers them itself -- so a program type extending `System.Object` agrees with corlib on
+    /// every inherited slot; an inherited-not-overridden slot's implementation is the referenced method,
+    /// named by its stable extern symbol. Without a reference, numbering stays this-assembly-relative.
+    fn vtable_methods(&self, type_def: TypeDef<'a>) -> Vec<VSlot<'a>> {
+        let chain = assembly_base_chain(self.assembly, type_def);
+        let mut slots: Vec<VSlot<'a>> = Vec::new();
+        if let (Some(reference), Some(root)) = (self.reference, chain.last()) {
+            let base = root.extends();
+            if base.row() != 0 && base.table() != table::TYPE_DEF {
+                if let Some(base_name) = self.assembly.type_token_name(base) {
+                    if let Some(ref_td) = reference.find_type(base_name.namespace, base_name.name) {
+                        slots = reference_vtable_slots(reference, ref_td);
+                    }
+                }
+            }
         }
-        let mut slots: Vec<(Option<&'a str>, Vec<SigType>, u32)> = Vec::new();
         for td in chain.into_iter().rev() {
             for method in td.methods() {
                 if !method.is_virtual() {
@@ -182,42 +197,52 @@ impl<'a> MetadataResolver<'a> {
                     .signature()
                     .map(|sig| sig.parameters)
                     .unwrap_or_default();
+                let key = param_key(self.assembly, &params);
                 let rid = method.rid();
                 let newslot = method.flags() & 0x0100 != 0;
                 if !newslot {
                     if let Some(entry) = slots
                         .iter_mut()
-                        .find(|(n, p, _)| *n == name && *p == params)
+                        .find(|slot| slot.name == name && slot.key == key)
                     {
-                        entry.2 = rid;
+                        entry.impl_ = SlotImpl::Rid(rid);
                         continue;
                     }
                 }
-                slots.push((name, params, rid));
+                slots.push(VSlot {
+                    name,
+                    key,
+                    impl_: SlotImpl::Rid(rid),
+                });
             }
         }
         slots
     }
 
-    /// Every this-module type's vtable as a list of FUNCTION INDICES in slot order -- the backend
-    /// emits this table before the type's TypeDesc so `callvirt` indexes it. Each slot's most-derived
-    /// MethodDef rid is mapped to its module function index; a type whose vtable is empty, or any of
-    /// whose slots is not a module function (e.g. an abstract type, never instantiated), is omitted.
-    /// Keyed by the type's handle (`TypeHandle(token.0)`), matching the handle its `Alloc`/TypeDesc use.
+    /// Every this-module type's vtable in slot order -- the backend emits this table before the type's
+    /// TypeDesc so `callvirt` indexes it. A slot implemented in this module maps to its function index;
+    /// a slot inherited from the [reference](Self::with_reference) assembly and not overridden stays an
+    /// [`VtableEntry::Extern`] the linker resolves against the library object exporting it. A type whose
+    /// vtable is empty, or any of whose local slots is not a module function (e.g. an abstract type,
+    /// never instantiated), is omitted. Keyed by the type's handle (`TypeHandle(token.0)`), matching the
+    /// handle its `Alloc`/TypeDesc use.
     #[must_use]
-    pub fn vtables(&self) -> Vec<(TypeHandle, Vec<u32>)> {
+    pub fn vtables(&self) -> Vec<(TypeHandle, Vec<VtableEntry>)> {
         let mut result = Vec::new();
         for type_def in self.assembly.type_defs() {
             let methods = self.vtable_methods(type_def);
             if methods.is_empty() {
                 continue;
             }
-            let indices: Vec<u32> = methods
+            let entries: Vec<VtableEntry> = methods
                 .iter()
-                .filter_map(|(_, _, rid)| self.function_index(*rid))
+                .filter_map(|slot| match &slot.impl_ {
+                    SlotImpl::Rid(rid) => self.function_index(*rid).map(VtableEntry::Func),
+                    SlotImpl::Extern(symbol) => Some(VtableEntry::Extern(symbol.clone())),
+                })
                 .collect();
-            if indices.len() == methods.len() {
-                result.push((TypeHandle(type_def.token().0), indices));
+            if entries.len() == methods.len() {
+                result.push((TypeHandle(type_def.token().0), entries));
             }
         }
         result
@@ -324,14 +349,17 @@ impl<'a> MetadataResolver<'a> {
                         .map(|sig| sig.parameters)
                         .unwrap_or_default();
                     let tag = interface_method_tag(&iface_name, name, &params);
-                    let Some((_, _, rid)) = impls
+                    let key = param_key(self.assembly, &params);
+                    let Some(slot) = impls
                         .iter()
-                        .find(|(n, p, _)| *n == Some(name) && *p == params)
+                        .find(|slot| slot.name == Some(name) && slot.key == key)
                     else {
                         continue;
                     };
-                    if let Some(func_index) = self.function_index(*rid) {
-                        entries.push((tag, func_index));
+                    if let SlotImpl::Rid(rid) = &slot.impl_ {
+                        if let Some(func_index) = self.function_index(*rid) {
+                            entries.push((tag, func_index));
+                        }
                     }
                 }
             }
@@ -341,6 +369,138 @@ impl<'a> MetadataResolver<'a> {
         }
         result
     }
+}
+
+/// One vtable slot during numbering: the method name, its assembly-independent parameter identity
+/// (the extern-symbol parameter encoding, so signatures from two assemblies compare by NAME), and
+/// where the most-derived implementation lives.
+struct VSlot<'a> {
+    name: Option<&'a str>,
+    key: String,
+    impl_: SlotImpl,
+}
+
+/// Where a vtable slot's most-derived implementation lives: a this-assembly `MethodDef` rid (a
+/// module function), or a referenced-assembly method named by its stable extern symbol.
+enum SlotImpl {
+    Rid(u32),
+    Extern(String),
+}
+
+/// The assembly-independent identity of a parameter list: each parameter's extern-symbol encoding
+/// (a primitive one char, a class/value type its FULL NAME), so a referenced base's signature and a
+/// this-assembly override's compare equal even though their `SigType` tokens index different
+/// metadata tables.
+fn param_key(assembly: &Assembly, params: &[SigType]) -> String {
+    let mut key = String::new();
+    for p in params {
+        encode_type(
+            p,
+            &|token| assembly.type_token_name(token).map(|n| joined_full_name(&n)),
+            &mut key,
+        );
+    }
+    key
+}
+
+/// The `extends` chain of `type_def` WITHIN `assembly`, derived-first (self at index 0), stopping at
+/// a non-TypeDef base (nil for `System.Object`, or a TypeRef into another assembly). Bounded against
+/// a malformed cyclic `extends`.
+fn assembly_base_chain<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>) -> Vec<TypeDef<'x>> {
+    let mut chain = Vec::new();
+    let mut current = Some(type_def);
+    for _ in 0..64 {
+        let Some(td) = current else {
+            break;
+        };
+        chain.push(td);
+        let base = td.extends();
+        current = if base.table() == table::TYPE_DEF && base.row() != 0 {
+            assembly.type_def(base.row())
+        } else {
+            None
+        };
+    }
+    chain
+}
+
+/// `type_def`'s vtable slots numbered ENTIRELY within `assembly` (the referenced corlib) -- the same
+/// root-first newslot/override walk as `vtable_methods` -- each slot's most-derived implementation
+/// named by its stable extern symbol (what the library object exports it as), ready to seed a
+/// derived program type's numbering or to answer a `MemberRef`'s slot.
+fn reference_vtable_slots<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>) -> Vec<VSlot<'x>> {
+    struct Building<'x> {
+        name: Option<&'x str>,
+        key: String,
+        params: Vec<SigType>,
+        owner_namespace: String,
+        owner_name: String,
+    }
+    let mut slots: Vec<Building<'x>> = Vec::new();
+    for td in assembly_base_chain(assembly, type_def).into_iter().rev() {
+        let owner = assembly.type_token_name(td.token());
+        let owner_namespace: String = owner.as_ref().map(|n| n.namespace.into()).unwrap_or_default();
+        let owner_name: String = owner.as_ref().map(|n| n.name.into()).unwrap_or_default();
+        for method in td.methods() {
+            if !method.is_virtual() {
+                continue;
+            }
+            let name = method.name();
+            let params = method
+                .signature()
+                .map(|sig| sig.parameters)
+                .unwrap_or_default();
+            let key = param_key(assembly, &params);
+            let newslot = method.flags() & 0x0100 != 0;
+            if !newslot {
+                if let Some(entry) = slots
+                    .iter_mut()
+                    .find(|slot| slot.name == name && slot.key == key)
+                {
+                    entry.params = params;
+                    entry.owner_namespace = owner_namespace.clone();
+                    entry.owner_name = owner_name.clone();
+                    continue;
+                }
+            }
+            slots.push(Building {
+                name,
+                key,
+                params,
+                owner_namespace: owner_namespace.clone(),
+                owner_name: owner_name.clone(),
+            });
+        }
+    }
+    slots
+        .into_iter()
+        .map(|building| {
+            let symbol = extern_method_symbol(
+                &building.owner_namespace,
+                &building.owner_name,
+                building.name.unwrap_or(""),
+                &building.params,
+                &|token| assembly.type_token_name(token).map(|n| joined_full_name(&n)),
+            );
+            VSlot {
+                name: building.name,
+                key: building.key,
+                impl_: SlotImpl::Extern(symbol),
+            }
+        })
+        .collect()
+}
+
+/// A vtable slot's emitted form: a module FUNCTION INDEX (this-assembly implementation), or the
+/// stable extern symbol of a referenced-assembly implementation the linker resolves cross-object
+/// (an inherited, not-overridden base virtual -- e.g. `System.Object.ToString.` for a program type
+/// that never overrides `ToString`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VtableEntry {
+    /// A module function index (the this-assembly implementation).
+    Func(u32),
+    /// A referenced-assembly implementation, by its stable extern symbol.
+    Extern(String),
 }
 
 /// Per-type emission metadata the backend's GC module path consumes: the type's identity tag (appended
@@ -353,8 +513,9 @@ pub struct TypeMeta {
     pub handle: TypeHandle,
     /// The FNV identity tag, appended to the TypeDesc.
     pub type_tag: u32,
-    /// Virtual-method function indices in slot order (empty if the type has no virtuals).
-    pub vtable: Vec<u32>,
+    /// Virtual-method slots in order (empty if the type has no virtuals): a module function index,
+    /// or the extern symbol of an inherited referenced-assembly implementation.
+    pub vtable: Vec<VtableEntry>,
     /// Interface dispatch entries -- `(interface_method_tag, implementation function index)`.
     pub itable: Vec<(u32, u32)>,
     /// The immediate in-program base type's handle, or `None` at the chain's end (a BCL base or
@@ -911,21 +1072,37 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        if token.table() != table::METHOD_DEF {
-            return None;
+        match token.table() {
+            table::METHOD_DEF => {
+                let type_token = self.type_token_of(*token)?;
+                if type_token.table() != table::TYPE_DEF {
+                    return None;
+                }
+                let type_def = self.assembly.type_def(type_token.row())?;
+                if type_def.is_interface() {
+                    return None;
+                }
+                let rid = token.row();
+                self.vtable_methods(type_def)
+                    .iter()
+                    .position(|slot| matches!(&slot.impl_, SlotImpl::Rid(r) if *r == rid))
+            }
+            table::MEMBER_REF => {
+                let reference = self.reference?;
+                let method = self.assembly.resolve_method(*token)?;
+                let declaring = method.declaring_type.as_ref()?;
+                let ref_td = reference.find_type(declaring.namespace, declaring.name)?;
+                if ref_td.is_interface() {
+                    return None;
+                }
+                let signature = method.signature.as_ref()?;
+                let key = param_key(self.assembly, &signature.parameters);
+                reference_vtable_slots(reference, ref_td)
+                    .iter()
+                    .position(|slot| slot.name == method.name && slot.key == key)
+            }
+            _ => None,
         }
-        let type_token = self.type_token_of(*token)?;
-        if type_token.table() != table::TYPE_DEF {
-            return None;
-        }
-        let type_def = self.assembly.type_def(type_token.row())?;
-        if type_def.is_interface() {
-            return None;
-        }
-        let rid = token.row();
-        self.vtable_methods(type_def)
-            .iter()
-            .position(|(_, _, method_rid)| *method_rid == rid)
     }
 
     fn interface_call_tag(&self, operand: &Operand) -> Option<u32> {

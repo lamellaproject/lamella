@@ -1,0 +1,18 @@
+[package]
+name = "lamella-cmsis-dap-stm32"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "STMicroelectronics STM32 flash programming over a Lamella CMSIS-DAP debug probe: the device-specific flash controller (STM32F4 embedded flash) layered on the chip-agnostic lamella-cmsis-dap, the same way lamella-cmsis-dap-sam adds the SAM controllers."
+
+[lints]
+workspace = true
+
+[dependencies]
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+
+[dev-dependencies]
+# Examples open a real probe over the native USB-HID transport (e.g. an MCU-Link Pro or Atmel-ICE).
+lamella-usbhid = { path = "../lamella-usbhid" }

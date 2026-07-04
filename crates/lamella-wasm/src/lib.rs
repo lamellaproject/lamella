@@ -3,6 +3,8 @@
 pub mod abi;
 #[cfg(feature = "aot")]
 pub mod aot;
+#[cfg(feature = "bake")]
+pub mod bake;
 #[cfg(feature = "compile")]
 pub mod compile;
 #[cfg(feature = "dap")]
@@ -47,6 +49,10 @@ pub struct RunResult {
 /// input: malformed bytes become a diagnostic.
 #[must_use]
 pub fn run_bytes(assembly_bytes: &[u8]) -> RunResult {
+    abi::with_static(assembly_bytes, run_static)
+}
+
+fn run_static(assembly_bytes: &'static [u8]) -> RunResult {
     let assembly = match lamella_metadata::Assembly::read(assembly_bytes) {
         Ok(assembly) => assembly,
         Err(error) => return failure("LAMELLA-PARSE", format!("{error:?}")),

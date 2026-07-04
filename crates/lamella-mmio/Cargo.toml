@@ -1,0 +1,13 @@
+[package]
+name = "lamella-mmio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The volatile MMIO primitive (write_volatile/read_volatile) the interpreter's Mmio seam installs on device."
+
+[dependencies]
+
+[lints]
+workspace = true

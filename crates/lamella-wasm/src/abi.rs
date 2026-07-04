@@ -81,6 +81,20 @@ pub(crate) fn result_buffer(bytes: Vec<u8>) -> *mut u8 {
     Box::into_raw(buffer.into_boxed_slice()) as *mut u8
 }
 
+/// Runs `f` over `bytes` staged in a leaked `'static` buffer, then reclaims the buffer. The loader's
+/// `code-in-place` seam pins loads to `Assembly<'static>` even though a run/bake confines the borrow
+/// to `f` (which returns an OWNED value) -- this bridges a caller's borrowed bytes to that
+/// requirement without a permanent per-call leak. `pub(crate)`: its callers here return an owned
+/// `RunResult`/`Vec`, so nothing borrows the staged buffer past `f`.
+pub(crate) fn with_static<T>(bytes: &[u8], f: impl FnOnce(&'static [u8]) -> T) -> T {
+    let staged: &'static [u8] = Box::leak(bytes.to_vec().into_boxed_slice());
+    let result = f(staged);
+    unsafe {
+        drop(Box::from_raw(core::ptr::from_ref::<[u8]>(staged).cast_mut()));
+    }
+    result
+}
+
 /// Whether the runtime is ready -- always true once the module is instantiated.
 #[unsafe(no_mangle)]
 pub extern "C" fn lamella_is_ready() -> i32 {

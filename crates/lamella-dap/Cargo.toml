@@ -71,7 +71,6 @@ path = "src/bin/lamella-dap-wire.rs"
 required-features = ["wireline-device"]
 
 [dev-dependencies]
-# The source-mapping integration test compiles a fixture (with a Portable PDB) in-memory.
 lamella-assemble = { path = "../lamella-assemble" }
 
 [lints]

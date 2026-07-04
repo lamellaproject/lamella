@@ -810,6 +810,9 @@ pub enum Member {
         getter: Option<Accessor>,
         /// The `set` accessor, if present.
         setter: Option<Accessor>,
+        /// The member's attribute sections (e.g. `[IndexerName("Chars")]`, which renames the
+        /// accessors to `get_Chars`/`set_Chars`).
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -871,6 +874,7 @@ impl Member {
             Member::Field { attributes: slot, .. }
             | Member::Method { attributes: slot, .. }
             | Member::Property { attributes: slot, .. }
+            | Member::Indexer { attributes: slot, .. }
             | Member::EventField { attributes: slot, .. }
             | Member::Event { attributes: slot, .. } => *slot = attributes,
             _ => {}

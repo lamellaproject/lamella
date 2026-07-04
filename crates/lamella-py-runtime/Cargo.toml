@@ -20,10 +20,6 @@ lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 lamella-unicode = { path = "../lamella-unicode", default-features = false }
 
 [dev-dependencies]
-# The front end (lexer/parser/compiler), used ONLY by the `interp-run` example to turn
-# a corpus `.py` into bytecode the interpreter then executes -- the interpreter lane of
-# the Python differential harness. Not a runtime dependency: the interpreter consumes
-# bytecode, never source. No dependency cycle (the front end does not depend on us).
 lamella-py-frontend = { path = "../lamella-py-frontend" }
 
 [lints]

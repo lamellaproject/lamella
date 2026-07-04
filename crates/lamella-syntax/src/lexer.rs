@@ -47,8 +47,13 @@ pub enum Normalization {
 /// Roslyn/csc oracle) and the csc typed-reference operators are off (they are not in
 /// ECMA-334). The two knobs move independently of the oracle -- `normalization` toward
 /// the spec, `typedref` toward csc -- because each closes a different gap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LexOptions {
+    /// Preprocessor symbols defined before scanning (9.5.3) -- csc's `/define:A;B`. `#if` sees
+    /// them (so a capability profile gates source with `#if NETMFv4_4` etc.), and an in-source
+    /// `#undef` can still remove one. Empty by default; the driver fills it from `/define`. (This
+    /// field makes `LexOptions` non-`Copy`, so it threads by move/clone rather than copy.)
+    pub defines: BTreeSet<Box<str>>,
     /// How identifiers are folded for comparison (9.4.2).
     pub normalization: Normalization,
     /// Whether the undocumented csc operators `__makeref`/`__refvalue`/`__reftype` are
@@ -95,6 +100,7 @@ pub fn tokenize(source: &str) -> Tokenized {
 pub fn tokenize_with(source: &str, options: LexOptions) -> Tokenized {
     let mut lexer = Lexer::new(source);
     lexer.options = options;
+    lexer.defined_symbols = lexer.options.defines.clone();
     let mut tokens = Vec::new();
     loop {
         let token = lexer.next_token();
@@ -1723,23 +1729,23 @@ mod tests {
         };
         assert_eq!(significant(tokenize("__makeref")), vec![ident("__makeref")]);
         assert_eq!(
-            significant(tokenize_with("__makeref", typedref)),
+            significant(tokenize_with("__makeref", typedref.clone())),
             vec![TokenKind::TypedRefKeyword(TypedRefKeyword::MakeRef)]
         );
         assert_eq!(
-            significant(tokenize_with("__refvalue", typedref)),
+            significant(tokenize_with("__refvalue", typedref.clone())),
             vec![TokenKind::TypedRefKeyword(TypedRefKeyword::RefValue)]
         );
         assert_eq!(
-            significant(tokenize_with("__reftype", typedref)),
+            significant(tokenize_with("__reftype", typedref.clone())),
             vec![TokenKind::TypedRefKeyword(TypedRefKeyword::RefType)]
         );
         assert_eq!(
-            significant(tokenize_with("__make", typedref)),
+            significant(tokenize_with("__make", typedref.clone())),
             vec![ident("__make")]
         );
         assert_eq!(
-            significant(tokenize_with("@__makeref", typedref)),
+            significant(tokenize_with("@__makeref", typedref.clone())),
             vec![ident("__makeref")]
         );
     }

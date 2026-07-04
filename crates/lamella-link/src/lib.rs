@@ -205,8 +205,10 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
 
     let mut relocations: Vec<ParsedRelocation> = Vec::new();
     for r in &obj.relocations {
-        let Some(&(old_start, _, new_start)) =
-            ranges.iter().find(|(a, b, _)| r.offset >= *a && r.offset < *b)
+        let Some(&(old_start, _, new_start)) = ranges
+            .iter()
+            .filter(|(a, b, _)| r.offset >= *a && r.offset < *b)
+            .min_by_key(|(a, b, _)| b - a)
         else {
             continue;
         };
@@ -1061,6 +1063,35 @@ mod tests {
         assert!(defined.contains(&"m"), "a method reached only through a descriptor's reloc is kept");
         assert!(!defined.contains(&"__lamella_typedesc_2"), "an unreached descriptor is dropped");
         assert!(!defined.contains(&"dead"), "a method only an unreached descriptor referenced drops out");
+    }
+
+    #[test]
+    fn gc_sections_remaps_a_reloc_into_the_smallest_covering_span() {
+        let obj = obj_arm(
+            &[0u8; 12],
+            &[
+                func("f0", 1, 4),
+                data("outer", 4, 8),
+                data("__lamella_typedesc_1", 8, 4),
+            ],
+            &[
+                Relocation { offset: 0, symbol: 2, kind: arm::R_ARM_ABS32, addend: 0 },
+                Relocation { offset: 8, symbol: 0, kind: arm::R_ARM_ABS32, addend: 0 },
+            ],
+        );
+        let trimmed = garbage_collect(&[obj], "f0");
+        let desc = trimmed[0]
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_typedesc_1")
+            .expect("the reached descriptor is kept");
+        assert!(
+            trimmed[0].relocations.iter().any(|r| r.offset == (desc.value & !1)),
+            "the descriptor's relocation must land in the descriptor symbol's own copy \
+             (offset {:#x}), got {:?}",
+            desc.value & !1,
+            trimmed[0].relocations.iter().map(|r| r.offset).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -384,6 +384,44 @@ fn lower_with_source(
     let (used_args, local_count) = scan_slots(code);
     let arg_count = used_args.max(arg_types.len());
 
+    let mut mem_elem: Vec<Option<MirType>> = alloc::vec![None; local_count];
+    for inst in code.iter() {
+        if let (Opcode::Ldloca | Opcode::LdlocaS, Operand::Variable(n)) =
+            (inst.opcode, &inst.operand)
+        {
+            if let Some(slot) = mem_elem.get_mut(*n as usize) {
+                *slot = local_types
+                    .get(*n as usize)
+                    .copied()
+                    .filter(|t| is_cell_backable(*t));
+            }
+        }
+    }
+    let cell_types: Vec<MirType> = (0..local_count)
+        .map(|n| match mem_elem[n] {
+            Some(elem) => MirType::ValueType {
+                handle: lamella_ir::TypeHandle(0),
+                size: elem.stack_slot_bytes(),
+            },
+            None => local_types.get(n).copied().unwrap_or(MirType::I32),
+        })
+        .collect();
+    let local_types: &[MirType] = &cell_types;
+
+    let mut mem_arg: Vec<Option<MirType>> = alloc::vec![None; arg_count];
+    for inst in code.iter() {
+        if let (Opcode::Ldarga | Opcode::LdargaS, Operand::Variable(n)) =
+            (inst.opcode, &inst.operand)
+        {
+            if let Some(slot) = mem_arg.get_mut(*n as usize) {
+                *slot = arg_types
+                    .get(*n as usize)
+                    .copied()
+                    .filter(|t| is_cell_backable(*t));
+            }
+        }
+    }
+
     let block_of = |instr: usize| blocks.iter().position(|&(s, e)| instr >= s && instr < e);
     let is_merge = |b: usize| preds.get(b).is_some_and(|p| p.len() > 1);
 
@@ -535,6 +573,7 @@ fn lower_with_source(
             )
         })
         .collect();
+    let mut arg_cells: Vec<Option<ValueId>> = alloc::vec![None; arg_count];
 
     let mut block_params: Vec<Vec<ValueId>> = Vec::with_capacity(blocks.len());
     for (b, handler) in handler_clause.iter().enumerate() {
@@ -657,6 +696,33 @@ fn lower_with_source(
         let mut il_index: Vec<u32> = Vec::new();
         let mut terminator: Option<Terminator> = None;
         let mut last_local_addr: Option<(AddrOf, u32)> = None;
+
+        if b == 0 {
+            for n in 0..arg_count {
+                let Some(elem) = mem_arg[n] else { continue };
+                let cell = new_value(
+                    &mut value_types,
+                    MirType::ValueType {
+                        handle: TypeHandle(0),
+                        size: elem.stack_slot_bytes(),
+                    },
+                );
+                insts.push((cell, Inst::InitStruct));
+                let placeholder = new_value(&mut value_types, MirType::I32);
+                insts.push((
+                    placeholder,
+                    Inst::FieldStore {
+                        base: cell,
+                        offset: 0,
+                        value: args[n],
+                    },
+                ));
+                arg_cells[n] = Some(cell);
+            }
+            while il_index.len() < insts.len() {
+                il_index.push(byte_offsets[start]);
+            }
+        }
 
         for i in start..end {
             let inst = &code[i];
@@ -781,6 +847,8 @@ fn lower_with_source(
                     &mut strings,
                     resolver,
                     &mut last_local_addr,
+                    &mem_elem,
+                    &arg_cells,
                 )?;
             }
             for _ in before..insts.len() {
@@ -942,6 +1010,17 @@ fn new_value(value_types: &mut Vec<MirType>, ty: MirType) -> ValueId {
     id
 }
 
+/// The compile-time integer a stack value holds, if it is defined by a `ConstInt` in this block. Used to
+/// fold a constant `localloc`/`stackalloc` size (csc emits `ldc; conv.u; localloc` for `stackalloc T[n]`
+/// with a constant `n`, and `conv.u`/`conv.i` are no-ops here, so the const IS the operand); a value that
+/// does not trace to a constant is a runtime size, which this SP-relative backend does not lower.
+fn const_value(insts: &[(ValueId, Inst)], value: ValueId) -> Option<i64> {
+    insts.iter().rev().find_map(|(v, inst)| match inst {
+        Inst::ConstInt { value: n, .. } if *v == value => Some(*n),
+        _ => None,
+    })
+}
+
 /// Pushes an integer constant: a new value defined by a `ConstInt`.
 fn push_const(
     value_types: &mut Vec<MirType>,
@@ -970,14 +1049,49 @@ fn binary(
 ) -> Result<(), CilError> {
     let rhs = stack.pop().ok_or(CilError::StackUnderflow)?;
     let lhs = stack.pop().ok_or(CilError::StackUnderflow)?;
-    let ty = value_types
+    let lty = value_types
         .get(lhs.0 as usize)
         .copied()
         .unwrap_or(MirType::I32);
-    let result = new_value(value_types, ty);
+    let rty = value_types
+        .get(rhs.0 as usize)
+        .copied()
+        .unwrap_or(MirType::I32);
+    let is_ptr = |t: MirType| matches!(t, MirType::ManagedPtr | MirType::NativeInt);
+    if is_ptr(lty) || is_ptr(rty) {
+        let li = reinterpret_word(lhs, lty, value_types, insts);
+        let ri = reinterpret_word(rhs, rty, value_types, insts);
+        let result = new_value(value_types, MirType::I32);
+        insts.push((result, Inst::Binary { op, lhs: li, rhs: ri }));
+        stack.push(result);
+        return Ok(());
+    }
+    let result = new_value(value_types, lty);
     insts.push((result, Inst::Binary { op, lhs, rhs }));
     stack.push(result);
     Ok(())
+}
+
+/// Reinterprets a value to a one-word i32 for integer arithmetic: a no-op for an i32, else a `RefToInt`
+/// retype of a pointer/reference (same bits, integer type) so a mixed pointer/int `Binary` is well-formed.
+fn reinterpret_word(
+    value: ValueId,
+    ty: MirType,
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> ValueId {
+    if ty == MirType::I32 {
+        return value;
+    }
+    let out = new_value(value_types, MirType::I32);
+    insts.push((
+        out,
+        Inst::Convert {
+            kind: ConvKind::RefToInt,
+            value,
+        },
+    ));
+    out
 }
 
 /// Lowers a `stind.i{1,2,4}`: `*(addr) = value`, a `width`-byte store (the value is on top of the
@@ -1025,6 +1139,30 @@ fn ldind(
             address,
             width,
             signed,
+        },
+    ));
+    stack.push(result);
+    Ok(())
+}
+
+/// Lowers a `ldind.r{4,8}`: a `width`-byte float load. Mirrors [`ldind`] but the result is a float
+/// (`F32`/`F64`) rather than an integer, so an `f64` rides the r0:r1 pair like an 8-byte integer load
+/// and downstream float ops (`dadd`, `(int)`) see the correct type.
+fn ldind_float(
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    result_type: MirType,
+    width: u32,
+) -> Result<(), CilError> {
+    let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let result = new_value(value_types, result_type);
+    insts.push((
+        result,
+        Inst::Load {
+            address,
+            width,
+            signed: false,
         },
     ));
     stack.push(result);
@@ -1118,6 +1256,18 @@ impl AddrOf {
     }
 }
 
+/// Whether a primitive local of this type is memory-backed as a one-cell value type when its address
+/// is taken: the scalar numeric and native-integer types. A value type already carries its own address
+/// (its slot is the instance), and an object reference / managed pointer / tagged value is a collector
+/// root whose address-taking needs GC-map support, so those are excluded (an address-taken one stays on
+/// the deferred path).
+fn is_cell_backable(ty: MirType) -> bool {
+    matches!(
+        ty,
+        MirType::I32 | MirType::I64 | MirType::NativeInt | MirType::F32 | MirType::F64
+    )
+}
+
 /// Resolves a pending address source to the MIR value it points at, allocating an
 /// uninitialized struct local's zeroed slot on demand: `Point a; a.X = 1;` (definite
 /// assignment, no `initobj`) writes through `&a` before `a` is ever stored, and an in-place
@@ -1163,38 +1313,136 @@ fn apply_value_op(
     strings: &mut Vec<(ValueId, Box<[u8]>)>,
     resolver: &dyn CallResolver,
     last_local_addr: &mut Option<(AddrOf, u32)>,
+    mem_elem: &[Option<MirType>],
+    arg_cells: &[Option<ValueId>],
 ) -> Result<(), CilError> {
     match inst.opcode {
         Opcode::Nop => {}
-        Opcode::Ldarg0 => push_arg(args, stack, 0)?,
-        Opcode::Ldarg1 => push_arg(args, stack, 1)?,
-        Opcode::Ldarg2 => push_arg(args, stack, 2)?,
-        Opcode::Ldarg3 => push_arg(args, stack, 3)?,
+        Opcode::Ldarg0 => read_arg(arg_cells, value_types, args, stack, insts, 0)?,
+        Opcode::Ldarg1 => read_arg(arg_cells, value_types, args, stack, insts, 1)?,
+        Opcode::Ldarg2 => read_arg(arg_cells, value_types, args, stack, insts, 2)?,
+        Opcode::Ldarg3 => read_arg(arg_cells, value_types, args, stack, insts, 3)?,
         Opcode::LdargS | Opcode::Ldarg => {
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            push_arg(args, stack, *n as usize)?;
+            read_arg(arg_cells, value_types, args, stack, insts, *n as usize)?;
         }
-        Opcode::Ldloc0 => push_local(value_types, locals, stack, insts, 0)?,
-        Opcode::Ldloc1 => push_local(value_types, locals, stack, insts, 1)?,
-        Opcode::Ldloc2 => push_local(value_types, locals, stack, insts, 2)?,
-        Opcode::Ldloc3 => push_local(value_types, locals, stack, insts, 3)?,
+        Opcode::StargS | Opcode::Starg => {
+            let Operand::Variable(n) = &inst.operand else {
+                return Err(CilError::BadOperand);
+            };
+            write_arg(arg_cells, value_types, stack, insts, *n as usize)?;
+        }
+        Opcode::Ldloc0 => read_local(
+            mem_elem,
+            value_types,
+            locals,
+            local_types,
+            args,
+            stack,
+            insts,
+            0,
+        )?,
+        Opcode::Ldloc1 => read_local(
+            mem_elem,
+            value_types,
+            locals,
+            local_types,
+            args,
+            stack,
+            insts,
+            1,
+        )?,
+        Opcode::Ldloc2 => read_local(
+            mem_elem,
+            value_types,
+            locals,
+            local_types,
+            args,
+            stack,
+            insts,
+            2,
+        )?,
+        Opcode::Ldloc3 => read_local(
+            mem_elem,
+            value_types,
+            locals,
+            local_types,
+            args,
+            stack,
+            insts,
+            3,
+        )?,
         Opcode::LdlocS | Opcode::Ldloc => {
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            push_local(value_types, locals, stack, insts, *n as usize)?;
+            read_local(
+                mem_elem,
+                value_types,
+                locals,
+                local_types,
+                args,
+                stack,
+                insts,
+                *n as usize,
+            )?;
         }
-        Opcode::Stloc0 => store_local(value_types, locals, stack, insts, 0)?,
-        Opcode::Stloc1 => store_local(value_types, locals, stack, insts, 1)?,
-        Opcode::Stloc2 => store_local(value_types, locals, stack, insts, 2)?,
-        Opcode::Stloc3 => store_local(value_types, locals, stack, insts, 3)?,
+        Opcode::Stloc0 => write_local(
+            mem_elem,
+            value_types,
+            locals,
+            local_types,
+            args,
+            stack,
+            insts,
+            0,
+        )?,
+        Opcode::Stloc1 => write_local(
+            mem_elem,
+            value_types,
+            locals,
+            local_types,
+            args,
+            stack,
+            insts,
+            1,
+        )?,
+        Opcode::Stloc2 => write_local(
+            mem_elem,
+            value_types,
+            locals,
+            local_types,
+            args,
+            stack,
+            insts,
+            2,
+        )?,
+        Opcode::Stloc3 => write_local(
+            mem_elem,
+            value_types,
+            locals,
+            local_types,
+            args,
+            stack,
+            insts,
+            3,
+        )?,
         Opcode::StlocS | Opcode::Stloc => {
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            store_local(value_types, locals, stack, insts, *n as usize)?;
+            write_local(
+                mem_elem,
+                value_types,
+                locals,
+                local_types,
+                args,
+                stack,
+                insts,
+                *n as usize,
+            )?;
         }
         Opcode::Ldnull => {
             let result = new_value(value_types, MirType::ObjectRef);
@@ -1275,6 +1523,36 @@ fn apply_value_op(
                 },
             ));
             stack.push(result);
+        }
+        Opcode::Sizeof => {
+            let size = resolver
+                .value_type_size(&inst.operand)
+                .ok_or(CilError::Unsupported(inst.opcode))?;
+            push_const(value_types, stack, insts, i64::from(size));
+        }
+        Opcode::Localloc => {
+            let size = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let bytes = const_value(insts, size)
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)
+                .ok_or(CilError::Unsupported(Opcode::Localloc))?;
+            let cell = new_value(
+                value_types,
+                MirType::ValueType {
+                    handle: TypeHandle(0),
+                    size: bytes,
+                },
+            );
+            insts.push((cell, Inst::InitStruct));
+            let ptr = new_value(value_types, MirType::ManagedPtr);
+            insts.push((
+                ptr,
+                Inst::FieldAddr {
+                    base: cell,
+                    offset: 0,
+                },
+            ));
+            stack.push(ptr);
         }
         Opcode::LdcR4 => {
             let Operand::Float32(v) = &inst.operand else {
@@ -1378,12 +1656,15 @@ fn apply_value_op(
         Opcode::ConvU8 | Opcode::ConvOvfU8 => widen(value_types, stack, insts, false)?,
         Opcode::ConvI4 | Opcode::ConvU4 | Opcode::ConvOvfI4 | Opcode::ConvOvfU4 => {
             let top = *stack.last().ok_or(CilError::StackUnderflow)?;
-            let float_kind = match value_types.get(top.index()) {
+            let convert = match value_types.get(top.index()) {
                 Some(MirType::F32) => Some(ConvKind::Float32ToInt),
                 Some(MirType::F64) => Some(ConvKind::Float64ToInt),
+                Some(MirType::ManagedPtr | MirType::NativeInt | MirType::ObjectRef) => {
+                    Some(ConvKind::RefToInt)
+                }
                 _ => None,
             };
-            if let Some(kind) = float_kind {
+            if let Some(kind) = convert {
                 let value = stack.pop().ok_or(CilError::StackUnderflow)?;
                 let result = new_value(value_types, MirType::I32);
                 insts.push((result, Inst::Convert { value, kind }));
@@ -1423,12 +1704,16 @@ fn apply_value_op(
         Opcode::StindI2 => stind(value_types, stack, insts, 2)?,
         Opcode::StindI4 => stind(value_types, stack, insts, 4)?,
         Opcode::StindI8 => stind(value_types, stack, insts, 8)?,
+        Opcode::StindR4 => stind(value_types, stack, insts, 4)?,
+        Opcode::StindR8 => stind(value_types, stack, insts, 8)?,
         Opcode::LdindI1 => ldind(value_types, stack, insts, 1, true)?,
         Opcode::LdindU1 => ldind(value_types, stack, insts, 1, false)?,
         Opcode::LdindI2 => ldind(value_types, stack, insts, 2, true)?,
         Opcode::LdindU2 => ldind(value_types, stack, insts, 2, false)?,
         Opcode::LdindI4 | Opcode::LdindU4 => ldind(value_types, stack, insts, 4, false)?,
         Opcode::LdindI8 => ldind(value_types, stack, insts, 8, false)?,
+        Opcode::LdindR4 => ldind_float(value_types, stack, insts, MirType::F32, 4)?,
+        Opcode::LdindR8 => ldind_float(value_types, stack, insts, MirType::F64, 8)?,
         Opcode::Cpblk => {
             let size = stack.pop().ok_or(CilError::StackUnderflow)?;
             let src = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -1673,13 +1958,21 @@ fn apply_value_op(
                 }
                 CallTarget::External(symbol) => {
                     let result = new_value(value_types, info.result_type.unwrap_or(MirType::I32));
-                    insts.push((
-                        result,
-                        Inst::PInvoke {
+                    let slot = (inst.opcode == Opcode::Callvirt)
+                        .then(|| resolver.virtual_slot(&inst.operand))
+                        .flatten();
+                    let call_inst = match slot {
+                        Some(slot) => Inst::CallVirtual {
+                            slot: slot as u32,
+                            args: call_args,
+                            returns_value: info.has_result,
+                        },
+                        None => Inst::PInvoke {
                             import: symbol,
                             args: call_args,
                         },
-                    ));
+                    };
+                    insts.push((result, call_inst));
                     if info.has_result {
                         stack.push(result);
                     }
@@ -1765,13 +2058,47 @@ fn apply_value_op(
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            *last_local_addr = Some((AddrOf::Local(*n as usize), 0));
+            let n = *n as usize;
+            if mem_elem.get(n).copied().flatten().is_some() {
+                let cell = addr_base(
+                    AddrOf::Local(n),
+                    locals,
+                    local_types,
+                    args,
+                    value_types,
+                    insts,
+                )?;
+                let ptr = new_value(value_types, MirType::ManagedPtr);
+                insts.push((
+                    ptr,
+                    Inst::FieldAddr {
+                        base: cell,
+                        offset: 0,
+                    },
+                ));
+                stack.push(ptr);
+            } else {
+                *last_local_addr = Some((AddrOf::Local(n), 0));
+            }
         }
         Opcode::LdargaS | Opcode::Ldarga => {
             let Operand::Variable(n) = &inst.operand else {
                 return Err(CilError::BadOperand);
             };
-            *last_local_addr = Some((AddrOf::Arg(*n as usize), 0));
+            let n = *n as usize;
+            if let Some(cell) = arg_cells.get(n).copied().flatten() {
+                let ptr = new_value(value_types, MirType::ManagedPtr);
+                insts.push((
+                    ptr,
+                    Inst::FieldAddr {
+                        base: cell,
+                        offset: 0,
+                    },
+                ));
+                stack.push(ptr);
+            } else {
+                *last_local_addr = Some((AddrOf::Arg(n), 0));
+            }
         }
         Opcode::Ldflda => {
             let (source, offset) = last_local_addr.take().ok_or(CilError::BadOperand)?;
@@ -2893,6 +3220,10 @@ fn eval_stack_widths(
                 }
                 None => stack.clear(),
             },
+            Opcode::Localloc => {
+                stack.pop();
+                stack.push(false);
+            }
             Opcode::Nop => {}
             _ => stack.clear(),
         }
@@ -3843,6 +4174,62 @@ fn push_arg(args: &[ValueId], stack: &mut Vec<ValueId>, index: usize) -> Result<
     Ok(())
 }
 
+/// Pushes the value of argument `index`. A memory-backed primitive argument (its address is taken, so it
+/// lives in an entry-laid one-cell value type) reads its cell with a `FieldLoad` at offset 0, typed by the
+/// argument's declared type; any other argument pushes its incoming SSA value directly ([`push_arg`]).
+fn read_arg(
+    arg_cells: &[Option<ValueId>],
+    value_types: &mut Vec<MirType>,
+    args: &[ValueId],
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    index: usize,
+) -> Result<(), CilError> {
+    let Some(cell) = arg_cells.get(index).copied().flatten() else {
+        return push_arg(args, stack, index);
+    };
+    let elem = *value_types
+        .get(args[index].index())
+        .ok_or(CilError::BadOperand)?;
+    let result = new_value(value_types, elem);
+    insts.push((
+        result,
+        Inst::FieldLoad {
+            base: cell,
+            offset: 0,
+        },
+    ));
+    stack.push(result);
+    Ok(())
+}
+
+/// Stores the stack top into argument `index` (`starg`). Only a memory-backed argument supports this: it
+/// writes through its cell (a `FieldStore` at offset 0, so the write is visible through any `&arg`-derived
+/// pointer). A plain argument is an SSA value threaded from entry, not a mutable slot, so storing to one is
+/// unsupported.
+fn write_arg(
+    arg_cells: &[Option<ValueId>],
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    index: usize,
+) -> Result<(), CilError> {
+    let Some(cell) = arg_cells.get(index).copied().flatten() else {
+        return Err(CilError::Unsupported(Opcode::Starg));
+    };
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let placeholder = new_value(value_types, MirType::I32);
+    insts.push((
+        placeholder,
+        Inst::FieldStore {
+            base: cell,
+            offset: 0,
+            value,
+        },
+    ));
+    Ok(())
+}
+
 /// Pushes the value in local slot `index`, materializing a zero for a local read
 /// before it is stored (CIL zero-initializes locals).
 fn push_local(
@@ -3893,6 +4280,82 @@ fn store_local(
         value
     };
     *locals.get_mut(index).ok_or(CilError::BadOperand)? = Some(stored);
+    Ok(())
+}
+
+/// Pushes the value of local `index`. A memory-backed primitive local (its address is taken, so it lives
+/// in a one-cell value type) reads its cell with a `FieldLoad` at offset 0 -- the field path already
+/// carries `int`/`long`/`double`, so the load types by the cell's element. Any other local pushes its SSA
+/// value directly ([`push_local`], materializing a zero for a never-written slot).
+#[allow(clippy::too_many_arguments)]
+fn read_local(
+    mem_elem: &[Option<MirType>],
+    value_types: &mut Vec<MirType>,
+    locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
+    args: &[ValueId],
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    index: usize,
+) -> Result<(), CilError> {
+    let Some(elem) = mem_elem.get(index).copied().flatten() else {
+        return push_local(value_types, locals, stack, insts, index);
+    };
+    let cell = addr_base(
+        AddrOf::Local(index),
+        locals,
+        local_types,
+        args,
+        value_types,
+        insts,
+    )?;
+    let result = new_value(value_types, elem);
+    insts.push((
+        result,
+        Inst::FieldLoad {
+            base: cell,
+            offset: 0,
+        },
+    ));
+    stack.push(result);
+    Ok(())
+}
+
+/// Stores the stack top into local `index`. A memory-backed primitive local writes through its cell (a
+/// `FieldStore` at offset 0, so the write is visible through any `&`-derived pointer); any other local
+/// takes the value as its new SSA definition ([`store_local`], copying a value type for value semantics).
+#[allow(clippy::too_many_arguments)]
+fn write_local(
+    mem_elem: &[Option<MirType>],
+    value_types: &mut Vec<MirType>,
+    locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
+    args: &[ValueId],
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    index: usize,
+) -> Result<(), CilError> {
+    if mem_elem.get(index).copied().flatten().is_none() {
+        return store_local(value_types, locals, stack, insts, index);
+    }
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let cell = addr_base(
+        AddrOf::Local(index),
+        locals,
+        local_types,
+        args,
+        value_types,
+        insts,
+    )?;
+    let placeholder = new_value(value_types, MirType::I32);
+    insts.push((
+        placeholder,
+        Inst::FieldStore {
+            base: cell,
+            offset: 0,
+            value,
+        },
+    ));
     Ok(())
 }
 
@@ -5229,6 +5692,255 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn address_taken_primitive_local_is_memory_backed() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcR8, Operand::Float64(42.0)),
+                Instruction::new(Opcode::StlocS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdlocS, Operand::Variable(0)),
+                Instruction::new(Opcode::StlocS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::simple(Opcode::ConvI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[MirType::F64]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::I32));
+        assert!(
+            func.value_types
+                .iter()
+                .any(|t| matches!(t, MirType::ValueType { size: 8, .. }))
+        );
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(i, Inst::InitStruct)));
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldStore { offset: 0, .. }))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldLoad { offset: 0, .. }))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldAddr { offset: 0, .. }))
+        );
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::Convert {
+                kind: ConvKind::RefToInt,
+                ..
+            }
+        )));
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn ldind_r8_loads_a_double() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcR8, Operand::Float64(21.0)),
+                Instruction::new(Opcode::StlocS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::simple(Opcode::LdindR8),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[MirType::F64]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::F64));
+        let load = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(r, i)| match i {
+                Inst::Load { width: 8, .. } => Some(*r),
+                _ => None,
+            })
+            .expect("ldind.r8 lowers to an 8-byte Load");
+        assert_eq!(func.value_types[load.index()], MirType::F64);
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn address_taken_primitive_arg_is_memory_backed() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
+                Instruction::new(Opcode::StargS, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+                Instruction::simple(Opcode::LdindI4),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::I32));
+        assert!(
+            func.value_types
+                .iter()
+                .any(|t| matches!(t, MirType::ValueType { size: 4, .. }))
+        );
+        let arg0 = func.blocks[0].params[0];
+        assert!(
+            func.blocks[0]
+                .insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::InitStruct))
+        );
+        assert!(func.blocks[0].insts.iter().any(
+            |(_, i)| matches!(i, Inst::FieldStore { offset: 0, value, .. } if *value == arg0)
+        ));
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldLoad { offset: 0, .. }))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldAddr { offset: 0, .. }))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::Load { width: 4, .. }))
+        );
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn ldarga_of_a_double_argument_backs_an_f64_cell() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+                Instruction::simple(Opcode::LdindR8),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[MirType::F64], &[]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::F64));
+        assert!(
+            func.value_types
+                .iter()
+                .any(|t| matches!(t, MirType::ValueType { size: 8, .. }))
+        );
+        let arg0 = func.blocks[0].params[0];
+        assert!(func.blocks[0].insts.iter().any(
+            |(_, i)| matches!(i, Inst::FieldStore { offset: 0, value, .. } if *value == arg0)
+        ));
+        let load = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find_map(|(r, i)| match i {
+                Inst::Load { width: 8, .. } => Some(*r),
+                _ => None,
+            })
+            .expect("ldind.r8 lowers to an 8-byte Load");
+        assert_eq!(func.value_types[load.index()], MirType::F64);
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn constant_localloc_lowers_to_a_zeroed_frame_cell() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(16)),
+                Instruction::simple(Opcode::ConvU),
+                Instruction::simple(Opcode::Localloc),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(4)),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::LdindI4),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(&body, &NoCalls, &[], &[]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        assert_eq!(func.ret, Some(MirType::I32));
+        assert!(
+            func.value_types
+                .iter()
+                .any(|t| matches!(t, MirType::ValueType { size: 16, .. }))
+        );
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(i, Inst::InitStruct)));
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldAddr { offset: 0, .. }))
+        );
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::Convert {
+                kind: ConvKind::RefToInt,
+                ..
+            }
+        )));
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn runtime_sized_localloc_is_unsupported() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::ConvU),
+                Instruction::simple(Opcode::Localloc),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let result = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[]);
+        assert!(matches!(
+            result,
+            Err(CilError::Unsupported(Opcode::Localloc))
+        ));
     }
 
     #[test]

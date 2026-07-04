@@ -7,9 +7,8 @@ license.workspace = true
 authors.workspace = true
 description = "A host-PC C# REPL that compiles each line and runs it on the lamella interpreter."
 
-# The REPL driver is a host CLI, so std is allowed here. It writes a temp source
-# file, shells out to csc, then loads and runs the resulting assembly on the
-# interpreter -- the same load-and-run path as lamella-load's run-assembly example.
+# The REPL driver is a host CLI, so std is allowed here: it compiles each submission
+# in-process (lamella-assemble) and runs it on the interpreter.
 [dependencies]
 lamella-assemble = { path = "../lamella-assemble" }
 lamella-load = { path = "../lamella-load" }

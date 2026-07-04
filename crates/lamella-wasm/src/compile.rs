@@ -4,7 +4,7 @@
 
 #![allow(unsafe_code)]
 
-use lamella_assemble::compile_source;
+use lamella_assemble::compile_source_with;
 use lamella_metadata::Assembly;
 
 use crate::abi::result_buffer;
@@ -56,21 +56,32 @@ pub(crate) fn split_refs(refs: &[u8]) -> Vec<&[u8]> {
     out
 }
 
-/// Compiles `source` against `refs`, returning the payload described in the module doc.
+/// Compiles `source` against `refs` in the DEBUG configuration (the default) -- see [`compile_with`].
 fn compile(source: &[u8], refs: &[u8]) -> Vec<u8> {
+    compile_with(source, refs, true)
+}
+
+/// Compiles `source` against `refs`, returning the payload described in the module doc. A DEBUG build
+/// (`debug`) defines the `DEBUG` symbol -- so `[Conditional("DEBUG")]` calls (Debug.WriteLine / Debug.Assert)
+/// are EMITTED, not stripped at compile time (24.4.2) -- and emits a PDB for the debugger. A RELEASE build
+/// (`!debug`) defines neither and emits no PDB: a shippable/embeddable artifact (the download path), not an
+/// interactively debuggable one. The DAP (dap.rs) loads corlib so an emitted Debug.WriteLine surfaces on the
+/// DAP "console" channel.
+fn compile_with(source: &[u8], refs: &[u8], debug: bool) -> Vec<u8> {
     let source = core::str::from_utf8(source).unwrap_or("");
     let blobs = split_refs(refs);
     let assemblies: Vec<Assembly> = blobs
         .iter()
         .filter_map(|blob| Assembly::read(blob).ok())
         .collect();
-    let result = compile_source(
+    let result = compile_source_with(
         source,
         "Program.cs",
         "Program",
         "Program",
         &assemblies,
-        true,
+        debug,
+        lamella_syntax::lexer::LexOptions::default(),
     );
 
     let diagnostics: Vec<serde_json::Value> = result
@@ -126,6 +137,29 @@ pub unsafe extern "C" fn lamella_compile(
         unsafe { core::slice::from_raw_parts(refs_ptr, refs_len) }
     };
     result_buffer(compile(source, refs))
+}
+
+/// Like [`lamella_compile`] but a RELEASE build: `DEBUG` is NOT defined (so `[Conditional("DEBUG")]` calls --
+/// Debug.WriteLine / Debug.Assert -- are stripped, 24.4.2) and no PDB is emitted. For producing a
+/// shippable/embeddable artifact (the eventual download path) rather than an interactively debuggable one.
+/// Same `[u32 len][payload]` shape as `lamella_compile`.
+///
+/// # Safety
+/// Both pointer/length pairs must be buffers the host filled via prior `lamella_alloc` calls.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_compile_release(
+    src_ptr: *const u8,
+    src_len: usize,
+    refs_ptr: *const u8,
+    refs_len: usize,
+) -> *mut u8 {
+    let source = unsafe { core::slice::from_raw_parts(src_ptr, src_len) };
+    let refs: &[u8] = if refs_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(refs_ptr, refs_len) }
+    };
+    result_buffer(compile_with(source, refs, false))
 }
 
 /// Builds completion JSON (`{ items: [{ label, kind, detail }] }`) for the caret at byte
@@ -317,6 +351,18 @@ mod tests {
         assert!(image_len > 0, "expected an emitted image");
         assert_eq!(json["diagnostics"].as_array().unwrap().len(), 0);
         assert!(json["emitError"].is_null());
+    }
+
+    #[test]
+    fn debug_emits_a_pdb_and_release_does_not() {
+        let program = b"class Program { static int Main() { return 0; } }";
+        let pdb_len = |payload: &[u8]| -> u32 {
+            let jl = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+            let il = u32::from_le_bytes(payload[4 + jl..8 + jl].try_into().unwrap()) as usize;
+            u32::from_le_bytes(payload[8 + jl + il..12 + jl + il].try_into().unwrap())
+        };
+        assert!(pdb_len(&compile_with(program, &0u32.to_le_bytes(), true)) > 0, "debug emits a PDB");
+        assert_eq!(pdb_len(&compile_with(program, &0u32.to_le_bytes(), false)), 0, "Release omits the PDB");
     }
 
     #[test]

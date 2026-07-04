@@ -50,6 +50,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             references.push(path.to_owned());
         } else if let Some(path) = strip_option(arg, &["/out:", "-o:", "--out="]) {
             output = Some(path.to_owned());
+        } else if let Some(list) = strip_option(arg, &["/define:", "/d:", "-d:", "--define="]) {
+            for symbol in list.split([';', ',']) {
+                let symbol = symbol.trim();
+                if !symbol.is_empty() {
+                    lex.defines.insert(symbol.into());
+                }
+            }
         } else if matches!(arg.as_str(), "/debug" | "/debug+" | "--debug") {
             emit_debug = true;
         } else if matches!(arg.as_str(), "/debug-" | "/debug:none" | "--no-debug") {
@@ -82,8 +89,9 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     })
 }
 
-const USAGE: &str = "usage: lcsc <source.cs>... [/out:<path>] [/reference:<dll>]... [/debug-] \
-     [/normalize-identifiers] [/typedref] [/native-interop]\n\
+const USAGE: &str = "usage: lcsc <source.cs>... [/out:<path>] [/reference:<dll>]... [/define:A;B]... \
+     [/debug-] [/normalize-identifiers] [/typedref] [/native-interop]\n\
+     /define:A;B seeds preprocessor symbols for #if (9.5.3), like csc's /define (repeatable).\n\
      Several source files compile into one assembly (the PDB is single-source only).\n\
      /normalize-identifiers folds identifiers to NFC per ECMA-334 9.4.2 (off by default, to \
      match csc).\n\
@@ -147,7 +155,7 @@ fn compile(options: &Options) -> Result<bool, String> {
             assembly,
             &references,
             options.emit_debug,
-            options.lex,
+            options.lex.clone(),
         );
         print_diagnostics(source_path, &text, &result.diagnostics);
         return match result.image {
@@ -186,7 +194,7 @@ fn compile(options: &Options) -> Result<bool, String> {
         .zip(&options.sources)
         .map(|(text, path)| (text.as_str(), path.as_str()))
         .collect();
-    let result = compile_sources_with(&sources, module, assembly, &references, options.lex);
+    let result = compile_sources_with(&sources, module, assembly, &references, options.lex.clone());
     let mut any_error = false;
     for ((text, path), diagnostics) in sources.iter().zip(&result.diagnostics) {
         print_diagnostics(path, text, diagnostics);

@@ -1879,6 +1879,12 @@ impl Binder {
         } else if matches!(
             operator,
             UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
+        ) && self.is_enum_type(&operand.ty)
+        {
+            operand.ty.clone()
+        } else if matches!(
+            operator,
+            UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
         ) && self.has_step_operator(
             &operand.ty,
             if operator == UnaryOperator::PreIncrement {
@@ -1895,6 +1901,33 @@ impl Binder {
             self.report_unary(unary_operator_symbol(operator), &operand.ty, span);
             TypeSymbol::Error
         };
+        if operator == UnaryOperator::Minus
+            && self.checked_context
+            && matches!(ty, TypeSymbol::Special(SpecialType::Int32 | SpecialType::Int64))
+            && constant_literal_value(&operand).is_none()
+        {
+            let zero = BoundExpr {
+                kind: BoundExprKind::Literal(Literal::Integer {
+                    value: 0,
+                    suffix: if matches!(ty, TypeSymbol::Special(SpecialType::Int64)) {
+                        IntegerSuffix::Long
+                    } else {
+                        IntegerSuffix::None
+                    },
+                }),
+                ty: ty.clone(),
+            };
+            let operand = self.convert(operand, &ty);
+            return BoundExpr {
+                kind: BoundExprKind::Binary {
+                    operator: BinaryOperator::Subtract,
+                    left: Box::new(zero),
+                    right: Box::new(operand),
+                    checked: true,
+                },
+                ty,
+            };
+        }
         BoundExpr {
             kind: BoundExprKind::Unary {
                 operator,
@@ -1979,6 +2012,7 @@ impl Binder {
         let ty = if operand.ty.is_error() {
             TypeSymbol::Error
         } else if as_special(&operand.ty).is_some_and(SpecialType::is_numeric)
+            || self.is_enum_type(&operand.ty)
             || self.has_step_operator(&operand.ty, step)
         {
             operand.ty.clone()
@@ -2857,6 +2891,7 @@ impl Binder {
                     .type_info_of(&target_ty)
                     .map(|info| info.constructors.clone())
                 {
+                    let constructors = self.accessible_overloads(&target_ty, &constructors);
                     let chosen = if has_method_group {
                         self.resolve_with_method_groups(
                             ".ctor",
@@ -2962,6 +2997,27 @@ impl Binder {
                 receiver: bound_receiver,
             },
             ty: delegate_ty.clone(),
+        }
+    }
+
+    /// Filters overload candidates to those accessible from the current context (7.4): an
+    /// inaccessible member does not participate in overload resolution, so it cannot shadow an
+    /// accessible one. If EVERY candidate is inaccessible, all are returned so the caller still
+    /// reports its normal failure rather than silently finding nothing.
+    fn accessible_overloads(
+        &self,
+        declaring: &TypeSymbol,
+        candidates: &[MethodSymbol],
+    ) -> Vec<MethodSymbol> {
+        let accessible: Vec<MethodSymbol> = candidates
+            .iter()
+            .filter(|candidate| self.is_accessible(declaring, candidate.accessibility))
+            .cloned()
+            .collect();
+        if accessible.is_empty() {
+            candidates.to_vec()
+        } else {
+            accessible
         }
     }
 
@@ -3136,11 +3192,17 @@ impl Binder {
 
     fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
         let lookup = member_lookup_type(ty);
-        if self.type_info_of(&lookup).is_none() {
+        let Some(is_interface) = self
+            .type_info_of(&lookup)
+            .map(|info| info.kind == TypeKind::Interface)
+        else {
             return MemberResolution::Unknown;
-        }
+        };
         let mut visited: Vec<TypeSymbol> = Vec::new();
         let mut pending = alloc::vec![lookup.clone()];
+        if is_interface {
+            pending.insert(0, type_symbol_in("System", "Object"));
+        }
         while let Some(current_ty) = pending.pop() {
             if visited.contains(&current_ty) {
                 continue;
@@ -3300,6 +3362,43 @@ impl Binder {
                 ));
             }
         }
+    }
+
+    /// Whether an instance member emitted under `method_name` with `params` (a method, or a
+    /// `get_`/`set_`/`add_`/`remove_` accessor) implements a member of an interface `class_ty`
+    /// implements -- the test for the sealed-virtual (`virtual final newslot`) flags an implicit
+    /// interface implementation carries (20.4.1). A member matching no interface member stays as
+    /// declared (non-virtual unless `virtual`/`abstract`/`override`), matching csc; merely
+    /// implementing SOME interface does not virtualize a type's unrelated members. `params` is
+    /// canonicalized so a body-bound signature matches the interface's model signature.
+    #[must_use]
+    pub fn member_implements_interface(
+        &self,
+        class_ty: &TypeSymbol,
+        method_name: &str,
+        params: &[TypeSymbol],
+    ) -> bool {
+        let canonical: Vec<TypeSymbol> = params.iter().map(|p| self.canonicalize(p)).collect();
+        let property = method_name
+            .strip_prefix("get_")
+            .or_else(|| method_name.strip_prefix("set_"));
+        let event = method_name
+            .strip_prefix("add_")
+            .or_else(|| method_name.strip_prefix("remove_"));
+        self.transitive_interfaces(class_ty).iter().any(|interface| {
+            self.model.get_by_symbol(interface).is_some_and(|info| {
+                info.methods.iter().any(|candidate| {
+                    &*candidate.name == method_name
+                        && candidate.parameters.len() == canonical.len()
+                        && candidate
+                            .parameters
+                            .iter()
+                            .zip(&canonical)
+                            .all(|(a, b)| a == b)
+                }) || property.is_some_and(|name| info.properties.iter().any(|p| &*p.name == name))
+                    || event.is_some_and(|name| info.events.iter().any(|e| &*e.name == name))
+            })
+        })
     }
 
     /// The interfaces a type transitively implements: its own interface bases, plus those
@@ -3489,8 +3588,16 @@ impl Binder {
 
     fn methods_in_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
         let mut methods: Vec<MethodSymbol> = Vec::new();
+        let mut inaccessible: Vec<MethodSymbol> = Vec::new();
         let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut pending = alloc::vec![member_lookup_type(ty)];
+        let lookup = member_lookup_type(ty);
+        let mut pending = alloc::vec![lookup.clone()];
+        if self
+            .type_info_of(&lookup)
+            .is_some_and(|info| info.kind == TypeKind::Interface)
+        {
+            pending.insert(0, type_symbol_in("System", "Object"));
+        }
         while let Some(current_ty) = pending.pop() {
             if visited.contains(&current_ty) {
                 continue;
@@ -3499,13 +3606,19 @@ impl Binder {
             let Some(info) = self.type_info_of(&current_ty) else {
                 continue;
             };
+            let declaring = type_symbol_in(&info.namespace, &info.name);
             for method in info.methods_named(name) {
                 let conversion_operator = matches!(name, "op_Implicit" | "op_Explicit");
-                if !methods.iter().any(|kept| {
+                let bucket = if self.is_accessible(&declaring, method.accessibility) {
+                    &mut methods
+                } else {
+                    &mut inaccessible
+                };
+                if !bucket.iter().any(|kept| {
                     kept.parameters == method.parameters
                         && (!conversion_operator || kept.return_type == method.return_type)
                 }) {
-                    methods.push(method.clone());
+                    bucket.push(method.clone());
                 }
             }
             for base in &info.bases {
@@ -3515,7 +3628,11 @@ impl Binder {
                 pending.push(base.clone());
             }
         }
-        methods
+        if methods.is_empty() {
+            inaccessible
+        } else {
+            methods
+        }
     }
 
     /// The type a resolved method reference should name: the most-derived type from
@@ -3531,6 +3648,13 @@ impl Binder {
         let lookup = member_lookup_type(ty);
         let mut visited: Vec<TypeSymbol> = Vec::new();
         let mut pending = alloc::vec![lookup.clone()];
+        if self
+            .type_info_of(&lookup)
+            .is_some_and(|info| info.kind == TypeKind::Interface)
+        {
+            pending.insert(0, type_symbol_in("System", "Object"));
+        }
+        let mut inaccessible_match: Option<TypeSymbol> = None;
         while let Some(current_ty) = pending.pop() {
             if visited.contains(&current_ty) {
                 continue;
@@ -3539,11 +3663,22 @@ impl Binder {
             let Some(info) = self.type_info_of(&current_ty) else {
                 continue;
             };
-            if info
-                .methods_named(name)
-                .any(|method| method.parameters.as_slice() == parameters)
-            {
-                return type_symbol_in(&info.namespace, &info.name);
+            let declaring = type_symbol_in(&info.namespace, &info.name);
+            let mut declares = false;
+            let mut accessible = false;
+            for method in info.methods_named(name) {
+                if method.parameters.as_slice() == parameters {
+                    declares = true;
+                    if self.is_accessible(&declaring, method.accessibility) {
+                        accessible = true;
+                    }
+                }
+            }
+            if accessible {
+                return declaring;
+            }
+            if declares && inaccessible_match.is_none() {
+                inaccessible_match = Some(declaring);
             }
             for base in &info.bases {
                 pending.push(base.clone());
@@ -3552,7 +3687,7 @@ impl Binder {
                 pending.push(base.clone());
             }
         }
-        lookup
+        inaccessible_match.unwrap_or(lookup)
     }
 
     /// Binds a simple name (14.5.2). For now a name resolves only to a local

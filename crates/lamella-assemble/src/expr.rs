@@ -107,7 +107,13 @@ pub fn emit_expression(
         ),
         BoundExprKind::Unary { operator, operand } => {
             emit_expression(operand, frame, tokens, out)?;
-            emit_unary(*operator, out)
+            emit_unary(*operator, out)?;
+            if *operator == UnaryOperator::Complement {
+                if let Some(underlying) = tokens.enum_underlying(&operand.ty) {
+                    narrow_subint(&TypeSymbol::Special(underlying), out);
+                }
+            }
+            Ok(())
         }
         BoundExprKind::Postfix { operator, operand } => emit_step_expression(
             operand,
@@ -1239,6 +1245,26 @@ pub(crate) fn numeric_conversion(target: &TypeSymbol) -> Result<Opcode, EmitErro
     })
 }
 
+/// Narrows an int-width stack value back to a sub-int type's width (`conv.u1`/`conv.i2`/...),
+/// so an operation defined in the narrower type wraps correctly (e.g. a `byte`-backed enum at
+/// 256). A no-op for int/uint/long/ulong (already the right width) and any non-sub-int type.
+fn narrow_subint(ty: &TypeSymbol, out: &mut Vec<Instruction>) {
+    if matches!(
+        ty,
+        TypeSymbol::Special(
+            SpecialType::SByte
+                | SpecialType::Byte
+                | SpecialType::Int16
+                | SpecialType::UInt16
+                | SpecialType::Char
+        )
+    ) {
+        if let Ok(op) = numeric_conversion(ty) {
+            out.push(Instruction::simple(op));
+        }
+    }
+}
+
 /// Emits the address of a local or parameter (`ldloca`/`ldarga`), for accessing a
 /// field of a value type in place.
 fn emit_local_address(
@@ -1447,8 +1473,13 @@ fn emit_step_expression(
         out.push(Instruction::simple(Opcode::Dup));
     }
     out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
+    let enum_underlying = tokens.enum_underlying(&operand.ty);
+    let step_ty = match enum_underlying {
+        Some(special) => TypeSymbol::Special(special),
+        None => operand.ty.clone(),
+    };
     if matches!(
-        operand.ty,
+        step_ty,
         TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
     ) {
         out.push(Instruction::simple(Opcode::ConvI8));
@@ -1458,6 +1489,9 @@ fn emit_step_expression(
     } else {
         Opcode::Sub
     }));
+    if enum_underlying.is_some() {
+        narrow_subint(&step_ty, out);
+    }
     if !postfix {
         out.push(Instruction::simple(Opcode::Dup));
     }

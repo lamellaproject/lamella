@@ -1,7 +1,8 @@
 //! The HOST side of the wireline debug + REPL channel:
 
 pub use lamella_runner::{
-    RunResult, debug, repl, run_program, send_image, send_program, serve_one, try_recv_result,
+    RunResult, debug, deploy, repl, run_program, send_image, send_program, serve_one,
+    try_recv_result,
 };
 
 pub mod engine;
@@ -41,6 +42,7 @@ impl SerialTransport {
             .map_err(|_| TransportError::Carrier)?;
         port.write_data_terminal_ready(true).map_err(|_| TransportError::Carrier)?;
         port.write_request_to_send(true).ok();
+        std::thread::sleep(Duration::from_millis(300));
         Ok(Self { port, reader: FrameReader::new(), baud })
     }
 }
@@ -90,9 +92,14 @@ pub fn hello_blocking(
         range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
         caps: host_caps,
     };
-    transport.send(msg::HELLO, seq, &hello.encode())?;
+    let encoded = hello.encode();
     let deadline = Instant::now() + timeout;
+    let mut next_send = Instant::now();
     while Instant::now() < deadline {
+        if Instant::now() >= next_send {
+            transport.send(msg::HELLO, seq, &encoded)?;
+            next_send = Instant::now() + Duration::from_millis(250);
+        }
         while let Some(frame) = transport.poll()? {
             match frame.msg_type {
                 msg::HELLO_ACK if frame.seq == seq => {
@@ -138,6 +145,83 @@ pub fn eval_image_blocking(
 ) -> Result<RunResult, TransportError> {
     send_image(transport, seq, image)?;
     await_result(transport, seq, timeout)
+}
+
+/// Host driver, blocking: persist `image` to the target's flash (it boots on reset), or
+/// -- with `image` empty -- clear the deployed image (un-deploy). Returns whether the
+/// target reported the flash write / clear succeeded.
+///
+/// # Errors
+/// [`TransportError::Closed`] on timeout; otherwise a carrier [`TransportError`].
+#[cfg(feature = "serial")]
+pub fn deploy_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    image: &[u8],
+    timeout: Duration,
+) -> Result<bool, TransportError> {
+    use lamella_wire::Frame;
+    let msg_type = if image.is_empty() { deploy::DEPLOY_CLEAR } else { deploy::DEPLOY_IMAGE };
+    transport.send(msg_type, seq, image)?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
+            if msg_type == deploy::DEPLOY_RESULT && reply_seq == seq {
+                return Ok(payload.first().copied().unwrap_or(0) == 1);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    Err(TransportError::Closed)
+}
+
+/// Deploy a baked image to flash in CHUNKS, so an image larger than one 64 KB wire frame can cross
+/// the wire (the frame LEN is a `u16`, so a single [`deploy_blocking`] silently truncates a
+/// corlib-baked image). Sends `DEPLOY_CHUNK(offset, total, bytes)` frames in ascending order,
+/// waiting for each `DEPLOY_RESULT` ack before the next; returns whether every chunk verified.
+/// `chunk_len` must be a multiple of the target's flash page (512 B) so each chunk starts on a page
+/// boundary, and leave frame-header room under 64 KB. A single-chunk deploy (image `<= chunk_len`)
+/// is equivalent to a `DEPLOY_IMAGE`, without the truncation risk.
+///
+/// # Errors
+/// Propagates a [`TransportError`], or reports the wire closed if a chunk goes unacked past `timeout`.
+pub fn deploy_chunked_blocking(
+    transport: &mut impl Transport,
+    seq: u16,
+    image: &[u8],
+    chunk_len: usize,
+    timeout: Duration,
+) -> Result<bool, TransportError> {
+    use lamella_wire::Frame;
+    let total = image.len() as u32;
+    let mut offset = 0usize;
+    while offset < image.len() {
+        let end = (offset + chunk_len).min(image.len());
+        let mut payload = Vec::with_capacity(8 + (end - offset));
+        payload.extend_from_slice(&(offset as u32).to_le_bytes());
+        payload.extend_from_slice(&total.to_le_bytes());
+        payload.extend_from_slice(&image[offset..end]);
+        transport.send(deploy::DEPLOY_CHUNK, seq, &payload)?;
+
+        let deadline = Instant::now() + timeout;
+        let mut acked = None;
+        'wait: while Instant::now() < deadline {
+            while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
+                if msg_type == deploy::DEPLOY_RESULT && reply_seq == seq {
+                    acked = Some(payload.first().copied().unwrap_or(0) == 1);
+                    break 'wait;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        match acked {
+            Some(true) => {}
+            Some(false) => return Ok(false),
+            None => return Err(TransportError::Closed),
+        }
+        offset = end;
+    }
+    Ok(true)
 }
 
 #[cfg(feature = "serial")]
