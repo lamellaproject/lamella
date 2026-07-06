@@ -302,6 +302,36 @@ impl<'a> MetadataResolver<'a> {
             .collect()
     }
 
+    /// The descriptor for a REFERENCED-assembly (corlib) type the program ALLOCATES but does not
+    /// declare -- e.g. `new StringBuilder()`. Its vtable is numbered ENTIRELY within the reference,
+    /// each slot the corlib's exported extern symbol, so a `callvirt` on a program-allocated corlib
+    /// object dispatches to the corlib's most-derived override (and the descriptor's vtable relocs
+    /// keep those library methods alive through gc). The base chain terminates at the assembly
+    /// boundary (`base` None) and interface dispatch on such a type is not yet threaded (empty
+    /// itable). `None` without a reference, or if the handle is not a reference TypeDef.
+    pub fn reference_type_meta(&self, handle: TypeHandle) -> Option<TypeMeta> {
+        let reference = self.reference?;
+        if handle.0 >> 24 != table::TYPE_DEF as u32 {
+            return None;
+        }
+        let type_def = reference.type_def(handle.0 & 0x00ff_ffff)?;
+        let vtable: Vec<VtableEntry> = reference_vtable_slots(reference, type_def)
+            .into_iter()
+            .map(|slot| match slot.impl_ {
+                SlotImpl::Extern(symbol) => VtableEntry::Extern(symbol),
+                SlotImpl::Rid(rid) => VtableEntry::Func(rid),
+            })
+            .collect();
+        let name = reference.type_token_name(type_def.token())?;
+        Some(TypeMeta {
+            handle,
+            type_tag: exception_tag_for_name(name.namespace, name.name),
+            vtable,
+            itable: Vec::new(),
+            base: None,
+        })
+    }
+
     /// Each this-module type's immediate IN-PROGRAM base, as `(handle, base_handle)` -- the `extends`
     /// target when it is a this-module TypeDef, else `None` (a BCL TypeRef base or System.Object, where
     /// the AOT base-pointer chain terminates). The backend walks this to lay the TypeDesc base_ptr chain
@@ -523,6 +553,26 @@ pub struct TypeMeta {
     pub base: Option<TypeHandle>,
 }
 
+/// The reference layout of `type_def` computed from its own `assembly` -- payload size and
+/// reference-field offsets (a class's payload is its fields); `None` for a value type. Used for a
+/// `newobj` of either a this-assembly class or a referenced-assembly (corlib) class.
+fn reference_layout_of<'a>(
+    assembly: &Assembly<'a>,
+    type_def: TypeDef<'a>,
+) -> Option<ReferenceLayout> {
+    if type_def.is_value_type() {
+        return None;
+    }
+    let layout = assembly
+        .value_type_layout(type_def.token(), &TargetLayout::ilp32())
+        .ok()?;
+    Some(ReferenceLayout {
+        handle: TypeHandle(type_def.token().0),
+        size: layout.size,
+        reference_offsets: layout.reference_offsets,
+    })
+}
+
 /// The AOT's interface-method identity tag: FNV-1a32 of the interface's full name, the method name, and
 /// a byte per parameter type, with the high bit set (the shared type/exception tag space). A
 /// `callvirt IFoo::Bar(args)` and every implementing type's itable entry for it derive the SAME tag, so
@@ -594,6 +644,9 @@ impl CallResolver for MetadataResolver<'_> {
             })
             .flatten();
         let target = match method.kind {
+            MethodKind::Definition(_) | MethodKind::Reference if is_int32_tostring(&method) => {
+                CallTarget::Intrinsic(Intrinsic::IntToString)
+            }
             MethodKind::Definition(rid) => {
                 CallTarget::Internal(self.function_index(rid).unwrap_or(rid))
             }
@@ -608,9 +661,6 @@ impl CallResolver for MetadataResolver<'_> {
             }
             MethodKind::Reference if is_string_concat(&method) => {
                 CallTarget::Intrinsic(Intrinsic::StringConcat)
-            }
-            MethodKind::Reference if is_int32_tostring(&method) => {
-                CallTarget::Intrinsic(Intrinsic::IntToString)
             }
             MethodKind::Reference if is_noop_base_ctor(&method) => {
                 CallTarget::Intrinsic(Intrinsic::ObjectCtor)
@@ -721,19 +771,16 @@ impl CallResolver for MetadataResolver<'_> {
     }
 
     fn newobj_reference_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
-        let type_def = self.newobj_type_def(operand)?;
-        if type_def.is_value_type() {
+        let Operand::Token(token) = operand else {
             return None;
+        };
+        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
+        if let Some(type_def) = self.assembly.find_type(declaring.namespace, declaring.name) {
+            return reference_layout_of(self.assembly, type_def);
         }
-        let layout = self
-            .assembly
-            .value_type_layout(type_def.token(), &TargetLayout::ilp32())
-            .ok()?;
-        Some(ReferenceLayout {
-            handle: TypeHandle(type_def.token().0),
-            size: layout.size,
-            reference_offsets: layout.reference_offsets,
-        })
+        let reference = self.reference?;
+        let type_def = reference.find_type(declaring.namespace, declaring.name)?;
+        reference_layout_of(reference, type_def)
     }
 
     fn newobj_delegate(&self, operand: &Operand) -> Option<ReferenceLayout> {
@@ -1066,6 +1113,39 @@ impl CallResolver for MetadataResolver<'_> {
             handle: TypeHandle(token.0),
             size: layout.size,
         })
+    }
+
+    fn type_operand_mir(&self, operand: &Operand) -> Option<MirType> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        if let Some(name) = self.assembly.type_token_name(*token) {
+            if name.namespace == "System" {
+                match name.name {
+                    "Boolean" | "SByte" | "Byte" | "Int16" | "UInt16" | "Char" | "Int32"
+                    | "UInt32" => return Some(MirType::I32),
+                    "Single" => return Some(MirType::F32),
+                    "Int64" | "UInt64" => return Some(MirType::I64),
+                    "Double" => return Some(MirType::F64),
+                    "IntPtr" | "UIntPtr" => return Some(MirType::NativeInt),
+                    _ => {}
+                }
+            }
+        }
+        if let Ok(layout) = self
+            .assembly
+            .value_type_layout(*token, &TargetLayout::ilp32())
+        {
+            if let Some(underlying) = enum_underlying(self.assembly, *token, &TargetLayout::ilp32())
+            {
+                return Some(underlying);
+            }
+            return Some(MirType::ValueType {
+                handle: TypeHandle(token.0),
+                size: layout.size,
+            });
+        }
+        Some(MirType::ObjectRef)
     }
 
     fn virtual_slot(&self, operand: &Operand) -> Option<usize> {

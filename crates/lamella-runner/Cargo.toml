@@ -21,6 +21,9 @@ lamella-mmio = { path = "../lamella-mmio" }
 
 [dev-dependencies]
 lamella-token = { path = "../lamella-token" }
+lamella-pinvoke-host = { path = "../lamella-pinvoke-host" }
+lamella-net-host = { path = "../lamella-net-host" }
+lamella-tls-host = { path = "../lamella-tls-host" }
 
 [features]
 # Source-level debugger names (forwarded to the loader). Default on; a constrained device build drops it.

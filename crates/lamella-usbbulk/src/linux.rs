@@ -125,6 +125,10 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
         .collect())
 }
 
+pub fn enumerate_guid(_interface_guid: &str) -> Result<Vec<DeviceInfo>> {
+    Err(Error::Unsupported)
+}
+
 pub struct Device {
     file: fs::File,
     interface: u8,
@@ -157,6 +161,12 @@ impl Device {
             ep_in: f.ep_in,
             ep_out: f.ep_out,
         })
+    }
+
+    /// Open by VID/PID; the interface GUID is a Windows concept (usbfs matches by VID/PID + the
+    /// vendor class-0xFF interface), so it is ignored here.
+    pub fn open_guid(_interface_guid: &str, vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
+        Self::open(vendor_id, product_id, serial)
     }
 
     pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {

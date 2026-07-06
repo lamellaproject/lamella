@@ -68,6 +68,17 @@ pub struct MethodReference {
     pub is_static: bool,
 }
 
+/// A user-defined `++`/`--` whose operand or result type differs from the variable's (14.14.2): the
+/// operator method to call and any implicit conversion of its result back to the variable's type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConvertingStep {
+    /// The `op_Increment`/`op_Decrement` to call.
+    pub operator: MethodReference,
+    /// The conversion of the operator's result back to the operand type, if it is not already that
+    /// type or a reference-convertible one.
+    pub result_conversion: Option<MethodReference>,
+}
+
 /// What an inserted [`BoundExprKind::Conversion`] does at emit time (13.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversionKind {
@@ -204,6 +215,10 @@ pub enum BoundExprKind {
         operator: PostfixOperator,
         /// The operand.
         operand: Box<BoundExpr>,
+        /// A user-defined `op_Increment`/`op_Decrement` whose parameter/result type differs from the
+        /// operand's (14.14.2): the operator to call and any conversion of its result back to the
+        /// operand type. `None` for a numeric/enum/pointer step or an exact same-type user operator.
+        step: Option<Box<ConvertingStep>>,
     },
     /// A cast to the expression's type (14.6.6).
     Cast {
@@ -240,6 +255,10 @@ pub enum BoundExprKind {
         target: Box<BoundExpr>,
         /// The assigned value.
         value: Box<BoundExpr>,
+        /// Whether the assignment is in a `checked` context, so a compound assignment's
+        /// implicit narrowing of its result back to a sub-int target uses `conv.ovf.*`
+        /// (14.14.2 / 14.5.12) -- e.g. `checked { short s; s += 32000; }` overflows.
+        checked: bool,
     },
     /// A conditional expression `c ? a : b` (14.13).
     Conditional {
@@ -281,6 +300,12 @@ pub enum BoundExprKind {
     /// addresses. An lvalue when it is an assignment target.
     Dereference {
         /// The pointer being dereferenced.
+        operand: Box<BoundExpr>,
+    },
+    /// The address-of `&operand` (unsafe, 18.5.4): a `T*` to a fixed variable (a local,
+    /// value parameter, field, or array element). The inverse of [`Dereference`].
+    AddressOf {
+        /// The fixed variable whose address is taken.
         operand: Box<BoundExpr>,
     },
     /// A `checked` expression (14.5.12); the type is the operand's.
@@ -439,15 +464,15 @@ impl Binder {
             if parts.len() == 1 {
                 let name: &str = &parts[0];
                 if let Some(target) = self.alias_target(name) {
-                    return target;
+                    return target.fold_builtin();
                 }
                 let hits = self.type_namespaces_containing(name);
-                if hits.len() == 1 {
-                    return type_symbol_in(&hits[0], name);
+                if let Some((namespace, _)) = hits.first() {
+                    return type_symbol_in(namespace, name).fold_builtin();
                 }
             }
         }
-        ty.clone()
+        ty.clone().fold_builtin()
     }
 
     /// Resolves a type against the reference world, reporting `CS0246` if unknown.
@@ -456,11 +481,11 @@ impl Binder {
             if parts.len() == 1 {
                 let name: &str = &parts[0];
                 if let Some(target) = self.alias_target(name) {
-                    return target;
+                    return target.fold_builtin();
                 }
                 let hits = self.type_namespaces_containing(name);
-                if hits.len() == 1 {
-                    return type_symbol_in(&hits[0], name);
+                if let Some((namespace, _)) = hits.first() {
+                    return type_symbol_in(namespace, name).fold_builtin();
                 }
             }
         }
@@ -473,7 +498,7 @@ impl Binder {
         if let TypeSymbol::Pointer(element) = ty {
             return TypeSymbol::Pointer(Box::new(self.resolve_named_type(element, span)));
         }
-        resolve_type(&self.world, ty, &mut self.diagnostics, span)
+        resolve_type(&self.world, ty, &mut self.diagnostics, span).fold_builtin()
     }
 
     /// Rewrites a single-part named type to its canonical fully-qualified symbol when that
@@ -487,7 +512,8 @@ impl Binder {
             TypeSymbol::Named(parts) if parts.len() == 1 => self
                 .model
                 .type_with_simple_name(&parts[0])
-                .unwrap_or_else(|| ty.clone()),
+                .unwrap_or_else(|| ty.clone())
+                .fold_builtin(),
             TypeSymbol::Array { element, rank } => TypeSymbol::Array {
                 element: Box::new(self.canonicalize(element)),
                 rank: *rank,
@@ -504,11 +530,15 @@ impl Binder {
             || self.user_conversion(from, to, "op_Implicit").is_some()
     }
 
-    /// Whether the constant `value` is the integer `0` and `target` is an enum type -- the
-    /// implicit enumeration conversion (13.1.3), which lets `E e = 0;`. Restricted to a
-    /// genuine integer constant (not `char`/`bool`), matching the reference compiler.
+    /// Whether the constant `value` has value zero and `target` is an enum type -- the implicit
+    /// enumeration conversion (13.1.3), which lets `E e = 0;`. A constant of ANY numeric type
+    /// whose value is zero converts (the reference compiler's relaxation -- so `E e = 0.0;` and
+    /// `E e = 0.0e+999;` are accepted), but `char`/`bool` are excluded.
     fn enum_from_zero(&self, value: &BoundExpr, target: &TypeSymbol) -> bool {
-        matches!(
+        if self.type_info_of(target).map(|info| info.kind) != Some(TypeKind::Enum) {
+            return false;
+        }
+        let integer_zero = matches!(
             value.ty,
             TypeSymbol::Special(
                 SpecialType::SByte
@@ -520,8 +550,23 @@ impl Binder {
                     | SpecialType::Int64
                     | SpecialType::UInt64
             )
-        ) && self.type_info_of(target).map(|info| info.kind) == Some(TypeKind::Enum)
-            && constant_int_value(value) == Some(0)
+        ) && constant_int_value(value) == Some(0);
+        let real_zero = match &value.ty {
+            TypeSymbol::Special(SpecialType::Single | SpecialType::Double) => {
+                matches!(constant_literal_value(value), Some(Literal::Real { bits, .. }) if bits == 0)
+            }
+            TypeSymbol::Special(SpecialType::Decimal) => matches!(
+                constant_literal_value(value),
+                Some(Literal::Decimal {
+                    lo: 0,
+                    mid: 0,
+                    hi: 0,
+                    ..
+                })
+            ),
+            _ => false,
+        };
+        integer_zero || real_zero
     }
 
     /// Whether `value` is assignable to `target`: it implicitly converts by type, it is a
@@ -567,7 +612,7 @@ impl Binder {
     /// A user-defined conversion method (`op_Implicit`/`op_Explicit`) taking `from` and
     /// returning `to`, declared on either the source or target type (17.9.3). The static
     /// call a `from -> to` conversion lowers to.
-    fn user_conversion(
+    pub(crate) fn user_conversion(
         &self,
         from: &TypeSymbol,
         to: &TypeSymbol,
@@ -793,9 +838,7 @@ impl Binder {
             && as_special(to).is_some_and(SpecialType::is_numeric)
         {
             ConversionKind::ImplicitNumeric
-        } else if self.is_value_type(from)
-            && (matches!(to, TypeSymbol::Special(SpecialType::Object)) || self.is_interface(to))
-        {
+        } else if self.is_value_type(from) && !self.is_value_type(to) {
             ConversionKind::Boxing
         } else {
             ConversionKind::ImplicitReference
@@ -809,10 +852,13 @@ impl Binder {
                 SpecialType::Object | SpecialType::String | SpecialType::Null,
             ) => false,
             TypeSymbol::Special(_) => true,
-            TypeSymbol::Named(_) => matches!(
-                self.type_info_of(ty).map(|info| info.kind),
-                Some(TypeKind::Struct | TypeKind::Enum)
-            ),
+            TypeSymbol::Named(_) => {
+                !is_reference_base_class(ty)
+                    && matches!(
+                        self.type_info_of(ty).map(|info| info.kind),
+                        Some(TypeKind::Struct | TypeKind::Enum)
+                    )
+            }
             TypeSymbol::Array { .. }
             | TypeSymbol::Pointer(_)
             | TypeSymbol::ByRef(_)
@@ -928,8 +974,13 @@ impl Binder {
 
     /// The distinct in-scope namespaces (current, global, and imported) that hold
     /// a type with this name.
-    fn type_namespaces_containing(&self, name: &str) -> Vec<Box<str>> {
-        let mut search: Vec<Box<str>> = Vec::new();
+    /// The namespaces (in scope) that declare a type of this simple name, ordered
+    /// most-specific scope first. The flag marks a hit that comes from a `using`-imported
+    /// namespace: those alone share one precedence level, so two of them are a CS0104
+    /// ambiguity, whereas a more-specific scope (an enclosing type, the current namespace,
+    /// the global namespace) unambiguously SHADOWS every less-specific hit (3.8, 10.8).
+    fn type_namespaces_containing(&self, name: &str) -> Vec<(Box<str>, bool)> {
+        let mut search: Vec<(Box<str>, bool)> = Vec::new();
         if let Some(TypeSymbol::Named(parts)) = &self.current_type {
             let mut enclosing = String::new();
             for part in parts.iter() {
@@ -938,17 +989,19 @@ impl Binder {
                 }
                 enclosing.push_str(part);
             }
-            search.push(enclosing.into());
+            search.push((enclosing.into(), false));
         }
         if let Some(current) = self.current_namespace() {
-            search.push(current);
+            search.push((current, false));
         }
-        search.push(Box::from(""));
-        search.extend(self.imported_namespaces.iter().cloned());
-        let mut hits: Vec<Box<str>> = Vec::new();
-        for namespace in search {
-            if self.model.get(&namespace, name).is_some() && !hits.contains(&namespace) {
-                hits.push(namespace);
+        search.push((Box::from(""), false));
+        search.extend(self.imported_namespaces.iter().cloned().map(|ns| (ns, true)));
+        let mut hits: Vec<(Box<str>, bool)> = Vec::new();
+        for (namespace, imported) in search {
+            if self.model.get(&namespace, name).is_some()
+                && !hits.iter().any(|(seen, _)| *seen == namespace)
+            {
+                hits.push((namespace, imported));
             }
         }
         hits
@@ -1095,6 +1148,7 @@ impl Binder {
                                     operator: AssignmentOperator::Assign,
                                     target: Box::new(target),
                                     value: Box::new(value),
+                                    checked: self.checked_context,
                                 },
                             };
                             bound.push(BoundStmt {
@@ -1436,6 +1490,38 @@ impl Binder {
                             },
                         };
                     }
+                    if let Some(underlying) = self.enum_underlying_type(&ty) {
+                        if let Some(method) = self
+                            .user_conversion(&operand.ty, &underlying, "op_Explicit")
+                            .or_else(|| self.user_conversion(&operand.ty, &underlying, "op_Implicit"))
+                        {
+                            return BoundExpr {
+                                ty,
+                                kind: BoundExprKind::Call {
+                                    callee: Box::new(error_expr()),
+                                    arguments: alloc::vec![operand],
+                                    method: Some(method),
+                                },
+                            };
+                        }
+                    }
+                    if let Some(underlying) = self.enum_underlying_type(&operand.ty) {
+                        if let Some(method) = self
+                            .user_conversion(&underlying, &ty, "op_Implicit")
+                            .or_else(|| self.user_conversion(&underlying, &ty, "op_Explicit"))
+                        {
+                            let mut as_underlying = operand;
+                            as_underlying.ty = underlying;
+                            return BoundExpr {
+                                ty,
+                                kind: BoundExprKind::Call {
+                                    callee: Box::new(error_expr()),
+                                    arguments: alloc::vec![as_underlying],
+                                    method: Some(method),
+                                },
+                            };
+                        }
+                    }
                     if !can_cast(&self.model, &operand.ty, &ty) {
                         self.diagnostics.push(Diagnostic::new(
                             DiagnosticKind::CannotCast {
@@ -1541,6 +1627,20 @@ impl Binder {
                     ty,
                 }
             }
+            ExprKind::AddressOf(operand) => {
+                let variable = self.bind_expression(operand);
+                let ty = if variable.ty.is_error() {
+                    TypeSymbol::Error
+                } else {
+                    TypeSymbol::Pointer(Box::new(variable.ty.clone()))
+                };
+                BoundExpr {
+                    kind: BoundExprKind::AddressOf {
+                        operand: Box::new(variable),
+                    },
+                    ty,
+                }
+            }
             ExprKind::Checked(inner) => {
                 let saved = self.checked_context;
                 self.checked_context = true;
@@ -1615,6 +1715,20 @@ impl Binder {
             {
                 return self.bind_delegate_equality(operator, left, right);
             }
+        }
+        if matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract)
+            && !left.ty.is_error()
+            && !right.ty.is_error()
+            && matches!(
+                self.type_info_of(&left.ty).map(|info| info.kind),
+                Some(TypeKind::Delegate)
+            )
+            && matches!(
+                self.type_info_of(&right.ty).map(|info| info.kind),
+                Some(TypeKind::Delegate)
+            )
+        {
+            return self.bind_delegate_combination(operator, left, right);
         }
         let (left, right) = self.adjust_binary_constant(operator, left, right);
         let ty = if left.ty.is_error() || right.ty.is_error() {
@@ -1789,6 +1903,104 @@ impl Binder {
         }
     }
 
+    /// Lowers `+` / `-` on two delegate operands to a `System.Delegate` `Combine` / `Remove` call,
+    /// cast back to the delegate type (14.7.4 / 15.4). Combine/Remove take and return
+    /// `System.Delegate`: the operands upcast to it implicitly (no instruction), and the
+    /// `System.Delegate` result downcasts (`castclass`) to the specific delegate type.
+    fn bind_delegate_combination(
+        &self,
+        operator: BinaryOperator,
+        left: BoundExpr,
+        right: BoundExpr,
+    ) -> BoundExpr {
+        let delegate_ty = left.ty.clone();
+        let delegate_base = TypeSymbol::Named([Box::from("System"), Box::from("Delegate")].into());
+        let accessor = if matches!(operator, BinaryOperator::Add) {
+            "Combine"
+        } else {
+            "Remove"
+        };
+        let method = MethodReference {
+            declaring_type: delegate_base.clone(),
+            name: accessor.into(),
+            parameters: alloc::vec![delegate_base.clone(), delegate_base.clone()],
+            return_type: delegate_base.clone(),
+            is_static: true,
+        };
+        let combined = BoundExpr {
+            kind: BoundExprKind::Call {
+                callee: Box::new(error_expr()),
+                arguments: alloc::vec![left, right],
+                method: Some(method),
+            },
+            ty: delegate_base,
+        };
+        BoundExpr {
+            kind: BoundExprKind::Cast {
+                operand: Box::new(combined),
+                checked: false,
+            },
+            ty: delegate_ty,
+        }
+    }
+
+    /// Coerces a `switch` governing expression to its governing type (15.7.2): when the expression
+    /// type is not itself a governing type, the single user-defined implicit conversion to one is
+    /// applied, so `switch (t)` where `t` has `implicit operator int` switches on the `int`.
+    pub(crate) fn coerce_switch_governing(&self, expression: BoundExpr) -> BoundExpr {
+        if expression.ty.is_error() || self.is_switch_governing_type(&expression.ty) {
+            return expression;
+        }
+        for target in [
+            SpecialType::SByte,
+            SpecialType::Byte,
+            SpecialType::Int16,
+            SpecialType::UInt16,
+            SpecialType::Int32,
+            SpecialType::UInt32,
+            SpecialType::Int64,
+            SpecialType::UInt64,
+            SpecialType::Char,
+            SpecialType::String,
+        ] {
+            let target = TypeSymbol::Special(target);
+            if self
+                .user_conversion(&expression.ty, &target, "op_Implicit")
+                .is_some()
+            {
+                return self.convert(expression, &target);
+            }
+        }
+        expression
+    }
+
+    /// Whether `ty` is a valid `switch` governing type (15.7.2): an integral type, `char`, `bool`,
+    /// `string`, or an enum. (Other types reach a governing type only via a user-defined conversion.)
+    fn is_switch_governing_type(&self, ty: &TypeSymbol) -> bool {
+        match ty {
+            TypeSymbol::Special(special) => {
+                is_integral(*special)
+                    || matches!(special, SpecialType::Boolean | SpecialType::String)
+            }
+            _ => self
+                .type_info_of(ty)
+                .is_some_and(|info| info.kind == TypeKind::Enum),
+        }
+    }
+
+    /// The underlying integral type of an enum -- its `value__` field's type, defaulting to `int`
+    /// (21.4) -- or `None` if `ty` is not an enum.
+    fn enum_underlying_type(&self, ty: &TypeSymbol) -> Option<TypeSymbol> {
+        let info = self.type_info_of(ty)?;
+        if info.kind != TypeKind::Enum {
+            return None;
+        }
+        Some(match info.find_field("value__").map(|field| &field.ty) {
+            Some(TypeSymbol::Special(special)) => TypeSymbol::Special(*special),
+            _ => TypeSymbol::Special(SpecialType::Int32),
+        })
+    }
+
     /// Whether `ty` is an enum type declared in the model.
     fn is_enum_type(&self, ty: &TypeSymbol) -> bool {
         self.type_info_of(ty)
@@ -1876,6 +2088,12 @@ impl Binder {
             operand.ty.clone()
         } else if let Some(result) = unary_result_type(operator, &operand.ty) {
             result
+        } else if matches!(
+            operator,
+            UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
+        ) && matches!(operand.ty, TypeSymbol::Pointer(_))
+        {
+            operand.ty.clone()
         } else if matches!(
             operator,
             UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
@@ -2005,16 +2223,26 @@ impl Binder {
         span: Span,
     ) -> BoundExpr {
         let operand = self.bind_expression(operand_expr);
-        let step = match operator {
+        let step_name = match operator {
             PostfixOperator::Increment => "op_Increment",
             PostfixOperator::Decrement => "op_Decrement",
         };
+        let mut converting: Option<Box<ConvertingStep>> = None;
         let ty = if operand.ty.is_error() {
             TypeSymbol::Error
         } else if as_special(&operand.ty).is_some_and(SpecialType::is_numeric)
             || self.is_enum_type(&operand.ty)
-            || self.has_step_operator(&operand.ty, step)
+            || matches!(operand.ty, TypeSymbol::Pointer(_))
+            || self.has_step_operator(&operand.ty, step_name)
         {
+            operand.ty.clone()
+        } else if let Some((operator_method, result_conversion)) =
+            self.find_converting_step(&operand.ty, step_name)
+        {
+            converting = Some(Box::new(ConvertingStep {
+                operator: operator_method,
+                result_conversion,
+            }));
             operand.ty.clone()
         } else {
             let symbol = match operator {
@@ -2028,6 +2256,7 @@ impl Binder {
             kind: BoundExprKind::Postfix {
                 operator,
                 operand: Box::new(operand),
+                step: converting,
             },
             ty,
         }
@@ -2041,6 +2270,48 @@ impl Binder {
                 && &method.parameters[0] == ty
                 && &method.return_type == ty
         })
+    }
+
+    /// A user-defined `op_Increment`/`op_Decrement` applicable to `ty` whose parameter or result
+    /// type is NOT `ty` (14.14.2): the operand converts to the parameter type, and the result
+    /// converts back to `ty` (identity, a reference conversion -- `None` -- or a user-defined
+    /// implicit conversion). Returns the operator and any result conversion. `None` when only the
+    /// exact same-type form matches (handled by [`has_step_operator`] + the emit's user_step path)
+    /// or none is applicable.
+    fn find_converting_step(
+        &self,
+        ty: &TypeSymbol,
+        step: &str,
+    ) -> Option<(MethodReference, Option<MethodReference>)> {
+        for method in self.methods_in_chain(ty, step) {
+            if method.parameters.len() != 1
+                || (&method.parameters[0] == ty && &method.return_type == ty)
+            {
+                continue;
+            }
+            if !self.converts(ty, &method.parameters[0]) {
+                continue;
+            }
+            let result_conversion = if &method.return_type == ty {
+                None
+            } else if let Some(conv) = self.user_conversion(&method.return_type, ty, "op_Implicit") {
+                Some(conv)
+            } else if self.converts(&method.return_type, ty) {
+                None
+            } else {
+                continue;
+            };
+            let declaring_type = self.declaring_type_in_chain(ty, step, &method.parameters);
+            let operator = MethodReference {
+                declaring_type,
+                name: step.into(),
+                parameters: method.parameters.clone(),
+                return_type: method.return_type.clone(),
+                is_static: true,
+            };
+            return Some((operator, result_conversion));
+        }
+        None
     }
 
     fn report_unary(&mut self, operator: &str, operand: &TypeSymbol, span: Span) {
@@ -2080,6 +2351,10 @@ impl Binder {
             conditional_result_type(&self.model, &when_true.ty, &when_false.ty)
         {
             common
+        } else if self.assignable(&when_true, &when_false.ty) {
+            when_false.ty.clone()
+        } else if self.assignable(&when_false, &when_true.ty) {
+            when_true.ty.clone()
         } else {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::ConditionalTypeMismatch {
@@ -2291,6 +2566,7 @@ impl Binder {
                     operator: AssignmentOperator::Assign,
                     target: Box::new(target),
                     value: Box::new(cast),
+                    checked: self.checked_context,
                 },
                 ty: delegate_ty,
             };
@@ -2298,6 +2574,28 @@ impl Binder {
         if !target.ty.is_error() && !value.ty.is_error() {
             if let Some(binary_op) = compound_binary_operator(operator) {
                 if binary_result_type(binary_op, &target.ty, &value.ty).is_none() {
+                    if let Some(result_ty) =
+                        pointer_binary_result(binary_op, &target.ty, &value.ty)
+                    {
+                        let binary = BoundExpr {
+                            kind: BoundExprKind::Binary {
+                                operator: binary_op,
+                                left: Box::new(target.clone()),
+                                right: Box::new(value),
+                                checked: self.checked_context,
+                            },
+                            ty: result_ty,
+                        };
+                        return BoundExpr {
+                            ty: target.ty.clone(),
+                            kind: BoundExprKind::Assignment {
+                                operator: AssignmentOperator::Assign,
+                                target: Box::new(target),
+                                value: Box::new(binary),
+                                checked: self.checked_context,
+                            },
+                        };
+                    }
                     if let Some(result_ty) = self.enum_binary_result(binary_op, &target.ty, &value.ty) {
                         let binary = BoundExpr {
                             kind: BoundExprKind::Binary {
@@ -2315,6 +2613,7 @@ impl Binder {
                                 operator: AssignmentOperator::Assign,
                                 target: Box::new(target),
                                 value: Box::new(assigned),
+                                checked: self.checked_context,
                             },
                         };
                     }
@@ -2326,13 +2625,16 @@ impl Binder {
                                 operator: AssignmentOperator::Assign,
                                 target: Box::new(target),
                                 value: Box::new(assigned),
+                                checked: self.checked_context,
                             },
                         };
                     }
                 }
             }
         }
-        if !target.ty.is_error() && !is_lvalue(&target) {
+        let this_in_struct =
+            matches!(target.kind, BoundExprKind::This) && self.is_value_type(&target.ty);
+        if !target.ty.is_error() && !is_lvalue(&target) && !this_in_struct {
             self.diagnostics
                 .push(Diagnostic::new(DiagnosticKind::NotAssignable, target_span));
         } else if !target.ty.is_error() && !value.ty.is_error() {
@@ -2352,6 +2654,7 @@ impl Binder {
                 operator,
                 target: Box::new(target),
                 value: Box::new(value),
+                checked: self.checked_context,
             },
             ty,
         }
@@ -2385,6 +2688,13 @@ impl Binder {
 
     fn bind_member_access(&mut self, receiver_expr: &Expr, name: &str, span: Span) -> BoundExpr {
         let receiver = self.bind_expression(receiver_expr);
+        self.member_access_of(receiver, name, span)
+    }
+
+    /// Resolves `receiver.name` from an already-bound receiver (14.5.4). Split from
+    /// [`Self::bind_member_access`] so an invocation target can reuse it after peeking the
+    /// receiver for a method group (see [`Self::bind_call_target`]).
+    fn member_access_of(&mut self, receiver: BoundExpr, name: &str, span: Span) -> BoundExpr {
         if let BoundExprKind::NamespaceReference(namespace) = &receiver.kind {
             let namespace = namespace.clone();
             return self.bind_qualified_name(&namespace, name, span);
@@ -2468,6 +2778,16 @@ impl Binder {
                 ty: TypeSymbol::Error,
             },
             MemberResolution::NoSuchMember(type_name) => {
+                if let BoundExprKind::TypeReference(TypeSymbol::Named(parts)) = &receiver.kind {
+                    let enclosing = parts.join(".");
+                    if self.model.get(&enclosing, name).is_some() {
+                        let ty = type_symbol_in(&enclosing, name);
+                        return BoundExpr {
+                            kind: BoundExprKind::TypeReference(ty.clone()),
+                            ty,
+                        };
+                    }
+                }
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::MemberNotFound {
                         type_name: type_name.into(),
@@ -2481,13 +2801,52 @@ impl Binder {
         }
     }
 
+    /// Binds the target of an invocation `target(args)`. Like [`Self::bind_expression`], but for
+    /// a member access `E.M` it forms the METHOD GROUP when methods of that name are in `E`'s
+    /// chain, even if a non-invocable member (a field, or a nested type) of the same name hides
+    /// them for ordinary member access (7.4): `x.M()` finds an inherited method M though a
+    /// more-derived non-method M hides it (verified against csc). A delegate-typed value still
+    /// invokes directly via `Invoke`, so it is NOT overridden.
+    fn bind_call_target(&mut self, target: &Expr) -> BoundExpr {
+        let ExprKind::MemberAccess { receiver, name } = &target.kind else {
+            return self.bind_expression(target);
+        };
+        let recv = self.bind_expression(receiver);
+        if let BoundExprKind::NamespaceReference(namespace) = &recv.kind {
+            let namespace = namespace.clone();
+            return self.bind_qualified_name(&namespace, name, target.span);
+        }
+        if recv.ty.is_error() {
+            return self.member_access_of(recv, name, target.span);
+        }
+        let receiver_ty = match &recv.kind {
+            BoundExprKind::TypeReference(ty) => ty.clone(),
+            _ => recv.ty.clone(),
+        };
+        let hidden_by_delegate = match self.resolve_member(&receiver_ty, name) {
+            MemberResolution::Field(field) => self.is_delegate_type(&field.ty),
+            MemberResolution::Property { ty, .. } => self.is_delegate_type(&ty),
+            _ => false,
+        };
+        if !hidden_by_delegate && !self.methods_in_chain(&receiver_ty, name).is_empty() {
+            return BoundExpr {
+                kind: BoundExprKind::MethodGroup {
+                    receiver: Box::new(recv),
+                    name: name.clone(),
+                },
+                ty: TypeSymbol::Error,
+            };
+        }
+        self.member_access_of(recv, name, target.span)
+    }
+
     fn bind_invocation(
         &mut self,
         receiver_expr: &Expr,
         argument_exprs: &[Expr],
         span: Span,
     ) -> BoundExpr {
-        let callee = self.bind_expression(receiver_expr);
+        let callee = self.bind_call_target(receiver_expr);
         let callee = if self.is_delegate_value(&callee) {
             BoundExpr {
                 ty: TypeSymbol::Error,
@@ -2655,7 +3014,8 @@ impl Binder {
     ) -> Option<MethodSymbol> {
         match resolve_overload(&self.model, candidates, argument_types, arg_constants) {
             OverloadResult::Resolved(method) => {
-                self.check_accessible(declaring, method.accessibility, name, span);
+                let declaring_type = self.declaring_type_in_chain(declaring, name, &method.parameters);
+                self.check_accessible(&declaring_type, method.accessibility, name, span);
                 Some(method)
             }
             OverloadResult::Ambiguous => {
@@ -2914,20 +3274,24 @@ impl Binder {
                         )
                     };
                     if let Some(chosen) = chosen {
-                        if chosen.parameters.len() == arguments.len() {
+                        let ctor_ref = MethodReference {
+                            declaring_type: target_ty.clone(),
+                            name: ".ctor".into(),
+                            parameters: chosen.parameters.clone(),
+                            return_type: TypeSymbol::Special(SpecialType::Void),
+                            is_static: false,
+                        };
+                        if chosen.is_params {
+                            arguments =
+                                self.bind_params_arguments(&ctor_ref, core::mem::take(&mut arguments));
+                        } else if chosen.parameters.len() == arguments.len() {
                             arguments = core::mem::take(&mut arguments)
                                 .into_iter()
                                 .zip(chosen.parameters.iter())
                                 .map(|(argument, parameter)| self.convert(argument, parameter))
                                 .collect();
                         }
-                        constructor = Some(MethodReference {
-                            declaring_type: target_ty.clone(),
-                            name: ".ctor".into(),
-                            parameters: chosen.parameters,
-                            return_type: TypeSymbol::Special(SpecialType::Void),
-                            is_static: false,
-                        });
+                        constructor = Some(ctor_ref);
                     }
                 }
             }
@@ -3092,7 +3456,9 @@ impl Binder {
         let Some(current) = &self.current_type else {
             return false;
         };
-        if current == declaring {
+        if current == declaring
+            || fold_primitive_name(current) == fold_primitive_name(declaring)
+        {
             return true;
         }
         let declaring_name = declaring.to_string();
@@ -3203,6 +3569,7 @@ impl Binder {
         if is_interface {
             pending.insert(0, type_symbol_in("System", "Object"));
         }
+        let mut inaccessible: Option<MemberResolution> = None;
         while let Some(current_ty) = pending.pop() {
             if visited.contains(&current_ty) {
                 continue;
@@ -3211,28 +3578,48 @@ impl Binder {
             let Some(info) = self.type_info_of(&current_ty) else {
                 continue;
             };
-            if let Some(field) = info.find_field(name) {
-                return MemberResolution::Field(FieldReference {
-                    declaring_type: type_symbol_in(&info.namespace, &info.name),
-                    name: field.name.clone(),
-                    ty: self.resolve_type(&field.ty),
-                    is_static: field.is_static,
-                    is_readonly: field.is_readonly,
-                    accessibility: field.accessibility,
-                    constant: field.constant.clone(),
-                });
+            let declaring = type_symbol_in(&info.namespace, &info.name);
+            let (resolution, accessible) = if let Some(field) = info.find_field(name) {
+                (
+                    MemberResolution::Field(FieldReference {
+                        declaring_type: declaring.clone(),
+                        name: field.name.clone(),
+                        ty: self.resolve_type(&field.ty),
+                        is_static: field.is_static,
+                        is_readonly: field.is_readonly,
+                        accessibility: field.accessibility,
+                        constant: field.constant.clone(),
+                    }),
+                    self.is_accessible(&declaring, field.accessibility),
+                )
+            } else if let Some(property) = info.find_property(name) {
+                (
+                    MemberResolution::Property {
+                        declaring_type: declaring.clone(),
+                        ty: self.resolve_type(&property.ty),
+                        accessibility: property.accessibility,
+                        is_static: property.is_static,
+                    },
+                    self.is_accessible(&declaring, property.accessibility),
+                )
+            } else if info.methods_named(name).next().is_some() {
+                let any_accessible = info
+                    .methods_named(name)
+                    .any(|method| self.is_accessible(&declaring, method.accessibility));
+                (MemberResolution::MethodGroup, any_accessible)
+            } else {
+                for base in &info.bases {
+                    pending.push(base.clone());
+                }
+                if let Some(base) = &info.base {
+                    pending.push(base.clone());
+                }
+                continue;
+            };
+            if accessible {
+                return resolution;
             }
-            if let Some(property) = info.find_property(name) {
-                return MemberResolution::Property {
-                    declaring_type: type_symbol_in(&info.namespace, &info.name),
-                    ty: self.resolve_type(&property.ty),
-                    accessibility: property.accessibility,
-                    is_static: property.is_static,
-                };
-            }
-            if info.methods_named(name).next().is_some() {
-                return MemberResolution::MethodGroup;
-            }
+            inaccessible.get_or_insert(resolution);
             for base in &info.bases {
                 pending.push(base.clone());
             }
@@ -3240,7 +3627,7 @@ impl Binder {
                 pending.push(base.clone());
             }
         }
-        MemberResolution::NoSuchMember(ty.to_string())
+        inaccessible.unwrap_or(MemberResolution::NoSuchMember(ty.to_string()))
     }
 
     /// Resolves a simple name against the STATIC members of the current type's enclosing types
@@ -3297,6 +3684,12 @@ impl Binder {
     /// The model entry for a named type, if any.
     fn type_info_of(&self, ty: &TypeSymbol) -> Option<&TypeInfo> {
         self.model.get_by_symbol(ty)
+    }
+
+    /// Whether `ty` is a delegate type (its values are invocable via `Invoke`).
+    fn is_delegate_type(&self, ty: &TypeSymbol) -> bool {
+        self.type_info_of(ty)
+            .is_some_and(|info| info.kind == TypeKind::Delegate)
     }
 
     /// Whether `expr` is a delegate-typed VALUE (so `expr(args)` means `expr.Invoke(args)`)
@@ -3712,6 +4105,22 @@ impl Binder {
                 return self.session_field_access(&receiver, &repl_type, &stable, &ty);
             }
         }
+        if let Some(TypeSymbol::Named(parts)) = &self.current_type {
+            let mut enclosing = String::new();
+            for part in parts.iter() {
+                if !enclosing.is_empty() {
+                    enclosing.push('.');
+                }
+                enclosing.push_str(part);
+            }
+            if self.model.get(&enclosing, name).is_some() {
+                let ty = type_symbol_in(&enclosing, name);
+                return BoundExpr {
+                    kind: BoundExprKind::TypeReference(ty.clone()),
+                    ty,
+                };
+            }
+        }
         if let Some(current) = self.current_type.clone() {
             match self.resolve_member(&current, name) {
                 MemberResolution::Field(field) => {
@@ -3725,11 +4134,22 @@ impl Binder {
                     };
                 }
                 MemberResolution::Property {
-                    declaring_type, ty, ..
+                    declaring_type,
+                    ty,
+                    is_static,
+                    ..
                 } => {
+                    let receiver = if is_static {
+                        BoundExpr {
+                            kind: BoundExprKind::TypeReference(current.clone()),
+                            ty: current.clone(),
+                        }
+                    } else {
+                        self.implicit_receiver()
+                    };
                     return BoundExpr {
                         kind: BoundExprKind::PropertyAccess {
-                            receiver: Box::new(self.implicit_receiver()),
+                            receiver: Box::new(receiver),
                             declaring_type,
                             name: name.into(),
                         },
@@ -3758,19 +4178,20 @@ impl Binder {
             };
         }
         let hits = self.type_namespaces_containing(name);
-        if hits.len() == 1 {
-            let ty = type_symbol_in(&hits[0], name);
-            return BoundExpr {
-                kind: BoundExprKind::TypeReference(ty.clone()),
-                ty,
-            };
-        }
-        if hits.len() >= 2 {
+        if let Some((namespace, imported)) = hits.first() {
+            let ambiguous_import = *imported && hits.get(1).is_some_and(|(_, other)| *other);
+            if !ambiguous_import {
+                let ty = type_symbol_in(namespace, name);
+                return BoundExpr {
+                    kind: BoundExprKind::TypeReference(ty.clone()),
+                    ty,
+                };
+            }
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::AmbiguousReference {
                     name: name.into(),
-                    first: full_type_name(&hits[0], name),
-                    second: full_type_name(&hits[1], name),
+                    first: full_type_name(&hits[0].0, name),
+                    second: full_type_name(&hits[1].0, name),
                 },
                 span,
             ));
@@ -3873,7 +4294,9 @@ fn pointer_binary_result(
     left: &TypeSymbol,
     right: &TypeSymbol,
 ) -> Option<TypeSymbol> {
-    use BinaryOperator::{Add, Subtract};
+    use BinaryOperator::{
+        Add, Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual, Subtract,
+    };
     let integral = |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(special) if special.is_integral());
     match (operator, left, right) {
         (Add, TypeSymbol::Pointer(_), other) | (Add, other, TypeSymbol::Pointer(_))
@@ -3889,6 +4312,11 @@ fn pointer_binary_result(
         (Subtract, TypeSymbol::Pointer(a), TypeSymbol::Pointer(b)) if a == b => {
             Some(TypeSymbol::Special(SpecialType::Int64))
         }
+        (
+            Equal | NotEqual | LessThan | LessThanOrEqual | GreaterThan | GreaterThanOrEqual,
+            TypeSymbol::Pointer(_),
+            TypeSymbol::Pointer(_),
+        ) => Some(TypeSymbol::Special(SpecialType::Boolean)),
         _ => None,
     }
 }
@@ -3907,7 +4335,11 @@ fn binary_result_type(
     match operator {
         Op::Add
             if (left_special == Some(SpecialType::String)
-                || right_special == Some(SpecialType::String))
+                || right_special == Some(SpecialType::String)
+                || (left_special == Some(SpecialType::Object)
+                    && right_special == Some(SpecialType::Null))
+                || (right_special == Some(SpecialType::Object)
+                    && left_special == Some(SpecialType::Null)))
                 && !left.is_void()
                 && !right.is_void() =>
         {
@@ -4158,6 +4590,30 @@ pub(crate) fn constant_int_value(expr: &BoundExpr) -> Option<i64> {
 /// Coerces a constant integer `value` to the integral or `char` type `target`, wrapping to
 /// the target's width (14.15 over a numeric/char cast, unchecked). `None` for a non-integral
 /// target (a floating or decimal cast is not folded).
+/// Casts a constant literal to a `Special` target type at compile time (6.2.1): a real operand
+/// rounds to a floating-point target's precision or truncates toward zero to an integral target; an
+/// integer operand goes through [`coerce_constant`]. Used to fold `(T)constant`.
+pub(crate) fn cast_constant(operand: &Literal, target: SpecialType) -> Option<Literal> {
+    use SpecialType as S;
+    match operand {
+        Literal::Real { bits, .. } => {
+            let value = f64::from_bits(*bits);
+            match target {
+                S::Single => Some(Literal::Real {
+                    bits: f64::from(value as f32).to_bits(),
+                    suffix: RealSuffix::Float,
+                }),
+                S::Double => Some(Literal::Real {
+                    bits: value.to_bits(),
+                    suffix: RealSuffix::Double,
+                }),
+                _ => coerce_constant(value as i64, target),
+            }
+        }
+        _ => coerce_constant(literal_int_value(operand)?, target),
+    }
+}
+
 pub(crate) fn coerce_constant(value: i64, target: SpecialType) -> Option<Literal> {
     use SpecialType as S;
     Some(match target {
@@ -4169,6 +4625,14 @@ pub(crate) fn coerce_constant(value: i64, target: SpecialType) -> Option<Literal
         S::UInt32 => integer_literal(i64::from(value as u32)),
         S::Int64 | S::UInt64 => integer_literal(value),
         S::Char => Literal::Character(value as u16),
+        S::Single => Literal::Real {
+            bits: f64::from(value as f32).to_bits(),
+            suffix: RealSuffix::Float,
+        },
+        S::Double => Literal::Real {
+            bits: (value as f64).to_bits(),
+            suffix: RealSuffix::Double,
+        },
         _ => return None,
     })
 }
@@ -4186,7 +4650,16 @@ pub(crate) fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
         BoundExprKind::FieldAccess {
             field: Some(field), ..
         } => field.constant.clone(),
-        BoundExprKind::Conversion { operand, .. } => constant_literal_value(operand),
+        BoundExprKind::Conversion { operand, .. } => {
+            let inner = constant_literal_value(operand)?;
+            match (&expr.ty, &inner) {
+                (
+                    TypeSymbol::Special(target @ (SpecialType::Single | SpecialType::Double)),
+                    Literal::Integer { .. },
+                ) => coerce_constant(literal_int_value(&inner)?, *target),
+                _ => Some(inner),
+            }
+        }
         BoundExprKind::Unary { operator, operand } => {
             fold_const_unary(*operator, &constant_literal_value(operand)?)
         }
@@ -4202,7 +4675,7 @@ pub(crate) fn constant_literal_value(expr: &BoundExpr) -> Option<Literal> {
         ),
         BoundExprKind::Cast { operand, .. } => match &expr.ty {
             TypeSymbol::Special(target) => {
-                coerce_constant(literal_int_value(&constant_literal_value(operand)?)?, *target)
+                cast_constant(&constant_literal_value(operand)?, *target)
             }
             _ => None,
         },
@@ -4687,6 +5160,28 @@ fn binary_numeric_promotion(left: SpecialType, right: SpecialType) -> Option<Spe
 }
 
 /// Whether a special type is one of the integral types (14.8 shift, bitwise).
+/// Folds a qualified framework-primitive name (`System.Decimal`, `System.Int32`) to its keyword
+/// `Special` form -- matching what SignatureCanon does at the token layer -- so a type compiling
+/// its own members compares equal whether spelled as the framework name or the folded primitive.
+/// System.Enum and System.ValueType extend System.ValueType in metadata but are themselves
+/// REFERENCE types (a value of that static type is a boxed object), so a concrete value type boxes
+/// when converted to one -- they are never value types despite the model marking their kind.
+fn is_reference_base_class(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Named(parts)
+        if matches!(&**parts, [ns, name] if &**ns == "System" && (&**name == "Enum" || &**name == "ValueType")))
+}
+
+fn fold_primitive_name(ty: &TypeSymbol) -> TypeSymbol {
+    if let TypeSymbol::Named(parts) = ty {
+        if parts.len() == 2 {
+            if let Some(special) = crate::reference::special_for_named(&parts[0], &parts[1]) {
+                return TypeSymbol::Special(special);
+            }
+        }
+    }
+    ty.clone()
+}
+
 fn is_integral(special: SpecialType) -> bool {
     use SpecialType::{Byte, Char, Int16, Int32, Int64, SByte, UInt16, UInt32, UInt64};
     matches!(

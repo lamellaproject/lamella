@@ -9,5 +9,10 @@ namespace System.Reflection
         {
             [Lamella.Runtime.RuntimeProvided] get { return null; }
         }
+
+        public ParameterInfo ReturnParameter
+        {
+            get { return new ParameterInfo(this, -1, ReturnType, null); }
+        }
     }
 }

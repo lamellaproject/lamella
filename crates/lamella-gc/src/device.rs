@@ -12,6 +12,7 @@ use core::cell::UnsafeCell;
 use crate::device_heap::{DeviceHeap, DeviceTypeDesc};
 use crate::heap::{Heap, Ref, StackMapTable, TypeDesc};
 
+
 /// The signature of the out-of-memory roots hook: given the live heap, report every
 /// root slot to `visit` so the subsequent compaction relocates them. This is the seam
 /// the device build fills with "decode the AOT frames at the captured SP/return_pc";
@@ -115,12 +116,19 @@ pub fn lamella_gc_alloc(payload_size: u32, type_desc_id: u32) -> u32 {
         if let Some(reference) = heap.alloc(type_desc_id) {
             return reference.0;
         }
-        let hook = unsafe { *GC.oom_roots.get() };
-        match hook {
-            Some(hook) => collect_via_hook(heap, hook),
-            None => heap.collect(|_visit| {}),
+        #[cfg(feature = "gc-collect")]
+        {
+            let hook = unsafe { *GC.oom_roots.get() };
+            match hook {
+                Some(hook) => collect_via_hook(heap, hook),
+                None => heap.collect(|_visit| {}),
+            }
+            heap.alloc(type_desc_id).map_or(Ref::NULL.0, |r| r.0)
         }
-        heap.alloc(type_desc_id).map_or(Ref::NULL.0, |r| r.0)
+        #[cfg(not(feature = "gc-collect"))]
+        {
+            Ref::NULL.0
+        }
     })
 }
 
@@ -128,6 +136,7 @@ pub fn lamella_gc_alloc(payload_size: u32, type_desc_id: u32) -> u32 {
 /// `heap` by the hook and by `collect` is expressed in one place: the hook is handed the
 /// heap to read its roots from (it may inspect object layouts) and the `visit` sink that
 /// `Heap::collect` drives twice (mark, then relocate).
+#[cfg(feature = "gc-collect")]
 fn collect_via_hook(heap: &mut Heap, hook: OomRootsHook) {
     let mut roots: Vec<Ref> = Vec::new();
     hook(heap, &mut |slot: &mut Ref| roots.push(*slot));
@@ -148,6 +157,7 @@ fn collect_via_hook(heap: &mut Heap, hook: OomRootsHook) {
 /// safepoint return address) down through each caller via `stack_maps`, reclaims the
 /// unreachable, compacts the survivors, and writes every relocated reference back into
 /// `stack`. Delegates wholesale to [`Heap::collect_stack`] on the global heap.
+#[cfg(feature = "gc-collect")]
 pub fn lamella_gc_collect(
     stack: &mut [u8],
     sp: u32,
@@ -256,8 +266,15 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
         if let Some(reference) = unsafe { heap.alloc(type_desc) } {
             return heap.payload_ptr(reference);
         }
-        heap.collect(|_visit| {});
-        unsafe { heap.alloc(type_desc) }.map_or(core::ptr::null_mut(), |r| heap.payload_ptr(r))
+        #[cfg(feature = "gc-collect")]
+        {
+            heap.collect(|_visit| {});
+            unsafe { heap.alloc(type_desc) }.map_or(core::ptr::null_mut(), |r| heap.payload_ptr(r))
+        }
+        #[cfg(not(feature = "gc-collect"))]
+        {
+            core::ptr::null_mut()
+        }
     })
 }
 
@@ -265,6 +282,7 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
 /// `(sp, return_pc)` against the installed stack maps and relocates the survivors,
 /// rewriting the roots in `stack`. The pointer-ABI counterpart of [`lamella_gc_collect`],
 /// over the global [`DeviceHeap`].
+#[cfg(feature = "gc-collect")]
 pub fn lamella_gc_collect_device(stack: &mut [u8], sp: u32, return_pc: u32) {
     with_device_heap(|heap| {
         let maps = unsafe { &*DEVICE_GC.stack_maps.get() };
@@ -317,7 +335,9 @@ fn critical_section<R>(body: impl FnOnce() -> R) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::heap::{StackMapEntry, ALIGN, HEADER_SIZE};
+    use crate::heap::{ALIGN, HEADER_SIZE};
+    #[cfg(feature = "gc-collect")]
+    use crate::heap::StackMapEntry;
     use alloc::vec;
     use std::sync::{Mutex, MutexGuard};
 
@@ -344,6 +364,7 @@ mod tests {
     }
 
     /// A type with a single reference field at payload offset 0.
+    #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
     fn one_ref() -> TypeDesc {
         TypeDesc {
             payload_size: 4,
@@ -353,6 +374,7 @@ mod tests {
     }
 
     /// Reads a [`Ref`] back from a stack image at `at`.
+    #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
     fn get_ref(image: &[u8], at: usize) -> Ref {
         Ref(u32::from_le_bytes([
             image[at],
@@ -363,6 +385,7 @@ mod tests {
     }
 
     /// Writes a [`Ref`] as 4 little-endian bytes into a stack image at `at`.
+    #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
     fn put_ref(image: &mut [u8], at: usize, reference: Ref) {
         image[at..at + 4].copy_from_slice(&reference.0.to_le_bytes());
     }
@@ -385,11 +408,15 @@ mod tests {
         assert_ne!(a, b);
 
         let c = lamella_gc_alloc(4, 0);
+        #[cfg(feature = "gc-collect")]
         assert_eq!(c, ALIGN + HEADER_SIZE, "OOM collect freed unrooted a,b; retry reuses front");
+        #[cfg(not(feature = "gc-collect"))]
+        assert_eq!(c, Ref::NULL.0, "the bump tier's OOM is final: null, no collect, no retry");
 
         lamella_gc_teardown();
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn alloc_returns_null_when_object_cannot_fit_even_after_collect() {
         let _guard = lock();
@@ -409,6 +436,7 @@ mod tests {
         lamella_gc_teardown();
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn oom_collect_with_no_roots_reclaims_then_retry_succeeds() {
         let _guard = lock();
@@ -425,6 +453,7 @@ mod tests {
         lamella_gc_teardown();
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn collect_via_stack_relocates_frame_roots_and_reclaims_garbage() {
         let _guard = lock();
@@ -465,6 +494,7 @@ mod tests {
         lamella_gc_teardown();
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn oom_roots_hook_keeps_live_objects_across_the_retry_collect() {
         let _guard = lock();
@@ -556,6 +586,7 @@ mod device_abi_tests {
         assert_eq!(p, unsafe { base.add((ALIGN + HEADER_SIZE) as usize) });
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn device_alloc_impl_returns_null_on_hard_oom_after_a_collect() {
         let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
@@ -566,6 +597,7 @@ mod device_abi_tests {
         assert!(p.is_null());
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn device_alloc_impl_oom_collects_unrooted_garbage_then_the_retry_succeeds() {
         let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());

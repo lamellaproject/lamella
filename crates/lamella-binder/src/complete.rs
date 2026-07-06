@@ -547,7 +547,7 @@ fn resolve_type_name(model: &Model, name: &str) -> Option<TypeSymbol> {
     if model.get("", name).is_some() {
         return Some(TypeSymbol::Named([Box::from(name)].into()));
     }
-    model.type_with_simple_name(name)
+    model.type_with_simple_name(name).map(TypeSymbol::fold_builtin)
 }
 
 /// The predefined `SpecialType` a primitive keyword names (`string`, `int`, ...), so

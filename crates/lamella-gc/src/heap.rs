@@ -317,6 +317,7 @@ impl Heap {
     /// the header-word -> type lookup, supplied here by [`TableResolver`] (a
     /// table-index lookup) and on device by a raw-pointer dereference. This keeps one
     /// collector serving both the host-test heap and the on-device heap.
+    #[cfg(feature = "gc-collect")]
     pub fn collect<R>(&mut self, enumerate_roots: R)
     where
         R: FnMut(&mut dyn FnMut(&mut Ref)),
@@ -335,6 +336,7 @@ impl Heap {
     ///
     /// One frame only: multi-frame walking via the saved LR
     /// (`sp + frame_size`) is a later increment.
+    #[cfg(feature = "gc-collect")]
     pub fn collect_frame(&mut self, frame: &mut [u8], sp: u32, entry: &StackMapEntry) {
         self.collect(|visit| {
             for &ref_offset in &entry.ref_offsets {
@@ -368,6 +370,7 @@ impl Heap {
     /// when it returns `None` -- the bottom frame's saved LR is the runtime entry
     /// trampoline's return address, which has no safepoint. A frame cap guards against a
     /// malformed or cyclic walk so a corrupt chain stops rather than looping forever.
+    #[cfg(feature = "gc-collect")]
     pub fn collect_stack(
         &mut self,
         stack: &mut [u8],
@@ -422,6 +425,7 @@ impl Heap {
 /// (to trace and relocate). `for_each_ref_offset` is a callback rather than a returned
 /// slice so the device side reads the inline `ref_offsets` array straight out of the
 /// descriptor with no per-object allocation (the host side stays `alloc`-free here too).
+#[cfg(feature = "gc-collect")]
 pub(crate) trait TypeResolver {
     /// The payload size, in bytes, of the object whose header holds `header_word`.
     fn payload_size(&self, header_word: u32) -> u32;
@@ -441,10 +445,12 @@ pub(crate) trait TypeResolver {
 /// The host resolver: an object's header word is an index into a [`TypeDesc`] table.
 /// This reproduces exactly the lookup the host engine used before [`mark_compact`] was
 /// factored out, so the host tests see identical behaviour.
+#[cfg(feature = "gc-collect")]
 pub(crate) struct TableResolver<'a> {
     pub(crate) type_descs: &'a [TypeDesc],
 }
 
+#[cfg(feature = "gc-collect")]
 impl TypeResolver for TableResolver<'_> {
     fn payload_size(&self, header_word: u32) -> u32 {
         self.type_descs[header_word as usize].payload_size
@@ -477,6 +483,7 @@ impl TypeResolver for TableResolver<'_> {
 /// clobbers an unmoved survivor). RELOCATE rewrites every root and every survivor
 /// field through the `old_payload -> new_payload` forwarding map; null stays null. The
 /// freed tail is zeroed so a later allocation never reads stale bytes.
+#[cfg(feature = "gc-collect")]
 pub(crate) fn mark_compact<R>(
     bytes: &mut [u8],
     resolver: &dyn TypeResolver,
@@ -583,6 +590,7 @@ mod tests {
     }
 
     /// A type with a single reference field at payload offset 0.
+    #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
     fn one_ref() -> TypeDesc {
         TypeDesc {
             payload_size: 4,
@@ -627,6 +635,7 @@ mod tests {
         assert!(heap.alloc(0).is_none());
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn linear_chain_reclaims_garbage_and_relocates_the_field() {
         let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
@@ -651,6 +660,7 @@ mod tests {
         assert!(heap.top() < top_before);
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn cycle_survives_with_both_refs_consistent() {
         let mut heap = Heap::new(4096, vec![one_ref()]);
@@ -669,6 +679,7 @@ mod tests {
         assert_eq!(heap.top(), ALIGN + 2 * (HEADER_SIZE + 4));
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn no_garbage_keeps_every_object() {
         let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
@@ -690,6 +701,7 @@ mod tests {
         assert_eq!(heap.type_id_of(roots[1]), 1);
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn all_garbage_resets_to_base() {
         let mut heap = Heap::new(4096, vec![leaf(), leaf()]);
@@ -705,6 +717,7 @@ mod tests {
         assert_eq!(fresh, Ref(ALIGN + HEADER_SIZE));
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn null_root_and_null_field_stay_null() {
         let mut heap = Heap::new(4096, vec![one_ref()]);
@@ -719,6 +732,7 @@ mod tests {
         assert_eq!(heap.read_ref_field(roots[0], 0), Ref::NULL);
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn tagged_interior_relocates_pointers_and_leaves_fixnums() {
         let container = TypeDesc {
@@ -813,6 +827,7 @@ mod tests {
         assert!(StackMapTable::decode(&bytes[..bytes.len() - 1]).is_none());
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn frame_integration_relocates_roots_through_the_stack_map() {
         let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
@@ -850,11 +865,13 @@ mod tests {
     }
 
     /// Writes a [`Ref`] as 4 little-endian bytes into a stack/frame image at `at`.
+    #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
     fn put_ref(image: &mut [u8], at: usize, reference: Ref) {
         image[at..at + 4].copy_from_slice(&reference.0.to_le_bytes());
     }
 
     /// Reads a [`Ref`] back from a stack/frame image at `at`.
+    #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
     fn get_ref(image: &[u8], at: usize) -> Ref {
         Ref(u32::from_le_bytes([
             image[at],
@@ -864,6 +881,7 @@ mod tests {
         ]))
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn stack_walk_two_frames_relocates_every_frame_and_reclaims_garbage() {
         let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
@@ -924,6 +942,7 @@ mod tests {
         assert_eq!(heap.top(), ALIGN + five_objects);
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn stack_walk_three_frames_traverses_two_saved_lr_hops() {
         let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);
@@ -972,6 +991,7 @@ mod tests {
         assert_eq!(heap.top(), ALIGN + four_objects);
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn stack_walk_single_frame_matches_collect_frame() {
         let make = || {
@@ -1014,6 +1034,7 @@ mod tests {
         assert_eq!(heap.type_id_of(c_new), 1);
     }
 
+    #[cfg(feature = "gc-collect")]
     #[test]
     fn stack_walk_with_unmapped_top_pc_collects_with_no_roots() {
         let mut heap = Heap::new(4096, vec![one_ref(), leaf()]);

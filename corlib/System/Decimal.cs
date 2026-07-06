@@ -85,11 +85,16 @@ namespace System
 
         private bool IsZero { get { return lo == 0 && mid == 0 && hi == 0; } }
 
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator +(Decimal d1, Decimal d2) { return new Decimal(); }
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator -(Decimal d1, Decimal d2) { return new Decimal(); }
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator *(Decimal d1, Decimal d2) { return new Decimal(); }
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator /(Decimal d1, Decimal d2) { return new Decimal(); }
-        [Lamella.Runtime.RuntimeProvided] public static Decimal operator %(Decimal d1, Decimal d2) { return new Decimal(); }
+        [Lamella.Runtime.RuntimeProvided] private static Decimal DecAdd(Decimal d1, Decimal d2) { return new Decimal(); }
+        public static Decimal operator +(Decimal d1, Decimal d2) { return DecAdd(d1, d2); }
+        [Lamella.Runtime.RuntimeProvided] private static Decimal DecSub(Decimal d1, Decimal d2) { return new Decimal(); }
+        public static Decimal operator -(Decimal d1, Decimal d2) { return DecSub(d1, d2); }
+        [Lamella.Runtime.RuntimeProvided] private static Decimal DecMul(Decimal d1, Decimal d2) { return new Decimal(); }
+        public static Decimal operator *(Decimal d1, Decimal d2) { return DecMul(d1, d2); }
+        [Lamella.Runtime.RuntimeProvided] private static Decimal DecDiv(Decimal d1, Decimal d2) { return new Decimal(); }
+        public static Decimal operator /(Decimal d1, Decimal d2) { return DecDiv(d1, d2); }
+        [Lamella.Runtime.RuntimeProvided] private static Decimal DecRem(Decimal d1, Decimal d2) { return new Decimal(); }
+        public static Decimal operator %(Decimal d1, Decimal d2) { return DecRem(d1, d2); }
 
         [Lamella.Runtime.RuntimeProvided] public static int Compare(Decimal d1, Decimal d2) { return 0; }
 
@@ -157,7 +162,7 @@ namespace System
 
         public static explicit operator double(Decimal value) { return ToDouble(value); }
 
-        public static explicit operator long(Decimal value)
+        private static long ToInt64(Decimal value)
         {
             ulong magnitude = value.IntegerMagnitude();
             if (value.IsNegative)
@@ -170,9 +175,11 @@ namespace System
             return (long)magnitude;
         }
 
+        public static explicit operator long(Decimal value) { return ToInt64(value); }
+
         public static explicit operator int(Decimal value)
         {
-            long asLong = (long)value;
+            long asLong = ToInt64(value);
             if (asLong < -2147483648L || asLong > 2147483647L) throw new OverflowException("Value was either too large or too small for an Int32.");
             return (int)asLong;
         }

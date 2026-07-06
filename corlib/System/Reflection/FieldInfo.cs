@@ -13,5 +13,17 @@ namespace System.Reflection
         [Lamella.Runtime.RuntimeProvided] public object GetValue(object obj) { return null; }
 
         [Lamella.Runtime.RuntimeProvided] public void SetValue(object obj, object value) { }
+
+        public bool IsLiteral
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return false; }
+        }
+
+        public bool IsStatic
+        {
+            [Lamella.Runtime.RuntimeProvided] get { return false; }
+        }
+
+        [Lamella.Runtime.RuntimeProvided] public object GetRawConstantValue() { return null; }
     }
 }

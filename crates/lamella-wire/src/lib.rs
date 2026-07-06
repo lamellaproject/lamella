@@ -11,6 +11,13 @@ use alloc::vec::Vec;
 /// The current protocol version this build implements. A peer advertises a [`ProtocolRange`] around it.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// Identity + descriptors for the native driverless-WinUSB wireline carrier (the fast
+/// interpreter-flash path): the shared VID/PID + WinUSB interface GUID + bulk endpoints, plus the
+/// BOS / Microsoft OS 2.0 / WebUSB descriptor bytes a firmware embeds so Windows auto-loads
+/// `winusb.sys` (no INF) and a browser can claim it. One home so firmware, host, and browser cannot
+/// drift.
+pub mod usb;
+
 /// The frame's leading sync magic ("LW" -- Lamella Wire). A receiver scans for it to find a frame
 /// boundary after attaching mid-stream or recovering from line noise.
 const SYNC: [u8; 2] = [0x4C, 0x57];
@@ -192,6 +199,9 @@ impl Capabilities {
     /// Run a host-BAKED flash image (`RUN_IMAGE`) -- a PE-less constrained target sets this
     /// instead of [`Capabilities::REPL_RUN`]; the host bakes each submission and ships the image.
     pub const BAKED_IMAGE: u32 = 1 << 8;
+    /// Debug the PERSISTENTLY DEPLOYED image in place (a 0-byte debug attach instead of
+    /// re-sending the image over the wire) -- deploy-capable targets only.
+    pub const DEBUG_ATTACH: u32 = 1 << 9;
 
     /// Whether this set includes `flag`.
     #[must_use]
@@ -242,26 +252,101 @@ impl Hello {
     }
 }
 
-/// The target's `HELLO_ACK`: the negotiated version + the target's capabilities.
+/// The RESIDENT-PROFILE identity a target may append to its `HELLO_ACK` -- the board telling the
+/// IDE what it is (docs/deployment-tiers.md), so a host scopes completion/validation to exactly
+/// the surface the target carries and keys a cached manifest without a second round-trip.
+///
+/// `abi` is the intrinsic-ABI LEVEL (bumped only when an existing intrinsic's semantics change
+/// incompatibly); `hash` is the CONTENT hash of the resident surface -- the intrinsic-registry
+/// fingerprint, which already differs per profile build, folded with a resident corlib's content
+/// hash once Tier-2 targets carry one. `name` is a short display / manifest-cache hint
+/// ("netmf-v4_4", "kernel-floor"), capped at [`Self::NAME_CAP`] bytes so the identity stays a
+/// fixed-size `Copy` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProfileIdentity {
+    /// The intrinsic-ABI level.
+    pub abi: u16,
+    /// The content hash of the resident surface.
+    pub hash: u64,
+    name_len: u8,
+    name: [u8; Self::NAME_CAP],
+}
+
+impl ProfileIdentity {
+    /// Maximum profile-name length on the wire (bytes; names are ASCII by convention).
+    pub const NAME_CAP: usize = 16;
+    /// Encoded size: `abi(2) | hash(8) | name_len(1)` before the name bytes.
+    const FIXED_LEN: usize = 11;
+
+    /// Build an identity; a `name` past [`Self::NAME_CAP`] bytes is truncated at a char boundary.
+    #[must_use]
+    pub fn new(abi: u16, hash: u64, name: &str) -> Self {
+        let mut take = name.len().min(Self::NAME_CAP);
+        while !name.is_char_boundary(take) {
+            take -= 1;
+        }
+        let mut buf = [0u8; Self::NAME_CAP];
+        buf[..take].copy_from_slice(&name.as_bytes()[..take]);
+        Self { abi, hash, name_len: take as u8, name: buf }
+    }
+
+    /// The profile name.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        core::str::from_utf8(&self.name[..self.name_len as usize]).unwrap_or("")
+    }
+
+    fn encode_into(&self, payload: &mut Vec<u8>) {
+        payload.extend_from_slice(&self.abi.to_le_bytes());
+        payload.extend_from_slice(&self.hash.to_le_bytes());
+        payload.push(self.name_len);
+        payload.extend_from_slice(&self.name[..self.name_len as usize]);
+    }
+
+    /// Decode from `bytes`; `None` if the fixed head or the declared name is not fully present.
+    fn decode_from(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < Self::FIXED_LEN {
+            return None;
+        }
+        let abi = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let hash = u64::from_le_bytes(bytes[2..10].try_into().ok()?);
+        let name_len = (bytes[10] as usize).min(Self::NAME_CAP);
+        let name_bytes = bytes.get(Self::FIXED_LEN..Self::FIXED_LEN + name_len)?;
+        let mut name = [0u8; Self::NAME_CAP];
+        name[..name_len].copy_from_slice(name_bytes);
+        Some(Self { abi, hash, name_len: name_len as u8, name })
+    }
+}
+
+/// The target's `HELLO_ACK`: the negotiated version + the target's capabilities, optionally
+/// followed by its resident-profile identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HelloAck {
     /// The negotiated protocol version (the top of the overlapping range).
     pub chosen: u16,
     /// The capabilities the target offers.
     pub caps: Capabilities,
+    /// The target's resident-profile identity, when it advertises one (a pre-identity target, or
+    /// a truncated tail, decodes as `None` -- the handshake itself never depends on it).
+    pub profile: Option<ProfileIdentity>,
 }
 
 impl HelloAck {
-    /// `chosen(2) | caps(4)`, little-endian.
+    /// `chosen(2) | caps(4)`, little-endian, then (when present) the profile identity
+    /// `abi(2) | hash(8) | name_len(1) | name`. An old host's decode skips the tail.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(6);
+        let mut payload = Vec::with_capacity(6 + ProfileIdentity::FIXED_LEN + ProfileIdentity::NAME_CAP);
         payload.extend_from_slice(&self.chosen.to_le_bytes());
         payload.extend_from_slice(&self.caps.0.to_le_bytes());
+        if let Some(profile) = &self.profile {
+            profile.encode_into(&mut payload);
+        }
         payload
     }
 
-    /// Decode, tolerating a longer payload (a newer peer's trailing fields are skipped).
+    /// Decode, tolerating a longer payload (a newer peer's trailing fields are skipped) and an
+    /// absent/short identity tail (`profile` = `None`).
     #[must_use]
     pub fn decode(payload: &[u8]) -> Option<Self> {
         if payload.len() < 6 {
@@ -270,6 +355,7 @@ impl HelloAck {
         Some(Self {
             chosen: u16::from_le_bytes([payload[0], payload[1]]),
             caps: Capabilities(u32::from_le_bytes([payload[2], payload[3], payload[4], payload[5]])),
+            profile: ProfileIdentity::decode_from(&payload[6..]),
         })
     }
 }
@@ -320,22 +406,76 @@ pub struct Negotiated {
     pub version: u16,
     /// The capabilities both sides offer.
     pub caps: Capabilities,
+    /// The target's resident-profile identity, when it advertised one.
+    pub profile: Option<ProfileIdentity>,
 }
 
 /// The target's reply to a `HELLO`: accept with the negotiated version + the target's capabilities, or
-/// reject with the target's range.
+/// reject with the target's range. The target attaches its [`ProfileIdentity`] afterwards (the
+/// negotiation itself never depends on it).
 pub fn target_respond(host: &Hello, target_range: ProtocolRange, target_caps: Capabilities) -> Result<HelloAck, Nak> {
     match negotiate(host.range, target_range) {
-        Some(chosen) => Ok(HelloAck { chosen, caps: target_caps }),
+        Some(chosen) => Ok(HelloAck { chosen, caps: target_caps, profile: None }),
         None => Err(Nak { target_range }),
     }
 }
 
 /// The host's session parameters from the target's `HELLO_ACK`: the chosen version + the capability
-/// INTERSECTION (only what both sides offer).
+/// INTERSECTION (only what both sides offer) + the target's profile identity as advertised.
 #[must_use]
 pub fn host_finish(ack: &HelloAck, host_caps: Capabilities) -> Negotiated {
-    Negotiated { version: ack.chosen, caps: host_caps.intersect(ack.caps) }
+    Negotiated { version: ack.chosen, caps: host_caps.intersect(ack.caps), profile: ack.profile }
+}
+
+/// The full resident-profile MANIFEST a target returns for a `GET_PROFILE` request (the message
+/// ids live beside the serve loop in `lamella-runner`): the identity plus the complete resident
+/// surface -- today the intrinsic-id list; a Tier-2 target grows a resident-assembly section in a
+/// later manifest version. A host asks only when [`ProfileIdentity::hash`] misses its cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileManifest {
+    /// The same identity the `HELLO_ACK` advertises.
+    pub identity: ProfileIdentity,
+    /// Every intrinsic id this target registers, in registry order.
+    pub intrinsic_ids: Vec<u32>,
+}
+
+impl ProfileManifest {
+    /// Manifest layout version.
+    pub const VERSION: u8 = 1;
+
+    /// `version(1) | abi(2) | hash(8) | name_len(1) | name | count(2) | count x id(4)`, LE.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut payload =
+            Vec::with_capacity(1 + ProfileIdentity::FIXED_LEN + ProfileIdentity::NAME_CAP + 2 + self.intrinsic_ids.len() * 4);
+        payload.push(Self::VERSION);
+        self.identity.encode_into(&mut payload);
+        let count = self.intrinsic_ids.len().min(u16::MAX as usize);
+        payload.extend_from_slice(&(count as u16).to_le_bytes());
+        for id in &self.intrinsic_ids[..count] {
+            payload.extend_from_slice(&id.to_le_bytes());
+        }
+        payload
+    }
+
+    /// Decode, tolerating a longer payload; `None` on an unknown version or a truncated list.
+    #[must_use]
+    pub fn decode(payload: &[u8]) -> Option<Self> {
+        if payload.first() != Some(&Self::VERSION) {
+            return None;
+        }
+        let identity = ProfileIdentity::decode_from(payload.get(1..)?)?;
+        let ids_at = 1 + ProfileIdentity::FIXED_LEN + identity.name_len as usize;
+        let count_bytes = payload.get(ids_at..ids_at + 2)?;
+        let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
+        let mut intrinsic_ids = Vec::with_capacity(count);
+        for index in 0..count {
+            let at = ids_at + 2 + index * 4;
+            let bytes = payload.get(at..at + 4)?;
+            intrinsic_ids.push(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        }
+        Some(Self { identity, intrinsic_ids })
+    }
 }
 
 /// A carrier error.
@@ -445,6 +585,48 @@ mod tests {
         assert_eq!(frame.msg_type, msg::PING);
         assert_eq!(frame.seq, 1);
         assert_eq!(frame.payload, vec![0xAB]);
+    }
+
+    #[test]
+    fn hello_ack_profile_identity_round_trips_and_stays_optional() {
+        let bare = HelloAck { chosen: 1, caps: Capabilities(0x107), profile: None };
+        let bytes = bare.encode();
+        assert_eq!(bytes.len(), 6, "no identity -> the pre-identity 6-byte ack");
+        assert_eq!(HelloAck::decode(&bytes), Some(bare));
+
+        let identity = ProfileIdentity::new(1, 0xDEAD_BEEF_0BAD_F00D, "netmf-v4_4");
+        let ack = HelloAck { profile: Some(identity), ..bare };
+        let bytes = ack.encode();
+        let back = HelloAck::decode(&bytes).expect("an extended ack decodes");
+        assert_eq!(back.profile, Some(identity));
+        assert_eq!(back.profile.expect("present").name(), "netmf-v4_4");
+        assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 1);
+        assert_eq!(bytes[2..6], 0x107u32.to_le_bytes());
+        let truncated = HelloAck::decode(&bytes[..8]).expect("still an ack");
+        assert_eq!(truncated.profile, None);
+    }
+
+    #[test]
+    fn profile_identity_name_truncates_at_the_cap() {
+        let identity = ProfileIdentity::new(1, 7, "a-very-long-profile-name-indeed");
+        assert_eq!(identity.name().len(), ProfileIdentity::NAME_CAP);
+        assert!("a-very-long-profile-name-indeed".starts_with(identity.name()));
+    }
+
+    #[test]
+    fn profile_manifest_round_trips_and_fails_loud_on_damage() {
+        let manifest = ProfileManifest {
+            identity: ProfileIdentity::new(1, 42, "kernel-floor"),
+            intrinsic_ids: vec![0x811c_9dc5, 1, 2, 3],
+        };
+        let bytes = manifest.encode();
+        assert_eq!(ProfileManifest::decode(&bytes), Some(manifest.clone()));
+        assert_eq!(
+            ProfileManifest::decode(&bytes[..bytes.len() - 1]),
+            None,
+            "a truncated id list is a decode failure, not a short list"
+        );
+        assert_eq!(ProfileManifest::decode(&[9]), None, "an unknown version is rejected");
     }
 
     #[test]

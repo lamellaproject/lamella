@@ -2,6 +2,8 @@
 
 use crate::interp::{Session, Vm};
 use crate::module::{AttrValue, BoxedPrimitive, Module};
+#[cfg(feature = "NETMFv4_4")]
+use crate::module::param_attr_key;
 use crate::net::{Interest, NetResult};
 use crate::tls::{TlsStack, VerifyMode};
 use crate::object::{Object, ObjectRef, decode_string};
@@ -247,6 +249,40 @@ pub fn console_write_int64(
     Ok(None)
 }
 
+/// `System.Console.Write(uint)`: write a `uint32` in decimal -- UNSIGNED (the `int32`
+/// stack slot's bits reinterpreted), no terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int32`.
+pub fn console_write_uint32(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_text(vm, &(value as u32).to_string());
+    Ok(None)
+}
+
+/// `System.Console.Write(ulong)`: write a `uint64` in decimal -- UNSIGNED (the `int64`
+/// stack slot's bits reinterpreted), no terminator.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not an `int64`.
+pub fn console_write_uint64(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int64(value)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    write_text(vm, &(value as u64).to_string());
+    Ok(None)
+}
+
 /// `System.Console.Write(bool)`: write `True` or `False`, no terminator.
 ///
 /// # Errors
@@ -279,29 +315,56 @@ pub fn console_write_char(
     Ok(None)
 }
 
-/// Formats an `f64` as .NET's `double.ToString()` does for the common cases:
-/// shortest round-trippable for finite values (Rust matches .NET here), and
-/// `Infinity` / `-Infinity` / `NaN` for the specials. Exponent formatting of very
-/// large or small magnitudes still differs from .NET -- a stage-4-oracle refinement.
+/// Formats an `f64` as .NET's `double.ToString()` does: shortest round-trippable digits
+/// (Rust matches .NET here), in fixed-point while the decimal exponent is in (-5, 17)
+/// and .NET's scientific shape outside it, with `Infinity` / `-Infinity` / `NaN`
+/// spelled out. The thresholds are oracle-verified: 1e16 and 12345678901234567.0
+/// (exponent 16) print fixed, 1e17 prints `1E+17`, 0.0001 fixed, 0.00001 `1E-05`.
 #[cfg(feature = "float")]
 fn format_double(value: f64) -> String {
     if value.is_infinite() {
         return String::from(if value < 0.0 { "-Infinity" } else { "Infinity" });
     }
-    value.to_string()
+    apply_g_notation(value.to_string(), format!("{value:e}"), 17)
 }
 
-/// Formats an `f32` as .NET's `Single.ToString()` does: the shortest round-trippable text for a
-/// finite value (Rust's `f32` formatter chooses the same fewest digits .NET does), and
-/// `Infinity` / `-Infinity` / `NaN` for the specials. The f32 path is what makes a Single render
-/// to its own (shorter) digits rather than the f64-widened decimal -- e.g. `0.1f` is "0.1", and a
-/// single-precision sum like `0.1f + 0.2f` is "0.3", where the double is "0.30000000000000004".
+/// Formats an `f32` as .NET's `Single.ToString()` does: the shortest round-trippable text
+/// for a finite value (Rust's `f32` formatter chooses the same fewest digits .NET does),
+/// fixed-point while the decimal exponent is in (-5, 9) and scientific outside it
+/// (oracle-verified: 400000000f and 123456792f -- rendered "123456790" -- print fixed,
+/// 1000000000f prints `1E+09`), and `Infinity` / `-Infinity` / `NaN` for the specials.
+/// The f32 path is what makes a Single render to its own (shorter) digits rather than
+/// the f64-widened decimal -- e.g. `0.1f` is "0.1", and a single-precision sum like
+/// `0.1f + 0.2f` is "0.3", where the double is "0.30000000000000004".
 #[cfg(feature = "float")]
 fn format_single(value: f32) -> String {
     if value.is_infinite() {
         return String::from(if value < 0.0 { "-Infinity" } else { "Infinity" });
     }
-    value.to_string()
+    apply_g_notation(value.to_string(), format!("{value:e}"), 9)
+}
+
+/// Chooses .NET's default-`ToString` notation for a finite float already rendered two
+/// ways by the shortest-round-trip formatter: `fixed` (Rust `Display`, never scientific)
+/// and `scientific` (Rust `LowerExp`, `d.ddde<exp>`). Fixed-point iff the scientific-form
+/// exponent is greater than -5 and less than the type's round-trip digit budget (17 for a
+/// double, 9 for a single -- the empirical .NET switch points); otherwise .NET's
+/// scientific shape `d.dddE{+,-}NN` with the exponent zero-padded to at least two digits.
+/// `NaN` carries no `e`, so it falls through to the `Display` spelling, which already
+/// matches .NET's.
+#[cfg(feature = "float")]
+fn apply_g_notation(fixed: String, scientific: String, precision: i32) -> String {
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return fixed;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return fixed;
+    };
+    if exponent > -5 && exponent < precision {
+        return fixed;
+    }
+    let sign = if exponent < 0 { '-' } else { '+' };
+    format!("{mantissa}E{sign}{:02}", exponent.abs())
 }
 
 /// `System.Console.WriteLine(double)`: write a double, then a line terminator.
@@ -3025,6 +3088,9 @@ fn object_text(vm: &Vm, module: &Module, value: Option<&Value>) -> String {
             Some(Object::Str(chars)) => String::from_utf16_lossy(&decode_string(chars)),
             Some(Object::StringBuilder { buf, .. }) => String::from_utf16_lossy(buf),
             Some(Object::Boxed { type_token, value }) => boxed_text(module, *type_token, value),
+            Some(Object::Instance { type_id, .. }) => module
+                .type_full_name(*type_id)
+                .map_or_else(|| String::from("object"), String::from),
             _ => String::from("object"),
         },
         Some(Value::Null) | None => String::new(),
@@ -3160,6 +3226,37 @@ pub fn delegate_remove(
     }
     let reference = vm.heap_mut().alloc_multicast(invocations);
     Ok(Some(Value::Object(reference)))
+}
+
+/// `System.Delegate.op_Equality` (`a == b` on delegates): VALUE equality -- the invocation
+/// lists match pairwise (target reference identity + bound method), `delegate_remove`'s
+/// matching rule. Two separately-constructed `new A(M)` are equal; `null == null` is equal
+/// (two empty lists); `null` against any delegate is not.
+///
+/// # Errors
+/// Never errors.
+pub fn delegate_equals(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let a = delegate_list(vm, args.first());
+    let b = delegate_list(vm, args.get(1));
+    Ok(Some(Value::Int32(i32::from(a == b))))
+}
+
+/// `System.Delegate.op_Inequality`: the complement of [`delegate_equals`].
+///
+/// # Errors
+/// Never errors.
+pub fn delegate_not_equals(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let a = delegate_list(vm, args.first());
+    let b = delegate_list(vm, args.get(1));
+    Ok(Some(Value::Int32(i32::from(a != b))))
 }
 
 /// `System.Threading.Interlocked.CompareExchange<T>(ref T location, T value, T comparand)`:
@@ -5381,6 +5478,40 @@ fn reflect_handle(arg: Option<&Value>) -> i64 {
     }
 }
 
+/// One operand of a reflection `==`/`!=`, by representation: most reflection references are
+/// token-only HANDLES (a native int), but a composed member (the managed `PropertyInfo` /
+/// `EventInfo`) is a heap INSTANCE -- so `info != null` must see the reference, not a handle.
+#[cfg(feature = "NETMFv4_4")]
+enum ReflectOperand {
+    Handle(i64),
+    Reference(ObjectRef),
+    Null,
+}
+
+#[cfg(feature = "NETMFv4_4")]
+fn reflect_operand(arg: Option<&Value>) -> ReflectOperand {
+    match arg {
+        Some(&Value::NativeInt(handle)) => ReflectOperand::Handle(handle),
+        Some(&Value::Object(reference)) => ReflectOperand::Reference(reference),
+        _ => ReflectOperand::Null,
+    }
+}
+
+/// Reflection reference equality across both representations: handles compare canonicalized
+/// (a `TypeRef` and its defining `TypeDef` are the same type), instances compare by reference,
+/// and a null equals only null. Mixed shapes are never equal.
+#[cfg(feature = "NETMFv4_4")]
+fn reflect_operands_equal(module: &Module, left: Option<&Value>, right: Option<&Value>) -> bool {
+    match (reflect_operand(left), reflect_operand(right)) {
+        (ReflectOperand::Handle(left), ReflectOperand::Handle(right)) => {
+            canonical_reflect_handle(module, left) == canonical_reflect_handle(module, right)
+        }
+        (ReflectOperand::Reference(left), ReflectOperand::Reference(right)) => left == right,
+        (ReflectOperand::Null, ReflectOperand::Null) => true,
+        _ => false,
+    }
+}
+
 /// Canonicalizes a reflection handle for `==`/`!=`. A `Type` reference can arrive via different
 /// tokens for the SAME type (a `TypeRef` vs the defining `TypeDef`, across assemblies -- e.g. a
 /// program's `typeof(int)` vs the corlib `Int32` a field's `FieldType` / a boxed value's `GetType`
@@ -5408,9 +5539,8 @@ pub fn reflect_handle_equals(
     module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let left = canonical_reflect_handle(module, reflect_handle(args.first()));
-    let right = canonical_reflect_handle(module, reflect_handle(args.get(1)));
-    Ok(Some(Value::Int32(i32::from(left == right))))
+    let equal = reflect_operands_equal(module, args.first(), args.get(1));
+    Ok(Some(Value::Int32(i32::from(equal))))
 }
 
 /// `op_Inequality` for the reflection references (the complement of [`reflect_handle_equals`]).
@@ -5423,9 +5553,8 @@ pub fn reflect_handle_not_equals(
     module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let left = canonical_reflect_handle(module, reflect_handle(args.first()));
-    let right = canonical_reflect_handle(module, reflect_handle(args.get(1)));
-    Ok(Some(Value::Int32(i32::from(left != right))))
+    let equal = reflect_operands_equal(module, args.first(), args.get(1));
+    Ok(Some(Value::Int32(i32::from(!equal))))
 }
 
 /// `System.Reflection.FieldInfo.GetValue(object obj)`: the value of this field on `obj` (or the
@@ -5505,6 +5634,116 @@ pub fn field_set_value(
         return Err(Trap::TypeMismatch(Opcode::Callvirt));
     }
     Ok(None)
+}
+
+/// `System.Reflection.FieldInfo.get_IsLiteral`: whether the field is a `const`
+/// (`FieldAttributes.Literal`), from the loader-recorded flags.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a field handle with recorded flags.
+#[cfg(feature = "NETMFv4_4")]
+pub fn field_is_literal(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let (is_literal, _) = module
+        .field_meta(handle as u64)
+        .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
+    Ok(Some(Value::Int32(i32::from(is_literal))))
+}
+
+/// `System.Reflection.FieldInfo.get_IsStatic`: whether the field is static, from the
+/// loader-recorded flags. (A `const` reports static too, as in .NET -- `literal` implies it.)
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a field handle with recorded flags.
+#[cfg(feature = "NETMFv4_4")]
+pub fn field_is_static(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let (is_literal, is_static) = module
+        .field_meta(handle as u64)
+        .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
+    Ok(Some(Value::Int32(i32::from(is_static || is_literal))))
+}
+
+/// `System.Reflection.FieldInfo.GetRawConstantValue()`: the `const` field's Constant-row
+/// value (II.22.9), boxed with its DECLARED kind -- a `bool` constant comes back as a
+/// Boolean box (so `(bool)raw` casts), a `char` as a Char box, exactly .NET's contract.
+/// The Boolean/Char box tokens resolve through the loaded corlib's own TypeDefs.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a field handle, or the field records no
+/// constant (a non-`const` field -- .NET throws InvalidOperationException; the corpus only
+/// asks consts).
+#[cfg(feature = "NETMFv4_4")]
+pub fn field_get_raw_constant(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    use crate::module::FieldConstant;
+    let Some(&Value::NativeInt(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let constant = module
+        .field_constant(handle as u64)
+        .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?
+        .clone();
+    let named_box = |vm: &mut Vm, name: &str, value: Value| {
+        module
+            .type_handle_by_name(name)
+            .map(|token| Value::Object(vm.heap_mut().alloc_boxed(token, value)))
+    };
+    let raw = match constant {
+        FieldConstant::Bool(value) => {
+            named_box(vm, "System.Boolean", Value::Int32(i32::from(value)))
+                .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?
+        }
+        FieldConstant::Char(value) => {
+            named_box(vm, "System.Char", Value::Int32(i32::from(value)))
+                .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?
+        }
+        FieldConstant::Int { value, wide } => {
+            let primitive = if wide {
+                Value::Int64(value)
+            } else {
+                Value::Int32(value as i32)
+            };
+            match module.primitive_type_token(&primitive) {
+                Some(token) => Value::Object(vm.heap_mut().alloc_boxed(token, primitive)),
+                None => primitive,
+            }
+        }
+        #[cfg(feature = "float")]
+        FieldConstant::R4(value) => {
+            let primitive = Value::Single(value);
+            match module.primitive_type_token(&primitive) {
+                Some(token) => Value::Object(vm.heap_mut().alloc_boxed(token, primitive)),
+                None => primitive,
+            }
+        }
+        #[cfg(feature = "float")]
+        FieldConstant::R8(value) => {
+            let primitive = Value::Float(value);
+            match module.primitive_type_token(&primitive) {
+                Some(token) => Value::Object(vm.heap_mut().alloc_boxed(token, primitive)),
+                None => primitive,
+            }
+        }
+        FieldConstant::Str(units) => Value::Object(vm.heap_mut().alloc_string(&units)),
+        FieldConstant::Null => Value::Null,
+    };
+    Ok(Some(raw))
 }
 
 /// Unboxes a reflection argument or result: a boxed value type yields its underlying value; a real
@@ -5707,6 +5946,11 @@ fn materialize_attr_value(vm: &mut Vm, value: &AttrValue) -> Value {
         AttrValue::R4(_) | AttrValue::R8(_) => Value::Null,
         AttrValue::Str(units) => Value::Object(vm.heap_mut().alloc_string(units)),
         AttrValue::Type(handle) => Value::NativeInt(*handle as i64),
+        AttrValue::Array(elements) => {
+            let values: Vec<Value> =
+                elements.iter().map(|element| materialize_attr_value(vm, element)).collect();
+            Value::Object(vm.heap_mut().alloc_array(values))
+        }
         AttrValue::Null => Value::Null,
     }
 }
@@ -5768,6 +6012,34 @@ pub fn type_property_custom_attributes(
         }
         None => Ok(Some(Value::Object(vm.heap_mut().alloc_array(Vec::new())))),
     }
+}
+
+/// `MethodBase.GetParameterCustomAttributes(int, bool)` (corlib-internal bridge): the custom
+/// attributes recorded on this method's `Param` row for `position` -- `-1` is the return
+/// value's sequence-0 row (`[return:]`, `MethodInfo.ReturnParameter`), `N >= 0` the
+/// (N+1)-sequence parameter row. The MANAGED `ParameterInfo` (which carries no `Param` token
+/// of its own) routes its `GetCustomAttributes` here; the loader recorded each row's
+/// attributes under [`param_attr_key`]. The `inherit` flag is accepted and ignored
+/// (parameters do not inherit attributes).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a method handle or the position is not an
+/// `Int32`; propagates an attribute ctor trap.
+#[cfg(feature = "NETMFv4_4")]
+pub fn method_parameter_custom_attributes(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(method_handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let Some(&Value::Int32(position)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    let sequence = position.saturating_add(1).max(0) as u16;
+    let key = param_attr_key(method_handle as u64, sequence);
+    get_custom_attributes(vm, module, &[Value::NativeInt(key as i64)])
 }
 
 /// `System.Reflection.MemberInfo.GetCustomAttributes(bool)` (the base method `Type`,
@@ -6074,6 +6346,23 @@ pub fn md_array_get_length(
     Ok(Some(Value::Int32(
         vm.heap().array_dimension(array, dim).unwrap_or(0),
     )))
+}
+
+/// `Array::get_Rank` (the `Rank` property): the array's dimension count -- 1 for a
+/// single-dimension array, the dimension count for a rectangular one.
+///
+/// # Errors
+/// [`Trap::NullReference`] for a null array.
+pub fn array_rank(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(array)) = args.first() else {
+        return Err(Trap::NullReference);
+    };
+    let rank = vm.heap().array_rank(array).unwrap_or(0);
+    Ok(Some(Value::Int32(rank)))
 }
 
 /// `System.Array.GetValue(int)`: the element at `index` as an `object`. A reference
@@ -6962,11 +7251,56 @@ mod tests {
     use lamella_cil::{Instruction, MethodBodyImage, Operand};
     use lamella_token::Token;
 
+    /// .NET notation anchors for the default (no-format) float rendering: fixed-point
+    /// inside (-5, 17) for a double and (-5, 9) for a single, scientific outside,
+    /// shortest digits either way. Every expected string here is ORACLE OUTPUT -- what
+    /// `dotnet` (net8, invariant) actually printed for the same literal.
+    #[cfg(feature = "float")]
+    #[test]
+    fn float_g_notation_matches_dotnet() {
+        assert_eq!(format_double(3000000000.0), "3000000000");
+        assert_eq!(format_double(999999999999999.0), "999999999999999");
+        assert_eq!(format_double(1e15), "1000000000000000");
+        assert_eq!(format_double(1.5e15), "1500000000000000");
+        assert_eq!(format_double(1e16), "10000000000000000");
+        assert_eq!(format_double(-1e16), "-10000000000000000");
+        assert_eq!(format_double(12345678901234567.0), "12345678901234568");
+        assert_eq!(format_double(1e17), "1E+17");
+        assert_eq!(format_double(12345678901234567890.0), "1.2345678901234567E+19");
+        assert_eq!(format_double(0.0001), "0.0001");
+        assert_eq!(format_double(0.00001), "1E-05");
+        assert_eq!(format_double(0.000012345678901234567), "1.2345678901234568E-05");
+        assert_eq!(format_double(1e-10), "1E-10");
+        assert_eq!(format_double(1e100), "1E+100");
+        assert_eq!(format_double(5e-324), "5E-324");
+        assert_eq!(format_double(123.456), "123.456");
+        assert_eq!(format_double(0.0), "0");
+        assert_eq!(format_double(f64::NAN), "NaN");
+        assert_eq!(format_single(3000000000.0_f32), "3E+09");
+        assert_eq!(format_single(2000000000.0_f32), "2E+09");
+        assert_eq!(format_single(999999999.0_f32), "1E+09");
+        assert_eq!(format_single(400000000.0_f32), "400000000");
+        assert_eq!(format_single(123456792.0_f32), "123456790");
+        assert_eq!(format_single(16777216.0_f32), "16777216");
+        assert_eq!(format_single(9999999.0_f32), "9999999");
+        assert_eq!(format_single(10000000.0_f32), "10000000");
+        assert_eq!(format_single(3.4028235e38_f32), "3.4028235E+38");
+        assert_eq!(format_single(0.00001_f32), "1E-05");
+        assert_eq!(format_single(0.0001_f32), "0.0001");
+        assert_eq!(format_single(1.5_f32), "1.5");
+        assert_eq!(format_single(123.456_f32), "123.456");
+    }
+
     #[test]
     fn hello_world_from_a_hand_built_assembly() {
         let mut module = Module::new();
 
-        let write_line = module.add_intrinsic(0, console_write_line, 1);
+        let write_line = module.add_intrinsic(
+            0,
+            console_write_line,
+            crate::intrinsic_registry::intrinsic_id("console_write_line"),
+            1,
+        );
         let write_line_token = Token(0x0A00_0001);
         module.bind_token(0, write_line_token, write_line);
 

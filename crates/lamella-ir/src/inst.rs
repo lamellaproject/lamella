@@ -88,6 +88,27 @@ pub enum ConvKind {
     /// Truncate a 64-bit float toward zero to a signed `int32` (`conv.i4` from an `R8`). wasm has a
     /// native truncate; a no-FPU ARM target needs the aeabi soft helper (a follow-on, not yet wired).
     Float64ToInt,
+    /// Convert a signed `int32` to a 64-bit float (`conv.r8` from an int32 -- e.g. `double d = intVar`).
+    /// The no-FPU ARM form is the `__aeabi_i2d` soft helper; wasm has `f64.convert_i32_s`.
+    IntToFloat64,
+    /// Convert a signed `int64` to a 64-bit float (`conv.r8` from an int64). ARM `__aeabi_l2d`; wasm
+    /// `f64.convert_i64_s`.
+    LongToFloat64,
+    /// Widen a 32-bit float to a 64-bit float (`conv.r8` from an R4 -- `double d = floatVar`). ARM
+    /// `__aeabi_f2d`; wasm `f64.promote_f32`.
+    Float32ToFloat64,
+    /// Narrow a 64-bit float to a 32-bit float (`conv.r4` from an R8 -- `float f = doubleVar`). ARM
+    /// `__aeabi_d2f`; wasm `f32.demote_f64`.
+    Float64ToFloat32,
+    /// Convert a signed `int64` to a 32-bit float (`conv.r4` from an int64). ARM `__aeabi_l2f`; wasm
+    /// `f32.convert_i64_s`.
+    LongToFloat32,
+    /// Convert an UNSIGNED `int32` to a 64-bit float (`conv.r.un` from a uint). ARM `__aeabi_ui2d`;
+    /// wasm `f64.convert_i32_u`.
+    UIntToFloat64,
+    /// Convert an UNSIGNED `int64` to a 64-bit float (`conv.r.un` from a ulong). ARM `__aeabi_ul2d`;
+    /// wasm `f64.convert_i64_u`.
+    ULongToFloat64,
     /// Reinterpret an `int32` as an `ObjectRef` -- a no-op at the machine level (both are one word), a
     /// pure retype so a computed integer can stand in for a reference. `isinst` uses it to fold a
     /// branchless `matched ? object : null` mask (an `int32`) into the reference result.
@@ -103,7 +124,14 @@ impl ConvKind {
     #[must_use]
     pub fn result_type(self) -> MirType {
         match self {
-            ConvKind::IntToFloat32 => MirType::F32,
+            ConvKind::IntToFloat32
+            | ConvKind::Float64ToFloat32
+            | ConvKind::LongToFloat32 => MirType::F32,
+            ConvKind::IntToFloat64
+            | ConvKind::LongToFloat64
+            | ConvKind::Float32ToFloat64
+            | ConvKind::UIntToFloat64
+            | ConvKind::ULongToFloat64 => MirType::F64,
             ConvKind::IntToRef => MirType::ObjectRef,
             ConvKind::SignExtend8
             | ConvKind::ZeroExtend8
@@ -629,6 +657,19 @@ pub enum Inst {
         index: ValueId,
         /// The value to store (its width comes from its type).
         value: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
+    /// The ADDRESS of element `index` of `array` -- the CLI's `ldelema`. The result is a `ManagedPtr`
+    /// to `array + 4 + index*element_size` (the same element location [`Inst::ArrayLoad`] reads, past
+    /// the length prefix), bounds-checked like a load. It backs `ref`/`out` array elements and calling
+    /// a method on a value-type array element (`arr[i].M()`), and is the address a value-type
+    /// `ldelem`/`stelem` loads or stores the struct through.
+    ArrayElemAddr {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The element index.
+        index: ValueId,
         /// The size in bytes of one element.
         element_size: u32,
     },

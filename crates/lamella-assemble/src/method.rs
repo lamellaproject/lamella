@@ -148,6 +148,11 @@ fn stack_effect(opcode: Opcode) -> i32 {
         | Opcode::Ldloca
         | Opcode::LdlocaS
         | Opcode::Ldsfld
+        | Opcode::Ldsflda
+        | Opcode::Ldstr
+        | Opcode::Ldtoken
+        | Opcode::Sizeof
+        | Opcode::Dup
         | Opcode::Newobj
         | Opcode::Call
         | Opcode::Callvirt => 1,
@@ -482,16 +487,62 @@ fn emit_statement(
             init,
             body,
         } => {
-            let array_slot = frame.reserve_pinned_local(&init.ty);
-            emit_expression(init, frame, tokens, out)?;
-            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(array_slot)));
-            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array_slot)));
-            out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
-            let element_token = tokens
-                .type_token(element)
-                .ok_or(EmitError::Unsupported("fixed element type has no token"))?;
-            out.push(Instruction::new(Opcode::Ldelema, Operand::Token(element_token)));
-            store_to(frame, name, out)?;
+            if matches!(&init.ty, TypeSymbol::Pointer(_)) {
+                let slot =
+                    frame.reserve_pinned_local(&TypeSymbol::ByRef(Box::new(element.clone())));
+                emit_expression(init, frame, tokens, out)?;
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+                out.push(Instruction::simple(Opcode::ConvU));
+                store_to(frame, name, out)?;
+            } else if matches!(&init.ty, TypeSymbol::Special(SpecialType::String)) {
+                let slot = frame.reserve_pinned_local(&init.ty);
+                emit_expression(init, frame, tokens, out)?;
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+                out.push(Instruction::simple(Opcode::ConvI));
+                out.push(Instruction::simple(Opcode::Dup));
+                let to_nonnull = out.len();
+                out.push(Instruction::new(Opcode::Brtrue, Operand::Target(0)));
+                let to_done = out.len();
+                out.push(Instruction::new(Opcode::Br, Operand::Target(0)));
+                out[to_nonnull].operand = Operand::Target(out.len() as u32);
+                let reference = crate::compile::offset_to_string_data_reference();
+                let offset_token = tokens
+                    .method(&reference.declaring_type, &reference.name, &reference.parameters)
+                    .ok_or(EmitError::Unsupported(
+                        "RuntimeHelpers.OffsetToStringData was not minted",
+                    ))?;
+                out.push(Instruction::new(Opcode::Call, Operand::Token(offset_token)));
+                out.push(Instruction::simple(Opcode::Add));
+                out[to_done].operand = Operand::Target(out.len() as u32);
+                store_to(frame, name, out)?;
+            } else {
+                let array_slot = frame.reserve_pinned_local(&init.ty);
+                emit_expression(init, frame, tokens, out)?;
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(array_slot)));
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array_slot)));
+                let rank = match &init.ty {
+                    TypeSymbol::Array { rank, .. } => *rank,
+                    _ => 1,
+                };
+                if rank <= 1 {
+                    out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+                    let element_token = tokens
+                        .type_token(element)
+                        .ok_or(EmitError::Unsupported("fixed element type has no token"))?;
+                    out.push(Instruction::new(Opcode::Ldelema, Operand::Token(element_token)));
+                } else {
+                    for _ in 0..rank {
+                        out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+                    }
+                    let token = tokens
+                        .method(&init.ty, "Address", &crate::expr::array_int_params(rank as usize))
+                        .ok_or(EmitError::Unsupported("fixed rectangular-array Address method"))?;
+                    out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+                }
+                store_to(frame, name, out)?;
+            }
             emit_statement(body, frame, tokens, labels, out)?;
         }
         BoundStmtKind::Throw(value) => match value {
@@ -831,7 +882,9 @@ fn emit_if(
             labels.branch(Opcode::Brfalse, else_label, out);
             emit_statement(then_branch, frame, tokens, labels, out)?;
             let end = labels.label();
-            labels.branch(Opcode::Br, end, out);
+            if !always_exits(then_branch) {
+                labels.branch(Opcode::Br, end, out);
+            }
             labels.place(else_label, out);
             emit_statement(else_branch, frame, tokens, labels, out)?;
             labels.place(end, out);
@@ -905,6 +958,7 @@ fn emit_statement_expression(
             operator: AssignmentOperator::Assign,
             target,
             value,
+            ..
         } => {
             if let BoundExprKind::Local(name) = &target.kind {
                 if let Some((slot, element)) = frame.byref(name) {
@@ -974,15 +1028,16 @@ fn emit_statement_expression(
             operator,
             target,
             value,
+            checked,
         } => {
             if let Some(binary) = compound_binary_operator(*operator) {
-                return emit_compound(target, binary, Some(value), None, frame, tokens, out, Leave::Discard);
+                return emit_compound(target, binary, Some(value), None, None, *checked, frame, tokens, out, Leave::Discard);
             }
         }
-        BoundExprKind::Postfix { operator, operand } => {
+        BoundExprKind::Postfix { operator, operand, step } => {
             let increment = *operator == PostfixOperator::Increment;
-            let user_step = user_step_method(operand, increment, tokens);
-            return emit_compound(operand, step_operator(increment), None, user_step, frame, tokens, out, Leave::Discard);
+            let (user_step, result_conversion) = step_tokens(step.as_deref(), operand, increment, tokens);
+            return emit_compound(operand, step_operator(increment), None, user_step, result_conversion, false, frame, tokens, out, Leave::Discard);
         }
         BoundExprKind::Unary {
             operator: operator @ (UnaryOperator::PreIncrement | UnaryOperator::PreDecrement),
@@ -990,7 +1045,7 @@ fn emit_statement_expression(
         } => {
             let increment = *operator == UnaryOperator::PreIncrement;
             let user_step = user_step_method(operand, increment, tokens);
-            return emit_compound(operand, step_operator(increment), None, user_step, frame, tokens, out, Leave::Discard);
+            return emit_compound(operand, step_operator(increment), None, user_step, None, false, frame, tokens, out, Leave::Discard);
         }
         _ => {}
     }
@@ -1023,6 +1078,45 @@ pub(crate) fn user_step_method(
     tokens.method(&operand.ty, name, core::slice::from_ref(&operand.ty))
 }
 
+/// The (operator, result-conversion) tokens for a `++`/`--`. For a converting user operator (14.14.2)
+/// -- the [`ConvertingStep`] the binder resolved -- the operator's own token and its result
+/// conversion; otherwise the type's exact same-type op_Increment/op_Decrement, if any, and no
+/// conversion.
+pub(crate) fn step_tokens(
+    step: Option<&lamella_binder::ConvertingStep>,
+    operand: &BoundExpr,
+    increment: bool,
+    tokens: &Tokens,
+) -> (Option<Token>, Option<Token>) {
+    match step {
+        Some(step) => {
+            let operator = tokens.method(
+                &step.operator.declaring_type,
+                &step.operator.name,
+                &step.operator.parameters,
+            );
+            let conversion = step
+                .result_conversion
+                .as_ref()
+                .and_then(|conversion| conversion_token(conversion, tokens));
+            (operator, conversion)
+        }
+        None => (user_step_method(operand, increment, tokens), None),
+    }
+}
+
+/// Resolves a conversion operator reference (`op_Implicit`/`op_Explicit`, keyed by return type to
+/// disambiguate return-overloaded operators) to its token, falling back to its plain name.
+fn conversion_token(method: &lamella_binder::MethodReference, tokens: &Tokens) -> Option<Token> {
+    tokens
+        .method(
+            &method.declaring_type,
+            &crate::tokens::conversion_key_name(&method.name, &method.return_type),
+            &method.parameters,
+        )
+        .or_else(|| tokens.method(&method.declaring_type, &method.name, &method.parameters))
+}
+
 /// Whether a read-modify-write leaves its value on the stack (an expression `++`/`--`) and,
 /// if so, which: the value BEFORE the step (postfix) or AFTER it (prefix).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1047,6 +1141,8 @@ pub(crate) fn emit_compound(
     binary: BinaryOperator,
     rhs: Option<&BoundExpr>,
     user_step: Option<Token>,
+    result_conversion: Option<Token>,
+    checked: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1062,12 +1158,12 @@ pub(crate) fn emit_compound(
             if let Some((slot, element)) = frame.byref(name) {
                 out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(slot)));
                 emit_local(name, frame, tokens, out)?;
-                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
                 crate::expr::emit_byref_store(element, tokens, out)?;
                 return Ok(());
             }
             emit_local(name, frame, tokens, out)?;
-            emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+            emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
             store_to(frame, name, out)
         }
         BoundExprKind::FieldAccess {
@@ -1084,7 +1180,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
                 if leave == Leave::New {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1098,7 +1194,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
                 if leave == Leave::New {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1146,7 +1242,7 @@ pub(crate) fn emit_compound(
                 out.push(Instruction::simple(Opcode::Dup));
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
             }
-            emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+            emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
             if leave == Leave::New {
                 out.push(Instruction::simple(Opcode::Dup));
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1173,7 +1269,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
                 if leave == Leave::New {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1203,7 +1299,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
                 if leave == Leave::New {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1221,7 +1317,7 @@ pub(crate) fn emit_compound(
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
                 }
-                emit_modify(user_step, binary, &target.ty, rhs, frame, tokens, out)?;
+                emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
                 if leave == Leave::New {
                     out.push(Instruction::simple(Opcode::Dup));
                     out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
@@ -1244,9 +1340,11 @@ pub(crate) fn emit_compound(
 /// `binary`.
 fn emit_modify(
     user_step: Option<Token>,
+    result_conversion: Option<Token>,
     binary: BinaryOperator,
     operand_ty: &TypeSymbol,
     rhs: Option<&BoundExpr>,
+    checked: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1254,9 +1352,12 @@ fn emit_modify(
     match user_step {
         Some(token) => {
             out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+            if let Some(conversion) = result_conversion {
+                out.push(Instruction::new(Opcode::Call, Operand::Token(conversion)));
+            }
             Ok(())
         }
-        None => emit_combine(binary, operand_ty, rhs, frame, tokens, out),
+        None => emit_combine(binary, operand_ty, rhs, checked, frame, tokens, out),
     }
 }
 
@@ -1266,6 +1367,7 @@ fn emit_combine(
     binary: BinaryOperator,
     operand_ty: &TypeSymbol,
     rhs: Option<&BoundExpr>,
+    checked: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1290,15 +1392,20 @@ fn emit_combine(
         None => push_one(operand_ty, out),
     }
     if binary == BinaryOperator::Add
-        && matches!(operand_ty, TypeSymbol::Special(SpecialType::String))
+        && matches!(
+            operand_ty,
+            TypeSymbol::Special(SpecialType::String | SpecialType::Object)
+        )
     {
         let value_is_string =
             rhs.is_some_and(|value| matches!(value.ty, TypeSymbol::Special(SpecialType::String)));
-        let arg = TypeSymbol::Special(if value_is_string {
-            SpecialType::String
-        } else {
-            SpecialType::Object
-        });
+        let arg = TypeSymbol::Special(
+            if value_is_string && matches!(operand_ty, TypeSymbol::Special(SpecialType::String)) {
+                SpecialType::String
+            } else {
+                SpecialType::Object
+            },
+        );
         let string = TypeSymbol::Special(SpecialType::String);
         let token = tokens
             .method(&string, "Concat", &[arg.clone(), arg])
@@ -1306,7 +1413,36 @@ fn emit_combine(
         out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
         return Ok(());
     }
-    crate::expr::emit_binary(binary, operand_ty, false, out)
+    crate::expr::emit_binary(binary, operand_ty, checked, out)?;
+    narrow_compound_result(operand_ty, checked, out);
+    Ok(())
+}
+
+/// Narrows a compound-assignment result back to a sub-int target: `conv.*` in an unchecked
+/// context, `conv.ovf.*` (throwing on overflow) in a checked one (14.14.2 / 14.5.12). Targets of
+/// int width or wider share int's stack representation and need no narrowing.
+fn narrow_compound_result(operand_ty: &TypeSymbol, checked: bool, out: &mut Vec<Instruction>) {
+    let TypeSymbol::Special(special) = operand_ty else {
+        return;
+    };
+    if !matches!(
+        special,
+        SpecialType::SByte
+            | SpecialType::Byte
+            | SpecialType::Int16
+            | SpecialType::UInt16
+            | SpecialType::Char
+    ) {
+        return;
+    }
+    let op = if checked {
+        crate::expr::checked_overflow_conversion(*special, false)
+    } else {
+        crate::expr::numeric_conversion(operand_ty).ok()
+    };
+    if let Some(op) = op {
+        out.push(Instruction::simple(op));
+    }
 }
 
 /// Pushes the constant `1` in `ty` (the step of `++`/`--`): `ldc.i4.1`, widened for a
@@ -1410,13 +1546,12 @@ mod tests {
                 Opcode::Brfalse,
                 Opcode::Ldarg,
                 Opcode::Ret,
-                Opcode::Br,
                 Opcode::Ldarg,
                 Opcode::Ret,
                 Opcode::Ret,
             ]
         );
-        assert_eq!(target(&body[3]), 7);
+        assert_eq!(target(&body[3]), 6);
     }
 
     #[test]

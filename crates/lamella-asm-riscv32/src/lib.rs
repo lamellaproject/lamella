@@ -112,6 +112,8 @@ pub struct Encoder {
     bytes: Vec<u8>,
     labels: Vec<Option<u32>>,
     fixups: Vec<(u32, Fixup, u32)>,
+    /// `emit_word_diff` sites: `(word offset, base label, target label)` patched to `target - base`.
+    diffs: Vec<(u32, u32, u32)>,
 }
 
 impl Encoder {
@@ -151,6 +153,16 @@ impl Encoder {
     /// references must be self-contained -- this encoder's fixups do not reach inside them.
     pub fn emit_bytes(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
+    }
+
+    /// Emits a 4-byte word holding the signed byte difference `target - base` of two labels, resolved
+    /// at [`finish`]. Position-independent: a `base`-relative vtable slot (`method_entry - descriptor`)
+    /// stays correct wherever the image loads, so dispatch adds the difference back to the descriptor
+    /// address it reads at run time.
+    pub fn emit_word_diff(&mut self, base: Label, target: Label) {
+        let site = self.position();
+        self.diffs.push((site, base.0, target.0));
+        self.emit_word(0);
     }
 
     fn r_type(&mut self, funct7: u32, rs2: Reg, rs1: Reg, funct3: u32, rd: Reg, opcode: u32) {
@@ -218,6 +230,11 @@ impl Encoder {
     /// `mul rd, rs1, rs2` (the `M` extension's low-word multiply).
     pub fn mul(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
         self.r_type(1, rs2, rs1, 0, rd, 0x33);
+    }
+    /// `mulhu rd, rs1, rs2` (the `M` extension's high word of an UNSIGNED 32x32 product) -- the carry
+    /// into the high half of a 64-bit multiply.
+    pub fn mulhu(&mut self, rd: Reg, rs1: Reg, rs2: Reg) {
+        self.r_type(1, rs2, rs1, 3, rd, 0x33);
     }
     /// `div rd, rs1, rs2` (the `M` extension's signed division, truncating toward zero). RV32M
     /// semantics: division by zero yields all-ones (-1) and the MIN/-1 overflow yields MIN, neither
@@ -395,6 +412,20 @@ impl Encoder {
     /// Resolves every label reference and returns the finished image, or an error if a label is
     /// unbound or a target is out of range.
     pub fn finish(mut self) -> Result<Assembled, AssembleError> {
+        for &(site, base_label, target_label) in &self.diffs {
+            let base = self
+                .labels
+                .get(base_label as usize)
+                .and_then(|p| *p)
+                .ok_or(AssembleError::UnboundLabel(Label(base_label)))?;
+            let target = self
+                .labels
+                .get(target_label as usize)
+                .and_then(|p| *p)
+                .ok_or(AssembleError::UnboundLabel(Label(target_label)))?;
+            let diff = (target as i64 - base as i64) as u32;
+            self.bytes[site as usize..site as usize + 4].copy_from_slice(&diff.to_le_bytes());
+        }
         for &(site, fixup, label) in &self.fixups {
             let target = self
                 .labels
@@ -498,6 +529,23 @@ mod tests {
         assert_eq!(&bytes[4..8], &0x0262_d533u32.to_le_bytes());
         assert_eq!(&bytes[8..12], &0x0262_e533u32.to_le_bytes());
         assert_eq!(&bytes[12..16], &0x0262_f533u32.to_le_bytes());
+    }
+
+    #[test]
+    fn emit_word_diff_holds_the_signed_label_difference() {
+        let mut enc = Encoder::new();
+        let base = enc.new_label();
+        let target = enc.new_label();
+        let back = enc.new_label();
+        enc.bind_label(back);
+        enc.emit_word(0xDEAD_BEEF);
+        enc.bind_label(base);
+        enc.emit_word_diff(base, target);
+        enc.emit_word_diff(base, back);
+        enc.bind_label(target);
+        let bytes = enc.finish().unwrap().bytes;
+        assert_eq!(&bytes[4..8], &8i32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &(-4i32).to_le_bytes());
     }
 
     #[test]

@@ -338,6 +338,7 @@ impl Binder {
             } => {
                 let switch_span = expression.span;
                 let expression = self.bind_expression(expression);
+                let expression = self.coerce_switch_governing(expression);
                 self.enter_scope();
                 self.enter_switch();
                 let mut seen_values: Vec<i64> = Vec::new();
@@ -478,14 +479,21 @@ impl Binder {
         match label {
             SwitchLabel::Default => BoundSwitchLabel::Default,
             SwitchLabel::Case(expr) => {
-                if let ExprKind::Literal(Literal::String(text)) = &expr.kind {
-                    return BoundSwitchLabel::CaseString(text.clone());
-                }
-                if let ExprKind::Literal(Literal::Null) = &expr.kind {
-                    return BoundSwitchLabel::CaseNull;
-                }
-                match self.case_label_value(expr) {
-                    Some(value) => BoundSwitchLabel::Case(value),
+                let bound = self.bind_expression(expr);
+                self.record_case_label_uses(&bound);
+                match crate::bound::constant_literal_value(&bound) {
+                    Some(Literal::String(text)) => BoundSwitchLabel::CaseString(text),
+                    Some(Literal::Null) => BoundSwitchLabel::CaseNull,
+                    Some(literal) => match crate::bound::literal_int_value(&literal) {
+                        Some(value) => BoundSwitchLabel::Case(value),
+                        None => {
+                            self.report(Diagnostic::new(
+                                DiagnosticKind::ConstantExpected,
+                                expr.span,
+                            ));
+                            BoundSwitchLabel::Case(0)
+                        }
+                    },
                     None => {
                         self.report(Diagnostic::new(DiagnosticKind::ConstantExpected, expr.span));
                         BoundSwitchLabel::Case(0)
@@ -788,7 +796,11 @@ impl Binder {
             UsingResource::Expression(expression) => {
                 let span = expression.span;
                 let bound = self.bind_expression(expression);
-                let resource_ty = bound.ty.clone();
+                let resource_ty = if matches!(bound.ty, TypeSymbol::Special(SpecialType::Null)) {
+                    TypeSymbol::Special(SpecialType::Object)
+                } else {
+                    bound.ty.clone()
+                };
                 let temp: Box<str> = format!("<using>{}", span.start).into();
                 resource_decls.push(BoundStmt {
                     kind: BoundStmtKind::Local {
@@ -1081,6 +1093,12 @@ impl Binder {
         let boolean = TypeSymbol::Special(SpecialType::Boolean);
         if bound.ty.is_error() || self.converts(&bound.ty, &boolean) {
             return bound;
+        }
+        if self
+            .user_conversion(&bound.ty, &boolean, "op_Implicit")
+            .is_some()
+        {
+            return self.convert(bound, &boolean);
         }
         if let Some(call) = self.bind_operator_true(&bound) {
             return call;

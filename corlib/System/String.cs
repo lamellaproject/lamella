@@ -12,6 +12,8 @@ namespace System
         [Lamella.Runtime.RuntimeProvided] public string Substring(int startIndex) { return null; }
         [Lamella.Runtime.RuntimeProvided] public string Substring(int startIndex, int length) { return null; }
 
+        [Lamella.Runtime.RuntimeProvided] public static string CreateFromChars(char[] chars, int start, int len) { return null; }
+
         [Lamella.Runtime.RuntimeProvided] public static string Concat(string a, string b) { return null; }
 
         public static string Concat(string a, string b, string c)

@@ -243,7 +243,8 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::AllocArray { length, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *length, ip);
                 }
-                Inst::ArrayLoad { array, index, .. } => {
+                Inst::ArrayLoad { array, index, .. }
+                | Inst::ArrayElemAddr { array, index, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *array, ip);
                     mark(&mut lo, &mut hi, &mut defined, *index, ip);
                 }
@@ -591,7 +592,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::IntToString { value } => f(*value),
         Inst::Alloc { .. } => {}
         Inst::AllocArray { length, .. } => f(*length),
-        Inst::ArrayLoad { array, index, .. } => {
+        Inst::ArrayLoad { array, index, .. } | Inst::ArrayElemAddr { array, index, .. } => {
             f(*array);
             f(*index);
         }

@@ -299,6 +299,10 @@ impl Parser {
                 Keyword::Checked | Keyword::Unchecked if self.next_is(Punctuator::OpenBrace) => {
                     return self.parse_checked_block(start, keyword);
                 }
+                Keyword::Unsafe if self.next_is(Punctuator::OpenBrace) => {
+                    self.bump();
+                    return self.parse_block();
+                }
                 _ => {}
             }
         }
@@ -751,21 +755,31 @@ impl Parser {
             DiagnosticKind::TokenExpected { expected: "(" },
         );
         let ty = self.parse_type();
-        let (name, _) = self.expect_identifier();
-        self.expect(Punctuator::Equals, DiagnosticKind::TokenExpected { expected: "=" });
-        let init = self.parse_expression();
+        let mut declarators: Vec<(Box<str>, Expr)> = Vec::new();
+        loop {
+            let (name, _) = self.expect_identifier();
+            self.expect(Punctuator::Equals, DiagnosticKind::TokenExpected { expected: "=" });
+            let init = self.parse_expression();
+            declarators.push((name, init));
+            if !self.eat(Punctuator::Comma) {
+                break;
+            }
+        }
         self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
-        let body = Box::new(self.parse_statement());
+        let mut body = Box::new(self.parse_statement());
         let end = body.span.end;
-        Stmt::new(
-            StmtKind::Fixed {
-                ty,
-                name,
-                init,
-                body,
-            },
-            Span::new(start, end),
-        )
+        for (name, init) in declarators.into_iter().rev() {
+            body = Box::new(Stmt::new(
+                StmtKind::Fixed {
+                    ty: ty.clone(),
+                    name,
+                    init,
+                    body,
+                },
+                Span::new(start, end),
+            ));
+        }
+        *body
     }
 
     /// Parses a `using ( resource ) statement` (15.13).
@@ -1949,6 +1963,13 @@ impl Parser {
             let span = Span::new(start, operand.span.end);
             return Expr::new(ExprKind::Dereference(Box::new(operand)), span);
         }
+        if self.current_punctuator() == Some(Punctuator::Ampersand) {
+            let start = self.current().span.start;
+            self.bump();
+            let operand = self.parse_unary();
+            let span = Span::new(start, operand.span.end);
+            return Expr::new(ExprKind::AddressOf(Box::new(operand)), span);
+        }
         if let Some(operator) = self.current_punctuator().and_then(prefix_operator) {
             let start = self.current().span.start;
             self.bump();
@@ -2038,6 +2059,20 @@ impl Parser {
                     expr = Expr::new(
                         ExprKind::MemberAccess {
                             receiver: Box::new(expr),
+                            name,
+                        },
+                        span,
+                    );
+                }
+                Some(Punctuator::Arrow) => {
+                    let receiver_span = expr.span;
+                    self.bump();
+                    let (name, end) = self.expect_identifier();
+                    let deref = Expr::new(ExprKind::Dereference(Box::new(expr)), receiver_span);
+                    let span = Span::new(receiver_span.start, end);
+                    expr = Expr::new(
+                        ExprKind::MemberAccess {
+                            receiver: Box::new(deref),
                             name,
                         },
                         span,
@@ -2749,6 +2784,7 @@ mod tests {
                 format!("(stackalloc {} {})", dump_type(element), dump(count))
             }
             ExprKind::Dereference(operand) => format!("(deref {})", dump(operand)),
+            ExprKind::AddressOf(operand) => format!("(addressof {})", dump(operand)),
             ExprKind::Checked(inner) => format!("(checked {})", dump(inner)),
             ExprKind::Unchecked(inner) => format!("(unchecked {})", dump(inner)),
             ExprKind::MakeRef(operand) => format!("(makeref {})", dump(operand)),

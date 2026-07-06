@@ -1,4 +1,4 @@
-//! Microchip SAM (Atmel SAM D21 and family) flash programming over a Lamella CMSIS-DAP debug probe.
+//! Microchip SAM (Atmel SAM) flash programming over a Lamella CMSIS-DAP debug probe.
 
 use lamella_cmsis_dap::{Dap, DapError, Transport};
 
@@ -125,6 +125,216 @@ fn same54_ready<T: Transport>(dap: &mut Dap<T>) -> Result<(), DapError> {
 fn same54_command<T: Transport>(dap: &mut Dap<T>, cmd: u32) -> Result<(), DapError> {
     dap.write_word(SAME54_CTRLB, SAME54_CMDEX | cmd)?;
     same54_ready(dap)
+}
+
+/// EEFC0 user-interface base: the controller for the plane in the 0x00400000 window.
+pub const SAM4S_EEFC0: u32 = 0x400e_0a00;
+/// EEFC1 user-interface base: the second controller of the dual-plane SAM4SD16/SD32.
+pub const SAM4S_EEFC1: u32 = 0x400e_0c00;
+/// The plane-0 flash window (also mirrored at 0x0 when GPNVM1 selects flash boot).
+pub const SAM4S_FLASH0_BASE: u32 = 0x0040_0000;
+/// SAM4SD32 second plane window (1 MB planes); the SAM4SD16's is at 0x0048_0000.
+pub const SAM4S_FLASH1_BASE: u32 = 0x0050_0000;
+/// SAM4S flash page size in bytes (also the EEFC write granularity).
+pub const SAM4S_PAGE: usize = 512;
+/// GPNVM bit index of the security bit (set = the debug port is locked out).
+pub const SAM4S_GPNVM_SECURITY: u32 = 0;
+/// GPNVM bit index of the boot-mode bit (set = boot flash, clear = boot the SAM-BA ROM).
+pub const SAM4S_GPNVM_BOOT_FLASH: u32 = 1;
+/// GPNVM bit index of the SAM4SD16/SD32 plane swap (set = flash 1 in the 0x00400000 window).
+pub const SAM4S_GPNVM_PLANE_SWAP: u32 = 2;
+
+const SAM4S_FCR: u32 = 0x04;
+const SAM4S_FSR: u32 = 0x08;
+const SAM4S_FRR: u32 = 0x0c;
+const SAM4S_FKEY: u32 = 0x5a << 24;
+const SAM4S_CMD_GETD: u32 = 0x00;
+const SAM4S_CMD_WP: u32 = 0x01;
+const SAM4S_CMD_EPA: u32 = 0x07;
+const SAM4S_CMD_CLB: u32 = 0x09;
+const SAM4S_CMD_GLB: u32 = 0x0a;
+const SAM4S_CMD_SGPB: u32 = 0x0b;
+const SAM4S_CMD_CGPB: u32 = 0x0c;
+const SAM4S_CMD_GGPB: u32 = 0x0d;
+const SAM4S_CMD_STUI: u32 = 0x0e;
+const SAM4S_CMD_SPUI: u32 = 0x0f;
+const SAM4S_FSR_FRDY: u32 = 1 << 0;
+const SAM4S_FSR_FCMDE: u32 = 1 << 1;
+const SAM4S_FSR_FLOCKE: u32 = 1 << 2;
+const SAM4S_FSR_FLERR: u32 = 1 << 3;
+/// EPA's FARG[1:0] = 1 selects 8 pages (4 KiB) -- the one block size legal in BOTH the
+/// small 8 KB sectors (which forbid 16/32) and the 48/64 KB sectors (which forbid 4).
+const SAM4S_EPA_8_PAGES: u32 = 1;
+/// Pages per [`Sam4sFlash::sam4s_erase_pages8`] erase (the EPA 8-page block).
+pub const SAM4S_ERASE_PAGES: u32 = 8;
+
+/// The first words of the flash descriptor a GETD command returns -- the live geometry
+/// cross-check before any erase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sam4sFlashDescriptor {
+    /// FL_ID: flash interface description.
+    pub interface: u32,
+    /// FL_SIZE: plane size in bytes.
+    pub size: u32,
+    /// FL_PAGE_SIZE: page size in bytes (512 on the SAM4S).
+    pub page_size: u32,
+    /// FL_NB_PLANE: number of planes this controller fronts.
+    pub planes: u32,
+}
+
+/// SAM4S (ATSAM4S / SAM4SD dual-plane) flash programming, added to a CMSIS-DAP [`Dap`]
+/// probe. `eefc` selects the controller ([`SAM4S_EEFC0`] / [`SAM4S_EEFC1`]); page numbers
+/// are relative to that controller's plane. Halt the core before erasing or writing.
+pub trait Sam4sFlash {
+    /// Erases 8 pages (4 KiB) starting at `first_page` (a multiple of 8), via EPA.
+    fn sam4s_erase_pages8(&mut self, eefc: u32, first_page: u32) -> Result<(), DapError>;
+    /// Programs `words` into consecutive pages starting at `first_page` of the plane
+    /// mapped at `plane_base` (already erased). Each page's latch buffer is filled
+    /// completely -- the tail beyond `words` is padded with the erased value -- because
+    /// ascending full-buffer fills are the documented procedure and the partial-fill
+    /// erratum's workaround.
+    fn sam4s_write_flash(
+        &mut self,
+        eefc: u32,
+        plane_base: u32,
+        first_page: u32,
+        words: &[u32],
+    ) -> Result<(), DapError>;
+    /// The plane's 128 lock bits (bit n = lock region n of 16 pages), via GLB.
+    fn sam4s_lock_bits(&mut self, eefc: u32) -> Result<[u32; 4], DapError>;
+    /// Clears the lock bit of the region containing `page`, via CLB.
+    fn sam4s_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), DapError>;
+    /// The GPNVM bits (bit 0 = security, 1 = boot mode, 2 = plane swap), via EEFC0 GGPB.
+    fn sam4s_gpnvm_bits(&mut self) -> Result<u32, DapError>;
+    /// Sets GPNVM bit `bit`, via EEFC0 SGPB.
+    fn sam4s_set_gpnvm(&mut self, bit: u32) -> Result<(), DapError>;
+    /// Clears GPNVM bit `bit`, via EEFC0 CGPB.
+    fn sam4s_clear_gpnvm(&mut self, bit: u32) -> Result<(), DapError>;
+    /// The controller's flash descriptor (GETD): the live geometry cross-check.
+    fn sam4s_flash_descriptor(&mut self, eefc: u32) -> Result<Sam4sFlashDescriptor, DapError>;
+    /// The 128-bit factory unique identifier, via STUI/SPUI. While the sequence is open the
+    /// plane's first words read as the identifier area, so the core must be halted.
+    fn sam4s_unique_id(&mut self, eefc: u32, plane_base: u32) -> Result<[u32; 4], DapError>;
+}
+
+impl<T: Transport> Sam4sFlash for Dap<T> {
+    fn sam4s_erase_pages8(&mut self, eefc: u32, first_page: u32) -> Result<(), DapError> {
+        assert!(first_page % SAM4S_ERASE_PAGES == 0, "EPA start page must be 8-aligned");
+        sam4s_command(self, eefc, SAM4S_CMD_EPA, first_page | SAM4S_EPA_8_PAGES)
+    }
+
+    fn sam4s_write_flash(
+        &mut self,
+        eefc: u32,
+        plane_base: u32,
+        first_page: u32,
+        words: &[u32],
+    ) -> Result<(), DapError> {
+        const PAGE_WORDS: usize = SAM4S_PAGE / 4;
+        for (index, chunk) in words.chunks(PAGE_WORDS).enumerate() {
+            let page = first_page + index as u32;
+            let page_addr = plane_base + page * SAM4S_PAGE as u32;
+            if chunk.len() == PAGE_WORDS {
+                self.write_words(page_addr, chunk)?;
+            } else {
+                let mut full = [0xffff_ffffu32; PAGE_WORDS];
+                full[..chunk.len()].copy_from_slice(chunk);
+                self.write_words(page_addr, &full)?;
+            }
+            sam4s_command(self, eefc, SAM4S_CMD_WP, page)?;
+        }
+        Ok(())
+    }
+
+    fn sam4s_lock_bits(&mut self, eefc: u32) -> Result<[u32; 4], DapError> {
+        sam4s_command(self, eefc, SAM4S_CMD_GLB, 0)?;
+        let mut bits = [0u32; 4];
+        for word in &mut bits {
+            *word = self.read_word(eefc + SAM4S_FRR)?;
+        }
+        Ok(bits)
+    }
+
+    fn sam4s_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), DapError> {
+        sam4s_command(self, eefc, SAM4S_CMD_CLB, page)?;
+        sam4s_post_bit_write_dummy_read(self)
+    }
+
+    fn sam4s_gpnvm_bits(&mut self) -> Result<u32, DapError> {
+        sam4s_command(self, SAM4S_EEFC0, SAM4S_CMD_GGPB, 0)?;
+        self.read_word(SAM4S_EEFC0 + SAM4S_FRR)
+    }
+
+    fn sam4s_set_gpnvm(&mut self, bit: u32) -> Result<(), DapError> {
+        sam4s_command(self, SAM4S_EEFC0, SAM4S_CMD_SGPB, bit)?;
+        sam4s_post_bit_write_dummy_read(self)
+    }
+
+    fn sam4s_clear_gpnvm(&mut self, bit: u32) -> Result<(), DapError> {
+        sam4s_command(self, SAM4S_EEFC0, SAM4S_CMD_CGPB, bit)?;
+        sam4s_post_bit_write_dummy_read(self)
+    }
+
+    fn sam4s_flash_descriptor(&mut self, eefc: u32) -> Result<Sam4sFlashDescriptor, DapError> {
+        sam4s_command(self, eefc, SAM4S_CMD_GETD, 0)?;
+        Ok(Sam4sFlashDescriptor {
+            interface: self.read_word(eefc + SAM4S_FRR)?,
+            size: self.read_word(eefc + SAM4S_FRR)?,
+            page_size: self.read_word(eefc + SAM4S_FRR)?,
+            planes: self.read_word(eefc + SAM4S_FRR)?,
+        })
+    }
+
+    fn sam4s_unique_id(&mut self, eefc: u32, plane_base: u32) -> Result<[u32; 4], DapError> {
+        self.write_word(eefc + SAM4S_FCR, SAM4S_FKEY | SAM4S_CMD_STUI)?;
+        for _ in 0..1000 {
+            if self.read_word(eefc + SAM4S_FSR)? & SAM4S_FSR_FRDY == 0 {
+                let mut id = [0u32; 4];
+                for (index, word) in id.iter_mut().enumerate() {
+                    *word = self.read_word(plane_base + index as u32 * 4)?;
+                }
+                sam4s_command(self, eefc, SAM4S_CMD_SPUI, 0)?;
+                return Ok(id);
+            }
+        }
+        Err(DapError::Timeout("SAM4S unique-identifier area (FRDY fall after STUI)"))
+    }
+}
+
+/// Issues one EEFC command (key | arg | cmd into FCR) and waits for FRDY, mapping the FSR
+/// error flags: FCMDE = bad key/command, FLOCKE = the command hit a locked region and was
+/// refused, FLERR = the flash's own erase/write verify failed.
+fn sam4s_command<T: Transport>(
+    dap: &mut Dap<T>,
+    eefc: u32,
+    cmd: u32,
+    arg: u32,
+) -> Result<(), DapError> {
+    dap.write_word(eefc + SAM4S_FCR, SAM4S_FKEY | (arg << 8) | cmd)?;
+    for _ in 0..4000 {
+        let fsr = dap.read_word(eefc + SAM4S_FSR)?;
+        if fsr & SAM4S_FSR_FRDY != 0 {
+            if fsr & SAM4S_FSR_FCMDE != 0 {
+                return Err(DapError::Device("SAM4S EEFC command error (FCMDE)"));
+            }
+            if fsr & SAM4S_FSR_FLOCKE != 0 {
+                return Err(DapError::Device("SAM4S EEFC lock violation (FLOCKE)"));
+            }
+            if fsr & SAM4S_FSR_FLERR != 0 {
+                return Err(DapError::Device("SAM4S EEFC flash verify failed (FLERR)"));
+            }
+            return Ok(());
+        }
+    }
+    Err(DapError::Timeout("SAM4S flash controller (FRDY)"))
+}
+
+/// SAM4S rev-A erratum "Read Error after a GPNVM or Lock Bit Writing": the first flash
+/// read after SGPB/CGPB/SLB/CLB can return a stale value unless a dummy read at another
+/// address is interposed. One discarded word read satisfies it.
+fn sam4s_post_bit_write_dummy_read<T: Transport>(dap: &mut Dap<T>) -> Result<(), DapError> {
+    dap.read_word(SAM4S_FLASH0_BASE + SAM4S_PAGE as u32)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -260,5 +470,111 @@ mod tests {
             &dap.transport().sent[15][4..8],
             &0x0000_a503u32.to_le_bytes()
         );
+    }
+
+    /// EEFC FSR read reply: FRDY set, no error flags.
+    fn sam4s_ready_reply() -> Vec<u8> {
+        vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00]
+    }
+
+    /// EEFC FSR read reply: FRDY clear (controller busy / STUI window open).
+    fn sam4s_busy_reply() -> Vec<u8> {
+        vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00]
+    }
+
+    /// A `DAP_TransferBlock` write acknowledge for `count` completed transfers.
+    fn block_ack(count: u16) -> Vec<u8> {
+        let c = count.to_le_bytes();
+        vec![proto::cmd::TRANSFER_BLOCK, c[0], c[1], 0x01]
+    }
+
+    #[test]
+    fn sam4s_erase_pages8_encodes_epa() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let replies = vec![
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            sam4s_ready_reply(),
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.sam4s_erase_pages8(SAM4S_EEFC0, 16).unwrap();
+        assert_eq!(&dap.transport().sent[0][4..8], &0x400e_0a04u32.to_le_bytes());
+        assert_eq!(&dap.transport().sent[1][4..8], &0x5a00_1107u32.to_le_bytes());
+    }
+
+    #[test]
+    fn sam4s_write_flash_fills_latch_ascending_then_wp() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut replies = Vec::new();
+        for _ in 0..9 {
+            replies.push(ack.clone());
+            replies.push(block_ack(14));
+        }
+        replies.push(ack.clone());
+        replies.push(block_ack(2));
+        replies.push(ack.clone());
+        replies.push(ack.clone());
+        replies.push(ack.clone());
+        replies.push(sam4s_ready_reply());
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.sam4s_write_flash(SAM4S_EEFC0, SAM4S_FLASH0_BASE, 3, &[0xcafe_babe]).unwrap();
+        let sent = &dap.transport().sent;
+        assert_eq!(&sent[0][4..8], &(0x0040_0000u32 + 3 * 512).to_le_bytes());
+        assert_eq!(sent[1][0], proto::cmd::TRANSFER_BLOCK);
+        assert_eq!(&sent[1][5..9], &0xcafe_babeu32.to_le_bytes());
+        assert_eq!(&sent[1][9..13], &0xffff_ffffu32.to_le_bytes());
+        assert_eq!(&sent[21][4..8], &0x5a00_0301u32.to_le_bytes());
+    }
+
+    #[test]
+    fn sam4s_set_gpnvm_drives_eefc0_then_dummy_reads() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let flash_word = vec![proto::cmd::TRANSFER, 0x01, 0x01, 0xee, 0xff, 0xc0, 0x00];
+        let replies = vec![
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            sam4s_ready_reply(),
+            ack.clone(),
+            flash_word,
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.sam4s_set_gpnvm(SAM4S_GPNVM_BOOT_FLASH).unwrap();
+        let sent = &dap.transport().sent;
+        assert_eq!(&sent[0][4..8], &0x400e_0a04u32.to_le_bytes());
+        assert_eq!(&sent[1][4..8], &0x5a00_010bu32.to_le_bytes());
+        assert_eq!(&sent[4][4..8], &(0x0040_0000u32 + 512).to_le_bytes());
+    }
+
+    #[test]
+    fn sam4s_unique_id_reads_plane_window_between_stui_and_spui() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let id_word = |b: u8| vec![proto::cmd::TRANSFER, 0x01, 0x01, b, 0x00, 0x00, 0x00];
+        let replies = vec![
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            sam4s_busy_reply(),
+            ack.clone(),
+            id_word(0x11),
+            ack.clone(),
+            id_word(0x22),
+            ack.clone(),
+            id_word(0x33),
+            ack.clone(),
+            id_word(0x44),
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            sam4s_ready_reply(),
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        let id = dap.sam4s_unique_id(SAM4S_EEFC0, SAM4S_FLASH0_BASE).unwrap();
+        assert_eq!(id, [0x11, 0x22, 0x33, 0x44]);
+        let sent = &dap.transport().sent;
+        assert_eq!(&sent[1][4..8], &0x5a00_000eu32.to_le_bytes());
+        assert_eq!(&sent[4][4..8], &0x0040_0000u32.to_le_bytes());
+        assert_eq!(&sent[13][4..8], &0x5a00_000fu32.to_le_bytes());
     }
 }

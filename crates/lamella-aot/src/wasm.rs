@@ -1,12 +1,11 @@
 //! The WebAssembly target code generator -- the third backend target, after ARM and RISC-V.
 
 use alloc::collections::BTreeMap;
-use alloc::vec;
 use alloc::vec::Vec;
 
 use lamella_asm_wasm::{BlockType, Func, FuncType, Limits, MemArg, Module, ValType};
 use lamella_ir::{
-    BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId,
+    BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId,
 };
 
 use crate::resolver::TypeMeta;
@@ -87,7 +86,7 @@ fn lower_module_inner(
 ) -> Result<Vec<u8>, LowerError> {
     let mut program: Vec<Function> = funcs.to_vec();
     let strings = layout_strings(&mut program);
-    lower_string_equals(&mut program);
+    crate::stringgen::lower_string_equals(&mut program);
     crate::stringgen::lower_string_concat(&mut program);
     crate::stringgen::lower_int_to_string(&mut program);
 
@@ -270,170 +269,6 @@ fn string_blob(utf16: &[u16]) -> Vec<u8> {
     blob
 }
 
-/// Rewrites each `StringEquals` to a call to a generated `__string_eq` helper (appended to the
-/// program as the last function), so ordinal string comparison reuses the normal call + structuring
-/// path rather than a bespoke inline expansion.
-fn lower_string_equals(program: &mut Vec<Function>) {
-    let has_string_equals = program
-        .iter()
-        .flat_map(|f| &f.blocks)
-        .flat_map(|b| &b.insts)
-        .any(|(_, inst)| matches!(inst, Inst::StringEquals { .. }));
-    if !has_string_equals {
-        return;
-    }
-    let helper = program.len() as u32;
-    for func in program.iter_mut() {
-        for block in &mut func.blocks {
-            for (_, inst) in &mut block.insts {
-                if let Inst::StringEquals { lhs, rhs } = inst {
-                    *inst = Inst::Call {
-                        callee: helper,
-                        args: alloc::vec![*lhs, *rhs],
-                    };
-                }
-            }
-        }
-    }
-    program.push(string_eq_mir());
-}
-
-/// The `__string_eq(a, b) -> i32` helper: ordinal UTF-16 string equality matching the runtime's
-/// contract -- two nulls are equal, null and non-null are not, otherwise length-then-content. The
-/// string blob is the array layout `[u32 length][u16 units]`, so the content loop reads units with a
-/// length-2 array load. Built as MIR so it goes through the same verifier + structurer as any
-/// function (the loop and branches relooped, the reference null-checks lowered as i32 compares).
-fn string_eq_mir() -> Function {
-    let i32t = MirType::I32;
-    let objt = MirType::ObjectRef;
-    let ci = |v: i64| Inst::ConstInt { ty: i32t, value: v };
-    let cmp = |op, lhs, rhs| Inst::Compare { op, lhs, rhs };
-    let unit = |array, index| Inst::ArrayLoad {
-        array,
-        index,
-        element_size: 2,
-        signed: false,
-    };
-    let branch = |cond, if_true: u32, if_false: u32| Terminator::Branch {
-        cond,
-        if_true: BlockId(if_true),
-        true_args: Vec::new(),
-        if_false: BlockId(if_false),
-        false_args: Vec::new(),
-    };
-    let ret = |v| Some(Terminator::Return(Some(v)));
-    Function {
-        params: vec![objt, objt],
-        ret: Some(i32t),
-        value_types: vec![
-            objt, objt, objt, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t,
-            i32t, i32t, i32t, i32t, i32t, i32t, i32t,
-        ],
-        entry: BlockId(0),
-        blocks: vec![
-            BasicBlock {
-                params: vec![ValueId(0), ValueId(1)],
-                insts: vec![
-                    (ValueId(2), Inst::ConstInt { ty: objt, value: 0 }),
-                    (ValueId(3), cmp(CmpOp::Eq, ValueId(0), ValueId(2))),
-                ],
-                terminator: Some(branch(ValueId(3), 1, 2)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![(ValueId(4), cmp(CmpOp::Eq, ValueId(1), ValueId(2)))],
-                terminator: ret(ValueId(4)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![(ValueId(5), cmp(CmpOp::Eq, ValueId(1), ValueId(2)))],
-                terminator: Some(branch(ValueId(5), 3, 4)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![(ValueId(6), ci(0))],
-                terminator: ret(ValueId(6)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![
-                    (
-                        ValueId(7),
-                        Inst::FieldLoad {
-                            base: ValueId(0),
-                            offset: 0,
-                        },
-                    ),
-                    (
-                        ValueId(8),
-                        Inst::FieldLoad {
-                            base: ValueId(1),
-                            offset: 0,
-                        },
-                    ),
-                    (ValueId(9), cmp(CmpOp::Ne, ValueId(7), ValueId(8))),
-                ],
-                terminator: Some(branch(ValueId(9), 5, 6)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![(ValueId(10), ci(0))],
-                terminator: ret(ValueId(10)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![(ValueId(11), ci(0))],
-                terminator: Some(Terminator::Jump {
-                    target: BlockId(7),
-                    args: vec![ValueId(11)],
-                }),
-            },
-            BasicBlock {
-                params: vec![ValueId(12)],
-                insts: vec![(ValueId(13), cmp(CmpOp::UnsignedGe, ValueId(12), ValueId(7)))],
-                terminator: Some(branch(ValueId(13), 8, 9)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![(ValueId(14), ci(1))],
-                terminator: ret(ValueId(14)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![
-                    (ValueId(15), unit(ValueId(0), ValueId(12))),
-                    (ValueId(16), unit(ValueId(1), ValueId(12))),
-                    (ValueId(17), cmp(CmpOp::Ne, ValueId(15), ValueId(16))),
-                ],
-                terminator: Some(branch(ValueId(17), 10, 11)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![(ValueId(18), ci(0))],
-                terminator: ret(ValueId(18)),
-            },
-            BasicBlock {
-                params: Vec::new(),
-                insts: vec![
-                    (ValueId(19), ci(1)),
-                    (
-                        ValueId(20),
-                        Inst::Binary {
-                            op: BinOp::Add,
-                            lhs: ValueId(12),
-                            rhs: ValueId(19),
-                        },
-                    ),
-                ],
-                terminator: Some(Terminator::Jump {
-                    target: BlockId(7),
-                    args: vec![ValueId(20)],
-                }),
-            },
-        ],
-    }
-}
-
 /// The WebAssembly function type for `func`: its MIR parameter and return types mapped to value
 /// types.
 fn func_type(func: &Function) -> Result<FuncType, LowerError> {
@@ -478,6 +313,9 @@ fn uses_memory(funcs: &[Function]) -> bool {
                     | Inst::StringEquals { .. }
                     | Inst::StringConcat { .. }
                     | Inst::IntToString { .. }
+                    | Inst::CopyBlock { .. }
+                    | Inst::FillBlock { .. }
+                    | Inst::ArrayElemAddr { .. }
             )
         })
 }
@@ -1601,6 +1439,32 @@ fn lower_inst(
             body.local_get(res);
             body.local_set(local(result));
         }
+        Inst::CopyBlock { dst, src, size } => {
+            body.local_get(local(*dst));
+            body.local_get(local(*src));
+            body.local_get(local(*size));
+            body.memory_copy();
+        }
+        Inst::FillBlock { dst, value, size } => {
+            body.local_get(local(*dst));
+            body.local_get(local(*value));
+            body.local_get(local(*size));
+            body.memory_fill();
+        }
+        Inst::ArrayElemAddr {
+            array,
+            index,
+            element_size,
+        } => {
+            body.local_get(local(*array));
+            body.i32_const(4);
+            body.i32_add();
+            body.local_get(local(*index));
+            body.i32_const(*element_size as i32);
+            body.i32_mul();
+            body.i32_add();
+            body.local_set(local(result));
+        }
         _ => return Err(LowerError::Unsupported),
     }
     Ok(())
@@ -1804,6 +1668,7 @@ fn emit_binary(
             BinOp::Add => bin(body, is64, Func::f32_add, Func::f64_add),
             BinOp::Sub => bin(body, is64, Func::f32_sub, Func::f64_sub),
             BinOp::Mul => bin(body, is64, Func::f32_mul, Func::f64_mul),
+            BinOp::DivSigned | BinOp::DivUnsigned => bin(body, is64, Func::f32_div, Func::f64_div),
             _ => return Err(LowerError::Unsupported),
         }
         return Ok(());
@@ -1859,7 +1724,22 @@ fn emit_compare(body: &mut Func, ty: MirType, op: CmpOp) -> Result<(), LowerErro
             CmpOp::SignedGt => bin(body, is64, Func::f32_gt, Func::f64_gt),
             CmpOp::SignedLe => bin(body, is64, Func::f32_le, Func::f64_le),
             CmpOp::SignedGe => bin(body, is64, Func::f32_ge, Func::f64_ge),
-            _ => return Err(LowerError::Unsupported),
+            CmpOp::UnsignedLt => {
+                bin(body, is64, Func::f32_ge, Func::f64_ge);
+                body.i32_eqz();
+            }
+            CmpOp::UnsignedGt => {
+                bin(body, is64, Func::f32_le, Func::f64_le);
+                body.i32_eqz();
+            }
+            CmpOp::UnsignedLe => {
+                bin(body, is64, Func::f32_gt, Func::f64_gt);
+                body.i32_eqz();
+            }
+            CmpOp::UnsignedGe => {
+                bin(body, is64, Func::f32_lt, Func::f64_lt);
+                body.i32_eqz();
+            }
         }
         return Ok(());
     }
@@ -1900,6 +1780,13 @@ fn emit_convert(body: &mut Func, kind: ConvKind) -> Result<(), LowerError> {
         ConvKind::Float32ToInt => body.i32_trunc_f32_s(),
         ConvKind::IntToFloat32 => body.f32_convert_i32_s(),
         ConvKind::Float64ToInt => body.i32_trunc_f64_s(),
+        ConvKind::IntToFloat64 => body.f64_convert_i32_s(),
+        ConvKind::LongToFloat64 => body.f64_convert_i64_s(),
+        ConvKind::Float32ToFloat64 => body.f64_promote_f32(),
+        ConvKind::Float64ToFloat32 => body.f32_demote_f64(),
+        ConvKind::LongToFloat32 => body.f32_convert_i64_s(),
+        ConvKind::UIntToFloat64 => body.f64_convert_i32_u(),
+        ConvKind::ULongToFloat64 => body.f64_convert_i64_u(),
         ConvKind::IntToRef | ConvKind::RefToInt => {}
     }
     Ok(())

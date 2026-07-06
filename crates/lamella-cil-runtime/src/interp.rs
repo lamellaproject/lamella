@@ -2,11 +2,12 @@
 
 #[cfg(feature = "bcl")]
 use crate::module::IntrinsicFn;
-use crate::module::{MethodId, MethodKind, Module, asm_key};
+use crate::module::{MethodId, MethodKind, Module, TypeId, asm_key};
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
 use crate::value::{Location, Value};
 use alloc::collections::BTreeMap;
+use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_cil::{
@@ -17,6 +18,21 @@ use lamella_token::Token;
 /// The maximum depth of the call stack before [`Trap::CallStackOverflow`]. Bounds
 /// runaway recursion in the absence of a configured stack size.
 const MAX_CALL_DEPTH: usize = 4096;
+
+/// One marshaled P/Invoke argument crossing the host seam: a 64-bit scalar slot (every
+/// integer/pointer parameter rides one), or a byte buffer the callee reads through a
+/// pointer (an ANSI string, NUL-terminated by the marshaler; the host passes its address).
+pub enum PInvokeArg {
+    /// An integer value, sign-extended into the call ABI's 64-bit argument slot.
+    Scalar(i64),
+    /// A byte buffer passed by address (the buffer outlives the call).
+    Bytes(Vec<u8>),
+}
+
+/// The host's native-call hook: resolve `target`'s library + entry point and invoke it
+/// with `args`, returning the raw 64-bit result slot. `Err(())` reports a resolution or
+/// call failure (missing library/symbol, unsupported arity).
+pub type PInvokeHostFn = fn(&crate::module::PInvokeTarget, &mut [PInvokeArg]) -> Result<i64, ()>;
 
 /// The runtime context an execution shares across frames and exposes to
 /// intrinsics: the managed heap and the console output.
@@ -36,6 +52,11 @@ pub struct Vm {
     /// unless `debug_write` is called.
     debug_output: Vec<u16>,
     statics: Vec<Value>,
+    /// The types whose `.cctor` has run (or is running) in this VM -- the lazy-initialization
+    /// state of II.10.5.3. Marked BEFORE the cctor's frame is pushed, so a recursive trigger
+    /// inside the cctor sees the type as initialized (partial state, as the spec allows)
+    /// instead of re-running it.
+    cctors_run: BTreeSet<TypeId>,
     /// The message string of each exception object, kept as runtime side-state so
     /// `Exception.Message` works without modeling mscorlib's field layout (and so the
     /// message-stripping knob has one place to act). Keyed by the exception object.
@@ -121,6 +142,10 @@ pub struct Vm {
     /// + raw `Read*`/`Write*`. `None` until the embedder selects a backend (the Safe bounds-checked
     /// block table or Real host pointers); Marshal ops then report no native memory on this build.
     memory_backend: Option<alloc::boxed::Box<dyn crate::memory::MemoryBackend>>,
+    /// The P/Invoke host seam: a `[DllImport]` dispatch resolves + calls the native entry
+    /// through this hook. `None` (the device tiers, or a host that keeps interop off)
+    /// makes such a call trap as unresolved.
+    pinvoke_host: Option<PInvokeHostFn>,
     /// The volatile MMIO seam ([`Lamella.Hardware.Mmio`]) -- a C# peripheral driver's register
     /// access. The no_std core does no raw pointer I/O itself (it forbids `unsafe`); the embedder
     /// installs these (a device firmware with `write_volatile`/`read_volatile` at the real address;
@@ -424,6 +449,19 @@ impl Vm {
         self.memory_backend.as_deref_mut()
     }
 
+    /// Installs the P/Invoke host seam: the native-call hook a `[DllImport]` dispatch
+    /// drives (a HOST runner resolves the library + entry and performs the foreign call;
+    /// a device build leaves this unset and the call traps as unresolved).
+    pub fn set_pinvoke_host(&mut self, host: PInvokeHostFn) {
+        self.pinvoke_host = Some(host);
+    }
+
+    /// The P/Invoke host seam, if installed.
+    #[must_use]
+    pub fn pinvoke_host(&self) -> Option<PInvokeHostFn> {
+        self.pinvoke_host
+    }
+
     /// Installs the volatile MMIO seam (a device firmware supplies `write_volatile`/`read_volatile`
     /// at the real register address; the no_std core does no raw pointer I/O itself). Once set,
     /// `Mmio.Write32`/`Read32` route here instead of the host simulated register file.
@@ -540,6 +578,30 @@ impl Vm {
     pub fn init_statics(&mut self, defaults: &[Value]) {
         if self.statics.len() < defaults.len() {
             self.statics = defaults.to_vec();
+        }
+    }
+
+    /// The not-yet-run `.cctor` of `type_id`, marking it run (II.10.5.3 lazy
+    /// initialization). `None` if the type has no cctor or it already ran in this VM.
+    /// Marking happens HERE -- before the caller pushes the cctor's frame -- so a
+    /// recursive trigger inside the cctor sees the type as initialized (the partial
+    /// state the spec allows) and the replayed trigger instruction does not re-fire.
+    pub fn take_pending_cctor(&mut self, module: &Module, type_id: TypeId) -> Option<MethodId> {
+        let cctor = module.cctor_of_type(type_id)?;
+        if self.cctors_run.insert(type_id) {
+            Some(cctor)
+        } else {
+            None
+        }
+    }
+
+    /// Marks every type's `.cctor` as already run -- the EAGER embedder's escape hatch
+    /// (a baked device image boots its cctors up front, before serving).
+    pub fn mark_all_cctors_run(&mut self, module: &Module) {
+        for &cctor in module.static_ctors() {
+            if let Some(type_id) = module.method_type(cctor) {
+                self.cctors_run.insert(type_id);
+            }
         }
     }
 
@@ -734,6 +796,11 @@ enum Flow {
         /// The constructor arguments (without `this`), from the caller's stack.
         args: Vec<Value>,
     },
+    /// A type's first static access / method entry found a not-yet-run `.cctor`
+    /// (II.10.5.3): the driver rewinds the triggering instruction and pushes the cctor's
+    /// frame, so the cctor runs to completion and the instruction replays initialized.
+    /// The type was already marked run (see [`Vm::take_pending_cctor`]).
+    EnsureCctor(MethodId),
     /// A `throw` or `rethrow` is propagating an exception; the call stack must be
     /// searched for a handler.
     Throw(ObjectRef),
@@ -864,6 +931,7 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
             Flow::NewObj { .. } | Flow::NewValueObj { .. } => {
                 return Err(Trap::Unsupported(Opcode::Newobj));
             }
+            Flow::EnsureCctor(_) => return Err(Trap::Unsupported(Opcode::Ldsfld)),
             Flow::Throw(_) => return Err(Trap::Unsupported(Opcode::Throw)),
             Flow::Leave(_) => return Err(Trap::Unsupported(Opcode::Leave)),
             Flow::EndFinally => return Err(Trap::Unsupported(Opcode::Endfinally)),
@@ -1082,9 +1150,6 @@ pub fn run(
     entry: MethodId,
     args: Vec<Value>,
 ) -> Result<Option<Value>, Trap> {
-    for &cctor in module.static_ctors() {
-        Session::new(module, cctor, Vec::new())?.run(module, vm)?;
-    }
     let mut threads = alloc::vec![ThreadSlot {
         id: 0,
         session: Session::new(module, entry, args)?,
@@ -1779,6 +1844,7 @@ impl Session {
         let top = &mut frames[current];
         let asm = module.method_asm(top.method);
         let code = method_code(module, top.method)?;
+        let instruction_ip = top.ip;
         #[cfg(not(feature = "code-in-place"))]
         let instruction = {
             let fetched = code.get(top.ip).ok_or(Trap::FellThroughEnd)?;
@@ -1820,6 +1886,7 @@ impl Session {
                         let mut next = new_frame(module, method, call_args)?;
                         next.multicast = Some((remaining, params));
                         frames.push(next);
+                        push_pending_cctor(frames, module, vm, method)?;
                         return Ok(Status::Running);
                     }
                 }
@@ -1849,6 +1916,7 @@ impl Session {
                 frames.pop();
                 let frame = new_frame(module, target, args)?;
                 frames.push(frame);
+                push_pending_cctor(frames, module, vm, target)?;
                 Ok(Status::Running)
             }
             Flow::Call { method, args } => match module.method_kind(method) {
@@ -1857,9 +1925,11 @@ impl Session {
                         return Err(Trap::CallStackOverflow);
                     }
                     frames.push(new_frame(module, method, args)?);
+                    push_pending_cctor(frames, module, vm, method)?;
                     Ok(Status::Running)
                 }
                 Some(MethodKind::Intrinsic(func)) => {
+                    run_pending_cctor_nested(module, vm, method)?;
                     let args = if is_compare_exchange(module, method) {
                         args
                     } else {
@@ -1905,6 +1975,7 @@ impl Session {
                     types: var_types,
                 });
                 frames.push(frame);
+                push_pending_cctor(frames, module, vm, method)?;
                 Ok(Status::Running)
             }
             Flow::NewObj { ctor, object, args } => match module.method_kind(ctor) {
@@ -1918,6 +1989,7 @@ impl Session {
                     let mut frame = new_frame(module, ctor, full_args)?;
                     frame.new_object = Some(object);
                     frames.push(frame);
+                    push_pending_cctor(frames, module, vm, ctor)?;
                     Ok(Status::Running)
                 }
                 Some(MethodKind::Intrinsic(func)) => {
@@ -1949,6 +2021,7 @@ impl Session {
                     let mut frame = new_frame(module, ctor, full_args)?;
                     frame.new_value = Some(location);
                     frames.push(frame);
+                    push_pending_cctor(frames, module, vm, ctor)?;
                     Ok(Status::Running)
                 }
                 Some(MethodKind::Intrinsic(_)) => {
@@ -1962,6 +2035,16 @@ impl Session {
                 }
                 None => Err(Trap::NoSuchMethod(ctor)),
             },
+            Flow::EnsureCctor(cctor) => {
+                if let Some(top) = frames.last_mut() {
+                    top.ip = instruction_ip;
+                }
+                if frames.len() >= MAX_CALL_DEPTH {
+                    return Err(Trap::CallStackOverflow);
+                }
+                frames.push(new_frame(module, cctor, Vec::new())?);
+                Ok(Status::Running)
+            }
             Flow::Throw(exception) => {
                 #[cfg(feature = "exceptions")]
                 vm.note_unhandled(exception);
@@ -2142,6 +2225,17 @@ fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<
             _ => None,
         },
         Location::Stack { .. } => None,
+        Location::LocalBytes {
+            frame,
+            slot,
+            byte_offset: 0,
+        } => read_location_value(frames, vm, Location::Local { frame, slot }),
+        Location::ArgBytes {
+            frame,
+            slot,
+            byte_offset: 0,
+        } => read_location_value(frames, vm, Location::Arg { frame, slot }),
+        Location::LocalBytes { .. } | Location::ArgBytes { .. } => None,
     }
 }
 
@@ -2203,6 +2297,19 @@ fn write_location_value(
             write_location_value(frames, vm, *base, Value::Struct(fields))
         }
         Location::Stack { .. } => Err(Trap::Unsupported(Opcode::Stobj)),
+        Location::LocalBytes {
+            frame,
+            slot,
+            byte_offset: 0,
+        } => write_location_value(frames, vm, Location::Local { frame, slot }, value),
+        Location::ArgBytes {
+            frame,
+            slot,
+            byte_offset: 0,
+        } => write_location_value(frames, vm, Location::Arg { frame, slot }, value),
+        Location::LocalBytes { .. } | Location::ArgBytes { .. } => {
+            Err(Trap::Unsupported(Opcode::Stobj))
+        }
     }
 }
 
@@ -2373,6 +2480,88 @@ fn write_field_at(
     write_location_value(frames, vm, location, container)
 }
 
+/// Dispatches a `call` of a bodyless `[DllImport]` method: takes the call's arguments
+/// off the evaluation stack, marshals them per the target's recorded signature shape
+/// (integers ride a 64-bit scalar slot; a managed string becomes a NUL-terminated byte
+/// buffer -- exact for the ASCII range an ANSI import reads), invokes the host seam, and
+/// pushes the mapped return. Without an installed host (the device tiers) the call traps
+/// as unresolved, exactly as if the import did not exist.
+fn pinvoke_call(
+    frame: &mut Frame,
+    vm: &mut Vm,
+    target: &crate::module::PInvokeTarget,
+    token: Token,
+) -> Result<Flow, Trap> {
+    use crate::module::{PInvokeParam, PInvokeReturn};
+    let host = vm.pinvoke_host().ok_or(Trap::UnresolvedCall(token))?;
+    let args = frame.take_args(target.params.len() as u16)?;
+    let mut marshaled = Vec::with_capacity(args.len());
+    for (value, kind) in args.iter().zip(&target.params) {
+        marshaled.push(match kind {
+            PInvokeParam::Scalar => PInvokeArg::Scalar(match value {
+                Value::Int32(n) => i64::from(*n),
+                Value::Int64(n) | Value::NativeInt(n) => *n,
+                _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+            }),
+            PInvokeParam::AnsiString => match value {
+                Value::Null => PInvokeArg::Scalar(0),
+                Value::Object(reference) => {
+                    let units = vm
+                        .heap()
+                        .as_string(*reference)
+                        .ok_or(Trap::TypeMismatch(Opcode::Call))?;
+                    let mut bytes = String::from_utf16_lossy(&units).into_bytes();
+                    bytes.push(0);
+                    PInvokeArg::Bytes(bytes)
+                }
+                _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+            },
+        });
+    }
+    let result = host(target, &mut marshaled).map_err(|()| Trap::UnresolvedCall(token))?;
+    match target.returns {
+        PInvokeReturn::Void => {}
+        PInvokeReturn::Int32 => frame.stack.push(Value::Int32(result as i32)),
+    }
+    Ok(Flow::Next)
+}
+
+/// Pushes the not-yet-run `.cctor` frame of `method`'s declaring type, if any, on top of
+/// the just-pushed callee frame -- the initializer runs to completion first, returns
+/// void, and the callee proceeds (II.10.5.3: first method entry triggers initialization).
+fn push_pending_cctor(
+    frames: &mut Vec<Frame>,
+    module: &Module,
+    vm: &mut Vm,
+    method: MethodId,
+) -> Result<(), Trap> {
+    let Some(type_id) = module.method_type(method) else {
+        return Ok(());
+    };
+    let Some(cctor) = vm.take_pending_cctor(module, type_id) else {
+        return Ok(());
+    };
+    if frames.len() >= MAX_CALL_DEPTH {
+        return Err(Trap::CallStackOverflow);
+    }
+    frames.push(new_frame(module, cctor, Vec::new())?);
+    Ok(())
+}
+
+/// Runs the not-yet-run `.cctor` of `method`'s declaring type as a NESTED session -- for
+/// the inline-intrinsic dispatch, which pushes no frame of its own (the same pattern the
+/// reflective intrinsics use to run attribute constructors).
+fn run_pending_cctor_nested(module: &Module, vm: &mut Vm, method: MethodId) -> Result<(), Trap> {
+    let Some(type_id) = module.method_type(method) else {
+        return Ok(());
+    };
+    let Some(cctor) = vm.take_pending_cctor(module, type_id) else {
+        return Ok(());
+    };
+    Session::new(module, cctor, Vec::new())?.run(module, vm)?;
+    Ok(())
+}
+
 fn new_frame(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
     match module.method_kind(id) {
         Some(MethodKind::Managed) => Ok(Frame::new(id, args)),
@@ -2465,6 +2654,12 @@ fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str]
         "System.Exception",
         "System.Object",
     ];
+    const ARRAY_MISMATCH: &[&str] = &[
+        "System.ArrayTypeMismatchException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
     const ARGUMENT: &[&str] = &[
         "System.ArgumentException",
         "System.SystemException",
@@ -2489,6 +2684,10 @@ fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str]
             ARG_OOR,
         ),
         Trap::InvalidCast => ("Unable to cast object to the target type.", INVALID_CAST),
+        Trap::ArrayTypeMismatch => (
+            "Attempted to access an element as a type incompatible with the array.",
+            ARRAY_MISMATCH,
+        ),
         Trap::InvalidArgument => ("Requested value was not found.", ARGUMENT),
         Trap::SynchronizationLock => (
             "Object synchronization method was called from an unsynchronized block of code.",
@@ -2988,16 +3187,19 @@ fn step(
             let chars = module
                 .resolve_string_le(asm, token)
                 .ok_or(Trap::UnresolvedString(token))?;
-            let reference = vm.heap_mut().alloc_string_le(chars);
+            let reference = vm.heap_mut().intern_string_le(chars);
             frame.stack.push(Value::Object(reference));
         }
 
         Opcode::Call => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Call))?;
             let token = token_operand(instruction)?;
-            let method = module
-                .resolve(asm, token)
-                .ok_or(Trap::UnresolvedCall(token))?;
+            let Some(method) = module.resolve(asm, token) else {
+                if let Some(target) = module.pinvoke_target(asm, token.0) {
+                    return pinvoke_call(frame, vm, target, token);
+                }
+                return Err(Trap::UnresolvedCall(token));
+            };
             if let Some(site) = module.vararg_site(asm, token) {
                 let total = site.total_args;
                 let vararg_start = site.vararg_start;
@@ -3335,6 +3537,11 @@ fn step(
             let slot = module
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
+            if let Some(type_id) = module.type_of_static_slot(slot) {
+                if let Some(cctor) = vm.take_pending_cctor(module, type_id) {
+                    return Ok(Flow::EnsureCctor(cctor));
+                }
+            }
             if vm.statics_len() < module.static_field_count() {
                 vm.init_statics(&module.decode_static_defaults());
             }
@@ -3470,6 +3677,11 @@ fn step(
             let slot = module
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
+            if let Some(type_id) = module.type_of_static_slot(slot) {
+                if let Some(cctor) = vm.take_pending_cctor(module, type_id) {
+                    return Ok(Flow::EnsureCctor(cctor));
+                }
+            }
             if vm.statics_len() < module.static_field_count() {
                 vm.init_statics(&module.decode_static_defaults());
             }
@@ -3482,6 +3694,11 @@ fn step(
             let slot = module
                 .static_field_slot(asm, token)
                 .ok_or(Trap::UnresolvedField(token))?;
+            if let Some(type_id) = module.type_of_static_slot(slot) {
+                if let Some(cctor) = vm.take_pending_cctor(module, type_id) {
+                    return Ok(Flow::EnsureCctor(cctor));
+                }
+            }
             let value = frame.pop()?;
             if vm.statics_len() < module.static_field_count() {
                 vm.init_statics(&module.decode_static_defaults());
@@ -3540,9 +3757,11 @@ fn step(
             };
             let element_size = module.array_element_size(asm, token);
             let length = array_length(frame.pop()?)?;
-            let object = vm
-                .heap_mut()
-                .alloc_array_sized(alloc::vec![default; length], element_size);
+            let object = vm.heap_mut().alloc_array_sized(
+                alloc::vec![default; length],
+                element_size,
+                asm_key(asm, token.0),
+            );
             frame.stack.push(Value::Object(object));
         }
 
@@ -3596,6 +3815,23 @@ fn step(
             let array = object_ref(frame.pop()?, instruction.opcode)?;
             let len = vm.heap().array_len(array).ok_or(Trap::NullReference)?;
             let index = bounded_index(index, len)?;
+            if instruction.opcode == Opcode::StelemRef {
+                if let (Value::Object(_), Some(element_type)) =
+                    (&value, vm.heap().array_element_type(array))
+                {
+                    if element_type != 0 {
+                        let element_asm = (element_type >> 32) as u8;
+                        let element_token = Token((element_type & 0xFFFF_FFFF) as u32);
+                        let matches = module.is_some_and(|module| {
+                            module.is_object_type_token(element_asm, element_token)
+                                || cast_matches(module, element_asm, vm, &value, element_token)
+                        });
+                        if !matches {
+                            return Err(Trap::ArrayTypeMismatch);
+                        }
+                    }
+                }
+            }
             if !vm.heap_mut().array_set(array, index, value) {
                 return Err(Trap::IndexOutOfRange(index as i32));
             }
@@ -4196,23 +4432,63 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
             index: *index,
             byte_offset: walked(*byte_offset),
         },
+        Location::Local { frame, slot } => Location::LocalBytes {
+            frame: *frame,
+            slot: *slot,
+            byte_offset: walked(0),
+        },
+        Location::Arg { frame, slot } => Location::ArgBytes {
+            frame: *frame,
+            slot: *slot,
+            byte_offset: walked(0),
+        },
+        Location::LocalBytes {
+            frame,
+            slot,
+            byte_offset,
+        } => Location::LocalBytes {
+            frame: *frame,
+            slot: *slot,
+            byte_offset: walked(*byte_offset),
+        },
+        Location::ArgBytes {
+            frame,
+            slot,
+            byte_offset,
+        } => Location::ArgBytes {
+            frame: *frame,
+            slot: *slot,
+            byte_offset: walked(*byte_offset),
+        },
         _ => return Ok(None),
     };
     Ok(Some(Value::ByRef(stepped)))
 }
 
-/// Whether a managed pointer is one of the raw byte-addressed kinds that pointer arithmetic
-/// walks: a `localloc` (`stackalloc`) buffer pointer or a pinned-array element pointer. The
-/// typed-slot kinds (a frame local/arg, a field, a static, a box) are not byte-addressed.
+/// Whether a managed pointer is one of the byte-addressed kinds that pointer arithmetic
+/// walks: a `localloc` (`stackalloc`) buffer pointer, a pinned-array element pointer, or
+/// the address of a frame local/argument (which arithmetic promotes to its `*Bytes`
+/// displaced form). A heap field/static/box pointer is not byte-addressed.
 fn is_raw_pointer(location: &Location) -> bool {
-    matches!(location, Location::Stack { .. } | Location::Element { .. })
+    matches!(
+        location,
+        Location::Stack { .. }
+            | Location::Element { .. }
+            | Location::Local { .. }
+            | Location::Arg { .. }
+            | Location::LocalBytes { .. }
+            | Location::ArgBytes { .. }
+    )
 }
 
-/// The signed BYTE difference `a - b` of two raw pointers into the SAME buffer/array, for
-/// `pointer - pointer` (III.1.5). `None` for pointers into different allocations (or different
-/// element bases) -- subtracting those is undefined, and returning `None` lets the op trap, as
-/// in .NET.
+/// The signed BYTE difference `a - b` of two raw pointers into the SAME buffer/array/slot,
+/// for `pointer - pointer` (III.1.5). `None` for pointers into different allocations (or
+/// different element bases) -- subtracting those is undefined, and returning `None` lets
+/// the op trap, as in .NET.
 fn raw_pointer_byte_difference(a: &Location, b: &Location) -> Option<i64> {
+    if let (Some((base_a, off_a)), Some((base_b, off_b))) = (slot_pointer(a), slot_pointer(b)) {
+        return (base_a == base_b).then(|| i64::from(off_a) - i64::from(off_b));
+    }
     match (a, b) {
         (
             Location::Stack {
@@ -4238,6 +4514,101 @@ fn raw_pointer_byte_difference(a: &Location, b: &Location) -> Option<i64> {
                 byte_offset: ob,
             },
         ) if aa == ab && ia == ib => Some(i64::from(*oa) - i64::from(*ob)),
+        _ => None,
+    }
+}
+
+/// A stable TOTAL order over managed pointers for the unsafe comparison operators
+/// (III.1.5): same-base slot pointers compare by byte displacement (a typed slot address
+/// and its displaced form normalize to one base, so `&s == &s + 0` and `&s + 8 > &s`
+/// hold); the raw buffer/element kinds compare within their base; pointers into
+/// different bases get an arbitrary but stable order (the CLI leaves cross-allocation
+/// comparison unspecified -- unsafe code may still form it, so it must not trap).
+fn pointer_compare(a: &Location, b: &Location) -> core::cmp::Ordering {
+    if let (Some((base_a, off_a)), Some((base_b, off_b))) = (slot_pointer(a), slot_pointer(b)) {
+        return base_a.cmp(&base_b).then(off_a.cmp(&off_b));
+    }
+    fn rank(location: &Location) -> u8 {
+        match location {
+            Location::Local { .. } | Location::LocalBytes { .. } => 0,
+            Location::Arg { .. } | Location::ArgBytes { .. } => 1,
+            Location::Stack { .. } => 2,
+            Location::Element { .. } => 3,
+            Location::Field { .. } => 4,
+            Location::Static { .. } => 5,
+            Location::Boxed { .. } => 6,
+            Location::Nested { .. } => 7,
+        }
+    }
+    match (a, b) {
+        (
+            Location::Stack {
+                frame: fa,
+                buffer: ba,
+                offset: oa,
+            },
+            Location::Stack {
+                frame: fb,
+                buffer: bb,
+                offset: ob,
+            },
+        ) => (fa, ba, oa).cmp(&(fb, bb, ob)),
+        (
+            Location::Element {
+                array: aa,
+                index: ia,
+                byte_offset: oa,
+            },
+            Location::Element {
+                array: ab,
+                index: ib,
+                byte_offset: ob,
+            },
+        ) => (aa, ia, oa).cmp(&(ab, ib, ob)),
+        (
+            Location::Field {
+                object: oa,
+                slot: sa,
+            },
+            Location::Field {
+                object: ob,
+                slot: sb,
+            },
+        ) => (oa, sa).cmp(&(ob, sb)),
+        (Location::Static { slot: sa }, Location::Static { slot: sb }) => sa.cmp(sb),
+        (Location::Boxed { object: oa }, Location::Boxed { object: ob }) => oa.cmp(ob),
+        (
+            Location::Nested {
+                base: ba,
+                slot: sa,
+            },
+            Location::Nested {
+                base: bb,
+                slot: sb,
+            },
+        ) => pointer_compare(ba, bb).then(sa.cmp(sb)),
+        _ => rank(a).cmp(&rank(b)),
+    }
+}
+
+/// Normalizes a frame-slot pointer to its `(base, byte displacement)` form: a plain
+/// local/arg address IS its slot at displacement 0, and the `*Bytes` forms carry the
+/// displacement pointer arithmetic accumulated. `None` for the non-slot kinds. The base
+/// distinguishes locals from arguments so `&local` never aliases `&arg`.
+fn slot_pointer(location: &Location) -> Option<((bool, usize, usize), u32)> {
+    match location {
+        Location::Local { frame, slot } => Some(((true, *frame, *slot), 0)),
+        Location::LocalBytes {
+            frame,
+            slot,
+            byte_offset,
+        } => Some(((true, *frame, *slot), *byte_offset)),
+        Location::Arg { frame, slot } => Some(((false, *frame, *slot), 0)),
+        Location::ArgBytes {
+            frame,
+            slot,
+            byte_offset,
+        } => Some(((false, *frame, *slot), *byte_offset)),
         _ => None,
     }
 }
@@ -4534,6 +4905,19 @@ fn compare(opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
             return Ok(unordered_or_unsigned && !matches!(relation, Relation::Equal));
         }
         return Ok(apply_relation(relation, x.partial_cmp(&y)));
+    }
+    if let (Value::ByRef(la), Value::ByRef(lb)) = (&a, &b) {
+        let ordering = pointer_compare(la, lb);
+        return Ok(apply_relation(relation, Some(ordering)));
+    }
+    if let (Value::ByRef(_), other) | (other, Value::ByRef(_)) = (&a, &b) {
+        if pointer_offset(other) == Some(0) {
+            return match (relation, unordered_or_unsigned) {
+                (Relation::Equal, _) => Ok(false),
+                (Relation::NotEqual, _) | (Relation::Greater, true) => Ok(true),
+                _ => Err(Trap::TypeMismatch(opcode)),
+            };
+        }
     }
     if matches!(a, Value::Object(_) | Value::Null) || matches!(b, Value::Object(_) | Value::Null) {
         let equal = reference_equal(a, b);

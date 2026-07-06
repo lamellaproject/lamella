@@ -503,6 +503,7 @@ fn emit_attributes(
     image: &mut ImageBuilder,
     binder: &Binder,
     tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
     parent: Token,
     sections: &[AttributeSection],
 ) {
@@ -519,7 +520,7 @@ fn emit_attributes(
             Some(_) => continue,
         };
         for attribute in &section.attributes {
-            emit_one_attribute(image, binder, tokens, attribute_parent, attribute);
+            emit_one_attribute(image, binder, tokens, enclosing, attribute_parent, attribute);
         }
     }
 }
@@ -528,6 +529,7 @@ fn emit_one_attribute(
     image: &mut ImageBuilder,
     binder: &Binder,
     tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
     parent: Token,
     attribute: &lamella_syntax::ast::Attribute,
 ) {
@@ -539,14 +541,44 @@ fn emit_one_attribute(
             AttributeArgument::Named { name, value } => named.push((name, value)),
         }
     }
-    let Some((attribute_ty, parameters)) =
+    let Some((attribute_ty, parameters, is_params)) =
         resolve_attribute(binder, &attribute.name, positional.len())
     else {
         return;
     };
     let mut blob = alloc::vec![0x01u8, 0x00];
-    for (expr, parameter) in positional.iter().zip(&parameters) {
-        if encode_value(binder, tokens, expr, parameter, &mut blob).is_none() {
+    for (index, parameter) in parameters.iter().enumerate() {
+        if is_params && index + 1 == parameters.len() {
+            let TypeSymbol::Array { element, rank: 1 } = binder.resolve_type(parameter) else {
+                return;
+            };
+            let rest = &positional[index.min(positional.len())..];
+            let direct = rest.len() == 1
+                && matches!(
+                    rest[0].kind,
+                    ExprKind::ArrayCreation { .. } | ExprKind::Literal(Literal::Null)
+                );
+            if direct {
+                if encode_value(binder, tokens, enclosing, rest[0], parameter, &mut blob).is_none() {
+                    return;
+                }
+            } else {
+                let Ok(count) = u32::try_from(rest.len()) else {
+                    return;
+                };
+                blob.extend_from_slice(&count.to_le_bytes());
+                for arg in rest {
+                    if encode_value(binder, tokens, enclosing, arg, &element, &mut blob).is_none() {
+                        return;
+                    }
+                }
+            }
+            break;
+        }
+        let Some(expr) = positional.get(index) else {
+            return;
+        };
+        if encode_value(binder, tokens, enclosing, expr, parameter, &mut blob).is_none() {
             return;
         }
     }
@@ -555,7 +587,9 @@ fn emit_one_attribute(
     };
     blob.extend_from_slice(&named_count.to_le_bytes());
     for (name, value) in &named {
-        if encode_named_argument(binder, tokens, &attribute_ty, name, value, &mut blob).is_none() {
+        if encode_named_argument(binder, tokens, enclosing, &attribute_ty, name, value, &mut blob)
+            .is_none()
+        {
             return;
         }
     }
@@ -582,17 +616,24 @@ fn resolve_attribute(
     binder: &Binder,
     name: &QualifiedName,
     arg_count: usize,
-) -> Option<(TypeSymbol, Vec<TypeSymbol>)> {
+) -> Option<(TypeSymbol, Vec<TypeSymbol>, bool)> {
     let model = binder.model();
     for candidate in attribute_candidates(name) {
         let resolved = binder.resolve_type(&candidate);
         if let Some(info) = model.get_by_symbol(&resolved) {
-            if let Some(constructor) = info
+            let constructor = info
                 .constructors
                 .iter()
                 .find(|constructor| constructor.parameters.len() == arg_count)
-            {
-                return Some((resolved, constructor.parameters.clone()));
+                .or_else(|| {
+                    info.constructors.iter().find(|constructor| {
+                        constructor.is_params
+                            && !constructor.parameters.is_empty()
+                            && arg_count + 1 >= constructor.parameters.len()
+                    })
+                });
+            if let Some(constructor) = constructor {
+                return Some((resolved, constructor.parameters.clone(), constructor.is_params));
             }
         }
     }
@@ -625,13 +666,24 @@ fn attribute_candidates(name: &QualifiedName) -> Vec<TypeSymbol> {
 fn encode_value(
     binder: &Binder,
     tokens: &Tokens,
+    enclosing: &TypeSymbol,
     expr: &Expr,
     ty: &TypeSymbol,
     blob: &mut Vec<u8>,
 ) -> Option<()> {
     let resolved = binder.resolve_type(ty);
     if let TypeSymbol::Array { element, rank: 1 } = &resolved {
-        return encode_array(binder, tokens, expr, element, blob);
+        return encode_array(binder, tokens, enclosing, expr, element, blob);
+    }
+    if let ExprKind::Name(name) = &expr.kind {
+        if let Some(constant) = binder
+            .model()
+            .get_by_symbol(enclosing)
+            .and_then(|info| info.find_field(name))
+            .and_then(|field| field.constant.as_ref())
+        {
+            return encode_literal(constant, &resolved, blob);
+        }
     }
     match &expr.kind {
         ExprKind::Literal(literal) => encode_literal(literal, &resolved, blob),
@@ -656,6 +708,7 @@ fn encode_value(
 fn encode_array(
     binder: &Binder,
     tokens: &Tokens,
+    enclosing: &TypeSymbol,
     expr: &Expr,
     element: &TypeSymbol,
     blob: &mut Vec<u8>,
@@ -677,7 +730,7 @@ fn encode_array(
     let count = u32::try_from(elements.len()).ok()?;
     blob.extend_from_slice(&count.to_le_bytes());
     for element_expr in elements {
-        encode_value(binder, tokens, element_expr, element, blob)?;
+        encode_value(binder, tokens, enclosing, element_expr, element, blob)?;
     }
     Some(())
 }
@@ -719,7 +772,7 @@ fn encode_literal(literal: &Literal, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Opt
             blob.extend_from_slice(&value.to_le_bytes());
         }
         (SpecialType::String, Literal::String(units)) => {
-            encode_ser_string(&String::from_utf16_lossy(units), blob);
+            encode_ser_string_units(units, blob);
         }
         (_, Literal::Integer { value, .. }) => return encode_integer(*special, *value, blob),
         _ => return None,
@@ -733,6 +786,7 @@ fn encode_literal(literal: &Literal, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Opt
 fn encode_named_argument(
     binder: &Binder,
     tokens: &Tokens,
+    enclosing: &TypeSymbol,
     attribute_ty: &TypeSymbol,
     name: &str,
     value: &Expr,
@@ -752,7 +806,7 @@ fn encode_named_argument(
     blob.push(tag);
     encode_element_type(binder.model(), &target_ty, blob)?;
     encode_ser_string(name, blob);
-    encode_value(binder, tokens, value, &target_ty, blob)
+    encode_value(binder, tokens, enclosing, value, &target_ty, blob)
 }
 
 /// Encodes the FieldOrPropType of a named argument (II.23.3): a primitive's element-type
@@ -801,6 +855,23 @@ fn primitive_element_code(special: SpecialType) -> Option<u8> {
 /// namespace-qualified name (the runtime resolves it in the attribute's assembly / mscorlib).
 fn type_serialization_name(target: &TypeRef) -> String {
     type_name(&bind_type(target))
+}
+
+/// Whether a static `Main` has a valid entry-point signature (10.1): return type `void` or `int`,
+/// and either no parameters or a single `string[]` parameter. Distinguishes the real entry point
+/// from an unrelated overload such as `Main(int)`.
+fn is_entry_point_signature(parameters: &[Parameter], return_type: &TypeRef) -> bool {
+    let ret = bind_type(return_type);
+    let ret_ok = ret.is_void() || matches!(ret, TypeSymbol::Special(SpecialType::Int32));
+    let params_ok = match parameters {
+        [] => true,
+        [only] => matches!(
+            bind_type(&only.ty),
+            TypeSymbol::Array { element, rank: 1 } if matches!(*element, TypeSymbol::Special(SpecialType::String))
+        ),
+        _ => false,
+    };
+    ret_ok && params_ok
 }
 
 /// A type's `namespace.name` (or bare `name` in the global namespace).
@@ -852,6 +923,14 @@ fn enum_member_constant(model: &Model, expr: &Expr) -> Option<(TypeSymbol, i64)>
     Some((enum_ty, value))
 }
 
+/// Whether `ty` is System.Enum or System.ValueType -- the two abstract classes that extend
+/// System.ValueType in metadata but are themselves REFERENCE types (a value of that static type is
+/// a boxed object). They must be encoded as Class, never as a value type, in signatures.
+fn is_reference_base_class(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Named(parts)
+        if matches!(&**parts, [ns, name] if &**ns == "System" && (&**name == "Enum" || &**name == "ValueType")))
+}
+
 /// An enum's underlying integral type (from its `value__` field), defaulting to `int`.
 fn enum_underlying(model: &Model, enum_ty: &TypeSymbol) -> SpecialType {
     match model
@@ -884,6 +963,49 @@ fn encode_integer(special: SpecialType, value: u64, blob: &mut Vec<u8>) -> Optio
 fn encode_ser_string(text: &str, blob: &mut Vec<u8>) {
     encode_compressed_u32(text.len() as u32, blob);
     blob.extend_from_slice(text.as_bytes());
+}
+
+/// Encodes UTF-16 code units as a SerString (II.23.3), combining a well-formed surrogate pair but
+/// preserving a LONE surrogate as its own 3-byte form (WTF-8). A lossy `from_utf16` would collapse a
+/// lone surrogate to one U+FFFD; csc keeps it, so the value round-trips through reflection the same.
+fn encode_ser_string_units(units: &[u16], blob: &mut Vec<u8>) {
+    let mut utf8: Vec<u8> = Vec::new();
+    let mut i = 0;
+    while i < units.len() {
+        let unit = u32::from(units[i]);
+        let code = if (0xD800..=0xDBFF).contains(&unit)
+            && i + 1 < units.len()
+            && (0xDC00..=0xDFFF).contains(&u32::from(units[i + 1]))
+        {
+            i += 1;
+            0x1_0000 + ((unit - 0xD800) << 10) + (u32::from(units[i]) - 0xDC00)
+        } else {
+            unit
+        };
+        i += 1;
+        push_utf8(code, &mut utf8);
+    }
+    encode_compressed_u32(utf8.len() as u32, blob);
+    blob.extend_from_slice(&utf8);
+}
+
+/// Appends a Unicode scalar (or a lone surrogate, encoded as WTF-8) as UTF-8 bytes.
+fn push_utf8(code: u32, out: &mut Vec<u8>) {
+    if code < 0x80 {
+        out.push(code as u8);
+    } else if code < 0x800 {
+        out.push(0xC0 | (code >> 6) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    } else if code < 0x1_0000 {
+        out.push(0xE0 | (code >> 12) as u8);
+        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    } else {
+        out.push(0xF0 | (code >> 18) as u8);
+        out.push(0x80 | ((code >> 12) & 0x3F) as u8);
+        out.push(0x80 | ((code >> 6) & 0x3F) as u8);
+        out.push(0x80 | (code & 0x3F) as u8);
+    }
 }
 
 /// Compresses an unsigned integer into the metadata blob form (II.23.2).
@@ -1382,7 +1504,7 @@ fn emit_enum(
             image.add_nested_class(enum_type_token, enclosing_token);
         }
     }
-    emit_attributes(image, binder, tokens, enum_type_token, &declaration.attributes);
+    emit_attributes(image, binder, tokens, &enum_ty, enum_type_token, &declaration.attributes);
     let value_field_sig = field_signature(&type_sig(tokens, &underlying)?);
     image.add_field("value__", &value_field_sig, ENUM_VALUE_FIELD_FLAGS);
     let member_field_sig = field_signature(&TypeSig::ValueType(enum_token));
@@ -1555,7 +1677,7 @@ fn emit_type(
             image.add_nested_class(type_token, enclosing_token);
         }
     }
-    emit_attributes(image, binder, tokens, type_token, &declaration.attributes);
+    emit_attributes(image, binder, tokens, &enclosing, type_token, &declaration.attributes);
     mint_member_signature_types(binder, &declaration.members, image, tokens);
     let direct_interfaces: Vec<TypeSymbol> = binder
         .model()
@@ -1593,7 +1715,7 @@ fn emit_type(
             emit_field(image, binder, tokens, &enclosing, modifiers, ty, declarators)?;
             for declarator in declarators {
                 if let Some(field_token) = tokens.field(&enclosing, &declarator.name) {
-                    emit_attributes(image, binder, tokens, field_token, attributes);
+                    emit_attributes(image, binder, tokens, &enclosing, field_token, attributes);
                 }
             }
         }
@@ -1691,10 +1813,11 @@ fn emit_type(
                     explicit_interface.as_ref(),
                     debug,
                 )?;
-                emit_attributes(image, binder, tokens, token, attributes);
+                emit_attributes(image, binder, tokens, &enclosing, token, attributes);
                 if entry_point.is_none()
                     && &**name == "Main"
                     && modifiers.contains(&Modifier::Static)
+                    && is_entry_point_signature(parameters, return_type)
                 {
                     *entry_point = Some(token);
                 }
@@ -1723,7 +1846,7 @@ fn emit_type(
             } if modifiers.contains(&Modifier::Abstract) => {
                 let token =
                     emit_abstract_method(image, tokens, modifiers, name, return_type, parameters)?;
-                emit_attributes(image, binder, tokens, token, attributes);
+                emit_attributes(image, binder, tokens, &enclosing, token, attributes);
             }
             Member::Operator {
                 modifiers,
@@ -1839,7 +1962,7 @@ fn emit_type(
                 explicit_interface.as_ref(),
                 debug,
             )?;
-            emit_attributes(image, binder, tokens, property, attributes);
+            emit_attributes(image, binder, tokens, &enclosing, property, attributes);
             first_property.get_or_insert(property);
         }
         if let Member::Indexer {
@@ -1895,7 +2018,7 @@ fn emit_type(
                     is_static,
                     debug,
                 )?;
-                emit_attributes(image, binder, tokens, event, attributes);
+                emit_attributes(image, binder, tokens, &enclosing, event, attributes);
                 first_event.get_or_insert(event);
             }
         }
@@ -1922,7 +2045,7 @@ fn emit_type(
                 explicit_interface.as_ref(),
                 debug,
             )?;
-            emit_attributes(image, binder, tokens, event, attributes);
+            emit_attributes(image, binder, tokens, &enclosing, event, attributes);
             first_event.get_or_insert(event);
         }
     }
@@ -2843,7 +2966,7 @@ fn emit_property(
             None
         };
         if let Some(token) = token {
-            emit_attributes(image, binder, tokens, token, &getter.attributes);
+            emit_attributes(image, binder, tokens, enclosing, token, &getter.attributes);
             image.add_method_semantics(SEMANTICS_GETTER, token, property);
         }
     }
@@ -2886,7 +3009,7 @@ fn emit_property(
             None
         };
         if let Some(token) = token {
-            emit_attributes(image, binder, tokens, token, &setter.attributes);
+            emit_attributes(image, binder, tokens, enclosing, token, &setter.attributes);
             image.add_method_semantics(SEMANTICS_SETTER, token, property);
         }
     }
@@ -2988,7 +3111,7 @@ fn emit_indexer(
             None
         };
         if let Some(token) = token {
-            emit_attributes(image, binder, tokens, token, &getter.attributes);
+            emit_attributes(image, binder, tokens, enclosing, token, &getter.attributes);
             image.add_method_semantics(SEMANTICS_GETTER, token, property);
         }
     }
@@ -3015,7 +3138,7 @@ fn emit_indexer(
             None
         };
         if let Some(token) = token {
-            emit_attributes(image, binder, tokens, token, &setter.attributes);
+            emit_attributes(image, binder, tokens, enclosing, token, &setter.attributes);
             image.add_method_semantics(SEMANTICS_SETTER, token, property);
         }
     }
@@ -3156,7 +3279,7 @@ fn member_visibility(modifiers: &[Modifier]) -> u16 {
 fn emit_field(
     image: &mut ImageBuilder,
     binder: &Binder,
-    tokens: &Tokens,
+    tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     modifiers: &[Modifier],
     ty: &lamella_syntax::ast::TypeRef,
@@ -3183,6 +3306,8 @@ fn emit_field(
         let field = image.add_field(&declarator.name, &signature, flags);
         if let Some((element, value)) = constant {
             image.add_constant(field, element, &value);
+        } else if is_const && matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal)) {
+            emit_decimal_constant_attribute(image, tokens, binder, enclosing, &declarator.name, field);
         }
     }
     Ok(())
@@ -3345,6 +3470,10 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
         } => {
             mint_in_expr(init, image, tokens);
             mint_type_token(image, tokens, element);
+            if matches!(init.ty, TypeSymbol::Special(SpecialType::String)) {
+                mint_member_ref(&offset_to_string_data_reference(), image, tokens);
+            }
+            mint_array_members(&init.ty, image, tokens);
             mint_references(body, image, tokens);
         }
         BoundStmtKind::Labeled { body, .. } => mint_references(body, image, tokens),
@@ -3385,6 +3514,10 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
         | BoundExprKind::Postfix { operand, .. }
         | BoundExprKind::Ref { operand, .. } => {
             mint_in_expr(operand, image, tokens);
+            if matches!(operand.ty, TypeSymbol::Special(SpecialType::Decimal)) {
+                mint_decimal_step("op_Increment", image, tokens);
+                mint_decimal_step("op_Decrement", image, tokens);
+            }
         }
         BoundExprKind::Conversion {
             operand,
@@ -3504,6 +3637,9 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     let token = image.user_string(text);
                     tokens.insert_string(text, token);
                 }
+                if matches!(&field.constant, Some(Literal::Decimal { .. })) {
+                    mint_decimal_ctor(image, tokens);
+                }
             }
         }
         BoundExprKind::MethodGroup { receiver, .. } => mint_in_expr(receiver, image, tokens),
@@ -3566,6 +3702,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             target,
             value,
             operator,
+            ..
         } => {
             mint_in_expr(target, image, tokens);
             mint_in_expr(value, image, tokens);
@@ -3590,9 +3727,13 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 }
             }
             if matches!(operator, lamella_syntax::ast::AssignmentOperator::Add)
-                && is_string(&target.ty)
+                && matches!(
+                    target.ty,
+                    TypeSymbol::Special(SpecialType::String | SpecialType::Object)
+                )
             {
-                mint_member_ref(&string_concat_reference(is_string(&value.ty)), image, tokens);
+                let both_string = is_string(&target.ty) && is_string(&value.ty);
+                mint_member_ref(&string_concat_reference(both_string), image, tokens);
             }
         }
         BoundExprKind::Conditional {
@@ -3606,6 +3747,9 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
         }
         BoundExprKind::TypeTest { operand, target, .. } => {
             mint_in_expr(operand, image, tokens);
+            if is_value_type(&operand.ty, tokens) {
+                mint_value_type_token(&operand.ty, image, tokens);
+            }
             mint_type_token(image, tokens, target);
         }
         BoundExprKind::TypeOf(target) => {
@@ -3652,6 +3796,18 @@ fn get_type_from_handle_reference() -> lamella_binder::MethodReference {
         name: "GetTypeFromHandle".into(),
         parameters: alloc::vec![crate::expr::runtime_type_handle_symbol()],
         return_type: crate::expr::system_type_symbol(),
+        is_static: true,
+    }
+}
+
+/// `RuntimeHelpers.get_OffsetToStringData()` -- the byte offset from a string reference to its first
+/// UTF-16 character, which `fixed (char* p = str)` (18.6) adds to the pinned string's address.
+pub(crate) fn offset_to_string_data_reference() -> lamella_binder::MethodReference {
+    lamella_binder::MethodReference {
+        declaring_type: named_symbol("System.Runtime.CompilerServices", "RuntimeHelpers"),
+        name: "get_OffsetToStringData".into(),
+        parameters: alloc::vec![],
+        return_type: TypeSymbol::Special(SpecialType::Int32),
         is_static: true,
     }
 }
@@ -3845,7 +4001,8 @@ fn system_type_name(special: SpecialType) -> Option<(&'static str, &'static str)
         SpecialType::String => ("System", "String"),
         SpecialType::Object => ("System", "Object"),
         SpecialType::Decimal => ("System", "Decimal"),
-        SpecialType::Void | SpecialType::Null => return None,
+        SpecialType::Void => ("System", "Void"),
+        SpecialType::Null => return None,
     })
 }
 
@@ -3892,6 +4049,9 @@ fn mark_external_value_types(model: &Model, tokens: &mut Tokens) {
         })
         .collect();
     for (symbol, kind) in value_types {
+        if is_reference_base_class(&symbol) {
+            continue;
+        }
         match kind {
             lamella_binder::TypeKind::Struct => tokens.insert_struct(&symbol),
             lamella_binder::TypeKind::Enum => {
@@ -4050,6 +4210,78 @@ fn mint_decimal_ctor(image: &mut ImageBuilder, tokens: &mut Tokens) {
     let signature = method_signature(true, &param_sigs, &TypeSig::Void);
     let ctor = image.member_ref(parent, ".ctor", &signature);
     tokens.insert_method(&decimal_ty, ".ctor", &params, ctor);
+}
+
+/// Emits `[DecimalConstantAttribute(scale, sign, hi, mid, low)]` on a `const decimal` field, since a
+/// decimal has no `Constant` metadata encoding -- the attribute is how reflection recovers the value.
+fn emit_decimal_constant_attribute(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    binder: &Binder,
+    enclosing: &TypeSymbol,
+    name: &str,
+    field: Token,
+) {
+    let Some(Literal::Decimal {
+        lo,
+        mid,
+        hi,
+        scale,
+        negative,
+    }) = binder
+        .model()
+        .get_by_symbol(enclosing)
+        .and_then(|info| info.find_field(name))
+        .and_then(|f| f.constant.clone())
+    else {
+        return;
+    };
+    let attr_ty = named_symbol("System.Runtime.CompilerServices", "DecimalConstantAttribute");
+    let params = [
+        TypeSymbol::Special(SpecialType::Byte),
+        TypeSymbol::Special(SpecialType::Byte),
+        TypeSymbol::Special(SpecialType::UInt32),
+        TypeSymbol::Special(SpecialType::UInt32),
+        TypeSymbol::Special(SpecialType::UInt32),
+    ];
+    let reference = lamella_binder::MethodReference {
+        declaring_type: attr_ty.clone(),
+        name: ".ctor".into(),
+        parameters: params.to_vec(),
+        return_type: TypeSymbol::Special(SpecialType::Void),
+        is_static: false,
+    };
+    mint_member_ref(&reference, image, tokens);
+    let Some(ctor) = tokens.method(&attr_ty, ".ctor", &params) else {
+        return;
+    };
+    let mut blob = alloc::vec![0x01u8, 0x00, scale, u8::from(negative)];
+    blob.extend_from_slice(&hi.to_le_bytes());
+    blob.extend_from_slice(&mid.to_le_bytes());
+    blob.extend_from_slice(&lo.to_le_bytes());
+    blob.extend_from_slice(&[0x00, 0x00]);
+    image.add_custom_attribute(field, ctor, &blob);
+}
+
+/// Mints `System.Decimal.op_Increment`/`op_Decrement` (`decimal -> decimal`): a `decimal++`/`--`
+/// steps through the operator method (there is no native CIL decimal add), so user_step_method can
+/// find its token and the increment emits the call instead of a native `add 1`.
+fn mint_decimal_step(name: &str, image: &mut ImageBuilder, tokens: &mut Tokens) {
+    let decimal_ty = TypeSymbol::Special(SpecialType::Decimal);
+    let params = [decimal_ty.clone()];
+    if tokens.method(&decimal_ty, name, &params).is_some() {
+        return;
+    }
+    mint_value_type_token(&decimal_ty, image, tokens);
+    let Some(parent) = tokens.type_token(&decimal_ty) else {
+        return;
+    };
+    let Ok(sig) = type_sig(tokens, &decimal_ty) else {
+        return;
+    };
+    let signature = method_signature(false, &[sig.clone()], &sig);
+    let method = image.member_ref(parent, name, &signature);
+    tokens.insert_method(&decimal_ty, name, &params, method);
 }
 
 /// Splits a named type into `(namespace, name)`, e.g. `System.Console` -> `("System",
@@ -4309,7 +4541,9 @@ fn collect_tokens(
                 tokens.insert_type(&declaring, Token::new(TYPE_DEF, *next_type));
                 let is_struct = declaration.kind == TypeKind::Struct;
                 let is_interface = declaration.kind == TypeKind::Interface;
-                if is_struct && !matches!(declaring, TypeSymbol::Special(_)) {
+                let is_cil_primitive =
+                    matches!(&declaring, TypeSymbol::Special(s) if *s != SpecialType::Decimal);
+                if is_struct && !is_cil_primitive {
                     tokens.insert_struct(&declaring);
                 }
                 if is_interface {
@@ -4415,17 +4649,23 @@ fn collect_tokens(
                         }
                         Member::ConversionOperator {
                             direction,
+                            target,
                             parameters,
                             ..
                         } => {
                             *next_method += 1;
                             let params: Vec<TypeSymbol> =
                                 parameters.iter().map(parameter_symbol).collect();
+                            let token = Token::new(METHOD_DEF, *next_method);
+                            tokens.insert_method(&declaring, direction.method_name(), &params, token);
                             tokens.insert_method(
                                 &declaring,
-                                direction.method_name(),
+                                &crate::tokens::conversion_key_name(
+                                    direction.method_name(),
+                                    &bind_type(target),
+                                ),
                                 &params,
-                                Token::new(METHOD_DEF, *next_method),
+                                token,
                             );
                         }
                         Member::Constructor {

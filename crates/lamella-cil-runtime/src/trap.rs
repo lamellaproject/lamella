@@ -34,6 +34,9 @@ pub enum Trap {
     /// A `castclass` to a type the object is not an instance of (the
     /// `InvalidCastException` site, until exceptions exist).
     InvalidCast,
+    /// A `stelem.ref` whose value is not assignable to the array's ELEMENT type -- a
+    /// covariant store (I.8.7.1, the `ArrayTypeMismatchException` site).
+    ArrayTypeMismatch,
     /// An argument was invalid (the `ArgumentException` site) -- e.g. `Enum.Parse` of a
     /// name that names no constant of the enum.
     InvalidArgument,
@@ -77,6 +80,7 @@ impl fmt::Display for Trap {
             Trap::IndexOutOfRange(index) => write!(f, "index {index} out of range"),
             Trap::NullReference => f.write_str("dereferenced a null reference"),
             Trap::InvalidCast => f.write_str("invalid cast"),
+            Trap::ArrayTypeMismatch => f.write_str("array element type mismatch"),
             Trap::InvalidArgument => f.write_str("invalid argument"),
             Trap::SynchronizationLock => {
                 f.write_str("monitor wait/pulse by a thread that does not own the lock")

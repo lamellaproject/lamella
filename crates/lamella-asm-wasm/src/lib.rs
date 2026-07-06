@@ -417,6 +417,23 @@ impl Func {
         self.code.push(0x00);
     }
 
+    /// `memory.copy` -- copy the popped `size` bytes from `src` to `dst` (bulk-memory proposal).
+    /// Pops dst, src, size with size on top; both memory indices are the single memory 0.
+    pub fn memory_copy(&mut self) {
+        self.op(0xFC);
+        self.code.push(0x0A);
+        self.code.push(0x00);
+        self.code.push(0x00);
+    }
+
+    /// `memory.fill` -- fill the popped `size` bytes at `dst` with the low byte of the popped `value`
+    /// (bulk-memory proposal). Pops dst, value, size with size on top.
+    pub fn memory_fill(&mut self) {
+        self.op(0xFC);
+        self.code.push(0x0B);
+        self.code.push(0x00);
+    }
+
     fn mem(&mut self, opcode: u8, m: MemArg) {
         self.op(opcode);
         m.write(&mut self.code);
@@ -785,6 +802,10 @@ impl Func {
     pub fn f32_convert_i32_s(&mut self) {
         self.op(0xB2);
     }
+    /// `f32.convert_i64_s` -- convert a signed i64 to an f32.
+    pub fn f32_convert_i64_s(&mut self) {
+        self.op(0xB4);
+    }
     /// `f32.demote_f64` -- narrow an f64 to an f32.
     pub fn f32_demote_f64(&mut self) {
         self.op(0xB6);
@@ -792,6 +813,18 @@ impl Func {
     /// `f64.convert_i32_s` -- convert a signed i32 to an f64.
     pub fn f64_convert_i32_s(&mut self) {
         self.op(0xB7);
+    }
+    /// `f64.convert_i64_s` -- convert a signed i64 to an f64.
+    pub fn f64_convert_i64_s(&mut self) {
+        self.op(0xB9);
+    }
+    /// `f64.convert_i32_u` -- convert an unsigned i32 to an f64.
+    pub fn f64_convert_i32_u(&mut self) {
+        self.op(0xB8);
+    }
+    /// `f64.convert_i64_u` -- convert an unsigned i64 to an f64.
+    pub fn f64_convert_i64_u(&mut self) {
+        self.op(0xBA);
     }
     /// `f64.promote_f32` -- widen an f32 to an f64.
     pub fn f64_promote_f32(&mut self) {

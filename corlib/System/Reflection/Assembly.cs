@@ -14,8 +14,9 @@ namespace System.Reflection
 
         [Lamella.Runtime.RuntimeProvided] public System.Type[] GetTypes() { return null; }
 
-        [Lamella.Runtime.RuntimeProvided] public static bool operator ==(Assembly left, Assembly right) { return false; }
+        [Lamella.Runtime.RuntimeProvided] private static bool HandleEquals(Assembly left, Assembly right) { return false; }
+        public static bool operator ==(Assembly left, Assembly right) { return HandleEquals(left, right); }
 
-        [Lamella.Runtime.RuntimeProvided] public static bool operator !=(Assembly left, Assembly right) { return false; }
+        public static bool operator !=(Assembly left, Assembly right) { return !HandleEquals(left, right); }
     }
 }

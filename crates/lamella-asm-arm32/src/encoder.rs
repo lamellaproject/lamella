@@ -766,6 +766,42 @@ impl Encoder {
         Ok(())
     }
 
+    /// Reserve a frame too large for one `SUB SP,#imm` (T1 caps at 508) by chunking into
+    /// consecutive 508-byte-max decrements. `imm` a multiple of 4. Thumb-1 SP-relative
+    /// slot loads/stores reach 1020, so a spilled frame stays within that; this only
+    /// spans the 508..=1020 gap the single instruction cannot.
+    pub fn sub_sp_far(&mut self, imm: u16) -> Result<(), AssembleError> {
+        if imm % 4 != 0 {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        let mut left = imm;
+        while left > 508 {
+            self.sub_sp(508)?;
+            left -= 508;
+        }
+        if left > 0 {
+            self.sub_sp(left)?;
+        }
+        Ok(())
+    }
+
+    /// Release a frame reserved by [`Encoder::sub_sp_far`] -- the `ADD SP,#imm` counterpart,
+    /// chunked the same way.
+    pub fn add_sp_far(&mut self, imm: u16) -> Result<(), AssembleError> {
+        if imm % 4 != 0 {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        let mut left = imm;
+        while left > 508 {
+            self.add_sp(508)?;
+            left -= 508;
+        }
+        if left > 0 {
+            self.add_sp(left)?;
+        }
+        Ok(())
+    }
+
     /// `BKPT #imm8` -- breakpoint. With `imm8 == 0xAB` it is the semihosting
     /// request a debugger or QEMU intercepts. 16-bit encoding T1 (A6.7.12).
     pub fn bkpt(&mut self, imm8: u8) {
@@ -1184,6 +1220,22 @@ impl Encoder {
             labels: self.labels,
         })
     }
+
+    /// Lays the image out exactly as [`Encoder::finish`] does -- running branch relaxation and literal
+    /// islanding to a joint fixpoint -- then returns each requested label's POST-RELAXATION byte offset
+    /// (`None` for a never-bound label), WITHOUT resolving fixups. `finish` consumes the encoder and, on
+    /// [`AssembleError::BranchOutOfRange`], reports only the failing site's post-relaxation byte offset; a
+    /// caller that must map that site back to a bound region -- e.g. the function whose body owns an
+    /// unencodable instruction, to stub it and rebuild the object -- clones the encoder first and reads
+    /// true offsets here against the SAME layout `finish` computes (relaxation is deterministic). A
+    /// relaxation error (rare: an unreadable marked pool word) surfaces here just as it would in `finish`.
+    pub fn relaxed_positions(mut self, labels: &[Label]) -> Result<Vec<Option<u32>>, AssembleError> {
+        self.relax()?;
+        Ok(labels
+            .iter()
+            .map(|l| self.labels.get(l.0 as usize).copied().flatten())
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -1500,6 +1552,80 @@ mod tests {
             &out.bytes[addr..addr + 4],
             &0x1234_5678u32.to_le_bytes(),
             "the load still resolves to its constant after both grew the image"
+        );
+    }
+
+    #[test]
+    fn relaxed_positions_returns_bound_offsets_when_nothing_relaxes() {
+        let mut enc = Encoder::new();
+        let a = enc.new_label();
+        enc.bind_label(a);
+        enc.nop();
+        let b = enc.new_label();
+        enc.bind_label(b);
+        enc.nop();
+        let pos = enc.relaxed_positions(&[a, b]).unwrap();
+        assert_eq!(pos.len(), 2);
+        assert_eq!(pos[0], Some(0));
+        assert_eq!(pos[1], Some(2), "an unrelaxed image reports its bound offsets verbatim");
+    }
+
+    #[test]
+    fn relaxed_positions_reports_the_post_islanding_layout_finish_uses() {
+        let mut enc = Encoder::new();
+        let pool = enc.new_label();
+        let marker = enc.new_label();
+        enc.ldr_literal(Reg::R0, pool).unwrap();
+        for _ in 0..600 {
+            enc.nop();
+        }
+        enc.bind_label(marker);
+        enc.align_to_word();
+        enc.pool_word(pool, 0xDEAD_BEEF);
+        let via_probe = enc.clone().relaxed_positions(&[marker, pool]).unwrap();
+        let out = enc.finish().expect("the far pool word islands rather than erroring");
+        assert_eq!(
+            via_probe[0],
+            out.label_position(marker),
+            "relaxed_positions tracks the island's forward shift exactly as finish bakes it"
+        );
+        assert_eq!(
+            via_probe[1],
+            out.label_position(pool),
+            "including the load's label being re-pointed at the in-reach island copy"
+        );
+        assert!(
+            via_probe[0].unwrap() > 2 + 600 * 2,
+            "the marker moved forward: an island was spliced before it (not a no-op agreement)"
+        );
+    }
+
+    #[test]
+    fn sub_sp_far_chunks_a_frame_past_the_single_instruction_reach() {
+        let mut enc = Encoder::new();
+        enc.sub_sp_far(1020).unwrap();
+        assert_eq!(enc.as_bytes(), &[0xFF, 0xB0, 0xFF, 0xB0, 0x81, 0xB0]);
+        let mut one = Encoder::new();
+        one.sub_sp_far(500).unwrap();
+        assert_eq!(one.as_bytes(), &[0xFD, 0xB0]);
+        assert_eq!(
+            Encoder::new().sub_sp_far(510),
+            Err(AssembleError::UnencodableOperand)
+        );
+    }
+
+    #[test]
+    fn add_sp_far_mirrors_sub_sp_far() {
+        let mut enc = Encoder::new();
+        enc.add_sp_far(1020).unwrap();
+        assert_eq!(enc.as_bytes(), &[0x7F, 0xB0, 0x7F, 0xB0, 0x01, 0xB0]);
+        let (mut sub, mut add) = (Encoder::new(), Encoder::new());
+        sub.sub_sp_far(1016).unwrap();
+        add.add_sp_far(1016).unwrap();
+        assert_eq!(sub.as_bytes().len(), add.as_bytes().len());
+        assert_eq!(
+            Encoder::new().add_sp_far(2),
+            Err(AssembleError::UnencodableOperand)
         );
     }
 

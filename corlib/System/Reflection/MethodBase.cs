@@ -13,7 +13,7 @@ namespace System.Reflection
             ParameterInfo[] result = new ParameterInfo[count];
             for (int i = 0; i < count; i++)
             {
-                result[i] = new ParameterInfo(i, GetParameterType(i), GetParameterName(i));
+                result[i] = new ParameterInfo(this, i, GetParameterType(i), GetParameterName(i));
             }
             return result;
         }
@@ -21,6 +21,8 @@ namespace System.Reflection
         [Lamella.Runtime.RuntimeProvided] internal int GetParameterCount() { return 0; }
         [Lamella.Runtime.RuntimeProvided] internal Type GetParameterType(int index) { return null; }
         [Lamella.Runtime.RuntimeProvided] internal string GetParameterName(int index) { return null; }
+
+        [Lamella.Runtime.RuntimeProvided] internal object[] GetParameterCustomAttributes(int position, bool inherit) { return null; }
 
         public bool IsPublic { [Lamella.Runtime.RuntimeProvided] get { return false; } }
 

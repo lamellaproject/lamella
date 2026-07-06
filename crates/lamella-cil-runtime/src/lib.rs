@@ -22,9 +22,13 @@ pub mod value;
 #[cfg(feature = "exceptions")]
 pub use exception::{exception_tag, tag_is_exact, tag_is_subtype};
 pub use interp::{
-    CodeLocation, FrameView, NamedValue, Session, Status, Stop, StopReason, Vm, run, run_method,
+    CodeLocation, FrameView, NamedValue, PInvokeArg, PInvokeHostFn, Session, Status, Stop,
+    StopReason, Vm, run, run_method,
 };
-pub use module::{IntrinsicFn, Method, MethodId, Module, TypeId};
+pub use module::{
+    IntrinsicFn, Method, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget, TypeId,
+    baked_image_checksum,
+};
 pub use object::{Heap, Object, ObjectRef};
 pub use trap::Trap;
 pub use value::Value;

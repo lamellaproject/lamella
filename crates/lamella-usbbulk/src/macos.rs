@@ -203,6 +203,12 @@ impl Device {
         Err(Error::NotFound)
     }
 
+    /// Open by VID/PID; the interface GUID is a Windows concept (macOS matches the vendor class-0xFF
+    /// interface directly), so it is ignored here.
+    pub fn open_guid(_interface_guid: &str, vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
+        Self::open(vendor_id, product_id, serial)
+    }
+
     pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
         unsafe {
             if ((**self.intf).WritePipeTO)(self.intf as *mut c_void, self.ep_out, data.as_ptr() as *const c_void, data.len() as u32, 1000, 1000) != kIOReturnSuccess {
@@ -433,6 +439,10 @@ unsafe fn device_info(svc: io_service_t, plugin_id: CFUUIDRef, dev_user: CFUUIDR
         serial_number: None,
         product: None,
     })
+}
+
+pub fn enumerate_guid(_interface_guid: &str) -> Result<Vec<DeviceInfo>> {
+    Err(Error::Unsupported)
 }
 
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {

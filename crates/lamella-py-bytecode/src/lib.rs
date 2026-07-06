@@ -14,7 +14,7 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 
 /// The binary format version. Bumped when the container or instruction encoding
 /// changes incompatibly; readers reject a version they do not recognize.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 12;
 
 /// The feature-flag bits a module's header carries, declaring which language
 /// surface its bytecode assumes. A reader lacking a required feature rejects the
@@ -34,9 +34,8 @@ impl FeatureFlags {
     }
 }
 
-/// A binary arithmetic operator carried by [`Op::Binary`]. First light emits only
-/// `Add`/`Sub`/`Mul` (plus floor-division and modulo where written); true division
-/// (`/`, float-producing) is out of the subset.
+/// A binary arithmetic/bitwise operator carried by [`Op::Binary`] -- add/sub/mul, floor-division
+/// and modulo, true division (`/`, float-producing), exponentiation (`**`), and the bitwise operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum BinOp {
@@ -60,6 +59,11 @@ pub enum BinOp {
     LShift = 8,
     /// `a >> b` -- right shift (arithmetic: Python ints are signed).
     RShift = 9,
+    /// `a / b` -- true division; always produces a float (even for integer operands).
+    TrueDiv = 10,
+    /// `a ** b` -- exponentiation, right-associative. A non-negative integer exponent gives an
+    /// integer (promoting past the fixnum range to a long); a negative exponent produces a float.
+    Pow = 11,
 }
 
 impl BinOp {
@@ -77,6 +81,8 @@ impl BinOp {
             7 => Some(BinOp::BitXor),
             8 => Some(BinOp::LShift),
             9 => Some(BinOp::RShift),
+            10 => Some(BinOp::TrueDiv),
+            11 => Some(BinOp::Pow),
             _ => None,
         }
     }
@@ -99,6 +105,10 @@ pub enum CmpOp {
     Gt = 4,
     /// `a >= b`.
     Ge = 5,
+    /// `a is b` -- object identity (not value equality).
+    Is = 6,
+    /// `a is not b` -- object non-identity.
+    IsNot = 7,
 }
 
 impl CmpOp {
@@ -112,6 +122,8 @@ impl CmpOp {
             3 => Some(CmpOp::Le),
             4 => Some(CmpOp::Gt),
             5 => Some(CmpOp::Ge),
+            6 => Some(CmpOp::Is),
+            7 => Some(CmpOp::IsNot),
             _ => None,
         }
     }
@@ -166,6 +178,8 @@ impl UnaryOp {
 /// |     37 | LoadSuper | super() |
 /// |     38 | BuildSet | set literals |
 /// |     39 | UnpackEx | starred unpacking |
+/// |     40 | CallKw | keyword calls |
+/// |     41 | Yield | generators |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -235,9 +249,17 @@ pub enum Op {
     /// Make local slot `slot` unbound (a `del`); a later `LoadFast` of it raises `NameError`.
     /// Emitted for the `except ... as name` auto-deletion at the end of the handler.
     DeleteFast(u32),
-    /// Push a function value for the Module function named `names[name]` -- a method, for a
-    /// class body.
-    MakeFunction(u32),
+    /// Push a function value for the Module function `names[func]`. `flags` (mirroring CPython's
+    /// MAKE_FUNCTION bits) says which default tables sit on the stack below, popped
+    /// kwdefaults-then-defaults: bit0 (`0x01`) a positional-defaults TUPLE, bit1 (`0x02`) a
+    /// kwdefaults DICT. `flags == 0` is a plain stateless function reference; `flags != 0` builds a
+    /// function object carrying the def-time defaults.
+    MakeFunction {
+        /// The index into `names` of the Module function to make.
+        func: u32,
+        /// Which default tables sit on the stack below (bit0 a defaults tuple, bit1 a kwdefaults dict).
+        flags: u8,
+    },
     /// Pop the namespace dict, then the base, then the name, and push a new class object (a
     /// type). For a `class` definition.
     BuildClass,
@@ -296,8 +318,42 @@ pub enum Op {
     /// and push the result. DEFINED for completeness; deferred for the first-light
     /// parity slice (the harness drives the call boundary), like [`Op::LoadGlobal`].
     Call(u32),
+    /// Call a callable with keyword arguments: the stack holds `[callable, pos0 .. pos{argc-1},
+    /// kwval0 .. kwval{k-1}]`, where `consts[kwnames]` (a [`Const::KwNames`]) gives the `k` keyword
+    /// NAMES in the order their values were pushed. Pop them all plus the callable, bind by CPython's
+    /// call rules, and push the result. [`Op::Call`] stays the positional-only fast path.
+    CallKw {
+        /// The number of positional arguments (those below the keyword-argument values).
+        argc: u32,
+        /// The index into `consts` of the [`Const::KwNames`] naming the keyword arguments in order.
+        kwnames: u32,
+    },
     /// Pop a value and return it from the current function.
     Return,
+    /// Suspend the current generator, yielding the popped value to the caller; on resume, push the
+    /// value the caller injected (`None` under `next`). A `yield` expression -- appears only in a
+    /// generator function (one whose [`CodeObject::is_generator`] is set).
+    Yield,
+    /// A call with `*args` / `**kwargs` unpacking. The stack holds `[callee, arg0 .. arg{argc-1}]`;
+    /// `consts[kinds]` (a [`Const::ArgKinds`]) tags each of the `argc` values (positional / `*` /
+    /// keyword / `**`), and `consts[kwnames]` (a [`Const::KwNames`]) names the keyword-tagged slots
+    /// in order. The runtime flattens the `*`/`**` operands and binds the result; pushes the result.
+    CallEx {
+        /// The number of argument values on the stack (each tagged by `kinds`).
+        argc: u32,
+        /// The index into `consts` of the [`Const::ArgKinds`] tagging each argument slot.
+        kinds: u32,
+        /// The index into `consts` of the [`Const::KwNames`] naming the keyword-tagged slots.
+        kwnames: u32,
+    },
+    /// `del container[index]`. Pop the index, then the container, and delete the element (a step-1
+    /// slice deletes a range). Pushes nothing.
+    DeleteItem,
+    /// `del object.attr` -- delete `object.<names[name]>`. Pop the object. Pushes nothing.
+    DeleteAttr {
+        /// The index into `names` of the attribute name.
+        name: u32,
+    },
 }
 
 /// A compile-time constant in a code object's constant pool. Every value the running
@@ -309,13 +365,26 @@ pub enum Const {
     None,
     /// `True` or `False`.
     Bool(bool),
-    /// An integer literal. First light keeps it in an `i64`; the interpreter
-    /// materializes it as a tagged 31-bit fixnum (overflow to a heap bignum is
-    /// deferred past first light).
+    /// An integer literal. The compiler keeps it in an `i64`; the interpreter materializes it as a
+    /// tagged 31-bit fixnum, widening to a heap `long` (and arbitrary-precision bignum) as needed.
     Int(i64),
-    /// A string literal (reserved; the first-light subset does not lex strings yet,
-    /// but the pool holds them so the format need not change to add them).
+    /// A string literal (its decoded value); the interpreter materializes it as a heap `str`.
     Str(String),
+    /// A per-argument tag list for [`Op::CallEx`]: one byte per argument slot -- 0 positional,
+    /// 1 `*` unpack, 2 keyword, 3 `**` unpack. Compile-time metadata, never a runtime value.
+    ArgKinds(Vec<u8>),
+    /// A compile-time tuple of keyword-argument names -- the kwnames a [`Op::CallKw`] references.
+    /// Never a runtime Python value; only `CallKw` reads it out of the const pool.
+    KwNames(Vec<String>),
+    /// A floating-point literal -- the `f64` value's raw bits (`to_bits`), so `Const` stays `Eq`.
+    /// The interpreter materializes it as a heap float; the typed AOT lane rejects it.
+    Float(u64),
+    /// An imaginary literal `Nj` -- the imaginary part's `f64` bits (real part is 0). The interpreter
+    /// materializes it as a heap `complex` (when the `complex` feature is on); the typed lane rejects it.
+    Imaginary(u64),
+    /// An integer literal too large for `i64` -- its decimal digits (no sign, no separators). The
+    /// interpreter materializes it as an arbitrary-precision `int` (bigint); the typed lane rejects it.
+    BigInt(String),
 }
 
 /// The first-light type lattice for an annotated value. Annotations (PEP 484), inert
@@ -331,6 +400,10 @@ pub enum StaticType {
     /// Annotated (or inferred) `int`: lowers to a machine integer on the typed path.
     /// First light maps it to MIR `i32` with bignum overflow deferred.
     Int = 1,
+    /// Annotated (or inferred) `float`: lowers to a native `f64` on the typed path -- the shared
+    /// MIR's F64, the same the C#/.NET `double` codegen targets. A dynamic (un-annotated) float is
+    /// a heap object in the interpreter instead.
+    Float = 2,
 }
 
 impl StaticType {
@@ -340,6 +413,7 @@ impl StaticType {
         match byte {
             0 => Some(StaticType::Dynamic),
             1 => Some(StaticType::Int),
+            2 => Some(StaticType::Float),
             _ => None,
         }
     }
@@ -362,8 +436,25 @@ pub struct Param {
 pub struct CodeObject {
     /// The function's name, or `"<module>"` for a module's top-level body.
     pub name: String,
-    /// The parameters, in order. They occupy the first `params.len()` local slots.
+    /// The parameters, in order (`[positional-only | positional-or-keyword | keyword-only]`). They
+    /// occupy the first `params.len()` local slots.
     pub params: Vec<Param>,
+    /// How many leading `params` are positional-only (bindable only by position). 0 until the
+    /// positional-only `/` marker is supported.
+    pub posonly_count: u32,
+    /// How many trailing `params` are keyword-only (bindable only by name, after a `*`). 0 until
+    /// keyword-only parameters are supported.
+    pub kwonly_count: u32,
+    /// Whether this is a generator function (its body contains `yield`). A CALL of a generator
+    /// function does not run the body -- it returns a generator object; the body runs on `next`.
+    pub is_generator: bool,
+    /// Whether the parameter list has a `*args` slot -- the param at index
+    /// `params.len() - kwonly_count - (has_varkwargs as usize) - 1`, which collects surplus
+    /// positional arguments into a tuple. When set, extra positionals are NOT a TypeError.
+    pub has_varargs: bool,
+    /// Whether the parameter list has a `**kwargs` slot (the last param), which collects
+    /// unmatched keyword arguments into a dict. 0 until `**kwargs` is supported.
+    pub has_varkwargs: bool,
     /// The return annotation, or [`StaticType::Dynamic`] if unannotated.
     pub ret_ty: StaticType,
     /// The total number of local-variable slots (parameters first, then the
@@ -480,6 +571,30 @@ fn put_const(buf: &mut Vec<u8>, c: &Const) {
             buf.push(3);
             put_str(buf, s);
         }
+        Const::KwNames(names) => {
+            buf.push(4);
+            put_len(buf, names.len());
+            for n in names {
+                put_str(buf, n);
+            }
+        }
+        Const::Float(bits) => {
+            buf.push(5);
+            buf.extend_from_slice(&bits.to_le_bytes());
+        }
+        Const::Imaginary(bits) => {
+            buf.push(6);
+            buf.extend_from_slice(&bits.to_le_bytes());
+        }
+        Const::ArgKinds(kinds) => {
+            buf.push(7);
+            put_len(buf, kinds.len());
+            buf.extend_from_slice(kinds);
+        }
+        Const::BigInt(digits) => {
+            buf.push(8);
+            put_str(buf, digits);
+        }
     }
 }
 
@@ -571,9 +686,10 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(29);
             put_u32(buf, *slot);
         }
-        Op::MakeFunction(name) => {
+        Op::MakeFunction { func, flags } => {
             buf.push(30);
-            put_u32(buf, *name);
+            put_u32(buf, *func);
+            buf.push(*flags);
         }
         Op::BuildClass => buf.push(31),
         Op::SetAttr { name, cache } => {
@@ -601,6 +717,27 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             put_u32(buf, *before);
             put_u32(buf, *after);
         }
+        Op::CallKw { argc, kwnames } => {
+            buf.push(40);
+            put_u32(buf, *argc);
+            put_u32(buf, *kwnames);
+        }
+        Op::Yield => buf.push(41),
+        Op::CallEx {
+            argc,
+            kinds,
+            kwnames,
+        } => {
+            buf.push(42);
+            put_u32(buf, *argc);
+            put_u32(buf, *kinds);
+            put_u32(buf, *kwnames);
+        }
+        Op::DeleteItem => buf.push(43),
+        Op::DeleteAttr { name } => {
+            buf.push(44);
+            put_u32(buf, *name);
+        }
     }
 }
 
@@ -611,6 +748,11 @@ fn put_code_object(buf: &mut Vec<u8>, co: &CodeObject) {
         put_str(buf, &p.name);
         buf.push(p.ty as u8);
     }
+    put_u32(buf, co.posonly_count);
+    put_u32(buf, co.kwonly_count);
+    buf.push(u8::from(co.is_generator));
+    buf.push(u8::from(co.has_varargs));
+    buf.push(u8::from(co.has_varkwargs));
     buf.push(co.ret_ty as u8);
     put_len(buf, co.n_locals);
     put_len(buf, co.local_names.len());
@@ -744,6 +886,21 @@ impl<'a> Reader<'a> {
             1 => Const::Bool(self.u8()? != 0),
             2 => Const::Int(self.i64()?),
             3 => Const::Str(self.string()?),
+            4 => {
+                let n = self.u32()? as usize;
+                let mut names = Vec::with_capacity(n);
+                for _ in 0..n {
+                    names.push(self.string()?);
+                }
+                Const::KwNames(names)
+            }
+            5 => Const::Float(self.i64()? as u64),
+            6 => Const::Imaginary(self.i64()? as u64),
+            7 => {
+                let n = self.u32()? as usize;
+                Const::ArgKinds(self.bytes(n)?.to_vec())
+            }
+            8 => Const::BigInt(self.string()?),
             _ => return Err(DecodeError::BadTag("Const", tag)),
         };
         Ok(c)
@@ -796,7 +953,10 @@ impl<'a> Reader<'a> {
             27 => Op::PopExcept,
             28 => Op::Reraise,
             29 => Op::DeleteFast(self.u32()?),
-            30 => Op::MakeFunction(self.u32()?),
+            30 => Op::MakeFunction {
+                func: self.u32()?,
+                flags: self.u8()?,
+            },
             31 => Op::BuildClass,
             32 => Op::SetAttr {
                 name: self.u32()?,
@@ -812,6 +972,18 @@ impl<'a> Reader<'a> {
                 before: self.u32()?,
                 after: self.u32()?,
             },
+            40 => Op::CallKw {
+                argc: self.u32()?,
+                kwnames: self.u32()?,
+            },
+            41 => Op::Yield,
+            42 => Op::CallEx {
+                argc: self.u32()?,
+                kinds: self.u32()?,
+                kwnames: self.u32()?,
+            },
+            43 => Op::DeleteItem,
+            44 => Op::DeleteAttr { name: self.u32()? },
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -826,6 +998,11 @@ impl<'a> Reader<'a> {
             let ty = self.py_type()?;
             params.push(Param { name: pname, ty });
         }
+        let posonly_count = self.u32()?;
+        let kwonly_count = self.u32()?;
+        let is_generator = self.u8()? != 0;
+        let has_varargs = self.u8()? != 0;
+        let has_varkwargs = self.u8()? != 0;
         let ret_ty = self.py_type()?;
         let n_locals = self.u32()? as usize;
         let n_local_names = self.u32()? as usize;
@@ -867,6 +1044,11 @@ impl<'a> Reader<'a> {
         Ok(CodeObject {
             name,
             params,
+            posonly_count,
+            kwonly_count,
+            is_generator,
+            has_varargs,
+            has_varkwargs,
             ret_ty,
             n_locals,
             local_names,
@@ -892,11 +1074,16 @@ mod tests {
                 name: String::from("n"),
                 ty: StaticType::Int,
             }],
+            posonly_count: 0,
+            kwonly_count: 0,
+            is_generator: false,
+            has_varargs: false,
+            has_varkwargs: false,
             ret_ty: StaticType::Int,
             n_locals: 1,
             local_names: vec![String::from("n")],
             local_types: vec![StaticType::Int],
-            consts: vec![Const::Int(1), Const::None],
+            consts: vec![Const::Int(1), Const::None, Const::KwNames(vec![String::from("x")])],
             names: vec![String::from("x")],
             ops: vec![
                 Op::LoadFast(0),
@@ -920,6 +1107,11 @@ mod tests {
             body: CodeObject {
                 name: String::from("<module>"),
                 params: Vec::new(),
+                posonly_count: 0,
+                kwonly_count: 0,
+                is_generator: false,
+                has_varargs: false,
+                has_varkwargs: false,
                 ret_ty: StaticType::Dynamic,
                 n_locals: 0,
                 local_names: Vec::new(),
@@ -973,7 +1165,7 @@ mod tests {
             Op::PopExcept,
             Op::Reraise,
             Op::DeleteFast(2),
-            Op::MakeFunction(0),
+            Op::MakeFunction { func: 0, flags: 1 },
             Op::BuildClass,
             Op::SetAttr { name: 0, cache: 7 },
             Op::UnpackSequence(2),
@@ -983,6 +1175,8 @@ mod tests {
             Op::LoadSuper(3),
             Op::BuildSet(2),
             Op::UnpackEx { before: 1, after: 1 },
+            Op::CallKw { argc: 2, kwnames: 1 },
+            Op::Yield,
             Op::Return,
         ];
         let mut buf = Vec::new();
@@ -1013,17 +1207,17 @@ mod tests {
 
     #[test]
     fn selector_bytes_round_trip() {
-        for byte in 0u8..=9 {
+        for byte in 0u8..=11 {
             assert_eq!(BinOp::from_u8(byte).unwrap() as u8, byte);
         }
-        for byte in 0u8..=5 {
+        for byte in 0u8..=7 {
             assert_eq!(CmpOp::from_u8(byte).unwrap() as u8, byte);
         }
         for byte in 0u8..=2 {
             assert_eq!(UnaryOp::from_u8(byte).unwrap() as u8, byte);
         }
-        assert_eq!(BinOp::from_u8(10), None);
-        assert_eq!(CmpOp::from_u8(6), None);
+        assert_eq!(BinOp::from_u8(12), None);
+        assert_eq!(CmpOp::from_u8(8), None);
         assert_eq!(UnaryOp::from_u8(3), None);
     }
 }

@@ -115,14 +115,31 @@ pub fn emit_expression(
             }
             Ok(())
         }
-        BoundExprKind::Postfix { operator, operand } => emit_step_expression(
+        BoundExprKind::Postfix {
+            operator,
             operand,
-            true,
-            *operator == PostfixOperator::Increment,
-            frame,
-            tokens,
-            out,
-        ),
+            step,
+        } => {
+            let increment = *operator == PostfixOperator::Increment;
+            if let Some(step) = step {
+                let (user_step, result_conversion) =
+                    crate::method::step_tokens(Some(step), operand, increment, tokens);
+                crate::method::emit_compound(
+                    operand,
+                    crate::method::step_operator(increment),
+                    None,
+                    user_step,
+                    result_conversion,
+                    false,
+                    frame,
+                    tokens,
+                    out,
+                    crate::method::Leave::Old,
+                )
+            } else {
+                emit_step_expression(operand, true, increment, frame, tokens, out)
+            }
+        }
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
             emit_expression(inner, frame, tokens, out)
         }
@@ -223,12 +240,31 @@ pub fn emit_expression(
             out.push(Instruction::simple(ldind_opcode(element)));
             Ok(())
         }
+        BoundExprKind::AddressOf { operand } => match &operand.kind {
+            BoundExprKind::Dereference { operand: pointer } => {
+                emit_expression(pointer, frame, tokens, out)
+            }
+            BoundExprKind::Local(_)
+            | BoundExprKind::FieldAccess { .. }
+            | BoundExprKind::ElementAccess { .. } => {
+                emit_value_type_receiver(operand, frame, tokens, out)
+            }
+            _ => Err(EmitError::Unsupported(
+                "address-of a non-addressable expression",
+            )),
+        },
         BoundExprKind::TypeTest {
             operation,
             operand,
             target,
         } => {
             emit_expression(operand, frame, tokens, out)?;
+            if is_value_type(&operand.ty, tokens) {
+                let box_token = tokens.type_token(&operand.ty).ok_or(EmitError::Unsupported(
+                    "boxing a value type for a type test with no metadata token",
+                ))?;
+                out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
+            }
             let token = tokens.type_token(target).ok_or(EmitError::Unsupported(
                 "a type test against a type with no metadata token",
             ))?;
@@ -243,6 +279,7 @@ pub fn emit_expression(
             operator: lamella_syntax::ast::AssignmentOperator::Assign,
             target,
             value,
+            ..
         } => match &target.kind {
             BoundExprKind::Local(name) if frame.byref(name).is_none() => {
                 emit_expression(value, frame, tokens, out)?;
@@ -284,6 +321,17 @@ pub fn emit_expression(
                 emit_expression(value, frame, tokens, out)?;
                 let kept = keep_assigned(true, &value.ty, frame, out);
                 out.push(Instruction::simple(stind_opcode(&target.ty)));
+                load_kept(kept, out);
+                Ok(())
+            }
+            BoundExprKind::This => {
+                out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
+                emit_expression(value, frame, tokens, out)?;
+                let kept = keep_assigned(true, &value.ty, frame, out);
+                let token = tokens.type_token(&target.ty).ok_or(EmitError::Unsupported(
+                    "`this =` on a value type with no token",
+                ))?;
+                out.push(Instruction::new(Opcode::Stobj, Operand::Token(token)));
                 load_kept(kept, out);
                 Ok(())
             }
@@ -670,7 +718,7 @@ fn emit_new(
             "an object creation that did not resolve",
         ));
     };
-    if arguments.is_empty() && tokens.is_struct(&constructor.declaring_type) {
+    if arguments.is_empty() && is_value_type(&constructor.declaring_type, tokens) {
         let type_token = tokens
             .type_token(&constructor.declaring_type)
             .ok_or(EmitError::Unsupported(
@@ -735,7 +783,18 @@ fn emit_delegate_creation(
         && through_object
         && tokens.is_virtual_method(&target.declaring_type, &target.name, &target.parameters);
     match receiver {
-        Some(receiver) => emit_expression(receiver, frame, tokens, out)?,
+        Some(receiver) => {
+            emit_expression(receiver, frame, tokens, out)?;
+            if !target.is_static
+                && !matches!(receiver.kind, BoundExprKind::Base)
+                && is_value_type(&receiver.ty, tokens)
+            {
+                let box_token = tokens.type_token(&receiver.ty).ok_or(EmitError::Unsupported(
+                    "boxing a delegate receiver with no type token",
+                ))?;
+                out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
+            }
+        }
         None => out.push(Instruction::simple(Opcode::Ldnull)),
     }
     if virtual_target {
@@ -1377,6 +1436,7 @@ pub(crate) fn emit_value_type_receiver(
             }
             Ok(())
         }
+        BoundExprKind::Dereference { operand } => emit_expression(operand, frame, tokens, out),
         _ => {
             emit_expression(receiver, frame, tokens, out)?;
             let slot = frame.reserve_local(&receiver.ty);
@@ -1440,6 +1500,8 @@ fn emit_step_expression(
             crate::method::step_operator(increment),
             None,
             user_step,
+            None,
+            false,
             frame,
             tokens,
             out,
@@ -1472,7 +1534,11 @@ fn emit_step_expression(
     if postfix {
         out.push(Instruction::simple(Opcode::Dup));
     }
-    out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
+    if let TypeSymbol::Pointer(element) = &operand.ty {
+        emit_sizeof(element, tokens, out)?;
+    } else {
+        out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(1)));
+    }
     let enum_underlying = tokens.enum_underlying(&operand.ty);
     let step_ty = match enum_underlying {
         Some(special) => TypeSymbol::Special(special),
@@ -1901,7 +1967,8 @@ pub(crate) fn emit_binary(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     use BinaryOperator as Op;
-    let unsigned = matches!(operand_ty, TypeSymbol::Special(special) if special.is_unsigned());
+    let unsigned = matches!(operand_ty, TypeSymbol::Special(special) if special.is_unsigned())
+        || matches!(operand_ty, TypeSymbol::Pointer(_));
     let opcode = match operator {
         Op::Add => checked_or(checked, unsigned, Opcode::AddOvfUn, Opcode::AddOvf, Opcode::Add),
         Op::Subtract => checked_or(checked, unsigned, Opcode::SubOvfUn, Opcode::SubOvf, Opcode::Sub),
@@ -1951,7 +2018,7 @@ fn checked_or(checked: bool, unsigned: bool, ovf_un: Opcode, ovf: Opcode, plain:
 /// The `conv.ovf.*` opcode for a checked conversion to integral `target` (the `.un`
 /// form for an unsigned source). `None` for a non-integral target (float/decimal),
 /// which cannot overflow and uses the plain `conv.*`.
-fn checked_overflow_conversion(target: SpecialType, unsigned_source: bool) -> Option<Opcode> {
+pub(crate) fn checked_overflow_conversion(target: SpecialType, unsigned_source: bool) -> Option<Opcode> {
     use SpecialType as S;
     Some(match (target, unsigned_source) {
         (S::SByte, false) => Opcode::ConvOvfI1,

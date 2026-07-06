@@ -9,6 +9,7 @@ pub mod cmd {
     pub const DISCONNECT: u8 = 0x03;
     pub const TRANSFER_CONFIGURE: u8 = 0x04;
     pub const TRANSFER: u8 = 0x05;
+    pub const TRANSFER_BLOCK: u8 = 0x06;
     pub const RESET_TARGET: u8 = 0x0A;
     pub const SWJ_CLOCK: u8 = 0x11;
     pub const SWJ_SEQUENCE: u8 = 0x12;
@@ -108,6 +109,64 @@ pub fn transfer_one(request: u8, write_data: Option<u32>) -> Vec<u8> {
         out.extend_from_slice(&data.to_le_bytes());
     }
     out
+}
+
+/// Encodes `DAP_TransferConfigure`: idle cycles appended after each transfer, and the probe's
+/// retry budgets for `WAIT` acknowledges and value-match reads (little-endian u16s each).
+pub fn transfer_configure(idle_cycles: u8, wait_retry: u16, match_retry: u16) -> [u8; 6] {
+    let w = wait_retry.to_le_bytes();
+    let m = match_retry.to_le_bytes();
+    [cmd::TRANSFER_CONFIGURE, idle_cycles, w[0], w[1], m[0], m[1]]
+}
+
+/// Encodes a write `DAP_TransferBlock` on DAP index 0: one `request` byte repeated by the
+/// probe for every 32-bit value in `values` -- the bulk sibling of [`transfer_one`], used to
+/// stream a buffer through an auto-incrementing MEM-AP `DRW`.
+pub fn transfer_block_write(request: u8, values: &[u32]) -> Vec<u8> {
+    let count = values.len() as u16;
+    let mut out = Vec::with_capacity(5 + values.len() * 4);
+    out.push(cmd::TRANSFER_BLOCK);
+    out.push(0x00);
+    out.extend_from_slice(&count.to_le_bytes());
+    out.push(request);
+    for value in values {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// Parses the reply to a write `DAP_TransferBlock`: the completed-transfer count and the last
+/// acknowledge.
+pub fn parse_block_write(reply: &[u8]) -> Result<(u16, Ack), ProtoError> {
+    if reply.len() < 4 {
+        return Err(ProtoError::Truncated);
+    }
+    if reply[0] != cmd::TRANSFER_BLOCK {
+        return Err(ProtoError::WrongCommand { expected: cmd::TRANSFER_BLOCK, got: reply[0] });
+    }
+    Ok((u16::from_le_bytes([reply[1], reply[2]]), Ack::from_bits(reply[3])))
+}
+
+/// Encodes a read `DAP_TransferBlock` on DAP index 0: `count` transfers of the one `request`
+/// byte -- the bulk sibling of a single read, for streaming target memory out through an
+/// auto-incrementing MEM-AP `DRW`.
+pub fn transfer_block_read(request: u8, count: u16) -> [u8; 5] {
+    let c = count.to_le_bytes();
+    [cmd::TRANSFER_BLOCK, 0x00, c[0], c[1], request]
+}
+
+/// Parses the reply to a read `DAP_TransferBlock` into `out`, returning the completed count and
+/// the last acknowledge; values are appended for however many transfers completed.
+pub fn parse_block_read(reply: &[u8], out: &mut Vec<u32>) -> Result<(u16, Ack), ProtoError> {
+    let (count, ack) = parse_block_write(reply)?;
+    let expected = 4 + count as usize * 4;
+    if reply.len() < expected {
+        return Err(ProtoError::Truncated);
+    }
+    for word in reply[4..expected].chunks_exact(4) {
+        out.push(u32::from_le_bytes([word[0], word[1], word[2], word[3]]));
+    }
+    Ok((count, ack))
 }
 
 /// The parsed reply to a single-access read transfer.

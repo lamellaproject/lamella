@@ -55,6 +55,15 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     imp::enumerate()
 }
 
+/// Lists the devices registered under a caller-supplied WinUSB device-interface GUID (a
+/// `"{...}"` string) -- e.g. every attached Lamella wireline board -- with product and serial
+/// strings where the OS can report them. Windows-only for now ([`Error::Unsupported`]
+/// elsewhere): macOS and Linux have no interface-GUID registry, and their backends match by
+/// VID/PID at open time instead.
+pub fn enumerate_interface(interface_guid: &str) -> Result<Vec<DeviceInfo>> {
+    imp::enumerate_guid(interface_guid)
+}
+
 /// An open bulk USB device that exchanges raw packets with a CMSIS-DAP v2 probe.
 pub struct Device(imp::Device);
 
@@ -63,6 +72,19 @@ impl Device {
     /// `serial`) that exposes a CMSIS-DAP v2 vendor interface -- a bulk IN + bulk OUT pipe.
     pub fn open(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
         imp::Device::open(vendor_id, product_id, serial).map(Device)
+    }
+
+    /// Opens a WinUSB device that registered under a caller-supplied device-interface GUID (a
+    /// `"{...}"` string) -- e.g. the Lamella wireline carrier rather than a CMSIS-DAP v2 probe. On
+    /// Windows the device is found by that interface GUID; macOS and Linux match by VID/PID + the
+    /// vendor-specific (class 0xFF) interface, so there the GUID is ignored.
+    pub fn open_interface(
+        interface_guid: &str,
+        vendor_id: u16,
+        product_id: u16,
+        serial: Option<&str>,
+    ) -> Result<Self> {
+        imp::Device::open_guid(interface_guid, vendor_id, product_id, serial).map(Device)
     }
 
     /// Sends one bulk OUT packet (raw -- no report id or padding).

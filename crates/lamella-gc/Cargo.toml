@@ -11,5 +11,15 @@ description = "The shared garbage-collection contract: root reporting, the trace
 # (lamella-aot) implement against. No dependencies -- it only defines the shapes.
 [dependencies]
 
+[features]
+default = ["gc-collect"]
+# The mark-compact COLLECTOR ENGINE (Heap/DeviceHeap collect, the frame/stack walks, the
+# OOM retry-collect). Off = the `gc = bump` allocation mode: `alloc` stays (grow-only) and
+# the whole tracing engine compiles out of the binary; an out-of-memory allocation is
+# final (null / fail loud). The capability profile's `gc` knob selects this per target:
+# none (no heap at all -- the consumer's own gate), bump (this feature off), collected
+# (this feature on).
+gc-collect = []
+
 [lints]
 workspace = true

@@ -304,6 +304,10 @@ fn check_inst(
             use_value(func, defined, *index, errors);
             use_value(func, defined, *value, errors);
         }
+        Inst::ArrayElemAddr { array, index, .. } => {
+            use_value(func, defined, *array, errors);
+            use_value(func, defined, *index, errors);
+        }
         Inst::AllocArray2D { dim0, dim1, .. } => {
             use_value(func, defined, *dim0, errors);
             use_value(func, defined, *dim1, errors);

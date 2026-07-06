@@ -144,8 +144,9 @@ namespace System
 
         [Lamella.Runtime.RuntimeProvided] public static Type GetTypeFromHandle(RuntimeTypeHandle handle) { return null; }
 
-        [Lamella.Runtime.RuntimeProvided] public static bool operator ==(Type left, Type right) { return false; }
+        [Lamella.Runtime.RuntimeProvided] private static bool HandleEquals(Type left, Type right) { return false; }
+        public static bool operator ==(Type left, Type right) { return HandleEquals(left, right); }
 
-        [Lamella.Runtime.RuntimeProvided] public static bool operator !=(Type left, Type right) { return false; }
+        public static bool operator !=(Type left, Type right) { return !HandleEquals(left, right); }
     }
 }

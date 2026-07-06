@@ -11,8 +11,12 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use lamella_ir::{BasicBlock, BlockId, Function, Inst, MirType, Terminator, TypeHandle, ValueId};
+use lamella_ir::{
+    BasicBlock, BinOp, BlockId, ConvKind, Function, Inst, MirType, Terminator, TypeHandle, ValueId,
+};
+use lamella_metadata::tables::table;
 use lamella_metadata::{Assembly, SigType, TargetLayout};
+use lamella_token::Token;
 
 #[cfg(feature = "arm32")]
 use crate::arm32;
@@ -185,7 +189,24 @@ fn build_object_inner(cil: &[u8], corlib: Option<&[u8]>) -> Result<Vec<u8>, Buil
     if let Some(reference) = reference.as_ref() {
         resolver = resolver.with_reference(reference);
     }
-    let descriptors = resolver.type_descriptors();
+    let mut descriptors = resolver.type_descriptors();
+    let mut added: Vec<u32> = Vec::new();
+    for func in &funcs {
+        for block in &func.blocks {
+            for (_, inst) in &block.insts {
+                if let Inst::Alloc { handle, .. } = inst {
+                    let known = descriptors.iter().any(|d| d.handle == *handle)
+                        || added.contains(&handle.0);
+                    if !known {
+                        if let Some(meta) = resolver.reference_type_meta(*handle) {
+                            added.push(handle.0);
+                            descriptors.push(meta);
+                        }
+                    }
+                }
+            }
+        }
+    }
     arm32::lower_object_vtables(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerArm)
 }
 
@@ -227,7 +248,23 @@ fn library_symbol_names(
             if rid >= names.len() {
                 continue;
             }
-            if (method.is_static() || method.is_virtual()) && method.flags() & 0x7 == 0x6 {
+            let token = Token::new(table::METHOD_DEF, method.rid());
+            let runtime_provided = has_runtime_provided_attribute(assembly, token);
+            let is_synth_reader = runtime_provided
+                && synthesize_runtime_reader(
+                    type_name.namespace,
+                    type_name.name,
+                    method.name(),
+                    method.signature().map(|s| s.parameters.len()).unwrap_or(0),
+                )
+                .is_some();
+            let is_plain_instance = !method.is_static()
+                && !method.is_virtual()
+                && !runtime_provided
+                && method.body().is_some();
+            if (method.is_static() || method.is_virtual() || is_synth_reader || is_plain_instance)
+                && method.flags() & 0x7 == 0x6
+            {
                 if let Some(method_name) = method.name() {
                     let params = method.signature().map(|s| s.parameters).unwrap_or_default();
                     names[rid] = crate::resolver::extern_method_symbol(
@@ -416,6 +453,345 @@ fn find_native_export(assembly: &Assembly, export: &str) -> Option<u32> {
     None
 }
 
+/// Whether `method_token` carries `[Lamella.Runtime.RuntimeProvided]` -- the corlib's marker for a method
+/// whose empty body is a placeholder for a runtime-provided intrinsic. Mirrors the interpreter's
+/// `lamella_load::has_runtime_provided_attribute`: csc emits a REAL empty body (not an implflag), so the
+/// AOT keys on the ATTRIBUTE, and for the readers it can it synthesizes a body ([`synthesize_runtime_reader`])
+/// instead of lowering the placeholder.
+fn has_runtime_provided_attribute(assembly: &Assembly, method_token: Token) -> bool {
+    assembly.custom_attributes(method_token).any(|attribute| {
+        assembly
+            .resolve_method(attribute.constructor)
+            .and_then(|ctor| ctor.declaring_type)
+            .is_some_and(|name| {
+                name.namespace == "Lamella.Runtime" && name.name == "RuntimeProvidedAttribute"
+            })
+    })
+}
+
+/// A synthesized MIR body for a `[RuntimeProvided]` `System.String` reader, over the AOT string layout
+/// `[len: u32][u16 code units ...]` (an `ldstr` ObjectRef points at the `len` word). `get_Length` loads the
+/// len word at `this + 0`; `get_Chars(i)` loads the `u16` at `this + 4 + i*2`, zero-extended to i32. Both
+/// are non-virtual now (the getter-virtual fix), so a program's `s.Length` / `s[i]` is a direct
+/// cross-assembly call that links to corlib's copy of this. Returns `None` for a marked method this backend
+/// does not synthesize (Substring/Concat/Console.*): it keeps its placeholder body, so a program calling one
+/// fails to LINK loudly rather than binding a wrong value.
+fn synthesize_runtime_reader(
+    namespace: &str,
+    type_name: &str,
+    method_name: Option<&str>,
+    param_count: usize,
+) -> Option<Function> {
+    if (namespace, type_name) != ("System", "String") {
+        return None;
+    }
+    match (method_name, param_count) {
+        (Some("get_Length"), 0) => Some(Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(1),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Load {
+                            address: ValueId(1),
+                            width: 4,
+                            signed: false,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        }),
+        (Some("get_Chars"), 1) => Some(Function {
+            params: vec![MirType::ObjectRef, MirType::I32],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::I32, MirType::I32, MirType::I32, MirType::I32, MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1)],
+                insts: vec![
+                    (ValueId(2), Inst::Convert { value: ValueId(0), kind: ConvKind::RefToInt }),
+                    (ValueId(3), Inst::ConstInt { ty: MirType::I32, value: 2 }),
+                    (ValueId(4), Inst::Binary { op: BinOp::Mul, lhs: ValueId(1), rhs: ValueId(3) }),
+                    (ValueId(5), Inst::ConstInt { ty: MirType::I32, value: 4 }),
+                    (ValueId(6), Inst::Binary { op: BinOp::Add, lhs: ValueId(2), rhs: ValueId(5) }),
+                    (ValueId(7), Inst::Binary { op: BinOp::Add, lhs: ValueId(6), rhs: ValueId(4) }),
+                    (ValueId(8), Inst::Load { address: ValueId(7), width: 2, signed: false }),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(8)))),
+            }],
+        }),
+        (Some("Substring"), 1) => Some(Function {
+            params: vec![MirType::ObjectRef, MirType::I32],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::ObjectRef,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1)],
+                insts: vec![
+                    (
+                        ValueId(2),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::Load {
+                            address: ValueId(2),
+                            width: 4,
+                            signed: false,
+                        },
+                    ),
+                    (
+                        ValueId(4),
+                        Inst::Binary {
+                            op: BinOp::Sub,
+                            lhs: ValueId(3),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                    (
+                        ValueId(5),
+                        Inst::PInvoke {
+                            import: "lamella_string_substring".into(),
+                            args: vec![ValueId(2), ValueId(1), ValueId(4)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(5)))),
+            }],
+        }),
+        (Some("Substring"), 2) => Some(Function {
+            params: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::ObjectRef,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                insts: vec![
+                    (
+                        ValueId(3),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(4),
+                        Inst::PInvoke {
+                            import: "lamella_string_substring".into(),
+                            args: vec![ValueId(3), ValueId(1), ValueId(2)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(4)))),
+            }],
+        }),
+        (Some("CreateFromChars"), 3) => Some(Function {
+            params: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::ObjectRef,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1), ValueId(2)],
+                insts: vec![
+                    (
+                        ValueId(3),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(4),
+                        Inst::PInvoke {
+                            import: "lamella_string_substring".into(),
+                            args: vec![ValueId(3), ValueId(1), ValueId(2)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(4)))),
+            }],
+        }),
+        _ => None,
+    }
+}
+
+/// A synthesized MIR body for a `System.Console` output overload. It threads an optional argument
+/// (`param`) -- reinterpreted from an ObjectRef to a raw pointer first when `ref_to_int` (the string
+/// form) -- into a runtime-support value-writer (`writer`), then optionally a trailing newline. So
+/// `Write(x)` = the writer, `WriteLine(x)` = the writer + newline, `WriteLine()` = just the newline.
+/// All are void `[RuntimeProvided]` statics; the object path rewrites each `PInvoke` to a `CallNative`
+/// the linker resolves against `tools/runtime-support`. The writer matches the interpreter / .NET
+/// formatting (signed/unsigned decimal, `True`/`False`, a `char`'s code unit).
+fn console_body(
+    param: Option<MirType>,
+    ref_to_int: bool,
+    writer: Option<&str>,
+    newline: bool,
+) -> Function {
+    let mut value_types: Vec<MirType> = Vec::new();
+    let mut block_params: Vec<ValueId> = Vec::new();
+    let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+    let mut next = 0u32;
+    let arg = param.map(|ty| {
+        value_types.push(ty);
+        block_params.push(ValueId(next));
+        next += 1;
+        ValueId(next - 1)
+    });
+    let write_arg = if ref_to_int {
+        let src = arg.expect("ref_to_int implies a parameter");
+        value_types.push(MirType::I32);
+        next += 1;
+        insts.push((
+            ValueId(next - 1),
+            Inst::Convert {
+                value: src,
+                kind: ConvKind::RefToInt,
+            },
+        ));
+        Some(ValueId(next - 1))
+    } else {
+        arg
+    };
+    if let Some(symbol) = writer {
+        value_types.push(MirType::I32);
+        next += 1;
+        insts.push((
+            ValueId(next - 1),
+            Inst::PInvoke {
+                import: symbol.into(),
+                args: write_arg.map(|a| vec![a]).unwrap_or_default(),
+            },
+        ));
+    }
+    if newline {
+        value_types.push(MirType::I32);
+        next += 1;
+        insts.push((
+            ValueId(next - 1),
+            Inst::PInvoke {
+                import: "lamella_console_newline".into(),
+                args: Vec::new(),
+            },
+        ));
+    }
+    Function {
+        params: param.map(|p| vec![p]).unwrap_or_default(),
+        ret: None,
+        value_types,
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: block_params,
+            insts,
+            terminator: Some(Terminator::Return(None)),
+        }],
+    }
+}
+
+/// A synthesized MIR body for `System.Double.ToString()` (its `[RuntimeProvided]` placeholder). `this` is
+/// a managed pointer to the `f64` value; load the 8-byte value from it and hand it to the runtime-support
+/// `lamella_double_to_string`, which formats it (byte-identical to the interpreter's `format_double`) and
+/// returns a GC-allocated `[len: u32][u16 units ...]` string. The object path rewrites the `PInvoke` to a
+/// `CallNative` the linker resolves against `tools/runtime-support`. `this` is dead by the allocating call,
+/// so nothing improper is a GC root there; the returned ObjectRef is rooted as the live result.
+fn double_to_string_body() -> Function {
+    Function {
+        params: vec![MirType::ManagedPtr],
+        ret: Some(MirType::ObjectRef),
+        value_types: vec![MirType::ManagedPtr, MirType::F64, MirType::ObjectRef],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0)],
+            insts: vec![
+                (
+                    ValueId(1),
+                    Inst::Load {
+                        address: ValueId(0),
+                        width: 8,
+                        signed: false,
+                    },
+                ),
+                (
+                    ValueId(2),
+                    Inst::PInvoke {
+                        import: "lamella_double_to_string".into(),
+                        args: vec![ValueId(1)],
+                    },
+                ),
+            ],
+            terminator: Some(Terminator::Return(Some(ValueId(2)))),
+        }],
+    }
+}
+
+/// A synthesized MIR body for `System.Char.ToString()` (its `[RuntimeProvided]` placeholder). `this` is a
+/// managed pointer to the `char`; load the code unit and hand it to the runtime-support
+/// `lamella_char_to_string`, which allocates a one-unit `[len][u16]` string. Like `Double.ToString`, the
+/// object path turns the `PInvoke` into a linker-resolved `CallNative`.
+fn char_to_string_body() -> Function {
+    Function {
+        params: vec![MirType::ManagedPtr],
+        ret: Some(MirType::ObjectRef),
+        value_types: vec![MirType::ManagedPtr, MirType::I32, MirType::ObjectRef],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0)],
+            insts: vec![
+                (
+                    ValueId(1),
+                    Inst::Load {
+                        address: ValueId(0),
+                        width: 2,
+                        signed: false,
+                    },
+                ),
+                (
+                    ValueId(2),
+                    Inst::PInvoke {
+                        import: "lamella_char_to_string".into(),
+                        args: vec![ValueId(1)],
+                    },
+                ),
+            ],
+            terminator: Some(Terminator::Return(Some(ValueId(2)))),
+        }],
+    }
+}
+
 /// Lowers an assembly's methods to a `Vec<Function>` keyed by MethodDef row. Index 0 is a trampoline
 /// to `entry` (if any) -- the `main` export -- or a stub. A method that does not lower stays a stub.
 /// `reference` is the referenced assembly (corlib) for cross-assembly vtable-slot agreement, or `None`
@@ -447,10 +823,11 @@ fn lower_assembly_debug<'a>(
     let mut methods = Vec::new();
     let mut max_rid = entry.unwrap_or(0);
     for type_def in assembly.type_defs() {
+        let type_name = type_def.name();
         for method in type_def.methods() {
             let rid = method.rid();
             max_rid = max_rid.max(rid);
-            methods.push((rid, method));
+            methods.push((rid, method, type_name));
         }
     }
     let mut funcs: Vec<Function> = (0..=max_rid).map(|_| stub()).collect();
@@ -469,9 +846,75 @@ fn lower_assembly_debug<'a>(
         None => MetadataResolver::new(assembly),
     };
     let mut fails: Vec<(u32, cil::CilError)> = Vec::new();
-    for (rid, method) in &methods {
+    for (rid, method, type_name) in &methods {
         let Some(body) = method.body() else { continue };
         let signature = method.signature();
+        if has_runtime_provided_attribute(assembly, Token::new(table::METHOD_DEF, method.rid())) {
+            if let Some(type_name) = type_name {
+                let params = signature.as_ref().map_or(0, |sig| sig.parameters.len());
+                if let Some(func) =
+                    synthesize_runtime_reader(type_name.namespace, type_name.name, method.name(), params)
+                {
+                    funcs[*rid as usize] = func;
+                    continue;
+                }
+                if (type_name.namespace, type_name.name) == ("System", "Console") {
+                    let params = signature.as_ref().map(|s| s.parameters.as_slice()).unwrap_or(&[]);
+                    let s = |sym| Some(sym);
+                    let body = match (method.name(), params) {
+                        (Some("Write"), [SigType::String]) => {
+                            Some(console_body(Some(MirType::ObjectRef), true, s("lamella_console_write"), false))
+                        }
+                        (Some("WriteLine"), [SigType::String]) => {
+                            Some(console_body(Some(MirType::ObjectRef), true, s("lamella_console_write"), true))
+                        }
+                        (Some("Write"), [SigType::I4]) => {
+                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_i32"), false))
+                        }
+                        (Some("WriteLine"), [SigType::I4]) => {
+                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_i32"), true))
+                        }
+                        (Some("WriteLine"), [SigType::U4]) => {
+                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_u32"), true))
+                        }
+                        (Some("Write"), [SigType::Char]) => {
+                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_char"), false))
+                        }
+                        (Some("WriteLine"), [SigType::Char]) => {
+                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_char"), true))
+                        }
+                        (Some("WriteLine"), [SigType::Boolean]) => {
+                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_bool"), true))
+                        }
+                        (Some("WriteLine"), [SigType::I8]) => {
+                            Some(console_body(Some(MirType::I64), false, s("lamella_console_write_i64"), true))
+                        }
+                        (Some("WriteLine"), [SigType::U8]) => {
+                            Some(console_body(Some(MirType::I64), false, s("lamella_console_write_u64"), true))
+                        }
+                        _ => None,
+                    };
+                    if let Some(func) = body {
+                        funcs[*rid as usize] = func;
+                        continue;
+                    }
+                }
+                if (type_name.namespace, type_name.name) == ("System", "Double")
+                    && method.name() == Some("ToString")
+                    && params == 0
+                {
+                    funcs[*rid as usize] = double_to_string_body();
+                    continue;
+                }
+                if (type_name.namespace, type_name.name) == ("System", "Char")
+                    && method.name() == Some("ToString")
+                    && params == 0
+                {
+                    funcs[*rid as usize] = char_to_string_body();
+                    continue;
+                }
+            }
+        }
         let mut arg_types = Vec::new();
         if let Some(sig) = &signature {
             if sig.has_this {
@@ -535,6 +978,62 @@ fn method_exports(assembly: &Assembly, has_main: bool) -> Vec<(String, u32)> {
 #[cfg(all(test, feature = "arm32"))]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn synthesized_string_readers_verify_and_lower() {
+        for (name, params) in [("get_Length", 0usize), ("get_Chars", 1usize)] {
+            let f = synthesize_runtime_reader("System", "String", Some(name), params)
+                .unwrap_or_else(|| panic!("{name} not synthesized"));
+            lamella_ir::verify(&f).unwrap_or_else(|e| panic!("{name} verify: {e:?}"));
+            crate::arm32::lower(&f).unwrap_or_else(|e| panic!("{name} lower: {e:?}"));
+        }
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn synthesized_console_writers_verify_and_lower() {
+        let bodies = [
+            console_body(Some(MirType::ObjectRef), true, Some("lamella_console_write"), true),
+            console_body(Some(MirType::I32), false, Some("lamella_console_write_i32"), true),
+            console_body(Some(MirType::I64), false, Some("lamella_console_write_i64"), true),
+            console_body(Some(MirType::I32), false, Some("lamella_console_write_char"), false),
+            console_body(None, false, None, true),
+        ];
+        for f in bodies {
+            lamella_ir::verify(&f).expect("a synthesized console body verifies");
+            crate::arm32::lower_object(&[f], &["c"], &[]).expect("a synthesized console body lowers");
+        }
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn synthesized_substring_and_char_tostring_verify_and_lower() {
+        let bodies = [
+            synthesize_runtime_reader("System", "String", Some("Substring"), 1).unwrap(),
+            synthesize_runtime_reader("System", "String", Some("Substring"), 2).unwrap(),
+            char_to_string_body(),
+        ];
+        for f in bodies {
+            lamella_ir::verify(&f).expect("a synthesized string body verifies");
+            crate::arm32::lower_object(&[f], &["s"], &[]).expect("it lowers on the object path");
+        }
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
+    fn synthesized_double_to_string_verifies_and_lowers() {
+        let f = double_to_string_body();
+        lamella_ir::verify(&f).expect("Double.ToString body verifies");
+        let obj = lamella_elf::read_object(&crate::arm32::lower_object(&[f], &["dts"], &[]).unwrap())
+            .unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "lamella_double_to_string" && !s.defined),
+            "the formatter is an undefined extern the link resolves against runtime-support"
+        );
+    }
 
     #[test]
     fn rejects_an_unknown_target() {

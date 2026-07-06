@@ -5,6 +5,7 @@ use crate::value::Location;
 use crate::value::Value;
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// A reference to a heap object: an index into the [`Heap`] arena. The null
@@ -29,6 +30,14 @@ type StrStore = Box<[u8]>;
 #[cfg(not(feature = "string-utf8"))]
 fn encode_string(units: &[u16]) -> StrStore {
     units.into()
+}
+
+/// Decodes little-endian UTF-16 bytes (the `ldstr` pool's on-disk shape) into code units.
+fn decode_le_units(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect()
 }
 
 /// Encodes UTF-16 code units into UTF-8 bytes; a lone surrogate (unrepresentable in
@@ -95,6 +104,11 @@ pub enum Object {
         /// allocated without `newarr` element-type info (e.g. `String.Split`'s result, an
         /// `ArrayList` backing store), for which the storage width is the only available size.
         element_size: u8,
+        /// The element type's asm-folded token, captured from `newarr` -- what a covariant
+        /// `stelem.ref` (I.8.7.1) checks the stored value against. `0` means "untracked" (an
+        /// array minted without `newarr` info): such an array never raises
+        /// `ArrayTypeMismatchException`, the pre-tracking behavior.
+        element_type: u64,
     },
     /// A multi-dimensional (rectangular) array (II.14.2): its per-dimension lengths and
     /// its elements in row-major order. Accessed via `Get`/`Set`/`.ctor` calls on the
@@ -158,6 +172,10 @@ const INITIAL_GC_THRESHOLD: usize = 64;
 #[cfg_attr(not(feature = "gc"), derive(Default))]
 pub struct Heap {
     objects: Vec<Object>,
+    /// The string intern table (III.4.16): character content -> the canonical
+    /// `System.String`, so every `ldstr` of the same sequence yields the same object.
+    /// Entries are strong roots for the collector and relocate with the survivors.
+    intern: BTreeMap<Vec<u16>, ObjectRef>,
     /// The object count at which the next collection triggers (see
     /// [`Heap::should_collect`]); adapts after each collection.
     #[cfg(feature = "gc")]
@@ -175,6 +193,7 @@ impl Default for Heap {
     fn default() -> Heap {
         Heap {
             objects: Vec::new(),
+            intern: BTreeMap::new(),
             gc_threshold: INITIAL_GC_THRESHOLD,
             #[cfg(feature = "finalizers")]
             finalize_registered: Vec::new(),
@@ -200,20 +219,38 @@ impl Heap {
         ObjectRef(index)
     }
 
-    /// Interns a UTF-16 string as a `System.String` and returns a reference. The units are
-    /// encoded into the heap's [`StrStore`] (the seam where UTF-8 / WTF-8 storage drops in).
+    /// Allocates a FRESH `System.String` (a distinct object every call -- the shape of a
+    /// computed string: concat, ToString, StringBuilder). The units are encoded into the
+    /// heap's [`StrStore`] (the seam where UTF-8 / WTF-8 storage drops in). Literals go
+    /// through [`Heap::intern_string`] instead.
     pub fn alloc_string(&mut self, chars: &[u16]) -> ObjectRef {
         self.alloc(Object::Str(encode_string(chars)))
     }
 
-    /// Interns a string given as little-endian UTF-16 BYTES (the frozen `ldstr` pool's shape --
-    /// a flash slice needs no alignment to be read this way).
+    /// Allocates a fresh string given as little-endian UTF-16 BYTES (the frozen `ldstr`
+    /// pool's shape -- a flash slice needs no alignment to be read this way).
     pub fn alloc_string_le(&mut self, bytes: &[u8]) -> ObjectRef {
-        let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .collect();
+        let units = decode_le_units(bytes);
         self.alloc_string(&units)
+    }
+
+    /// The canonical (interned) `System.String` for `chars`, allocated on first sight:
+    /// III.4.16 -- every `ldstr` of the same character sequence yields the SAME object,
+    /// across modules. Interned strings stay live across collections (the table is a
+    /// strong root) and relocate with the survivors.
+    pub fn intern_string(&mut self, chars: &[u16]) -> ObjectRef {
+        if let Some(&existing) = self.intern.get(chars) {
+            return existing;
+        }
+        let reference = self.alloc_string(chars);
+        self.intern.insert(chars.to_vec(), reference);
+        reference
+    }
+
+    /// [`Heap::intern_string`] over little-endian UTF-16 bytes (the `ldstr` pool's shape).
+    pub fn intern_string_le(&mut self, bytes: &[u8]) -> ObjectRef {
+        let units = decode_le_units(bytes);
+        self.intern_string(&units)
     }
 
     /// The object `reference` names, if it is live.
@@ -363,6 +400,7 @@ impl Heap {
         self.alloc(Object::Array {
             elements,
             element_size: 0,
+            element_type: 0,
         })
     }
 
@@ -372,11 +410,27 @@ impl Heap {
     /// `byte[]` and an `int[]` (both storing `Value::Int32`) cannot share. `element_size == 0`
     /// means the element type is not a sized primitive (a reference / value-type array), recorded
     /// as such so `Buffer` rejects it.
-    pub fn alloc_array_sized(&mut self, elements: Vec<Value>, element_size: u8) -> ObjectRef {
+    pub fn alloc_array_sized(
+        &mut self,
+        elements: Vec<Value>,
+        element_size: u8,
+        element_type: u64,
+    ) -> ObjectRef {
         self.alloc(Object::Array {
             elements,
             element_size,
+            element_type,
         })
+    }
+
+    /// The asm-folded element-type token captured at `newarr` for the array at `reference`
+    /// (`0` = untracked), or `None` if it is not a single-dimensional array.
+    #[must_use]
+    pub fn array_element_type(&self, reference: ObjectRef) -> Option<u64> {
+        match self.get(reference)? {
+            Object::Array { element_type, .. } => Some(*element_type),
+            _ => None,
+        }
     }
 
     /// Shallow-clones an array (single- or multi-dimensional) and returns a reference to
@@ -389,9 +443,11 @@ impl Heap {
             Object::Array {
                 elements,
                 element_size,
+                element_type,
             } => Object::Array {
                 elements: elements.clone(),
                 element_size: *element_size,
+                element_type: *element_type,
             },
             Object::MdArray { dims, elements } => Object::MdArray {
                 dims: dims.clone(),
@@ -529,6 +585,17 @@ impl Heap {
         match self.get(reference)? {
             Object::MdArray { dims, .. } => dims.get(usize::try_from(dim).ok()?).copied(),
             Object::Array { elements, .. } if dim == 0 => i32::try_from(elements.len()).ok(),
+            _ => None,
+        }
+    }
+
+    /// The rank (dimension count) of the array at `reference`: a single-dimension array is
+    /// rank 1; a multi-dimensional array reports its dimension count.
+    #[must_use]
+    pub fn array_rank(&self, reference: ObjectRef) -> Option<i32> {
+        match self.get(reference)? {
+            Object::Array { .. } => Some(1),
+            Object::MdArray { dims, .. } => i32::try_from(dims.len()).ok(),
             _ => None,
         }
     }
@@ -942,6 +1009,13 @@ impl Heap {
                 }
             });
         });
+        for reference in self.intern.values() {
+            let index = reference.0 as usize;
+            if index < count && !live[index] {
+                live[index] = true;
+                work.push(index);
+            }
+        }
         trace(&self.objects, &mut live, &mut work);
 
         #[cfg(feature = "finalizers")]
@@ -980,6 +1054,11 @@ impl Heap {
             }
         }
         enumerate_roots(&mut |value| remap_value(value, &remap));
+        for reference in self.intern.values_mut() {
+            if let Some(new_index) = remap[reference.0 as usize] {
+                *reference = ObjectRef(new_index);
+            }
+        }
         self.gc_threshold = self
             .objects
             .len()
@@ -1026,6 +1105,8 @@ fn location_refs<F: FnMut(ObjectRef)>(location: &Location, visit: &mut F) {
         Location::Nested { base, .. } => location_refs(base, visit),
         Location::Local { .. }
         | Location::Arg { .. }
+        | Location::LocalBytes { .. }
+        | Location::ArgBytes { .. }
         | Location::Static { .. }
         | Location::Stack { .. } => {}
     }
@@ -1071,6 +1152,8 @@ fn remap_location(location: &mut Location, remap: &[Option<u32>]) {
         Location::Nested { base, .. } => remap_location(base, remap),
         Location::Local { .. }
         | Location::Arg { .. }
+        | Location::LocalBytes { .. }
+        | Location::ArgBytes { .. }
         | Location::Static { .. }
         | Location::Stack { .. } => {}
     }
@@ -1173,6 +1256,22 @@ mod gc_tests {
             other => panic!("field not an object: {other:?}"),
         };
         assert_eq!(heap.as_string(kept).as_deref(), Some(&[b'a' as u16][..]));
+    }
+
+    #[test]
+    fn interned_strings_survive_collection_and_relocate() {
+        let mut heap = Heap::new();
+        let _garbage = heap.alloc_string(&[b'x' as u16]);
+        let interned = heap.intern_string(&[b'i' as u16]);
+        assert_eq!(heap.intern_string(&[b'i' as u16]), interned);
+        assert_ne!(heap.alloc_string(&[b'i' as u16]), interned);
+
+        heap.collect(|_visit| {});
+
+        assert_eq!(heap.object_count(), 1);
+        let relocated = heap.intern_string(&[b'i' as u16]);
+        assert_eq!(heap.object_count(), 1);
+        assert_eq!(heap.as_string(relocated).as_deref(), Some(&[b'i' as u16][..]));
     }
 
     #[test]

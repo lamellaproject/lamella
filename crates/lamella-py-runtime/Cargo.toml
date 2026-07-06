@@ -7,10 +7,17 @@ license.workspace = true
 authors.workspace = true
 description = "Lamella's Python runtime: the bytecode interpreter, the dynamic object model, and built-ins."
 
+[features]
+default = ["gc-collect", "complex"]
+complex = []
+gc-collect = ["lamella-gc/gc-collect"]
+gc-none = []
+
 [dependencies]
-# The single shared collector. Python objects live on the same heap as C# objects;
-# the interpreter scans its tagged-value slots by tag through this contract.
-lamella-gc = { path = "../lamella-gc" }
+# The single shared collector. Python objects live on the same heap as C# objects; the interpreter
+# scans its tagged-value slots by tag through this contract. `default-features = false` so THIS
+# crate's `gc-collect` feature drives lamella-gc's collector-engine gate (the `bump` tier drops it).
+lamella-gc = { path = "../lamella-gc", default-features = false }
 # The shared bytecode contract (single source of truth): the interpreter executes
 # what the front end emits, so both depend on this one definition of the bytecode.
 lamella-py-bytecode = { path = "../lamella-py-bytecode" }
@@ -18,6 +25,12 @@ lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 # classify code points exactly as CPython, from one tree-shakeable table. The str predicates use
 # only the categories tier, so opt out of `normalization` (and `alloc` in the crate).
 lamella-unicode = { path = "../lamella-unicode", default-features = false }
+# The MUSL/fdlibm port (the same accurate libm the C# runtime uses). `no_std` -- `core` has the f64
+# arithmetic operators but NOT floor/fmod, which the float `//` and `%` need (CPython's exact
+# float_divmod), so bind them here rather than hand-roll fdlibm. Only floor/fmod/trunc are
+# referenced, so the transcendentals dead-code-eliminate; a future `float` size knob (mirroring the
+# C# `math-transcendental` gate) can drop it entirely on a no-float tier.
+libm = "0.2.16"
 
 [dev-dependencies]
 lamella-py-frontend = { path = "../lamella-py-frontend" }

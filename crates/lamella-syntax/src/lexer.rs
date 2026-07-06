@@ -1347,7 +1347,15 @@ fn parse_decimal_literal(text: &str) -> Option<(u32, u32, u32, u8)> {
         mantissa = mantissa.checked_mul(10)?;
         scale += 1;
     }
-    if scale > 28 || mantissa > 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF {
+    while scale > 28 {
+        let dropped = mantissa % 10;
+        mantissa /= 10;
+        if dropped > 5 || (dropped == 5 && mantissa % 2 == 1) {
+            mantissa += 1;
+        }
+        scale -= 1;
+    }
+    if mantissa > 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF {
         return None;
     }
     Some((

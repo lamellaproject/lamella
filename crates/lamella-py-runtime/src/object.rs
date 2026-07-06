@@ -5,11 +5,14 @@ use alloc::vec::Vec;
 
 use core::cmp::Ordering;
 
-use lamella_gc::{Heap, TypeDesc};
+use lamella_gc::{Heap, Ref, TypeDesc};
 use lamella_py_bytecode::{BinOp, CmpOp};
 
+use crate::bigint::BigInt;
+use crate::builtins::Builtin;
+use crate::interp::Frame;
 use crate::trap::Trap;
-use crate::value::Value;
+use crate::value::{Value, FIXNUM_MAX, FIXNUM_MIN};
 
 /// The `str` method ids stored in a bound method's payload (Python 3.14.6 "String
 /// Methods"). The set grows as methods are added.
@@ -51,8 +54,57 @@ const STR_RPARTITION: u32 = 34;
 const STR_EXPANDTABS: u32 = 35;
 const STR_ISASCII: u32 = 36;
 const STR_ISIDENTIFIER: u32 = 37;
+const STR_FORMAT: u32 = 38;
+const STR_RSPLIT: u32 = 39;
+const STR_CASEFOLD: u32 = 40;
+const STR_TRANSLATE: u32 = 41;
+const STR_FORMAT_MAP: u32 = 42;
+const STR_ENCODE: u32 = 43;
 
 /// The id of the `str` method `name`, or `None` if `str` has no such method.
+/// Renders `n` in `radix` (2/8/10/16) with no sign or prefix; `upper` uppercases the hex digits.
+fn format_radix(mut n: u32, radix: u32, upper: bool) -> String {
+    if n == 0 {
+        return String::from("0");
+    }
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = Vec::new();
+    while n > 0 {
+        let digit = DIGITS[(n % radix) as usize];
+        buf.push(if upper { digit.to_ascii_uppercase() } else { digit });
+        n /= radix;
+    }
+    buf.reverse();
+    String::from_utf8(buf).unwrap_or_default()
+}
+
+/// Pads `s` to `width` code points with `fill`, per `align` (`<` left, `>`/`=` right, `^` centre).
+fn pad_field(s: &str, width: usize, fill: char, align: char) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        return String::from(s);
+    }
+    let total = width - len;
+    let mut out = String::new();
+    match align {
+        '<' => {
+            out.push_str(s);
+            (0..total).for_each(|_| out.push(fill));
+        }
+        '^' => {
+            let left = total / 2;
+            (0..left).for_each(|_| out.push(fill));
+            out.push_str(s);
+            (0..total - left).for_each(|_| out.push(fill));
+        }
+        _ => {
+            (0..total).for_each(|_| out.push(fill));
+            out.push_str(s);
+        }
+    }
+    out
+}
+
 fn str_method_id(name: &str) -> Option<u32> {
     match name {
         "upper" => Some(STR_UPPER),
@@ -93,6 +145,12 @@ fn str_method_id(name: &str) -> Option<u32> {
         "expandtabs" => Some(STR_EXPANDTABS),
         "isascii" => Some(STR_ISASCII),
         "isidentifier" => Some(STR_ISIDENTIFIER),
+        "format" => Some(STR_FORMAT),
+        "rsplit" => Some(STR_RSPLIT),
+        "casefold" => Some(STR_CASEFOLD),
+        "translate" => Some(STR_TRANSLATE),
+        "format_map" => Some(STR_FORMAT_MAP),
+        "encode" => Some(STR_ENCODE),
         _ => None,
     }
 }
@@ -117,6 +175,7 @@ const DICT_POP: u32 = 5;
 const DICT_SETDEFAULT: u32 = 6;
 const DICT_CLEAR: u32 = 7;
 const DICT_COPY: u32 = 8;
+const DICT_POPITEM: u32 = 9;
 const SET_UNION: u32 = 0;
 const SET_INTERSECTION: u32 = 1;
 const SET_DIFFERENCE: u32 = 2;
@@ -164,6 +223,7 @@ fn dict_method_id(name: &str) -> Option<u32> {
         "setdefault" => Some(DICT_SETDEFAULT),
         "clear" => Some(DICT_CLEAR),
         "copy" => Some(DICT_COPY),
+        "popitem" => Some(DICT_POPITEM),
         _ => None,
     }
 }
@@ -194,6 +254,50 @@ fn tuple_method_id(name: &str) -> Option<u32> {
     match name {
         "index" => Some(TUPLE_INDEX),
         "count" => Some(TUPLE_COUNT),
+        _ => None,
+    }
+}
+
+/// `complex.conjugate()` -- the one complex method (`.real`/`.imag` are plain float attributes,
+/// resolved in `getattr` directly, not bound methods).
+#[cfg(feature = "complex")]
+const COMPLEX_CONJUGATE: u32 = 0;
+
+/// The method id for a `complex` method `name`.
+#[cfg(feature = "complex")]
+fn complex_method_id(name: &str) -> Option<u32> {
+    match name {
+        "conjugate" => Some(COMPLEX_CONJUGATE),
+        _ => None,
+    }
+}
+
+const BYTES_HEX: u32 = 0;
+const BYTES_DECODE: u32 = 1;
+const BYTEARRAY_APPEND: u32 = 2;
+const BYTEARRAY_EXTEND: u32 = 3;
+const BYTES_STARTSWITH: u32 = 4;
+const BYTES_ENDSWITH: u32 = 5;
+const BYTES_FIND: u32 = 6;
+const BYTES_COUNT: u32 = 7;
+const BYTES_REPLACE: u32 = 8;
+const BYTES_UPPER: u32 = 9;
+const BYTES_LOWER: u32 = 10;
+
+/// The method id for a `bytes`/`bytearray` method `name` (`mutating` allows the bytearray-only ones).
+fn bytes_method_id(name: &str, mutating: bool) -> Option<u32> {
+    match name {
+        "hex" => Some(BYTES_HEX),
+        "decode" => Some(BYTES_DECODE),
+        "startswith" => Some(BYTES_STARTSWITH),
+        "endswith" => Some(BYTES_ENDSWITH),
+        "find" => Some(BYTES_FIND),
+        "count" => Some(BYTES_COUNT),
+        "replace" => Some(BYTES_REPLACE),
+        "upper" => Some(BYTES_UPPER),
+        "lower" => Some(BYTES_LOWER),
+        "append" if mutating => Some(BYTEARRAY_APPEND),
+        "extend" if mutating => Some(BYTEARRAY_EXTEND),
         _ => None,
     }
 }
@@ -405,6 +509,244 @@ fn str_repr(s: &str) -> String {
     out
 }
 
+/// Renders a `float` exactly as CPython 3.14's `repr(float)`/`str(float)` does (they are identical
+/// for a float): the SHORTEST decimal string that round-trips to the same double, in CPython's
+/// choice of fixed vs exponential notation. This is deliberately NOT .NET's `Double.ToString`
+/// (csharp's `G`-switch), whose thresholds and digit choices differ.
+///
+/// The rules, from CPython's `format_float_short` (`Python/pystrtod.c`, format code `'r'`):
+/// - `nan`, `inf`, `-inf` render as those literals (lowercase; a NaN never carries a sign).
+/// - Otherwise take the shortest round-trip digits `d0 d1 ...` and the scientific exponent `E`
+///   (value = `d0.d1d2... x 10^E`). Rust's `{:e}` gives exactly this pair.
+/// - Use EXPONENTIAL notation when `E < -4` (i.e. `E <= -5`) or `E >= 16`; the exponent is written
+///   with an explicit sign and at least two digits (`1e-05`, `1e+16`, `1e+308`). A single
+///   significant digit omits the point (`1e+16`, not `1.0e+16`).
+/// - Else FIXED notation, with the decimal point placed after `E + 1` digits; a value with no
+///   fractional part still gets a trailing `.0` (`1.0`, `100.0`) -- CPython's `Py_DTSF_ADD_DOT_0`.
+///
+/// The shortest round-trip scientific form of `value` (`"<mantissa>e<exp>"`, one digit before the
+/// point) with CPython's tie-breaking. Rust's `{:e}` gives the shortest round-trip length but breaks
+/// an exactly-halfway tie AWAY from even, whereas CPython (David Gay's `dtoa`) breaks it TO even. So
+/// re-round to that same number of significant digits with `{:.*e}` (which rounds half-to-even on
+/// the exact value): when the even-tie result still round-trips, it is the one CPython emits (either
+/// the unique shortest, or the even member of a genuine tie); when it does not round-trip (the
+/// correctly-rounded value falls outside the double's interval), Rust's shortest is already correct.
+/// Verified to match CPython 3.14 on a 250k-double random differential, ties included.
+fn shortest_scientific(value: f64) -> String {
+    let shortest = alloc::format!("{value:e}");
+    let mantissa = shortest.split('e').next().unwrap_or(&shortest);
+    let sig = mantissa.chars().filter(char::is_ascii_digit).count();
+    let even = alloc::format!("{value:.*e}", sig.saturating_sub(1));
+    if even.parse::<f64>() == Ok(value) {
+        even
+    } else {
+        shortest
+    }
+}
+
+/// The digit sequence is the shortest that round-trips, with equidistant ties broken to EVEN --
+/// see [`shortest_scientific`] for why Rust's `{:e}` alone is not enough. A 250k-double random
+/// differential confirms it matches CPython 3.14 exactly (see the float corpus).
+fn format_float(value: f64) -> String {
+    format_float_impl(value, true)
+}
+
+/// The shared shortest-round-trip float renderer. `add_point_zero` controls CPython's
+/// `Py_DTSF_ADD_DOT_0`: `true` for `float` (`1.0`, `100.0`), `false` for a `complex` PART (`(1+2j)`,
+/// not `(1.0+2.0j)`) -- the only place the two formats differ (an integer-valued fixed result).
+fn format_float_impl(value: f64, add_point_zero: bool) -> String {
+    if value.is_nan() {
+        return String::from("nan");
+    }
+    if value.is_infinite() {
+        return String::from(if value < 0.0 { "-inf" } else { "inf" });
+    }
+    let scientific = shortest_scientific(value);
+    let (negative, rest) = match scientific.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, scientific.as_str()),
+    };
+    let (mantissa, exponent) = rest.split_once('e').expect("`{:e}` always has an exponent");
+    let exponent: i32 = exponent.parse().expect("`{:e}` exponent is a valid integer");
+    let mut digits: String = mantissa.chars().filter(|&c| c != '.').collect();
+    while digits.len() > 1 && digits.ends_with('0') {
+        digits.pop();
+    }
+    let ndigits = digits.len() as i32;
+    let decpt = exponent + 1;
+
+    let body = if !(-4..16).contains(&exponent) {
+        let mut mantissa_out = String::new();
+        mantissa_out.push_str(&digits[..1]);
+        if ndigits > 1 {
+            mantissa_out.push('.');
+            mantissa_out.push_str(&digits[1..]);
+        }
+        let sign = if exponent < 0 { '-' } else { '+' };
+        alloc::format!("{mantissa_out}e{sign}{:02}", exponent.unsigned_abs())
+    } else if decpt <= 0 {
+        alloc::format!("0.{}{digits}", "0".repeat((-decpt) as usize))
+    } else if decpt >= ndigits {
+        let zeros = "0".repeat((decpt - ndigits) as usize);
+        if add_point_zero {
+            alloc::format!("{digits}{zeros}.0")
+        } else {
+            alloc::format!("{digits}{zeros}")
+        }
+    } else {
+        alloc::format!("{}.{}", &digits[..decpt as usize], &digits[decpt as usize..])
+    };
+    if negative {
+        alloc::format!("-{body}")
+    } else {
+        body
+    }
+}
+
+/// Formats a non-negative double in scientific notation with a fixed number of fractional digits,
+/// in CPython's `e`/`E` style (signed, >=2-digit exponent): `1.23e+04`. `mantissa` precision is the
+/// fractional-digit count.
+fn float_format_scientific(magnitude: f64, precision: usize, upper: bool) -> String {
+    let raw = alloc::format!("{magnitude:.precision$e}");
+    let (mantissa, exponent) = raw.split_once('e').expect("`{:e}` always has an exponent");
+    let exponent: i32 = exponent.parse().expect("valid exponent");
+    let e = if upper { 'E' } else { 'e' };
+    let sign = if exponent < 0 { '-' } else { '+' };
+    alloc::format!("{mantissa}{e}{sign}{:02}", exponent.unsigned_abs())
+}
+
+/// Formats a non-negative double in the general (`g`/`G`) style: `precision` significant digits, in
+/// fixed notation when the exponent is in `[-4, precision)` else scientific, trailing zeros stripped
+/// (kept under `#` alternate). With `keep_decimal`, a fixed result always keeps one fractional digit
+/// (the default-format code's rule, `3.0` not `3`).
+fn float_format_general(magnitude: f64, precision: usize, upper: bool, alternate: bool, keep_decimal: bool) -> String {
+    let precision = precision.max(1);
+    let sci = alloc::format!("{magnitude:.*e}", precision - 1);
+    let (mantissa, exponent) = sci.split_once('e').expect("`{:e}` always has an exponent");
+    let exponent: i32 = exponent.parse().expect("valid exponent");
+    if (-4..precision as i32).contains(&exponent) {
+        let fractional = (precision as i32 - 1 - exponent) as usize;
+        let fixed = alloc::format!("{magnitude:.fractional$}");
+        let stripped = if alternate { fixed } else { strip_float_trailing_zeros(&fixed) };
+        if keep_decimal && !stripped.contains('.') {
+            alloc::format!("{stripped}.0")
+        } else {
+            stripped
+        }
+    } else {
+        let mantissa = if alternate {
+            String::from(mantissa)
+        } else {
+            strip_float_trailing_zeros(mantissa)
+        };
+        let e = if upper { 'E' } else { 'e' };
+        let sign = if exponent < 0 { '-' } else { '+' };
+        alloc::format!("{mantissa}{e}{sign}{:02}", exponent.unsigned_abs())
+    }
+}
+
+/// Strips trailing zeros after a decimal point (and a now-bare trailing point): `3.140` -> `3.14`,
+/// `3.000` -> `3`.
+fn strip_float_trailing_zeros(s: &str) -> String {
+    if !s.contains('.') {
+        return String::from(s);
+    }
+    let trimmed = s.trim_end_matches('0');
+    String::from(trimmed.strip_suffix('.').unwrap_or(trimmed))
+}
+
+/// Inserts a `separator` every three digits of the INTEGER part (left of any `.`): `1234567.89` with
+/// `,` -> `1,234,567.89`.
+fn group_integer_digits(body: &str, separator: char) -> String {
+    let (integer, rest) = match body.split_once('.') {
+        Some((int, frac)) => (int, alloc::format!(".{frac}")),
+        None => (body, String::new()),
+    };
+    let mut grouped = String::new();
+    let digit_count = integer.len();
+    for (index, digit) in integer.chars().enumerate() {
+        if index > 0 && (digit_count - index) % 3 == 0 {
+            grouped.push(separator);
+        }
+        grouped.push(digit);
+    }
+    grouped.push_str(&rest);
+    grouped
+}
+
+/// Renders a `complex` as CPython's `repr`/`str` (identical). When the real part is a POSITIVE zero
+/// only the imaginary term shows (`1j`, `-1j`, `0j`); otherwise `(real+imagj)` with the imaginary
+/// term explicitly signed. Each part uses the shortest-round-trip float format WITHOUT a trailing
+/// `.0` (`(1+2j)`, `(2.5-0.5j)`, `(1e+100+2e-05j)`, `(-0-1j)`).
+#[cfg(feature = "complex")]
+fn format_complex(real: f64, imag: f64) -> String {
+    let imag_str = format_float_impl(imag, false);
+    if real == 0.0 && real.is_sign_positive() {
+        return alloc::format!("{imag_str}j");
+    }
+    let real_str = format_float_impl(real, false);
+    let sign = if imag.is_sign_negative() { "" } else { "+" };
+    alloc::format!("({real_str}{sign}{imag_str}j)")
+}
+
+/// CPython's `repr(bytes)` / `repr(bytearray)`: `b'...'` (or `bytearray(b'...')`), printable ASCII
+/// shown literally, `\t\n\r\\` escaped, everything else as `\xNN`. The quote is `'` unless the data
+/// has a `'` but no `"`.
+fn bytes_repr(data: &[u8], is_bytearray: bool) -> String {
+    let quote = if data.contains(&b'\'') && !data.contains(&b'"') { b'"' } else { b'\'' };
+    let mut out = String::new();
+    if is_bytearray {
+        out.push_str("bytearray(");
+    }
+    out.push('b');
+    out.push(quote as char);
+    for &byte in data {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b if b == quote => {
+                out.push('\\');
+                out.push(b as char);
+            }
+            0x20..=0x7e => out.push(byte as char),
+            _ => out.push_str(&alloc::format!("\\x{byte:02x}")),
+        }
+    }
+    out.push(quote as char);
+    if is_bytearray {
+        out.push(')');
+    }
+    out
+}
+
+/// Replaces every non-overlapping occurrence of `old` with `new` in `data`. An empty `old` inserts
+/// `new` between (and around) every byte, matching CPython.
+fn replace_bytes(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
+    if old.is_empty() {
+        let mut out = Vec::with_capacity(data.len() + new.len() * (data.len() + 1));
+        out.extend_from_slice(new);
+        for &byte in data {
+            out.push(byte);
+            out.extend_from_slice(new);
+        }
+        return out;
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        if i + old.len() <= data.len() && &data[i..i + old.len()] == old {
+            out.extend_from_slice(new);
+            i += old.len();
+        } else {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// The number of elements in `range(start, stop, step)` (CPython's length formula).
 fn range_len(start: i64, stop: i64, step: i64) -> i64 {
     if step > 0 {
@@ -540,6 +882,25 @@ pub struct ObjectModel {
     strings: Vec<String>,
     /// The GC type-descriptor id of the `str` type; it follows the user types.
     str_type_id: u32,
+    /// The GC type-descriptor id of `bytes` (immutable); its one-word payload indexes `byte_buffers`.
+    bytes_type_id: u32,
+    /// The GC type-descriptor id of `bytearray` (mutable); shares the `byte_buffers` arena.
+    bytearray_type_id: u32,
+    /// The GC type-descriptor id of a `long` (a big int, an i128 payload).
+    long_type_id: u32,
+    /// The GC type-descriptor id of a `bigint` (an arbitrary-precision int beyond i128); its
+    /// one-word payload indexes the `bigints` arena. The third `int` representation (after fixnum
+    /// and the i128 `long`); all three present as Python `int`.
+    bigint_type_id: u32,
+    /// The GC type-descriptor id of a `float` (an IEEE-754 double, an f64 payload). A heap object
+    /// because `Value` is a 32-bit word -- an f64 cannot be an immediate (mirrors `long`).
+    float_type_id: u32,
+    /// The GC type-descriptor id of a `complex` (two f64 -- the real + imaginary parts, a 16-byte
+    /// payload). Behind the `complex` capability knob.
+    #[cfg(feature = "complex")]
+    complex_type_id: u32,
+    /// The GC type-descriptor id of a provided module (a namespace-dict wrapper).
+    module_type_id: u32,
     /// The GC type-descriptor id of a bound method (`str.method`); it follows `str`.
     bound_method_type_id: u32,
     /// The GC type-descriptor id of a `slice(start, stop, step)`; it follows the bound method.
@@ -552,6 +913,12 @@ pub struct ObjectModel {
     /// The runtime backing for `dict`: insertion-ordered key/value pairs (Python dicts
     /// preserve insertion order). A dict's heap object holds an index into this.
     dicts: Vec<Vec<(Value, Value)>>,
+    /// The runtime backing for `bigint`: each arbitrary-precision int's heap object holds an index
+    /// into this. Grows monotonically (str-arena pattern; the values are immutable).
+    bigints: Vec<BigInt>,
+    /// The runtime backing for `bytes`/`bytearray`: each object holds an index into this. A `bytes`
+    /// buffer never mutates; a `bytearray` mutates its `Vec<u8>` in place (list-arena pattern).
+    byte_buffers: Vec<Vec<u8>>,
     /// The runtime backing for `set`: deduped elements in insertion order. A set's heap object
     /// holds an index into this. (Iteration order is insertion, not CPython's hash order -- a
     /// documented divergence; differential tests compare sets as sets, e.g. via `sorted`.)
@@ -592,6 +959,77 @@ pub struct ObjectModel {
     /// Captured `print(...)` output (the interpreter is `no_std`, so it buffers rather than
     /// writing a stream; the host drains it).
     stdout: String,
+    /// The GC type-descriptor id of the `gpio` module singleton (the clean hardware API).
+    gpio_type_id: u32,
+    /// The GC type-descriptor id of the `board` pin-name singleton.
+    board_type_id: u32,
+    /// The GC type-descriptor id of a `Pin` handle (a GC leaf of raw register words).
+    pin_type_id: u32,
+    /// The GC type-descriptor id of the `machine` module singleton.
+    machine_type_id: u32,
+    /// The GC type-descriptor id of a `machine.Pin` factory (a callable, carrying OUT/IN).
+    pin_factory_type_id: u32,
+    /// The GC type-descriptor id of the `digitalio` module singleton.
+    digitalio_type_id: u32,
+    /// The GC type-descriptor id of a `digitalio.DigitalInOut` factory (a callable).
+    dio_factory_type_id: u32,
+    /// The GC type-descriptor id of the `digitalio.Direction` enum singleton (OUTPUT/INPUT).
+    direction_type_id: u32,
+    /// The GC type-descriptor id of a `DigitalInOut` instance -- wraps a clean gpio `Pin` (one
+    /// tagged slot), its `value`/`direction` exposed as properties.
+    dio_type_id: u32,
+    /// The GC type-descriptor id of a `PyFunction` -- a DEFAULTED function object
+    /// `[func_index: raw u32 @0, defaults: tagged tuple|None @4, kwdefaults: tagged dict|None @8]`.
+    /// A plain (non-defaulted) function stays a stateless `function_ref` immediate; only a `def`
+    /// with default arguments allocates one.
+    py_function_type_id: u32,
+    /// The GC type-descriptor id of a generator object -- a leaf holding an index into
+    /// `generators` (the arena slot of its suspended frame).
+    generator_type_id: u32,
+    /// The GC type-descriptor id of a `Cell` -- a heap box holding one tagged `Value`, shared
+    /// (mutably) between an enclosing function and a nested closure that captures the variable.
+    cell_type_id: u32,
+    /// The suspended frames of live generators, indexed by a generator object's payload word.
+    /// `None` = the generator is exhausted (its body returned) or currently running; `Some(frame)`
+    /// = it is fresh (ip 0) or suspended at a `yield`. A suspended frame holds tagged Values
+    /// (locals, eval stack) that are GC roots, so a future moving collector must trace each frame
+    /// here -- the same follow-on the `seqs`/`dicts` element arenas need (the interpreter never
+    /// auto-collects today, so no live path exercises it yet).
+    generators: Vec<Option<Frame>>,
+    /// A pool of returned call frames, kept for their Vec allocations (locals/eval-stack/caches) so a
+    /// hot call/return cycle reuses buffers instead of allocating a fresh frame each call. Bounded;
+    /// every pooled frame is cleared of Values (holds nothing to trace).
+    frame_pool: Vec<Frame>,
+    /// App-claimed GPIO pins -- the one-owner-per-pin reservation. A second claim of a held pin
+    /// fails LOUD (a `ValueError`, never a silent register
+    /// race. Language-neutral; the shared BSP-level registry both interpreters consult is the
+    /// coordinated follow-on.
+    gpio_claimed: Vec<u32>,
+    /// Firmware-reserved pins (seeded from the target profile): a claim of one fails loud, so an
+    /// app-vs-firmware conflict is caught rather than silently colliding.
+    gpio_reserved: Vec<u32>,
+    /// The volatile MMIO write seam: on device the runner installs `lamella_mmio::write32`; on
+    /// the host it is unset and writes fall to the simulated register file.
+    mmio_write_fn: Option<fn(u32, u32)>,
+    /// The volatile MMIO read seam (device: `lamella_mmio::read32`; host: the sim).
+    mmio_read_fn: Option<fn(u32) -> u32>,
+    /// The host-only simulated register file (the default MMIO target when no seam is installed),
+    /// so a driver runs and its register writes are verifiable OFF-device.
+    #[cfg(not(target_os = "none"))]
+    mmio_sim: alloc::collections::BTreeMap<u32, u32>,
+    /// The host-only ordered log of every MMIO write, so a test can assert the exact drive
+    /// sequence (e.g. a blinky's alternating set/reset) that the last-value sim map cannot show.
+    #[cfg(not(target_os = "none"))]
+    mmio_trace: Vec<(u32, u32)>,
+    /// The `sleep_ms` delay seam (device: a timer/spin; host: a no-op, so the differential is not
+    /// slowed by real sleeps).
+    delay_fn: Option<fn(u32)>,
+    /// A one-shot argument for the NEXT trap-raised built-in exception, so a trap site can attach
+    /// context (a `KeyError`'s key, an `IndexError`/`ValueError` message) that the bare `Trap` enum
+    /// cannot carry. Set right before returning the bare trap; [`ObjectModel::trap_to_exception`]
+    /// takes it as the exception's single arg. Transient: consumed on the immediately following
+    /// conversion (a future safe-point collector would trace it as a root while set).
+    pending_trap_arg: Option<Value>,
 }
 
 impl ObjectModel {
@@ -610,6 +1048,18 @@ impl ObjectModel {
             })
             .collect();
         let str_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let bytes_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let bytearray_type_id = descs.len() as u32;
         descs.push(TypeDesc {
             payload_size: 4,
             ref_offsets: Vec::new(),
@@ -693,14 +1143,128 @@ impl ObjectModel {
             ref_offsets: Vec::new(),
             tagged_offsets: Vec::new(),
         });
+        let gpio_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let board_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let pin_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::gpio::PIN_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let machine_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let pin_factory_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let digitalio_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let dio_factory_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let direction_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let dio_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: (0..1).map(|i| i * 4).collect(),
+        });
+        let py_function_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 12,
+            ref_offsets: Vec::new(),
+            tagged_offsets: (1..3).map(|i| i * 4).collect(),
+        });
+        let generator_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let cell_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0],
+        });
+        let long_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 16,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let bigint_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let float_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        #[cfg(feature = "complex")]
+        let complex_type_id = descs.len() as u32;
+        #[cfg(feature = "complex")]
+        descs.push(TypeDesc {
+            payload_size: 16,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let module_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0],
+        });
         ObjectModel {
             heap: Heap::new(heap_capacity, descs),
             types,
             strings: Vec::new(),
             seqs: Vec::new(),
             dicts: Vec::new(),
+            bigints: Vec::new(),
+            byte_buffers: Vec::new(),
             sets: Vec::new(),
             str_type_id,
+            bytes_type_id,
+            bytearray_type_id,
+            long_type_id,
+            bigint_type_id,
+            float_type_id,
+            #[cfg(feature = "complex")]
+            complex_type_id,
+            module_type_id,
             bound_method_type_id,
             slice_type_id,
             list_type_id,
@@ -718,6 +1282,53 @@ impl ObjectModel {
             pending_exception: None,
             globals: Vec::new(),
             stdout: String::new(),
+            gpio_type_id,
+            board_type_id,
+            pin_type_id,
+            machine_type_id,
+            pin_factory_type_id,
+            digitalio_type_id,
+            dio_factory_type_id,
+            direction_type_id,
+            dio_type_id,
+            py_function_type_id,
+            generator_type_id,
+            cell_type_id,
+            generators: Vec::new(),
+            frame_pool: Vec::new(),
+            gpio_claimed: Vec::new(),
+            gpio_reserved: Vec::new(),
+            mmio_write_fn: None,
+            mmio_read_fn: None,
+            #[cfg(not(target_os = "none"))]
+            mmio_sim: alloc::collections::BTreeMap::new(),
+            #[cfg(not(target_os = "none"))]
+            mmio_trace: Vec::new(),
+            delay_fn: None,
+            pending_trap_arg: None,
+        }
+    }
+
+    /// The single managed-allocation chokepoint: every `new_*` heap object is allocated here, so
+    /// the GC / allocation tier is chosen in ONE place (a `gc(none|bump|collected)` knob --
+    /// see [[gc-implementation-tiers]]). The default (allocation-capable) tier bumps the moving
+    /// heap and returns `None` when full, at which point a collected tier drives `collect()` before
+    /// retrying (the interpreter never auto-collects today, so it is allocate-only / bump). The
+    /// `gc-none` tier has NO managed heap: every allocation is `None` -> a loud `OutOfMemory`, so a
+    /// pure fixnum / mmio / control-flow driver runs (it never allocates) while an allocating
+    /// program fails fast -- upholding "runs on interpreter-P => runs on device-P" for the tiniest
+    /// micros. Dropping the collector code itself (binary size) is the coordinated `lamella-gc`
+    /// allocation-mode follow-on (the `Allocator` trait's no-GC profile).
+    #[must_use]
+    fn alloc_object(&mut self, type_id: u32) -> Option<Ref> {
+        #[cfg(feature = "gc-none")]
+        {
+            let _ = type_id;
+            None
+        }
+        #[cfg(not(feature = "gc-none"))]
+        {
+            self.heap.alloc(type_id)
         }
     }
 
@@ -726,7 +1337,7 @@ impl ObjectModel {
     pub fn new_str(&mut self, s: &str) -> Result<Value, Trap> {
         let index = self.strings.len() as u32;
         self.strings.push(String::from(s));
-        let reference = self.heap.alloc(self.str_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.str_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
     }
@@ -748,6 +1359,8 @@ impl ObjectModel {
     pub fn py_len(&self, value: Value) -> Result<Value, Trap> {
         let n = if let Some(s) = self.str_value(value) {
             s.chars().count()
+        } else if let Some(data) = self.bytes_value(value) {
+            data.len()
         } else if let Some(elems) = self.seq_value(value) {
             elems.len()
         } else if let Some(entries) = self.dict_value(value) {
@@ -769,24 +1382,273 @@ impl ObjectModel {
         self.str_value(value).is_some()
     }
 
-    /// The dynamic binary-op dispatch (`py_binop`) for object operands -- currently `str`.
-    /// `str + str` concatenates; any other operator, or a `str` mixed with a non-`str`,
-    /// is a `TypeError` (Python: `"a" + 1` and `"a" - "b"` raise; `str * int` repetition
-    /// is unsupported). Returns `Ok(None)` when NEITHER operand is an object, so the
-    /// caller falls back to the numeric path -- the one-source-of-truth dispatch both the
-    /// interpreter and the AOT `py_binop` intrinsic consume.
+    /// A new immutable `bytes` object over `data`.
+    pub fn new_bytes(&mut self, data: Vec<u8>) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.bytes_type_id).ok_or(Trap::OutOfMemory)?;
+        let index = self.byte_buffers.len();
+        self.byte_buffers.push(data);
+        self.heap.write_u32(reference.0, index as u32);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// A new mutable `bytearray` object over `data`.
+    pub fn new_bytearray(&mut self, data: Vec<u8>) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.bytearray_type_id).ok_or(Trap::OutOfMemory)?;
+        let index = self.byte_buffers.len();
+        self.byte_buffers.push(data);
+        self.heap.write_u32(reference.0, index as u32);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The bytes a `bytes` or `bytearray` holds, or `None` for any other value.
+    #[must_use]
+    pub fn bytes_value(&self, value: Value) -> Option<&[u8]> {
+        let reference = value.as_ref()?;
+        let type_id = self.heap.type_id_of(reference);
+        if type_id != self.bytes_type_id && type_id != self.bytearray_type_id {
+            return None;
+        }
+        let index = self.heap.read_u32(reference.0) as usize;
+        self.byte_buffers.get(index).map(Vec::as_slice)
+    }
+
+    /// The `byte_buffers` arena slot of a `bytes`/`bytearray`, for in-place mutation of a bytearray.
+    fn byte_buffer_slot(&self, value: Value) -> Option<usize> {
+        let reference = value.as_ref()?;
+        let type_id = self.heap.type_id_of(reference);
+        if type_id != self.bytes_type_id && type_id != self.bytearray_type_id {
+            return None;
+        }
+        Some(self.heap.read_u32(reference.0) as usize)
+    }
+
+    /// Whether `value` is a `bytes` (immutable).
+    #[must_use]
+    pub fn is_bytes(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.bytes_type_id)
+    }
+
+    /// Whether `value` is a `bytearray` (mutable).
+    #[must_use]
+    pub fn is_bytearray(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.bytearray_type_id)
+    }
+
+    /// The dynamic binary-op dispatch (`py_binop`) for object operands: `str` (`+` concatenates,
+    /// `* int` repeats), `list`/`tuple` (`+` concatenates the SAME kind, `* int` repeats), and the
+    /// set algebra (`| & - ^`). Any other operator, or a mismatched-kind pair (`"a" + 1`,
+    /// `[1] + (1,)`, `"a" - "b"`), is a `TypeError` -- Python's rules. Returns `Ok(None)` when
+    /// NEITHER operand is an object, so the caller falls back to the numeric path -- the
+    /// one-source-of-truth dispatch both the interpreter and the AOT `py_binop` intrinsic consume.
     pub fn py_binary(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Result<Option<Value>, Trap> {
         if self.is_set(lhs) || self.is_frozenset(lhs) {
             return Ok(Some(self.set_binary_op(op, lhs, rhs)?));
         }
-        let a = self.str_value(lhs).map(String::from);
-        let b = self.str_value(rhs).map(String::from);
-        match (a, b) {
-            (None, None) => Ok(None),
-            (Some(a), Some(b)) if op == BinOp::Add => {
-                let mut s = a;
-                s.push_str(&b);
-                Ok(Some(self.new_str(&s)?))
+        if self.is_str(lhs) || self.is_str(rhs) {
+            return Ok(Some(self.str_binary_op(op, lhs, rhs)?));
+        }
+        if self.bytes_value(lhs).is_some() || self.bytes_value(rhs).is_some() {
+            return Ok(Some(self.bytes_binary_op(op, lhs, rhs)?));
+        }
+        if self.seq_value(lhs).is_some() || self.seq_value(rhs).is_some() {
+            return Ok(Some(self.seq_binary_op(op, lhs, rhs)?));
+        }
+        Ok(None)
+    }
+
+    /// `bytes`/`bytearray` `+` (concatenate two byte strings; the result kind follows the LEFT
+    /// operand) and `* int` (repeat; a non-positive count gives empty). Any other combination is a
+    /// `TypeError`.
+    fn bytes_binary_op(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Result<Value, Trap> {
+        match op {
+            BinOp::Add => {
+                match (self.bytes_value(lhs).map(<[u8]>::to_vec), self.bytes_value(rhs).map(<[u8]>::to_vec)) {
+                    (Some(mut a), Some(b)) => {
+                        a.extend(b);
+                        if self.is_bytearray(lhs) {
+                            self.new_bytearray(a)
+                        } else {
+                            self.new_bytes(a)
+                        }
+                    }
+                    _ => Err(Trap::TypeError),
+                }
+            }
+            BinOp::Mul => {
+                let (data, count, bytearray) = if let Some(d) = self.bytes_value(lhs).map(<[u8]>::to_vec) {
+                    (d, rhs.as_int().ok_or(Trap::TypeError)?, self.is_bytearray(lhs))
+                } else {
+                    let d = self.bytes_value(rhs).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?;
+                    (d, lhs.as_int().ok_or(Trap::TypeError)?, self.is_bytearray(rhs))
+                };
+                let repeated = if count > 0 { data.repeat(count as usize) } else { Vec::new() };
+                if bytearray {
+                    self.new_bytearray(repeated)
+                } else {
+                    self.new_bytes(repeated)
+                }
+            }
+            _ => Err(Trap::TypeError),
+        }
+    }
+
+    /// `str + str` (concatenate) and `str * int` / `int * str` (repeat, a non-positive count gives
+    /// `""`). Any other combination (`"a" + 1`, `"a" - "b"`, `"a" * "b"`) is a `TypeError`.
+    fn str_binary_op(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Result<Value, Trap> {
+        match op {
+            BinOp::Add => {
+                match (self.str_value(lhs).map(String::from), self.str_value(rhs).map(String::from)) {
+                    (Some(mut a), Some(b)) => {
+                        a.push_str(&b);
+                        self.new_str(&a)
+                    }
+                    _ => Err(Trap::TypeError),
+                }
+            }
+            BinOp::Mul => {
+                let (text, count) = if let Some(text) = self.str_value(lhs).map(String::from) {
+                    (text, rhs.as_int().ok_or(Trap::TypeError)?)
+                } else {
+                    let text = self.str_value(rhs).map(String::from).ok_or(Trap::TypeError)?;
+                    (text, lhs.as_int().ok_or(Trap::TypeError)?)
+                };
+                let repeated = if count > 0 { text.repeat(count as usize) } else { String::new() };
+                self.new_str(&repeated)
+            }
+            BinOp::Mod => {
+                let template = self.str_value(lhs).map(String::from).ok_or(Trap::TypeError)?;
+                let args = if self.is_tuple(rhs) {
+                    self.seq_value(rhs).cloned().unwrap_or_default()
+                } else {
+                    alloc::vec![rhs]
+                };
+                let rendered = self.percent_format(&template, &args)?;
+                self.new_str(&rendered)
+            }
+            _ => Err(Trap::TypeError),
+        }
+    }
+
+    /// printf-style `%` formatting for `str % args`: `%d`/`%i` an int, `%s` str(), `%r` repr(),
+    /// `%%` a literal `%`; the args are consumed left to right. A conversion with flags/width/
+    /// precision (`%5d`) or an unhandled type (`%f`, `%x`) is `Unsupported` (never wrong output);
+    /// too few or too many args is a `TypeError` (matching CPython's "not enough/all ... converted").
+    fn percent_format(&self, template: &str, args: &[Value]) -> Result<String, Trap> {
+        let mut out = String::new();
+        let chars: Vec<char> = template.chars().collect();
+        let mut i = 0;
+        let mut next_arg = 0usize;
+        while i < chars.len() {
+            if chars[i] != '%' {
+                out.push(chars[i]);
+                i += 1;
+                continue;
+            }
+            i += 1;
+            if chars.get(i) == Some(&'%') {
+                out.push('%');
+                i += 1;
+                continue;
+            }
+            let mut flags = String::new();
+            while chars.get(i).is_some_and(|c| matches!(c, '-' | '+' | ' ' | '0' | '#')) {
+                flags.push(chars[i]);
+                i += 1;
+            }
+            let mut width = String::new();
+            while chars.get(i).is_some_and(char::is_ascii_digit) {
+                width.push(chars[i]);
+                i += 1;
+            }
+            let mut precision = 0usize;
+            let mut has_precision = false;
+            if chars.get(i) == Some(&'.') {
+                has_precision = true;
+                i += 1;
+                while chars.get(i).is_some_and(char::is_ascii_digit) {
+                    precision = precision * 10 + (chars[i] as usize - '0' as usize);
+                    i += 1;
+                }
+            }
+            let ty = *chars.get(i).ok_or(Trap::ValueError)?;
+            i += 1;
+            let arg = *args.get(next_arg).ok_or(Trap::TypeError)?;
+            next_arg += 1;
+            let width_n = width.parse::<usize>().unwrap_or(0);
+            match ty {
+                's' | 'r' => {
+                    let mut body = if ty == 's' { self.display(arg) } else { self.repr(arg) };
+                    if has_precision {
+                        body = body.chars().take(precision).collect();
+                    }
+                    let align = if flags.contains('-') { '<' } else { '>' };
+                    out.push_str(&pad_field(&body, width_n, ' ', align));
+                }
+                _ => {
+                    let mut spec = String::new();
+                    if flags.contains('-') {
+                        spec.push('<');
+                    }
+                    if flags.contains('+') {
+                        spec.push('+');
+                    } else if flags.contains(' ') {
+                        spec.push(' ');
+                    }
+                    if flags.contains('#') {
+                        spec.push('#');
+                    }
+                    if flags.contains('0') && !flags.contains('-') {
+                        spec.push('0');
+                    }
+                    spec.push_str(&width);
+                    spec.push(if ty == 'i' || ty == 'u' { 'd' } else { ty });
+                    out.push_str(&self.format_value_spec(arg, &spec)?);
+                }
+            }
+        }
+        if next_arg != args.len() {
+            return Err(Trap::TypeError);
+        }
+        Ok(out)
+    }
+
+    /// `list + list` / `tuple + tuple` (concatenate the SAME kind) and `seq * int` / `int * seq`
+    /// (repeat, a non-positive count gives an empty sequence). A mismatched-kind `+` (`[1] + (2,)`,
+    /// `[1] + 2`) or any other operator is a `TypeError`.
+    fn seq_binary_op(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Result<Value, Trap> {
+        match op {
+            BinOp::Add => {
+                let both_lists = self.is_list(lhs) && self.is_list(rhs);
+                let both_tuples = self.is_tuple(lhs) && self.is_tuple(rhs);
+                if !both_lists && !both_tuples {
+                    return Err(Trap::TypeError);
+                }
+                let mut elements = self.seq_value(lhs).cloned().ok_or(Trap::TypeError)?;
+                let rhs_elements = self.seq_value(rhs).cloned().ok_or(Trap::TypeError)?;
+                elements.extend(rhs_elements);
+                if both_tuples {
+                    self.new_tuple(elements)
+                } else {
+                    self.new_list(elements)
+                }
+            }
+            BinOp::Mul => {
+                let (sequence, count) = if self.seq_value(lhs).is_some() {
+                    (lhs, rhs.as_int().ok_or(Trap::TypeError)?)
+                } else {
+                    (rhs, lhs.as_int().ok_or(Trap::TypeError)?)
+                };
+                let is_tuple = self.is_tuple(sequence);
+                let base = self.seq_value(sequence).cloned().ok_or(Trap::TypeError)?;
+                let mut elements = Vec::new();
+                for _ in 0..count.max(0) {
+                    elements.extend_from_slice(&base);
+                }
+                if is_tuple {
+                    self.new_tuple(elements)
+                } else {
+                    self.new_list(elements)
+                }
             }
             _ => Err(Trap::TypeError),
         }
@@ -801,6 +1663,30 @@ impl ObjectModel {
         if self.is_set(lhs) || self.is_frozenset(lhs) {
             return Ok(Some(self.set_compare(op, lhs, rhs)?));
         }
+        if self.bytes_value(lhs).is_some() || self.bytes_value(rhs).is_some() {
+            return match (self.bytes_value(lhs), self.bytes_value(rhs)) {
+                (Some(a), Some(b)) => {
+                    let ord = a.cmp(b);
+                    let holds = match op {
+                        CmpOp::Eq => ord == Ordering::Equal,
+                        CmpOp::Ne => ord != Ordering::Equal,
+                        CmpOp::Lt => ord == Ordering::Less,
+                        CmpOp::Le => ord != Ordering::Greater,
+                        CmpOp::Gt => ord == Ordering::Greater,
+                        CmpOp::Ge => ord != Ordering::Less,
+                        CmpOp::Is | CmpOp::IsNot => {
+                            unreachable!("is/is not handled in the Op::Compare path")
+                        }
+                    };
+                    Ok(Some(Value::from_bool(holds)))
+                }
+                _ => match op {
+                    CmpOp::Eq => Ok(Some(Value::FALSE)),
+                    CmpOp::Ne => Ok(Some(Value::TRUE)),
+                    _ => Err(Trap::TypeError),
+                },
+            };
+        }
         match (self.str_value(lhs), self.str_value(rhs)) {
             (None, None) => Ok(None),
             (Some(a), Some(b)) => {
@@ -812,6 +1698,9 @@ impl ObjectModel {
                     CmpOp::Le => ord != Ordering::Greater,
                     CmpOp::Gt => ord == Ordering::Greater,
                     CmpOp::Ge => ord != Ordering::Less,
+                    CmpOp::Is | CmpOp::IsNot => {
+                        unreachable!("is/is not handled in the Op::Compare path")
+                    }
                 };
                 Ok(Some(Value::from_bool(holds)))
             }
@@ -840,6 +1729,9 @@ impl ObjectModel {
         if let Some(s) = self.str_value(value) {
             return Ok(Some(!s.is_empty()));
         }
+        if let Some(data) = self.bytes_value(value) {
+            return Ok(Some(!data.is_empty()));
+        }
         if let Some(elems) = self.seq_value(value) {
             return Ok(Some(!elems.is_empty()));
         }
@@ -866,19 +1758,41 @@ impl ObjectModel {
     /// dispatch later -- the one-source-of-truth path the interpreter and the AOT
     /// `py_getitem` intrinsic both consume.
     pub fn py_getitem(&mut self, container: Value, index: Value) -> Result<Value, Trap> {
+        if self.bytes_value(container).is_some() {
+            if self.is_slice(index) {
+                let selected = self.slice_bytes(container, index)?;
+                return if self.is_bytearray(container) {
+                    self.new_bytearray(selected)
+                } else {
+                    self.new_bytes(selected)
+                };
+            }
+            let data = self.bytes_value(container).ok_or(Trap::TypeError)?;
+            let len = data.len() as i64;
+            let i = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if i < 0 { i + len } else { i };
+            if at < 0 || at >= len {
+                return Err(self.with_message(Trap::IndexError, "index out of range"));
+            }
+            return Value::fixnum(i32::from(data[at as usize])).ok_or(Trap::Overflow);
+        }
         if self.str_value(container).is_some() {
             if self.is_slice(index) {
                 return self.str_getitem_slice(container, index);
             }
-            let ch = {
+            let resolved = {
                 let s = self.str_value(container).ok_or(Trap::TypeError)?;
                 let i = index.as_int().ok_or(Trap::TypeError)?;
                 let len = s.chars().count() as i64;
                 let at = if i < 0 { i + len } else { i };
                 if at < 0 || at >= len {
-                    return Err(Trap::IndexError);
+                    None
+                } else {
+                    s.chars().nth(at as usize)
                 }
-                s.chars().nth(at as usize).ok_or(Trap::IndexError)?
+            };
+            let Some(ch) = resolved else {
+                return Err(self.with_message(Trap::IndexError, "string index out of range"));
             };
             let mut buf = [0u8; 4];
             return self.new_str(ch.encode_utf8(&mut buf));
@@ -887,22 +1801,41 @@ impl ObjectModel {
             if self.is_slice(index) {
                 return self.seq_getitem_slice(container, index);
             }
-            let elems = self.seq_value(container).ok_or(Trap::TypeError)?;
-            let len = elems.len() as i64;
-            let i = index.as_int().ok_or(Trap::TypeError)?;
-            let at = if i < 0 { i + len } else { i };
-            if at < 0 || at >= len {
-                return Err(Trap::IndexError);
-            }
-            return Ok(elems[at as usize]);
-        }
-        if let Some(entries) = self.dict_value(container) {
-            for (k, v) in entries {
-                if self.key_eq(*k, index) {
-                    return Ok(*v);
+            let (resolved, is_tuple) = {
+                let elems = self.seq_value(container).ok_or(Trap::TypeError)?;
+                let len = elems.len() as i64;
+                let i = index.as_int().ok_or(Trap::TypeError)?;
+                let at = if i < 0 { i + len } else { i };
+                let resolved = if at < 0 || at >= len { None } else { Some(elems[at as usize]) };
+                (resolved, self.is_tuple(container))
+            };
+            match resolved {
+                Some(value) => return Ok(value),
+                None => {
+                    let message = if is_tuple {
+                        "tuple index out of range"
+                    } else {
+                        "list index out of range"
+                    };
+                    return Err(self.with_message(Trap::IndexError, message));
                 }
             }
-            return Err(Trap::KeyError);
+        }
+        if self.dict_value(container).is_some() {
+            let found = {
+                let entries = self.dict_value(container).ok_or(Trap::TypeError)?;
+                entries
+                    .iter()
+                    .find(|(k, _)| self.key_eq(*k, index))
+                    .map(|(_, v)| *v)
+            };
+            return match found {
+                Some(value) => Ok(value),
+                None => {
+                    self.set_trap_arg(index);
+                    Err(Trap::KeyError)
+                }
+            };
         }
         if self.is_range(container) {
             let (start, stop, step) = self.range_bounds(container);
@@ -910,7 +1843,7 @@ impl ObjectModel {
             let i = index.as_int().ok_or(Trap::TypeError)?;
             let at = if i < 0 { i + len } else { i };
             if at < 0 || at >= len {
-                return Err(Trap::IndexError);
+                return Err(self.with_message(Trap::IndexError, "range object index out of range"));
             }
             return Value::fixnum((start + at * step) as i32).ok_or(Trap::Overflow);
         }
@@ -960,6 +1893,35 @@ impl ObjectModel {
         }
     }
 
+    /// The bytes a slice selects from a `bytes`/`bytearray` (clamping, negative bounds, any step).
+    fn slice_bytes(&self, container: Value, slice: Value) -> Result<Vec<u8>, Trap> {
+        let reference = slice.as_ref().ok_or(Trap::TypeError)?;
+        let start_v = Value::from_bits(self.heap.read_u32(reference.0));
+        let stop_v = Value::from_bits(self.heap.read_u32(reference.0 + 4));
+        let step_v = Value::from_bits(self.heap.read_u32(reference.0 + 8));
+        let step = if step_v.is_none() {
+            1
+        } else {
+            let step = step_v.as_int().ok_or(Trap::TypeError)?;
+            if step == 0 {
+                return Err(Trap::ValueError);
+            }
+            step
+        };
+        let data = self.bytes_value(container).ok_or(Trap::TypeError)?;
+        let len = data.len() as i64;
+        let (start, stop) = adjust_slice(start_v, stop_v, step, len)?;
+        let mut out = Vec::new();
+        let mut i = start;
+        while (step > 0 && i < stop) || (step < 0 && i > stop) {
+            if i >= 0 && i < len {
+                out.push(data[i as usize]);
+            }
+            i += step;
+        }
+        Ok(out)
+    }
+
     fn str_getitem_slice(&mut self, container: Value, slice: Value) -> Result<Value, Trap> {
         let reference = slice.as_ref().ok_or(Trap::TypeError)?;
         let start_v = Value::from_bits(self.heap.read_u32(reference.0));
@@ -995,7 +1957,7 @@ impl ObjectModel {
     /// Builds a `slice(start, stop, step)` object (each bound an int or `None`) -- the value
     /// `Op::BuildSlice` pushes and `Subscript` consumes. A small GC-leaf heap object.
     pub fn new_slice(&mut self, start: Value, stop: Value, step: Value) -> Result<Value, Trap> {
-        let reference = self.heap.alloc(self.slice_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.slice_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, start.bits());
         self.heap.write_u32(reference.0 + 4, stop.bits());
         self.heap.write_u32(reference.0 + 8, step.bits());
@@ -1016,7 +1978,7 @@ impl ObjectModel {
         let s = Value::fixnum(i32::try_from(start).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)?;
         let e = Value::fixnum(i32::try_from(stop).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)?;
         let t = Value::fixnum(i32::try_from(step).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)?;
-        let reference = self.heap.alloc(self.range_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.range_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, s.bits());
         self.heap.write_u32(reference.0 + 4, e.bits());
         self.heap.write_u32(reference.0 + 8, t.bits());
@@ -1101,7 +2063,7 @@ impl ObjectModel {
     pub fn new_list(&mut self, elements: Vec<Value>) -> Result<Value, Trap> {
         let index = self.seqs.len() as u32;
         self.seqs.push(elements);
-        let reference = self.heap.alloc(self.list_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.list_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
     }
@@ -1110,7 +2072,7 @@ impl ObjectModel {
     pub fn new_tuple(&mut self, elements: Vec<Value>) -> Result<Value, Trap> {
         let index = self.seqs.len() as u32;
         self.seqs.push(elements);
-        let reference = self.heap.alloc(self.tuple_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.tuple_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
     }
@@ -1128,7 +2090,7 @@ impl ObjectModel {
         }
         let index = self.dicts.len() as u32;
         self.dicts.push(entries);
-        let reference = self.heap.alloc(self.dict_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.dict_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
     }
@@ -1144,7 +2106,7 @@ impl ObjectModel {
         }
         let index = self.sets.len() as u32;
         self.sets.push(deduped);
-        let reference = self.heap.alloc(type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
     }
@@ -1203,10 +2165,21 @@ impl ObjectModel {
     /// `int`/`bool` compare numerically (so `True == 1`), `str` by content, everything else
     /// by identity (`None`, the same object). Enough for `in`, dict keys, and `==` on these.
     fn key_eq(&self, a: Value, b: Value) -> bool {
-        if let (Some(x), Some(y)) = (a.as_int(), b.as_int()) {
+        if let (Some(x), Some(y)) = (self.as_i128(a), self.as_i128(b)) {
             return x == y;
         }
+        if self.is_int(a) && self.is_int(b) {
+            return self.as_bigint(a) == self.as_bigint(b);
+        }
+        if self.is_float(a) || self.is_float(b) {
+            if let (Some(x), Some(y)) = (self.as_f64(a), self.as_f64(b)) {
+                return x == y;
+            }
+        }
         if let (Some(x), Some(y)) = (self.str_value(a), self.str_value(b)) {
+            return x == y;
+        }
+        if let (Some(x), Some(y)) = (self.bytes_value(a), self.bytes_value(b)) {
             return x == y;
         }
         a == b
@@ -1216,6 +2189,21 @@ impl ObjectModel {
     /// from the end, `IndexError` out of range); a `dict` inserts or updates `index` as the
     /// key. A `tuple`/`str`/other is not assignable (`TypeError`).
     pub fn py_setitem(&mut self, container: Value, index: Value, value: Value) -> Result<(), Trap> {
+        if self.is_bytearray(container) {
+            let slot = self.byte_buffer_slot(container).ok_or(Trap::TypeError)?;
+            let len = self.byte_buffers[slot].len() as i64;
+            let at = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if at < 0 { at + len } else { at };
+            if at < 0 || at >= len {
+                return Err(self.with_message(Trap::IndexError, "bytearray index out of range"));
+            }
+            let byte = value.as_int().ok_or(Trap::TypeError)?;
+            if !(0..=255).contains(&byte) {
+                return Err(Trap::ValueError);
+            }
+            self.byte_buffers[slot][at as usize] = byte as u8;
+            return Ok(());
+        }
         if let Some(i) = self.container_slot(container, self.list_type_id) {
             let len = self.seqs[i].len() as i64;
             let at = index.as_int().ok_or(Trap::TypeError)?;
@@ -1236,12 +2224,147 @@ impl ObjectModel {
         Err(Trap::TypeError)
     }
 
+    /// `list[slice] = elements` (`Op::Setitem` with a slice index): replaces the slice with the
+    /// already-collected RHS `elements`. A step-1 slice SPLICES (the list may change length --
+    /// `xs[1:3] = [a, b, c]`); an extended slice (step != 1) assigns element-wise and requires the
+    /// RHS length to equal the slice length (else a `ValueError`). Bounds resolve exactly like a
+    /// slice read (clamping, negative indices). The RHS is collected by the caller (it may be any
+    /// iterable, including a generator, which needs the interpreter).
+    pub fn seq_setitem_slice(&mut self, container: Value, slice: Value, elements: Vec<Value>) -> Result<(), Trap> {
+        let reference = slice.as_ref().ok_or(Trap::TypeError)?;
+        let start_v = Value::from_bits(self.heap.read_u32(reference.0));
+        let stop_v = Value::from_bits(self.heap.read_u32(reference.0 + 4));
+        let step_v = Value::from_bits(self.heap.read_u32(reference.0 + 8));
+        let step = if step_v.is_none() {
+            1
+        } else {
+            let step = step_v.as_int().ok_or(Trap::TypeError)?;
+            if step == 0 {
+                return Err(Trap::ValueError);
+            }
+            step
+        };
+        let i = self.container_slot(container, self.list_type_id).ok_or(Trap::TypeError)?;
+        let len = self.seqs[i].len() as i64;
+        let (start, stop) = adjust_slice(start_v, stop_v, step, len)?;
+        if step == 1 {
+            let low = start.clamp(0, len) as usize;
+            let high = stop.clamp(start, len) as usize;
+            self.seqs[i].splice(low..high, elements);
+        } else {
+            let mut indices = Vec::new();
+            let mut at = start;
+            while (step > 0 && at < stop) || (step < 0 && at > stop) {
+                if at >= 0 && at < len {
+                    indices.push(at as usize);
+                }
+                at += step;
+            }
+            if indices.len() != elements.len() {
+                let message = alloc::format!(
+                    "attempt to assign sequence of size {} to extended slice of size {}",
+                    elements.len(),
+                    indices.len()
+                );
+                return Err(self.with_message(Trap::ValueError, &message));
+            }
+            for (index, value) in indices.into_iter().zip(elements) {
+                self.seqs[i][index] = value;
+            }
+        }
+        Ok(())
+    }
+
+    /// `del container[index]` (a future `Op::DeleteItem`): a `list` removes an int index (negative
+    /// from the end, `IndexError` out of range) or the elements a slice selects (the list shrinks);
+    /// a `dict` removes `index` as a key (`KeyError` if absent). A `tuple`/`str`/other is a
+    /// `TypeError`. Ready for the frontend's `del x[i]` emission (co-design); an instance's
+    /// `__delitem__` is dispatched by the interpreter before this.
+    pub fn py_delitem(&mut self, container: Value, index: Value) -> Result<(), Trap> {
+        if let Some(i) = self.container_slot(container, self.list_type_id) {
+            if self.is_slice(index) {
+                return self.seq_delitem_slice(container, index);
+            }
+            let len = self.seqs[i].len() as i64;
+            let at = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if at < 0 { at + len } else { at };
+            if at < 0 || at >= len {
+                return Err(self.with_message(Trap::IndexError, "list assignment index out of range"));
+            }
+            self.seqs[i].remove(at as usize);
+            return Ok(());
+        }
+        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+            return match self.dicts[i].iter().position(|(k, _)| self.key_eq(*k, index)) {
+                Some(slot) => {
+                    self.dicts[i].remove(slot);
+                    Ok(())
+                }
+                None => {
+                    self.set_trap_arg(index);
+                    Err(Trap::KeyError)
+                }
+            };
+        }
+        Err(Trap::TypeError)
+    }
+
+    /// `del list[slice]` -- removes the elements the slice selects; the list shrinks. Bounds resolve
+    /// exactly like a slice read.
+    fn seq_delitem_slice(&mut self, container: Value, slice: Value) -> Result<(), Trap> {
+        let reference = slice.as_ref().ok_or(Trap::TypeError)?;
+        let start_v = Value::from_bits(self.heap.read_u32(reference.0));
+        let stop_v = Value::from_bits(self.heap.read_u32(reference.0 + 4));
+        let step_v = Value::from_bits(self.heap.read_u32(reference.0 + 8));
+        let step = if step_v.is_none() {
+            1
+        } else {
+            let step = step_v.as_int().ok_or(Trap::TypeError)?;
+            if step == 0 {
+                return Err(Trap::ValueError);
+            }
+            step
+        };
+        let i = self.container_slot(container, self.list_type_id).ok_or(Trap::TypeError)?;
+        let len = self.seqs[i].len() as i64;
+        let (start, stop) = adjust_slice(start_v, stop_v, step, len)?;
+        if step == 1 {
+            let low = start.clamp(0, len) as usize;
+            let high = stop.clamp(start, len) as usize;
+            self.seqs[i].drain(low..high);
+        } else {
+            let mut indices = Vec::new();
+            let mut at = start;
+            while (step > 0 && at < stop) || (step < 0 && at > stop) {
+                if at >= 0 && at < len {
+                    indices.push(at as usize);
+                }
+                at += step;
+            }
+            indices.sort_unstable();
+            for index in indices.into_iter().rev() {
+                self.seqs[i].remove(index);
+            }
+        }
+        Ok(())
+    }
+
     /// `element in container` (`Op::Contains`): substring for `str`, membership for a
     /// `list`/`tuple` (any element equals), key membership for a `dict`.
     pub fn py_contains(&self, container: Value, element: Value) -> Result<bool, Trap> {
         if let Some(s) = self.str_value(container) {
             let sub = self.str_value(element).ok_or(Trap::TypeError)?;
             return Ok(s.contains(sub));
+        }
+        if let Some(data) = self.bytes_value(container) {
+            if let Some(byte) = element.as_int() {
+                if !(0..=255).contains(&byte) {
+                    return Err(Trap::ValueError);
+                }
+                return Ok(data.contains(&(byte as u8)));
+            }
+            let needle = self.bytes_value(element).ok_or(Trap::TypeError)?;
+            return Ok(needle.is_empty() || data.windows(needle.len()).any(|w| w == needle));
         }
         if let Some(elems) = self.seq_value(container) {
             return Ok(elems.iter().any(|&e| self.key_eq(e, element)));
@@ -1272,8 +2395,24 @@ impl ObjectModel {
         if let Some(n) = value.as_fixnum() {
             return alloc::format!("{n}");
         }
+        if let Some(n) = self.long_value(value) {
+            return alloc::format!("{n}");
+        }
+        if let Some(big) = self.bigint_value(value) {
+            return big.to_decimal_string();
+        }
+        if let Some(f) = self.float_value(value) {
+            return format_float(f);
+        }
+        #[cfg(feature = "complex")]
+        if let Some((re, im)) = self.complex_value(value) {
+            return format_complex(re, im);
+        }
         if let Some(s) = self.str_value(value) {
             return str_repr(s);
+        }
+        if let Some(data) = self.bytes_value(value) {
+            return bytes_repr(data, self.is_bytearray(value));
         }
         if self.is_range(value) {
             let (start, stop, step) = self.range_bounds(value);
@@ -1325,6 +2464,23 @@ impl ObjectModel {
                 .join(", ");
             return alloc::format!("{{{inner}}}");
         }
+        if let Some(id) = value.as_builtin_id() {
+            if let Some(builtin) = Builtin::from_id(id) {
+                return if builtin.is_type() {
+                    alloc::format!("<class '{}'>", builtin.python_name())
+                } else {
+                    alloc::format!("<built-in function {}>", builtin.python_name())
+                };
+            }
+        }
+        if self.is_class(value) {
+            let name = self.str_value(self.read_slot(value, 0)).unwrap_or("?");
+            return alloc::format!("<class '__main__.{name}'>");
+        }
+        if self.is_instance(value) {
+            let name = self.instance_class_name(value).unwrap_or("object");
+            return alloc::format!("<{name} object>");
+        }
         alloc::format!("{value:?}")
     }
 
@@ -1343,19 +2499,376 @@ impl ObjectModel {
             String::from("False")
         } else if value.is_none() {
             String::from("None")
+        } else if self.is_instance(value) {
+            self.instance_display(value)
         } else {
             self.repr(value)
         };
         self.new_str(&rendered)
     }
 
+    /// `hash(value)` for a hashable value: int/bool `n` -> `n` (except `hash(-1) == -2`, CPython's
+    /// error sentinel); `None` -> a stable constant; `str`/`tuple` -> a deterministic FNV-1a hash
+    /// folded into the fixnum range (NOT CPython's randomized hash -- the value differs but is
+    /// stable within a run). `list`/`dict`/`set` (and a tuple containing one) are unhashable ->
+    /// `TypeError`, matching CPython.
+    pub fn py_hash(&self, value: Value) -> Result<Value, Trap> {
+        if let Some(n) = value.as_int() {
+            let h = if n == -1 { -2 } else { n };
+            return Value::fixnum(i32::try_from(h).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow);
+        }
+        if let Some(big) = self.long_value(value) {
+            let bits = big as u128;
+            let folded = (bits ^ (bits >> 64)) as u32;
+            return Value::fixnum((folded & 0x3FFF_FFFF) as i32).ok_or(Trap::Overflow);
+        }
+        if let Some(bigint) = self.bigint_value(value) {
+            let mut folded: u32 = if bigint.is_negative() { 2_166_136_261 } else { 16_777_619 };
+            for byte in bigint.to_decimal_string().bytes() {
+                folded = folded.wrapping_mul(16_777_619) ^ u32::from(byte);
+            }
+            return Value::fixnum((folded & 0x3FFF_FFFF) as i32).ok_or(Trap::Overflow);
+        }
+        if let Some(f) = self.float_value(value) {
+            return Ok(self.py_hash_float(f));
+        }
+        #[cfg(feature = "complex")]
+        if let Some((re, im)) = self.complex_value(value) {
+            let hash_real = i64::from(self.py_hash_float(re).as_fixnum().unwrap_or(0));
+            let hash_imag = i64::from(self.py_hash_float(im).as_fixnum().unwrap_or(0));
+            let combined = hash_real.wrapping_add(1_000_003_i64.wrapping_mul(hash_imag));
+            return Value::fixnum((combined & 0x3FFF_FFFF) as i32).ok_or(Trap::Overflow);
+        }
+        if value.is_none() {
+            return Value::fixnum(0).ok_or(Trap::Overflow);
+        }
+        let folded = self.hash_nonint(value)?;
+        Value::fixnum((folded & 0x3FFF_FFFF) as i32).ok_or(Trap::Overflow)
+    }
+
+    /// The deterministic FNV-1a hash of a `str`/`tuple` (recursive), or a `TypeError` for an
+    /// unhashable value. Backs [`ObjectModel::py_hash`] for the non-int cases.
+    fn hash_nonint(&self, value: Value) -> Result<u32, Trap> {
+        if let Some(s) = self.str_value(value) {
+            let mut hash: u32 = 2_166_136_261;
+            for byte in s.bytes() {
+                hash ^= u32::from(byte);
+                hash = hash.wrapping_mul(16_777_619);
+            }
+            return Ok(hash);
+        }
+        if self.is_tuple(value) {
+            let elements = self.seq_value(value).ok_or(Trap::TypeError)?;
+            let mut hash: u32 = 2_166_136_261;
+            for &element in elements {
+                let element_hash = self.py_hash(element)?.as_fixnum().unwrap_or(0) as u32;
+                hash ^= element_hash;
+                hash = hash.wrapping_mul(16_777_619);
+            }
+            return Ok(hash);
+        }
+        Err(Trap::TypeError)
+    }
+
+    /// `hash(float)`, folded into the fixnum range. The load-bearing invariant is Python's numeric
+    /// hash rule: a value that equals an int hashes EQUAL to that int (`hash(2.0) == hash(2)`), so
+    /// mixed int/float dict and set keys collapse; `+0.0` and `-0.0` both equal int `0`, so they
+    /// hash alike. `inf`/`-inf` use CPython's `+-314159` sentinels; a `NaN` gets a stable `0` (its
+    /// value is never CPython's object-identity hash, but a NaN never matches anything anyway).
+    /// A non-integral float uses a deterministic fold of its bits (stable within a run, not
+    /// CPython's `_Py_HashDouble` value -- the same documented divergence as the str/tuple hash).
+    #[must_use]
+    fn py_hash_float(&self, value: f64) -> Value {
+        let fixnum = |n: i32| Value::fixnum(n).unwrap_or(Value::fixnum(0).unwrap());
+        if value.is_nan() {
+            return fixnum(0);
+        }
+        if value.is_infinite() {
+            return fixnum(if value > 0.0 { 314_159 } else { -314_159 });
+        }
+        if libm::floor(value) == value && (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&value) {
+            let n = i128::from(value as i64);
+            if n >= i128::from(FIXNUM_MIN) && n <= i128::from(FIXNUM_MAX) {
+                return fixnum(if n == -1 { -2 } else { n as i32 });
+            }
+            let bits = n as u128;
+            return fixnum(((bits ^ (bits >> 64)) as u32 & 0x3FFF_FFFF) as i32);
+        }
+        let bits = value.to_bits();
+        fixnum(((bits ^ (bits >> 32)) as u32 & 0x3FFF_FFFF) as i32)
+    }
+
+    /// An `int` value from an `i128`, normalized: one that fits the fixnum range stays a fixnum (so
+    /// `10**10 == 10**10` and small results never allocate); a bigger one becomes a heap `long`.
+    /// This is the i128-range first increment; a result outside i128 is a `Trap::Overflow` (true
+    /// arbitrary precision -- limb arithmetic -- is the follow-on).
+    pub fn new_long(&mut self, n: i128) -> Result<Value, Trap> {
+        if n >= i128::from(FIXNUM_MIN) && n <= i128::from(FIXNUM_MAX) {
+            return Value::fixnum(n as i32).ok_or(Trap::Overflow);
+        }
+        let reference = self.alloc_object(self.long_type_id).ok_or(Trap::OutOfMemory)?;
+        let bits = n as u128;
+        for word in 0..4u32 {
+            self.heap.write_u32(reference.0 + word * 4, (bits >> (word * 32)) as u32);
+        }
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The i128 a `long` holds, or `None` if `value` is not a long.
+    #[must_use]
+    pub fn long_value(&self, value: Value) -> Option<i128> {
+        let reference = value.as_ref()?;
+        if self.heap.type_id_of(reference) != self.long_type_id {
+            return None;
+        }
+        let mut bits: u128 = 0;
+        for word in 0..4u32 {
+            bits |= u128::from(self.heap.read_u32(reference.0 + word * 4)) << (word * 32);
+        }
+        Some(bits as i128)
+    }
+
+    /// The integer value of `value` as an i128 -- a fixnum/bool or a `long`; `None` for a non-int.
+    /// The single reader the arithmetic/comparison core uses so it treats both int kinds uniformly.
+    #[must_use]
+    pub fn as_i128(&self, value: Value) -> Option<i128> {
+        if let Some(n) = value.as_int() {
+            return Some(i128::from(n));
+        }
+        self.long_value(value)
+    }
+
+    /// Whether `value` is a `long` (a big int); a plain int-valued fixnum is NOT a long.
+    #[must_use]
+    pub fn is_long(&self, value: Value) -> bool {
+        self.long_value(value).is_some()
+    }
+
+    /// An `int` from a [`BigInt`], normalized DOWN to the smallest representation: a value that fits
+    /// the fixnum range stays a fixnum, one that fits `i128` becomes a `long`, and only a truly
+    /// arbitrary-precision value allocates a `bigint`. So the three int tiers never overlap and a
+    /// shrunk result (`big - big`) collapses back automatically.
+    pub fn new_bigint(&mut self, value: BigInt) -> Result<Value, Trap> {
+        if let Some(n) = value.to_i128() {
+            return self.new_long(n);
+        }
+        let reference = self.alloc_object(self.bigint_type_id).ok_or(Trap::OutOfMemory)?;
+        let index = self.bigints.len();
+        self.bigints.push(value);
+        self.heap.write_u32(reference.0, index as u32);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The [`BigInt`] a `bigint` object holds, or `None` if `value` is not a bigint (a fixnum/long is
+    /// NOT a bigint -- use [`ObjectModel::as_bigint`] to read any int as a `BigInt`).
+    #[must_use]
+    pub fn bigint_value(&self, value: Value) -> Option<&BigInt> {
+        let reference = value.as_ref()?;
+        if self.heap.type_id_of(reference) != self.bigint_type_id {
+            return None;
+        }
+        let index = self.heap.read_u32(reference.0) as usize;
+        self.bigints.get(index)
+    }
+
+    /// Any int -- a fixnum/bool, an i128 `long`, or a `bigint` -- as a [`BigInt`]; `None` for a
+    /// non-int. The reader the arbitrary-precision arithmetic core uses so it treats all three int
+    /// tiers uniformly (the `BigInt` sibling of [`ObjectModel::as_i128`]).
+    #[must_use]
+    pub fn as_bigint(&self, value: Value) -> Option<BigInt> {
+        if let Some(n) = self.as_i128(value) {
+            return Some(BigInt::from_i128(n));
+        }
+        self.bigint_value(value).cloned()
+    }
+
+    /// Whether `value` is a `bigint` (an int beyond the i128 range); a fixnum/`long` is NOT a bigint.
+    #[must_use]
+    pub fn is_bigint(&self, value: Value) -> bool {
+        self.bigint_value(value).is_some()
+    }
+
+    /// Whether `value` is any Python `int` (a fixnum, a `bool`, an i128 `long`, or a `bigint`) --
+    /// the three integer tiers plus `bool` (an int subtype). NOT a float/complex.
+    #[must_use]
+    pub fn is_int(&self, value: Value) -> bool {
+        value.is_fixnum()
+            || value == Value::TRUE
+            || value == Value::FALSE
+            || self.is_long(value)
+            || self.is_bigint(value)
+    }
+
+    /// A heap `float` holding the IEEE-754 double `n`. Unlike `new_long`, a float is ALWAYS boxed
+    /// (there is no immediate float form -- `Value` is a 32-bit word, an f64 does not fit), so even
+    /// `0.0`/`1.0` allocate. Mirrors `new_long`'s heap-leaf storage (two u32 words of raw bits).
+    pub fn new_float(&mut self, n: f64) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.float_type_id).ok_or(Trap::OutOfMemory)?;
+        let bits = n.to_bits();
+        self.heap.write_u32(reference.0, bits as u32);
+        self.heap.write_u32(reference.0 + 4, (bits >> 32) as u32);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The f64 a `float` holds, or `None` if `value` is not a float (an int/bool is NOT a float --
+    /// use [`ObjectModel::as_f64`] for the numeric-coercion reader).
+    #[must_use]
+    pub fn float_value(&self, value: Value) -> Option<f64> {
+        let reference = value.as_ref()?;
+        if self.heap.type_id_of(reference) != self.float_type_id {
+            return None;
+        }
+        let low = u64::from(self.heap.read_u32(reference.0));
+        let high = u64::from(self.heap.read_u32(reference.0 + 4));
+        Some(f64::from_bits((high << 32) | low))
+    }
+
+    /// The value of `value` as an f64 for MIXED int/float arithmetic and comparison: a fixnum/bool,
+    /// a `long`, or a `float` all read here (an int widens to the nearest double); `None` for a
+    /// non-number. The reader the float arithmetic/comparison core uses so `2 + 3.5` and `1 < 1.5`
+    /// coerce the int operand -- the float sibling of [`ObjectModel::as_i128`].
+    #[must_use]
+    pub fn as_f64(&self, value: Value) -> Option<f64> {
+        if let Some(n) = value.as_int() {
+            return Some(n as f64);
+        }
+        if let Some(big) = self.long_value(value) {
+            return Some(big as f64);
+        }
+        if let Some(bigint) = self.bigint_value(value) {
+            return Some(bigint.to_f64());
+        }
+        self.float_value(value)
+    }
+
+    /// Whether `value` is a `float`; an int-valued fixnum/long is NOT a float (Python keeps the types
+    /// distinct -- `1 is not 1.0`, `type(1) is not type(1.0)`).
+    #[must_use]
+    pub fn is_float(&self, value: Value) -> bool {
+        self.float_value(value).is_some()
+    }
+
+    /// A heap `complex` from its real and imaginary parts. Always boxed (two f64 do not fit an
+    /// immediate). Behind the `complex` knob.
+    #[cfg(feature = "complex")]
+    pub fn new_complex(&mut self, real: f64, imag: f64) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.complex_type_id).ok_or(Trap::OutOfMemory)?;
+        for (word, part) in [real, imag].into_iter().enumerate() {
+            let bits = part.to_bits();
+            self.heap.write_u32(reference.0 + word as u32 * 8, bits as u32);
+            self.heap.write_u32(reference.0 + word as u32 * 8 + 4, (bits >> 32) as u32);
+        }
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The `(real, imag)` a `complex` holds, or `None` if `value` is not a complex.
+    #[cfg(feature = "complex")]
+    #[must_use]
+    pub fn complex_value(&self, value: Value) -> Option<(f64, f64)> {
+        let reference = value.as_ref()?;
+        if self.heap.type_id_of(reference) != self.complex_type_id {
+            return None;
+        }
+        let read = |offset: u32| {
+            let low = u64::from(self.heap.read_u32(reference.0 + offset));
+            let high = u64::from(self.heap.read_u32(reference.0 + offset + 4));
+            f64::from_bits((high << 32) | low)
+        };
+        Some((read(0), read(8)))
+    }
+
+    /// The value of `value` as a `(real, imag)` pair for MIXED complex arithmetic: an int/bool, a
+    /// `long`, or a `float` promotes to `(x, 0.0)`, and a `complex` reads directly; `None` for a
+    /// non-number. Lets `2 + 3j` and `(1+2j) + 1` coerce the real operand -- the complex sibling of
+    /// [`ObjectModel::as_f64`].
+    #[cfg(feature = "complex")]
+    #[must_use]
+    pub fn as_complex(&self, value: Value) -> Option<(f64, f64)> {
+        if let Some(re) = self.as_f64(value) {
+            return Some((re, 0.0));
+        }
+        self.complex_value(value)
+    }
+
+    /// Whether `value` is a `complex`.
+    #[cfg(feature = "complex")]
+    #[must_use]
+    pub fn is_complex(&self, value: Value) -> bool {
+        self.complex_value(value).is_some()
+    }
+
+    /// Wraps a namespace dict in a module object; `module.member` resolves `member` in that dict.
+    pub fn new_module(&mut self, namespace: Value) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.module_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, namespace.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The namespace dict a module wraps; the precondition is that `value` is a module object.
+    #[must_use]
+    pub fn module_namespace(&self, value: Value) -> Value {
+        self.read_slot(value, 0)
+    }
+
+    /// Whether `value` is a provided module object.
+    #[must_use]
+    pub fn is_module_object(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.module_type_id)
+    }
+
+    /// Provides a module `name` backed by `namespace` (a dict of its members), bound as a global so
+    /// a program reaches it as `name.member` -- the injection path the native machine/board modules
+    /// use, here for a Python-authored namespace. (`import name` is the front-end follow-on; the
+    /// loader that RUNS a `.py` module body to build `namespace` is the co-design follow-on.)
+    pub fn provide_module(&mut self, name: &str, namespace: Value) -> Result<(), Trap> {
+        let module = self.new_module(namespace)?;
+        self.set_global(name, module);
+        Ok(())
+    }
+
     /// `iter(iterable)` (`Op::GetIter`): an iterator over a `str`/`list`/`tuple`/`dict` (a
     /// dict iterates its keys). A non-iterable value is a `TypeError`.
+    /// A fresh `Cell` boxing `value` (the closure primitive: a shared mutable box for a variable
+    /// captured by a nested function).
+    pub fn new_cell(&mut self, value: Value) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.cell_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, value.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The value a `Cell` holds. `TypeError` if `cell` is not a Cell (an interpreter invariant).
+    pub fn cell_get(&self, cell: Value) -> Result<Value, Trap> {
+        let reference = cell.as_ref().ok_or(Trap::TypeError)?;
+        if self.heap.type_id_of(reference) != self.cell_type_id {
+            return Err(Trap::TypeError);
+        }
+        Ok(Value::from_bits(self.heap.read_u32(reference.0)))
+    }
+
+    /// Stores `value` into a `Cell` (a `nonlocal`/enclosing-scope write is visible to every holder).
+    pub fn cell_set(&mut self, cell: Value, value: Value) -> Result<(), Trap> {
+        let reference = cell.as_ref().ok_or(Trap::TypeError)?;
+        if self.heap.type_id_of(reference) != self.cell_type_id {
+            return Err(Trap::TypeError);
+        }
+        self.heap.write_u32(reference.0, value.bits());
+        Ok(())
+    }
+
+    /// Whether `value` is a `Cell`.
+    #[must_use]
+    pub fn is_cell(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.cell_type_id)
+    }
+
     pub fn new_iter(&mut self, iterable: Value) -> Result<Value, Trap> {
         if self.is_iter(iterable) {
             return Ok(iterable);
         }
         let iterable_ok = self.str_value(iterable).is_some()
+            || self.bytes_value(iterable).is_some()
             || self.seq_value(iterable).is_some()
             || self.dict_value(iterable).is_some()
             || self.is_range(iterable)
@@ -1363,7 +2876,7 @@ impl ObjectModel {
         if !iterable_ok {
             return Err(Trap::TypeError);
         }
-        let reference = self.heap.alloc(self.iter_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.iter_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, iterable.bits());
         self.heap.write_u32(reference.0 + 4, 0);
         Ok(Value::from_ref(reference))
@@ -1412,6 +2925,14 @@ impl ObjectModel {
             self.heap.write_u32(reference.0 + 4, (pos + 1) as u32);
             return Ok(Some(element));
         }
+        if let Some(data) = self.bytes_value(container) {
+            if pos >= data.len() {
+                return Ok(None);
+            }
+            let byte = data[pos];
+            self.heap.write_u32(reference.0 + 4, (pos + 1) as u32);
+            return Value::fixnum(i32::from(byte)).ok_or(Trap::Overflow).map(Some);
+        }
         if self.str_value(container).is_some() {
             let ch = {
                 let s = self.str_value(container).ok_or(Trap::TypeError)?;
@@ -1437,7 +2958,7 @@ impl ObjectModel {
     /// Allocates a class object `[name, base, namespace]` (`Op::BuildClass`). `base` is a
     /// class or `None`; `namespace` is the class body's dict (methods + class attributes).
     pub fn new_class(&mut self, name: Value, base: Value, namespace: Value) -> Result<Value, Trap> {
-        let reference = self.heap.alloc(self.class_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.class_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, name.bits());
         self.heap.write_u32(reference.0 + 4, base.bits());
         self.heap.write_u32(reference.0 + 8, namespace.bits());
@@ -1448,19 +2969,134 @@ impl ObjectModel {
     /// calling a type; `__init__` runs in the interpreter's Call arm).
     pub fn new_object(&mut self, class: Value) -> Result<Value, Trap> {
         let dict = self.new_dict(Vec::new())?;
-        let reference = self.heap.alloc(self.instance_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.instance_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, class.bits());
         self.heap.write_u32(reference.0 + 4, dict.bits());
         Ok(Value::from_ref(reference))
     }
 
+    /// The default construction of a class that has NO user `__init__` but is called with arguments:
+    /// a `BaseException` subclass stores its positional args (so `str(exc)` renders the message and
+    /// `exc.args` works, like `BaseException.__init__`); any other class ignores them (a lenient
+    /// divergence from CPython's "takes no arguments" TypeError).
+    pub fn init_default_args(&mut self, instance: Value, args: &[Value]) -> Result<(), Trap> {
+        self.ensure_exception_types();
+        let base_exception = self.exc_class_lookup("BaseException").ok_or(Trap::Malformed)?;
+        if self.is_instance_of(instance, base_exception) {
+            let args_tuple = self.new_tuple(args.to_vec())?;
+            self.py_setattr_instance(instance, "args", args_tuple)?;
+        }
+        Ok(())
+    }
+
     /// Allocates a bound Python method `[receiver, func]` -- the value `LoadAttr` yields for
     /// a function found on an instance's class; `Call` prepends the receiver as `self`.
     pub fn new_py_bound(&mut self, receiver: Value, func: Value) -> Result<Value, Trap> {
-        let reference = self.heap.alloc(self.py_bound_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.py_bound_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, receiver.bits());
         self.heap.write_u32(reference.0 + 4, func.bits());
         Ok(Value::from_ref(reference))
+    }
+
+    /// Allocates a `PyFunction` -- a DEFAULTED function `[func_index, defaults, kwdefaults]`. Only a
+    /// `def` (or lambda) carrying default args needs this; a plain function stays a `function_ref`
+    /// immediate. `defaults` is a tuple (or `None`); `kwdefaults` a dict (or `None`).
+    pub fn new_py_function(
+        &mut self,
+        func_index: u32,
+        defaults: Value,
+        kwdefaults: Value,
+    ) -> Result<Value, Trap> {
+        let reference = self
+            .heap
+            .alloc(self.py_function_type_id)
+            .ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, func_index);
+        self.heap.write_u32(reference.0 + 4, defaults.bits());
+        self.heap.write_u32(reference.0 + 8, kwdefaults.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a `PyFunction` (a defaulted function object).
+    #[must_use]
+    pub fn is_py_function(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.py_function_type_id)
+    }
+
+    /// The module-function index a `PyFunction` refers to.
+    #[must_use]
+    pub fn py_function_index(&self, func: Value) -> u32 {
+        let reference = func.as_ref().expect("a PyFunction");
+        self.heap.read_u32(reference.0)
+    }
+
+    /// The positional DEFAULTS of a `PyFunction` as a vector (the defaults tuple's elements, or
+    /// empty if it has none). They align to the trailing positional parameters at bind time.
+    #[must_use]
+    pub fn py_function_defaults(&self, func: Value) -> Vec<Value> {
+        let reference = func.as_ref().expect("a PyFunction");
+        let defaults = Value::from_bits(self.heap.read_u32(reference.0 + 4));
+        self.seq_value(defaults).cloned().unwrap_or_default()
+    }
+
+    /// Allocates a generator object owning `frame` (its fresh, not-yet-run activation, with args
+    /// already bound to locals), returning the heap value. The body does not run until the first
+    /// resume; the frame lives in the `generators` arena and the heap object holds its index.
+    pub fn new_generator(&mut self, frame: Frame) -> Result<Value, Trap> {
+        let index = self.generators.len() as u32;
+        self.generators.push(Some(frame));
+        let reference = self.alloc_object(self.generator_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, index);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Takes a recycled frame from the pool (its Vec buffers ready to reuse), or `None` if empty.
+    pub(crate) fn take_pooled_frame(&mut self) -> Option<Frame> {
+        self.frame_pool.pop()
+    }
+
+    /// Returns a finished call frame to the pool (cleared of Values, buffers kept), bounded so a
+    /// deep-but-transient call chain does not permanently retain buffers.
+    pub(crate) fn recycle_frame(&mut self, mut frame: Frame) {
+        const FRAME_POOL_CAP: usize = 256;
+        if self.frame_pool.len() < FRAME_POOL_CAP {
+            frame.clear_for_reuse();
+            self.frame_pool.push(frame);
+        }
+    }
+
+    /// Whether `value` is a generator object.
+    #[must_use]
+    pub fn is_generator(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.generator_type_id)
+    }
+
+    /// Takes the suspended frame OUT of generator `gen` (leaving the slot `None`), or `None` if it
+    /// has already been taken -- the generator is exhausted, or is currently running (a re-entrant
+    /// resume). Pair with [`ObjectModel::put_generator_frame`] to suspend it again after a yield.
+    pub fn take_generator_frame(&mut self, generator: Value) -> Option<Frame> {
+        let reference = generator.as_ref()?;
+        if self.heap.type_id_of(reference) != self.generator_type_id {
+            return None;
+        }
+        let index = self.heap.read_u32(reference.0) as usize;
+        self.generators.get_mut(index)?.take()
+    }
+
+    /// Suspends `frame` back into generator `gen` after it yielded, so the next resume continues
+    /// it. The slot was emptied by [`ObjectModel::take_generator_frame`]; leaving it `None`
+    /// instead (never calling this) marks the generator exhausted.
+    pub fn put_generator_frame(&mut self, generator: Value, frame: Frame) {
+        if let Some(reference) = generator.as_ref() {
+            let index = self.heap.read_u32(reference.0) as usize;
+            if let Some(slot) = self.generators.get_mut(index) {
+                *slot = Some(frame);
+            }
+        }
     }
 
     /// Whether `value` is a user class object.
@@ -1469,6 +3105,13 @@ impl ObjectModel {
         value
             .as_ref()
             .is_some_and(|r| self.heap.type_id_of(r) == self.class_type_id)
+    }
+
+    /// The class object of a class instance (its `type`); the precondition is that `value` is an
+    /// instance ([`ObjectModel::is_instance`]).
+    #[must_use]
+    pub fn instance_class(&self, value: Value) -> Value {
+        self.read_slot(value, 0)
     }
 
     /// Whether `value` is a user class instance.
@@ -1501,7 +3144,7 @@ impl ObjectModel {
 
     /// Allocates a `super` object `[class, self]` -- the `super()` of a method of `class`.
     pub fn new_super(&mut self, class: Value, receiver: Value) -> Result<Value, Trap> {
-        let reference = self.heap.alloc(self.super_type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(self.super_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, class.bits());
         self.heap.write_u32(reference.0 + 4, receiver.bits());
         Ok(Value::from_ref(reference))
@@ -1578,6 +3221,34 @@ impl ObjectModel {
         self.py_setitem(dict, key, value)
     }
 
+    /// Deletes the named attribute from `instance`'s `__dict__` (`delattr(obj, name)` / `del
+    /// obj.name`). An `AttributeError` if the value is not an instance or has no such attribute.
+    pub fn py_delattr_instance(&mut self, instance: Value, name: &str) -> Result<(), Trap> {
+        if !self.is_instance(instance) {
+            return Err(Trap::AttributeError);
+        }
+        let dict = self.read_slot(instance, 1);
+        let index = self
+            .container_slot(dict, self.dict_type_id)
+            .ok_or(Trap::AttributeError)?;
+        let entries = core::mem::take(&mut self.dicts[index]);
+        let mut found = false;
+        let kept: Vec<(Value, Value)> = entries
+            .into_iter()
+            .filter(|(key, _)| {
+                let matches = self.str_value(*key) == Some(name);
+                found |= matches;
+                !matches
+            })
+            .collect();
+        self.dicts[index] = kept;
+        if found {
+            Ok(())
+        } else {
+            Err(Trap::AttributeError)
+        }
+    }
+
     /// Resolves `__init__` on `class` (or its bases), if the class defines a constructor.
     #[must_use]
     pub fn find_init(&self, class: Value) -> Option<Value> {
@@ -1620,9 +3291,12 @@ impl ObjectModel {
             ("UnboundLocalError", "NameError"),
             ("TypeError", "Exception"),
             ("ValueError", "Exception"),
+            ("AssertionError", "Exception"),
             ("RuntimeError", "Exception"),
             ("RecursionError", "RuntimeError"),
+            ("NotImplementedError", "RuntimeError"),
             ("StopIteration", "Exception"),
+            ("GeneratorExit", "BaseException"),
         ];
         for &(name, base_name) in HIERARCHY {
             let name_value = match self.new_str(name) {
@@ -1664,10 +3338,31 @@ impl ObjectModel {
     /// class's base chain. The basis for `MatchExc` / `except E`.
     #[must_use]
     pub fn exception_isinstance(&self, exc: Value, target: Value) -> bool {
-        if !self.is_instance(exc) {
+        self.is_instance_of(exc, target)
+    }
+
+    /// Whether `value` is a class instance whose class is `class` or one of its bases (the class's
+    /// base chain). Backs `MatchExc`/`except E` and the `isinstance` built-in for user classes.
+    #[must_use]
+    pub fn is_instance_of(&self, value: Value, class: Value) -> bool {
+        if !self.is_instance(value) {
             return false;
         }
-        let mut current = self.read_slot(exc, 0);
+        let mut current = self.read_slot(value, 0);
+        while self.is_class(current) {
+            if current == class {
+                return true;
+            }
+            current = self.read_slot(current, 1);
+        }
+        false
+    }
+
+    /// Whether user class `cls` derives from user class `target` (walking `cls`'s base chain, which
+    /// includes `cls` itself). Backs `issubclass`.
+    #[must_use]
+    pub fn is_subclass_of(&self, cls: Value, target: Value) -> bool {
+        let mut current = cls;
         while self.is_class(current) {
             if current == target {
                 return true;
@@ -1700,8 +3395,74 @@ impl ObjectModel {
                 return None;
             }
         };
+        let mut arg = self.pending_trap_arg.take();
+        if arg.is_none() {
+            arg = self.default_trap_message(trap);
+        }
         let class = self.exception_class(name)?;
-        self.new_object(class).ok()
+        let instance = self.new_object(class).ok()?;
+        if let Some(arg) = arg {
+            let _ = self.init_default_args(instance, &[arg]);
+        }
+        Some(instance)
+    }
+
+    /// The constant CPython message for the traps whose text never varies; `None` for traps whose
+    /// message is data-dependent (attached at the site via `pending_trap_arg`) or absent.
+    fn default_trap_message(&mut self, trap: Trap) -> Option<Value> {
+        let message = match trap {
+            Trap::ZeroDivisionError => "division by zero",
+            Trap::RecursionError => "maximum recursion depth exceeded",
+            _ => return None,
+        };
+        self.new_str(message).ok()
+    }
+
+    /// Attaches a one-shot context argument to the next trap-raised exception (see
+    /// [`ObjectModel::pending_trap_arg`]). Call immediately before returning the bare trap.
+    pub(crate) fn set_trap_arg(&mut self, arg: Value) {
+        self.pending_trap_arg = Some(arg);
+    }
+
+    /// Attaches `message` (as the exception's text) to the next raised exception and returns
+    /// `trap`, for `return Err(self.with_message(Trap::IndexError, "list index out of range"))`.
+    pub(crate) fn with_message(&mut self, trap: Trap, message: &str) -> Trap {
+        if let Ok(text) = self.new_str(message) {
+            self.set_trap_arg(text);
+        }
+        trap
+    }
+
+    /// A fresh, no-argument instance of the named built-in exception (e.g. `GeneratorExit`).
+    pub(crate) fn new_exception(&mut self, name: &str) -> Result<Value, Trap> {
+        let class = self.exception_class(name).ok_or(Trap::Malformed)?;
+        self.new_object(class)
+    }
+
+    /// Raises the named built-in exception with `message`: stashes the instance in the pending slot
+    /// and returns `Trap::Raised` (for `return Err(self.raise_named_exception("RuntimeError", ...))`).
+    pub(crate) fn raise_named_exception(&mut self, name: &str, message: &str) -> Trap {
+        match self.new_exception(name) {
+            Ok(exc) => {
+                if !message.is_empty() {
+                    if let Ok(text) = self.new_str(message) {
+                        let _ = self.init_default_args(exc, &[text]);
+                    }
+                }
+                self.set_pending_exception(exc);
+                Trap::Raised
+            }
+            Err(trap) => trap,
+        }
+    }
+
+    /// Whether the currently pending exception is an instance of the named class -- consumed by the
+    /// generator close() protocol (a GeneratorExit escaping cleanly ends the close).
+    pub(crate) fn pending_exception_is(&self, name: &str) -> bool {
+        match (self.pending_exception, self.exc_class_lookup(name)) {
+            (Some(exc), Some(class)) => self.is_instance_of(exc, class),
+            _ => false,
+        }
     }
 
     /// Resolves the operand of `raise` (`Op::Raise` argc 1): a class is instantiated no-arg,
@@ -1752,8 +3513,18 @@ impl ObjectModel {
     /// singletons by name, a container via its `repr`.
     #[must_use]
     pub fn display(&self, value: Value) -> String {
+        #[cfg(feature = "complex")]
+        if let Some((re, im)) = self.complex_value(value) {
+            return format_complex(re, im);
+        }
         if let Some(n) = value.as_fixnum() {
             alloc::format!("{n}")
+        } else if let Some(n) = self.long_value(value) {
+            alloc::format!("{n}")
+        } else if let Some(big) = self.bigint_value(value) {
+            big.to_decimal_string()
+        } else if let Some(f) = self.float_value(value) {
+            format_float(f)
         } else if value == Value::TRUE {
             String::from("True")
         } else if value == Value::FALSE {
@@ -1762,15 +3533,84 @@ impl ObjectModel {
             String::from("None")
         } else if let Some(s) = self.str_value(value) {
             String::from(s)
+        } else if self.is_instance(value) {
+            self.instance_display(value)
         } else {
             self.repr(value)
         }
+    }
+
+    /// `str()` of a class instance: an exception renders as its MESSAGE (the str of its single arg,
+    /// `""` for none, or the args tuple's repr for several -- Python's `str(exc)`); any other
+    /// instance falls back to its `repr` (`<ClassName object>`).
+    fn instance_display(&self, instance: Value) -> String {
+        if self.is_exception_value(instance) {
+            return self.exception_message(instance);
+        }
+        self.repr(instance)
+    }
+
+    /// Whether `value` is an exception instance (derives `BaseException`). Uses the immutable
+    /// class lookup: if the exception types are not built yet, no exception instance exists, so
+    /// this is `false`.
+    #[must_use]
+    fn is_exception_value(&self, value: Value) -> bool {
+        self.exc_class_lookup("BaseException")
+            .is_some_and(|base| self.is_instance_of(value, base))
+    }
+
+    /// The str message of an exception instance: `str(arg)` for a single stored arg, `""` for none,
+    /// else the args tuple's repr (Python's `BaseException.__str__`).
+    fn exception_message(&self, instance: Value) -> String {
+        let Some(args) = self.instance_attr(instance, "args") else {
+            return String::new();
+        };
+        let key_error = self
+            .exc_class_lookup("KeyError")
+            .is_some_and(|class| self.is_instance_of(instance, class));
+        match self.seq_value(args) {
+            Some(elements) if elements.len() == 1 => {
+                if key_error {
+                    self.repr(elements[0])
+                } else {
+                    self.display(elements[0])
+                }
+            }
+            Some(elements) if elements.is_empty() => String::new(),
+            _ => self.repr(args),
+        }
+    }
+
+    /// An instance attribute read straight from its `__dict__` (no method/MRO resolution), or
+    /// `None`. For rendering an exception's stored `args` / another instance's class.
+    #[must_use]
+    fn instance_attr(&self, instance: Value, name: &str) -> Option<Value> {
+        let dict = self.read_slot(instance, 1);
+        for (key, value) in self.dict_value(dict)? {
+            if self.str_value(*key) == Some(name) {
+                return Some(*value);
+            }
+        }
+        None
+    }
+
+    /// The name of a class instance's class (its class object's name slot), or `None`.
+    #[must_use]
+    fn instance_class_name(&self, instance: Value) -> Option<&str> {
+        let class = self.read_slot(instance, 0);
+        self.str_value(self.read_slot(class, 0))
     }
 
     /// Appends a `print()` line (already formatted) plus a newline to the captured output.
     pub fn write_line(&mut self, line: &str) {
         self.stdout.push_str(line);
         self.stdout.push('\n');
+    }
+
+    /// Appends `text` to the captured output WITHOUT a trailing newline -- for `print(..., end=s)`,
+    /// which supplies its own terminator.
+    pub fn write(&mut self, text: &str) {
+        self.stdout.push_str(text);
     }
 
     /// Drains the captured `print` output.
@@ -1858,7 +3698,7 @@ impl ObjectModel {
         if attrs.len() != usize::from(ty.num_slots) {
             return Err(Trap::Malformed);
         }
-        let reference = self.heap.alloc(type_id).ok_or(Trap::OutOfMemory)?;
+        let reference = self.alloc_object(type_id).ok_or(Trap::OutOfMemory)?;
         for (i, value) in attrs.iter().enumerate() {
             self.heap.write_u32(reference.0 + (i as u32) * 4, value.bits());
         }
@@ -1886,10 +3726,26 @@ impl ObjectModel {
         name: &str,
         cache: &mut InlineCache,
     ) -> Result<Value, Trap> {
+        if let Some(id) = obj.as_builtin_id() {
+            if name == "__name__" {
+                if let Some(builtin) = Builtin::from_id(id) {
+                    return self.new_str(builtin.python_name());
+                }
+            }
+            if id == Builtin::Dict.id() && name == "fromkeys" {
+                return Ok(Value::builtin_ref(Builtin::DictFromkeys.id()));
+            }
+            return Err(Trap::AttributeError);
+        }
         let reference = obj.as_ref().ok_or(Trap::AttributeError)?;
         let type_id = self.heap.type_id_of(reference);
         if type_id == self.str_type_id {
             let method_id = str_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.bytes_type_id || type_id == self.bytearray_type_id {
+            let method_id = bytes_method_id(name, type_id == self.bytearray_type_id)
+                .ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
         if type_id == self.list_type_id {
@@ -1912,7 +3768,82 @@ impl ObjectModel {
             let method_id = tuple_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
+        #[cfg(feature = "complex")]
+        if type_id == self.complex_type_id {
+            let (re, im) = self.complex_value(obj).ok_or(Trap::AttributeError)?;
+            return match name {
+                "real" => self.new_float(re),
+                "imag" => self.new_float(im),
+                _ => {
+                    let method_id = complex_method_id(name).ok_or(Trap::AttributeError)?;
+                    self.new_bound_method(obj, method_id)
+                }
+            };
+        }
+        if type_id == self.generator_type_id {
+            let method_id = crate::interp::generator_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.module_type_id {
+            let namespace = self.read_slot(obj, 0);
+            let index = self
+                .container_slot(namespace, self.dict_type_id)
+                .ok_or(Trap::AttributeError)?;
+            return self.dicts[index]
+                .iter()
+                .find(|(key, _)| self.str_value(*key) == Some(name))
+                .map(|(_, value)| *value)
+                .ok_or(Trap::AttributeError);
+        }
+        if type_id == self.gpio_type_id {
+            let method_id = crate::gpio::gpio_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.board_type_id {
+            let pin = crate::gpio::board_pin_id(name).ok_or(Trap::AttributeError)?;
+            return Value::fixnum(pin as i32).ok_or(Trap::Overflow);
+        }
+        if type_id == self.pin_type_id {
+            let method_id = crate::gpio::pin_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.machine_type_id {
+            if name == "Pin" {
+                return self.pin_factory_singleton();
+            }
+            return Err(Trap::AttributeError);
+        }
+        if type_id == self.pin_factory_type_id {
+            let mode = crate::gpio::machine_pin_const(name).ok_or(Trap::AttributeError)?;
+            return Value::fixnum(mode as i32).ok_or(Trap::Overflow);
+        }
+        if type_id == self.digitalio_type_id {
+            return match name {
+                "DigitalInOut" => self.dio_factory_singleton(),
+                "Direction" => self.direction_singleton(),
+                _ => Err(Trap::AttributeError),
+            };
+        }
+        if type_id == self.direction_type_id {
+            let d = crate::gpio::direction_const(name).ok_or(Trap::AttributeError)?;
+            return Value::fixnum(d as i32).ok_or(Trap::Overflow);
+        }
+        if type_id == self.dio_type_id {
+            return match name {
+                "value" => self.dio_read_value(obj),
+                "direction" => {
+                    let pin = self.dio_pin(obj);
+                    let reference = pin.as_ref().ok_or(Trap::TypeError)?;
+                    let mode = self.heap.read_u32(reference.0 + crate::gpio::PIN_W_MODE * 4);
+                    Value::fixnum(mode as i32).ok_or(Trap::Overflow)
+                }
+                _ => Err(Trap::AttributeError),
+            };
+        }
         if type_id == self.class_type_id {
+            if name == "__name__" {
+                return Ok(self.read_slot(obj, 0));
+            }
             return self.find_in_class(obj, name).ok_or(Trap::AttributeError);
         }
         if type_id == self.instance_type_id {
@@ -1947,6 +3878,422 @@ impl ObjectModel {
         Ok(Value::from_ref(reference))
     }
 
+
+    /// Installs the volatile MMIO seam (on device the runner passes `lamella_mmio::write32` /
+    /// `read32`). The host leaves it unset and uses the simulated register file, so a driver runs
+    /// and is verifiable off-device.
+    pub fn set_mmio(&mut self, write: fn(u32, u32), read: fn(u32) -> u32) {
+        self.mmio_write_fn = Some(write);
+        self.mmio_read_fn = Some(read);
+    }
+
+    /// A volatile 32-bit register write: through the installed seam on device, else into the host
+    /// simulated register file (and the ordered write trace).
+    pub fn mmio_write(&mut self, address: u32, value: u32) {
+        if let Some(write) = self.mmio_write_fn {
+            write(address, value);
+            return;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            self.mmio_sim.insert(address, value);
+            self.mmio_trace.push((address, value));
+        }
+    }
+
+    /// A volatile 32-bit register read: through the installed seam on device, else from the host
+    /// simulated register file (0 for a register never written).
+    #[must_use]
+    pub fn mmio_read(&self, address: u32) -> u32 {
+        if let Some(read) = self.mmio_read_fn {
+            return read(address);
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            self.mmio_sim.get(&address).copied().unwrap_or(0)
+        }
+        #[cfg(target_os = "none")]
+        0
+    }
+
+    /// The host simulated register file (last value written per address) -- a test oracle.
+    #[cfg(not(target_os = "none"))]
+    #[must_use]
+    pub fn mmio_sim(&self) -> &alloc::collections::BTreeMap<u32, u32> {
+        &self.mmio_sim
+    }
+
+    /// The host ordered log of every MMIO write -- the drive-sequence oracle for a test.
+    #[cfg(not(target_os = "none"))]
+    #[must_use]
+    pub fn mmio_trace(&self) -> &[(u32, u32)] {
+        &self.mmio_trace
+    }
+
+    /// Installs the `sleep_ms` delay seam (device: a timer/spin). The host leaves it a no-op, so
+    /// the differential is not slowed by real sleeps.
+    pub fn set_delay(&mut self, delay: fn(u32)) {
+        self.delay_fn = Some(delay);
+    }
+
+    /// `sleep_ms(ms)`: the installed delay on device, a no-op on the host.
+    pub fn delay_ms(&mut self, ms: u32) {
+        if let Some(delay) = self.delay_fn {
+            delay(ms);
+        }
+    }
+
+    /// Seeds the firmware-reserved pins (from the target profile) so an app claim of one fails
+    /// loud -- never a silent app-vs-firmware register race.
+    pub fn reserve_firmware_pins(&mut self, pins: &[u32]) {
+        for &pin in pins {
+            if !self.gpio_reserved.contains(&pin) {
+                self.gpio_reserved.push(pin);
+            }
+        }
+    }
+
+    /// Claims `pin` for the app. Fails LOUD with `ValueError` if the
+    /// pin is already app-claimed or firmware-reserved -- one owner per pin.
+    fn claim_pin(&mut self, pin: u32) -> Result<(), Trap> {
+        if self.gpio_reserved.contains(&pin) || self.gpio_claimed.contains(&pin) {
+            return Err(Trap::ValueError);
+        }
+        self.gpio_claimed.push(pin);
+        Ok(())
+    }
+
+    /// Releases an app-claimed pin (`Pin.deinit`), so it can be opened again.
+    fn release_pin(&mut self, pin: u32) {
+        self.gpio_claimed.retain(|&p| p != pin);
+    }
+
+    /// The `gpio` module singleton (the clean hardware API). Bind it as the global `gpio` so a
+    /// program reaches `gpio.output(...)`.
+    pub fn gpio_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.gpio_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The `board` pin-name singleton. Bind it as the global `board` so a program reaches
+    /// `board.LED` etc.
+    pub fn board_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.board_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is the `gpio` singleton.
+    #[must_use]
+    pub fn is_gpio(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.gpio_type_id)
+    }
+
+    /// Whether `value` is a `Pin`.
+    #[must_use]
+    pub fn is_pin(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.pin_type_id)
+    }
+
+    /// Allocates a `Pin` handle over the precomputed drive registers `regs` in `mode`, current
+    /// output state low.
+    fn new_pin(&mut self, mode: u32, regs: &crate::gpio::PinRegs) -> Result<Value, Trap> {
+        use crate::gpio::*;
+        let reference = self.alloc_object(self.pin_type_id).ok_or(Trap::OutOfMemory)?;
+        let base = reference.0;
+        self.heap.write_u32(base + PIN_W_ID * 4, regs.pin_id);
+        self.heap.write_u32(base + PIN_W_SET_REG * 4, regs.set_reg);
+        self.heap.write_u32(base + PIN_W_SET_VAL * 4, regs.set_val);
+        self.heap.write_u32(base + PIN_W_CLR_REG * 4, regs.clr_reg);
+        self.heap.write_u32(base + PIN_W_CLR_VAL * 4, regs.clr_val);
+        self.heap.write_u32(base + PIN_W_READ_REG * 4, regs.read_reg);
+        self.heap.write_u32(base + PIN_W_READ_MASK * 4, regs.read_mask);
+        self.heap.write_u32(base + PIN_W_CUR * 4, 0);
+        self.heap.write_u32(base + PIN_W_MODE * 4, mode);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Opens `pin` in the given direction: claims it (fail-loud), configures the port through the
+    /// board driver (clock ungate + the pin's MODER direction), and returns a `Pin`. Shared by the
+    /// clean `gpio` API.
+    fn open_pin(&mut self, pin: u32, output: bool) -> Result<Value, Trap> {
+        use crate::gpio::*;
+        if pin > MAX_PIN {
+            return Err(Trap::ValueError);
+        }
+        self.claim_pin(pin)?;
+        let enabled = self.mmio_read(CLOCK_ENABLE_REG) | CLOCK_ENABLE_BIT;
+        self.mmio_write(CLOCK_ENABLE_REG, enabled);
+        let (clear_mask, set_value) = moder_bits(pin, output);
+        let moder = (self.mmio_read(MODER_REG) & !clear_mask) | set_value;
+        self.mmio_write(MODER_REG, moder);
+        let regs = pin_regs(pin);
+        let mode = if output { PIN_MODE_OUTPUT } else { PIN_MODE_INPUT };
+        self.new_pin(mode, &regs)
+    }
+
+    /// Dispatches a `gpio` method (`gpio.output(pin)` / `gpio.input(pin)`): opens the pin.
+    fn call_gpio_method(
+        &mut self,
+        _gpio: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        use crate::gpio::{GPIO_INPUT, GPIO_OUTPUT};
+        let pin = match args {
+            [p] => {
+                u32::try_from(p.as_int().ok_or(Trap::TypeError)?).map_err(|_| Trap::ValueError)?
+            }
+            _ => return Err(Trap::TypeError),
+        };
+        let output = match method_id {
+            GPIO_OUTPUT => true,
+            GPIO_INPUT => false,
+            _ => return Err(Trap::AttributeError),
+        };
+        self.open_pin(pin, output)
+    }
+
+    /// The `machine` module singleton. Bind it as the global `machine`.
+    pub fn machine_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.machine_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// A fresh `machine.Pin` factory (the callable class carrying OUT/IN + constructing pins).
+    fn pin_factory_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.pin_factory_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is the `machine` singleton.
+    #[must_use]
+    pub fn is_machine(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.machine_type_id)
+    }
+
+    /// Whether `value` is a `machine.Pin` factory (a callable).
+    #[must_use]
+    pub fn is_pin_factory(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.pin_factory_type_id)
+    }
+
+    /// Constructs `machine.Pin(id[, mode])`: opens the pin and returns it. The
+    /// result IS a clean gpio `Pin` -- `value`/`on`/`off`/`toggle` are the same methods.
+    pub(crate) fn call_pin_factory(&mut self, args: &[Value]) -> Result<Value, Trap> {
+        use crate::gpio::{MACHINE_PIN_IN, MACHINE_PIN_OUT};
+        let (id, mode) = match args {
+            [id] => (*id, MACHINE_PIN_OUT),
+            [id, mode] => (
+                *id,
+                u32::try_from(mode.as_int().ok_or(Trap::TypeError)?).unwrap_or(MACHINE_PIN_IN),
+            ),
+            _ => return Err(Trap::TypeError),
+        };
+        let pin =
+            u32::try_from(id.as_int().ok_or(Trap::TypeError)?).map_err(|_| Trap::ValueError)?;
+        self.open_pin(pin, mode == MACHINE_PIN_OUT)
+    }
+
+    /// The `digitalio` module singleton. Bind it as the global `digitalio`.
+    pub fn digitalio_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.digitalio_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// A fresh `digitalio.DigitalInOut` factory (callable).
+    fn dio_factory_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.dio_factory_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// A fresh `digitalio.Direction` enum singleton (OUTPUT/INPUT).
+    fn direction_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.direction_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is the `digitalio` singleton.
+    #[must_use]
+    pub fn is_digitalio(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.digitalio_type_id)
+    }
+
+    /// Whether `value` is a `digitalio.DigitalInOut` factory (a callable).
+    #[must_use]
+    pub fn is_dio_factory(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.dio_factory_type_id)
+    }
+
+    /// Whether `value` is a `DigitalInOut` instance.
+    #[must_use]
+    fn is_dio(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.dio_type_id)
+    }
+
+    /// Constructs `digitalio.DigitalInOut(pin)`: opens the pin (input by default -- 
+    /// and wraps it as a `DigitalInOut` whose `value`/`direction` are properties.
+    pub(crate) fn call_dio_factory(&mut self, args: &[Value]) -> Result<Value, Trap> {
+        let pin_id = match args {
+            [p] => {
+                u32::try_from(p.as_int().ok_or(Trap::TypeError)?).map_err(|_| Trap::ValueError)?
+            }
+            _ => return Err(Trap::TypeError),
+        };
+        let pin = self.open_pin(pin_id, false)?;
+        let reference = self.alloc_object(self.dio_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, pin.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The clean gpio `Pin` a `DigitalInOut` wraps.
+    fn dio_pin(&self, dio: Value) -> Value {
+        self.read_slot(dio, 0)
+    }
+
+    /// Reconfigures a `Pin`'s direction in place (rewrites the MODER field + the mode word); the
+    /// port clock is already ungated at open.
+    fn set_pin_direction(&mut self, pin: Value, output: bool) -> Result<(), Trap> {
+        use crate::gpio::*;
+        let reference = pin.as_ref().ok_or(Trap::TypeError)?;
+        let pin_id = self.heap.read_u32(reference.0 + PIN_W_ID * 4);
+        let (clear_mask, set_value) = moder_bits(pin_id, output);
+        let moder = (self.mmio_read(MODER_REG) & !clear_mask) | set_value;
+        self.mmio_write(MODER_REG, moder);
+        let mode = if output { PIN_MODE_OUTPUT } else { PIN_MODE_INPUT };
+        self.heap.write_u32(reference.0 + PIN_W_MODE * 4, mode);
+        Ok(())
+    }
+
+    /// `dio.value` (getattr): the pin's level as a `bool` -- the last driven value for an output,
+    /// or the sampled input for an input.
+    fn dio_read_value(&self, dio: Value) -> Result<Value, Trap> {
+        use crate::gpio::*;
+        let pin = self.dio_pin(dio);
+        let reference = pin.as_ref().ok_or(Trap::TypeError)?;
+        let mode = self.heap.read_u32(reference.0 + PIN_W_MODE * 4);
+        let bit = if mode == PIN_MODE_OUTPUT {
+            self.heap.read_u32(reference.0 + PIN_W_CUR * 4)
+        } else {
+            let read_reg = self.heap.read_u32(reference.0 + PIN_W_READ_REG * 4);
+            let read_mask = self.heap.read_u32(reference.0 + PIN_W_READ_MASK * 4);
+            u32::from(self.mmio_read(read_reg) & read_mask != 0)
+        };
+        Ok(Value::from_bool(bit != 0))
+    }
+
+    /// `dio.value = x` / `dio.direction = d` (attribute SET on a `DigitalInOut`); any other native
+    /// object has no settable attribute (`AttributeError`, as before).
+    pub(crate) fn py_setattr_native(
+        &mut self,
+        object: Value,
+        name: &str,
+        value: Value,
+    ) -> Result<(), Trap> {
+        use crate::gpio::{PIN_HIGH, PIN_LOW, PIN_MODE_OUTPUT};
+        if self.is_dio(object) {
+            let pin = self.dio_pin(object);
+            match name {
+                "value" => {
+                    let high = value.as_int().map_or_else(|| value.is_truthy(), |n| n != 0);
+                    self.call_pin_method(pin, if high { PIN_HIGH } else { PIN_LOW }, &[])?;
+                    return Ok(());
+                }
+                "direction" => {
+                    let output = value.as_int().unwrap_or(0) == i64::from(PIN_MODE_OUTPUT);
+                    self.set_pin_direction(pin, output)?;
+                    return Ok(());
+                }
+                _ => return Err(Trap::AttributeError),
+            }
+        }
+        Err(Trap::AttributeError)
+    }
+
+    /// Dispatches a `Pin` method: `high`/`on` and `low`/`off` drive the output, `toggle` flips
+    /// it, `value` reads (no argument) or writes (one), `read` samples the input, `deinit`
+    /// releases the reservation. Each drive is a single register write through the MMIO seam.
+    fn call_pin_method(
+        &mut self,
+        pin: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        use crate::gpio::*;
+        let reference = pin.as_ref().ok_or(Trap::TypeError)?;
+        let base = reference.0;
+        let pin_id = self.heap.read_u32(base + PIN_W_ID * 4);
+        let set_reg = self.heap.read_u32(base + PIN_W_SET_REG * 4);
+        let set_val = self.heap.read_u32(base + PIN_W_SET_VAL * 4);
+        let clr_reg = self.heap.read_u32(base + PIN_W_CLR_REG * 4);
+        let clr_val = self.heap.read_u32(base + PIN_W_CLR_VAL * 4);
+        let read_reg = self.heap.read_u32(base + PIN_W_READ_REG * 4);
+        let read_mask = self.heap.read_u32(base + PIN_W_READ_MASK * 4);
+        let cur = self.heap.read_u32(base + PIN_W_CUR * 4);
+        match method_id {
+            PIN_HIGH => {
+                self.mmio_write(set_reg, set_val);
+                self.heap.write_u32(base + PIN_W_CUR * 4, 1);
+                Ok(Value::NONE)
+            }
+            PIN_LOW => {
+                self.mmio_write(clr_reg, clr_val);
+                self.heap.write_u32(base + PIN_W_CUR * 4, 0);
+                Ok(Value::NONE)
+            }
+            PIN_TOGGLE => {
+                if cur == 0 {
+                    self.mmio_write(set_reg, set_val);
+                    self.heap.write_u32(base + PIN_W_CUR * 4, 1);
+                } else {
+                    self.mmio_write(clr_reg, clr_val);
+                    self.heap.write_u32(base + PIN_W_CUR * 4, 0);
+                }
+                Ok(Value::NONE)
+            }
+            PIN_VALUE => match args {
+                [] => {
+                    let bit = i32::from(self.mmio_read(read_reg) & read_mask != 0);
+                    Value::fixnum(bit).ok_or(Trap::Overflow)
+                }
+                [x] => {
+                    let high = x.as_int().ok_or(Trap::TypeError)? != 0;
+                    if high {
+                        self.mmio_write(set_reg, set_val);
+                        self.heap.write_u32(base + PIN_W_CUR * 4, 1);
+                    } else {
+                        self.mmio_write(clr_reg, clr_val);
+                        self.heap.write_u32(base + PIN_W_CUR * 4, 0);
+                    }
+                    Ok(Value::NONE)
+                }
+                _ => Err(Trap::TypeError),
+            },
+            PIN_READ => {
+                let bit = i32::from(self.mmio_read(read_reg) & read_mask != 0);
+                Value::fixnum(bit).ok_or(Trap::Overflow)
+            }
+            PIN_DEINIT => {
+                self.release_pin(pin_id);
+                Ok(Value::NONE)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
     /// Whether `value` is a bound method (the callable a `str.method` reference produces).
     #[must_use]
     pub fn is_bound_method(&self, value: Value) -> bool {
@@ -1955,11 +4302,278 @@ impl ObjectModel {
             .is_some_and(|reference| self.heap.type_id_of(reference) == self.bound_method_type_id)
     }
 
-    /// Calls a bound method -- the `Call` dispatch when [`ObjectModel::is_bound_method`].
-    /// Reads the stored `[receiver, method_id]` and runs the str method (Python 3.14.6
-    /// "String Methods"): `upper`/`lower` (no args) return a cased copy, `startswith`/
-    /// `endswith` (one str arg) a bool, `find` (one str arg) the lowest code-point index
-    /// or -1. A wrong argument count, or a non-str argument, is a `TypeError`.
+    /// Renders a `str.format(*args)` template: `{}` takes the next positional argument, `{N}` the
+    /// N-th, and `{{` / `}}` are literal braces; each field is rendered with `str()` ([`display`]).
+    /// An out-of-range index is an `IndexError`. Named fields (`{name}`, kwargs-only) and format
+    /// specs (`{:spec}`) are follow-ons -- `Unsupported` for now, never wrong output.
+    /// Renders `value` under a format spec `[[fill]align][sign][#][0][width][.prec][type]`. Supports
+    /// the int presentation types (d/x/X/o/b/c) and str (s), plus alignment/width/fill/sign/zero-pad
+    /// and str precision (truncation). Float types (f/e/g) and grouping (`,`) are unsupported (no
+    /// float; a niche) -> `Unsupported`.
+    fn format_value_spec(&self, value: Value, spec: &str) -> Result<String, Trap> {
+        let chars: Vec<char> = spec.chars().collect();
+        let mut i = 0;
+        let (mut fill, mut align) = (' ', '\0');
+        if chars.len() >= 2 && matches!(chars[1], '<' | '>' | '^' | '=') {
+            fill = chars[0];
+            align = chars[1];
+            i = 2;
+        } else if chars.first().is_some_and(|c| matches!(c, '<' | '>' | '^' | '=')) {
+            align = chars[0];
+            i = 1;
+        }
+        let mut sign = '-';
+        if chars.get(i).is_some_and(|c| matches!(c, '+' | '-' | ' ')) {
+            sign = chars[i];
+            i += 1;
+        }
+        let mut alternate = false;
+        if chars.get(i) == Some(&'#') {
+            alternate = true;
+            i += 1;
+        }
+        if chars.get(i) == Some(&'0') {
+            if align == '\0' {
+                align = '=';
+                fill = '0';
+            }
+            i += 1;
+        }
+        let mut width = 0usize;
+        while chars.get(i).is_some_and(char::is_ascii_digit) {
+            width = width * 10 + (chars[i] as usize - '0' as usize);
+            i += 1;
+        }
+        let mut grouping = None;
+        if chars.get(i).is_some_and(|c| matches!(c, ',' | '_')) {
+            grouping = Some(chars[i]);
+            i += 1;
+        }
+        let mut precision = None;
+        if chars.get(i) == Some(&'.') {
+            i += 1;
+            let mut p = 0usize;
+            while chars.get(i).is_some_and(char::is_ascii_digit) {
+                p = p * 10 + (chars[i] as usize - '0' as usize);
+                i += 1;
+            }
+            precision = Some(p);
+        }
+        let type_char = chars.get(i).copied();
+        if type_char.is_some() {
+            i += 1;
+        }
+        if i != chars.len() {
+            return Err(Trap::Unsupported);
+        }
+
+        if let Some(n) = value.as_int() {
+            let magnitude = n.unsigned_abs() as u32;
+            let (digits, prefix) = match type_char.unwrap_or('d') {
+                'd' | 'n' => (format_radix(magnitude, 10, false), ""),
+                'x' => (format_radix(magnitude, 16, false), if alternate { "0x" } else { "" }),
+                'X' => (format_radix(magnitude, 16, true), if alternate { "0X" } else { "" }),
+                'o' => (format_radix(magnitude, 8, false), if alternate { "0o" } else { "" }),
+                'b' => (format_radix(magnitude, 2, false), if alternate { "0b" } else { "" }),
+                'c' => {
+                    let cp = u32::try_from(n).map_err(|_| Trap::ValueError)?;
+                    let ch = char::from_u32(cp).ok_or(Trap::ValueError)?;
+                    let mut buf = [0u8; 4];
+                    let align = if align == '\0' { '<' } else { align };
+                    return Ok(pad_field(ch.encode_utf8(&mut buf), width, fill, align));
+                }
+                _ => return Err(Trap::Unsupported),
+            };
+            let digits = match grouping {
+                Some(separator) => group_integer_digits(&digits, separator),
+                None => digits,
+            };
+            let sign_str = if n < 0 {
+                "-"
+            } else {
+                match sign {
+                    '+' => "+",
+                    ' ' => " ",
+                    _ => "",
+                }
+            };
+            let align = if align == '\0' { '>' } else { align };
+            if align == '=' {
+                let head = sign_str.chars().count() + prefix.chars().count() + digits.chars().count();
+                let mut out = String::new();
+                out.push_str(sign_str);
+                out.push_str(prefix);
+                (0..width.saturating_sub(head)).for_each(|_| out.push(fill));
+                out.push_str(&digits);
+                return Ok(out);
+            }
+            Ok(pad_field(&alloc::format!("{sign_str}{prefix}{digits}"), width, fill, align))
+        } else if let Some(s) = self.str_value(value) {
+            if !matches!(type_char, None | Some('s')) {
+                return Err(Trap::Unsupported);
+            }
+            let body: String = match precision {
+                Some(p) => s.chars().take(p).collect(),
+                None => String::from(s),
+            };
+            let align = if align == '\0' { '<' } else { align };
+            Ok(pad_field(&body, width, fill, align))
+        } else if let Some(f) = self.float_value(value) {
+            let negative = f < 0.0 || (f == 0.0 && f.is_sign_negative());
+            let magnitude = if negative { -f } else { f };
+            let upper = matches!(type_char, Some('E' | 'F' | 'G'));
+            let mut body = if magnitude.is_nan() {
+                String::from(if upper { "NAN" } else { "nan" })
+            } else if magnitude.is_infinite() {
+                String::from(if upper { "INF" } else { "inf" })
+            } else {
+                match type_char {
+                    Some('f' | 'F') => alloc::format!("{magnitude:.*}", precision.unwrap_or(6)),
+                    Some('e' | 'E') => float_format_scientific(magnitude, precision.unwrap_or(6), upper),
+                    Some('g' | 'G') => {
+                        float_format_general(magnitude, precision.unwrap_or(6), upper, alternate, false)
+                    }
+                    Some('%') => alloc::format!("{:.*}%", precision.unwrap_or(6), magnitude * 100.0),
+                    None => match precision {
+                        None => format_float(magnitude),
+                        Some(p) => float_format_general(magnitude, p, false, alternate, true),
+                    },
+                    _ => return Err(Trap::Unsupported),
+                }
+            };
+            if let Some(separator) = grouping {
+                if magnitude.is_finite() {
+                    body = group_integer_digits(&body, separator);
+                }
+            }
+            let sign_str = if negative {
+                "-"
+            } else {
+                match sign {
+                    '+' => "+",
+                    ' ' => " ",
+                    _ => "",
+                }
+            };
+            let align = if align == '\0' { '>' } else { align };
+            if align == '=' {
+                let head = sign_str.chars().count() + body.chars().count();
+                let mut out = String::from(sign_str);
+                (0..width.saturating_sub(head)).for_each(|_| out.push(fill));
+                out.push_str(&body);
+                return Ok(out);
+            }
+            Ok(pad_field(&alloc::format!("{sign_str}{body}"), width, fill, align))
+        } else {
+            Err(Trap::Unsupported)
+        }
+    }
+
+    fn format_template(&self, template: &str, args: &[Value]) -> Result<String, Trap> {
+        let mut out = String::new();
+        let mut chars = template.chars().peekable();
+        let mut auto_index = 0usize;
+        while let Some(c) = chars.next() {
+            match c {
+                '{' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    out.push('{');
+                }
+                '{' => {
+                    let mut field = String::new();
+                    let mut closed = false;
+                    for fc in chars.by_ref() {
+                        if fc == '}' {
+                            closed = true;
+                            break;
+                        }
+                        field.push(fc);
+                    }
+                    if !closed {
+                        return Err(Trap::Unsupported);
+                    }
+                    let (name, spec) = match field.split_once(':') {
+                        Some((n, s)) => (n, Some(s)),
+                        None => (field.as_str(), None),
+                    };
+                    let index = if name.is_empty() {
+                        let i = auto_index;
+                        auto_index += 1;
+                        i
+                    } else {
+                        name.parse::<usize>().map_err(|_| Trap::Unsupported)?
+                    };
+                    let arg = *args.get(index).ok_or(Trap::IndexError)?;
+                    match spec {
+                        None => out.push_str(&self.display(arg)),
+                        Some(spec) => out.push_str(&self.format_value_spec(arg, spec)?),
+                    }
+                }
+                '}' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    out.push('}');
+                }
+                '}' => return Err(Trap::Unsupported),
+                _ => out.push(c),
+            }
+        }
+        Ok(out)
+    }
+
+    /// `str.format_map(mapping)`: renders `template`, resolving each `{name}` field by looking the
+    /// name up (as a str key) in `mapping` (a dict). A missing key is a `KeyError`; a `:spec` is not
+    /// yet supported. `{{`/`}}` escape to a literal brace.
+    fn format_with_map(&self, template: &str, mapping: Value) -> Result<String, Trap> {
+        let entries = self.dict_value(mapping).ok_or(Trap::TypeError)?.clone();
+        let mut out = String::new();
+        let mut chars = template.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '{' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    out.push('{');
+                }
+                '{' => {
+                    let mut field = String::new();
+                    let mut closed = false;
+                    for fc in chars.by_ref() {
+                        if fc == '}' {
+                            closed = true;
+                            break;
+                        }
+                        field.push(fc);
+                    }
+                    if !closed {
+                        return Err(Trap::Unsupported);
+                    }
+                    let (name, spec) = match field.split_once(':') {
+                        Some((n, s)) => (n, Some(s)),
+                        None => (field.as_str(), None),
+                    };
+                    let value = entries
+                        .iter()
+                        .find_map(|(k, v)| (self.str_value(*k) == Some(name)).then_some(*v))
+                        .ok_or(Trap::KeyError)?;
+                    match spec {
+                        None => out.push_str(&self.display(value)),
+                        Some(spec) => out.push_str(&self.format_value_spec(value, spec)?),
+                    }
+                }
+                '}' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    out.push('}');
+                }
+                '}' => return Err(Trap::Unsupported),
+                _ => out.push(c),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Calls a bound method -- the `Call` dispatch when [`ObjectModel::is_bound_method`]. Reads the
+    /// stored `[receiver, method_id]` and runs the receiver's method: list/dict/set/tuple/gpio/pin
+    /// methods, else a `str` method (Python 3.14.6 "String Methods"). A wrong argument count, or a
+    /// wrong-typed argument, is a `TypeError`.
     pub fn call_bound_method(&mut self, callee: Value, args: &[Value]) -> Result<Value, Trap> {
         let reference = callee.as_ref().ok_or(Trap::TypeError)?;
         let receiver = Value::from_bits(self.heap.read_u32(reference.0));
@@ -1976,6 +4590,19 @@ impl ObjectModel {
         if self.is_tuple(receiver) {
             return self.call_tuple_method(receiver, method_id, args);
         }
+        #[cfg(feature = "complex")]
+        if self.is_complex(receiver) {
+            return self.call_complex_method(receiver, method_id, args);
+        }
+        if self.is_bytes(receiver) || self.is_bytearray(receiver) {
+            return self.call_bytes_method(receiver, method_id, args);
+        }
+        if self.is_gpio(receiver) {
+            return self.call_gpio_method(receiver, method_id, args);
+        }
+        if self.is_pin(receiver) {
+            return self.call_pin_method(receiver, method_id, args);
+        }
         match method_id {
             STR_UPPER | STR_LOWER => {
                 if !args.is_empty() {
@@ -1988,6 +4615,108 @@ impl ObjectModel {
                     s.to_lowercase()
                 };
                 self.new_str(&cased)
+            }
+            STR_FORMAT => {
+                let template = self.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
+                let rendered = self.format_template(&template, args)?;
+                self.new_str(&rendered)
+            }
+            STR_FORMAT_MAP => {
+                let [mapping] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let template = self.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
+                let rendered = self.format_with_map(&template, *mapping)?;
+                self.new_str(&rendered)
+            }
+            STR_RSPLIT => {
+                let (sep, maxsplit) = match args {
+                    [] => (None, -1i64),
+                    [sep] if sep.is_none() => (None, -1),
+                    [sep] => (Some(String::from(self.str_value(*sep).ok_or(Trap::TypeError)?)), -1),
+                    [sep, ms] => {
+                        let limit = ms.as_int().ok_or(Trap::TypeError)?;
+                        let sep = if sep.is_none() {
+                            None
+                        } else {
+                            Some(String::from(self.str_value(*sep).ok_or(Trap::TypeError)?))
+                        };
+                        (sep, limit)
+                    }
+                    _ => return Err(Trap::TypeError),
+                };
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let parts: Vec<String> = match &sep {
+                    None => s.split_whitespace().map(String::from).collect(),
+                    Some(sep) => {
+                        if sep.is_empty() {
+                            return Err(Trap::ValueError);
+                        }
+                        let all: Vec<&str> = s.split(sep.as_str()).collect();
+                        if maxsplit < 0 || all.len() <= maxsplit as usize + 1 {
+                            all.into_iter().map(String::from).collect()
+                        } else {
+                            let keep_from = all.len() - maxsplit as usize;
+                            let head = all[..keep_from].join(sep.as_str());
+                            let mut parts = alloc::vec![head];
+                            parts.extend(all[keep_from..].iter().map(|p| String::from(*p)));
+                            parts
+                        }
+                    }
+                };
+                let mut elems = Vec::with_capacity(parts.len());
+                for p in &parts {
+                    elems.push(self.new_str(p)?);
+                }
+                self.new_list(elems)
+            }
+            STR_CASEFOLD => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let folded = self.str_value(receiver).ok_or(Trap::TypeError)?.to_lowercase();
+                self.new_str(&folded)
+            }
+            STR_ENCODE => {
+                let name = match args {
+                    [] => String::from("utf8"),
+                    [encoding] => self.str_value(*encoding).map(String::from).ok_or(Trap::TypeError)?,
+                    _ => return Err(Trap::TypeError),
+                };
+                let text = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                match name.to_ascii_lowercase().replace('-', "").as_str() {
+                    "utf8" | "ascii" => self.new_bytes(text.into_bytes()),
+                    _ => Err(Trap::Unsupported),
+                }
+            }
+            STR_TRANSLATE => {
+                let [table] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let entries = self.dict_value(*table).ok_or(Trap::TypeError)?.clone();
+                let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
+                let mut out = String::new();
+                for ch in s.chars() {
+                    let ordinal = ch as i64;
+                    let replacement = entries
+                        .iter()
+                        .find_map(|(k, v)| (k.as_int() == Some(ordinal)).then_some(*v));
+                    match replacement {
+                        None => out.push(ch),
+                        Some(r) if r.is_none() => {}
+                        Some(r) => {
+                            if let Some(ord) = r.as_int() {
+                                let cp = u32::try_from(ord).map_err(|_| Trap::ValueError)?;
+                                out.push(char::from_u32(cp).ok_or(Trap::ValueError)?);
+                            } else if let Some(repl) = self.str_value(r) {
+                                out.push_str(repl);
+                            } else {
+                                return Err(Trap::TypeError);
+                            }
+                        }
+                    }
+                }
+                self.new_str(&out)
             }
             STR_STARTSWITH | STR_ENDSWITH => {
                 let (affix, start, end) = affix_and_bounds(args)?;
@@ -2579,8 +5308,30 @@ impl ObjectModel {
                 let copy = self.dicts[index].clone();
                 self.new_dict(copy)
             }
+            DICT_POPITEM => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                match self.dicts[index].pop() {
+                    Some((key, value)) => self.new_tuple(alloc::vec![key, value]),
+                    None => Err(Trap::KeyError),
+                }
+            }
             _ => Err(Trap::AttributeError),
         }
+    }
+
+    /// `dict.fromkeys(iterable, value)`: a new dict with each distinct element of `iterable` as a
+    /// key, all mapped to `value`.
+    pub fn new_dict_fromkeys(&mut self, iterable: Value, value: Value) -> Result<Value, Trap> {
+        let keys = self.collect_elements(iterable)?;
+        let mut entries: Vec<(Value, Value)> = Vec::new();
+        for key in keys {
+            if !entries.iter().any(|(existing, _)| self.key_eq(*existing, key)) {
+                entries.push((key, value));
+            }
+        }
+        self.new_dict(entries)
     }
 
     /// Collects any iterable into an owned `Vec` (a set/frozenset or list/tuple is cloned, else
@@ -2644,6 +5395,145 @@ impl ObjectModel {
             TUPLE_COUNT => {
                 let n = self.seqs[index].iter().filter(|e| self.key_eq(**e, *value)).count();
                 Value::fixnum(n as i32).ok_or(Trap::Overflow)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a `bytes`/`bytearray` method: `hex()` -> the lowercase hex string; `decode()` ->
+    /// the utf-8 `str` (an invalid sequence is a `ValueError`); `append(int)` / `extend(bytes-like)`
+    /// mutate a bytearray in place (returning None).
+    fn call_bytes_method(&mut self, receiver: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
+        match method_id {
+            BYTES_HEX => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let mut hex = String::new();
+                for &byte in self.bytes_value(receiver).ok_or(Trap::TypeError)? {
+                    hex.push_str(&alloc::format!("{byte:02x}"));
+                }
+                self.new_str(&hex)
+            }
+            BYTES_DECODE => {
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let text = core::str::from_utf8(&data).map_err(|_| Trap::ValueError)?;
+                let owned = String::from(text);
+                self.new_str(&owned)
+            }
+            BYTEARRAY_APPEND => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let byte = value.as_int().ok_or(Trap::TypeError)?;
+                if !(0..=255).contains(&byte) {
+                    return Err(Trap::ValueError);
+                }
+                let slot = self.byte_buffer_slot(receiver).ok_or(Trap::TypeError)?;
+                self.byte_buffers[slot].push(byte as u8);
+                Ok(Value::NONE)
+            }
+            BYTEARRAY_EXTEND => {
+                let [source] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let extra = self.bytes_value(*source).ok_or(Trap::TypeError)?.to_vec();
+                let slot = self.byte_buffer_slot(receiver).ok_or(Trap::TypeError)?;
+                self.byte_buffers[slot].extend(extra);
+                Ok(Value::NONE)
+            }
+            BYTES_STARTSWITH | BYTES_ENDSWITH => {
+                let [prefix] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
+                let needle = self.bytes_value(*prefix).ok_or(Trap::TypeError)?;
+                let matches = if method_id == BYTES_STARTSWITH {
+                    data.starts_with(needle)
+                } else {
+                    data.ends_with(needle)
+                };
+                Ok(Value::from_bool(matches))
+            }
+            BYTES_FIND => {
+                let [sub] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
+                let needle = self.bytes_value(*sub).ok_or(Trap::TypeError)?;
+                let index = if needle.is_empty() {
+                    0
+                } else {
+                    data.windows(needle.len()).position(|w| w == needle).map_or(-1, |p| p as i64)
+                };
+                Value::fixnum(i32::try_from(index).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)
+            }
+            BYTES_COUNT => {
+                let [sub] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
+                let needle = self.bytes_value(*sub).ok_or(Trap::TypeError)?;
+                let count = if needle.is_empty() {
+                    data.len() + 1
+                } else {
+                    let mut n = 0;
+                    let mut i = 0;
+                    while i + needle.len() <= data.len() {
+                        if &data[i..i + needle.len()] == needle {
+                            n += 1;
+                            i += needle.len();
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    n
+                };
+                Value::fixnum(count as i32).ok_or(Trap::Overflow)
+            }
+            BYTES_REPLACE => {
+                let [old, new] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let old = self.bytes_value(*old).ok_or(Trap::TypeError)?.to_vec();
+                let new = self.bytes_value(*new).ok_or(Trap::TypeError)?.to_vec();
+                let replaced = replace_bytes(&data, &old, &new);
+                if self.is_bytearray(receiver) {
+                    self.new_bytearray(replaced)
+                } else {
+                    self.new_bytes(replaced)
+                }
+            }
+            BYTES_UPPER | BYTES_LOWER => {
+                let mut data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                for byte in &mut data {
+                    *byte = if method_id == BYTES_UPPER {
+                        byte.to_ascii_uppercase()
+                    } else {
+                        byte.to_ascii_lowercase()
+                    };
+                }
+                if self.is_bytearray(receiver) {
+                    self.new_bytearray(data)
+                } else {
+                    self.new_bytes(data)
+                }
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a `complex` method: `conjugate()` flips the sign of the imaginary part.
+    #[cfg(feature = "complex")]
+    fn call_complex_method(&mut self, complex: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
+        let (re, im) = self.complex_value(complex).ok_or(Trap::TypeError)?;
+        match method_id {
+            COMPLEX_CONJUGATE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                self.new_complex(re, -im)
             }
             _ => Err(Trap::AttributeError),
         }
@@ -2806,29 +5696,179 @@ impl ObjectModel {
                 let b_elems = b_set.ok_or(Trap::TypeError)?;
                 self.set_subset(b_elems, a_elems) && !self.set_subset(a_elems, b_elems)
             }
+            CmpOp::Is | CmpOp::IsNot => unreachable!("is/is not handled in the Op::Compare path"),
         };
         Ok(Value::from_bool(value))
     }
 
-    /// Sorts `elements` in place by Python ordering: all-int numerically, all-str
-    /// lexicographically; a mixed or otherwise unorderable set is a `TypeError`. Shared by
-    /// `list.sort` and the `sorted` built-in.
-    pub(crate) fn sort_values(&self, elements: &mut [Value]) -> Result<(), Trap> {
-        if elements.iter().all(|e| e.as_int().is_some()) {
-            elements.sort_by_key(|e| e.as_int().unwrap_or(0));
-        } else if elements.iter().all(|e| self.str_value(*e).is_some()) {
-            let mut keyed: Vec<(String, Value)> = elements
-                .iter()
-                .map(|e| (String::from(self.str_value(*e).unwrap_or("")), *e))
-                .collect();
-            keyed.sort_by(|a, b| a.0.cmp(&b.0));
-            for (slot, (_, value)) in keyed.into_iter().enumerate() {
-                elements[slot] = value;
-            }
-        } else {
-            return Err(Trap::TypeError);
+    /// Python's ordering comparison for `sorted`/`min`/`max`/`list.sort`/the ordering operators:
+    /// int/bool numerically, str lexicographically (by code point), and tuple/list element-wise
+    /// (lexicographic, recursive, shorter-is-less when one is a prefix). Comparing two different
+    /// orderable kinds -- or any unorderable type -- is a `TypeError`, matching CPython (`1 < "a"`
+    /// raises). Only same-kind sequences compare (`[1] < (1,)` is a TypeError).
+    pub(crate) fn compare_ordered(&self, a: Value, b: Value) -> Result<Ordering, Trap> {
+        if let (Some(x), Some(y)) = (self.as_i128(a), self.as_i128(b)) {
+            return Ok(x.cmp(&y));
         }
-        Ok(())
+        if self.is_int(a) && self.is_int(b) {
+            if let (Some(x), Some(y)) = (self.as_bigint(a), self.as_bigint(b)) {
+                return Ok(x.cmp(&y));
+            }
+        }
+        if self.is_float(a) || self.is_float(b) {
+            if let (Some(x), Some(y)) = (self.as_f64(a), self.as_f64(b)) {
+                return Ok(x.partial_cmp(&y).unwrap_or(Ordering::Equal));
+            }
+        }
+        if let (Some(x), Some(y)) = (self.str_value(a), self.str_value(b)) {
+            return Ok(x.cmp(y));
+        }
+        let same_sequence =
+            (self.is_tuple(a) && self.is_tuple(b)) || (self.is_list(a) && self.is_list(b));
+        if same_sequence {
+            if let (Some(xs), Some(ys)) = (self.seq_value(a), self.seq_value(b)) {
+                let mut i = 0;
+                while i < xs.len() && i < ys.len() {
+                    match self.compare_ordered(xs[i], ys[i])? {
+                        Ordering::Equal => i += 1,
+                        non_equal => return Ok(non_equal),
+                    }
+                }
+                return Ok(xs.len().cmp(&ys.len()));
+            }
+        }
+        Err(Trap::TypeError)
+    }
+
+    /// Sorts `elements` in place by Python ordering ([`ObjectModel::compare_ordered`]), stably; an
+    /// unorderable pair is a `TypeError`. Shared by `list.sort` and the `sorted` built-in.
+    pub(crate) fn sort_values(&self, elements: &mut [Value]) -> Result<(), Trap> {
+        let mut error = None;
+        elements.sort_by(|a, b| match self.compare_ordered(*a, *b) {
+            Ok(ordering) => ordering,
+            Err(trap) => {
+                error = error.or(Some(trap));
+                Ordering::Equal
+            }
+        });
+        match error {
+            Some(trap) => Err(trap),
+            None => Ok(()),
+        }
+    }
+
+    /// Reorders `pairs` (sort-key, element) IN PLACE so that reading `pairs[i].1` gives the elements
+    /// sorted by their key -- all-int numerically or all-str lexicographically (a mixed/unorderable
+    /// set of keys is a `TypeError`), stably, DESCENDING when `reverse`. Backs `sorted(key=...,
+    /// reverse=...)`: ties keep their original order (Python's stable sort), so `reverse` is a
+    /// directional stable sort, not an ascending sort reversed (which would flip equal-key ties).
+    pub(crate) fn sort_pairs_by_key(
+        &self,
+        pairs: &mut [(Value, Value)],
+        reverse: bool,
+    ) -> Result<(), Trap> {
+        let mut error = None;
+        pairs.sort_by(|a, b| match self.compare_ordered(a.0, b.0) {
+            Ok(ordering) => {
+                if reverse {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            }
+            Err(trap) => {
+                error = error.or(Some(trap));
+                Ordering::Equal
+            }
+        });
+        match error {
+            Some(trap) => Err(trap),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether `callee` is a bound `list.sort` method -- the one built-in method with a keyword
+    /// surface (`sort(key=None, reverse=False)`), which the interpreter's `CallKw` routes specially.
+    #[must_use]
+    pub fn is_list_sort_bound(&self, callee: Value) -> bool {
+        callee.as_ref().is_some_and(|reference| {
+            self.heap.type_id_of(reference) == self.bound_method_type_id && {
+                let receiver = Value::from_bits(self.heap.read_u32(reference.0));
+                let method_id = self.heap.read_u32(reference.0 + 4);
+                self.is_list(receiver) && method_id == LIST_SORT
+            }
+        })
+    }
+
+    /// The receiver a bound method is bound to (its `self`); the precondition is that `callee` is a
+    /// bound method (e.g. [`ObjectModel::is_list_sort_bound`]).
+    #[must_use]
+    pub fn bound_receiver(&self, callee: Value) -> Value {
+        let reference = callee.as_ref().expect("a bound method");
+        Value::from_bits(self.heap.read_u32(reference.0))
+    }
+
+    /// The method id a bound method carries (payload word at offset 4, a raw int, not a tagged
+    /// slot); the precondition is that `callee` is a bound method.
+    #[must_use]
+    pub fn bound_method_id(&self, callee: Value) -> u32 {
+        let reference = callee.as_ref().expect("a bound method");
+        self.heap.read_u32(reference.0 + 4)
+    }
+
+    /// A clone of a list/tuple's elements (so a caller can compute over them without holding a
+    /// borrow on the model), or `None` if `value` is not a sequence.
+    #[must_use]
+    pub fn seq_elements(&self, value: Value) -> Option<Vec<Value>> {
+        self.seq_value(value).cloned()
+    }
+
+    /// Sorts list `receiver` IN PLACE for `list.sort(key=, reverse=)`: by `keys[i]` (element i's
+    /// precomputed sort key, or the element itself when `keys` is `None`), descending when
+    /// `reverse`. `keys`, when given, must have one entry per element. Returns `None`.
+    pub fn list_sort_in_place(
+        &mut self,
+        receiver: Value,
+        keys: Option<Vec<Value>>,
+        reverse: bool,
+    ) -> Result<Value, Trap> {
+        let index = self.seq_slot(receiver).ok_or(Trap::TypeError)?;
+        let mut elements = core::mem::take(&mut self.seqs[index]);
+        let outcome = self.sort_elements(&mut elements, keys, reverse);
+        self.seqs[index] = elements;
+        outcome.map(|()| Value::NONE)
+    }
+
+    /// The in-place sort behind [`ObjectModel::list_sort_in_place`]: no key sorts the elements
+    /// directly (reverse flips), a key sorts (element, key) pairs by key (directional stable, so
+    /// ties keep original order under reverse).
+    fn sort_elements(
+        &self,
+        elements: &mut [Value],
+        keys: Option<Vec<Value>>,
+        reverse: bool,
+    ) -> Result<(), Trap> {
+        match keys {
+            None => {
+                self.sort_values(elements)?;
+                if reverse {
+                    elements.reverse();
+                }
+                Ok(())
+            }
+            Some(keys) => {
+                if keys.len() != elements.len() {
+                    return Err(Trap::TypeError);
+                }
+                let mut pairs: Vec<(Value, Value)> =
+                    keys.into_iter().zip(elements.iter().copied()).collect();
+                self.sort_pairs_by_key(&mut pairs, reverse)?;
+                for (slot, (_, element)) in pairs.into_iter().enumerate() {
+                    elements[slot] = element;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -2875,6 +5915,302 @@ mod tests {
         assert_eq!(model.str_value(lo), Some("héllo"));
         let again = model.getattr(s, "upper", &mut InlineCache::empty()).unwrap();
         assert_eq!(model.call_bound_method(again, &[s]), Err(Trap::TypeError));
+    }
+
+    #[test]
+    fn str_format_substitutes_positional_fields() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let t1 = model.new_str("{} + {} = {}").unwrap();
+        let b1 = model.getattr(t1, "format", &mut InlineCache::empty()).unwrap();
+        let r1 = model.call_bound_method(b1, &[n(1), n(2), n(3)]).unwrap();
+        assert_eq!(model.str_value(r1), Some("1 + 2 = 3"));
+        let t2 = model.new_str("{0}{1}{0} {{x}}").unwrap();
+        let b2 = model.getattr(t2, "format", &mut InlineCache::empty()).unwrap();
+        let r2 = model.call_bound_method(b2, &[n(7), n(8)]).unwrap();
+        assert_eq!(model.str_value(r2), Some("787 {x}"));
+        let t3 = model.new_str("{} {}").unwrap();
+        let b3 = model.getattr(t3, "format", &mut InlineCache::empty()).unwrap();
+        assert_eq!(model.call_bound_method(b3, &[n(1)]), Err(Trap::IndexError));
+    }
+
+    #[test]
+    fn list_sort_in_place_no_key_and_with_keys() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let l = model.new_list(alloc::vec![n(3), n(1), n(2)]).unwrap();
+        model.list_sort_in_place(l, None, true).unwrap();
+        assert_eq!(model.repr(l), "[3, 2, 1]");
+        let l2 = model.new_list(alloc::vec![n(10), n(20), n(30)]).unwrap();
+        model.list_sort_in_place(l2, Some(alloc::vec![n(3), n(1), n(2)]), false).unwrap();
+        assert_eq!(model.repr(l2), "[20, 30, 10]");
+        let l3 = model.new_list(alloc::vec![n(100), n(200)]).unwrap();
+        model.list_sort_in_place(l3, Some(alloc::vec![n(1), n(1)]), true).unwrap();
+        assert_eq!(model.repr(l3), "[100, 200]");
+    }
+
+    #[test]
+    fn exception_instances_render_their_message() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let value_error = model.exception_class("ValueError").unwrap();
+        let exc = model.new_object(value_error).unwrap();
+        let msg = model.new_str("bad input").unwrap();
+        model.init_default_args(exc, &[msg]).unwrap();
+        assert_eq!(model.display(exc), "bad input");
+        let key_error = model.exception_class("KeyError").unwrap();
+        let ke = model.new_object(key_error).unwrap();
+        let key = model.new_str("missing").unwrap();
+        model.init_default_args(ke, &[key]).unwrap();
+        assert_eq!(model.display(ke), "'missing'");
+        let empty = model.new_object(value_error).unwrap();
+        assert_eq!(model.display(empty), "");
+    }
+
+    #[test]
+    fn repr_of_builtin_types_and_functions() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        assert_eq!(model.repr(Value::builtin_ref(Builtin::Int.id())), "<class 'int'>");
+        assert_eq!(model.repr(Value::builtin_ref(Builtin::List.id())), "<class 'list'>");
+        assert_eq!(model.repr(Value::builtin_ref(Builtin::Abs.id())), "<built-in function abs>");
+        let mut cache = InlineCache::empty();
+        let int_name = model
+            .getattr(Value::builtin_ref(Builtin::Int.id()), "__name__", &mut cache)
+            .unwrap();
+        assert_eq!(model.str_value(int_name), Some("int"));
+    }
+
+    #[test]
+    fn py_delattr_removes_an_instance_attribute() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let class = model.exception_class("ValueError").unwrap();
+        let obj = model.new_object(class).unwrap();
+        model.py_setattr_instance(obj, "x", Value::fixnum(1).unwrap()).unwrap();
+        let mut cache = InlineCache::empty();
+        assert_eq!(model.getattr(obj, "x", &mut cache).unwrap().as_fixnum(), Some(1));
+        model.py_delattr_instance(obj, "x").unwrap();
+        assert_eq!(model.getattr(obj, "x", &mut cache), Err(Trap::AttributeError));
+        assert_eq!(model.py_delattr_instance(obj, "x"), Err(Trap::AttributeError));
+    }
+
+    #[test]
+    fn provided_module_resolves_members_as_attributes() {
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let answer_key = model.new_str("answer").unwrap();
+        let name_key = model.new_str("name").unwrap();
+        let name_val = model.new_str("lib").unwrap();
+        let namespace = model
+            .new_dict(alloc::vec![
+                (answer_key, Value::fixnum(42).unwrap()),
+                (name_key, name_val),
+            ])
+            .unwrap();
+        model.provide_module("mylib", namespace).unwrap();
+        let module = model.get_global("mylib").unwrap();
+        assert!(model.is_module_object(module));
+        let mut cache = InlineCache::empty();
+        assert_eq!(model.getattr(module, "answer", &mut cache).unwrap().as_fixnum(), Some(42));
+        let name = model.getattr(module, "name", &mut cache).unwrap();
+        assert_eq!(model.str_value(name), Some("lib"));
+        assert_eq!(model.getattr(module, "nope", &mut cache), Err(Trap::AttributeError));
+    }
+
+    #[test]
+    fn new_long_normalizes_and_round_trips() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let small = model.new_long(42).unwrap();
+        assert_eq!(small.as_fixnum(), Some(42));
+        assert!(!model.is_long(small));
+        let big = model.new_long(1_000_000_000_000_000_000).unwrap();
+        assert!(model.is_long(big));
+        assert_eq!(model.long_value(big), Some(1_000_000_000_000_000_000));
+        assert_eq!(model.as_i128(big), Some(1_000_000_000_000_000_000));
+        assert_eq!(model.display(big), "1000000000000000000");
+        assert_eq!(model.as_i128(Value::fixnum(7).unwrap()), Some(7));
+    }
+
+    #[test]
+    fn new_float_round_trips_and_coerces() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        for &n in &[0.0, -0.0, 1.0, 0.1, -3.5, 1e300, f64::INFINITY] {
+            let v = model.new_float(n).unwrap();
+            assert!(model.is_float(v));
+            assert!(!model.is_long(v));
+            assert_eq!(model.float_value(v).unwrap().to_bits(), n.to_bits());
+            assert_eq!(model.as_f64(v), Some(n));
+        }
+        assert_eq!(model.as_f64(Value::fixnum(7).unwrap()), Some(7.0));
+        assert_eq!(model.as_f64(Value::TRUE), Some(1.0));
+        let big = model.new_long(1_000_000_000_000_000_000).unwrap();
+        assert_eq!(model.as_f64(big), Some(1e18));
+        assert!(!model.is_float(Value::fixnum(7).unwrap()));
+        let nan = model.new_float(f64::NAN).unwrap();
+        assert!(model.is_float(nan));
+        assert!(model.float_value(nan).unwrap().is_nan());
+    }
+
+    #[cfg(feature = "complex")]
+    #[test]
+    fn new_complex_round_trips_and_reprs() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let c = model.new_complex(1.5, -2.5).unwrap();
+        assert!(model.is_complex(c));
+        assert_eq!(model.complex_value(c), Some((1.5, -2.5)));
+        assert_eq!(model.as_complex(Value::fixnum(3).unwrap()), Some((3.0, 0.0)));
+        assert_eq!(model.as_complex(c), Some((1.5, -2.5)));
+        let f = model.new_float(1.5).unwrap();
+        assert!(!model.is_complex(f));
+        assert!(model.float_value(c).is_none());
+    }
+
+    #[cfg(feature = "complex")]
+    #[test]
+    fn format_complex_matches_cpython_repr() {
+        let cases: &[(f64, f64, &str)] = &[
+            (0.0, 0.0, "0j"),
+            (0.0, 1.0, "1j"),
+            (0.0, -1.0, "-1j"),
+            (1.0, 2.0, "(1+2j)"),
+            (3.0, -4.0, "(3-4j)"),
+            (1.0, 0.0, "(1+0j)"),
+            (2.5, -0.5, "(2.5-0.5j)"),
+            (-0.0, -1.0, "(-0-1j)"),
+            (-0.0, -0.0, "(-0-0j)"),
+            (1e100, 2e-5, "(1e+100+2e-05j)"),
+        ];
+        for &(re, im, expected) in cases {
+            assert_eq!(format_complex(re, im), expected, "complex({re}, {im})");
+        }
+    }
+
+    #[test]
+    fn format_float_matches_cpython_repr() {
+        let cases: &[(f64, &str)] = &[
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1.0, "1.0"),
+            (-1.0, "-1.0"),
+            (3.0, "3.0"),
+            (0.5, "0.5"),
+            (0.1, "0.1"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (10.0 / 3.0, "3.3333333333333335"),
+            (100.0, "100.0"),
+            (123.456, "123.456"),
+            (1.2345678901234567, "1.2345678901234567"),
+            (0.1234567890123456, "0.1234567890123456"),
+            (1e15, "1000000000000000.0"),
+            (1234567890123456.0, "1234567890123456.0"),
+            (1e16, "1e+16"),
+            (1e17, "1e+17"),
+            (12345678901234567.0, "1.2345678901234568e+16"),
+            (1e20, "1e+20"),
+            (1e100, "1e+100"),
+            (1e308, "1e+308"),
+            (1e-4, "0.0001"),
+            (0.000123, "0.000123"),
+            (1e-5, "1e-05"),
+            (1e-100, "1e-100"),
+            (1e-308, "1e-308"),
+            (-0.1, "-0.1"),
+            (-1e16, "-1e+16"),
+            (-1e-5, "-1e-05"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ];
+        for &(value, expected) in cases {
+            assert_eq!(format_float(value), expected, "repr({value:e})");
+        }
+    }
+
+    #[test]
+    fn format_value_spec_float_types_match_python() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let cases: &[(&str, f64, &str)] = &[
+            (".2f", 3.14159, "3.14"),
+            (".0f", 3.14159, "3"),
+            ("08.2f", 3.14159, "00003.14"),
+            ("+.2f", 3.14159, "+3.14"),
+            ("^10.2f", 3.14159, "   3.14   "),
+            (".2e", 12345.678, "1.23e+04"),
+            (".0e", 12345.678, "1e+04"),
+            ("E", 3.14159, "3.141590E+00"),
+            ("g", 1234567.0, "1.23457e+06"),
+            (".3g", 0.0001234, "0.000123"),
+            (".1%", 0.5, "50.0%"),
+            (".3", 3.0, "3.0"),
+            (",.2f", 1234567.89, "1,234,567.89"),
+            ("_.0f", 1234567.0, "1_234_567"),
+            (".2f", -0.0, "-0.00"),
+            (".2f", f64::INFINITY, "inf"),
+            ("+f", f64::NAN, "+nan"),
+            ("F", f64::INFINITY, "INF"),
+        ];
+        for &(spec, value, expected) in cases {
+            let v = model.new_float(value).unwrap();
+            assert_eq!(model.format_value_spec(v, spec).unwrap(), expected, "format({value:e}, {spec:?})");
+        }
+    }
+
+    #[test]
+    fn py_hash_matches_python_for_ints_and_rejects_unhashables() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        assert_eq!(model.py_hash(Value::fixnum(5).unwrap()).unwrap().as_fixnum(), Some(5));
+        assert_eq!(model.py_hash(Value::fixnum(-1).unwrap()).unwrap().as_fixnum(), Some(-2));
+        assert_eq!(model.py_hash(Value::TRUE).unwrap().as_fixnum(), Some(1));
+        let s = model.new_str("abc").unwrap();
+        assert_eq!(model.py_hash(s).unwrap(), model.py_hash(s).unwrap());
+        let t = model.new_tuple(alloc::vec![Value::fixnum(1).unwrap(), s]).unwrap();
+        assert_eq!(model.py_hash(t).unwrap(), model.py_hash(t).unwrap());
+        let l = model.new_list(alloc::vec![Value::fixnum(1).unwrap()]).unwrap();
+        assert_eq!(model.py_hash(l), Err(Trap::TypeError));
+    }
+
+    #[test]
+    fn new_dict_fromkeys_dedups_keys() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let keys = model
+            .new_list(alloc::vec![
+                Value::fixnum(1).unwrap(),
+                Value::fixnum(1).unwrap(),
+                Value::fixnum(2).unwrap(),
+            ])
+            .unwrap();
+        let zero = Value::fixnum(0).unwrap();
+        let d = model.new_dict_fromkeys(keys, zero).unwrap();
+        assert_eq!(model.py_len(d).unwrap().as_fixnum(), Some(2));
+    }
+
+    #[test]
+    fn trap_to_exception_carries_context_and_constant_messages() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let key = model.new_str("missing").unwrap();
+        model.set_trap_arg(key);
+        let exc = model.trap_to_exception(Trap::KeyError).unwrap();
+        assert_eq!(model.display(exc), "'missing'");
+        let zde = model.trap_to_exception(Trap::ZeroDivisionError).unwrap();
+        assert_eq!(model.display(zde), "division by zero");
+        let trap = model.with_message(Trap::IndexError, "list index out of range");
+        let ie = model.trap_to_exception(trap).unwrap();
+        assert_eq!(model.display(ie), "list index out of range");
+        let te = model.trap_to_exception(Trap::TypeError).unwrap();
+        assert_eq!(model.display(te), "");
+    }
+
+    #[test]
+    fn format_value_spec_covers_int_and_str() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let n = Value::fixnum(42).unwrap();
+        assert_eq!(model.format_value_spec(n, "05d").unwrap(), "00042");
+        assert_eq!(model.format_value_spec(n, "x").unwrap(), "2a");
+        assert_eq!(model.format_value_spec(Value::fixnum(255).unwrap(), "#X").unwrap(), "0XFF");
+        assert_eq!(model.format_value_spec(n, ">5").unwrap(), "   42");
+        assert_eq!(model.format_value_spec(Value::fixnum(-42).unwrap(), "+d").unwrap(), "-42");
+        let s = model.new_str("abcdef").unwrap();
+        assert_eq!(model.format_value_spec(s, ".3").unwrap(), "abc");
+        assert_eq!(model.format_value_spec(s, "^8").unwrap(), " abcdef ");
+        assert_eq!(model.format_value_spec(n, ".2f"), Err(Trap::Unsupported));
     }
 
     #[test]
@@ -3104,6 +6440,74 @@ mod tests {
         let dup = model.new_dict(alloc::vec![(n(1), n(1)), (n(1), n(2))]).unwrap();
         assert_eq!(model.py_len(dup).unwrap().as_fixnum(), Some(1));
         assert_eq!(model.py_getitem(dup, n(1)).unwrap().as_fixnum(), Some(2));
+    }
+
+    #[test]
+    fn slice_assignment_matches_python() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let n = |i: i32| Value::fixnum(i).unwrap();
+        fn run(model: &mut ObjectModel, base: &[i32], s: Value, e: Value, k: Value, rhs: Vec<Value>) -> Result<String, Trap> {
+            let list = model.new_list(base.iter().map(|&i| Value::fixnum(i).unwrap()).collect())?;
+            let slice = model.new_slice(s, e, k)?;
+            model.seq_setitem_slice(list, slice, rhs)?;
+            Ok(model.repr(list))
+        }
+        let five = [1, 2, 3, 4, 5];
+        let none = Value::NONE;
+        assert_eq!(run(&mut model, &five, n(1), n(3), none, alloc::vec![n(10), n(20), n(30)]).unwrap(), "[1, 10, 20, 30, 4, 5]");
+        assert_eq!(run(&mut model, &five, n(1), n(4), none, alloc::vec![n(99)]).unwrap(), "[1, 99, 5]");
+        assert_eq!(run(&mut model, &five, n(1), n(1), none, alloc::vec![n(10), n(20)]).unwrap(), "[1, 10, 20, 2, 3, 4, 5]");
+        assert_eq!(run(&mut model, &five, n(1), n(3), none, alloc::vec![]).unwrap(), "[1, 4, 5]");
+        assert_eq!(run(&mut model, &five, n(-2), none, none, alloc::vec![n(99)]).unwrap(), "[1, 2, 3, 99]");
+        assert_eq!(run(&mut model, &five, n(3), n(1), none, alloc::vec![n(88)]).unwrap(), "[1, 2, 3, 88, 4, 5]");
+        assert_eq!(run(&mut model, &five, none, none, none, alloc::vec![n(7), n(8)]).unwrap(), "[7, 8]");
+        assert_eq!(run(&mut model, &five, none, none, n(2), alloc::vec![n(10), n(20), n(30)]).unwrap(), "[10, 2, 20, 4, 30]");
+        assert_eq!(run(&mut model, &[1, 2, 3], none, none, n(-1), alloc::vec![n(10), n(20), n(30)]).unwrap(), "[30, 20, 10]");
+        assert!(matches!(run(&mut model, &five, none, none, n(2), alloc::vec![n(1), n(2)]), Err(Trap::ValueError)));
+    }
+
+    #[test]
+    fn cell_boxes_and_shares_a_value() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let cell = model.new_cell(Value::fixnum(5).unwrap()).unwrap();
+        assert!(model.is_cell(cell));
+        assert!(!model.is_cell(Value::fixnum(5).unwrap()));
+        assert_eq!(model.cell_get(cell).unwrap().as_fixnum(), Some(5));
+        model.cell_set(cell, Value::fixnum(10).unwrap()).unwrap();
+        assert_eq!(model.cell_get(cell).unwrap().as_fixnum(), Some(10));
+        let s = model.new_str("captured").unwrap();
+        let boxed = model.new_cell(s).unwrap();
+        assert_eq!(model.str_value(model.cell_get(boxed).unwrap()), Some("captured"));
+        assert!(matches!(model.cell_get(Value::NONE), Err(Trap::TypeError)));
+    }
+
+    #[test]
+    fn del_item_matches_python() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let n = |i: i32| Value::fixnum(i).unwrap();
+        let none = Value::NONE;
+        fn del_index(model: &mut ObjectModel, base: &[i32], index: Value) -> Result<String, Trap> {
+            let list = model.new_list(base.iter().map(|&i| Value::fixnum(i).unwrap()).collect())?;
+            model.py_delitem(list, index)?;
+            Ok(model.repr(list))
+        }
+        fn del_slice(model: &mut ObjectModel, base: &[i32], s: Value, e: Value, k: Value) -> Result<String, Trap> {
+            let list = model.new_list(base.iter().map(|&i| Value::fixnum(i).unwrap()).collect())?;
+            let slice = model.new_slice(s, e, k)?;
+            model.py_delitem(list, slice)?;
+            Ok(model.repr(list))
+        }
+        let five = [1, 2, 3, 4, 5];
+        assert_eq!(del_index(&mut model, &five, n(1)).unwrap(), "[1, 3, 4, 5]");
+        assert_eq!(del_index(&mut model, &five, n(-1)).unwrap(), "[1, 2, 3, 4]");
+        assert!(matches!(del_index(&mut model, &five, n(10)), Err(Trap::IndexError)));
+        assert_eq!(del_slice(&mut model, &five, n(1), n(3), none).unwrap(), "[1, 4, 5]");
+        assert_eq!(del_slice(&mut model, &five, none, none, n(2)).unwrap(), "[2, 4]");
+        assert_eq!(del_slice(&mut model, &five, n(1), none, n(2)).unwrap(), "[1, 3, 5]");
+        let d = model.new_dict(alloc::vec![(n(1), n(10)), (n(2), n(20))]).unwrap();
+        model.py_delitem(d, n(1)).unwrap();
+        assert_eq!(model.repr(d), "{2: 20}");
+        assert!(matches!(model.py_delitem(d, n(9)), Err(Trap::KeyError)));
     }
 
     #[test]
@@ -3489,5 +6893,51 @@ mod tests {
         assert_eq!(model.getattr(a, "x", &mut cache).unwrap().as_fixnum(), Some(1));
         assert_eq!(cache.lookup(0), Some(0));
         assert_eq!(model.getattr(b, "x", &mut cache).unwrap().as_fixnum(), Some(3));
+    }
+
+    #[test]
+    fn compare_ordered_covers_ints_strs_and_tuples() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let i = |n: i32| Value::fixnum(n).unwrap();
+        assert_eq!(model.compare_ordered(i(1), i(2)), Ok(Ordering::Less));
+        assert_eq!(model.compare_ordered(i(5), i(5)), Ok(Ordering::Equal));
+        assert_eq!(model.compare_ordered(Value::TRUE, i(0)), Ok(Ordering::Greater));
+        let a = model.new_str("apple").unwrap();
+        let b = model.new_str("banana").unwrap();
+        assert_eq!(model.compare_ordered(a, b), Ok(Ordering::Less));
+        let t1 = model.new_tuple(alloc::vec![i(1), i(2)]).unwrap();
+        let t2 = model.new_tuple(alloc::vec![i(1), i(3)]).unwrap();
+        let t3 = model.new_tuple(alloc::vec![i(1)]).unwrap();
+        assert_eq!(model.compare_ordered(t1, t2), Ok(Ordering::Less));
+        assert_eq!(model.compare_ordered(t3, t1), Ok(Ordering::Less));
+        assert_eq!(model.compare_ordered(i(1), a), Err(Trap::TypeError));
+        assert_eq!(model.compare_ordered(t1, a), Err(Trap::TypeError));
+    }
+
+    #[test]
+    fn py_binary_concatenates_and_repeats_strs_and_sequences() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        let i = |n: i32| Value::fixnum(n).unwrap();
+        let ab = model.new_str("ab").unwrap();
+        let cat = model.py_binary(BinOp::Add, ab, ab).unwrap().unwrap();
+        assert_eq!(model.str_value(cat), Some("abab"));
+        let rep = model.py_binary(BinOp::Mul, ab, i(3)).unwrap().unwrap();
+        assert_eq!(model.str_value(rep), Some("ababab"));
+        let rep_rev = model.py_binary(BinOp::Mul, i(2), ab).unwrap().unwrap();
+        assert_eq!(model.str_value(rep_rev), Some("abab"));
+        let l1 = model.new_list(alloc::vec![i(1), i(2)]).unwrap();
+        let l2 = model.new_list(alloc::vec![i(3)]).unwrap();
+        let lcat = model.py_binary(BinOp::Add, l1, l2).unwrap().unwrap();
+        assert_eq!(model.repr(lcat), "[1, 2, 3]");
+        let lrep = model.py_binary(BinOp::Mul, l1, i(2)).unwrap().unwrap();
+        assert_eq!(model.repr(lrep), "[1, 2, 1, 2]");
+        let t1 = model.new_tuple(alloc::vec![i(1)]).unwrap();
+        let t2 = model.new_tuple(alloc::vec![i(2)]).unwrap();
+        let tcat = model.py_binary(BinOp::Add, t1, t2).unwrap().unwrap();
+        assert_eq!(model.repr(tcat), "(1, 2)");
+        assert_eq!(model.py_binary(BinOp::Add, l1, t1), Err(Trap::TypeError));
+        let empty = model.py_binary(BinOp::Mul, l1, i(0)).unwrap().unwrap();
+        assert_eq!(model.repr(empty), "[]");
+        assert_eq!(model.py_binary(BinOp::Add, i(1), i(2)).unwrap(), None);
     }
 }

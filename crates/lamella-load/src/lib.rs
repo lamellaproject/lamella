@@ -20,16 +20,30 @@ use lamella_metadata::{
 #[cfg(feature = "exceptions")]
 use lamella_metadata::exception_tag_for_name;
 use lamella_token::Token;
+
+/// Pair an intrinsic fn with its stable registry id (FNV-1a-32 of the fn's own name, computed at
+/// compile time) so binding carries the id the bake needs -- NO fn-pointer comparison, which is
+/// unreliable on wasm32. Invoke with the BARE fn name that matches the registry (so `stringify!`
+/// yields that name; a qualified path would hash wrong).
+macro_rules! intrinsic {
+    ($f:ident) => {
+        (
+            $f as lamella_cil_runtime::module::IntrinsicFn,
+            lamella_cil_runtime::intrinsic_registry::intrinsic_id(stringify!($f)),
+        )
+    };
+}
 use lamella_cil_runtime::intrinsics::{
-    array_clone, array_empty, array_get_value, array_set_value, boolean_to_string,
+    array_clone, array_empty, array_get_value, array_rank, array_set_value, boolean_to_string,
     buffer_block_copy, buffer_byte_length, char_to_string, console_write,
     decimal_add, decimal_compare, decimal_divide, decimal_multiply, decimal_remainder,
     decimal_subtract,
     console_write_bool, console_write_char, console_write_int32, console_write_int64,
+    console_write_uint32, console_write_uint64,
     console_write_line, console_write_line_bool, console_write_line_char, console_write_line_empty,
     console_write_line_int32, console_write_line_int64, console_write_line_object,
     console_write_line_uint32, console_write_line_uint64, debug_write,
-    datetime_now_ticks, delegate_combine, delegate_remove,
+    datetime_now_ticks, delegate_combine, delegate_equals, delegate_not_equals, delegate_remove,
     environment_get_variable, environment_processor_count, environment_tick_count,
     enum_format, enum_get_name,
     enum_get_names, enum_get_values, enum_is_defined, enum_parse, exception_ctor,
@@ -69,8 +83,10 @@ use lamella_cil_runtime::intrinsics::{
     activator_create_instance, assembly_full_name, assembly_get_type, assembly_get_types,
     field_get_value, field_set_value, member_get_type,
     method_invoke, method_is_abstract, method_is_final, method_is_public, method_is_static,
-    method_parameter_count, method_parameter_name, method_parameter_type,
-    constructor_invoke, method_is_virtual, reflect_handle_equals, reflect_handle_not_equals,
+    method_parameter_count, method_parameter_custom_attributes, method_parameter_name,
+    method_parameter_type,
+    constructor_invoke, field_get_raw_constant, field_is_literal, field_is_static,
+    method_is_virtual, reflect_handle_equals, reflect_handle_not_equals,
     type_get_base_type, type_get_constructor,
     char_is_upper, char_is_white_space, char_to_lower, char_to_upper, collection_contains,
     collection_push, convert_to_boolean_int, convert_to_byte_int, convert_to_char_int, int32_parse,
@@ -116,8 +132,12 @@ use lamella_cil_runtime::module::{
     AttrValue, BoxedPrimitive, LoadedAttribute, RawCil, VarargSite, asm_key,
 };
 #[cfg(feature = "NETMFv4_4")]
-use lamella_cil_runtime::module::{MethodParam, ReflectField, ReflectMethod, ReflectType};
-use lamella_cil_runtime::{IntrinsicFn, MethodId, Module, TypeId, Value};
+use lamella_cil_runtime::module::{
+    MethodParam, ReflectField, ReflectMethod, ReflectType, param_attr_key,
+};
+use lamella_cil_runtime::{
+    IntrinsicFn, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget, TypeId, Value,
+};
 
 const TYPE_REF: u8 = 0x01;
 const TYPE_DEF: u8 = 0x02;
@@ -966,6 +986,7 @@ fn load_assembly<'pe>(
             module.set_enum_flags(asm, Token::new(TYPE_DEF, type_row).0);
         }
         let mut own = Vec::new();
+        let statics_start = module.static_field_count();
         for field in type_def.fields() {
             field_row += 1;
             let token = Token::new(FIELD, field_row);
@@ -996,6 +1017,11 @@ fn load_assembly<'pe>(
             own.push((token, default_field_value(field.signature())));
         }
         let type_id = module.add_type(Vec::new());
+        module.bind_static_slot_range(
+            statics_start as u32,
+            module.static_field_count() as u32,
+            type_id,
+        );
         if let Some(name) = type_def.name() {
             if module.string_type_id().is_none() && name.namespace == "System" && name.name == "String"
             {
@@ -1081,8 +1107,8 @@ fn load_assembly<'pe>(
                     })
                 })
                 .flatten();
-            if let Some(func) = intrinsic {
-                let id = module.add_intrinsic(asm, func, arg_count(&method));
+            if let Some((func, intr_id)) = intrinsic {
+                let id = module.add_intrinsic(asm, func, intr_id, arg_count(&method));
                 module.bind_token(asm, token, id);
                 module.set_method_type(id, type_id);
                 if let Some(declaring) = type_def.name() {
@@ -1112,6 +1138,7 @@ fn load_assembly<'pe>(
                 continue;
             }
             let Some((body, raw_il)) = method.body_and_bytes() else {
+                bind_pinvoke_target(assembly, module, asm, token, &method);
                 continue;
             };
             for instruction in body.code.iter() {
@@ -1140,6 +1167,7 @@ fn load_assembly<'pe>(
                         }
                         Opcode::Newarr => {
                             newarr_tokens.insert(*operand);
+                            type_test_tokens.insert(*operand);
                         }
                         Opcode::Ldtoken if operand.table() == FIELD => {
                             ldtoken_field_tokens.insert(*operand);
@@ -1426,9 +1454,9 @@ fn bind_bcl_calls(
                     module.mark_md_array_ctor(asm, *token, u16::try_from(rank).unwrap_or(0));
                     continue;
                 }
-                "Get" => Some(md_array_get as IntrinsicFn),
-                "Set" => Some(md_array_set as IntrinsicFn),
-                "Address" => Some(md_array_address as IntrinsicFn),
+                "Get" => Some(intrinsic!(md_array_get)),
+                "Set" => Some(intrinsic!(md_array_set)),
+                "Address" => Some(intrinsic!(md_array_address)),
                 _ => continue,
             }
         } else if parent.table() == TYPE_REF {
@@ -1438,6 +1466,15 @@ fn bind_bcl_calls(
             else {
                 continue;
             };
+            if let Some(params) = string_builder_ctor(
+                parent_type.namespace,
+                parent_type.name,
+                method_name,
+                signature.as_ref(),
+            ) {
+                module.mark_string_builder_ctor(asm, *token, params);
+                continue;
+            }
             if resolve_external {
                 let key = name_key(
                     assembly,
@@ -1451,15 +1488,6 @@ fn bind_bcl_calls(
                     module.bind_token(asm, *token, target);
                     continue;
                 }
-            }
-            if let Some(params) = string_builder_ctor(
-                parent_type.namespace,
-                parent_type.name,
-                method_name,
-                signature.as_ref(),
-            ) {
-                module.mark_string_builder_ctor(asm, *token, params);
-                continue;
             }
             if let Some(params) = list_ctor(
                 parent_type.namespace,
@@ -1479,13 +1507,13 @@ fn bind_bcl_calls(
         } else {
             continue;
         };
-        let Some(function) = function else {
+        let Some((function, intr_id)) = function else {
             continue;
         };
         let id = match bound.get(&(function as usize, arg_count)) {
             Some(&id) => id,
             None => {
-                let id = module.add_intrinsic(asm, function, arg_count);
+                let id = module.add_intrinsic(asm, function, intr_id, arg_count);
                 bound.insert((function as usize, arg_count), id);
                 id
             }
@@ -1523,19 +1551,19 @@ fn bind_generic_calls(
         else {
             continue;
         };
-        let recognized: Option<(IntrinsicFn, u16)> = match (
+        let recognized: Option<((IntrinsicFn, u32), u16)> = match (
             parent_type.namespace,
             parent_type.name,
             member.name(),
         ) {
-            ("System", "Array", Some("Empty")) => Some((array_empty as IntrinsicFn, 0)),
+            ("System", "Array", Some("Empty")) => Some((intrinsic!(array_empty), 0)),
             ("System.Threading", "Interlocked", Some("CompareExchange")) => {
-                Some((interlocked_compare_exchange as IntrinsicFn, 3))
+                Some((intrinsic!(interlocked_compare_exchange), 3))
             }
             _ => None,
         };
-        if let Some((function, arg_count)) = recognized {
-            let id = module.add_intrinsic(asm, function, arg_count);
+        if let Some(((function, intr_id), arg_count)) = recognized {
+            let id = module.add_intrinsic(asm, function, intr_id, arg_count);
             module.bind_token(asm, *token, id);
         }
     }
@@ -1632,7 +1660,7 @@ fn bcl_intrinsic(
     type_name: &str,
     method: &str,
     signature: Option<&MethodSig>,
-) -> Option<IntrinsicFn> {
+) -> Option<(IntrinsicFn, u32)> {
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Text" {
         return extended::text_intrinsic(type_name, method, signature);
@@ -1645,16 +1673,17 @@ fn bcl_intrinsic(
         && type_name == "RuntimeHelpers"
         && method == "InitializeArray"
     {
-        return Some(initialize_array);
+        return Some(intrinsic!(initialize_array));
     }
     if namespace == "System.Reflection" && type_name == "MemberInfo" && method == "get_Name" {
-        return Some(type_get_name);
+        return Some(intrinsic!(type_get_name));
     }
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Reflection" {
         match method {
-            "op_Equality" => return Some(reflect_handle_equals),
-            "op_Inequality" => return Some(reflect_handle_not_equals),
+            "op_Equality" => return Some(intrinsic!(reflect_handle_equals)),
+            "op_Inequality" => return Some(intrinsic!(reflect_handle_not_equals)),
+            "HandleEquals" => return Some(intrinsic!(reflect_handle_equals)),
             _ => {}
         }
     }
@@ -1663,16 +1692,19 @@ fn bcl_intrinsic(
         && method == "GetCustomAttributes"
     {
         return match parameters_of(signature) {
-            [SigType::Boolean] => Some(get_custom_attributes),
+            [SigType::Boolean] => Some(intrinsic!(get_custom_attributes)),
             _ => None,
         };
     }
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Reflection" && type_name == "FieldInfo" {
         match (method, parameters_of(signature)) {
-            ("GetValue", [SigType::Object]) => return Some(field_get_value),
-            ("SetValue", [SigType::Object, SigType::Object]) => return Some(field_set_value),
-            ("get_FieldType", []) => return Some(member_get_type),
+            ("GetValue", [SigType::Object]) => return Some(intrinsic!(field_get_value)),
+            ("SetValue", [SigType::Object, SigType::Object]) => return Some(intrinsic!(field_set_value)),
+            ("get_FieldType", []) => return Some(intrinsic!(member_get_type)),
+            ("get_IsLiteral", []) => return Some(intrinsic!(field_is_literal)),
+            ("get_IsStatic", []) => return Some(intrinsic!(field_is_static)),
+            ("GetRawConstantValue", []) => return Some(intrinsic!(field_get_raw_constant)),
             _ => {}
         }
     }
@@ -1681,29 +1713,32 @@ fn bcl_intrinsic(
         && (type_name == "MethodBase" || type_name == "MethodInfo")
         && method == "Invoke"
     {
-        return Some(method_invoke);
+        return Some(intrinsic!(method_invoke));
     }
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Reflection" && type_name == "ConstructorInfo" && method == "Invoke" {
         if let [SigType::SzArray(_)] = parameters_of(signature) {
-            return Some(constructor_invoke);
+            return Some(intrinsic!(constructor_invoke));
         }
     }
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Reflection" && type_name == "MethodInfo" && method == "get_ReturnType" {
-        return Some(member_get_type);
+        return Some(intrinsic!(member_get_type));
     }
     #[cfg(feature = "NETMFv4_4")]
     if namespace == "System.Reflection" && type_name == "MethodBase" {
         match method {
-            "get_IsPublic" => return Some(method_is_public),
-            "get_IsStatic" => return Some(method_is_static),
-            "get_IsFinal" => return Some(method_is_final),
-            "get_IsVirtual" => return Some(method_is_virtual),
-            "get_IsAbstract" => return Some(method_is_abstract),
-            "GetParameterCount" => return Some(method_parameter_count),
-            "GetParameterType" => return Some(method_parameter_type),
-            "GetParameterName" => return Some(method_parameter_name),
+            "get_IsPublic" => return Some(intrinsic!(method_is_public)),
+            "get_IsStatic" => return Some(intrinsic!(method_is_static)),
+            "get_IsFinal" => return Some(intrinsic!(method_is_final)),
+            "get_IsVirtual" => return Some(intrinsic!(method_is_virtual)),
+            "get_IsAbstract" => return Some(intrinsic!(method_is_abstract)),
+            "GetParameterCount" => return Some(intrinsic!(method_parameter_count)),
+            "GetParameterType" => return Some(intrinsic!(method_parameter_type)),
+            "GetParameterName" => return Some(intrinsic!(method_parameter_name)),
+            "GetParameterCustomAttributes" => {
+                return Some(intrinsic!(method_parameter_custom_attributes));
+            }
             _ => {}
         }
     }
@@ -1711,40 +1746,40 @@ fn bcl_intrinsic(
     if namespace == "System.Reflection" && type_name == "Assembly" {
         match method {
             "GetType" if matches!(parameters_of(signature), [SigType::String]) => {
-                return Some(assembly_get_type);
+                return Some(intrinsic!(assembly_get_type));
             }
-            "get_FullName" => return Some(assembly_full_name),
-            "GetTypes" => return Some(assembly_get_types),
+            "get_FullName" => return Some(intrinsic!(assembly_full_name)),
+            "GetTypes" => return Some(intrinsic!(assembly_get_types)),
             _ => {}
         }
     }
     if namespace == "System" && type_name == "IntPtr" {
         match method {
-            "FromRawValue" => return Some(intptr_from_raw_value),
-            "ToRawValue" => return Some(intptr_to_raw_value),
+            "FromRawValue" => return Some(intrinsic!(intptr_from_raw_value)),
+            "ToRawValue" => return Some(intrinsic!(intptr_to_raw_value)),
             _ => {}
         }
     }
     if namespace == "System.Runtime.InteropServices" && type_name == "Marshal" {
         match method {
-            "__AllocHGlobal" => return Some(marshal_alloc_hglobal),
-            "__FreeHGlobal" => return Some(marshal_free_hglobal),
-            "__ReadByte" => return Some(marshal_read_byte),
-            "__ReadInt16" => return Some(marshal_read_int16),
-            "__ReadInt32" => return Some(marshal_read_int32),
-            "__ReadInt64" => return Some(marshal_read_int64),
-            "__WriteByte" => return Some(marshal_write_byte),
-            "__WriteInt16" => return Some(marshal_write_int16),
-            "__WriteInt32" => return Some(marshal_write_int32),
-            "__WriteInt64" => return Some(marshal_write_int64),
-            "SizeOf" => return Some(marshal_size_of),
+            "__AllocHGlobal" => return Some(intrinsic!(marshal_alloc_hglobal)),
+            "__FreeHGlobal" => return Some(intrinsic!(marshal_free_hglobal)),
+            "__ReadByte" => return Some(intrinsic!(marshal_read_byte)),
+            "__ReadInt16" => return Some(intrinsic!(marshal_read_int16)),
+            "__ReadInt32" => return Some(intrinsic!(marshal_read_int32)),
+            "__ReadInt64" => return Some(intrinsic!(marshal_read_int64)),
+            "__WriteByte" => return Some(intrinsic!(marshal_write_byte)),
+            "__WriteInt16" => return Some(intrinsic!(marshal_write_int16)),
+            "__WriteInt32" => return Some(intrinsic!(marshal_write_int32)),
+            "__WriteInt64" => return Some(intrinsic!(marshal_write_int64)),
+            "SizeOf" => return Some(intrinsic!(marshal_size_of)),
             _ => {}
         }
     }
     if namespace == "Lamella.Hardware" && type_name == "Mmio" {
         match method {
-            "Read32" => return Some(mmio_read32),
-            "Write32" => return Some(mmio_write32),
+            "Read32" => return Some(intrinsic!(mmio_read32)),
+            "Write32" => return Some(intrinsic!(mmio_write32)),
             _ => {}
         }
     }
@@ -1753,91 +1788,91 @@ fn bcl_intrinsic(
         && method == "DebugWrite"
     {
         return match parameters_of(signature) {
-            [SigType::String] => Some(debug_write),
+            [SigType::String] => Some(intrinsic!(debug_write)),
             _ => None,
         };
     }
     if namespace == "System.Threading" && type_name == "Thread" {
         match method {
-            "StartThread" => return Some(thread_start),
-            "JoinThread" => return Some(thread_join),
-            "YieldThread" => return Some(thread_yield),
-            "SleepThread" => return Some(thread_sleep),
+            "StartThread" => return Some(intrinsic!(thread_start)),
+            "JoinThread" => return Some(intrinsic!(thread_join)),
+            "YieldThread" => return Some(intrinsic!(thread_yield)),
+            "SleepThread" => return Some(intrinsic!(thread_sleep)),
             _ => {}
         }
     }
     if namespace == "System.Threading" && type_name == "Monitor" {
         match method {
-            "EnterLock" => return Some(monitor_enter),
-            "ExitLock" => return Some(monitor_exit),
-            "TryEnterLock" => return Some(monitor_try_enter),
-            "WaitLock" => return Some(monitor_wait),
-            "PulseLock" => return Some(monitor_pulse),
-            "PulseAllLock" => return Some(monitor_pulse_all),
+            "EnterLock" => return Some(intrinsic!(monitor_enter)),
+            "ExitLock" => return Some(intrinsic!(monitor_exit)),
+            "TryEnterLock" => return Some(intrinsic!(monitor_try_enter)),
+            "WaitLock" => return Some(intrinsic!(monitor_wait)),
+            "PulseLock" => return Some(intrinsic!(monitor_pulse)),
+            "PulseAllLock" => return Some(intrinsic!(monitor_pulse_all)),
             _ => {}
         }
     }
     if namespace == "System.Net.Sockets" && type_name == "Socket" {
         match method {
-            "ConnectStart" => return Some(socket_connect_start),
-            "ConnectPoll" => return Some(socket_connect_poll),
-            "ListenStart" => return Some(socket_listen),
-            "AcceptPoll" => return Some(socket_accept),
-            "SendPoll" => return Some(socket_send),
-            "ReceivePoll" => return Some(socket_recv),
-            "LocalPort" => return Some(socket_local_port),
-            "CloseSocket" => return Some(socket_close),
-            "UdpBind" => return Some(socket_udp_bind),
-            "UdpSendTo" => return Some(socket_udp_send_to),
-            "UdpReceiveFrom" => return Some(socket_udp_recv_from),
+            "ConnectStart" => return Some(intrinsic!(socket_connect_start)),
+            "ConnectPoll" => return Some(intrinsic!(socket_connect_poll)),
+            "ListenStart" => return Some(intrinsic!(socket_listen)),
+            "AcceptPoll" => return Some(intrinsic!(socket_accept)),
+            "SendPoll" => return Some(intrinsic!(socket_send)),
+            "ReceivePoll" => return Some(intrinsic!(socket_recv)),
+            "LocalPort" => return Some(intrinsic!(socket_local_port)),
+            "CloseSocket" => return Some(intrinsic!(socket_close)),
+            "UdpBind" => return Some(intrinsic!(socket_udp_bind)),
+            "UdpSendTo" => return Some(intrinsic!(socket_udp_send_to)),
+            "UdpReceiveFrom" => return Some(intrinsic!(socket_udp_recv_from)),
             _ => {}
         }
     }
     if namespace == "System.Net" && type_name == "Dns" {
         match method {
-            "ResolveHost" => return Some(dns_resolve_host),
+            "ResolveHost" => return Some(intrinsic!(dns_resolve_host)),
             _ => {}
         }
     }
     if namespace == "System.Net.Security" && type_name == "TlsNative" {
         match method {
-            "ClientConfig" => return Some(tls_client_config),
-            "ServerConfig" => return Some(tls_server_config),
-            "ClientNew" => return Some(tls_client_new),
-            "ServerNew" => return Some(tls_server_new),
-            "Process" => return Some(tls_process),
-            "WantsWrite" => return Some(tls_wants_write),
-            "WriteTls" => return Some(tls_write_tls),
-            "ReadTls" => return Some(tls_read_tls),
-            "ReadPlain" => return Some(tls_read_plain),
-            "WritePlain" => return Some(tls_write_plain),
-            "PeerCert" => return Some(tls_peer_cert),
-            "CloseTls" => return Some(tls_close),
-            "DefaultStack" => return Some(tls_default_stack),
+            "ClientConfig" => return Some(intrinsic!(tls_client_config)),
+            "ServerConfig" => return Some(intrinsic!(tls_server_config)),
+            "ClientNew" => return Some(intrinsic!(tls_client_new)),
+            "ServerNew" => return Some(intrinsic!(tls_server_new)),
+            "Process" => return Some(intrinsic!(tls_process)),
+            "WantsWrite" => return Some(intrinsic!(tls_wants_write)),
+            "WriteTls" => return Some(intrinsic!(tls_write_tls)),
+            "ReadTls" => return Some(intrinsic!(tls_read_tls)),
+            "ReadPlain" => return Some(intrinsic!(tls_read_plain)),
+            "WritePlain" => return Some(intrinsic!(tls_write_plain)),
+            "PeerCert" => return Some(intrinsic!(tls_peer_cert)),
+            "CloseTls" => return Some(intrinsic!(tls_close)),
+            "DefaultStack" => return Some(intrinsic!(tls_default_stack)),
             _ => {}
         }
     }
     #[cfg(feature = "varargs")]
     if namespace == "System" && type_name == "ArgIteratorNative" {
         match method {
-            "Cookie" => return Some(arg_iterator_cookie),
-            "RemainingCount" => return Some(arg_iterator_remaining),
-            "GetArg" => return Some(arg_iterator_get),
+            "Cookie" => return Some(intrinsic!(arg_iterator_cookie)),
+            "RemainingCount" => return Some(intrinsic!(arg_iterator_remaining)),
+            "GetArg" => return Some(intrinsic!(arg_iterator_get)),
             _ => {}
         }
     }
     if namespace == "System" && type_name == "Environment" {
         match method {
-            "get_TickCount" => return Some(environment_tick_count),
-            "get_ProcessorCount" => return Some(environment_processor_count),
-            "GetEnvironmentVariable" => return Some(environment_get_variable),
+            "get_TickCount" => return Some(intrinsic!(environment_tick_count)),
+            "get_ProcessorCount" => return Some(intrinsic!(environment_processor_count)),
+            "GetEnvironmentVariable" => return Some(intrinsic!(environment_get_variable)),
             _ => {}
         }
     }
     if namespace != "System" {
         return None;
     }
-    let base: Option<IntrinsicFn> = match (type_name, method) {
+    let base: Option<(IntrinsicFn, u32)> = match (type_name, method) {
         ("Console", "WriteLine") => console_write_line_overload(signature),
         ("Console", "Write") => console_write_overload(signature),
         ("String", "Concat") => string_concat_overload(signature),
@@ -1849,195 +1884,209 @@ fn bcl_intrinsic(
         ("String", "Substring") => string_substring_overload(signature),
         ("Object", ".ctor") => object_ctor_overload(signature),
         ("Object", "ReferenceEquals") => match parameters_of(signature) {
-            [SigType::Object, SigType::Object] => Some(object_reference_equals),
+            [SigType::Object, SigType::Object] => Some(intrinsic!(object_reference_equals)),
             _ => None,
         },
-        ("Object", "Finalize") => Some(object_ctor),
+        ("Object", "Finalize") => Some(intrinsic!(object_ctor)),
         ("Object", "GetType") => match parameters_of(signature) {
-            [] => Some(object_get_type),
+            [] => Some(intrinsic!(object_get_type)),
             _ => None,
         },
-        ("Exception", ".ctor") => Some(exception_ctor),
-        ("Exception", "get_Message") => Some(exception_get_message),
+        ("Exception", ".ctor") => Some(intrinsic!(exception_ctor)),
+        ("Exception", "get_Message") => Some(intrinsic!(exception_get_message)),
         #[cfg(feature = "finalizers")]
-        ("GC", "SuppressFinalize") => Some(suppress_finalize),
+        ("GC", "SuppressFinalize") => Some(intrinsic!(suppress_finalize)),
         #[cfg(feature = "finalizers")]
-        ("GC", "ReRegisterForFinalize") => Some(reregister_finalize),
+        ("GC", "ReRegisterForFinalize") => Some(intrinsic!(reregister_finalize)),
         #[cfg(feature = "gc")]
-        ("GC", "Collect") => Some(gc_collect),
+        ("GC", "Collect") => Some(intrinsic!(gc_collect)),
         #[cfg(feature = "finalizers")]
-        ("GC", "WaitForPendingFinalizers") => Some(wait_for_pending_finalizers),
+        ("GC", "WaitForPendingFinalizers") => Some(intrinsic!(wait_for_pending_finalizers)),
         #[cfg(feature = "gc")]
-        ("WeakReference", "MakeWeakCell") => Some(weak_make_cell),
+        ("WeakReference", "MakeWeakCell") => Some(intrinsic!(weak_make_cell)),
         #[cfg(feature = "gc")]
-        ("WeakReference", "ReadWeakCell") => Some(weak_read_cell),
+        ("WeakReference", "ReadWeakCell") => Some(intrinsic!(weak_read_cell)),
         #[cfg(feature = "gc")]
-        ("WeakReference", "WriteWeakCell") => Some(weak_write_cell),
-        ("Type", "GetTypeFromHandle") => Some(type_from_handle),
-        ("Type", "get_Name") => Some(type_get_name),
+        ("WeakReference", "WriteWeakCell") => Some(intrinsic!(weak_write_cell)),
+        ("Type", "GetTypeFromHandle") => Some(intrinsic!(type_from_handle)),
+        ("Type", "get_Name") => Some(intrinsic!(type_get_name)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_FullName") => Some(type_get_full_name),
+        ("Type", "get_FullName") => Some(intrinsic!(type_get_full_name)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_Namespace") => Some(type_get_namespace),
+        ("Type", "get_Namespace") => Some(intrinsic!(type_get_namespace)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_Assembly") => Some(type_get_assembly),
+        ("Type", "get_Assembly") => Some(intrinsic!(type_get_assembly)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_BaseType") => Some(type_get_base_type),
+        ("Type", "get_BaseType") => Some(intrinsic!(type_get_base_type)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_IsEnum") => Some(type_is_enum),
+        ("Type", "get_IsEnum") => Some(intrinsic!(type_is_enum)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_IsValueType") => Some(type_is_value_type),
+        ("Type", "get_IsValueType") => Some(intrinsic!(type_is_value_type)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_IsClass") => Some(type_is_class),
+        ("Type", "get_IsClass") => Some(intrinsic!(type_is_class)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_IsInterface") => Some(type_is_interface),
+        ("Type", "get_IsInterface") => Some(intrinsic!(type_is_interface)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_IsAbstract") => Some(type_is_abstract),
+        ("Type", "get_IsAbstract") => Some(intrinsic!(type_is_abstract)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_IsPublic") => Some(type_is_public),
+        ("Type", "get_IsPublic") => Some(intrinsic!(type_is_public)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_IsNotPublic") => Some(type_is_not_public),
+        ("Type", "get_IsNotPublic") => Some(intrinsic!(type_is_not_public)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "get_IsArray") => Some(type_is_array),
+        ("Type", "get_IsArray") => Some(intrinsic!(type_is_array)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "op_Equality") => Some(reflect_handle_equals),
+        ("Type", "op_Equality") => Some(intrinsic!(reflect_handle_equals)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "op_Inequality") => Some(reflect_handle_not_equals),
+        ("Type", "op_Inequality") => Some(intrinsic!(reflect_handle_not_equals)),
+        #[cfg(feature = "NETMFv4_4")]
+        ("Type", "HandleEquals") => Some(intrinsic!(reflect_handle_equals)),
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetField") => match parameters_of(signature) {
-            [SigType::String] | [SigType::String, _] => Some(type_get_field),
+            [SigType::String] | [SigType::String, _] => Some(intrinsic!(type_get_field)),
             _ => None,
         },
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "GetFields") => Some(type_get_fields),
+        ("Type", "GetFields") => Some(intrinsic!(type_get_fields)),
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "GetMethods") => Some(type_get_methods),
+        ("Type", "GetMethods") => Some(intrinsic!(type_get_methods)),
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetMethod") => match parameters_of(signature) {
-            [SigType::String] | [SigType::String, _] => Some(type_get_method),
+            [SigType::String] | [SigType::String, _] => Some(intrinsic!(type_get_method)),
             _ => None,
         },
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetProperty") => match parameters_of(signature) {
-            [SigType::String] | [SigType::String, _] => Some(type_get_property),
+            [SigType::String] | [SigType::String, _] => Some(intrinsic!(type_get_property)),
             _ => None,
         },
         #[cfg(feature = "NETMFv4_4")]
-        ("Type", "GetPropertyCustomAttributes") => Some(type_property_custom_attributes),
+        ("Type", "GetPropertyCustomAttributes") => Some(intrinsic!(type_property_custom_attributes)),
         #[cfg(feature = "NETMFv4_4")]
         ("Type", "GetConstructor") => match parameters_of(signature) {
-            [SigType::SzArray(_)] => Some(type_get_constructor),
+            [SigType::SzArray(_)] => Some(intrinsic!(type_get_constructor)),
             _ => None,
         },
         #[cfg(feature = "NETMFv4_4")]
         ("Activator", "CreateInstance") => match parameters_of(signature) {
-            [_] => Some(activator_create_instance),
+            [_] => Some(intrinsic!(activator_create_instance)),
             _ => None,
         },
-        ("Enum", "Parse") => Some(enum_parse),
-        ("Enum", "IsDefined") => Some(enum_is_defined),
-        ("Enum", "GetName") => Some(enum_get_name),
-        ("Enum", "GetNames") => Some(enum_get_names),
-        ("Enum", "GetValues") => Some(enum_get_values),
-        ("Enum", "Format") => Some(enum_format),
-        ("Array", "get_Length") => Some(md_array_length),
-        ("Array", "GetLength") => Some(md_array_get_length),
+        ("Enum", "Parse") => Some(intrinsic!(enum_parse)),
+        ("Enum", "IsDefined") => Some(intrinsic!(enum_is_defined)),
+        ("Enum", "GetName") => Some(intrinsic!(enum_get_name)),
+        ("Enum", "GetNames") => Some(intrinsic!(enum_get_names)),
+        ("Enum", "GetValues") => Some(intrinsic!(enum_get_values)),
+        ("Enum", "Format") => Some(intrinsic!(enum_format)),
+        ("Array", "get_Length") => Some(intrinsic!(md_array_length)),
+        ("Array", "GetLength") => Some(intrinsic!(md_array_get_length)),
+        ("Array", "get_Rank") => Some(intrinsic!(array_rank)),
         ("Array", "GetValue") => match parameters_of(signature) {
-            [SigType::I4] => Some(array_get_value),
+            [SigType::I4] => Some(intrinsic!(array_get_value)),
             _ => None,
         },
         ("Array", "SetValue") => match parameters_of(signature) {
-            [SigType::Object, SigType::I4] => Some(array_set_value),
+            [SigType::Object, SigType::I4] => Some(intrinsic!(array_set_value)),
             _ => None,
         },
         ("Array", "Clone") => match parameters_of(signature) {
-            [] => Some(array_clone),
+            [] => Some(intrinsic!(array_clone)),
             _ => None,
         },
         ("Buffer", "BlockCopyInternal") => match parameters_of(signature) {
             [SigType::Class(_), SigType::I4, SigType::Class(_), SigType::I4, SigType::I4] => {
-                Some(buffer_block_copy)
+                Some(intrinsic!(buffer_block_copy))
             }
             _ => None,
         },
         ("Buffer", "ByteLengthInternal") => match parameters_of(signature) {
-            [SigType::Class(_)] => Some(buffer_byte_length),
+            [SigType::Class(_)] => Some(intrinsic!(buffer_byte_length)),
             _ => None,
         },
-        ("Int32", "ToString") => to_string_overload(int32_to_string, signature),
-        ("Boolean", "ToString") => to_string_overload(boolean_to_string, signature),
-        ("Char", "ToString") => to_string_overload(char_to_string, signature),
-        ("Int64", "ToString") => to_string_overload(int64_to_string, signature),
+        ("Int32", "ToString") => to_string_overload(intrinsic!(int32_to_string), signature),
+        ("Boolean", "ToString") => to_string_overload(intrinsic!(boolean_to_string), signature),
+        ("Char", "ToString") => to_string_overload(intrinsic!(char_to_string), signature),
+        ("Int64", "ToString") => to_string_overload(intrinsic!(int64_to_string), signature),
         #[cfg(feature = "float")]
-        ("Double", "ToString") => to_string_overload(double_to_string, signature),
+        ("Double", "ToString") => to_string_overload(intrinsic!(double_to_string), signature),
         #[cfg(feature = "float")]
         ("Double", "ToFixed") => match parameters_of(signature) {
-            [SigType::R8, SigType::I4] => Some(double_to_fixed),
+            [SigType::R8, SigType::I4] => Some(intrinsic!(double_to_fixed)),
             _ => None,
         },
         #[cfg(feature = "float")]
         ("Double", "ToExponential") => match parameters_of(signature) {
-            [SigType::R8, SigType::I4, SigType::Boolean] => Some(double_to_exponential),
+            [SigType::R8, SigType::I4, SigType::Boolean] => Some(intrinsic!(double_to_exponential)),
             _ => None,
         },
         #[cfg(feature = "float")]
-        ("Single", "ToString") => to_string_overload(single_to_string, signature),
+        ("Single", "ToString") => to_string_overload(intrinsic!(single_to_string), signature),
         #[cfg(feature = "float")]
         ("Single", "ToFixed") => match parameters_of(signature) {
-            [SigType::R4, SigType::I4] => Some(single_to_fixed),
+            [SigType::R4, SigType::I4] => Some(intrinsic!(single_to_fixed)),
             _ => None,
         },
         #[cfg(feature = "float")]
         ("Single", "ToExponential") => match parameters_of(signature) {
-            [SigType::R4, SigType::I4, SigType::Boolean] => Some(single_to_exponential),
+            [SigType::R4, SigType::I4, SigType::Boolean] => Some(intrinsic!(single_to_exponential)),
             _ => None,
         },
         #[cfg(feature = "float")]
         ("Single", "ParseValid") => match parameters_of(signature) {
-            [SigType::String] => Some(single_parse),
+            [SigType::String] => Some(intrinsic!(single_parse)),
             _ => None,
         },
-        ("Object", "ToString") => to_string_overload(object_to_string, signature),
-        ("Delegate", "Combine") => Some(delegate_combine),
-        ("Delegate", "Remove") => Some(delegate_remove),
+        ("Object", "ToString") => to_string_overload(intrinsic!(object_to_string), signature),
+        ("Delegate", "Combine") => Some(intrinsic!(delegate_combine)),
+        ("Delegate", "Remove") => Some(intrinsic!(delegate_remove)),
+        ("Delegate", "op_Equality") | ("MulticastDelegate", "op_Equality") => {
+            Some(intrinsic!(delegate_equals))
+        }
+        ("Delegate", "op_Inequality") | ("MulticastDelegate", "op_Inequality") => {
+            Some(intrinsic!(delegate_not_equals))
+        }
         ("DateTime", "NowTicks") => match parameters_of(signature) {
-            [] => Some(datetime_now_ticks),
+            [] => Some(intrinsic!(datetime_now_ticks)),
             _ => None,
         },
         #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
         ("BitConverter", "DoubleToInt64Bits") => match parameters_of(signature) {
-            [SigType::R8] => Some(bitconverter_double_to_int64_bits),
+            [SigType::R8] => Some(intrinsic!(bitconverter_double_to_int64_bits)),
             _ => None,
         },
         #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
         ("BitConverter", "Int64BitsToDouble") => match parameters_of(signature) {
-            [SigType::I8] => Some(bitconverter_int64_bits_to_double),
+            [SigType::I8] => Some(intrinsic!(bitconverter_int64_bits_to_double)),
             _ => None,
         },
         #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
         ("BitConverter", "SingleToInt32Bits") => match parameters_of(signature) {
-            [SigType::R4] => Some(bitconverter_single_to_int32_bits),
+            [SigType::R4] => Some(intrinsic!(bitconverter_single_to_int32_bits)),
             _ => None,
         },
         #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
         ("BitConverter", "Int32BitsToSingle") => match parameters_of(signature) {
-            [SigType::I4] => Some(bitconverter_int32_bits_to_single),
+            [SigType::I4] => Some(intrinsic!(bitconverter_int32_bits_to_single)),
             _ => None,
         },
-        ("Decimal", "op_Addition") => decimal_binary_op(decimal_add, signature),
-        ("Decimal", "op_Subtraction") => decimal_binary_op(decimal_subtract, signature),
-        ("Decimal", "op_Multiply") => decimal_binary_op(decimal_multiply, signature),
-        ("Decimal", "op_Division") => decimal_binary_op(decimal_divide, signature),
-        ("Decimal", "op_Modulus") => decimal_binary_op(decimal_remainder, signature),
-        ("Decimal", "Compare") => decimal_binary_op(decimal_compare, signature),
+        ("Decimal", "op_Addition") => decimal_binary_op(intrinsic!(decimal_add), signature),
+        ("Decimal", "op_Subtraction") => decimal_binary_op(intrinsic!(decimal_subtract), signature),
+        ("Decimal", "op_Multiply") => decimal_binary_op(intrinsic!(decimal_multiply), signature),
+        ("Decimal", "op_Division") => decimal_binary_op(intrinsic!(decimal_divide), signature),
+        ("Decimal", "op_Modulus") => decimal_binary_op(intrinsic!(decimal_remainder), signature),
+        ("Decimal", "DecAdd") => decimal_binary_op(intrinsic!(decimal_add), signature),
+        ("Decimal", "DecSub") => decimal_binary_op(intrinsic!(decimal_subtract), signature),
+        ("Decimal", "DecMul") => decimal_binary_op(intrinsic!(decimal_multiply), signature),
+        ("Decimal", "DecDiv") => decimal_binary_op(intrinsic!(decimal_divide), signature),
+        ("Decimal", "DecRem") => decimal_binary_op(intrinsic!(decimal_remainder), signature),
+        ("Decimal", "Compare") => decimal_binary_op(intrinsic!(decimal_compare), signature),
         #[cfg(feature = "float")]
         ("Decimal", "FromDouble") => match parameters_of(signature) {
-            [SigType::R8] => Some(decimal_from_double),
+            [SigType::R8] => Some(intrinsic!(decimal_from_double)),
             _ => None,
         },
         #[cfg(feature = "float")]
         ("Decimal", "ToDouble") => match parameters_of(signature) {
-            [SigType::ValueType(_)] => Some(decimal_to_double),
+            [SigType::ValueType(_)] => Some(intrinsic!(decimal_to_double)),
             _ => None,
         },
         _ => None,
@@ -2057,9 +2106,9 @@ fn bcl_intrinsic(
 
 /// `System.Object..ctor()` -- the base constructor every constructor chains to; a
 /// no-op intrinsic (it takes only `this`).
-fn object_ctor_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+fn object_ctor_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
-        [] => Some(object_ctor),
+        [] => Some(intrinsic!(object_ctor)),
         _ => None,
     }
 }
@@ -2434,6 +2483,13 @@ fn record_custom_attributes(
                 module.bind_type_field_name(type_handle, name, handle);
                 module.bind_type_name(asm, field.token(), String::from(name));
                 let field_flags = field.flags();
+                let is_literal = field_flags & 0x0040 != 0;
+                module.bind_field_meta(handle, is_literal, field_flags & 0x0010 != 0);
+                if is_literal {
+                    if let Some(constant) = field.constant() {
+                        module.bind_field_constant(handle, field_constant_of(constant));
+                    }
+                }
                 reflect_fields.push(ReflectField {
                     handle,
                     is_static: field_flags & 0x0010 != 0,
@@ -2456,6 +2512,16 @@ fn record_custom_attributes(
             let token = Token::new(METHOD_DEF, method.rid());
             let handle = asm_key(asm, token.0);
             record_target_attributes(assembly, module, asm, handle, token);
+            #[cfg(feature = "NETMFv4_4")]
+            for param in method.params() {
+                record_target_attributes(
+                    assembly,
+                    module,
+                    asm,
+                    param_attr_key(handle, param.sequence() as u16),
+                    param.token(),
+                );
+            }
             #[cfg(feature = "NETMFv4_4")]
             if let Some(name) = method.name() {
                 module.bind_type_method_name(type_handle, name, handle);
@@ -2684,6 +2750,35 @@ fn split_reflection_name(reflection_name: &str) -> (&str, &str) {
     }
 }
 
+/// Maps a decoded Constant-row value (II.22.9) to the KIND-preserving [`FieldConstant`] the
+/// module stores for `FieldInfo.GetRawConstantValue`: bool/char keep their identity (they must
+/// box as Boolean/Char, not bare ints), integers ride sign-extended with a wide flag, floats
+/// per width (dropped to null on a no-float build -- no corpus does this), strings as UTF-16.
+#[cfg(feature = "NETMFv4_4")]
+fn field_constant_of(constant: ConstantValue) -> lamella_cil_runtime::module::FieldConstant {
+    use lamella_cil_runtime::module::FieldConstant;
+    match constant {
+        ConstantValue::Bool(value) => FieldConstant::Bool(value),
+        ConstantValue::Char(value) => FieldConstant::Char(value),
+        ConstantValue::I1(value) => FieldConstant::Int { value: i64::from(value), wide: false },
+        ConstantValue::U1(value) => FieldConstant::Int { value: i64::from(value), wide: false },
+        ConstantValue::I2(value) => FieldConstant::Int { value: i64::from(value), wide: false },
+        ConstantValue::U2(value) => FieldConstant::Int { value: i64::from(value), wide: false },
+        ConstantValue::I4(value) => FieldConstant::Int { value: i64::from(value), wide: false },
+        ConstantValue::U4(value) => FieldConstant::Int { value: i64::from(value), wide: false },
+        ConstantValue::I8(value) => FieldConstant::Int { value, wide: true },
+        ConstantValue::U8(value) => FieldConstant::Int { value: value as i64, wide: true },
+        #[cfg(feature = "float")]
+        ConstantValue::R4(value) => FieldConstant::R4(value),
+        #[cfg(feature = "float")]
+        ConstantValue::R8(value) => FieldConstant::R8(value),
+        #[cfg(not(feature = "float"))]
+        ConstantValue::R4(_) | ConstantValue::R8(_) => FieldConstant::Null,
+        ConstantValue::String(units) => FieldConstant::Str(units.into_boxed_slice()),
+        ConstantValue::Null => FieldConstant::Null,
+    }
+}
+
 /// Materializes a decoded custom-attribute argument into the load-time [`AttrValue`] the module
 /// stores: an integer at its width, a string's UTF-16 units, a resolved `Type` handle for a
 /// `typeof(X)` argument (the asm-folded `TypeDef` token of a same-assembly `X`, which is exactly
@@ -2719,6 +2814,12 @@ fn attr_arg_to_value(argument: &AttrArg, assembly: &Assembly, asm: u8) -> AttrVa
                 .map_or(0, |type_def| asm_key(asm, type_def.token().0));
             AttrValue::Type(handle)
         }
+        AttrArg::Array(elements) => AttrValue::Array(
+            elements
+                .iter()
+                .map(|element| attr_arg_to_value(element, assembly, asm))
+                .collect(),
+        ),
     }
 }
 fn classify_type_test_tokens(
@@ -2985,14 +3086,71 @@ fn is_delegate_type(assembly: &Assembly, extends: Token) -> bool {
 
 /// Whether a type extends `System.Enum` -- i.e. is an enum, whose literal constants the
 /// loader records (by value) so `Enum.ToString` can name them.
-fn is_enum_type(assembly: &Assembly, extends: Token) -> bool {
-    if extends.table() != TYPE_REF {
-        return false;
+/// Records the `[DllImport]` target of a bodyless PinvokeImpl method, when its signature
+/// is within the supported marshaling surface: integer/char/bool parameters (each rides
+/// the host call's 64-bit scalar slot), `string` parameters under the ANSI (or default)
+/// charset, and a `void`/32-bit-integer return. A method outside that surface records
+/// nothing and its call site keeps trapping as unresolved -- the honest partial surface.
+fn bind_pinvoke_target(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    token: Token,
+    method: &lamella_metadata::Method,
+) {
+    let rid = token.row();
+    let (Some(entry), Some(dll)) = (assembly.pinvoke_import(rid), assembly.pinvoke_module(rid))
+    else {
+        return;
+    };
+    if matches!(
+        assembly.pinvoke_charset(rid),
+        Some(lamella_metadata::CharSet::Unicode | lamella_metadata::CharSet::Auto)
+    ) {
+        return;
     }
+    let Some(signature) = method.signature() else {
+        return;
+    };
+    let mut param_kinds = Vec::with_capacity(signature.parameters.len());
+    for parameter in &signature.parameters {
+        param_kinds.push(match parameter {
+            SigType::Boolean
+            | SigType::Char
+            | SigType::I1
+            | SigType::U1
+            | SigType::I2
+            | SigType::U2
+            | SigType::I4
+            | SigType::U4
+            | SigType::I8
+            | SigType::U8 => PInvokeParam::Scalar,
+            SigType::String => PInvokeParam::AnsiString,
+            _ => return,
+        });
+    }
+    let returns = match signature.return_type {
+        SigType::Void => PInvokeReturn::Void,
+        SigType::Boolean | SigType::I1 | SigType::U1 | SigType::I2 | SigType::U2
+        | SigType::I4 | SigType::U4 => PInvokeReturn::Int32,
+        _ => return,
+    };
+    module.bind_pinvoke_target(
+        asm,
+        token.0,
+        PInvokeTarget {
+            module: String::from(dll),
+            entry: String::from(entry),
+            params: param_kinds,
+            returns,
+        },
+    );
+}
+
+fn is_enum_type(assembly: &Assembly, extends: Token) -> bool {
     assembly
-        .type_ref(extends.row())
-        .and_then(|type_ref| type_ref.name())
-        .is_some_and(|name| name.name == "Enum")
+        .type_token_name(extends)
+        .is_some_and(|name| name.namespace == "System" && name.name == "Enum")
 }
 
 /// Whether the type `type_token` (a `TypeDef`) carries `[System.FlagsAttribute]`, by scanning its
@@ -3404,21 +3562,21 @@ fn parameters_of(signature: Option<&MethodSig>) -> &[SigType] {
 }
 
 /// Picks the `Console.WriteLine` overload by its parameter type.
-fn console_write_line_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
-    let intrinsic: IntrinsicFn = match parameters_of(signature) {
-        [] => console_write_line_empty,
-        [SigType::String] => console_write_line,
-        [SigType::I4] => console_write_line_int32,
-        [SigType::I8] => console_write_line_int64,
-        [SigType::U4] => console_write_line_uint32,
-        [SigType::U8] => console_write_line_uint64,
-        [SigType::Boolean] => console_write_line_bool,
-        [SigType::Char] => console_write_line_char,
+fn console_write_line_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
+    let intrinsic: (IntrinsicFn, u32) = match parameters_of(signature) {
+        [] => intrinsic!(console_write_line_empty),
+        [SigType::String] => intrinsic!(console_write_line),
+        [SigType::I4] => intrinsic!(console_write_line_int32),
+        [SigType::I8] => intrinsic!(console_write_line_int64),
+        [SigType::U4] => intrinsic!(console_write_line_uint32),
+        [SigType::U8] => intrinsic!(console_write_line_uint64),
+        [SigType::Boolean] => intrinsic!(console_write_line_bool),
+        [SigType::Char] => intrinsic!(console_write_line_char),
         #[cfg(feature = "float")]
-        [SigType::R8] => console_write_line_double,
+        [SigType::R8] => intrinsic!(console_write_line_double),
         #[cfg(feature = "float")]
-        [SigType::R4] => console_write_line_single,
-        [SigType::Object] => console_write_line_object,
+        [SigType::R4] => intrinsic!(console_write_line_single),
+        [SigType::Object] => intrinsic!(console_write_line_object),
         _ => return None,
     };
     Some(intrinsic)
@@ -3427,9 +3585,9 @@ fn console_write_line_overload(signature: Option<&MethodSig>) -> Option<Intrinsi
 /// A two-`Decimal` operator/comparison: both parameters are the `Decimal` value type (each
 /// arriving as the inline value-type struct). Binds only that two-operand form.
 fn decimal_binary_op(
-    intrinsic: IntrinsicFn,
+    intrinsic: (IntrinsicFn, u32),
     signature: Option<&MethodSig>,
-) -> Option<IntrinsicFn> {
+) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
         [SigType::ValueType(_), SigType::ValueType(_)] => Some(intrinsic),
         _ => None,
@@ -3439,9 +3597,9 @@ fn decimal_binary_op(
 /// The parameterless `ToString()` overload binds to `intrinsic`; the formatting
 /// overloads (`ToString(string)` / `ToString(IFormatProvider)`) are not modeled.
 fn to_string_overload(
-    intrinsic: IntrinsicFn,
+    intrinsic: (IntrinsicFn, u32),
     signature: Option<&MethodSig>,
-) -> Option<IntrinsicFn> {
+) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
         [] => Some(intrinsic),
         _ => None,
@@ -3449,17 +3607,19 @@ fn to_string_overload(
 }
 
 /// Picks the `Console.Write` overload (no line terminator) by its parameter type.
-fn console_write_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
-    let intrinsic: IntrinsicFn = match parameters_of(signature) {
-        [SigType::String] => console_write,
-        [SigType::I4] => console_write_int32,
-        [SigType::I8] => console_write_int64,
-        [SigType::Boolean] => console_write_bool,
-        [SigType::Char] => console_write_char,
+fn console_write_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
+    let intrinsic: (IntrinsicFn, u32) = match parameters_of(signature) {
+        [SigType::String] => intrinsic!(console_write),
+        [SigType::I4] => intrinsic!(console_write_int32),
+        [SigType::I8] => intrinsic!(console_write_int64),
+        [SigType::U4] => intrinsic!(console_write_uint32),
+        [SigType::U8] => intrinsic!(console_write_uint64),
+        [SigType::Boolean] => intrinsic!(console_write_bool),
+        [SigType::Char] => intrinsic!(console_write_char),
         #[cfg(feature = "float")]
-        [SigType::R8] => console_write_double,
+        [SigType::R8] => intrinsic!(console_write_double),
         #[cfg(feature = "float")]
-        [SigType::R4] => console_write_single,
+        [SigType::R4] => intrinsic!(console_write_single),
         _ => return None,
     };
     Some(intrinsic)
@@ -3467,62 +3627,62 @@ fn console_write_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> 
 
 /// Picks the `String.Concat` overload by its parameter types (the two-string form
 /// for now -- what `a + b` on strings emits).
-fn string_concat_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+fn string_concat_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
-        [SigType::String, SigType::String] => Some(string_concat),
-        [SigType::String, SigType::String, SigType::String] => Some(string_concat3),
-        [SigType::Object, SigType::Object] => Some(string_concat_object2),
-        [SigType::Object, SigType::Object, SigType::Object] => Some(string_concat_object3),
+        [SigType::String, SigType::String] => Some(intrinsic!(string_concat)),
+        [SigType::String, SigType::String, SigType::String] => Some(intrinsic!(string_concat3)),
+        [SigType::Object, SigType::Object] => Some(intrinsic!(string_concat_object2)),
+        [SigType::Object, SigType::Object, SigType::Object] => Some(intrinsic!(string_concat_object3)),
         _ => None,
     }
 }
 
 /// The `String.Length` getter -- an instance method with no explicit parameters.
-fn string_get_length_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+fn string_get_length_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
-        [] => Some(string_get_length),
+        [] => Some(intrinsic!(string_get_length)),
         _ => None,
     }
 }
 
 /// The `String.op_Equality(string, string)` operator (what `==` on strings emits).
-fn string_equals_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+fn string_equals_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
-        [SigType::String, SigType::String] => Some(string_equals),
+        [SigType::String, SigType::String] => Some(intrinsic!(string_equals)),
         _ => None,
     }
 }
 
 /// The `String.op_Inequality(string, string)` operator (`!=`).
-fn string_not_equals_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+fn string_not_equals_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
-        [SigType::String, SigType::String] => Some(string_not_equals),
+        [SigType::String, SigType::String] => Some(intrinsic!(string_not_equals)),
         _ => None,
     }
 }
 
 /// `String.IsNullOrEmpty(string)` -- a static one-string predicate.
-fn string_is_null_or_empty_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+fn string_is_null_or_empty_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
-        [SigType::String] => Some(string_is_null_or_empty),
+        [SigType::String] => Some(intrinsic!(string_is_null_or_empty)),
         _ => None,
     }
 }
 
 /// `String.Substring(int)` / `Substring(int, int)` -- instance methods.
-fn string_substring_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+fn string_substring_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
-        [SigType::I4] => Some(string_substring),
-        [SigType::I4, SigType::I4] => Some(string_substring_len),
+        [SigType::I4] => Some(intrinsic!(string_substring)),
+        [SigType::I4, SigType::I4] => Some(intrinsic!(string_substring_len)),
         _ => None,
     }
 }
 
 /// The `String.get_Chars(int)` indexer (`s[i]`) -- an instance method taking an
 /// `int` index.
-fn string_get_chars_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+fn string_get_chars_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
-        [SigType::I4] => Some(string_get_chars),
+        [SigType::I4] => Some(intrinsic!(string_get_chars)),
         _ => None,
     }
 }
@@ -3535,27 +3695,27 @@ mod extended {
     use super::*;
 
     /// `String.IndexOf(char)` / `IndexOf(string)` -- the ordinal-search overloads.
-    fn string_index_of_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn string_index_of_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::Char] => Some(string_index_of_char),
-            [SigType::String] => Some(string_index_of_string),
+            [SigType::Char] => Some(intrinsic!(string_index_of_char)),
+            [SigType::String] => Some(intrinsic!(string_index_of_string)),
             _ => None,
         }
     }
 
     /// `String.LastIndexOf(char)`.
-    fn string_last_index_of_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn string_last_index_of_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::Char] => Some(string_last_index_of_char),
+            [SigType::Char] => Some(intrinsic!(string_last_index_of_char)),
             _ => None,
         }
     }
 
     /// A one-string-argument predicate (`StartsWith` / `EndsWith` / `Contains`), ordinal.
     fn string_one_string_predicate(
-        intrinsic: IntrinsicFn,
+        intrinsic: (IntrinsicFn, u32),
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
             [SigType::String] => Some(intrinsic),
             _ => None,
@@ -3565,9 +3725,9 @@ mod extended {
     /// A parameterless string-returning transform (`ToUpper` / `ToLower` / `Trim`); the
     /// culture/char-set overloads are not modeled.
     fn string_no_arg_transform(
-        intrinsic: IntrinsicFn,
+        intrinsic: (IntrinsicFn, u32),
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
             [] => Some(intrinsic),
             _ => None,
@@ -3575,21 +3735,21 @@ mod extended {
     }
 
     /// `String.Replace(char, char)` / `Replace(string, string)`.
-    fn string_replace_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn string_replace_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::Char, SigType::Char] => Some(string_replace_char),
-            [SigType::String, SigType::String] => Some(string_replace_string),
+            [SigType::Char, SigType::Char] => Some(intrinsic!(string_replace_char)),
+            [SigType::String, SigType::String] => Some(intrinsic!(string_replace_string)),
             _ => None,
         }
     }
 
     /// `Math.Abs(int)` / `Abs(long)` -- the integer overloads (float/double need libm).
-    fn math_abs_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn math_abs_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::I4] => Some(math_abs_int32),
-            [SigType::I8] => Some(math_abs_int64),
+            [SigType::I4] => Some(intrinsic!(math_abs_int32)),
+            [SigType::I8] => Some(intrinsic!(math_abs_int64)),
             #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-            [SigType::R8] => Some(math_abs_f64),
+            [SigType::R8] => Some(intrinsic!(math_abs_f64)),
             _ => None,
         }
     }
@@ -3597,9 +3757,9 @@ mod extended {
     /// A unary `double -> double` `Math` overload (`Floor` / `Ceiling` / `Truncate` / `Round`).
     #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
     fn math_unary_f64_overload(
-        intrinsic: IntrinsicFn,
+        intrinsic: (IntrinsicFn, u32),
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
             [SigType::R8] => Some(intrinsic),
             _ => None,
@@ -3608,11 +3768,11 @@ mod extended {
 
     /// A binary `Math` overload (`Max` / `Min`) over two ints or two longs.
     fn math_binary_overload(
-        int32: IntrinsicFn,
-        int64: IntrinsicFn,
-        float: Option<IntrinsicFn>,
+        int32: (IntrinsicFn, u32),
+        int64: (IntrinsicFn, u32),
+        float: Option<(IntrinsicFn, u32)>,
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
             [SigType::I4, SigType::I4] => Some(int32),
             [SigType::I8, SigType::I8] => Some(int64),
@@ -3624,30 +3784,30 @@ mod extended {
     /// The double `Math.Max` / `Math.Min` intrinsics, present only with `float` (and, since they live
     /// in the NETMFv4_4 `extended` module, only with reflection on).
     #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-    const MATH_MAX_F64: Option<IntrinsicFn> = Some(math_max_f64);
+    const MATH_MAX_F64: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_max_f64));
     #[cfg(not(all(feature = "NETMFv4_4", feature = "float")))]
-    const MATH_MAX_F64: Option<IntrinsicFn> = None;
+    const MATH_MAX_F64: Option<(IntrinsicFn, u32)> = None;
     #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-    const MATH_MIN_F64: Option<IntrinsicFn> = Some(math_min_f64);
+    const MATH_MIN_F64: Option<(IntrinsicFn, u32)> = Some(intrinsic!(math_min_f64));
     #[cfg(not(all(feature = "NETMFv4_4", feature = "float")))]
-    const MATH_MIN_F64: Option<IntrinsicFn> = None;
+    const MATH_MIN_F64: Option<(IntrinsicFn, u32)> = None;
 
     /// `Math.Sign(int)` / `Sign(long)` -- both return an `int`.
-    fn math_sign_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn math_sign_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::I4] => Some(math_sign_int32),
-            [SigType::I8] => Some(math_sign_int64),
+            [SigType::I4] => Some(intrinsic!(math_sign_int32)),
+            [SigType::I8] => Some(intrinsic!(math_sign_int64)),
             #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-            [SigType::R8] => Some(math_sign_f64),
+            [SigType::R8] => Some(intrinsic!(math_sign_f64)),
             _ => None,
         }
     }
 
     /// A one-`char` `System.Char` method (classification or ASCII casing).
     fn char_one_arg_overload(
-        intrinsic: IntrinsicFn,
+        intrinsic: (IntrinsicFn, u32),
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
             [SigType::Char] => Some(intrinsic),
             _ => None,
@@ -3657,9 +3817,9 @@ mod extended {
     /// A single-`string`-argument static method (`Int32.Parse`, `Boolean.Parse`, ...). The
     /// format-provider / number-styles overloads are not modeled.
     fn one_string_overload(
-        intrinsic: IntrinsicFn,
+        intrinsic: (IntrinsicFn, u32),
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
             [SigType::String] => Some(intrinsic),
             _ => None,
@@ -3668,25 +3828,25 @@ mod extended {
 
     /// `System.Convert.ToString(value)`: dispatch to the primitive's `ToString` rendering by
     /// the argument type (each is a Kernel/base intrinsic reused for the static conversion).
-    fn convert_to_string_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn convert_to_string_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::I4] => Some(int32_to_string),
-            [SigType::I8] => Some(int64_to_string),
-            [SigType::Boolean] => Some(boolean_to_string),
+            [SigType::I4] => Some(intrinsic!(int32_to_string)),
+            [SigType::I8] => Some(intrinsic!(int64_to_string)),
+            [SigType::Boolean] => Some(intrinsic!(boolean_to_string)),
             #[cfg(feature = "float")]
-            [SigType::R8] => Some(double_to_string),
+            [SigType::R8] => Some(intrinsic!(double_to_string)),
             #[cfg(feature = "float")]
-            [SigType::R4] => Some(single_to_string),
-            [SigType::Char] => Some(char_to_string),
+            [SigType::R4] => Some(intrinsic!(single_to_string)),
+            [SigType::Char] => Some(intrinsic!(char_to_string)),
             _ => None,
         }
     }
 
     /// `String.PadLeft(int)` / `PadLeft(int, char)` (and the `PadRight` pair).
     fn string_pad_overload(
-        intrinsic: IntrinsicFn,
+        intrinsic: (IntrinsicFn, u32),
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
             [SigType::I4] | [SigType::I4, SigType::Char] => Some(intrinsic),
             _ => None,
@@ -3694,17 +3854,17 @@ mod extended {
     }
 
     /// `String.Insert(int, string)`.
-    fn string_insert_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn string_insert_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::I4, SigType::String] => Some(string_insert),
+            [SigType::I4, SigType::String] => Some(intrinsic!(string_insert)),
             _ => None,
         }
     }
 
     /// `String.Remove(int)` / `Remove(int, int)`.
-    fn string_remove_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn string_remove_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::I4] | [SigType::I4, SigType::I4] => Some(string_remove),
+            [SigType::I4] | [SigType::I4, SigType::I4] => Some(intrinsic!(string_remove)),
             _ => None,
         }
     }
@@ -3715,43 +3875,43 @@ mod extended {
         type_name: &str,
         method: &str,
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match (type_name, method) {
             ("StringBuilder", "Append") => string_builder_append_overload(signature),
             ("StringBuilder", "ToString") => match parameters_of(signature) {
-                [] => Some(string_builder_to_string),
+                [] => Some(intrinsic!(string_builder_to_string)),
                 _ => None,
             },
             ("StringBuilder", "get_Length") => match parameters_of(signature) {
-                [] => Some(string_builder_get_length),
+                [] => Some(intrinsic!(string_builder_get_length)),
                 _ => None,
             },
             ("StringBuilder", "SetLengthCore") => match parameters_of(signature) {
-                [SigType::I4] => Some(string_builder_set_length),
+                [SigType::I4] => Some(intrinsic!(string_builder_set_length)),
                 _ => None,
             },
             ("StringBuilder", "get_Capacity") => match parameters_of(signature) {
-                [] => Some(string_builder_get_capacity),
+                [] => Some(intrinsic!(string_builder_get_capacity)),
                 _ => None,
             },
             ("StringBuilder", "get_Chars") => match parameters_of(signature) {
-                [SigType::I4] => Some(string_builder_get_char),
+                [SigType::I4] => Some(intrinsic!(string_builder_get_char)),
                 _ => None,
             },
             ("StringBuilder", "SetCharsCore") => match parameters_of(signature) {
-                [SigType::I4, SigType::Char] => Some(string_builder_set_char),
+                [SigType::I4, SigType::Char] => Some(intrinsic!(string_builder_set_char)),
                 _ => None,
             },
             ("StringBuilder", "InsertCore") => match parameters_of(signature) {
-                [SigType::I4, SigType::String] => Some(string_builder_insert),
+                [SigType::I4, SigType::String] => Some(intrinsic!(string_builder_insert)),
                 _ => None,
             },
             ("StringBuilder", "RemoveCore") => match parameters_of(signature) {
-                [SigType::I4, SigType::I4] => Some(string_builder_remove),
+                [SigType::I4, SigType::I4] => Some(intrinsic!(string_builder_remove)),
                 _ => None,
             },
             ("StringBuilder", "Replace") => match parameters_of(signature) {
-                [SigType::Char, SigType::Char] => Some(string_builder_replace_char),
+                [SigType::Char, SigType::Char] => Some(intrinsic!(string_builder_replace_char)),
                 _ => None,
             },
             _ => None,
@@ -3759,22 +3919,22 @@ mod extended {
     }
 
     /// A `StringBuilder.Append` overload by argument type (string / char / int).
-    fn string_builder_append_overload(signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn string_builder_append_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match parameters_of(signature) {
-            [SigType::String] => Some(string_builder_append_string),
-            [SigType::Char] => Some(string_builder_append_char),
-            [SigType::I4] => Some(string_builder_append_int),
+            [SigType::String] => Some(intrinsic!(string_builder_append_string)),
+            [SigType::Char] => Some(intrinsic!(string_builder_append_char)),
+            [SigType::I4] => Some(intrinsic!(string_builder_append_int)),
             _ => None,
         }
     }
 
     /// The `get_Count` / `Contains` / `Clear` methods shared by `Stack` and `Queue` (both
     /// are array-backed, so they reuse the list intrinsics).
-    fn collection_shared(method: &str, signature: Option<&MethodSig>) -> Option<IntrinsicFn> {
+    fn collection_shared(method: &str, signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
         match (method, parameters_of(signature)) {
-            ("get_Count", []) => Some(list_get_count),
-            ("Contains", [SigType::Object]) => Some(collection_contains),
-            ("Clear", []) => Some(list_clear),
+            ("get_Count", []) => Some(intrinsic!(list_get_count)),
+            ("Contains", [SigType::Object]) => Some(intrinsic!(collection_contains)),
+            ("Clear", []) => Some(intrinsic!(list_clear)),
             _ => None,
         }
     }
@@ -3786,86 +3946,86 @@ mod extended {
         type_name: &str,
         method: &str,
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match (type_name, method) {
             ("ArrayList", "Add") => match parameters_of(signature) {
-                [SigType::Object] => Some(list_add),
+                [SigType::Object] => Some(intrinsic!(list_add)),
                 _ => None,
             },
             ("ArrayList", "get_Item") => match parameters_of(signature) {
-                [SigType::I4] => Some(list_get_item),
+                [SigType::I4] => Some(intrinsic!(list_get_item)),
                 _ => None,
             },
             ("ArrayList", "set_Item") => match parameters_of(signature) {
-                [SigType::I4, SigType::Object] => Some(list_set_item),
+                [SigType::I4, SigType::Object] => Some(intrinsic!(list_set_item)),
                 _ => None,
             },
             ("ArrayList", "get_Count") => match parameters_of(signature) {
-                [] => Some(list_get_count),
+                [] => Some(intrinsic!(list_get_count)),
                 _ => None,
             },
             ("ArrayList", "Clear") => match parameters_of(signature) {
-                [] => Some(list_clear),
+                [] => Some(intrinsic!(list_clear)),
                 _ => None,
             },
             ("ArrayList", "RemoveAt") => match parameters_of(signature) {
-                [SigType::I4] => Some(list_remove_at),
+                [SigType::I4] => Some(intrinsic!(list_remove_at)),
                 _ => None,
             },
             ("ArrayList", "Insert") => match parameters_of(signature) {
-                [SigType::I4, SigType::Object] => Some(list_insert),
+                [SigType::I4, SigType::Object] => Some(intrinsic!(list_insert)),
                 _ => None,
             },
             ("Hashtable", "Add") => match parameters_of(signature) {
-                [SigType::Object, SigType::Object] => Some(map_add),
+                [SigType::Object, SigType::Object] => Some(intrinsic!(map_add)),
                 _ => None,
             },
             ("Hashtable", "get_Item") => match parameters_of(signature) {
-                [SigType::Object] => Some(map_get_item),
+                [SigType::Object] => Some(intrinsic!(map_get_item)),
                 _ => None,
             },
             ("Hashtable", "set_Item") => match parameters_of(signature) {
-                [SigType::Object, SigType::Object] => Some(map_set_item),
+                [SigType::Object, SigType::Object] => Some(intrinsic!(map_set_item)),
                 _ => None,
             },
             ("Hashtable", "get_Count") => match parameters_of(signature) {
-                [] => Some(map_get_count),
+                [] => Some(intrinsic!(map_get_count)),
                 _ => None,
             },
             ("Hashtable", "Contains" | "ContainsKey") => match parameters_of(signature) {
-                [SigType::Object] => Some(map_contains),
+                [SigType::Object] => Some(intrinsic!(map_contains)),
                 _ => None,
             },
             ("Hashtable", "Remove") => match parameters_of(signature) {
-                [SigType::Object] => Some(map_remove),
+                [SigType::Object] => Some(intrinsic!(map_remove)),
                 _ => None,
             },
             ("Hashtable", "Clear") => match parameters_of(signature) {
-                [] => Some(list_clear),
+                [] => Some(intrinsic!(list_clear)),
                 _ => None,
             },
             ("Stack", "Push") => match parameters_of(signature) {
-                [SigType::Object] => Some(collection_push),
+                [SigType::Object] => Some(intrinsic!(collection_push)),
                 _ => None,
             },
             ("Stack", "Pop") => match parameters_of(signature) {
-                [] => Some(stack_pop),
+                [] => Some(intrinsic!(stack_pop)),
                 _ => None,
             },
             ("Stack", "Peek") => match parameters_of(signature) {
-                [] => Some(stack_peek),
+                [] => Some(intrinsic!(stack_peek)),
                 _ => None,
             },
             ("Queue", "Enqueue") => match parameters_of(signature) {
-                [SigType::Object] => Some(collection_push),
+                [SigType::Object] => Some(intrinsic!(collection_push)),
                 _ => None,
             },
             ("Queue", "Dequeue") => match parameters_of(signature) {
-                [] => Some(queue_dequeue),
+                [] => Some(intrinsic!(queue_dequeue)),
                 _ => None,
             },
             ("Queue", "Peek") => match parameters_of(signature) {
-                [] => Some(queue_peek),
+                [] => Some(intrinsic!(queue_peek)),
                 _ => None,
             },
             ("Stack" | "Queue", "get_Count" | "Contains" | "Clear") => {
@@ -3881,101 +4041,101 @@ mod extended {
         type_name: &str,
         method: &str,
         signature: Option<&MethodSig>,
-    ) -> Option<IntrinsicFn> {
+    ) -> Option<(IntrinsicFn, u32)> {
         match (type_name, method) {
             ("String", "IndexOf") => string_index_of_overload(signature),
             ("String", "LastIndexOf") => string_last_index_of_overload(signature),
-            ("String", "StartsWith") => string_one_string_predicate(string_starts_with, signature),
-            ("String", "EndsWith") => string_one_string_predicate(string_ends_with, signature),
-            ("String", "Contains") => string_one_string_predicate(string_contains, signature),
-            ("String", "ToUpper") => string_no_arg_transform(string_to_upper, signature),
-            ("String", "ToLower") => string_no_arg_transform(string_to_lower, signature),
-            ("String", "Trim") => string_no_arg_transform(string_trim, signature),
+            ("String", "StartsWith") => string_one_string_predicate(intrinsic!(string_starts_with), signature),
+            ("String", "EndsWith") => string_one_string_predicate(intrinsic!(string_ends_with), signature),
+            ("String", "Contains") => string_one_string_predicate(intrinsic!(string_contains), signature),
+            ("String", "ToUpper") => string_no_arg_transform(intrinsic!(string_to_upper), signature),
+            ("String", "ToLower") => string_no_arg_transform(intrinsic!(string_to_lower), signature),
+            ("String", "Trim") => string_no_arg_transform(intrinsic!(string_trim), signature),
             ("String", "Replace") => string_replace_overload(signature),
-            ("String", "PadLeft") => string_pad_overload(string_pad_left, signature),
-            ("String", "PadRight") => string_pad_overload(string_pad_right, signature),
+            ("String", "PadLeft") => string_pad_overload(intrinsic!(string_pad_left), signature),
+            ("String", "PadRight") => string_pad_overload(intrinsic!(string_pad_right), signature),
             ("String", "Insert") => string_insert_overload(signature),
             ("String", "Remove") => string_remove_overload(signature),
-            ("String", "ToCharArray") => string_no_arg_transform(string_to_char_array, signature),
-            ("String", "Equals") => string_one_string_predicate(string_equals, signature),
+            ("String", "ToCharArray") => string_no_arg_transform(intrinsic!(string_to_char_array), signature),
+            ("String", "Equals") => string_one_string_predicate(intrinsic!(string_equals), signature),
             ("String", "Split") => match parameters_of(signature) {
-                [SigType::Char, SigType::ValueType(_)] => Some(string_split_char),
+                [SigType::Char, SigType::ValueType(_)] => Some(intrinsic!(string_split_char)),
                 _ => None,
             },
             ("String", "Join") => match parameters_of(signature) {
                 [SigType::String, SigType::SzArray(element)]
                     if matches!(element.as_ref(), SigType::String) =>
                 {
-                    Some(string_join)
+                    Some(intrinsic!(string_join))
                 }
                 _ => None,
             },
             ("Math", "Abs") => math_abs_overload(signature),
             ("Math", "Max") => {
-                math_binary_overload(math_max_int32, math_max_int64, MATH_MAX_F64, signature)
+                math_binary_overload(intrinsic!(math_max_int32), intrinsic!(math_max_int64), MATH_MAX_F64, signature)
             }
             ("Math", "Min") => {
-                math_binary_overload(math_min_int32, math_min_int64, MATH_MIN_F64, signature)
+                math_binary_overload(intrinsic!(math_min_int32), intrinsic!(math_min_int64), MATH_MIN_F64, signature)
             }
             ("Math", "Sign") => math_sign_overload(signature),
             #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-            ("Math", "Floor") => math_unary_f64_overload(math_floor_f64, signature),
+            ("Math", "Floor") => math_unary_f64_overload(intrinsic!(math_floor_f64), signature),
             #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-            ("Math", "Ceiling") => math_unary_f64_overload(math_ceiling_f64, signature),
+            ("Math", "Ceiling") => math_unary_f64_overload(intrinsic!(math_ceiling_f64), signature),
             #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-            ("Math", "Truncate") => math_unary_f64_overload(math_truncate_f64, signature),
+            ("Math", "Truncate") => math_unary_f64_overload(intrinsic!(math_truncate_f64), signature),
             #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-            ("Math", "Round") => math_unary_f64_overload(math_round_f64, signature),
+            ("Math", "Round") => math_unary_f64_overload(intrinsic!(math_round_f64), signature),
             #[cfg(feature = "math-transcendental")]
-            ("Math", "Sqrt") => math_unary_f64_overload(math_sqrt_f64, signature),
+            ("Math", "Sqrt") => math_unary_f64_overload(intrinsic!(math_sqrt_f64), signature),
             #[cfg(feature = "math-transcendental")]
-            ("Math", "Sin") => math_unary_f64_overload(math_sin_f64, signature),
+            ("Math", "Sin") => math_unary_f64_overload(intrinsic!(math_sin_f64), signature),
             #[cfg(feature = "math-transcendental")]
-            ("Math", "Cos") => math_unary_f64_overload(math_cos_f64, signature),
+            ("Math", "Cos") => math_unary_f64_overload(intrinsic!(math_cos_f64), signature),
             #[cfg(feature = "math-transcendental")]
-            ("Math", "Tan") => math_unary_f64_overload(math_tan_f64, signature),
+            ("Math", "Tan") => math_unary_f64_overload(intrinsic!(math_tan_f64), signature),
             #[cfg(feature = "math-transcendental")]
-            ("Math", "Log") => math_unary_f64_overload(math_log_f64, signature),
+            ("Math", "Log") => math_unary_f64_overload(intrinsic!(math_log_f64), signature),
             #[cfg(feature = "math-transcendental")]
-            ("Math", "Log10") => math_unary_f64_overload(math_log10_f64, signature),
+            ("Math", "Log10") => math_unary_f64_overload(intrinsic!(math_log10_f64), signature),
             #[cfg(feature = "math-transcendental")]
-            ("Math", "Exp") => math_unary_f64_overload(math_exp_f64, signature),
+            ("Math", "Exp") => math_unary_f64_overload(intrinsic!(math_exp_f64), signature),
             #[cfg(feature = "math-transcendental")]
             ("Math", "Pow") => match parameters_of(signature) {
-                [SigType::R8, SigType::R8] => Some(math_pow_f64),
+                [SigType::R8, SigType::R8] => Some(intrinsic!(math_pow_f64)),
                 _ => None,
             },
-            ("Char", "IsDigit") => char_one_arg_overload(char_is_digit, signature),
-            ("Char", "IsLetter") => char_one_arg_overload(char_is_letter, signature),
+            ("Char", "IsDigit") => char_one_arg_overload(intrinsic!(char_is_digit), signature),
+            ("Char", "IsLetter") => char_one_arg_overload(intrinsic!(char_is_letter), signature),
             ("Char", "IsLetterOrDigit") => {
-                char_one_arg_overload(char_is_letter_or_digit, signature)
+                char_one_arg_overload(intrinsic!(char_is_letter_or_digit), signature)
             }
-            ("Char", "IsWhiteSpace") => char_one_arg_overload(char_is_white_space, signature),
-            ("Char", "IsUpper") => char_one_arg_overload(char_is_upper, signature),
-            ("Char", "IsLower") => char_one_arg_overload(char_is_lower, signature),
-            ("Char", "ToUpper") => char_one_arg_overload(char_to_upper, signature),
-            ("Char", "ToLower") => char_one_arg_overload(char_to_lower, signature),
-            ("Int32", "Parse") => one_string_overload(int32_parse, signature),
-            ("Int64", "Parse") => one_string_overload(int64_parse, signature),
-            ("Boolean", "Parse") => one_string_overload(boolean_parse, signature),
+            ("Char", "IsWhiteSpace") => char_one_arg_overload(intrinsic!(char_is_white_space), signature),
+            ("Char", "IsUpper") => char_one_arg_overload(intrinsic!(char_is_upper), signature),
+            ("Char", "IsLower") => char_one_arg_overload(intrinsic!(char_is_lower), signature),
+            ("Char", "ToUpper") => char_one_arg_overload(intrinsic!(char_to_upper), signature),
+            ("Char", "ToLower") => char_one_arg_overload(intrinsic!(char_to_lower), signature),
+            ("Int32", "Parse") => one_string_overload(intrinsic!(int32_parse), signature),
+            ("Int64", "Parse") => one_string_overload(intrinsic!(int64_parse), signature),
+            ("Boolean", "Parse") => one_string_overload(intrinsic!(boolean_parse), signature),
             ("Convert", "ToInt32") => match parameters_of(signature) {
-                [SigType::String] => Some(int32_parse),
+                [SigType::String] => Some(intrinsic!(int32_parse)),
                 #[cfg(all(feature = "NETMFv4_4", feature = "float"))]
-                [SigType::R8] => Some(convert_to_int32_double),
+                [SigType::R8] => Some(intrinsic!(convert_to_int32_double)),
                 _ => None,
             },
-            ("Convert", "ToInt64") => one_string_overload(int64_parse, signature),
+            ("Convert", "ToInt64") => one_string_overload(intrinsic!(int64_parse), signature),
             ("Convert", "ToBoolean") => match parameters_of(signature) {
-                [SigType::String] => Some(boolean_parse),
-                [SigType::I4] => Some(convert_to_boolean_int),
+                [SigType::String] => Some(intrinsic!(boolean_parse)),
+                [SigType::I4] => Some(intrinsic!(convert_to_boolean_int)),
                 _ => None,
             },
             ("Convert", "ToChar") => match parameters_of(signature) {
-                [SigType::I4] => Some(convert_to_char_int),
+                [SigType::I4] => Some(intrinsic!(convert_to_char_int)),
                 _ => None,
             },
             ("Convert", "ToByte") => match parameters_of(signature) {
-                [SigType::I4] => Some(convert_to_byte_int),
+                [SigType::I4] => Some(intrinsic!(convert_to_byte_int)),
                 _ => None,
             },
             ("Convert", "ToString") => convert_to_string_overload(signature),

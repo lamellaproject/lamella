@@ -1,0 +1,23 @@
+[package]
+name = "lamella-net-smoltcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DEVICE networking backend for the interpreter's NetBackend seam: smoltcp (pure-Rust no_std TCP/IP) over any smoltcp phy::Device (a board's Ethernet MAC driver). The device twin of lamella-net-host."
+
+[dependencies]
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+smoltcp = { version = "0.12", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+    "socket-dns",
+    "socket-dhcpv4",
+    "alloc",
+] }
+
+[lints]
+workspace = true

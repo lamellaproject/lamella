@@ -14,7 +14,9 @@ extern crate alloc;
 
 use core::slice;
 
-use crate::heap::{align_up, mark_compact, Ref, StackMapTable, TypeResolver, ALIGN, HEADER_SIZE};
+use crate::heap::{align_up, Ref, ALIGN, HEADER_SIZE};
+#[cfg(feature = "gc-collect")]
+use crate::heap::{mark_compact, StackMapTable, TypeResolver};
 
 /// A type's on-device GC layout, in the exact memory shape the AOT backend emits and the
 /// object header points at: `[u32 payload_size][u32 nrefs][u32 ref_offsets...]`,
@@ -42,6 +44,7 @@ pub struct DeviceTypeDesc {
 impl DeviceTypeDesc {
     /// The byte offset, within a [`DeviceTypeDesc`], of the inline `ref_offsets` array
     /// (the two leading `u32` words `payload_size` and `nrefs`).
+    #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
     const REF_OFFSETS_BASE: usize = 2 * 4;
 
     /// Reads the `i`th reference offset out of the descriptor at `desc` (a raw `*const
@@ -51,6 +54,7 @@ impl DeviceTypeDesc {
     /// `desc` must point at a valid [`DeviceTypeDesc`] blob (the backend emits one per
     /// type and stores its address in each object's header) and `i < nrefs`, so the read
     /// stays within the descriptor's inline `ref_offsets` array.
+    #[cfg_attr(not(feature = "gc-collect"), allow(dead_code))]
     unsafe fn ref_offset(desc: *const DeviceTypeDesc, i: u32) -> u32 {
         unsafe {
             let base = desc.cast::<u8>().add(Self::REF_OFFSETS_BASE).cast::<u32>();
@@ -64,8 +68,10 @@ impl DeviceTypeDesc {
 /// reference-offset questions. This is the one piece that differs from the host's
 /// [`crate::heap::TableResolver`] (a table-index lookup); the mark-compact algorithm is
 /// otherwise identical.
+#[cfg(feature = "gc-collect")]
 struct PtrResolver;
 
+#[cfg(feature = "gc-collect")]
 impl TypeResolver for PtrResolver {
     fn payload_size(&self, header_word: u32) -> u32 {
         let desc = header_word as *const DeviceTypeDesc;
@@ -167,6 +173,7 @@ impl DeviceHeap {
     /// `enumerate_roots`. Delegates to the shared [`mark_compact`] engine through
     /// [`PtrResolver`] (the device header-word -> type lookup), so the device collection
     /// is byte-for-byte the same algorithm the host tests exercise.
+    #[cfg(feature = "gc-collect")]
     pub fn collect<R>(&mut self, enumerate_roots: R)
     where
         R: FnMut(&mut dyn FnMut(&mut Ref)),
@@ -180,6 +187,7 @@ impl DeviceHeap {
     /// unreachable, compacts the survivors, and writes every relocated reference back
     /// into `stack`. The frame-walk convention is identical to [`crate::heap::Heap::
     /// collect_stack`]; only the heap's type lookup differs (pointer, not table index).
+    #[cfg(feature = "gc-collect")]
     pub fn collect_stack(
         &mut self,
         stack: &mut [u8],

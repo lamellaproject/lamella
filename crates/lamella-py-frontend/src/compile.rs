@@ -36,19 +36,50 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
     let mut top_level: Vec<&Stmt> = Vec::new();
     for stmt in &ast.body {
         match stmt {
-            Stmt::FuncDef(func) => functions.push(compile_function(func)?),
+            Stmt::FuncDef(func) => {
+                let (co, lambdas) = compile_function(func)?;
+                functions.push(co);
+                functions.extend(lambdas);
+                if func.params.iter().any(|p| p.default.is_some()) {
+                    top_level.push(stmt);
+                }
+            }
             Stmt::ClassDef { name, body, .. } => {
                 for member in body {
                     if let Stmt::FuncDef(method) = member {
-                        functions.push(compile_method(name, method)?);
+                        let (co, lambdas) = compile_method(name, method)?;
+                        functions.push(co);
+                        functions.extend(lambdas);
                     }
+                }
+                top_level.push(stmt);
+            }
+            Stmt::Decorated { inner, .. } => {
+                match &**inner {
+                    Stmt::FuncDef(func) => {
+                        let (co, lambdas) = compile_function(func)?;
+                        functions.push(co);
+                        functions.extend(lambdas);
+                    }
+                    Stmt::ClassDef { name, body, .. } => {
+                        for member in body {
+                            if let Stmt::FuncDef(method) = member {
+                                let (co, lambdas) = compile_method(name, method)?;
+                                functions.push(co);
+                                functions.extend(lambdas);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 top_level.push(stmt);
             }
             other => top_level.push(other),
         }
     }
-    let body = compile_code_object(Scope::Module, "<module>", &[], &None, &top_level, None)?;
+    let (body, body_lambdas) =
+        compile_code_object(Scope::Module, "<module>", &[], &None, &top_level, None)?;
+    functions.extend(body_lambdas);
     Ok(bc::Module {
         name: String::from(name),
         functions,
@@ -64,14 +95,19 @@ enum Scope {
     Module,
 }
 
-fn compile_function(func: &FuncDef) -> Result<bc::CodeObject, CompileError> {
+fn compile_function(
+    func: &FuncDef,
+) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let body: Vec<&Stmt> = func.body.iter().collect();
     compile_code_object(Scope::Function, &func.name, &func.params, &func.ret, &body, None)
 }
 
 /// Compile a class method as a Module function named `"ClassName.method"`; the class body
 /// emits `MakeFunction` referencing it by that qualified name.
-fn compile_method(class_name: &str, method: &FuncDef) -> Result<bc::CodeObject, CompileError> {
+fn compile_method(
+    class_name: &str,
+    method: &FuncDef,
+) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let mut qualified = String::from(class_name);
     qualified.push('.');
     qualified.push_str(&method.name);
@@ -91,6 +127,7 @@ fn compile_method(class_name: &str, method: &FuncDef) -> Result<bc::CodeObject, 
 fn resolve_type(annotation: &Option<Expr>) -> bc::StaticType {
     match annotation {
         Some(Expr::Name(name)) if name == "int" => bc::StaticType::Int,
+        Some(Expr::Name(name)) if name == "float" => bc::StaticType::Float,
         _ => bc::StaticType::Dynamic,
     }
 }
@@ -102,7 +139,7 @@ fn compile_code_object(
     ret: &Option<Expr>,
     body: &[&Stmt],
     current_class: Option<&str>,
-) -> Result<bc::CodeObject, CompileError> {
+) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let mut local_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
     let mut local_types: Vec<bc::StaticType> =
         params.iter().map(|p| resolve_type(&p.annotation)).collect();
@@ -122,6 +159,10 @@ fn compile_code_object(
         loops: Vec::new(),
         finallys: Vec::new(),
         current_class: current_class.map(String::from),
+        name: String::from(name),
+        hoisted: Vec::new(),
+        lambda_counter: 0,
+        has_yield: false,
     };
     for stmt in body {
         compiler.compile_stmt(stmt)?;
@@ -138,9 +179,14 @@ fn compile_code_object(
             ty: resolve_type(&p.annotation),
         })
         .collect();
-    Ok(bc::CodeObject {
+    let code_object = bc::CodeObject {
         name: String::from(name),
         params: co_params,
+        posonly_count: 0,
+        kwonly_count: params.iter().filter(|p| p.keyword_only).count() as u32,
+        is_generator: compiler.has_yield,
+        has_varargs: params.iter().any(|p| p.is_vararg),
+        has_varkwargs: params.iter().any(|p| p.is_varkwarg),
         ret_ty: resolve_type(ret),
         n_locals: compiler.local_names.len(),
         local_names: compiler.local_names,
@@ -150,7 +196,8 @@ fn compile_code_object(
         ops,
         cache_count,
         exc_table,
-    })
+    };
+    Ok((code_object, compiler.hoisted))
 }
 
 /// Collect every name a body assigns (descending into `if`/`while` bodies, since
@@ -180,11 +227,21 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 }
             }
         }
-        Stmt::MultiAssign { targets, .. } | Stmt::TupleAssign { targets, .. } => {
+        Stmt::MultiAssign { targets, .. } => {
             for target in targets {
-                if !names.iter().any(|n| n == target) {
-                    names.push(target.clone());
-                    types.push(bc::StaticType::Dynamic);
+                let mut bound = Vec::new();
+                target.collect_names(&mut bound);
+                for name in bound {
+                    add_dynamic_local(name, names, types);
+                }
+            }
+        }
+        Stmt::TupleAssign { targets, .. } => {
+            for target in targets {
+                let mut bound = Vec::new();
+                target.collect_names(&mut bound);
+                for name in bound {
+                    add_dynamic_local(name, names, types);
                 }
             }
         }
@@ -252,15 +309,43 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 }
             }
         }
+        Stmt::With {
+            optional_name,
+            body,
+            ..
+        } => {
+            if let Some(name) = optional_name {
+                add_dynamic_local(name, names, types);
+            }
+            for s in body {
+                collect_locals_stmt(s, names, types);
+            }
+        }
         Stmt::ClassDef { name, .. } => {
             if !names.iter().any(|n| n == name) {
                 names.push(name.clone());
                 types.push(bc::StaticType::Dynamic);
             }
         }
+        Stmt::FuncDef(func) => {
+            if func.params.iter().any(|p| p.default.is_some()) {
+                add_dynamic_local(&func.name, names, types);
+            }
+        }
+        Stmt::Decorated { decorators, inner } => {
+            match &**inner {
+                Stmt::FuncDef(f) => add_dynamic_local(&f.name, names, types),
+                Stmt::ClassDef { name, .. } => add_dynamic_local(name, names, types),
+                _ => {}
+            }
+            collect_locals_stmt(inner, names, types);
+            for d in decorators {
+                collect_comp_targets_expr(d, names, types);
+            }
+        }
         Stmt::Return(_)
         | Stmt::Expr(_)
-        | Stmt::FuncDef(_)
+        | Stmt::Delete(_)
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass
@@ -317,6 +402,7 @@ fn collect_comp_targets_stmt(
             container,
             index,
             value,
+            ..
         } => {
             collect_comp_targets_expr(container, names, types);
             collect_comp_targets_expr(index, names, types);
@@ -369,12 +455,35 @@ fn collect_comp_targets_stmt(
                 }
             }
         }
+        Stmt::With { context, body, .. } => {
+            collect_comp_targets_expr(context, names, types);
+            for s in body {
+                collect_comp_targets_stmt(s, names, types);
+            }
+        }
+        Stmt::Decorated { decorators, .. } => {
+            for d in decorators {
+                collect_comp_targets_expr(d, names, types);
+            }
+        }
         Stmt::Return(None)
         | Stmt::FuncDef(_)
         | Stmt::ClassDef { .. }
         | Stmt::Break
         | Stmt::Continue
-        | Stmt::Pass => {}
+        | Stmt::Pass
+        | Stmt::Delete(_) => {}
+    }
+}
+
+/// The inner value expression of a call argument -- the same field for every kind (`value`,
+/// `*value`, `name=value`, `**value`).
+fn call_arg_expr(arg: &ast::CallArg) -> &Expr {
+    match arg {
+        ast::CallArg::Positional(e)
+        | ast::CallArg::Star(e)
+        | ast::CallArg::Keyword(_, e)
+        | ast::CallArg::DoubleStar(e) => e,
     }
 }
 
@@ -386,7 +495,9 @@ fn collect_comp_targets_expr(
     types: &mut Vec<bc::StaticType>,
 ) {
     match expr {
-        Expr::ListComp { element, clauses } | Expr::SetComp { element, clauses } => {
+        Expr::ListComp { element, clauses }
+        | Expr::SetComp { element, clauses }
+        | Expr::GeneratorExp { element, clauses } => {
             collect_comp_clauses(clauses, names, types);
             collect_comp_targets_expr(element, names, types);
         }
@@ -409,10 +520,19 @@ fn collect_comp_targets_expr(
             collect_comp_targets_expr(body, names, types);
             collect_comp_targets_expr(orelse, names, types);
         }
-        Expr::Call { func, args } => {
+        Expr::Call { func, args, keywords } => {
             collect_comp_targets_expr(func, names, types);
             for a in args {
                 collect_comp_targets_expr(a, names, types);
+            }
+            for k in keywords {
+                collect_comp_targets_expr(&k.value, names, types);
+            }
+        }
+        Expr::CallEx { func, args } => {
+            collect_comp_targets_expr(func, names, types);
+            for a in args {
+                collect_comp_targets_expr(call_arg_expr(a), names, types);
             }
         }
         Expr::List(es) | Expr::Tuple(es) | Expr::Set(es) => {
@@ -436,7 +556,114 @@ fn collect_comp_targets_expr(
                 collect_comp_targets_expr(e, names, types);
             }
         }
-        Expr::Int(_) | Expr::Str(_) | Expr::Bool(_) | Expr::None | Expr::Name(_) => {}
+        Expr::Walrus { target, value } => {
+            add_dynamic_local(target, names, types);
+            collect_comp_targets_expr(value, names, types);
+        }
+        Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Imaginary(_)
+        | Expr::BigInt(_)
+        | Expr::Str(_)
+        | Expr::Bool(_)
+        | Expr::None
+        | Expr::Name(_) => {}
+        Expr::Lambda { .. } => {}
+        Expr::Yield(value) => {
+            if let Some(v) = value {
+                collect_comp_targets_expr(v, names, types);
+            }
+        }
+    }
+}
+
+/// Collect every name referenced anywhere in `expr` into `out` -- the input to a lambda's
+/// capture check. Conservative: it descends through nested lambdas and comprehensions rather
+/// than modelling their binders, so it may over-approximate the free set. That is safe, since
+/// the only use is to REJECT a capture, never to silently allow one.
+fn collect_names(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Name(n) => out.push(n.clone()),
+        Expr::Int(_) | Expr::Float(_) | Expr::Imaginary(_) | Expr::BigInt(_) | Expr::Str(_) | Expr::Bool(_) | Expr::None => {}
+        Expr::Attribute { value, .. } => collect_names(value, out),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::BoolBinary { lhs, rhs, .. }
+        | Expr::Compare { lhs, rhs, .. } => {
+            collect_names(lhs, out);
+            collect_names(rhs, out);
+        }
+        Expr::Unary { operand, .. } | Expr::Not { operand } => collect_names(operand, out),
+        Expr::Conditional { test, body, orelse } => {
+            collect_names(test, out);
+            collect_names(body, out);
+            collect_names(orelse, out);
+        }
+        Expr::CallEx { func, args } => {
+            collect_names(func, out);
+            for a in args {
+                collect_names(call_arg_expr(a), out);
+            }
+        }
+        Expr::Call { func, args, keywords } => {
+            collect_names(func, out);
+            for a in args {
+                collect_names(a, out);
+            }
+            for k in keywords {
+                collect_names(&k.value, out);
+            }
+        }
+        Expr::Subscript { value, index } => {
+            collect_names(value, out);
+            collect_names(index, out);
+        }
+        Expr::Slice { lower, upper, step } => {
+            for e in [lower, upper, step].into_iter().flatten() {
+                collect_names(e, out);
+            }
+        }
+        Expr::Walrus { target, value } => {
+            out.push(target.clone());
+            collect_names(value, out);
+        }
+        Expr::List(es) | Expr::Tuple(es) | Expr::Set(es) => {
+            for e in es {
+                collect_names(e, out);
+            }
+        }
+        Expr::Dict(ps) => {
+            for (k, v) in ps {
+                collect_names(k, out);
+                collect_names(v, out);
+            }
+        }
+        Expr::ListComp { element, clauses }
+        | Expr::SetComp { element, clauses }
+        | Expr::GeneratorExp { element, clauses } => {
+            collect_names(element, out);
+            for c in clauses {
+                collect_names(&c.iterable, out);
+                for cond in &c.conditions {
+                    collect_names(cond, out);
+                }
+            }
+        }
+        Expr::DictComp { key, value, clauses } => {
+            collect_names(key, out);
+            collect_names(value, out);
+            for c in clauses {
+                collect_names(&c.iterable, out);
+                for cond in &c.conditions {
+                    collect_names(cond, out);
+                }
+            }
+        }
+        Expr::Lambda { body, .. } => collect_names(body, out),
+        Expr::Yield(value) => {
+            if let Some(v) = value {
+                collect_names(v, out);
+            }
+        }
     }
 }
 
@@ -508,15 +735,23 @@ fn gather_assignments_stmt(
         }
         Stmt::MultiAssign { targets, value } => {
             for target in targets {
-                if let Some(slot) = names.iter().position(|n| n == target) {
-                    rhss[slot].push(value.clone());
+                let mut bound = Vec::new();
+                target.collect_names(&mut bound);
+                for name in bound {
+                    if let Some(slot) = names.iter().position(|n| n == name) {
+                        rhss[slot].push(value.clone());
+                    }
                 }
             }
         }
         Stmt::TupleAssign { targets, .. } => {
             for target in targets {
-                if let Some(slot) = names.iter().position(|n| n == target) {
-                    pinned[slot] = true;
+                let mut bound = Vec::new();
+                target.collect_names(&mut bound);
+                for name in bound {
+                    if let Some(slot) = names.iter().position(|n| n == name) {
+                        pinned[slot] = true;
+                    }
                 }
             }
         }
@@ -581,6 +816,20 @@ fn gather_assignments_stmt(
                 }
             }
         }
+        Stmt::With {
+            optional_name,
+            body,
+            ..
+        } => {
+            if let Some(name) = optional_name {
+                if let Some(slot) = names.iter().position(|n| n == name) {
+                    pinned[slot] = true;
+                }
+            }
+            for s in body {
+                gather_assignments_stmt(s, names, pinned, rhss);
+            }
+        }
         Stmt::ClassDef { name, .. } => {
             if let Some(slot) = names.iter().position(|n| n == name) {
                 pinned[slot] = true;
@@ -588,7 +837,9 @@ fn gather_assignments_stmt(
         }
         Stmt::Return(_)
         | Stmt::Expr(_)
+        | Stmt::Delete(_)
         | Stmt::FuncDef(_)
+        | Stmt::Decorated { .. }
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass
@@ -631,8 +882,10 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
                 bc::StaticType::Dynamic
             }
         }
-        Expr::Call { func, args }
-            if matches!(&**func, Expr::Name(n) if matches!(n.as_str(), "abs" | "min" | "max"))
+        Expr::Call { func, args, keywords }
+            if keywords.is_empty()
+                && matches!(&**func, Expr::Name(n) if matches!(n.as_str(),
+                    "abs" | "min" | "max" | "mmio_read8" | "mmio_read16" | "mmio_read32"))
                 && args
                     .iter()
                     .all(|a| expr_static_type(a, names, types) == bc::StaticType::Int) =>
@@ -669,6 +922,15 @@ struct Compiler {
     finallys: Vec<Vec<Stmt>>,
     /// The enclosing class name, so `super()` in a method resolves to its base.
     current_class: Option<String>,
+    /// This code object's own name, used to prefix hoisted-lambda names for uniqueness.
+    name: String,
+    /// Lambda functions hoisted out of this code object (and nested ones), appended to the
+    /// module's function table so their `MakeFunction` references resolve.
+    hoisted: Vec<bc::CodeObject>,
+    /// Counts hoisted lambdas within this code object, for unique naming.
+    lambda_counter: usize,
+    /// Set when the body emits a `Yield`, marking this code object a generator function.
+    has_yield: bool,
 }
 
 impl Compiler {
@@ -697,8 +959,41 @@ impl Compiler {
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
-            Stmt::FuncDef(_) => {
-                Err(error("nested function definitions are not supported in this subset"))
+            Stmt::FuncDef(func) => {
+                if self.scope == Scope::Function {
+                    return Err(error(
+                        "nested function definitions are not supported in this subset",
+                    ));
+                }
+                self.compile_defaulted_def(func)
+            }
+            Stmt::Delete(targets) => {
+                for target in targets {
+                    match target {
+                        Expr::Name(name) => {
+                            let slot = self.local_slot(name).ok_or_else(|| {
+                                error("cannot delete a name that is not a local in this scope")
+                            })?;
+                            self.asm.emit(bc::Op::DeleteFast(slot));
+                        }
+                        Expr::Subscript { value, index } => {
+                            self.compile_expr(value)?;
+                            self.compile_expr(index)?;
+                            self.asm.emit(bc::Op::DeleteItem);
+                        }
+                        Expr::Attribute { value, attr } => {
+                            self.compile_expr(value)?;
+                            let name = self.name_index(attr);
+                            self.asm.emit(bc::Op::DeleteAttr { name });
+                        }
+                        _ => {
+                            return Err(error(
+                                "a del target must be a name, a subscript, or an attribute",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
             }
             Stmt::Return(value) => {
                 if self.scope != Scope::Function {
@@ -716,6 +1011,7 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Assign(assign) => self.compile_assign(assign),
+            Stmt::Decorated { decorators, inner } => self.compile_decorated(decorators, inner),
             Stmt::MultiAssign { targets, value } => self.compile_multi_assign(targets, value),
             Stmt::TupleAssign { targets, star, value } => {
                 self.compile_expr(value)?;
@@ -727,10 +1023,7 @@ impl Compiler {
                     }),
                 }
                 for target in targets {
-                    let slot = self
-                        .local_slot(target)
-                        .expect("the tuple-unpacking target is a local (added by the pre-pass)");
-                    self.asm.emit(bc::Op::StoreFast(slot));
+                    self.compile_unpack_target(target)?;
                 }
                 Ok(())
             }
@@ -738,21 +1031,14 @@ impl Compiler {
                 container,
                 index,
                 value,
-            } => {
-                self.compile_expr(value)?;
-                self.compile_expr(container)?;
-                self.compile_expr(index)?;
-                self.asm.emit(bc::Op::Setitem);
-                Ok(())
-            }
-            Stmt::SetAttr { obj, attr, value } => {
-                self.compile_expr(value)?;
-                self.compile_expr(obj)?;
-                let name = self.name_index(attr);
-                let cache = self.asm.next_cache_slot();
-                self.asm.emit(bc::Op::SetAttr { name, cache });
-                Ok(())
-            }
+                op,
+            } => self.compile_setitem(container, index, value, *op),
+            Stmt::SetAttr {
+                obj,
+                attr,
+                value,
+                op,
+            } => self.compile_setattr(obj, attr, value, *op),
             Stmt::ClassDef { name, base, body } => self.compile_classdef(name, base, body),
             Stmt::Expr(expr) => {
                 self.compile_expr(expr)?;
@@ -802,6 +1088,11 @@ impl Compiler {
                     self.compile_try_finally(body, handlers, orelse, finalbody)
                 }
             }
+            Stmt::With {
+                context,
+                optional_name,
+                body,
+            } => self.compile_with(context, optional_name, body),
             Stmt::Break => {
                 let (_, target, depth) = self
                     .loops
@@ -826,6 +1117,35 @@ impl Compiler {
         }
     }
 
+    /// Compile a decorated `def`/`class`: define it (binding `name`), then rebind
+    /// `name = d0(d1(... dn(name) ...))` -- the decorators wrap the name bottom-up (the one nearest
+    /// the `def` applied first). Each `decorator(name)` is an ordinary call.
+    fn compile_decorated(
+        &mut self,
+        decorators: &[Expr],
+        inner: &Stmt,
+    ) -> Result<(), CompileError> {
+        self.compile_stmt(inner)?;
+        let name = match inner {
+            Stmt::FuncDef(f) => f.name.clone(),
+            Stmt::ClassDef { name, .. } => name.clone(),
+            _ => unreachable!("the parser wraps only a def or class"),
+        };
+        let mut value = Expr::Name(name.clone());
+        for decorator in decorators.iter().rev() {
+            value = Expr::Call {
+                func: Box::new(decorator.clone()),
+                args: vec![value],
+                keywords: Vec::new(),
+            };
+        }
+        self.compile_assign(&Assign {
+            target: name,
+            annotation: None,
+            value: Some(value),
+        })
+    }
+
     fn compile_assign(&mut self, assign: &Assign) -> Result<(), CompileError> {
         let Some(value) = &assign.value else {
             return Ok(());
@@ -842,20 +1162,15 @@ impl Compiler {
     /// that into each remaining target (left to right), so all bind the same value.
     fn compile_multi_assign(
         &mut self,
-        targets: &[String],
+        targets: &[ast::AssignTarget],
         value: &Expr,
     ) -> Result<(), CompileError> {
         self.compile_expr(value)?;
-        let first = self
-            .local_slot(&targets[0])
-            .expect("an assigned name is always a local (added by the pre-pass)");
-        self.asm.emit(bc::Op::StoreFast(first));
-        for target in &targets[1..] {
-            let slot = self
-                .local_slot(target)
-                .expect("an assigned name is always a local (added by the pre-pass)");
-            self.asm.emit(bc::Op::LoadFast(first));
-            self.asm.emit(bc::Op::StoreFast(slot));
+        let temp = self.alloc_temp();
+        self.asm.emit(bc::Op::StoreFast(temp));
+        for target in targets {
+            self.asm.emit(bc::Op::LoadFast(temp));
+            self.compile_unpack_target(target)?;
         }
         Ok(())
     }
@@ -1084,6 +1399,52 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile `with context [as name]: body` by desugaring to the context-manager protocol over a
+    /// try/finally (reusing that machinery, so `__exit__` runs on normal fall-through, on
+    /// return/break/continue, AND on exception):
+    ///   `_mgr = context; [name =] _mgr.__enter__(); try: body finally: _mgr.__exit__(None,None,None)`
+    /// The manager lives in a temp local. Passing the exception info to `__exit__` and honouring its
+    /// return value for exception SUPPRESSION are follow-ons -- this increment always passes
+    /// `None, None, None` and lets any exception propagate (correct for a cleanup manager).
+    fn compile_with(
+        &mut self,
+        context: &Expr,
+        optional_name: &Option<String>,
+        body: &[Stmt],
+    ) -> Result<(), CompileError> {
+        let mgr = self.alloc_temp();
+        let mgr_name = format!(".t{mgr}");
+        self.compile_expr(context)?;
+        self.asm.emit(bc::Op::StoreFast(mgr));
+        let enter = Expr::Call {
+            func: Box::new(Expr::Attribute {
+                value: Box::new(Expr::Name(mgr_name.clone())),
+                attr: String::from("__enter__"),
+            }),
+            args: Vec::new(),
+            keywords: Vec::new(),
+        };
+        self.compile_expr(&enter)?;
+        match optional_name {
+            Some(name) => {
+                let slot = self
+                    .local_slot(name)
+                    .expect("a with-target is a local (added by the pre-pass)");
+                self.asm.emit(bc::Op::StoreFast(slot));
+            }
+            None => self.asm.emit(bc::Op::PopTop),
+        }
+        let exit = Stmt::Expr(Expr::Call {
+            func: Box::new(Expr::Attribute {
+                value: Box::new(Expr::Name(mgr_name)),
+                attr: String::from("__exit__"),
+            }),
+            args: vec![Expr::None, Expr::None, Expr::None],
+            keywords: Vec::new(),
+        });
+        self.compile_try_finally(body, &[], &[], &[exit])
+    }
+
     /// `class Name [(Base)]:` -- push the name and base, build the namespace dict (class
     /// attributes + a `MakeFunction("Name.method")` for each method), `BuildClass` over
     /// `[name, base, namespace]`, and bind the class object to its name.
@@ -1109,13 +1470,18 @@ impl Compiler {
         for member in body {
             match member {
                 Stmt::FuncDef(method) => {
+                    if method.params.iter().any(|p| p.default.is_some()) {
+                        return Err(error(
+                            "default parameter values on a method are not yet supported",
+                        ));
+                    }
                     let key = self.const_index(bc::Const::Str(method.name.clone()));
                     self.asm.emit(bc::Op::LoadConst(key));
                     let mut qualified = String::from(name);
                     qualified.push('.');
                     qualified.push_str(&method.name);
                     let f = self.name_index(&qualified);
-                    self.asm.emit(bc::Op::MakeFunction(f));
+                    self.asm.emit(bc::Op::MakeFunction { func: f, flags: 0 });
                     n_members += 1;
                 }
                 Stmt::Assign(assign) => {
@@ -1180,6 +1546,26 @@ impl Compiler {
         match expr {
             Expr::Int(value) => {
                 let idx = self.const_index(bc::Const::Int(*value));
+                self.asm.emit(bc::Op::LoadConst(idx));
+            }
+            Expr::Walrus { target, value } => {
+                self.compile_expr(value)?;
+                let slot = self
+                    .local_slot(target)
+                    .expect("a walrus target is a local (added by the pre-pass)");
+                self.asm.emit(bc::Op::StoreFast(slot));
+                self.asm.emit(bc::Op::LoadFast(slot));
+            }
+            Expr::Float(bits) => {
+                let idx = self.const_index(bc::Const::Float(*bits));
+                self.asm.emit(bc::Op::LoadConst(idx));
+            }
+            Expr::Imaginary(bits) => {
+                let idx = self.const_index(bc::Const::Imaginary(*bits));
+                self.asm.emit(bc::Op::LoadConst(idx));
+            }
+            Expr::BigInt(digits) => {
+                let idx = self.const_index(bc::Const::BigInt(digits.clone()));
                 self.asm.emit(bc::Op::LoadConst(idx));
             }
             Expr::Str(value) => {
@@ -1247,6 +1633,9 @@ impl Compiler {
             Expr::ListComp { element, clauses } => {
                 self.compile_comprehension(CompKind::List(element), clauses)?
             }
+            Expr::GeneratorExp { element, clauses } => {
+                self.compile_comprehension(CompKind::List(element), clauses)?
+            }
             Expr::DictComp {
                 key,
                 value,
@@ -1278,8 +1667,22 @@ impl Compiler {
                     _ => self.asm.emit(bc::Op::Compare(cmp_sel(*op))),
                 }
             }
-            Expr::Call { func, args } => {
-                if args.is_empty()
+            Expr::Call { func, args, keywords } => {
+                if !keywords.is_empty() {
+                    self.compile_expr(func)?;
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                    }
+                    for kw in keywords {
+                        self.compile_expr(&kw.value)?;
+                    }
+                    let names: Vec<String> = keywords.iter().map(|k| k.name.clone()).collect();
+                    let kwnames = self.const_index(bc::Const::KwNames(names));
+                    self.asm.emit(bc::Op::CallKw {
+                        argc: args.len() as u32,
+                        kwnames,
+                    });
+                } else if args.is_empty()
                     && matches!(&**func, Expr::Name(n) if n == "super")
                     && self.current_class.is_some()
                 {
@@ -1294,7 +1697,120 @@ impl Compiler {
                     self.asm.emit(bc::Op::Call(args.len() as u32));
                 }
             }
+            Expr::CallEx { func, args } => {
+                self.compile_expr(func)?;
+                let mut kinds: Vec<u8> = Vec::with_capacity(args.len());
+                let mut kwnames: Vec<String> = Vec::new();
+                for arg in args {
+                    match arg {
+                        ast::CallArg::Positional(e) => {
+                            self.compile_expr(e)?;
+                            kinds.push(0);
+                        }
+                        ast::CallArg::Star(e) => {
+                            self.compile_expr(e)?;
+                            kinds.push(1);
+                        }
+                        ast::CallArg::Keyword(name, e) => {
+                            self.compile_expr(e)?;
+                            kinds.push(2);
+                            kwnames.push(name.clone());
+                        }
+                        ast::CallArg::DoubleStar(e) => {
+                            self.compile_expr(e)?;
+                            kinds.push(3);
+                        }
+                    }
+                }
+                let kinds_idx = self.const_index(bc::Const::ArgKinds(kinds));
+                let kwnames_idx = self.const_index(bc::Const::KwNames(kwnames));
+                self.asm.emit(bc::Op::CallEx {
+                    argc: args.len() as u32,
+                    kinds: kinds_idx,
+                    kwnames: kwnames_idx,
+                });
+            }
+            Expr::Lambda { params, body } => self.compile_lambda(params, body)?,
+            Expr::Yield(value) => {
+                match value {
+                    Some(v) => self.compile_expr(v)?,
+                    None => {
+                        let none = self.const_index(bc::Const::None);
+                        self.asm.emit(bc::Op::LoadConst(none));
+                    }
+                }
+                self.asm.emit(bc::Op::Yield);
+                self.has_yield = true;
+            }
         }
+        Ok(())
+    }
+
+    /// Emit a module-level defaulted def at its source position: 
+    /// push each default value, build the defaults tuple, `MakeFunction` (flag bit0 =
+    /// defaults) resolving the function by name, then `StoreFast` -- which set_global's the
+    /// PyFunction so a later `LoadGlobal` prefers it (it carries the defaults) over the plain
+    /// function-table ref. Emitted at the source position because a default may reference an
+    /// earlier module var.
+    fn compile_defaulted_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
+        let mut n_defaults = 0u32;
+        for p in &func.params {
+            if let Some(default) = &p.default {
+                self.compile_expr(default)?;
+                n_defaults += 1;
+            }
+        }
+        self.asm.emit(bc::Op::BuildTuple(n_defaults));
+        let func_name = self.name_index(&func.name);
+        self.asm.emit(bc::Op::MakeFunction {
+            func: func_name,
+            flags: 0x01,
+        });
+        let slot = self
+            .local_slot(&func.name)
+            .expect("a defaulted def name is a body local (added by the pre-pass)");
+        self.asm.emit(bc::Op::StoreFast(slot));
+        Ok(())
+    }
+
+    /// Compile a lambda: hoist it to a synthetic module function and push a reference to it
+    /// (`MakeFunction`, as a class method does). Its body is `return <body>`. Capturing an
+    /// enclosing function's local (a closure) is rejected loudly -- hoisting to a module
+    /// function would otherwise silently read a same-named global instead; at module scope
+    /// every name is a global, so no capture is possible.
+    fn compile_lambda(
+        &mut self,
+        params: &[ast::ParamDef],
+        body: &Expr,
+    ) -> Result<(), CompileError> {
+        if params.iter().any(|p| p.default.is_some()) {
+            return Err(error(
+                "default parameter values on a lambda are not yet supported",
+            ));
+        }
+        if self.scope == Scope::Function {
+            let mut used = Vec::new();
+            collect_names(body, &mut used);
+            for used_name in &used {
+                let is_param = params.iter().any(|p| p.name == *used_name);
+                if !is_param && self.local_names.iter().any(|l| l == used_name) {
+                    return Err(error(&format!(
+                        "a lambda cannot use the enclosing local '{used_name}' \
+                         (closures are not yet supported)"
+                    )));
+                }
+            }
+        }
+        let lambda_name = format!("{}.<lambda.{}>", self.name, self.lambda_counter);
+        self.lambda_counter += 1;
+        let lambda_body = [Stmt::Return(Some(body.clone()))];
+        let body_refs: Vec<&Stmt> = lambda_body.iter().collect();
+        let (lambda_co, nested) =
+            compile_code_object(Scope::Function, &lambda_name, params, &None, &body_refs, None)?;
+        self.hoisted.push(lambda_co);
+        self.hoisted.extend(nested);
+        let idx = self.name_index(&lambda_name);
+        self.asm.emit(bc::Op::MakeFunction { func: idx, flags: 0 });
         Ok(())
     }
 
@@ -1445,17 +1961,117 @@ impl Compiler {
         let falsey = self.asm.new_label();
         let end = self.asm.new_label();
         self.asm.emit_branch(falsey);
-        let zero = self.const_index(bc::Const::Int(0));
-        self.asm.emit(bc::Op::LoadConst(zero));
+        let f = self.const_index(bc::Const::Bool(false));
+        self.asm.emit(bc::Op::LoadConst(f));
         self.asm.emit(bc::Op::StoreFast(tmp));
         self.asm.emit_jump(end);
         self.asm.place(falsey);
-        let one = self.const_index(bc::Const::Int(1));
-        self.asm.emit(bc::Op::LoadConst(one));
+        let t = self.const_index(bc::Const::Bool(true));
+        self.asm.emit(bc::Op::LoadConst(t));
         self.asm.emit(bc::Op::StoreFast(tmp));
         self.asm.place(end);
         self.asm.emit(bc::Op::LoadFast(tmp));
         Ok(())
+    }
+
+    /// Store the value on top of the stack (an unpacked element, or the starred list) into one
+    /// tuple-unpacking target. The element sits BELOW any container/index/obj we compile, which is
+    /// exactly the stack order Setitem `[value, container, index]` / SetAttr `[value, obj]` expect.
+    fn compile_unpack_target(&mut self, target: &ast::AssignTarget) -> Result<(), CompileError> {
+        match target {
+            ast::AssignTarget::Name(name) => {
+                let slot = self
+                    .local_slot(name)
+                    .expect("a tuple-unpacking name target is a local (added by the pre-pass)");
+                self.asm.emit(bc::Op::StoreFast(slot));
+            }
+            ast::AssignTarget::Subscript { container, index } => {
+                self.compile_expr(container)?;
+                self.compile_expr(index)?;
+                self.asm.emit(bc::Op::Setitem);
+            }
+            ast::AssignTarget::Attribute { obj, attr } => {
+                self.compile_expr(obj)?;
+                let name = self.name_index(attr);
+                let cache = self.asm.next_cache_slot();
+                self.asm.emit(bc::Op::SetAttr { name, cache });
+            }
+            ast::AssignTarget::Tuple(targets) => {
+                self.asm.emit(bc::Op::UnpackSequence(targets.len() as u32));
+                for t in targets {
+                    self.compile_unpack_target(t)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Compile `c[i] = v` (op None) or `c[i] OP= v` (op Some). The augmented form evaluates the
+    /// container and index ONCE into temps, then `_c[_i] = _c[_i] OP v` -- so a side-effecting
+    /// container/index runs exactly once (Python semantics), unlike a `c[i] = c[i] OP v` desugar.
+    fn compile_setitem(
+        &mut self,
+        container: &Expr,
+        index: &Expr,
+        value: &Expr,
+        op: Option<ast::BinOp>,
+    ) -> Result<(), CompileError> {
+        let Some(op) = op else {
+            self.compile_expr(value)?;
+            self.compile_expr(container)?;
+            self.compile_expr(index)?;
+            self.asm.emit(bc::Op::Setitem);
+            return Ok(());
+        };
+        let c = self.alloc_temp();
+        let i = self.alloc_temp();
+        self.compile_expr(container)?;
+        self.asm.emit(bc::Op::StoreFast(c));
+        self.compile_expr(index)?;
+        self.asm.emit(bc::Op::StoreFast(i));
+        let cn = Expr::Name(format!(".t{c}"));
+        let ix = Expr::Name(format!(".t{i}"));
+        let combined = Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Subscript {
+                value: Box::new(cn.clone()),
+                index: Box::new(ix.clone()),
+            }),
+            rhs: Box::new(value.clone()),
+        };
+        self.compile_setitem(&cn, &ix, &combined, None)
+    }
+
+    /// Compile `obj.attr = v` (op None) or `obj.attr OP= v` (op Some). The augmented form evaluates
+    /// `obj` once into a temp, then `_o.attr = _o.attr OP v`.
+    fn compile_setattr(
+        &mut self,
+        obj: &Expr,
+        attr: &str,
+        value: &Expr,
+        op: Option<ast::BinOp>,
+    ) -> Result<(), CompileError> {
+        let Some(op) = op else {
+            self.compile_expr(value)?;
+            self.compile_expr(obj)?;
+            let name = self.name_index(attr);
+            let cache = self.asm.next_cache_slot();
+            self.asm.emit(bc::Op::SetAttr { name, cache });
+            return Ok(());
+        };
+        let o = self.alloc_temp();
+        self.compile_expr(obj)?;
+        self.asm.emit(bc::Op::StoreFast(o));
+        let on = Expr::Name(format!(".t{o}"));
+        let combined = Expr::Binary {
+            op,
+            lhs: Box::new(Expr::Attribute {
+                value: Box::new(on.clone()),
+                attr: String::from(attr),
+            }),
+            rhs: Box::new(value.clone()),
+        };
+        self.compile_setattr(&on, attr, &combined, None)
     }
 
     /// `body if test else orelse` -- branch on the test's truthiness, storing the
@@ -1489,6 +2105,8 @@ fn binop_sel(op: ast::BinOp) -> bc::BinOp {
         ast::BinOp::Sub => bc::BinOp::Sub,
         ast::BinOp::Mul => bc::BinOp::Mul,
         ast::BinOp::FloorDiv => bc::BinOp::FloorDiv,
+        ast::BinOp::TrueDiv => bc::BinOp::TrueDiv,
+        ast::BinOp::Pow => bc::BinOp::Pow,
         ast::BinOp::Mod => bc::BinOp::Mod,
         ast::BinOp::BitAnd => bc::BinOp::BitAnd,
         ast::BinOp::BitOr => bc::BinOp::BitOr,
@@ -1514,6 +2132,8 @@ fn cmp_sel(op: ast::CmpOp) -> bc::CmpOp {
         ast::CmpOp::Le => bc::CmpOp::Le,
         ast::CmpOp::Gt => bc::CmpOp::Gt,
         ast::CmpOp::Ge => bc::CmpOp::Ge,
+        ast::CmpOp::Is => bc::CmpOp::Is,
+        ast::CmpOp::IsNot => bc::CmpOp::IsNot,
         ast::CmpOp::In | ast::CmpOp::NotIn => {
             unreachable!("membership routes to Op::Contains")
         }
@@ -1647,6 +2267,176 @@ mod tests {
     }
 
     #[test]
+    fn keyword_arguments_emit_callkw() {
+        let module = compile_src("def g(a):\n    return a\ng(x=1)\n").unwrap();
+        let (argc, kwnames) = module
+            .body
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::CallKw { argc, kwnames } => Some((*argc, *kwnames)),
+                _ => None,
+            })
+            .expect("a CallKw op");
+        assert_eq!(argc, 0);
+        assert_eq!(
+            module.body.consts.get(kwnames as usize),
+            Some(&Const::KwNames(vec![String::from("x")]))
+        );
+    }
+
+    #[test]
+    fn a_mixed_positional_and_keyword_call_orders_the_names() {
+        let module = compile_src("def h(a):\n    return a\nh(1, 2, y=3, z=4)\n").unwrap();
+        let (argc, kwnames) = module
+            .body
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::CallKw { argc, kwnames } => Some((*argc, *kwnames)),
+                _ => None,
+            })
+            .expect("a CallKw op");
+        assert_eq!(argc, 2);
+        assert_eq!(
+            module.body.consts.get(kwnames as usize),
+            Some(&Const::KwNames(vec![String::from("y"), String::from("z")]))
+        );
+    }
+
+    #[test]
+    fn a_module_level_defaulted_def_emits_its_def_site() {
+        let module = compile_src("def f(a, b=1):\n    return a + b\nprint(f(5))\n").unwrap();
+        assert!(module.body.ops.iter().any(|op| matches!(op, Op::BuildTuple(1))));
+        assert!(module
+            .body
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::MakeFunction { flags: 1, .. })));
+        assert!(module.functions.iter().any(|co| co.name == "f"));
+    }
+
+    #[test]
+    fn a_plain_def_has_no_def_site_emission() {
+        let module = compile_src("def f(a):\n    return a\nprint(f(5))\n").unwrap();
+        assert!(!module
+            .body
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::MakeFunction { .. })));
+    }
+
+    #[test]
+    fn defaults_on_lambdas_and_methods_are_still_gated() {
+        assert!(compile_src("f = lambda a, b=1: a + b\n").is_err());
+        assert!(compile_src("class C:\n    def m(self, x=1):\n        return x\n").is_err());
+    }
+
+    #[test]
+    fn keyword_only_params_set_kwonly_count() {
+        let module = compile_src("def f(a, b, *, c, d):\n    return a\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.params.len(), 4);
+        assert_eq!(f.kwonly_count, 2);
+        assert_eq!(f.posonly_count, 0);
+    }
+
+    #[test]
+    fn varargs_sets_has_varargs() {
+        let module = compile_src("def f(a, *args):\n    return a\n").unwrap();
+        let f = func(&module, "f");
+        assert!(f.has_varargs);
+        assert!(!f.has_varkwargs);
+        assert_eq!(f.params.len(), 2);
+    }
+
+    #[test]
+    fn varkwargs_sets_has_varkwargs() {
+        let module = compile_src("def f(a, **kw):\n    return a\n").unwrap();
+        let f = func(&module, "f");
+        assert!(f.has_varkwargs);
+        assert!(!f.has_varargs);
+        assert_eq!(f.params.len(), 2);
+    }
+
+    #[test]
+    fn float_literal_emits_a_float_const() {
+        let module = compile_src("x = 3.14\nprint(x)\n").unwrap();
+        assert!(module
+            .body
+            .consts
+            .iter()
+            .any(|c| matches!(c, bc::Const::Float(bits) if f64::from_bits(*bits) == 3.14)));
+    }
+
+    #[test]
+    fn del_of_a_subscript_or_attribute_compiles_to_delete_ops() {
+        let item = compile_src("xs = [1]\ndel xs[0]\n").unwrap();
+        assert!(item.body.ops.iter().any(|op| matches!(op, Op::DeleteItem)));
+        let attr = compile_src("o = make()\ndel o.attr\n").unwrap();
+        assert!(attr.body.ops.iter().any(|op| matches!(op, Op::DeleteAttr { .. })));
+    }
+
+    #[test]
+    fn with_desugars_to_the_enter_exit_protocol() {
+        let module = compile_src("with mgr() as x:\n    print(x)\n").unwrap();
+        assert!(module.body.names.iter().any(|n| n == "__enter__"));
+        assert!(module.body.names.iter().any(|n| n == "__exit__"));
+    }
+
+    #[test]
+    fn a_generator_function_emits_yield_and_is_flagged() {
+        let module = compile_src("def g():\n    yield 1\n    yield 2\n").unwrap();
+        let g = func(&module, "g");
+        assert!(g.is_generator);
+        assert_eq!(g.ops.iter().filter(|op| matches!(op, Op::Yield)).count(), 2);
+        let plain = compile_src("def h():\n    return 5\n").unwrap();
+        assert!(!func(&plain, "h").is_generator);
+    }
+
+    #[test]
+    fn lambda_hoists_to_a_function_and_emits_makefunction() {
+        let module = compile_src("f = lambda x: x + 1\n").unwrap();
+        let lam = module
+            .functions
+            .iter()
+            .find(|f| f.name.contains("<lambda."))
+            .expect("hoisted lambda function present");
+        assert_eq!(lam.params.len(), 1);
+        assert_eq!(lam.params[0].name, "x");
+        assert!(matches!(lam.ops.last(), Some(Op::Return)));
+        assert!(
+            module.body.ops.iter().any(|op| matches!(op, Op::MakeFunction { .. })),
+            "the module body references the lambda with MakeFunction"
+        );
+    }
+
+    #[test]
+    fn lambda_capturing_an_enclosing_local_is_rejected() {
+        let err =
+            compile_src("def f():\n    n = 5\n    g = lambda: n\n    return g\n").unwrap_err();
+        assert!(
+            err.message.contains("closures are not yet supported"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn lambda_using_only_params_and_globals_is_fine_inside_a_function() {
+        let module =
+            compile_src("LIMIT = 10\ndef f(xs):\n    g = lambda x: x + LIMIT\n    return g\n")
+                .unwrap();
+        assert!(module.functions.iter().any(|f| f.name.contains("<lambda.")));
+    }
+
+    #[test]
+    fn defaulted_lambda_is_gated_like_a_defaulted_def() {
+        let err = compile_src("f = lambda a, n=2: a + n\n").unwrap_err();
+        assert!(err.message.contains("default parameter"), "{}", err.message);
+    }
+
+    #[test]
     fn unannotated_int_locals_are_inferred() {
         let module = compile_src("def f() -> int:\n    x = 5\n    y = x + 1\n    return y\n").unwrap();
         assert_eq!(
@@ -1728,7 +2518,7 @@ mod tests {
         let m = compile_src(src).unwrap();
         assert!(m.body.ops.iter().any(|op| matches!(op, Op::BuildClass)));
         assert_eq!(
-            m.body.ops.iter().filter(|op| matches!(op, Op::MakeFunction(_))).count(),
+            m.body.ops.iter().filter(|op| matches!(op, Op::MakeFunction { .. })).count(),
             2
         );
         assert!(m.functions.iter().any(|f| f.name == "C.__init__"));

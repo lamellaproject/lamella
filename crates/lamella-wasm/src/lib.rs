@@ -5,6 +5,8 @@ pub mod abi;
 pub mod aot;
 #[cfg(feature = "bake")]
 pub mod bake;
+#[cfg(feature = "bake")]
+pub mod srcmap;
 #[cfg(feature = "compile")]
 pub mod compile;
 #[cfg(feature = "dap")]

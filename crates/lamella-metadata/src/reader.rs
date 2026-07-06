@@ -226,6 +226,10 @@ pub enum AttrArg<'a> {
     /// A `System.Type` argument (`typeof(X)`): the borrowed type NAME the blob serializes
     /// (its reflection name, e.g. `"Program"`). The caller resolves it to a type handle.
     Type(&'a str),
+    /// A single-dimension array argument (`new int[]{...}` / `new string[]{...}`): the decoded
+    /// elements in order. A NULL array (`NumElem == 0xFFFF_FFFF`, II.23.3) decodes as
+    /// [`AttrArg::Null`], not as an empty `Array`.
+    Array(Vec<AttrArg<'a>>),
 }
 
 /// One decoded named argument of a custom attribute (II.23.3): which member it sets and
@@ -295,7 +299,41 @@ fn read_attr_value<'a>(
             None => AttrArg::Null,
         },
         SigType::ValueType(_) => read_attr_value(reader, &SigType::I4, enum_width)?,
+        SigType::SzArray(element) => {
+            let count = reader.read_u32().ok()?;
+            if count == 0xFFFF_FFFF {
+                AttrArg::Null
+            } else {
+                let mut elements = Vec::with_capacity((count as usize).min(4096));
+                for _ in 0..count {
+                    elements.push(read_attr_value(reader, element, enum_width)?);
+                }
+                AttrArg::Array(elements)
+            }
+        }
         SigType::Class(_) | SigType::Object => return read_tagged_value(reader, enum_width),
+        _ => return None,
+    })
+}
+
+/// The [`SigType`] a one-byte `FieldOrPropType` element tag names, for the primitive tags an
+/// `object`-boxed / named-argument ARRAY may carry as its element type (II.23.3). `None` for a
+/// tag with no direct primitive mapping (enum/type/tagged-object elements are not modeled here).
+fn tag_element_sig(tag: u8) -> Option<SigType> {
+    Some(match tag {
+        element::BOOLEAN => SigType::Boolean,
+        element::CHAR => SigType::Char,
+        element::I1 => SigType::I1,
+        element::U1 => SigType::U1,
+        element::I2 => SigType::I2,
+        element::U2 => SigType::U2,
+        element::I4 => SigType::I4,
+        element::U4 => SigType::U4,
+        element::I8 => SigType::I8,
+        element::U8 => SigType::U8,
+        element::R4 => SigType::R4,
+        element::R8 => SigType::R8,
+        element::STRING => SigType::String,
         _ => return None,
     })
 }
@@ -341,6 +379,10 @@ fn read_tagged_value<'a>(
         element::R4 => read_attr_value(reader, &SigType::R4, enum_width),
         element::R8 => read_attr_value(reader, &SigType::R8, enum_width),
         element::STRING => read_attr_value(reader, &SigType::String, enum_width),
+        element::SZARRAY => {
+            let element_sig = tag_element_sig(reader.read_u8().ok()?)?;
+            read_attr_value(reader, &SigType::SzArray(Box::new(element_sig)), enum_width)
+        }
         _ => None,
     }
 }
@@ -628,6 +670,22 @@ impl<'a> Assembly<'a> {
             } else {
                 None
             }
+        })
+    }
+
+    /// The unmanaged MODULE (DLL) name of a P/Invoke method -- its `DllImport` library --
+    /// from the `ImplMap` row's `ImportScope` column, a `ModuleRef` (II.22.31) whose only
+    /// column is the name. `None` for an ordinary method.
+    #[must_use]
+    pub fn pinvoke_module(&self, method_rid: u32) -> Option<&'a str> {
+        let forwarded = (method_rid << 1) | 1;
+        (1..=self.tables.row_count(table::IMPL_MAP)).find_map(|index| {
+            let row = self.tables.row(table::IMPL_MAP, index)?;
+            if row.raw(1) != forwarded {
+                return None;
+            }
+            let scope = self.tables.row(table::MODULE_REF, row.raw(3))?;
+            self.strings().get(scope.raw(0)).ok()
         })
     }
 

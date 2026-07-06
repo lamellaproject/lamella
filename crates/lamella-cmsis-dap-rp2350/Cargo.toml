@@ -1,0 +1,18 @@
+[package]
+name = "lamella-cmsis-dap-rp2350"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Raspberry Pi RP2350 flash programming over the Lamella CMSIS-DAP debug stack -- dormant-state SWD connect, the ADIv6 MEM-AP, and the chip's bootrom flash API driven from the debugger; a device-specific extension of lamella-cmsis-dap."
+
+[lints]
+workspace = true
+
+[dependencies]
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
+
+[dev-dependencies]
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util", "usbbulk"] }
+lamella-usbbulk = { path = "../lamella-usbbulk" }

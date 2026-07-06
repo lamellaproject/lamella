@@ -4,8 +4,26 @@ namespace System
     public abstract class Array : ICloneable
     {
         public int Length { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
+        public int Rank { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
+        [Lamella.Runtime.RuntimeProvided] public int GetLength(int dimension) { return 0; }
+
+        public int GetLowerBound(int dimension)
+        {
+            GetLength(dimension);
+            return 0;
+        }
+
+        public int GetUpperBound(int dimension)
+        {
+            return GetLength(dimension) - 1;
+        }
         [Lamella.Runtime.RuntimeProvided] public object GetValue(int index) { return null; }
         [Lamella.Runtime.RuntimeProvided] public void SetValue(object value, int index) { }
+
+        public System.Collections.IEnumerator GetEnumerator()
+        {
+            return new ArrayEnumerator(this);
+        }
 
         [Lamella.Runtime.RuntimeProvided] public object Clone() { return null; }
 
@@ -95,6 +113,39 @@ namespace System
                 else hi = mid - 1;
             }
             return ~lo;
+        }
+    }
+
+    internal sealed class ArrayEnumerator : System.Collections.IEnumerator
+    {
+        private readonly Array array;
+        private int index;
+
+        internal ArrayEnumerator(Array array)
+        {
+            this.array = array;
+            this.index = -1;
+        }
+
+        public bool MoveNext()
+        {
+            if (index + 1 >= array.Length) return false;
+            index = index + 1;
+            return true;
+        }
+
+        public object Current
+        {
+            get
+            {
+                if (index < 0 || index >= array.Length) throw new InvalidOperationException("Enumeration has either not started or has already finished.");
+                return array.GetValue(index);
+            }
+        }
+
+        public void Reset()
+        {
+            index = -1;
         }
     }
 }

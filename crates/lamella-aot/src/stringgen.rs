@@ -1,10 +1,10 @@
-//! Generated MIR helper builders shared by the WASM and ARM backends: the bodies that the
-//! `StringConcat` and `IntToString` marker instructions lower to. Each is an ordinary verified
-//! [`Function`] of pure [`lamella_ir`] MIR (no target specifics) -- a string is the array layout
-//! `[u32 unit_count][u16 units]`, so the helpers build their results with `AllocArray` (element size
-//! 2), array loads/stores, and the integer Div/Rem. A backend rewrites the marker to a call to the
-//! appended helper and lowers it through its usual path. Kept out of the feature-gated WASM module so
-//! the always-compiled ARM backend can use them too.
+//! Generated MIR helper builders shared by the WASM, ARM, and RISC-V backends: the bodies that the
+//! `StringConcat`, `IntToString`, and `StringEquals` marker instructions lower to. Each is an
+//! ordinary verified [`Function`] of pure [`lamella_ir`] MIR (no target specifics) -- a string is the
+//! array layout `[u32 unit_count][u16 units]`, so the helpers build/read their results with
+//! `AllocArray` (element size 2), array loads/stores, `FieldLoad` of the count word, and the integer
+//! Div/Rem. A backend rewrites the marker to a call to the appended helper and lowers it through its
+//! usual path.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -308,6 +308,170 @@ fn string_concat_mir() -> Function {
                 params: Vec::new(),
                 insts: Vec::new(),
                 terminator: Some(Terminator::Return(Some(v(5)))),
+            },
+        ],
+    }
+}
+
+/// Rewrites each `StringEquals` to a call to a generated `__string_eq` helper appended to the
+/// program, so ordinal string comparison reuses the normal call + structuring path on every backend
+/// rather than a bespoke inline expansion.
+pub(crate) fn lower_string_equals(program: &mut Vec<Function>) {
+    let has_string_equals = program
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.insts)
+        .any(|(_, inst)| matches!(inst, Inst::StringEquals { .. }));
+    if !has_string_equals {
+        return;
+    }
+    let helper = program.len() as u32;
+    for func in program.iter_mut() {
+        for block in &mut func.blocks {
+            for (_, inst) in &mut block.insts {
+                if let Inst::StringEquals { lhs, rhs } = inst {
+                    *inst = Inst::Call {
+                        callee: helper,
+                        args: vec![*lhs, *rhs],
+                    };
+                }
+            }
+        }
+    }
+    program.push(string_eq_mir());
+}
+
+/// The `__string_eq(a, b) -> i32` helper: ordinal UTF-16 string equality matching the runtime's
+/// contract -- two nulls are equal, null and non-null are not, otherwise length-then-content. The
+/// string blob is the array layout `[u32 length][u16 units]`, so the content loop reads units with a
+/// length-2 array load. Built as MIR so it goes through the same verifier + structurer as any
+/// function (the loop and branches relooped, the reference null-checks lowered as i32 compares).
+fn string_eq_mir() -> Function {
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let ci = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let cmp = |op, lhs, rhs| Inst::Compare { op, lhs, rhs };
+    let unit = |array, index| Inst::ArrayLoad {
+        array,
+        index,
+        element_size: 2,
+        signed: false,
+    };
+    let branch = |cond, if_true: u32, if_false: u32| Terminator::Branch {
+        cond,
+        if_true: BlockId(if_true),
+        true_args: Vec::new(),
+        if_false: BlockId(if_false),
+        false_args: Vec::new(),
+    };
+    let ret = |v| Some(Terminator::Return(Some(v)));
+    Function {
+        params: vec![objt, objt],
+        ret: Some(i32t),
+        value_types: vec![
+            objt, objt, objt, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t, i32t,
+            i32t, i32t, i32t, i32t, i32t, i32t, i32t,
+        ],
+        entry: BlockId(0),
+        blocks: vec![
+            BasicBlock {
+                params: vec![ValueId(0), ValueId(1)],
+                insts: vec![
+                    (ValueId(2), Inst::ConstInt { ty: objt, value: 0 }),
+                    (ValueId(3), cmp(CmpOp::Eq, ValueId(0), ValueId(2))),
+                ],
+                terminator: Some(branch(ValueId(3), 1, 2)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(4), cmp(CmpOp::Eq, ValueId(1), ValueId(2)))],
+                terminator: ret(ValueId(4)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(5), cmp(CmpOp::Eq, ValueId(1), ValueId(2)))],
+                terminator: Some(branch(ValueId(5), 3, 4)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(6), ci(0))],
+                terminator: ret(ValueId(6)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(7),
+                        Inst::FieldLoad {
+                            base: ValueId(0),
+                            offset: 0,
+                        },
+                    ),
+                    (
+                        ValueId(8),
+                        Inst::FieldLoad {
+                            base: ValueId(1),
+                            offset: 0,
+                        },
+                    ),
+                    (ValueId(9), cmp(CmpOp::Ne, ValueId(7), ValueId(8))),
+                ],
+                terminator: Some(branch(ValueId(9), 5, 6)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(10), ci(0))],
+                terminator: ret(ValueId(10)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(11), ci(0))],
+                terminator: Some(Terminator::Jump {
+                    target: BlockId(7),
+                    args: vec![ValueId(11)],
+                }),
+            },
+            BasicBlock {
+                params: vec![ValueId(12)],
+                insts: vec![(ValueId(13), cmp(CmpOp::UnsignedGe, ValueId(12), ValueId(7)))],
+                terminator: Some(branch(ValueId(13), 8, 9)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(14), ci(1))],
+                terminator: ret(ValueId(14)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(15), unit(ValueId(0), ValueId(12))),
+                    (ValueId(16), unit(ValueId(1), ValueId(12))),
+                    (ValueId(17), cmp(CmpOp::Ne, ValueId(15), ValueId(16))),
+                ],
+                terminator: Some(branch(ValueId(17), 10, 11)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(18), ci(0))],
+                terminator: ret(ValueId(18)),
+            },
+            BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(19), ci(1)),
+                    (
+                        ValueId(20),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(12),
+                            rhs: ValueId(19),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Jump {
+                    target: BlockId(7),
+                    args: vec![ValueId(20)],
+                }),
             },
         ],
     }

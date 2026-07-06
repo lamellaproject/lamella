@@ -128,6 +128,10 @@ pub enum ExprKind {
     /// A pointer indirection (unsafe): the prefix `* operand`, reading or writing the value
     /// the pointer addresses (its element type). An lvalue when assigned.
     Dereference(Box<Expr>),
+    /// The address-of operator (unsafe, 18.5.4): the prefix `& operand`, yielding a `T*` to a
+    /// fixed variable (a local, value parameter, field, or array element). The inverse of
+    /// [`Dereference`].
+    AddressOf(Box<Expr>),
     /// A `checked ( expression )` (14.5.12), forcing overflow checking on.
     Checked(Box<Expr>),
     /// An `unchecked ( expression )` (14.5.12), forcing overflow checking off.

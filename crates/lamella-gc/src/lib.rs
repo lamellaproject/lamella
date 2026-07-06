@@ -11,9 +11,11 @@ pub mod device;
 pub mod device_heap;
 
 pub use device::{
-    lamella_gc_alloc, lamella_gc_alloc_impl, lamella_gc_collect, lamella_gc_collect_device,
-    lamella_gc_init, lamella_gc_init_region, lamella_gc_teardown, set_oom_roots_hook, OomRootsHook,
+    lamella_gc_alloc, lamella_gc_alloc_impl, lamella_gc_init, lamella_gc_init_region,
+    lamella_gc_teardown, set_oom_roots_hook, OomRootsHook,
 };
+#[cfg(feature = "gc-collect")]
+pub use device::{lamella_gc_collect, lamella_gc_collect_device};
 pub use device_heap::{DeviceHeap, DeviceTypeDesc};
 pub use heap::{Heap, Ref, StackMapEntry, StackMapTable, TypeDesc};
 

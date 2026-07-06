@@ -7,5 +7,6 @@ namespace System
         public virtual bool Equals(object o) { return (object)this == o; }
         public virtual int GetHashCode() { return 0; }
         [Lamella.Runtime.RuntimeProvided] public virtual string ToString() { return null; }
+        [Lamella.Runtime.RuntimeProvided] public Type GetType() { return null; }
     }
 }

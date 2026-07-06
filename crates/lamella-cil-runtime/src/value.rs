@@ -115,6 +115,29 @@ pub enum Location {
         /// `ldelema` pointer; a multiple of the element width once walked by `p[i]`).
         byte_offset: u32,
     },
+    /// A byte-displaced pointer into (or one past the end of) a frame LOCAL's storage --
+    /// produced only by unsafe pointer arithmetic on the address of a local (C# 18.5.6:
+    /// `S* q = &s; q++;`). `byte_offset == 0` addresses the local itself; a nonzero offset
+    /// is a formed-but-raw pointer whose eventual dereference must resolve through the
+    /// value's layout (or trap). Arithmetic, comparison, and pointer difference treat the
+    /// (frame, slot) pair as the allocation base, exactly as `Stack` treats its buffer.
+    LocalBytes {
+        /// The owning frame's index in the call stack.
+        frame: usize,
+        /// The local-variable slot within that frame.
+        slot: usize,
+        /// The raw byte displacement from the local's base.
+        byte_offset: u32,
+    },
+    /// [`Location::LocalBytes`]'s twin for an ARGUMENT slot (`&arg` walked by arithmetic).
+    ArgBytes {
+        /// The owning frame's index in the call stack.
+        frame: usize,
+        /// The argument slot within that frame.
+        slot: usize,
+        /// The raw byte displacement from the argument's base.
+        byte_offset: u32,
+    },
     /// A static-field storage slot.
     Static {
         /// The static-field storage slot.

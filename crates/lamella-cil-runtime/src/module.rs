@@ -51,6 +51,9 @@ pub enum AttrValue {
     Str(Box<[u16]>),
     /// A `System.Type` (`typeof(X)`): the resolved asm-folded type handle, or `0` if unresolved.
     Type(u64),
+    /// A single-dimension array argument (`new int[]{...}`): the decoded elements in order.
+    /// A NULL array decodes as [`AttrValue::Null`], never as an empty `Array`.
+    Array(Box<[AttrValue]>),
     /// A null reference (a null `string` / `Type` / `object` argument).
     Null,
 }
@@ -402,6 +405,10 @@ pub enum Method {
     Intrinsic {
         /// The Rust implementation.
         func: IntrinsicFn,
+        /// The intrinsic's stable registry id (FNV-1a-32 of the fn's own name), stamped at bind time
+        /// so the bake records it WITHOUT a fn-pointer comparison (unreliable on wasm32). See
+        /// [`crate::intrinsic_registry::intrinsic_id`].
+        id: u32,
         /// How many arguments it takes from the caller's stack.
         arg_count: u16,
     },
@@ -446,6 +453,43 @@ pub struct VarargSite {
     pub var_types: Vec<u64>,
 }
 
+/// The marshaling kind of one P/Invoke parameter, derived from the managed signature at
+/// load: a SCALAR passes its integer value through unchanged (every integer width and a
+/// char/bool ride the one 64-bit argument slot of the host call ABI); an ANSI STRING
+/// marshals the managed string to NUL-terminated bytes the callee reads by pointer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PInvokeParam {
+    /// An integer/pointer-width value, passed through as its 64-bit slot.
+    Scalar,
+    /// A managed `string` marshaled to a NUL-terminated ANSI/UTF-8 byte buffer.
+    AnsiString,
+}
+
+/// What a P/Invoke returns, mapped back onto the evaluation stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PInvokeReturn {
+    /// `void`: nothing is pushed.
+    Void,
+    /// A 32-bit integer (the host call's 64-bit return truncated).
+    Int32,
+}
+
+/// A `[DllImport]` target recorded at load from a bodyless PinvokeImpl method's `ImplMap`
+/// row (II.22.22): the native library + entry names and the marshaling shape of the
+/// signature. A `call` of such a method dispatches through the [`crate::Vm`]'s host seam
+/// (a host runner installs one; a device build leaves it unset and the call traps).
+#[derive(Clone, Debug)]
+pub struct PInvokeTarget {
+    /// The native library (`DllImport("kernel32.dll")`).
+    pub module: String,
+    /// The entry-point symbol within it.
+    pub entry: String,
+    /// Each parameter's marshaling kind, in order.
+    pub params: Vec<PInvokeParam>,
+    /// The return mapping.
+    pub returns: PInvokeReturn,
+}
+
 /// The runtime primitive kind a boxed value must display as. The stack [`Value`](crate::Value)
 /// collapses `bool` and `char` into [`Value::Int32`](crate::Value::Int32) (III.1.1.1), so a box
 /// alone cannot tell `box bool` `1` (`"True"`) from `box int` `1` (`"1"`), nor `box char` `66`
@@ -459,6 +503,36 @@ pub enum BoxedPrimitive {
     Boolean,
     /// `System.Char`: displays the underlying UTF-16 code unit as its character.
     Char,
+}
+
+/// A `const` field's Constant-row value (II.22.9), decoded at load for
+/// `FieldInfo.GetRawConstantValue`: the KIND is kept (a `bool` constant materializes as a
+/// Boolean-boxed value, not a bare int) so the raw constant round-trips a cast exactly as
+/// .NET's does. Lives in the module's LIVE reflection maps (like [`LoadedAttribute`]);
+/// the baked tier trims reflection metadata by design, so it is not serialized.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FieldConstant {
+    /// A `bool` constant.
+    Bool(bool),
+    /// A `char` constant (a UTF-16 code unit).
+    Char(u16),
+    /// An integer constant, sign-extended; `wide` marks a 64-bit source (`long`/`ulong`).
+    Int {
+        /// The value, sign-extended from its source width.
+        value: i64,
+        /// Whether the source type is 64-bit, so it materializes as `Int64`.
+        wide: bool,
+    },
+    /// A `float` constant.
+    #[cfg(feature = "float")]
+    R4(f32),
+    /// A `double` constant.
+    #[cfg(feature = "float")]
+    R8(f64),
+    /// A `string` constant, as UTF-16 code units.
+    Str(Box<[u16]>),
+    /// A `null` constant (a reference-typed const).
+    Null,
 }
 
 /// A collection of methods, the call tokens that name them, and the strings
@@ -514,6 +588,18 @@ pub struct Module {
     static_defaults: Vec<Value>,
     /// The static constructors (`.cctor`), to run before the entry point.
     static_ctors: Vec<MethodId>,
+    /// A type's `.cctor`, for the LAZY trigger (II.10.5.3): the interpreter runs it on the
+    /// type's first static-field access / method entry, marking it run in the `Vm`. Runtime-
+    /// side only (not baked): a baked image boots its cctors eagerly.
+    cctor_types: BTreeMap<TypeId, MethodId>,
+    /// A bodyless PinvokeImpl method's `[DllImport]` target, keyed by the method token's
+    /// asm-folded handle -- consulted where an unresolvable `call` would otherwise trap.
+    /// Runtime-side only (a baked device image has no host FFI).
+    pinvoke_targets: BTreeMap<u64, PInvokeTarget>,
+    /// The [`TypeId`] owning each contiguous run of static storage slots
+    /// (`start, end, type`), so a static-field access can find the type whose cctor it
+    /// triggers. Loader-recorded, runtime-side only.
+    static_slot_types: Vec<(u32, u32, TypeId)>,
     /// A `TypeDef` token mapped to its [`TypeId`] (for `castclass` / `isinst`).
     type_tokens: BTreeMap<u64, TypeId>,
     /// The reverse of `type_tokens`: a [`TypeId`] mapped to its declaring type's asm-folded
@@ -659,6 +745,12 @@ pub struct Module {
     /// field values); the interpreter instantiates them on demand. A target with no recorded
     /// (instantiable) attributes is absent.
     custom_attributes: BTreeMap<u64, Vec<LoadedAttribute>>,
+    /// Per-field reflection flags, keyed by the field's asm-folded token: `(is_literal,
+    /// is_static)` -- `FieldInfo.IsLiteral` / `IsStatic`. Live-tier only (see [`FieldConstant`]).
+    field_meta: BTreeMap<u64, (bool, bool)>,
+    /// A `literal` field's decoded Constant-row value, keyed by the field's asm-folded token --
+    /// what `FieldInfo.GetRawConstantValue` materializes. Live-tier only.
+    field_constants: BTreeMap<u64, FieldConstant>,
     /// A type's member by simple name, keyed by `(type handle, member name)` -> the member's
     /// asm-folded token (a `Field` / `MethodDef` / `Property` token). This is what
     /// `Type.GetField` / `GetMethod` / `GetProperty` resolve a name to: the handle of the
@@ -713,6 +805,16 @@ pub struct Module {
 #[must_use]
 pub fn asm_key(asm: u8, token: u32) -> u64 {
     ((asm as u64) << 32) | (token as u64)
+}
+
+/// The synthetic attribute-store key for one of a method's `Param` rows (II.22.33): the
+/// method's own asm-folded handle tagged in bits `asm_key` never sets -- bit 63 marks
+/// "parameter attributes", bits 40..56 carry the row's 1-based sequence (0 = the return
+/// value's row). Custom attributes on a `Param` row are recorded under this key at load,
+/// so `ParameterInfo.GetCustomAttributes` reads the same store as every other target.
+#[must_use]
+pub fn param_attr_key(method_handle: u64, sequence: u16) -> u64 {
+    method_handle | (1 << 63) | ((sequence as u64) << 40)
 }
 
 /// The frozen, flat form of the module's binding tables: one growable little-endian byte arena
@@ -1386,6 +1488,14 @@ pub enum BakeError {
     WrongVersion(u32),
     /// The image records an intrinsic id this build's registry lacks (a profile mismatch).
     MissingIntrinsic(u32),
+    /// The image's recorded content checksum does not match its bytes (corruption / truncation /
+    /// a partially-written flash image).
+    ChecksumMismatch {
+        /// The checksum recorded in the image's header (word 18).
+        stored: u64,
+        /// The checksum recomputed from the image's directory + arena as read.
+        computed: u64,
+    },
 }
 
 impl core::fmt::Display for BakeError {
@@ -1400,6 +1510,9 @@ impl core::fmt::Display for BakeError {
             }
             BakeError::MissingIntrinsic(id) => {
                 write!(f, "image needs intrinsic 0x{id:08X}, absent from this build")
+            }
+            BakeError::ChecksumMismatch { stored, computed } => {
+                write!(f, "baked image checksum mismatch: header {stored:#018x}, computed {computed:#018x}")
             }
         }
     }
@@ -1420,6 +1533,49 @@ fn image_word(bytes: &[u8], index: usize) -> Option<u64> {
         .and_then(|word| word.try_into().ok())
         .map(u64::from_le_bytes)
 }
+
+/// CRC-64/ECMA-182 (poly 0x42F0E1EBA9EA3693, init 0, no reflection) over a byte run, updating `crc`.
+/// A baked image's content checksum uses this: strong error detection for flash integrity, and a
+/// 64-bit content id for deploy-skip -- a false collision would skip a NEEDED redeploy, so the 32-bit
+/// wire CRC is too few bits here.
+#[cfg(feature = "code-in-place")]
+fn crc64_update(mut crc: u64, bytes: &[u8]) -> u64 {
+    const POLY: u64 = 0x42F0_E1EB_A9EA_3693;
+    for &byte in bytes {
+        crc ^= u64::from(byte) << 56;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000_0000_0000 != 0 { (crc << 1) ^ POLY } else { crc << 1 };
+        }
+    }
+    crc
+}
+
+/// A baked image's content checksum: CRC-64 over the directory then the arena (the actual baked
+/// data). `write_baked` records it in the header; `from_baked` recomputes + compares at boot.
+#[cfg(feature = "code-in-place")]
+fn image_checksum(directory: &[u8], arena: &[u8]) -> u64 {
+    crc64_update(crc64_update(0, directory), arena)
+}
+
+/// The content checksum recorded in a baked image's header (word 18), or `None` if the bytes are not
+/// a current-version Lamella image. Reads ONLY the fixed header -- for a deploy-skip check (does a
+/// device already hold this exact image?) without parsing or hashing the whole image. Not gated on
+/// `code-in-place`: a deploy HOST that never boots an image still needs it to content-address one.
+pub fn baked_image_checksum(image: &[u8]) -> Option<u64> {
+    if image.get(..4) != Some(&b"LMLI"[..]) {
+        return None;
+    }
+    let version = u32::from_le_bytes(image.get(4..8)?.try_into().ok()?);
+    if version != BAKED_IMAGE_VERSION {
+        return None;
+    }
+    let at = 8 + 18 * 8;
+    Some(u64::from_le_bytes(image.get(at..at + 8)?.try_into().ok()?))
+}
+
+/// The baked-image format version. v2 added the content checksum (header word 18); v1 had no
+/// checksum and a shorter header, so `from_baked` rejects it (rebake).
+const BAKED_IMAGE_VERSION: u32 = 2;
 
 /// Packs a by-name index key: the member/type handle in the high 40 bits, the name id in the low
 /// 24. `None` if either exceeds its field (the entry then stays in the builder map).
@@ -1817,9 +1973,11 @@ impl Module {
         )
     }
 
-    /// Adds a native intrinsic belonging to assembly `asm` and returns its [`MethodId`].
-    pub fn add_intrinsic(&mut self, asm: u8, func: IntrinsicFn, arg_count: u16) -> MethodId {
-        self.push(asm, Method::Intrinsic { func, arg_count })
+    /// Adds a native intrinsic belonging to assembly `asm` and returns its [`MethodId`]. `id` is the
+    /// intrinsic's stable registry id (`intrinsic_registry::intrinsic_id(fn_name)`), stamped by the
+    /// binder so the bake never compares fn pointers.
+    pub fn add_intrinsic(&mut self, asm: u8, func: IntrinsicFn, id: u32, arg_count: u16) -> MethodId {
+        self.push(asm, Method::Intrinsic { func, id, arg_count })
     }
 
     fn push(&mut self, asm: u8, method: Method) -> MethodId {
@@ -3045,15 +3203,13 @@ impl Module {
                         eh.len() as u32,
                     ));
                 }
-                Method::Intrinsic { func, arg_count } => {
-                    let intrinsic = crate::intrinsic_registry::intrinsic_id_of(*func)
-                        .ok_or(BakeError::UnregisteredIntrinsic(id as MethodId))?;
-                    let hint = crate::intrinsic_registry::intrinsic_index_of(intrinsic)
+                Method::Intrinsic { id: intrinsic, arg_count, .. } => {
+                    let hint = crate::intrinsic_registry::intrinsic_index_of(*intrinsic)
                         .ok_or(BakeError::UnregisteredIntrinsic(id as MethodId))?;
                     method_records.push((
                         1,
                         u32::from(*arg_count),
-                        intrinsic,
+                        *intrinsic,
                         u32::from(hint),
                         0,
                         0,
@@ -3106,7 +3262,7 @@ impl Module {
 
         let mut out = Vec::new();
         out.extend_from_slice(b"LMLI");
-        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&BAKED_IMAGE_VERSION.to_le_bytes());
         image_push(&mut out, entry.map_or(0, |method| u64::from(method) + 1));
         image_push(&mut out, method_count as u64);
         image_push(&mut out, method_table as u64);
@@ -3130,6 +3286,7 @@ impl Module {
         self.frozen.write_directory(&mut directory);
         image_push(&mut out, directory.len() as u64);
         image_push(&mut out, self.arena.bytes.len() as u64);
+        image_push(&mut out, image_checksum(&directory, &self.arena.bytes));
         out.extend_from_slice(&directory);
         out.extend_from_slice(&self.arena.bytes);
         Ok(out)
@@ -3151,7 +3308,7 @@ impl Module {
             .and_then(|word| word.try_into().ok())
             .map(u32::from_le_bytes)
             .ok_or(BakeError::NotAnImage)?;
-        if version != 1 {
+        if version != BAKED_IMAGE_VERSION {
             return Err(BakeError::WrongVersion(version));
         }
         let words = &image[8..];
@@ -3174,7 +3331,8 @@ impl Module {
         let fingerprint = word(15)?;
         let directory_len = word(16)? as usize;
         let arena_len = word(17)? as usize;
-        let directory_start = 8 + 18 * 8;
+        let stored_checksum = word(18)?;
+        let directory_start = 8 + 19 * 8;
         let arena_start = directory_start + directory_len;
         let directory = image
             .get(directory_start..arena_start)
@@ -3182,6 +3340,10 @@ impl Module {
         let arena_bytes = image
             .get(arena_start..arena_start + arena_len)
             .ok_or(BakeError::NotAnImage)?;
+        let computed = image_checksum(directory, arena_bytes);
+        if computed != stored_checksum {
+            return Err(BakeError::ChecksumMismatch { stored: stored_checksum, computed });
+        }
         let (frozen, _) =
             FrozenTables::read_directory(directory).ok_or(BakeError::NotAnImage)?;
         let arena = TableArena {
@@ -3528,8 +3690,10 @@ impl Module {
     /// Discards everything [`Module::reachable_set`] did not keep, BEFORE the freeze, so every
     /// frozen table and pool shrinks to the kept surface: an unreachable managed body bakes
     /// EMPTY (calling it traps `FellThroughEnd` -- it cannot be called from kept code), an
-    /// unreachable type loses its shape and reflection records, and the ldstr pool keeps only
-    /// the strings kept code loads.
+    /// unreachable INTRINSIC demotes to that same empty managed body (so the baked image
+    /// demands only the intrinsics kept code can reach -- the boot-time registry check then
+    /// gates on the app's real surface, not the whole corlib's), an unreachable type loses its
+    /// shape and reflection records, and the ldstr pool keeps only the strings kept code loads.
     #[cfg(feature = "code-in-place")]
     pub fn retain_reachable(
         &mut self,
@@ -3541,9 +3705,16 @@ impl Module {
             |handle_map: &BTreeMap<u64, MethodId>, handle: u64| handle_map.contains_key(&handle);
         let empty_raw: RawCil = &[];
         for (id, method) in self.methods.iter_mut().enumerate() {
-            if let Method::Managed { body, .. } = method {
-                if !keep_method.get(id).copied().unwrap_or(false) {
-                    *body = ManagedBody::from_raw(empty_raw);
+            if keep_method.get(id).copied().unwrap_or(false) {
+                continue;
+            }
+            match method {
+                Method::Managed { body, .. } => *body = ManagedBody::from_raw(empty_raw),
+                Method::Intrinsic { arg_count, .. } => {
+                    *method = Method::Managed {
+                        body: ManagedBody::from_raw(empty_raw),
+                        arg_count: *arg_count,
+                    };
                 }
             }
         }
@@ -4194,9 +4365,48 @@ impl Module {
         &self.static_defaults
     }
 
-    /// Records a static constructor (`.cctor`) to run before the entry point.
+    /// Records a static constructor (`.cctor`) to run before the entry point. The declaring
+    /// type (already bound via [`Module::set_method_type`]) keys the lazy-trigger map.
     pub fn add_static_ctor(&mut self, method: MethodId) {
+        if let Some(type_id) = self.method_type(method) {
+            self.cctor_types.insert(type_id, method);
+        }
         self.static_ctors.push(method);
+    }
+
+    /// The `.cctor` of `type_id`, if it declares one -- the lazy-initialization trigger map.
+    #[must_use]
+    pub fn cctor_of_type(&self, type_id: TypeId) -> Option<MethodId> {
+        self.cctor_types.get(&type_id).copied()
+    }
+
+    /// Records the `[DllImport]` target of the bodyless PinvokeImpl method `token`.
+    pub fn bind_pinvoke_target(&mut self, asm: u8, token: u32, target: PInvokeTarget) {
+        self.pinvoke_targets.insert(asm_key(asm, token), target);
+    }
+
+    /// The `[DllImport]` target of the method `token` in assembly `asm`, if it is one.
+    #[must_use]
+    pub fn pinvoke_target(&self, asm: u8, token: u32) -> Option<&PInvokeTarget> {
+        self.pinvoke_targets.get(&asm_key(asm, token))
+    }
+
+    /// Records that static storage slots `start..end` belong to `type_id`, so a static
+    /// access can trigger that type's lazy `.cctor`.
+    pub fn bind_static_slot_range(&mut self, start: u32, end: u32, type_id: TypeId) {
+        if end > start {
+            self.static_slot_types.push((start, end, type_id));
+        }
+    }
+
+    /// The type owning static storage slot `slot`, if recorded.
+    #[must_use]
+    pub fn type_of_static_slot(&self, slot: usize) -> Option<TypeId> {
+        let slot = slot as u32;
+        self.static_slot_types
+            .iter()
+            .find(|&&(start, end, _)| slot >= start && slot < end)
+            .map(|&(_, _, type_id)| type_id)
     }
 
     /// Records `type_id`'s `Finalize` method (its destructor), so allocating an instance
@@ -5027,6 +5237,29 @@ impl Module {
             .insert((type_handle, name.to_string()), field_handle);
     }
 
+    /// Records a field's reflection flags: `is_literal` (`FieldAttributes.Literal` -- a
+    /// `const`) and `is_static`, keyed by the field's asm-folded token.
+    pub fn bind_field_meta(&mut self, field_handle: u64, is_literal: bool, is_static: bool) {
+        self.field_meta.insert(field_handle, (is_literal, is_static));
+    }
+
+    /// The `(is_literal, is_static)` flags recorded for a field handle, if any.
+    #[must_use]
+    pub fn field_meta(&self, field_handle: u64) -> Option<(bool, bool)> {
+        self.field_meta.get(&field_handle).copied()
+    }
+
+    /// Records a `literal` field's decoded Constant-row value (see [`FieldConstant`]).
+    pub fn bind_field_constant(&mut self, field_handle: u64, constant: FieldConstant) {
+        self.field_constants.insert(field_handle, constant);
+    }
+
+    /// The Constant-row value recorded for a `literal` field handle, if any.
+    #[must_use]
+    pub fn field_constant(&self, field_handle: u64) -> Option<&FieldConstant> {
+        self.field_constants.get(&field_handle)
+    }
+
     /// Records that the type whose handle is `type_handle` has a method named `name` whose
     /// asm-folded `MethodDef` token is `method_handle` -- what `Type.GetMethod(name)` returns.
     pub fn bind_type_method_name(&mut self, type_handle: u64, name: &str, method_handle: u64) {
@@ -5518,8 +5751,12 @@ mod tests {
         let raw: RawCil = Box::leak(write_method_body(&add_body).expect("encode").into_boxed_slice());
         let add = module.add_method(0, raw, 2);
         module.bind_token(0, Token::new(0x06, 1), add);
-        let write_line =
-            module.add_intrinsic(0, crate::intrinsics::console_write_line_empty, 0);
+        let write_line = module.add_intrinsic(
+            0,
+            crate::intrinsics::console_write_line_empty,
+            crate::intrinsic_registry::intrinsic_id("console_write_line_empty"),
+            0,
+        );
         module.bind_token(0, Token::new(0x0A, 1), write_line);
         module.bind_string(0, Token::new(0x70, 1), &[104, 105]);
 
@@ -5545,6 +5782,65 @@ mod tests {
         )
         .expect("run from the baked image");
         assert_eq!(result, Some(Value::Int32(42)));
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn a_corrupt_baked_image_fails_the_checksum() {
+        let mut module = Module::new();
+        let id = module.add_method(0, one_ret_raw(), 0);
+        let image = module.write_baked(Some(id)).expect("bake");
+
+        assert!(baked_image_checksum(&image).is_some(), "a v2 image records a checksum");
+
+        let clean: &'static [u8] = Box::leak(image.clone().into_boxed_slice());
+        assert!(Module::from_baked(clean).is_ok(), "the clean image boots");
+
+        let mut bytes = image;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        let corrupt: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        assert!(
+            matches!(Module::from_baked(corrupt), Err(BakeError::ChecksumMismatch { .. })),
+            "a corrupted image is rejected by the checksum, not run"
+        );
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn trim_demotes_an_unreachable_intrinsic_to_an_empty_body() {
+        let mut module = Module::new();
+        let reached = module.add_intrinsic(
+            0,
+            crate::intrinsics::console_write_line_empty,
+            crate::intrinsic_registry::intrinsic_id("console_write_line_empty"),
+            0,
+        );
+        let unreached = module.add_intrinsic(
+            0,
+            crate::intrinsics::array_clone,
+            crate::intrinsic_registry::intrinsic_id("array_clone"),
+            1,
+        );
+
+        let (methods, types, strings) = module.reachable_set(Some(reached));
+        assert!(methods[reached as usize], "the entry intrinsic is reached");
+        assert!(!methods[unreached as usize], "nothing reaches the other intrinsic");
+        module.retain_reachable(&methods, &types, &strings);
+
+        assert!(
+            matches!(module.methods[reached as usize], Method::Intrinsic { .. }),
+            "a reached intrinsic keeps its binding"
+        );
+        assert!(
+            matches!(module.methods[unreached as usize], Method::Managed { .. }),
+            "an unreached intrinsic demotes to an empty managed body (no baked demand)"
+        );
+
+        let image = module.write_baked(Some(reached)).expect("bake");
+        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (_booted, entry) = Module::from_baked(leaked).expect("boot the trimmed bake");
+        assert_eq!(entry, Some(reached));
     }
 
     #[cfg(feature = "code-in-place")]

@@ -187,7 +187,9 @@ fn sigtype_to_symbol(assembly: &Assembly, sig: &SigType) -> TypeSymbol {
         SigType::ByRef(referent) => {
             TypeSymbol::ByRef(Box::new(sigtype_to_symbol(assembly, referent)))
         }
-        SigType::Pointer(_) => TypeSymbol::Error,
+        SigType::Pointer(referent) => {
+            TypeSymbol::Pointer(Box::new(sigtype_to_symbol(assembly, referent)))
+        }
         _ => TypeSymbol::Error,
     }
 }

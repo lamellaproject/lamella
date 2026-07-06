@@ -4,9 +4,8 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-/// A binary arithmetic operator (the `+ - * // %` of the subset). True division
-/// (`/`) is intentionally absent -- it produces a float, which is outside the
-/// typed integer subset.
+/// A binary arithmetic or bitwise operator. The typed AOT lane lowers the integer forms; true
+/// division (`/`), exponentiation (`**`), and any float operand stay dynamic (the interpreter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinOp {
     /// `+`
@@ -17,6 +16,10 @@ pub enum BinOp {
     Mul,
     /// `//`
     FloorDiv,
+    /// `/` -- true division (always a float result).
+    TrueDiv,
+    /// `**` -- exponentiation, right-associative (a non-negative integer exponent gives an integer).
+    Pow,
     /// `%`
     Mod,
     /// `&`
@@ -50,6 +53,10 @@ pub enum CmpOp {
     In,
     /// `not in` -- a negated membership test.
     NotIn,
+    /// `is` -- an object-identity test.
+    Is,
+    /// `is not` -- a negated object-identity test.
+    IsNot,
 }
 
 /// A unary operator (`- + ~`).
@@ -78,6 +85,13 @@ pub enum Expr {
     /// An integer literal (already folded to its signed value, so a source `-3`
     /// arrives here as `Int(-3)`).
     Int(i64),
+    /// A floating-point literal -- the `f64` value's raw bits (`to_bits`), so `Expr` stays `Eq`.
+    /// Floats are dynamic (heap-boxed in the interpreter); the typed AOT lane rejects them.
+    Float(u64),
+    /// An imaginary literal `Nj` -- the imaginary part's `f64` bits. Dynamic (a heap `complex`).
+    Imaginary(u64),
+    /// An integer literal too large for `i64` -- its decimal digits. Dynamic (an arbitrary-precision int).
+    BigInt(String),
     /// A string literal (its decoded value). A dynamic value -- no typed AOT lowering.
     Str(String),
     /// A `True` or `False` literal.
@@ -119,7 +133,7 @@ pub enum Expr {
         /// The right operand (evaluated only when the operator does not short-circuit).
         rhs: Box<Expr>,
     },
-    /// A logical negation, `not operand` -- always a boolean (`0`/`1`).
+    /// A logical negation, `not operand` -- always a boolean (`True`/`False`).
     Not {
         /// The operand whose truthiness is negated.
         operand: Box<Expr>,
@@ -144,12 +158,24 @@ pub enum Expr {
         /// The right operand.
         rhs: Box<Expr>,
     },
-    /// A call, `func(args...)`.
+    /// A call, `func(args..., name=value...)`.
     Call {
         /// The callee expression.
         func: Box<Expr>,
         /// The positional arguments, in order.
         args: Vec<Expr>,
+        /// The keyword arguments `name=value`, in source order. Empty for a purely
+        /// positional call. (`*args` / `**kwargs` unpacking uses [`Expr::CallEx`].)
+        keywords: Vec<Keyword>,
+    },
+    /// A call with `*args` / `**kwargs` unpacking, `f(a, *seq, k=1, **map)`. Kept separate from
+    /// [`Expr::Call`] so the common (no-unpacking) call stays simple; the arguments are one ordered
+    /// list of [`CallArg`], evaluated left to right. Always a dynamic operation.
+    CallEx {
+        /// The callee expression.
+        func: Box<Expr>,
+        /// The arguments -- positional, starred, keyword, double-starred -- in source order.
+        args: Vec<CallArg>,
     },
     /// A subscript, `value[index]`. A dynamic operation (no typed lowering).
     Subscript {
@@ -200,6 +226,60 @@ pub enum Expr {
         /// One or more `for ... [if ...]` clauses, outermost first.
         clauses: Vec<CompClause>,
     },
+    /// A generator expression `(element for target in iterable [if cond])`. Materialized EAGERLY
+    /// (compiled as a list comprehension) in this increment -- indistinguishable from a lazy
+    /// generator when consumed immediately (`sum(x for x in xs)`, the common case); true lazy
+    /// evaluation is a follow-on.
+    GeneratorExp {
+        /// The element expression, evaluated per innermost item.
+        element: Box<Expr>,
+        /// One or more `for ... [if ...]` clauses, outermost first.
+        clauses: Vec<CompClause>,
+    },
+    /// A lambda `lambda params: body` -- an anonymous function whose body is a single
+    /// expression. Compiled by hoisting to a synthetic module function; capturing an
+    /// enclosing function's local (a closure) is not yet supported.
+    Lambda {
+        /// The parameters, in order (no annotations; defaults allowed).
+        params: Vec<ParamDef>,
+        /// The body expression, evaluated and returned when the lambda is called.
+        body: Box<Expr>,
+    },
+    /// A `yield` expression -- `yield` or `yield value` -- suspending a generator and producing
+    /// `value` (or `None`). A `yield` anywhere in a function body makes that function a generator.
+    /// The expression's own value is what a later `send` injects (`None` under `next`).
+    Yield(Option<Box<Expr>>),
+    /// `name := value` -- the walrus (assignment expression): binds `name` and yields `value`.
+    Walrus {
+        /// The bound name (the target is a bare name).
+        target: String,
+        /// The assigned value, which is also the expression's result.
+        value: Box<Expr>,
+    },
+}
+
+/// One keyword argument at a call site, `name=value`. (A `**mapping` unpack carries no name and
+/// appears as [`CallArg::DoubleStar`] inside an [`Expr::CallEx`] instead.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keyword {
+    /// The keyword name.
+    pub name: String,
+    /// The argument value.
+    pub value: Expr,
+}
+
+/// One argument of an [`Expr::CallEx`] star-call, in source order. `*`/`**` unpacking makes the
+/// argument count dynamic, so these are resolved at run time rather than folded into a fixed arity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallArg {
+    /// A plain positional argument, `value`.
+    Positional(Expr),
+    /// An iterable unpacked into the positional arguments, `*value`.
+    Star(Expr),
+    /// A keyword argument, `name=value`.
+    Keyword(String, Expr),
+    /// A mapping unpacked into the keyword arguments, `**value`.
+    DoubleStar(Expr),
 }
 
 /// One `for target(s) in iterable [if cond ...]` clause of a comprehension.
@@ -211,6 +291,47 @@ pub struct CompClause {
     pub iterable: Expr,
     /// Zero or more `if` filters that follow this `for` (before the next `for`).
     pub conditions: Vec<Expr>,
+}
+
+/// A target of a tuple-unpacking assignment `a, b[i], c.x, (d, e) = seq`: a bare name, a subscript,
+/// an attribute, or a nested tuple/list target (unpacked recursively).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignTarget {
+    /// `name` -- binds a local/global.
+    Name(String),
+    /// `container[index]` -- a subscript store.
+    Subscript {
+        /// The container.
+        container: Expr,
+        /// The index.
+        index: Expr,
+    },
+    /// `obj.attr` -- an attribute store.
+    Attribute {
+        /// The object.
+        obj: Expr,
+        /// The attribute name.
+        attr: String,
+    },
+    /// `(a, b)` or `[a, b]` -- a nested tuple/list target; its element sequence is unpacked
+    /// recursively. (A starred target `*x` inside a nested tuple is a follow-on.)
+    Tuple(Vec<AssignTarget>),
+}
+
+impl AssignTarget {
+    /// Append the names this target binds -- recursing into nested tuples -- to `out`. A subscript
+    /// or attribute target binds no name (it stores into an existing object), so it appends nothing.
+    pub fn collect_names<'a>(&'a self, out: &mut Vec<&'a str>) {
+        match self {
+            AssignTarget::Name(name) => out.push(name),
+            AssignTarget::Tuple(elems) => {
+                for elem in elems {
+                    elem.collect_names(out);
+                }
+            }
+            AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {}
+        }
+    }
 }
 
 /// A statement.
@@ -226,16 +347,17 @@ pub enum Stmt {
     /// A multiple assignment, `a = b = value` -- the value is evaluated once and bound
     /// to every target (left to right).
     MultiAssign {
-        /// The target names, in source order (two or more).
-        targets: Vec<String>,
+        /// The targets, in source order (two or more) -- names, subscripts, or attributes; the one
+        /// value is bound to each (`a = b[i] = o.x = value`).
+        targets: Vec<AssignTarget>,
         /// The value bound to each target.
         value: Expr,
     },
     /// Tuple-unpacking assignment `a, b = expr` -- the value is a sequence whose elements
     /// bind to the targets in order. Flat targets only (nested `(a, (b, c))` is post-cut).
     TupleAssign {
-        /// The target names, in source order.
-        targets: Vec<String>,
+        /// The targets, in source order (names, subscripts, or attributes).
+        targets: Vec<AssignTarget>,
         /// The index of the starred target `*name`, if any (`a, *b, c` -> `Some(1)`); the
         /// star binds a list of the leftover elements.
         star: Option<usize>,
@@ -248,8 +370,11 @@ pub enum Stmt {
         container: Expr,
         /// The index.
         index: Expr,
-        /// The value to store.
+        /// The value to store (the right-hand side; for an augmented store, the operand).
         value: Expr,
+        /// For an augmented store (`c[i] += v`), the operator; `None` for a plain `c[i] = v`. The
+        /// container and index are evaluated once, then combined with the current element.
+        op: Option<BinOp>,
     },
     /// An attribute assignment `obj.attr = value` (e.g. `self.x = v`).
     SetAttr {
@@ -257,11 +382,16 @@ pub enum Stmt {
         obj: Expr,
         /// The attribute name.
         attr: String,
-        /// The value to store.
+        /// The value to store (the right-hand side; for an augmented store, the operand).
         value: Expr,
+        /// For an augmented store (`obj.x += v`), the operator; `None` for a plain `obj.x = v`.
+        op: Option<BinOp>,
     },
     /// An expression evaluated for its effect; its value is discarded.
     Expr(Expr),
+    /// `del target, ...` -- unbind each target. A bare name is supported (it unbinds the local);
+    /// subscript / attribute targets (`del xs[i]`, `del o.x`) are a follow-on (need interp ops).
+    Delete(Vec<Expr>),
     /// An `if`/`elif`/`else`. Each `elif` is desugared by the parser into a
     /// nested `If` in the preceding clause's `orelse`.
     If {
@@ -332,6 +462,17 @@ pub enum Stmt {
         /// The `finally` clause; empty if absent.
         finalbody: Vec<Stmt>,
     },
+    /// A `with context [as name]:` statement (a single context manager). Desugars at compile time
+    /// to the `__enter__` / `try` / `finally` / `__exit__` protocol.
+    With {
+        /// The context-manager expression: evaluated once; its `__enter__` runs on entry and
+        /// `__exit__` on exit (including on exception).
+        context: Expr,
+        /// The optional `as name` target, bound to `__enter__`'s result.
+        optional_name: Option<String>,
+        /// The `with` body.
+        body: Vec<Stmt>,
+    },
     /// A `class Name [(Base)]:` definition. The body holds method definitions (`FuncDef`)
     /// and class-attribute assignments (`Assign`).
     ClassDef {
@@ -341,6 +482,15 @@ pub enum Stmt {
         base: Option<Expr>,
         /// The class body.
         body: Vec<Stmt>,
+    },
+    /// A decorated function or class -- one or more `@decorator` lines above a `def`/`class`.
+    /// Desugars to `name = d0(d1(... dn(name) ...))`: the decorators wrap the freshly defined name,
+    /// applied bottom-up (the decorator nearest the `def` first).
+    Decorated {
+        /// The decorator expressions, in source (top-to-bottom) order.
+        decorators: Vec<Expr>,
+        /// The decorated statement -- a [`Stmt::FuncDef`] or [`Stmt::ClassDef`].
+        inner: Box<Stmt>,
     },
     /// `break` -- exit the innermost enclosing loop.
     Break,
@@ -381,6 +531,18 @@ pub struct ParamDef {
     pub name: String,
     /// The parameter's annotation expression, if any.
     pub annotation: Option<Expr>,
+    /// The parameter's default value expression, if any (`b=1`). Evaluated at
+    /// def-execution time in the defining scope (Python semantics).
+    pub default: Option<Expr>,
+    /// Whether this parameter is keyword-only -- it follows a bare `*` in the list, so it binds
+    /// only by name, never positionally.
+    pub keyword_only: bool,
+    /// Whether this is the `*args` parameter -- it collects surplus positional arguments into a
+    /// tuple. At most one per parameter list; the params after it are keyword-only.
+    pub is_vararg: bool,
+    /// Whether this is the `**kwargs` parameter -- it collects unmatched keyword arguments into a
+    /// dict. At most one per parameter list, and it must be last.
+    pub is_varkwarg: bool,
 }
 
 /// A function definition.

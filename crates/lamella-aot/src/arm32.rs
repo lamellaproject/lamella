@@ -175,7 +175,16 @@ fn lower_inst(
         Inst::Convert { value, kind } => {
             if matches!(
                 kind,
-                ConvKind::Float32ToInt | ConvKind::IntToFloat32 | ConvKind::Float64ToInt
+                ConvKind::Float32ToInt
+                    | ConvKind::IntToFloat32
+                    | ConvKind::Float64ToInt
+                    | ConvKind::IntToFloat64
+                    | ConvKind::LongToFloat64
+                    | ConvKind::Float32ToFloat64
+                    | ConvKind::Float64ToFloat32
+                    | ConvKind::LongToFloat32
+                    | ConvKind::UIntToFloat64
+                    | ConvKind::ULongToFloat64
             ) {
                 return Err(LowerError::CallUnsupported);
             }
@@ -205,6 +214,7 @@ fn lower_inst(
         | Inst::AllocArray { .. }
         | Inst::ArrayLoad { .. }
         | Inst::ArrayStore { .. }
+        | Inst::ArrayElemAddr { .. }
         | Inst::AllocArray2D { .. }
         | Inst::Array2DLoad { .. }
         | Inst::Array2DStore { .. }
@@ -267,7 +277,16 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
         ConvKind::ZeroExtend8 => enc.uxtb(rd, rm),
         ConvKind::SignExtend16 => enc.sxth(rd, rm),
         ConvKind::ZeroExtend16 => enc.uxth(rd, rm),
-        ConvKind::Float32ToInt | ConvKind::IntToFloat32 | ConvKind::Float64ToInt => Ok(()),
+        ConvKind::Float32ToInt
+        | ConvKind::IntToFloat32
+        | ConvKind::Float64ToInt
+        | ConvKind::IntToFloat64
+        | ConvKind::LongToFloat64
+        | ConvKind::Float32ToFloat64
+        | ConvKind::Float64ToFloat32
+        | ConvKind::LongToFloat32
+        | ConvKind::UIntToFloat64
+        | ConvKind::ULongToFloat64 => Ok(()),
         ConvKind::IntToRef | ConvKind::RefToInt => {
             if rd != rm {
                 enc.mov_reg(rd, rm);
@@ -375,6 +394,7 @@ fn lower_spilled_inst(
     result_ty: Option<MirType>,
     func_labels: &[Label],
     relocate: bool,
+    blob_table: Option<&[Box<[u16]>]>,
 ) -> Result<Option<u32>, LowerError> {
     match inst {
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
@@ -976,12 +996,25 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             emit_write_int(enc)?;
         }
-        Inst::StringLiteral { utf16 } => {
-            let entry = enc.new_label();
-            string_blobs.push((entry, utf16.clone()));
-            enc.adr(Reg::R0, entry)
-                .map_err(|_| LowerError::TooManyValues)?;
-        }
+        Inst::StringLiteral { utf16 } => match blob_table {
+            Some(table) => {
+                let id = table
+                    .iter()
+                    .position(|b| b.as_ref() == utf16.as_ref())
+                    .expect("the emit_object_pass pre-scan registers every string literal")
+                    as u32;
+                let label = enc.new_label();
+                sym_pool.push((label, STRING_SYMBOL_FLAG | id));
+                enc.ldr_literal(Reg::R0, label)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+            None => {
+                let entry = enc.new_label();
+                string_blobs.push((entry, utf16.clone()));
+                enc.adr(Reg::R0, entry)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            }
+        },
         Inst::StringEquals { lhs, rhs } => {
             enc.ldr_sp(Reg::R0, slot(*lhs))
                 .map_err(|_| LowerError::TooManyValues)?;
@@ -1059,6 +1092,22 @@ fn lower_spilled_inst(
                 }
                 .map_err(|_| LowerError::TooManyValues)?;
             }
+        }
+        Inst::ArrayElemAddr {
+            array,
+            index,
+            element_size,
+        } => {
+            enc.ldr_sp(Reg::R0, slot(*array))
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.ldr_sp(Reg::R1, slot(*index))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_array_bounds_check(enc)?;
+            scale_index(enc, pool, *element_size)?;
+            enc.adds_imm3(Reg::R0, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R0, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::StaticLoad { offset } => {
             load_const_word(enc, pool, Reg::R0, STATIC_FIELD_BASE + *offset)?;
@@ -1812,6 +1861,7 @@ fn lower_spilled_into(
     stack_maps: &mut Vec<StackMapEntry>,
     vtables: &[TypeMeta],
     relocate: bool,
+    blob_table: Option<&[Box<[u16]>]>,
 ) -> Result<(), LowerError> {
     let has_calls = func.blocks.iter().any(|b| {
         b.insts.iter().any(|(_, i)| {
@@ -1867,7 +1917,7 @@ fn lower_spilled_into(
     let argv_scratch_off = used;
     used += (max_call_argc as u16) * 4;
     let frame = ((used as usize + lr_bytes + 7) & !7usize) - lr_bytes;
-    if frame > 508 {
+    if frame > 1020 {
         return Err(LowerError::TooManyValues);
     }
     let frame = frame as u16;
@@ -1909,7 +1959,7 @@ fn lower_spilled_into(
     if has_calls {
         enc.push_registers(saved_mask, true);
     }
-    enc.sub_sp(frame).map_err(|_| LowerError::TooManyValues)?;
+    enc.sub_sp_far(frame).map_err(|_| LowerError::TooManyValues)?;
 
     let entry_block = func
         .blocks
@@ -2283,6 +2333,7 @@ fn lower_spilled_into(
                 func.value_type(*result),
                 func_labels,
                 relocate,
+                blob_table,
             )?;
             if let Some(return_pc) = call_pc {
                 record_safepoint(stack_maps, index, inst_pos, return_pc);
@@ -2322,7 +2373,7 @@ fn lower_spilled_into(
                             .map_err(|_| LowerError::TooManyValues)?;
                     }
                 }
-                enc.add_sp(frame).map_err(|_| LowerError::TooManyValues)?;
+                enc.add_sp_far(frame).map_err(|_| LowerError::TooManyValues)?;
                 if has_calls {
                     enc.pop_registers(saved_mask, true);
                 } else {
@@ -2555,6 +2606,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::AllocArray { .. }
                     | Inst::ArrayLoad { .. }
                     | Inst::ArrayStore { .. }
+                    | Inst::ArrayElemAddr { .. }
                     | Inst::AllocArray2D { .. }
                     | Inst::Array2DLoad { .. }
                     | Inst::Array2DStore { .. }
@@ -2642,7 +2694,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     let lr_bytes = if has_calls { 4 } else { 0 };
     let pushed = saved.count_ones() as usize * 4 + lr_bytes;
     let frame = ((pushed + mixed.spill_count as usize * 4 + 7) & !7usize) - pushed;
-    if frame > 508 {
+    if frame > 1020 {
         return Err(LowerError::TooManyValues);
     }
     Ok(Assignment::Mixed {
@@ -2901,7 +2953,7 @@ fn lower_mixed_into(
         enc.push_registers(saved, has_calls);
     }
     if frame > 0 {
-        enc.sub_sp(frame).map_err(|_| LowerError::TooManyValues)?;
+        enc.sub_sp_far(frame).map_err(|_| LowerError::TooManyValues)?;
     }
 
     let mut pool: Vec<(Label, u32)> = Vec::new();
@@ -2968,7 +3020,7 @@ fn lower_mixed_into(
                     load_home(enc, home(*v), Reg::R0)?;
                 }
                 if frame > 0 {
-                    enc.add_sp(frame).map_err(|_| LowerError::TooManyValues)?;
+                    enc.add_sp_far(frame).map_err(|_| LowerError::TooManyValues)?;
                 }
                 if has_calls {
                     enc.pop_registers(saved, true);
@@ -3356,6 +3408,7 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
             &mut Vec::new(),
             &[],
             false,
+            None,
         )?,
     }
     enc.finish()
@@ -3411,6 +3464,7 @@ pub fn lower_debug(
             &mut Vec::new(),
             &[],
             false,
+            None,
         )?,
     }
     let bytes = enc
@@ -3493,6 +3547,17 @@ const EXTERN_SYMBOL_FLAG: u32 = 0x8000_0000;
 /// to the descriptor's symbol-table index. Bit 30, distinct from `EXTERN_SYMBOL_FLAG`; type tokens are well
 /// under 2^30, so the handle never collides with the flag.
 const DESC_SYMBOL_FLAG: u32 = 0x4000_0000;
+/// A backend symbol whose low bits are a deduplicated STRING-LITERAL blob id (not a function index) -- a
+/// program-object reference to the `__lamella_str_<id>` blob symbol `emit_object_pass` lays after the
+/// descriptors. Bit 29, distinct from `EXTERN_SYMBOL_FLAG`/`DESC_SYMBOL_FLAG`; a blob id is a small
+/// first-appearance index, well under 2^29, so it never collides with the flag. Loading a literal through
+/// this ISLANDABLE pool word (rather than a direct `adr`) lets a literal in a >1020-byte function relax via
+/// `finish`'s literal islanding instead of hard-erroring. Program objects only -- a library's blob symbols
+/// would collide across a link (the assembly-unique-prefix fix descriptors also await is deferred).
+const STRING_SYMBOL_FLAG: u32 = 0x2000_0000;
+/// The name prefix of a deduplicated string-literal blob symbol. Backend-only (unlike `TYPE_DESC_PREFIX`
+/// the linker never special-cases it: `trim_object` keeps a reached non-descriptor data symbol already).
+const STR_BLOB_PREFIX: &str = "__lamella_str_";
 
 /// The `__aeabi_*` soft-float helper for a float arithmetic `Binary` op, keyed by the operand type;
 /// `None` for an integer op (a different type) or a non-arithmetic op. ARM AAPCS soft-float passes
@@ -3524,6 +3589,13 @@ fn aeabi_float_helper(op: BinOp, operand_ty: Option<MirType>) -> Option<&'static
 fn aeabi_convert_helper(kind: ConvKind) -> Option<&'static str> {
     match kind {
         ConvKind::Float64ToInt => Some("__aeabi_d2iz"),
+        ConvKind::IntToFloat64 => Some("__aeabi_i2d"),
+        ConvKind::LongToFloat64 => Some("__aeabi_l2d"),
+        ConvKind::Float32ToFloat64 => Some("__aeabi_f2d"),
+        ConvKind::Float64ToFloat32 => Some("__aeabi_d2f"),
+        ConvKind::LongToFloat32 => Some("__aeabi_l2f"),
+        ConvKind::UIntToFloat64 => Some("__aeabi_ui2d"),
+        ConvKind::ULongToFloat64 => Some("__aeabi_ul2d"),
         _ => None,
     }
 }
@@ -3653,6 +3725,84 @@ fn lower_runtime_calls(
                     Inst::CallNative {
                         symbol,
                         args: alloc::vec![size, typedesc],
+                    },
+                ));
+                continue;
+            }
+            if let Inst::AllocArray {
+                handle,
+                length,
+                element_size,
+            } = &inst
+            {
+                let symbol = intern_extern(externs, "lamella_gc_alloc");
+                let type_tag = descriptors
+                    .iter()
+                    .find(|m| m.handle == *handle)
+                    .map_or(0, |m| m.type_tag);
+                let esize = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                let scaled = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                let four = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                let size = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                let typedesc = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                insts.push((
+                    esize,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i64::from(*element_size),
+                    },
+                ));
+                insts.push((
+                    scaled,
+                    Inst::Binary {
+                        op: BinOp::Mul,
+                        lhs: *length,
+                        rhs: esize,
+                    },
+                ));
+                insts.push((
+                    four,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 4,
+                    },
+                ));
+                insts.push((
+                    size,
+                    Inst::Binary {
+                        op: BinOp::Add,
+                        lhs: scaled,
+                        rhs: four,
+                    },
+                ));
+                insts.push((
+                    typedesc,
+                    Inst::TypeDescLiteral {
+                        handle: handle.0,
+                        words: alloc::vec![0, 0, type_tag, 0].into_boxed_slice(),
+                        vtable: alloc::vec![].into_boxed_slice(),
+                    },
+                ));
+                insts.push((
+                    result,
+                    Inst::CallNative {
+                        symbol,
+                        args: alloc::vec![size, typedesc],
+                    },
+                ));
+                let lenstore = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                insts.push((
+                    lenstore,
+                    Inst::FieldStore {
+                        base: result,
+                        offset: 0,
+                        value: *length,
                     },
                 ));
                 continue;
@@ -3805,6 +3955,7 @@ fn lower_one_func(
     enc: &mut Encoder,
     func_labels: &[Label],
     stack_maps: &mut Vec<StackMapEntry>,
+    blob_table: Option<&[Box<[u16]>]>,
 ) -> Result<(), LowerError> {
     if lamella_ir::verify(func).is_err() {
         return Err(LowerError::NotWellFormed);
@@ -3848,6 +3999,7 @@ fn lower_one_func(
             stack_maps,
             &[],
             true,
+            blob_table,
         ),
     }
 }
@@ -3860,26 +4012,90 @@ fn lower_object_inner(
     emit_entry: bool,
 ) -> Result<Vec<u8>, LowerError> {
     let mut externs: Vec<alloc::string::String> = extern_syms.iter().map(|s| (*s).into()).collect();
-    let funcs: Vec<Function> = funcs
+    let mut program = funcs.to_vec();
+    crate::stringgen::lower_string_concat(&mut program);
+    crate::stringgen::lower_int_to_string(&mut program);
+    let owned_names: Vec<alloc::string::String> = names
+        .iter()
+        .map(|s| alloc::string::String::from(*s))
+        .chain((names.len()..program.len()).map(|i| alloc::format!("__lamella_strgen_{i}")))
+        .collect();
+    let names: Vec<&str> = owned_names.iter().map(|s| s.as_str()).collect();
+    let names = names.as_slice();
+    let funcs: Vec<Function> = program
         .iter()
         .map(|f| lower_runtime_calls(f, &mut externs, descriptors))
         .collect();
     let funcs = funcs.as_slice();
+    let mut stubbed: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
+    loop {
+        match emit_object_pass(funcs, names, &externs, descriptors, emit_entry, &stubbed)? {
+            PassOutcome::Object(bytes) => return Ok(bytes),
+            PassOutcome::StubAndRetry(index) => {
+                stubbed.insert(index);
+            }
+        }
+    }
+}
+
+/// One outcome of [`emit_object_pass`]: either the finished object bytes, or -- for a library -- the
+/// index of a method that lowered but made the whole object exceed a Thumb-1 encoding reach, so the
+/// driver stubs it and rebuilds.
+enum PassOutcome {
+    Object(Vec<u8>),
+    StubAndRetry(usize),
+}
+
+/// Emits ONE object from the already-lowered `funcs`: every function, then the canonical per-type
+/// descriptors, then `finish`. `stubbed` names functions to emit as a bare `bx lr` (a prior pass found
+/// the object could not encode with them in). Returns [`PassOutcome::StubAndRetry`] if a LIBRARY object
+/// still fails to encode -- mapping the overflow site back to its method; a program's encode failure is
+/// fatal. Driven to a fixpoint by [`lower_object_inner`].
+fn emit_object_pass(
+    funcs: &[Function],
+    names: &[&str],
+    externs: &[alloc::string::String],
+    descriptors: &[TypeMeta],
+    emit_entry: bool,
+    stubbed: &alloc::collections::BTreeSet<usize>,
+) -> Result<PassOutcome, LowerError> {
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     let mut stack_maps: Vec<StackMapEntry> = Vec::new();
+    let string_table: Vec<Box<[u16]>> = if emit_entry {
+        let mut table: Vec<Box<[u16]>> = Vec::new();
+        for func in funcs {
+            for block in &func.blocks {
+                for (_, inst) in &block.insts {
+                    if let Inst::StringLiteral { utf16 } = inst {
+                        if !table.iter().any(|b| b.as_ref() == utf16.as_ref()) {
+                            table.push(utf16.clone());
+                        }
+                    }
+                }
+            }
+        }
+        table
+    } else {
+        Vec::new()
+    };
+    let blob_table: Option<&[Box<[u16]>]> = emit_entry.then_some(string_table.as_slice());
     for (index, func) in funcs.iter().enumerate() {
         enc.align_to_word();
         enc.bind_label(func_labels[index]);
         if emit_entry {
-            lower_one_func(func, &mut enc, &func_labels, &mut stack_maps)?;
+            lower_one_func(func, &mut enc, &func_labels, &mut stack_maps, blob_table)?;
+        } else if stubbed.contains(&index) {
+            enc.bx(Reg::LR);
         } else {
             let mut scratch = Encoder::new();
             let scratch_labels: Vec<Label> =
                 (0..funcs.len()).map(|_| scratch.new_label()).collect();
             let mut scratch_maps = Vec::new();
-            if lower_one_func(func, &mut scratch, &scratch_labels, &mut scratch_maps).is_ok() {
-                lower_one_func(func, &mut enc, &func_labels, &mut stack_maps)
+            if lower_one_func(func, &mut scratch, &scratch_labels, &mut scratch_maps, blob_table)
+                .is_ok()
+            {
+                lower_one_func(func, &mut enc, &func_labels, &mut stack_maps, blob_table)
                     .expect("a method that lowered in the dry run lowers for real");
             } else {
                 enc.bx(Reg::LR);
@@ -3988,7 +4204,55 @@ fn lower_object_inner(
             ));
         }
     }
-    let assembled = enc.finish().map_err(|_| LowerError::CodeTooLarge)?;
+    let mut str_syms: Vec<(Label, u32)> = Vec::with_capacity(string_table.len());
+    for utf16 in &string_table {
+        enc.align_to_word();
+        let label = enc.new_label();
+        enc.bind_label(label);
+        let start = enc.position();
+        #[cfg(not(any(feature = "string-utf8", feature = "string-utf8-wtf8")))]
+        {
+            enc.emit_word(utf16.len() as u32);
+            for &unit in utf16.iter() {
+                enc.emit_u16(unit);
+            }
+        }
+        #[cfg(any(feature = "string-utf8", feature = "string-utf8-wtf8"))]
+        {
+            let bytes = encode_string_bytes(utf16);
+            enc.emit_word(utf16.len() as u32);
+            enc.emit_word(bytes.len() as u32);
+            enc.emit_bytes(&bytes);
+        }
+        str_syms.push((label, enc.position() - start));
+    }
+    let assembled = if emit_entry {
+        enc.finish().map_err(|_| LowerError::CodeTooLarge)?
+    } else {
+        let probe = enc.clone();
+        match enc.finish() {
+            Ok(assembled) => assembled,
+            Err(AssembleError::BranchOutOfRange { at }) => {
+                let mut query = func_labels.clone();
+                query.push(code_end_label);
+                let positions = probe
+                    .relaxed_positions(&query)
+                    .map_err(|_| LowerError::CodeTooLarge)?;
+                let code_end_pos = positions[funcs.len()].unwrap_or(u32::MAX);
+                if at >= code_end_pos {
+                    return Err(LowerError::CodeTooLarge);
+                }
+                let failed = (0..funcs.len())
+                    .rev()
+                    .find(|&i| positions[i].is_some_and(|start| start <= at));
+                return match failed {
+                    Some(i) if !stubbed.contains(&i) => Ok(PassOutcome::StubAndRetry(i)),
+                    _ => Err(LowerError::CodeTooLarge),
+                };
+            }
+            Err(_) => return Err(LowerError::CodeTooLarge),
+        }
+    };
     let offsets: Vec<u32> = func_labels
         .iter()
         .map(|&l| assembled.label_position(l).unwrap_or(0))
@@ -4002,6 +4266,10 @@ fn lower_object_inner(
     let desc_positions: Vec<u32> = desc_syms
         .iter()
         .map(|(_, label, ..)| assembled.label_position(*label).unwrap_or(0))
+        .collect();
+    let str_positions: Vec<u32> = str_syms
+        .iter()
+        .map(|(label, _)| assembled.label_position(*label).unwrap_or(0))
         .collect();
     let mut text = assembled.bytes;
     let mut symbols: Vec<lamella_elf::Symbol> = (0..funcs.len())
@@ -4017,7 +4285,7 @@ fn lower_object_inner(
             }
         })
         .collect();
-    for name in &externs {
+    for name in externs {
         symbols.push(lamella_elf::Symbol {
             name: name.as_str(),
             value: 0,
@@ -4054,6 +4322,26 @@ fn lower_object_inner(
             name: desc_names[i].as_str(),
             value: pos,
             size: (vtable_len + words_len + itable_words) * 4,
+            binding: if emit_entry {
+                lamella_elf::Binding::Global
+            } else {
+                lamella_elf::Binding::Weak
+            },
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        });
+    }
+    let str_names: Vec<alloc::string::String> = (0..str_syms.len())
+        .map(|id| alloc::format!("{STR_BLOB_PREFIX}{id}"))
+        .collect();
+    let str_index: Vec<u32> = (0..str_syms.len())
+        .map(|id| symbols.len() as u32 + id as u32)
+        .collect();
+    for (id, (_, size)) in str_syms.iter().enumerate() {
+        symbols.push(lamella_elf::Symbol {
+            name: str_names[id].as_str(),
+            value: str_positions[id],
+            size: *size,
             binding: lamella_elf::Binding::Global,
             kind: lamella_elf::SymbolType::NoType,
             section: lamella_elf::SymbolSection::Text,
@@ -4074,6 +4362,8 @@ fn lower_object_inner(
         } else if r.symbol & DESC_SYMBOL_FLAG != 0 {
             let (index, vtable_bytes) = desc_index[&(r.symbol & !DESC_SYMBOL_FLAG)];
             (index, vtable_bytes + addend)
+        } else if r.symbol & STRING_SYMBOL_FLAG != 0 {
+            (str_index[(r.symbol & !STRING_SYMBOL_FLAG) as usize], addend)
         } else {
             (r.symbol, addend)
         };
@@ -4106,12 +4396,12 @@ fn lower_object_inner(
             section: lamella_elf::SymbolSection::Text,
         });
     }
-    Ok(lamella_elf::write_relocatable_object(
+    Ok(PassOutcome::Object(lamella_elf::write_relocatable_object(
         lamella_elf::Machine::Arm,
         &text,
         &symbols,
         &relocations,
-    ))
+    )))
 }
 
 /// Lowers a whole multi-method program WITH debug line tables -- the module variant of [`lower_debug`].
@@ -4197,6 +4487,7 @@ fn lower_module_inner(
                     &mut stack_maps,
                     vtables,
                     false,
+                    None,
                 )?;
             }
         }
@@ -5105,6 +5396,130 @@ mod tests {
             "opens by pushing the callee-saved registers"
         );
         assert_eq!(&bytes[bytes.len() - 2..], &[0x70, 0x47]);
+    }
+
+    /// A straight-line pure-int function whose `n` constants are ALL live at once (each feeds the
+    /// final left-associative sum), so an 8-register allocation must spill most of them -- a large
+    /// register/spill MIXED frame. For n past ~135 that frame exceeds the single `SUB SP,#imm`
+    /// reach (508) and must chunk via `sub_sp_far`.
+    fn wide_live_mixed_function(n: u32) -> Function {
+        let mut insts: Vec<(ValueId, Inst)> = (0..n)
+            .map(|i| {
+                (
+                    ValueId(i),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 1,
+                    },
+                )
+            })
+            .collect();
+        let mut acc = ValueId(0);
+        for i in 1..n {
+            let dst = ValueId(n - 1 + i);
+            insts.push((
+                dst,
+                Inst::Binary {
+                    op: BinOp::Add,
+                    lhs: acc,
+                    rhs: ValueId(i),
+                },
+            ));
+            acc = dst;
+        }
+        Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32; (2 * n - 1) as usize],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts,
+                terminator: Some(Terminator::Return(Some(acc))),
+            }],
+        }
+    }
+
+    #[test]
+    fn lowers_a_mixed_frame_past_the_single_sub_sp_reach() {
+        let func = wide_live_mixed_function(160);
+        assert!(lamella_ir::verify(&func).is_ok());
+        let frame = match prepare(&func).unwrap() {
+            Assignment::Mixed { frame, .. } => frame,
+            _ => panic!("a wide pure-int live set should take the register/spill Mixed path"),
+        };
+        assert!(
+            frame > 508,
+            "the spill frame {frame} exceeds the single SUB SP,#imm reach"
+        );
+        assert!(
+            frame <= 1020,
+            "and stays within the LDR/STR [SP,#imm] slot reach ({frame})"
+        );
+        let bytes = lower(&func).unwrap();
+        assert_eq!(&bytes[bytes.len() - 2..], &[0x70, 0x47], "ends with bx lr");
+    }
+
+    #[test]
+    fn lowers_a_fully_spilled_frame_past_the_single_sub_sp_reach() {
+        const N: u32 = 100;
+        let seed = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 1,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let mut insts: Vec<(ValueId, Inst)> = (0..N)
+            .map(|i| {
+                (
+                    ValueId(i),
+                    Inst::Call {
+                        callee: 1,
+                        args: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        let mut acc = ValueId(0);
+        for i in 1..N {
+            let dst = ValueId(N - 1 + i);
+            insts.push((
+                dst,
+                Inst::Binary {
+                    op: BinOp::Add,
+                    lhs: acc,
+                    rhs: ValueId(i),
+                },
+            ));
+            acc = dst;
+        }
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32; (2 * N - 1) as usize],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts,
+                terminator: Some(Terminator::Return(Some(acc))),
+            }],
+        };
+        assert!(matches!(prepare(&main), Ok(Assignment::Spilled)));
+        assert!(
+            lower_object(&[main, seed], &["main", "seed"], &[]).is_ok(),
+            "a >508-byte fully-spilled frame lowers via sub_sp_far"
+        );
     }
 
     fn cross_call_example() -> [Function; 2] {
@@ -6387,6 +6802,51 @@ mod tests {
     }
 
     #[test]
+    fn lower_object_emits_a_far_islandable_string_blob() {
+        let utf16: Box<[u16]> = alloc::vec![b'H' as u16, b'i' as u16].into_boxed_slice();
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::StringLiteral { utf16: utf16.clone() }),
+                    (ValueId(1), Inst::StringLiteral { utf16: utf16.clone() }),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let obj = lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        let blob = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_str_0")
+            .expect("string blob symbol");
+        assert!(blob.defined, "the blob is defined in this object");
+        assert!(
+            obj.symbols.iter().all(|s| s.name != "__lamella_str_1"),
+            "identical literals share one blob"
+        );
+        let at = (blob.value & !1) as usize;
+        assert_eq!(
+            u32::from_le_bytes(obj.text[at..at + 4].try_into().unwrap()),
+            2,
+            "the blob leads with the char count"
+        );
+        let str_relocs: Vec<_> = obj
+            .relocations
+            .iter()
+            .filter(|r| r.kind == lamella_elf::arm::R_ARM_ABS32)
+            .collect();
+        assert_eq!(str_relocs.len(), 2, "two ldstr pool words, one shared blob");
+        for r in &str_relocs {
+            assert_eq!(obj.symbols[r.symbol as usize].name, "__lamella_str_0");
+        }
+    }
+
+    #[test]
     fn lower_object_lowers_float_add_to_aeabi_fadd() {
         let main = Function {
             params: Vec::new(),
@@ -6488,6 +6948,44 @@ mod tests {
     }
 
     #[test]
+    fn lower_object_lowers_int_to_double_via_aeabi_i2d() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::F64),
+            value_types: vec![MirType::I32, MirType::F64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 42,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::IntToFloat64,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "__aeabi_i2d" && !s.defined),
+            "int->double emits an undefined __aeabi_i2d extern"
+        );
+    }
+
+    #[test]
     fn lower_object_lowers_ldvirtftn_to_a_vtable_load() {
         let main = Function {
             params: vec![MirType::ObjectRef],
@@ -6546,6 +7044,77 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "lamella_gc_alloc" && !s.defined),
             "Alloc lowers to a call to the undefined lamella_gc_alloc"
+        );
+    }
+
+    #[test]
+    fn lower_object_lowers_alloc_array_to_the_runtime_allocator() {
+        let main = Function {
+            params: vec![MirType::I32],
+            ret: Some(MirType::F64),
+            value_types: vec![MirType::I32, MirType::ObjectRef, MirType::F64],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(1),
+                        Inst::AllocArray {
+                            handle: lamella_ir::TypeHandle(8),
+                            length: ValueId(0),
+                            element_size: 8,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::ArrayLoad {
+                            array: ValueId(1),
+                            index: ValueId(0),
+                            element_size: 8,
+                            signed: false,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&main).is_ok());
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "lamella_gc_alloc" && !s.defined),
+            "AllocArray lowers to a lamella_gc_alloc call (not the flat-path fixed address)"
+        );
+    }
+
+    #[test]
+    fn lower_object_lowers_array_elem_addr() {
+        let main = Function {
+            params: vec![MirType::ObjectRef, MirType::I32],
+            ret: Some(MirType::ManagedPtr),
+            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::ManagedPtr],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0), ValueId(1)],
+                insts: vec![(
+                    ValueId(2),
+                    Inst::ArrayElemAddr {
+                        array: ValueId(0),
+                        index: ValueId(1),
+                        element_size: 8,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&main).is_ok());
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols.iter().all(|s| s.defined || s.name.is_empty()),
+            "ldelema is pure address arithmetic -- no undefined externs"
         );
     }
 

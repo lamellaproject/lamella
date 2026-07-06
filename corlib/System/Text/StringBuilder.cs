@@ -3,40 +3,92 @@ namespace System.Text
 {
     public sealed class StringBuilder
     {
-        [Lamella.Runtime.RuntimeProvided] public StringBuilder() { }
-        [Lamella.Runtime.RuntimeProvided] public StringBuilder(int capacity) { }
-        [Lamella.Runtime.RuntimeProvided] public StringBuilder(string value) { }
+        private char[] _chars;
+        private int _length;
+
+        public StringBuilder()
+        {
+            _chars = new char[16];
+            _length = 0;
+        }
+
+        public StringBuilder(int capacity)
+        {
+            if (capacity < 0) throw new ArgumentOutOfRangeException("capacity");
+            _chars = new char[capacity == 0 ? 16 : capacity];
+            _length = 0;
+        }
+
+        public StringBuilder(string value)
+        {
+            int len = value == null ? 0 : value.Length;
+            int cap = len < 16 ? 16 : len;
+            _chars = new char[cap];
+            for (int i = 0; i < len; i++) _chars[i] = value[i];
+            _length = len;
+        }
+
+        private void EnsureCapacity(int min)
+        {
+            if (_chars.Length >= min) return;
+            int grown = _chars.Length * 2;
+            int cap = grown < min ? min : grown;
+            char[] bigger = new char[cap];
+            for (int i = 0; i < _length; i++) bigger[i] = _chars[i];
+            _chars = bigger;
+        }
 
         public int Length
         {
-            [Lamella.Runtime.RuntimeProvided] get { return 0; }
+            get { return _length; }
             set
             {
                 if (value < 0) throw new ArgumentOutOfRangeException("value");
-                SetLengthCore(value);
+                if (value > _length)
+                {
+                    EnsureCapacity(value);
+                    for (int i = _length; i < value; i++) _chars[i] = '\0';
+                }
+                _length = value;
             }
         }
 
-        [Lamella.Runtime.RuntimeProvided] private void SetLengthCore(int value) { }
-
-        public int Capacity { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
+        public int Capacity { get { return _chars.Length; } }
 
         [System.Runtime.CompilerServices.IndexerName("Chars")]
         public char this[int index]
         {
-            [Lamella.Runtime.RuntimeProvided] get { return '\0'; }
+            get
+            {
+                if (index < 0 || index >= _length) return _chars[_chars.Length];
+                return _chars[index];
+            }
             set
             {
-                if (index < 0 || index >= Length) throw new ArgumentOutOfRangeException("index");
-                SetCharsCore(index, value);
+                if (index < 0 || index >= _length) throw new ArgumentOutOfRangeException("index");
+                _chars[index] = value;
             }
         }
 
-        [Lamella.Runtime.RuntimeProvided] private void SetCharsCore(int index, char value) { }
+        public StringBuilder Append(string value)
+        {
+            if (value == null) return this;
+            int n = value.Length;
+            EnsureCapacity(_length + n);
+            for (int i = 0; i < n; i++) _chars[_length + i] = value[i];
+            _length += n;
+            return this;
+        }
 
-        [Lamella.Runtime.RuntimeProvided] public StringBuilder Append(string value) { return null; }
-        [Lamella.Runtime.RuntimeProvided] public StringBuilder Append(char value) { return null; }
-        [Lamella.Runtime.RuntimeProvided] public StringBuilder Append(int value) { return null; }
+        public StringBuilder Append(char value)
+        {
+            EnsureCapacity(_length + 1);
+            _chars[_length] = value;
+            _length++;
+            return this;
+        }
+
+        public StringBuilder Append(int value) { return Append(value.ToString()); }
         public StringBuilder Append(bool value) { return Append(value ? "True" : "False"); }
         public StringBuilder Append(long value) { return Append(value.ToString()); }
         public StringBuilder Append(object value)
@@ -50,38 +102,53 @@ namespace System.Text
 
         public StringBuilder Insert(int index, string value)
         {
-            if (index < 0 || index > Length) throw new ArgumentOutOfRangeException("index");
+            if (index < 0 || index > _length) throw new ArgumentOutOfRangeException("index");
             if (value == null) return this;
-            InsertCore(index, value);
+            int n = value.Length;
+            if (n == 0) return this;
+            EnsureCapacity(_length + n);
+            for (int i = _length - 1; i >= index; i--) _chars[i + n] = _chars[i];
+            for (int i = 0; i < n; i++) _chars[index + i] = value[i];
+            _length += n;
             return this;
         }
-
-        [Lamella.Runtime.RuntimeProvided] private void InsertCore(int index, string value) { }
 
         public StringBuilder Remove(int startIndex, int length)
         {
             if (startIndex < 0) throw new ArgumentOutOfRangeException("startIndex");
             if (length < 0) throw new ArgumentOutOfRangeException("length");
-            if (startIndex > Length - length) throw new ArgumentOutOfRangeException("length");
-            RemoveCore(startIndex, length);
+            if (startIndex > _length - length) throw new ArgumentOutOfRangeException("length");
+            for (int i = startIndex + length; i < _length; i++) _chars[i - length] = _chars[i];
+            _length -= length;
             return this;
         }
 
-        [Lamella.Runtime.RuntimeProvided] private void RemoveCore(int startIndex, int length) { }
-
-        [Lamella.Runtime.RuntimeProvided] public StringBuilder Replace(char oldChar, char newChar) { return null; }
+        public StringBuilder Replace(char oldChar, char newChar)
+        {
+            for (int i = 0; i < _length; i++)
+            {
+                if (_chars[i] == oldChar) _chars[i] = newChar;
+            }
+            return this;
+        }
 
         public StringBuilder Clear()
         {
-            Length = 0;
+            _length = 0;
             return this;
         }
 
-        [Lamella.Runtime.RuntimeProvided] public override string ToString() { return null; }
+        public override string ToString()
+        {
+            return String.CreateFromChars(_chars, 0, _length);
+        }
 
         public string ToString(int startIndex, int length)
         {
-            return ToString().Substring(startIndex, length);
+            if (startIndex < 0) throw new ArgumentOutOfRangeException("startIndex");
+            if (length < 0) throw new ArgumentOutOfRangeException("length");
+            if (startIndex > _length - length) throw new ArgumentOutOfRangeException("length");
+            return String.CreateFromChars(_chars, startIndex, length);
         }
     }
 }

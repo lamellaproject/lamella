@@ -5,7 +5,9 @@
 
 extern crate alloc;
 
+pub mod bigint;
 pub mod builtins;
+pub mod gpio;
 pub mod interp;
 pub mod object;
 pub mod trap;

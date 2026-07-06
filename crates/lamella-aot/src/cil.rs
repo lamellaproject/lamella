@@ -279,6 +279,14 @@ pub trait CallResolver {
         None
     }
 
+    /// The [`MirType`] of a type-token operand (`ldobj`/`stobj`/`ldelem`/`stelem` `<T>`): a scalar
+    /// for a `System` primitive, the underlying int for an enum, a `ValueType` for a struct, else
+    /// `ObjectRef` for a reference type. Distinguishes a whole-struct copy from a scalar element
+    /// load/store. Defaults to None.
+    fn type_operand_mir(&self, _operand: &Operand) -> Option<MirType> {
+        None
+    }
+
     /// The vtable slot a virtual `callvirt` target dispatches through: its index in its declaring
     /// type's vtable (the same index across the hierarchy, so the receiver's runtime-type vtable at
     /// this slot is the override to call). `None` for a non-virtual target, or one this resolver
@@ -1145,10 +1153,10 @@ fn ldind(
     Ok(())
 }
 
-/// Lowers a `ldind.r{4,8}`: a `width`-byte float load. Mirrors [`ldind`] but the result is a float
-/// (`F32`/`F64`) rather than an integer, so an `f64` rides the r0:r1 pair like an 8-byte integer load
-/// and downstream float ops (`dadd`, `(int)`) see the correct type.
-fn ldind_float(
+/// Lowers an indirect load whose result carries an EXPLICIT type -- `ldind.r{4,8}` (`F32`/`F64`, so an
+/// `f64` rides the r0:r1 pair and downstream float ops see the right type), `ldind.ref` (an `ObjectRef`,
+/// a GC root), and `ldind.i` (a `NativeInt`). A `width`-byte load, no extension (widths are exact here).
+fn ldind_typed(
     value_types: &mut Vec<MirType>,
     stack: &mut Vec<ValueId>,
     insts: &mut Vec<(ValueId, Inst)>,
@@ -1675,22 +1683,47 @@ fn apply_value_op(
         }
         Opcode::ConvR4 => {
             let top = *stack.last().ok_or(CilError::StackUnderflow)?;
-            match value_types.get(top.index()) {
-                Some(MirType::I32) => {
-                    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
-                    let result = new_value(value_types, MirType::F32);
-                    insts.push((
-                        result,
-                        Inst::Convert {
-                            value,
-                            kind: ConvKind::IntToFloat32,
-                        },
-                    ));
-                    stack.push(result);
-                }
-                Some(MirType::F32) => {}
+            let kind = match value_types.get(top.index()) {
+                Some(MirType::I32 | MirType::NativeInt) => Some(ConvKind::IntToFloat32),
+                Some(MirType::I64) => Some(ConvKind::LongToFloat32),
+                Some(MirType::F64) => Some(ConvKind::Float64ToFloat32),
+                Some(MirType::F32) => None,
                 _ => return Err(CilError::Unsupported(inst.opcode)),
+            };
+            if let Some(kind) = kind {
+                let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let result = new_value(value_types, MirType::F32);
+                insts.push((result, Inst::Convert { value, kind }));
+                stack.push(result);
             }
+        }
+        Opcode::ConvR8 => {
+            let top = *stack.last().ok_or(CilError::StackUnderflow)?;
+            let kind = match value_types.get(top.index()) {
+                Some(MirType::I32 | MirType::NativeInt) => Some(ConvKind::IntToFloat64),
+                Some(MirType::I64) => Some(ConvKind::LongToFloat64),
+                Some(MirType::F32) => Some(ConvKind::Float32ToFloat64),
+                Some(MirType::F64) => None,
+                _ => return Err(CilError::Unsupported(inst.opcode)),
+            };
+            if let Some(kind) = kind {
+                let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+                let result = new_value(value_types, MirType::F64);
+                insts.push((result, Inst::Convert { value, kind }));
+                stack.push(result);
+            }
+        }
+        Opcode::ConvRUn => {
+            let top = *stack.last().ok_or(CilError::StackUnderflow)?;
+            let kind = match value_types.get(top.index()) {
+                Some(MirType::I32 | MirType::NativeInt) => ConvKind::UIntToFloat64,
+                Some(MirType::I64) => ConvKind::ULongToFloat64,
+                _ => return Err(CilError::Unsupported(inst.opcode)),
+            };
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::F64);
+            insts.push((result, Inst::Convert { value, kind }));
+            stack.push(result);
         }
         Opcode::Pop => {
             stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -1706,14 +1739,17 @@ fn apply_value_op(
         Opcode::StindI8 => stind(value_types, stack, insts, 8)?,
         Opcode::StindR4 => stind(value_types, stack, insts, 4)?,
         Opcode::StindR8 => stind(value_types, stack, insts, 8)?,
+        Opcode::StindRef | Opcode::StindI => stind(value_types, stack, insts, 4)?,
         Opcode::LdindI1 => ldind(value_types, stack, insts, 1, true)?,
         Opcode::LdindU1 => ldind(value_types, stack, insts, 1, false)?,
         Opcode::LdindI2 => ldind(value_types, stack, insts, 2, true)?,
         Opcode::LdindU2 => ldind(value_types, stack, insts, 2, false)?,
         Opcode::LdindI4 | Opcode::LdindU4 => ldind(value_types, stack, insts, 4, false)?,
         Opcode::LdindI8 => ldind(value_types, stack, insts, 8, false)?,
-        Opcode::LdindR4 => ldind_float(value_types, stack, insts, MirType::F32, 4)?,
-        Opcode::LdindR8 => ldind_float(value_types, stack, insts, MirType::F64, 8)?,
+        Opcode::LdindR4 => ldind_typed(value_types, stack, insts, MirType::F32, 4)?,
+        Opcode::LdindR8 => ldind_typed(value_types, stack, insts, MirType::F64, 8)?,
+        Opcode::LdindRef => ldind_typed(value_types, stack, insts, MirType::ObjectRef, 4)?,
+        Opcode::LdindI => ldind_typed(value_types, stack, insts, MirType::NativeInt, 4)?,
         Opcode::Cpblk => {
             let size = stack.pop().ok_or(CilError::StackUnderflow)?;
             let src = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -1898,10 +1934,24 @@ fn apply_value_op(
                 .resolve(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
             if matches!(info.target, CallTarget::Intrinsic(Intrinsic::IntToString)) {
-                let (source, _) = last_local_addr
-                    .take()
-                    .ok_or(CilError::Unsupported(inst.opcode))?;
-                let value = addr_base(source, locals, local_types, args, value_types, insts)?;
+                let value = match last_local_addr.take() {
+                    Some((source, _)) => {
+                        addr_base(source, locals, local_types, args, value_types, insts)?
+                    }
+                    None => {
+                        let ptr = stack.pop().ok_or(CilError::StackUnderflow)?;
+                        let loaded = new_value(value_types, MirType::I32);
+                        insts.push((
+                            loaded,
+                            Inst::Load {
+                                address: ptr,
+                                width: 4,
+                                signed: true,
+                            },
+                        ));
+                        loaded
+                    }
+                };
                 let result = new_value(value_types, MirType::ObjectRef);
                 insts.push((result, Inst::IntToString { value }));
                 stack.push(result);
@@ -2285,6 +2335,237 @@ fn apply_value_op(
                 },
             ));
         }
+        Opcode::LdelemR8 => {
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::F64);
+            insts.push((
+                result,
+                Inst::ArrayLoad {
+                    array,
+                    index,
+                    element_size: 8,
+                    signed: false,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::LdelemR4 => {
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::F32);
+            insts.push((
+                result,
+                Inst::ArrayLoad {
+                    array,
+                    index,
+                    element_size: 4,
+                    signed: false,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::LdelemI => {
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::NativeInt);
+            insts.push((
+                result,
+                Inst::ArrayLoad {
+                    array,
+                    index,
+                    element_size: 4,
+                    signed: false,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::StelemR8 => {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::ArrayStore {
+                    array,
+                    index,
+                    value,
+                    element_size: 8,
+                },
+            ));
+        }
+        Opcode::StelemR4 => {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::ArrayStore {
+                    array,
+                    index,
+                    value,
+                    element_size: 4,
+                },
+            ));
+        }
+        Opcode::StelemI => {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::ArrayStore {
+                    array,
+                    index,
+                    value,
+                    element_size: 4,
+                },
+            ));
+        }
+        Opcode::Ldelema => {
+            let element = resolver
+                .array_element(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, MirType::ManagedPtr);
+            insts.push((
+                result,
+                Inst::ArrayElemAddr {
+                    array,
+                    index,
+                    element_size: element.element_size,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::Ldobj => {
+            let ty = resolver
+                .type_operand_mir(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let result = new_value(value_types, ty);
+            insts.push((
+                result,
+                Inst::FieldLoad {
+                    base: address,
+                    offset: 0,
+                },
+            ));
+            stack.push(result);
+        }
+        Opcode::Stobj => {
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let address = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::FieldStore {
+                    base: address,
+                    offset: 0,
+                    value,
+                },
+            ));
+        }
+        Opcode::Cpobj => {
+            let ty = resolver
+                .type_operand_mir(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let src = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let dst = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let temp = new_value(value_types, ty);
+            insts.push((temp, Inst::FieldLoad { base: src, offset: 0 }));
+            let placeholder = new_value(value_types, MirType::I32);
+            insts.push((
+                placeholder,
+                Inst::FieldStore {
+                    base: dst,
+                    offset: 0,
+                    value: temp,
+                },
+            ));
+        }
+        Opcode::Ldelem => {
+            let ty = resolver
+                .type_operand_mir(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let element = resolver
+                .array_element(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            if matches!(ty, MirType::ValueType { .. }) {
+                let addr = new_value(value_types, MirType::ManagedPtr);
+                insts.push((
+                    addr,
+                    Inst::ArrayElemAddr {
+                        array,
+                        index,
+                        element_size: element.element_size,
+                    },
+                ));
+                let result = new_value(value_types, ty);
+                insts.push((result, Inst::FieldLoad { base: addr, offset: 0 }));
+                stack.push(result);
+            } else {
+                let result = new_value(value_types, ty);
+                insts.push((
+                    result,
+                    Inst::ArrayLoad {
+                        array,
+                        index,
+                        element_size: element.element_size,
+                        signed: false,
+                    },
+                ));
+                stack.push(result);
+            }
+        }
+        Opcode::Stelem => {
+            let element = resolver
+                .array_element(&inst.operand)
+                .ok_or(CilError::BadOperand)?;
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let index = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+            if matches!(
+                value_types.get(value.index()),
+                Some(MirType::ValueType { .. })
+            ) {
+                let addr = new_value(value_types, MirType::ManagedPtr);
+                insts.push((
+                    addr,
+                    Inst::ArrayElemAddr {
+                        array,
+                        index,
+                        element_size: element.element_size,
+                    },
+                ));
+                let placeholder = new_value(value_types, MirType::I32);
+                insts.push((
+                    placeholder,
+                    Inst::FieldStore {
+                        base: addr,
+                        offset: 0,
+                        value,
+                    },
+                ));
+            } else {
+                let placeholder = new_value(value_types, MirType::I32);
+                insts.push((
+                    placeholder,
+                    Inst::ArrayStore {
+                        array,
+                        index,
+                        value,
+                        element_size: element.element_size,
+                    },
+                ));
+            }
+        }
         Opcode::Ldlen => {
             let array = stack.pop().ok_or(CilError::StackUnderflow)?;
             let result = new_value(value_types, MirType::I32);
@@ -2419,7 +2700,17 @@ fn apply_value_op(
                         },
                     ));
                 }
-                CallTarget::Intrinsic(_) | CallTarget::External(_) => {
+                CallTarget::External(symbol) => {
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((
+                        result,
+                        Inst::PInvoke {
+                            import: symbol,
+                            args: call_args,
+                        },
+                    ));
+                }
+                CallTarget::Intrinsic(_) => {
                     return Err(CilError::UnresolvedCall);
                 }
             }
@@ -3134,7 +3425,7 @@ fn eval_stack_widths(
                 stack.pop();
                 stack.push(i64w(resolver.field_type(&inst.operand)));
             }
-            Opcode::LdelemI8 => {
+            Opcode::LdelemI8 | Opcode::LdelemR8 => {
                 stack.pop();
                 stack.pop();
                 stack.push(true);
@@ -3145,12 +3436,38 @@ fn eval_stack_widths(
             | Opcode::LdelemU2
             | Opcode::LdelemI4
             | Opcode::LdelemU4
-            | Opcode::LdelemRef => {
+            | Opcode::LdelemR4
+            | Opcode::LdelemI
+            | Opcode::LdelemRef
+            | Opcode::Ldelema => {
                 stack.pop();
                 stack.pop();
                 stack.push(false);
             }
-            Opcode::ConvI8 | Opcode::ConvU8 | Opcode::ConvOvfI8 | Opcode::ConvOvfU8 => {
+            Opcode::Ldobj => {
+                stack.pop();
+                stack.push(i64w(resolver.type_operand_mir(&inst.operand)));
+            }
+            Opcode::Ldelem => {
+                stack.pop();
+                stack.pop();
+                stack.push(i64w(resolver.type_operand_mir(&inst.operand)));
+            }
+            Opcode::Stobj | Opcode::Cpobj => {
+                stack.pop();
+                stack.pop();
+            }
+            Opcode::Stelem => {
+                stack.pop();
+                stack.pop();
+                stack.pop();
+            }
+            Opcode::ConvI8
+            | Opcode::ConvU8
+            | Opcode::ConvOvfI8
+            | Opcode::ConvOvfU8
+            | Opcode::ConvR8
+            | Opcode::ConvRUn => {
                 stack.pop();
                 stack.push(true);
             }
@@ -3166,8 +3483,7 @@ fn eval_stack_widths(
             | Opcode::ConvOvfU2
             | Opcode::ConvOvfI4
             | Opcode::ConvOvfU4
-            | Opcode::ConvR4
-            | Opcode::ConvR8 => {
+            | Opcode::ConvR4 => {
                 stack.pop();
                 stack.push(false);
             }
@@ -3273,8 +3589,14 @@ fn trap_operand_types(inst: &Instruction, wide: bool, resolver: &dyn CallResolve
     }
     let value = match opcode {
         Opcode::StelemI8 => MirType::I64,
+        Opcode::StelemR8 => MirType::F64,
+        Opcode::StelemR4 => MirType::F32,
+        Opcode::StelemI => MirType::NativeInt,
         Opcode::StelemRef => MirType::ObjectRef,
         Opcode::StelemI1 | Opcode::StelemI2 | Opcode::StelemI4 => MirType::I32,
+        Opcode::Stelem => resolver
+            .type_operand_mir(&inst.operand)
+            .unwrap_or(MirType::I32),
         _ => return Vec::new(),
     };
     vec![MirType::ObjectRef, MirType::I32, value]
@@ -4615,7 +4937,12 @@ mod control_flow {
                 | Opcode::LdelemI4
                 | Opcode::LdelemU4
                 | Opcode::LdelemI8
+                | Opcode::LdelemR4
+                | Opcode::LdelemR8
+                | Opcode::LdelemI
                 | Opcode::LdelemRef
+                | Opcode::Ldelema
+                | Opcode::Ldelem
         )
     }
 
@@ -4629,7 +4956,11 @@ mod control_flow {
                 | Opcode::StelemI2
                 | Opcode::StelemI4
                 | Opcode::StelemI8
+                | Opcode::StelemR4
+                | Opcode::StelemR8
+                | Opcode::StelemI
                 | Opcode::StelemRef
+                | Opcode::Stelem
         )
     }
 

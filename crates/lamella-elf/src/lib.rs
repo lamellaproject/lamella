@@ -611,8 +611,8 @@ const SH_SIZE: usize = 20;
 const SH_LINK: usize = 24;
 const SH_INFO: usize = 28;
 const SH_ADDRALIGN: usize = 32;
+const SHF_WRITE: u32 = 0x1;
 const SHF_ALLOC: u32 = 0x2;
-const SHF_EXECINSTR: u32 = 0x4;
 
 /// Parses an ELF32 little-endian relocatable object (as written by [`write_relocatable_object`],
 /// and, later, a C toolchain): the `.text` bytes, the symbol table (names resolved), and the
@@ -642,14 +642,14 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     section_base.resize(e_shnum, None);
     let mut text: Vec<u8> = Vec::new();
     let mut text_align = 1u32;
+    #[allow(clippy::needless_range_loop)]
     for i in 0..e_shnum {
         if sh(i, SH_TYPE)? == 2 {
             symtab_i = Some(i);
         }
         let flags = sh(i, SH_FLAGS)?;
-        let executable =
-            sh(i, SH_TYPE)? == 1 && flags & SHF_EXECINSTR != 0 && flags & SHF_ALLOC != 0;
-        if !executable {
+        let merge = sh(i, SH_TYPE)? == 1 && flags & SHF_ALLOC != 0 && flags & SHF_WRITE == 0;
+        if !merge {
             continue;
         }
         let align = sh(i, SH_ADDRALIGN)?.max(1);

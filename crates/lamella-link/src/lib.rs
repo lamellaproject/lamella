@@ -338,6 +338,7 @@ fn link_with_base(
                 machine,
                 site,
                 text_base,
+                bases[oi],
                 &defined,
                 &obj.symbols,
                 r,
@@ -454,6 +455,7 @@ fn apply_relocation(
     machine: Machine,
     site: u32,
     text_base: Option<u32>,
+    obj_base: u32,
     defined: &[Defined],
     obj_syms: &[lamella_elf::ParsedSymbol],
     r: &ParsedRelocation,
@@ -462,9 +464,17 @@ fn apply_relocation(
     if machine == Machine::RiscV && r.kind == riscv::R_RISCV_RELAX {
         return Ok(());
     }
-    let name = &obj_syms[r.symbol as usize].name;
-    let (target, target_is_thumb) =
-        resolve_sym(defined, name).ok_or_else(|| LinkError::UndefinedSymbol(name.clone()))?;
+    let sym = &obj_syms[r.symbol as usize];
+    let (target, target_is_thumb) = if sym.defined
+        && (sym.name.is_empty() || sym.binding == Binding::Local)
+    {
+        (
+            obj_base + normalized_value(machine, sym.value),
+            is_thumb_func(machine, sym.value),
+        )
+    } else {
+        resolve_sym(defined, &sym.name).ok_or_else(|| LinkError::UndefinedSymbol(sym.name.clone()))?
+    };
     let target = target as i64;
     let site_i = site as i64;
     let addend = relocation_addend(text, machine, site, r);
@@ -643,6 +653,7 @@ fn link_gc_inner(
                 machine,
                 site,
                 text_base,
+                fbase.wrapping_sub(*start),
                 &defined,
                 &objects[*oi].symbols,
                 r,
@@ -1411,6 +1422,52 @@ mod tests {
     }
 
     #[test]
+    fn gc_drops_an_unreached_functions_intrinsic_demand() {
+        let object = obj_arm(
+            &[
+                0x70, 0x47,
+                0x00, 0xF0, 0x00, 0xD0,
+                0x70, 0x47,
+            ],
+            &[
+                func("f0", 1, 2),
+                func("unreached", 3, 6),
+                undef("exotic_intrinsic"),
+            ],
+            &[Relocation {
+                offset: 2,
+                symbol: 2,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+        );
+
+        assert_eq!(
+            link(core::slice::from_ref(&object), "f0").unwrap_err(),
+            LinkError::UndefinedSymbol(String::from("exotic_intrinsic")),
+            "a plain link demands even a dead function's intrinsic"
+        );
+
+        let trimmed = garbage_collect(core::slice::from_ref(&object), "f0");
+        let names: Vec<&str> = trimmed
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(names.contains(&"f0"), "the entry survives");
+        assert!(!names.contains(&"unreached"), "the unreached function is dropped");
+        assert!(
+            !names.contains(&"exotic_intrinsic"),
+            "its intrinsic demand drops with it -- the image demands only the reached set"
+        );
+        assert!(
+            link_gc(core::slice::from_ref(&object), "f0").is_ok(),
+            "so the gc link resolves with no intrinsic supplied"
+        );
+    }
+
+    #[test]
     fn archive_members_are_pulled_on_demand() {
         let main = obj_arm(
             &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
@@ -1438,6 +1495,33 @@ mod tests {
         assert!(
             !img.symbols.iter().any(|(n, _)| n == "unused"),
             "an archive member nothing references must not be pulled"
+        );
+    }
+
+    #[test]
+    fn a_local_section_symbol_resolves_within_its_object() {
+        let section = Symbol {
+            name: "",
+            value: 4,
+            size: 0,
+            binding: Binding::Local,
+            kind: SymbolType::NoType,
+            section: SymbolSection::Text,
+        };
+        let obj = obj_arm(
+            &[0, 0, 0, 0, 0x0D, 0xF0, 0xFE, 0xCA],
+            &[func("f", 1, 4), section],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+        );
+        let img = link_with_archives(&[obj], &[], "f", Some(0x1000)).unwrap();
+        assert_eq!(
+            u32::from_le_bytes([img.text[0], img.text[1], img.text[2], img.text[3]]),
+            0x1000 + 4,
         );
     }
 

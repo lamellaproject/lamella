@@ -15,6 +15,8 @@ crate-type = ["cdylib", "rlib"]
 lamella-load = { path = "../lamella-load" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-cil-runtime = { path = "../lamella-cil-runtime" }
+# The MethodDef token for srcmap's module.resolve (source-map export, used under `bake`).
+lamella-token = { path = "../lamella-token" }
 # The DAP feature pulls in the debugger and a JSON codec for its wire messages.
 lamella-dap = { path = "../lamella-dap", optional = true }
 # The compile feature pulls in the compiler (source -> assembly) for in-page builds.

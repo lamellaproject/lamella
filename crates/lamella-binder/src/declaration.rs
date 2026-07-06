@@ -3,7 +3,7 @@
 
 use crate::bind::{bind_type, parameter_symbol};
 use crate::bound::{coerce_constant, integer_literal, literal_int_value};
-use lamella_syntax::token::IntegerSuffix;
+use lamella_syntax::token::{IntegerSuffix, RealSuffix};
 use crate::resolve::TypeTable;
 use crate::special::SpecialType;
 use crate::symbols::{
@@ -223,16 +223,72 @@ pub(crate) fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Op
 /// arithmetic uses checked ops, so an overflow or a divide-by-zero declines to fold (it is not a
 /// constant value); string `+` concatenates. Operands are treated as `i64`, so a `const` whose type
 /// or value needs the operand's own width (e.g. a `uint` expression near `u32::MAX`) is not folded.
+/// The f64 value of a numeric constant literal -- a real's stored bits, or an integer widened to
+/// double -- for folding floating-point constant arithmetic.
+fn real_value(literal: &Literal) -> Option<f64> {
+    match literal {
+        Literal::Real { bits, .. } => Some(f64::from_bits(*bits)),
+        Literal::Integer { .. } => Some(literal_int_value(literal)? as f64),
+        _ => None,
+    }
+}
+
+/// Whether a numeric literal is a `double` -- a real with no suffix or the `d`/`D` suffix. Binary
+/// numeric promotion (14.7.2) makes an arithmetic result double when either operand is one.
+fn is_double_literal(literal: &Literal) -> bool {
+    matches!(
+        literal,
+        Literal::Real {
+            suffix: RealSuffix::None | RealSuffix::Double,
+            ..
+        }
+    )
+}
+
 pub(crate) fn fold_const_binary(
     operator: BinaryOperator,
     left: &Literal,
     right: &Literal,
 ) -> Option<Literal> {
     use BinaryOperator as Op;
-    if let (Op::Add, Literal::String(left), Literal::String(right)) = (operator, left, right) {
-        let mut units = left.to_vec();
-        units.extend_from_slice(right);
-        return Some(Literal::String(units.into()));
+    if operator == Op::Add
+        && (matches!(left, Literal::String(_)) || matches!(right, Literal::String(_)))
+    {
+        let units = |lit: &Literal| match lit {
+            Literal::String(s) => Some(s.to_vec()),
+            Literal::Null => Some(Vec::new()),
+            _ => None,
+        };
+        if let (Some(mut concatenated), Some(tail)) = (units(left), units(right)) {
+            concatenated.extend_from_slice(&tail);
+            return Some(Literal::String(concatenated.into()));
+        }
+    }
+    if matches!(left, Literal::Real { .. }) || matches!(right, Literal::Real { .. }) {
+        let (lv, rv) = (real_value(left)?, real_value(right)?);
+        let result = match operator {
+            Op::Add => lv + rv,
+            Op::Subtract => lv - rv,
+            Op::Multiply => lv * rv,
+            Op::Divide => lv / rv,
+            Op::Modulo => lv % rv,
+            Op::LessThan => return Some(Literal::Boolean(lv < rv)),
+            Op::GreaterThan => return Some(Literal::Boolean(lv > rv)),
+            Op::LessThanOrEqual => return Some(Literal::Boolean(lv <= rv)),
+            Op::GreaterThanOrEqual => return Some(Literal::Boolean(lv >= rv)),
+            Op::Equal => return Some(Literal::Boolean(lv == rv)),
+            Op::NotEqual => return Some(Literal::Boolean(lv != rv)),
+            _ => return None,
+        };
+        let (result, suffix) = if is_double_literal(left) || is_double_literal(right) {
+            (result, RealSuffix::Double)
+        } else {
+            (f64::from(result as f32), RealSuffix::Float)
+        };
+        return Some(Literal::Real {
+            bits: result.to_bits(),
+            suffix,
+        });
     }
     let (left, right) = (literal_int_value(left)?, literal_int_value(right)?);
     let value = match operator {

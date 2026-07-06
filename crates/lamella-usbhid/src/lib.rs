@@ -56,8 +56,20 @@ pub struct Device(imp::Device);
 impl Device {
     /// Opens the first connected device with `vendor_id` and `product_id`, optionally
     /// requiring a specific `serial` number.
+    ///
+    /// Any input reports already queued are DRAINED before the device is handed out: a
+    /// probe protocol is strict request/reply, so a report waiting at open can only be a
+    /// stale reply a crashed session never read -- left in place it shifts every later
+    /// exchange off by one (each command reads the PREVIOUS command's reply; observed on
+    /// an EDBG with a six-figure backlog after an aborted flash write).
     pub fn open(vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
-        imp::Device::open(vendor_id, product_id, serial).map(Device)
+        let mut device = imp::Device::open(vendor_id, product_id, serial).map(Device)?;
+        let mut stale = [0u8; 64];
+        while device
+            .read_report(&mut stale, Duration::from_millis(100))
+            .is_ok()
+        {}
+        Ok(device)
     }
 
     /// Sends one output report. The report id (0) is supplied by the backend.

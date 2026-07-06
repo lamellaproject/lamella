@@ -5,14 +5,21 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// One piece of an f-string: literal text (escapes already resolved), or the raw source
-/// of a `{expression}` replacement field (the parser re-parses it).
+/// One piece of an f-string: literal text (escapes already resolved), or a `{expression}`
+/// replacement field split into its parts (the parser re-parses the expression text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FStringPart {
     /// Literal text between replacement fields.
     Literal(String),
-    /// The raw source text of a `{expression}` replacement field.
-    Expr(String),
+    /// A `{expr[!conversion][:spec]}` replacement field.
+    Expr {
+        /// The raw source of the expression (before any `!`/`:`).
+        text: String,
+        /// A `!r` / `!s` / `!a` conversion, if present.
+        conversion: Option<char>,
+        /// A `:format_spec`, if present (captured literally, up to the closing `}`).
+        spec: Option<String>,
+    },
 }
 
 /// A lexical token kind.
@@ -20,6 +27,12 @@ pub enum FStringPart {
 pub enum Tok {
     /// A decimal integer literal.
     Int(i64),
+    /// A floating-point literal -- the `f64` value's raw bits (`to_bits`), so the token stays `Eq`.
+    Float(u64),
+    /// An imaginary literal `Nj` -- the imaginary part's `f64` bits (real part is 0).
+    Imaginary(u64),
+    /// A decimal integer literal too large for `i64` -- its digits (a bignum).
+    BigInt(String),
     /// A short string literal -- its decoded value, with escape sequences resolved.
     /// Single-line `'...'` and `"..."` are handled; triple-quoted and `r`/`b`-prefixed
     /// strings are outside this subset.
@@ -75,12 +88,22 @@ pub enum Tok {
     KwAs,
     /// `class`
     KwClass,
+    /// `del`
+    KwDel,
+    /// `assert`
+    KwAssert,
     /// `break`
     KwBreak,
     /// `continue`
     KwContinue,
     /// `pass`
     KwPass,
+    /// `lambda`
+    KwLambda,
+    /// `yield`
+    KwYield,
+    /// `with`
+    KwWith,
 
     /// `+`
     Plus,
@@ -88,12 +111,16 @@ pub enum Tok {
     Minus,
     /// `*`
     Star,
+    /// `**` -- the exponentiation operator, and the `**kwargs` parameter / call-unpack marker.
+    DoubleStar,
     /// `/`
     Slash,
     /// `//`
     DoubleSlash,
     /// `%`
     Percent,
+    /// `@` -- the decorator marker (matrix-multiply is out of subset).
+    At,
     /// `&`
     Amper,
     /// `|`
@@ -142,6 +169,8 @@ pub enum Tok {
     GtGtEq,
     /// `:`
     Colon,
+    /// `:=` -- the walrus (assignment expression) operator.
+    ColonEqual,
     /// `,`
     Comma,
     /// `.`
@@ -391,6 +420,8 @@ impl Lexer {
             self.lex_number()
         } else if (c == 'f' || c == 'F') && matches!(self.peek2(), Some('\'' | '"')) {
             self.lex_fstring()
+        } else if (c == 'r' || c == 'R') && matches!(self.peek2(), Some('\'' | '"')) {
+            self.lex_raw_string()
         } else if c == '_' || c.is_ascii_alphabetic() {
             self.lex_name();
             Ok(())
@@ -481,6 +512,46 @@ impl Lexer {
     }
 
     /// Resolve one escape sequence (the leading backslash already consumed) into `out`.
+    /// Lex a raw string `r"..."` / `r'...'`: like [`Self::lex_string`] but backslashes are LITERAL
+    /// (no escapes) -- `r"a\tb"` is the four characters `a\tb`. A backslash still keeps the next
+    /// character from being special, so an escaped quote does not close the string (both the
+    /// backslash and the quote are kept), matching CPython's raw-string tokenizing.
+    fn lex_raw_string(&mut self) -> Result<(), LexError> {
+        self.pos += 1;
+        let quote = self.peek().expect("lex_raw_string called before the quote");
+        self.pos += 1;
+        let mut value = String::new();
+        loop {
+            match self.peek() {
+                None | Some('\n') | Some('\r') => {
+                    return Err(self.err("unterminated string literal"));
+                }
+                Some(c) if c == quote => {
+                    self.pos += 1;
+                    self.push(Tok::Str(value));
+                    return Ok(());
+                }
+                Some('\\') => {
+                    value.push('\\');
+                    self.pos += 1;
+                    match self.peek() {
+                        None | Some('\n') | Some('\r') => {
+                            return Err(self.err("unterminated string literal"));
+                        }
+                        Some(c) => {
+                            value.push(c);
+                            self.pos += 1;
+                        }
+                    }
+                }
+                Some(c) => {
+                    value.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
     fn lex_string_escape(&mut self, out: &mut String) -> Result<(), LexError> {
         let c = match self.peek() {
             Some(c) => c,
@@ -552,9 +623,10 @@ impl Lexer {
     }
 
     /// Lex a single-line f-string `f"..."` / `f'...'` (the `f`/`F` not yet consumed):
-    /// literal text (escapes resolved, `{{`/`}}` -> `{`/`}`) interspersed with `{expr}`
-    /// replacement fields whose raw source is captured for the parser. Format specs,
-    /// conversions, `=`-debug, and raw/triple-quoted f-strings are out of subset.
+    /// literal text (escapes resolved, `{{`/`}}` -> `{`/`}`) interspersed with
+    /// `{expr[!conversion][:spec]}` replacement fields. The expression source is captured
+    /// for the parser; a `!r`/`!s` conversion and a `:spec` are split off here. `=`-debug and
+    /// raw/triple-quoted f-strings are out of subset.
     fn lex_fstring(&mut self) -> Result<(), LexError> {
         self.pos += 1;
         let quote = self.peek().expect("lex_fstring called at a quote");
@@ -585,8 +657,12 @@ impl Lexer {
                         parts.push(FStringPart::Literal(core::mem::take(&mut literal)));
                     }
                     self.pos += 1;
-                    let raw = self.scan_fstring_expr(quote)?;
-                    parts.push(FStringPart::Expr(raw));
+                    let (text, conversion, spec) = self.scan_fstring_expr(quote)?;
+                    parts.push(FStringPart::Expr {
+                        text,
+                        conversion,
+                        spec,
+                    });
                 }
                 Some('}') => {
                     return Err(self.err("single '}' in an f-string (double it as '}}' for a literal)"));
@@ -606,8 +682,13 @@ impl Lexer {
     /// Capture the raw source of a replacement field, from just after `{` to the matching
     /// `}` (tracking `()`/`[]`/`{}` nesting). First light does not handle a `}` inside a
     /// string within the field.
-    fn scan_fstring_expr(&mut self, quote: char) -> Result<String, LexError> {
-        let mut raw = String::new();
+    fn scan_fstring_expr(
+        &mut self,
+        quote: char,
+    ) -> Result<(String, Option<char>, Option<String>), LexError> {
+        let mut text = String::new();
+        let mut conversion: Option<char> = None;
+        let mut spec: Option<String> = None;
         let mut depth = 0i32;
         loop {
             match self.peek() {
@@ -619,30 +700,48 @@ impl Lexer {
                 }
                 Some('}') if depth == 0 => {
                     self.pos += 1;
-                    return Ok(raw);
+                    return Ok((text, conversion, spec));
+                }
+                Some(c) if spec.is_some() => {
+                    match c {
+                        '(' | '[' | '{' => depth += 1,
+                        ')' | ']' | '}' => depth -= 1,
+                        _ => {}
+                    }
+                    spec.as_mut().expect("spec is Some").push(c);
+                    self.pos += 1;
+                }
+                Some(':') if depth == 0 => {
+                    self.pos += 1;
+                    spec = Some(String::new());
+                }
+                Some('!') if depth == 0 && matches!(self.peek2(), Some('r' | 's' | 'a')) => {
+                    conversion = self.peek2();
+                    self.pos += 2;
                 }
                 Some(c @ ('(' | '[' | '{')) => {
                     depth += 1;
-                    raw.push(c);
+                    text.push(c);
                     self.pos += 1;
                 }
                 Some(c @ (')' | ']' | '}')) => {
                     depth -= 1;
-                    raw.push(c);
+                    text.push(c);
                     self.pos += 1;
                 }
                 Some(c) => {
-                    raw.push(c);
+                    text.push(c);
                     self.pos += 1;
                 }
             }
         }
     }
 
-    /// Lex an integer literal per the Language Reference (2.4.4): a decimal digit run
+    /// Lex a numeric literal per the Language Reference (2.4.4): a decimal digit run
     /// (no leading zeros on a non-zero value), or a base-prefixed `0x`/`0o`/`0b`
     /// literal. In every base, `_` separators are permitted only between digits (or
-    /// right after the prefix). Float and imaginary literals remain out of scope.
+    /// right after the prefix). A `.` or `e`/`E` continues into `lex_float_tail`, and a
+    /// `j`/`J` suffix makes the number an imaginary literal.
     fn lex_number(&mut self) -> Result<(), LexError> {
         let first = self.peek().expect("lex_number called at a digit");
         if first == '0' {
@@ -677,6 +776,17 @@ impl Lexer {
                 _ => break,
             }
         }
+        if (self.peek() == Some('.') && self.peek2() != Some('.'))
+            || matches!(self.peek(), Some('e' | 'E'))
+        {
+            return self.lex_float_tail(digits);
+        }
+        if matches!(self.peek(), Some('j' | 'J')) {
+            self.pos += 1;
+            let value: f64 = digits.parse().map_err(|_| self.err("invalid imaginary literal"))?;
+            self.push(Tok::Imaginary(value.to_bits()));
+            return Ok(());
+        }
         if matches!(self.peek(), Some(c) if c == '_' || c.is_ascii_alphabetic()) {
             return Err(self.err("invalid integer literal"));
         }
@@ -688,7 +798,64 @@ impl Lexer {
                 self.push(Tok::Int(value));
                 Ok(())
             }
-            Err(_) => Err(self.err("integer literal too large (exceeds 64 bits)")),
+            Err(_) => {
+                self.push(Tok::BigInt(digits));
+                Ok(())
+            }
+        }
+    }
+
+    /// Lex the fractional and/or exponent tail of a float literal, given the already-collected
+    /// integer-part `digits` (the next char is a `.` decimal point or `e`/`E`). Produces a
+    /// [`Tok::Float`] carrying the `f64` bits.
+    fn lex_float_tail(&mut self, mut digits: String) -> Result<(), LexError> {
+        if self.peek() == Some('.') {
+            digits.push('.');
+            self.pos += 1;
+            self.take_digit_run(&mut digits);
+        }
+        if matches!(self.peek(), Some('e' | 'E')) {
+            digits.push('e');
+            self.pos += 1;
+            if let Some(sign @ ('+' | '-')) = self.peek() {
+                digits.push(sign);
+                self.pos += 1;
+            }
+            let before = digits.len();
+            self.take_digit_run(&mut digits);
+            if digits.len() == before {
+                return Err(self.err("a float exponent needs at least one digit"));
+            }
+        }
+        if matches!(self.peek(), Some('j' | 'J')) {
+            self.pos += 1;
+            let value: f64 = digits.parse().map_err(|_| self.err("invalid imaginary literal"))?;
+            self.push(Tok::Imaginary(value.to_bits()));
+            return Ok(());
+        }
+        if matches!(self.peek(), Some(c) if c == '_' || c.is_ascii_alphabetic()) {
+            return Err(self.err("invalid float literal"));
+        }
+        match digits.parse::<f64>() {
+            Ok(value) => {
+                self.push(Tok::Float(value.to_bits()));
+                Ok(())
+            }
+            Err(_) => Err(self.err("invalid float literal")),
+        }
+    }
+
+    /// Consume a run of ASCII digits (with `_` separators between digits) into `digits`.
+    fn take_digit_run(&mut self, digits: &mut String) {
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                digits.push(c);
+                self.pos += 1;
+            } else if c == '_' && matches!(self.peek2(), Some(d) if d.is_ascii_digit()) {
+                self.pos += 1;
+            } else {
+                break;
+            }
         }
     }
 
@@ -765,8 +932,14 @@ impl Lexer {
             "raise" => Tok::KwRaise,
             "as" => Tok::KwAs,
             "class" => Tok::KwClass,
-            "assert" | "async" | "await" | "del" | "from" | "global" | "import" | "is"
-            | "lambda" | "nonlocal" | "with" | "yield" => Tok::Reserved(name),
+            "lambda" => Tok::KwLambda,
+            "yield" => Tok::KwYield,
+            "with" => Tok::KwWith,
+            "del" => Tok::KwDel,
+            "assert" => Tok::KwAssert,
+            "async" | "await" | "from" | "global" | "import" | "is" | "nonlocal" => {
+                Tok::Reserved(name)
+            }
             _ => Tok::Name(name),
         };
         self.push(kind);
@@ -782,9 +955,7 @@ impl Lexer {
             '-' if next == Some('>') => (Tok::Arrow, 2),
             '-' if next == Some('=') => (Tok::MinusEq, 2),
             '-' => (Tok::Minus, 1),
-            '*' if next == Some('*') => {
-                return Err(self.err("exponentiation '**' is not supported in this subset"));
-            }
+            '*' if next == Some('*') => (Tok::DoubleStar, 2),
             '*' if next == Some('=') => (Tok::StarEq, 2),
             '*' => (Tok::Star, 1),
             '/' if next == Some('/') && third == Some('=') => (Tok::SlashSlashEq, 3),
@@ -792,6 +963,7 @@ impl Lexer {
             '/' => (Tok::Slash, 1),
             '%' if next == Some('=') => (Tok::PercentEq, 2),
             '%' => (Tok::Percent, 1),
+            '@' => (Tok::At, 1),
             '&' if next == Some('=') => (Tok::AmperEq, 2),
             '&' => (Tok::Amper, 1),
             '|' if next == Some('=') => (Tok::PipeEq, 2),
@@ -811,6 +983,7 @@ impl Lexer {
             '=' => (Tok::Assign, 1),
             '!' if next == Some('=') => (Tok::NotEq, 2),
             '!' => return Err(self.err("'!' is only valid as '!='")),
+            ':' if next == Some('=') => (Tok::ColonEqual, 2),
             ':' => (Tok::Colon, 1),
             ',' => (Tok::Comma, 1),
             '.' => (Tok::Dot, 1),
@@ -983,6 +1156,34 @@ mod tests {
     }
 
     #[test]
+    fn raw_strings_keep_backslashes_literal() {
+        assert_eq!(kinds("r\"a\\tb\"\n")[0], Tok::Str("a\\tb".into()));
+        assert_eq!(kinds("r\"x\\\"y\"\n")[0], Tok::Str("x\\\"y".into()));
+        assert_eq!(kinds("R'\\d+'\n")[0], Tok::Str("\\d+".into()));
+    }
+
+    #[test]
+    fn imaginary_literals_lex_to_the_imaginary_part() {
+        assert_eq!(kinds("2j\n")[0], Tok::Imaginary(2.0f64.to_bits()));
+        assert_eq!(kinds("1.5J\n")[0], Tok::Imaginary(1.5f64.to_bits()));
+        assert_eq!(kinds("0j\n")[0], Tok::Imaginary(0.0f64.to_bits()));
+        assert_eq!(kinds("1e3j\n")[0], Tok::Imaginary(1000.0f64.to_bits()));
+    }
+
+    #[test]
+    fn oversized_integer_literals_lex_to_bigint() {
+        assert_eq!(
+            kinds("123456789012345678901234567890\n")[0],
+            Tok::BigInt("123456789012345678901234567890".into())
+        );
+        assert_eq!(kinds("42\n")[0], Tok::Int(42));
+        assert_eq!(
+            kinds("100_000_000_000_000_000_000\n")[0],
+            Tok::BigInt("100000000000000000000".into())
+        );
+    }
+
+    #[test]
     fn string_escape_sequences_decode_per_2_4_1() {
         assert_eq!(kinds("'a\\tb'\n")[0], Tok::Str("a\tb".into()));
         assert_eq!(kinds("'\\n\\r'\n")[0], Tok::Str("\n\r".into()));
@@ -1053,9 +1254,9 @@ mod tests {
     #[test]
     fn out_of_subset_keywords_are_reserved_not_names() {
         assert_eq!(
-            kinds("lambda x import\n"),
+            kinds("global x import\n"),
             vec![
-                Tok::Reserved("lambda".into()),
+                Tok::Reserved("global".into()),
                 Tok::Name("x".into()),
                 Tok::Reserved("import".into()),
                 Tok::Newline,
@@ -1095,7 +1296,6 @@ mod tests {
         assert!(tokenize("0123\n").is_err());
         assert!(tokenize("1__2\n").is_err());
         assert!(tokenize("1_\n").is_err());
-        assert!(tokenize("2 ** 3\n").is_err());
     }
 
     #[test]

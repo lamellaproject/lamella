@@ -1,0 +1,141 @@
+//! In-page SOURCE MAP (feature `bake`): given the assemblies + the app's Portable PDB, return the
+//! `method_id -> source line` table the WIRELINE DEBUGGER needs, keyed by the SAME `method_id` the deployed
+//! baked image reports on the wire. It loads + trims EXACTLY as `bake` does (so the numbering matches the
+//! image the device runs) and reads the PDB via `lamella_metadata::PortablePdb` through the loader's own
+//! token binding (`Module::resolve`) -- the mapping `lamella-dap`'s `InterpreterBackend::with_pdb` builds.
+//! So the JS debugger REUSES the Rust PDB reader + loader binding (no JS PDB parser, no drift, and the
+//! `MethodId <-> method_rid` question is answered by the code, not guessed).
+
+#![allow(unsafe_code)]
+
+use crate::abi::result_buffer;
+use lamella_load::{load_with_corlib_and_library_unfrozen, load_with_corlib_unfrozen};
+use lamella_metadata::{Assembly, PortablePdb};
+use lamella_token::Token;
+
+/// The `MethodDef` metadata table tag (matches lamella-dap's InterpreterBackend).
+const METHOD_DEF: u8 = 0x06;
+
+/// Wrap a JSON body as `[u32 json_len][JSON]` (the payload `result_buffer` then length-prefixes again).
+fn wrap(json: Vec<u8>) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4 + json.len());
+    payload.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&json);
+    payload
+}
+
+fn error_payload(message: &str) -> Vec<u8> {
+    wrap(
+        serde_json::to_vec(&serde_json::json!({
+            "methods": {}, "entryPoint": serde_json::Value::Null, "error": message,
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+fn srcmap(corlib: &[u8], library: &[u8], app: &[u8], pdb: &[u8], trim: bool) -> Vec<u8> {
+    crate::abi::with_static(corlib, |corlib| {
+        crate::abi::with_static(library, |library| {
+            crate::abi::with_static(app, |app| srcmap_inner(corlib, library, app, pdb, trim))
+        })
+    })
+}
+
+fn srcmap_inner(corlib: &'static [u8], library: &'static [u8], app: &'static [u8], pdb_bytes: &[u8], trim: bool) -> Vec<u8> {
+    let corlib_asm = match Assembly::read(corlib) {
+        Ok(assembly) => assembly,
+        Err(error) => return error_payload(&format!("corlib parse: {error:?}")),
+    };
+    let app_asm = match Assembly::read(app) {
+        Ok(assembly) => assembly,
+        Err(error) => return error_payload(&format!("app parse: {error:?}")),
+    };
+    let library_asm = if library.is_empty() {
+        None
+    } else {
+        match Assembly::read(library) {
+            Ok(assembly) => Some(assembly),
+            Err(error) => return error_payload(&format!("library parse: {error:?}")),
+        }
+    };
+
+    let (loaded, app_asm_index) = match &library_asm {
+        Some(library_asm) => (load_with_corlib_and_library_unfrozen(&corlib_asm, library_asm, &app_asm), 2u8),
+        None => (load_with_corlib_unfrozen(&corlib_asm, &app_asm), 1u8),
+    };
+    let mut loaded = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => return error_payload(&format!("load: {error:?}")),
+    };
+    if trim {
+        let (methods, types, strings) = loaded.module.reachable_set(Some(loaded.entry));
+        loaded.module.retain_reachable(&methods, &types, &strings);
+    }
+
+    let pdb = match PortablePdb::read(pdb_bytes) {
+        Ok(pdb) => pdb,
+        Err(error) => return error_payload(&format!("pdb parse: {error:?}")),
+    };
+
+    let mut methods = serde_json::Map::new();
+    for rid in 1..=pdb.method_count() {
+        let Some(method_id) = loaded.module.resolve(app_asm_index, Token::new(METHOD_DEF, rid)) else {
+            continue;
+        };
+        let points: Vec<serde_json::Value> = pdb
+            .sequence_points(rid)
+            .into_iter()
+            .filter(|point| !point.is_hidden)
+            .map(|point| serde_json::json!({ "o": point.il_offset, "l": point.start_line, "c": point.start_column }))
+            .collect();
+        if points.is_empty() {
+            continue;
+        }
+        let document = pdb.method_document(rid).unwrap_or_default();
+        methods.insert(method_id.to_string(), serde_json::json!({ "document": document, "points": points }));
+    }
+    let entry_point = pdb
+        .entry_point()
+        .and_then(|token| loaded.module.resolve(app_asm_index, token))
+        .map_or(serde_json::Value::Null, serde_json::Value::from);
+
+    wrap(
+        serde_json::to_vec(&serde_json::json!({
+            "methods": methods, "entryPoint": entry_point, "error": serde_json::Value::Null,
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+/// See the module doc for the ABI.
+///
+/// # Safety
+/// Each pointer/length pair must be a buffer the host filled via a prior `lamella_alloc` (a zero-length
+/// `lib` is allowed and means a corlib+app, 2-assembly, map).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_srcmap(
+    corlib_ptr: *const u8,
+    corlib_len: usize,
+    lib_ptr: *const u8,
+    lib_len: usize,
+    app_ptr: *const u8,
+    app_len: usize,
+    pdb_ptr: *const u8,
+    pdb_len: usize,
+    trim: u32,
+) -> *mut u8 {
+    let read = |ptr: *const u8, len: usize| -> &[u8] {
+        if len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(ptr, len) }
+        }
+    };
+    result_buffer(srcmap(
+        read(corlib_ptr, corlib_len),
+        read(lib_ptr, lib_len),
+        read(app_ptr, app_len),
+        read(pdb_ptr, pdb_len),
+        trim != 0,
+    ))
+}

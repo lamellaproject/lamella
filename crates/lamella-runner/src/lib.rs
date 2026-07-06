@@ -48,7 +48,9 @@ pub mod debug {
     /// `Breakpoint`/`Done`/`Trap` if the step landed there).
     pub const DBG_STEP: u8 = 0x12;
     /// Host -> target: replace ALL breakpoints. Payload = `count(u16 LE)` then `count` x
-    /// `(method_id: u32 LE, offset: u32 LE)`. Replies [`DBG_ACK`].
+    /// `(method_id: u32 LE, offset: u32 LE)`. Replies [`DBG_ACK`]. Accepted BOTH while halted
+    /// AND mid-run (during a [`DBG_RESUME`]) -- a breakpoint set while the program runs takes
+    /// effect on its next hit, so the IDE can add one without first pausing.
     pub const DBG_BREAK: u8 = 0x13;
     /// Host -> target: request the call stack. Replies [`DBG_FRAMES`].
     pub const DBG_STACK: u8 = 0x14;
@@ -68,6 +70,14 @@ pub mod debug {
     /// Host -> target: end the debug session (the target discards it and returns to the
     /// serve loop). Replies [`DBG_ACK`].
     pub const DBG_DETACH: u8 = 0x19;
+    /// Host -> target: debug the PERSISTENTLY DEPLOYED image (the flash region
+    /// `DEPLOY_IMAGE`/`DEPLOY_CHUNK` programmed) IN PLACE -- no payload, so attaching to a
+    /// ~190 KB deployed app costs nothing on the wire. The target boots that image HALTED
+    /// at the entry and replies [`EVT_STOPPED`] (reason `Entry`); from there the session is
+    /// identical to a [`DBG_IMAGE`] one. A missing/corrupt image answers [`EVT_STOPPED`]
+    /// (reason `Trap`) carrying the boot error. Served by deploy-capable targets
+    /// ([`crate::serve_one_deploy`]), advertised as `Capabilities::DEBUG_ATTACH`.
+    pub const DBG_ATTACH: u8 = 0x1A;
 
     /// [`EVT_STOPPED`] reasons.
     pub mod reason {
@@ -85,6 +95,20 @@ pub mod debug {
         /// Ends the session.
         pub const TRAP: u8 = 5;
     }
+}
+
+/// Wireline message types for PROFILE INTROSPECTION (the 0x30 range): the board tells the IDE
+/// what it is. The `HELLO_ACK` already carries the compact [`lamella_wire::ProfileIdentity`]
+/// (abi level + surface hash + name) at zero extra round-trips; this pair pulls the FULL
+/// resident manifest only when the host's cache misses that hash
+/// (docs/deployment-tiers.md's identity/manifest split).
+pub mod profile {
+    /// Host -> target: request the resident-profile manifest. Empty payload. Answered by
+    /// [`PROFILE_MANIFEST`].
+    pub const GET_PROFILE: u8 = 0x30;
+    /// Target -> host: the manifest ([`lamella_wire::ProfileManifest`] bytes -- the identity +
+    /// the complete intrinsic-id listing of the resident surface).
+    pub const PROFILE_MANIFEST: u8 = 0x31;
 }
 
 /// Wireline message types for PERSISTENT deploy (write a baked image to the target's flash
@@ -108,7 +132,23 @@ pub mod deploy {
     /// without ever holding it whole in RAM. Each chunk is answered by [`DEPLOY_RESULT`]; the final
     /// chunk's reply is the deploy's overall result.
     pub const DEPLOY_CHUNK: u8 = 0x26;
+    /// Host -> target: query the deployed image (no payload). Answered by [`DEPLOY_STATUS_RESULT`].
+    /// Lets a host skip re-deploying an image the target already holds -- content-addressed deploy,
+    /// the phone-style "already installed, just run it" flow.
+    pub const DEPLOY_STATUS: u8 = 0x27;
+    /// Target -> host: `present(u8) | checksum(u64 LE)` -- present=1 with the stored image's content
+    /// checksum (`lamella_cil_runtime::baked_image_checksum`) if a valid image is deployed, else
+    /// present=0 (checksum 0). The host compares it to a freshly-baked image's checksum.
+    pub const DEPLOY_STATUS_RESULT: u8 = 0x28;
+    /// Host -> target: boot the deployed image NOW -- a clean self-reset into the boot-run path, so
+    /// deploy->run needs no debug probe. No reply and no payload (the target resets).
+    pub const DEPLOY_RUN: u8 = 0x29;
 }
+
+/// Re-exported for a deploy host: read a baked image's content checksum from its header, to compare
+/// against what a target already holds (content-addressed deploy-skip) without a direct dependency on
+/// the interpreter crate.
+pub use lamella_cil_runtime::baked_image_checksum;
 
 /// The persistent-image flash region a deploy-capable target owns. The generic runner
 /// drives the deploy protocol against this seam; the erase/write primitives are
@@ -143,6 +183,20 @@ pub enum Deployed {
     /// A host sent `HELLO` mid-run: the app was aborted and the host acknowledged; the
     /// firmware should enter its serve loop where the host's next command lands.
     Interrupted,
+}
+
+/// What [`serve_one_deploy`] did with a pending frame -- so a firmware serve loop knows when the host
+/// asked to BOOT the deployed image, which is a reset the firmware must perform itself (the runner is
+/// target-agnostic and cannot reset the MCU).
+#[cfg(feature = "baked-image")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Served {
+    /// No frame was pending.
+    Nothing,
+    /// A frame was handled; keep serving.
+    Handled,
+    /// The host sent [`deploy::DEPLOY_RUN`]: the firmware should reset into its boot-run path.
+    RunRequested,
 }
 
 /// The result of running a program on the target: its process exit code and captured console output.
@@ -220,21 +274,60 @@ fn failure(reason: &str) -> RunResult {
 /// Answers a `HELLO` with this baked target's honest advertisement (or a `NAK` on a
 /// version mismatch). A malformed `HELLO` is dropped; the host times out and retries.
 #[cfg(feature = "baked-image")]
-fn hello_reply(
-    transport: &mut impl Transport,
-    frame: &lamella_wire::Frame,
-) -> Result<(), TransportError> {
-    use lamella_wire::{Capabilities, Hello, PROTOCOL_VERSION, ProtocolRange, msg, target_respond};
-    let range = ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION };
-    let caps = Capabilities(
+/// The capability set every baked-image serve advertises.
+fn serve_caps() -> lamella_wire::Capabilities {
+    use lamella_wire::Capabilities;
+    Capabilities(
         Capabilities::BAKED_IMAGE
             | Capabilities::DEBUG_BASIC
             | Capabilities::BREAKPOINTS
             | Capabilities::STEPPING,
-    );
+    )
+}
+
+/// [`serve_caps`] plus the deploy tier's extras: a target with a persistent image region
+/// also debugs it in place ([`debug::DBG_ATTACH`]).
+#[cfg(feature = "baked-image")]
+fn deploy_caps() -> lamella_wire::Capabilities {
+    lamella_wire::Capabilities(serve_caps().0 | lamella_wire::Capabilities::DEBUG_ATTACH)
+}
+
+/// This build's resident-profile identity (docs/deployment-tiers.md): the intrinsic-ABI level +
+/// the registry fingerprint as the surface hash + the surface's name, all derived in
+/// `intrinsic_registry` from the one feature set that shapes the registry. A Tier-2 target
+/// folds its resident corlib's content hash in once one is resident.
+#[cfg(feature = "baked-image")]
+fn profile_identity() -> lamella_wire::ProfileIdentity {
+    use lamella_cil_runtime::intrinsic_registry;
+    lamella_wire::ProfileIdentity::new(
+        intrinsic_registry::INTRINSIC_ABI,
+        intrinsic_registry::registry_fingerprint(),
+        intrinsic_registry::profile_name(),
+    )
+}
+
+#[cfg(feature = "baked-image")]
+fn hello_reply(
+    transport: &mut impl Transport,
+    frame: &lamella_wire::Frame,
+) -> Result<(), TransportError> {
+    hello_reply_caps(transport, frame, serve_caps())
+}
+
+#[cfg(feature = "baked-image")]
+fn hello_reply_caps(
+    transport: &mut impl Transport,
+    frame: &lamella_wire::Frame,
+    caps: lamella_wire::Capabilities,
+) -> Result<(), TransportError> {
+    use lamella_wire::{Hello, PROTOCOL_VERSION, ProtocolRange, msg, target_respond};
+    let range = ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION };
     match Hello::decode(&frame.payload) {
         Some(hello) => match target_respond(&hello, range, caps) {
-            Ok(ack) => transport.send(msg::HELLO_ACK, frame.seq, &ack.encode()),
+            Ok(mut ack) => {
+                ack.profile = Some(profile_identity());
+                transport.send(msg::HELLO_ACK, frame.seq, &ack.encode())
+            }
             Err(nak) => transport.send(msg::NAK, frame.seq, &nak.encode()),
         },
         None => Ok(()),
@@ -248,6 +341,10 @@ enum RunStop {
     Paused,
     Done(RunResult),
     Trap(RunResult),
+    /// A mid-run `HELLO` reclaimed the target (already answered): the session is over.
+    Reclaimed,
+    /// A mid-run [`debug::DBG_DETACH`] (already acked): the session is over.
+    Detached,
 }
 
 /// The debugged program's current `(method_id, offset)` -- the innermost frame. On the
@@ -290,14 +387,43 @@ fn run_result_of(vm: &Vm, value: &Option<lamella_cil_runtime::Value>) -> RunResu
     RunResult { exit, stdout: String::from_utf16_lossy(vm.output()) }
 }
 
+/// Applies a [`debug::DBG_BREAK`] payload to `session`: replace the whole breakpoint set with
+/// the `(method_id, offset)` pairs it carries (`count(u16 LE)` then `count` x two u32 LE). On
+/// the `in_place` tier the offset is the CIL byte offset, the domain `is_at_breakpoint` checks
+/// the running ip against -- so a breakpoint applied here (even mid-run) fires on the next hit.
+/// Shared by the halted command loop and the mid-run poll, so setting a breakpoint WHILE the
+/// program runs behaves identically to setting one while it is stopped.
+#[cfg(feature = "baked-image")]
+fn apply_breakpoints(session: &mut lamella_cil_runtime::Session, payload: &[u8]) {
+    session.clear_breakpoints();
+    let count = payload
+        .get(0..2)
+        .map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize);
+    for pair in 0..count {
+        let base = 2 + pair * 8;
+        let Some(bytes) = payload.get(base..base + 8) else {
+            break;
+        };
+        let method = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let offset = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        session.add_breakpoint(method, offset);
+    }
+}
+
 /// Run until a breakpoint, completion, a trap, or a [`debug::DBG_PAUSE`]: bounded bursts
 /// of steps with a wire poll between bursts, so a running target stays pause-able.
+/// A mid-run `HELLO` is answered with `caps` and ends the run ([`RunStop::Reclaimed`]);
+/// a mid-run detach is acked and ends it ([`RunStop::Detached`]) -- without these, a
+/// resume over a non-terminating program left the wireline PERMANENTLY deaf on every
+/// carrier (the F427 post-debug wedge: the blink loops forever, no breakpoint fires,
+/// and the old loop dropped every reclaim HELLO here).
 #[cfg(feature = "baked-image")]
 fn run_until_stop(
     transport: &mut impl Transport,
     module: &lamella_cil_runtime::Module,
     vm: &mut Vm,
     session: &mut lamella_cil_runtime::Session,
+    caps: lamella_wire::Capabilities,
 ) -> Result<RunStop, TransportError> {
     use lamella_cil_runtime::Status;
     loop {
@@ -322,8 +448,21 @@ fn run_until_stop(
             }
         }
         if let Some(frame) = transport.poll()? {
-            if frame.msg_type == debug::DBG_PAUSE {
-                return Ok(RunStop::Paused);
+            match frame.msg_type {
+                debug::DBG_PAUSE => return Ok(RunStop::Paused),
+                lamella_wire::msg::HELLO => {
+                    hello_reply_caps(transport, &frame, caps)?;
+                    return Ok(RunStop::Reclaimed);
+                }
+                debug::DBG_DETACH => {
+                    transport.send(debug::DBG_ACK, frame.seq, &[])?;
+                    return Ok(RunStop::Detached);
+                }
+                debug::DBG_BREAK => {
+                    apply_breakpoints(session, &frame.payload);
+                    transport.send(debug::DBG_ACK, frame.seq, &[])?;
+                }
+                _ => {}
             }
         }
     }
@@ -342,10 +481,27 @@ pub fn run_debug_session(
     image: Vec<u8>,
     image_seq: u16,
 ) -> Result<(), TransportError> {
+    let image: &'static [u8] = Box::leak(image.into_boxed_slice());
+    run_debug_session_static(transport, image, image_seq, serve_caps())
+}
+
+/// [`run_debug_session`] over an ALREADY-RESIDENT image -- the [`debug::DBG_ATTACH`] arm:
+/// a deploy-capable target debugs the flash region it already holds, so nothing but
+/// commands crosses the wire. `caps` is what a mid-session `HELLO` (a NEW host adopting a
+/// stale session) is answered with -- the serve tier's own set.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+pub fn run_debug_session_static(
+    transport: &mut impl Transport,
+    image: &'static [u8],
+    image_seq: u16,
+    caps: lamella_wire::Capabilities,
+) -> Result<(), TransportError> {
     use debug::reason;
     use lamella_cil_runtime::{Module, Session, Status};
 
-    let image: &'static [u8] = Box::leak(image.into_boxed_slice());
     let (module, entry) = match Module::from_baked(image) {
         Ok((module, Some(entry))) => (module, entry),
         Ok((_, None)) => {
@@ -361,6 +517,10 @@ pub fn run_debug_session(
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
     vm.set_memory_backend(Box::new(SafeMemory::new()));
+    if let Err(trap) = boot_static_ctors(&module, &mut vm) {
+        let result = failure(&format!("static constructor: {trap:?}"));
+        return send_stopped(transport, image_seq, reason::TRAP, (0, 0), Some(&result));
+    }
     let mut session = match Session::new(&module, entry, Vec::new()) {
         Ok(session) => session,
         Err(trap) => {
@@ -415,7 +575,7 @@ pub fn run_debug_session(
                         Ok(_) => {}
                     }
                 }
-                match run_until_stop(transport, &module, &mut vm, &mut session)? {
+                match run_until_stop(transport, &module, &mut vm, &mut session, caps)? {
                     RunStop::Breakpoint => {
                         at_reported_breakpoint = true;
                         send_stopped(
@@ -435,23 +595,11 @@ pub fn run_debug_session(
                     RunStop::Trap(result) => {
                         return send_stopped(transport, frame.seq, reason::TRAP, (0, 0), Some(&result));
                     }
+                    RunStop::Reclaimed | RunStop::Detached => return Ok(()),
                 }
             }
             debug::DBG_BREAK => {
-                session.clear_breakpoints();
-                let payload = &frame.payload;
-                let count = payload
-                    .get(0..2)
-                    .map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize);
-                for pair in 0..count {
-                    let base = 2 + pair * 8;
-                    let Some(bytes) = payload.get(base..base + 8) else {
-                        break;
-                    };
-                    let method = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                    let offset = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-                    session.add_breakpoint(method, offset);
-                }
+                apply_breakpoints(&mut session, &frame.payload);
                 transport.send(debug::DBG_ACK, frame.seq, &[])?;
             }
             debug::DBG_STACK => {
@@ -474,7 +622,7 @@ pub fn run_debug_session(
                 return Ok(());
             }
             lamella_wire::msg::HELLO => {
-                hello_reply(transport, &frame)?;
+                hello_reply_caps(transport, &frame, caps)?;
                 return Ok(());
             }
             _ => {}
@@ -490,6 +638,17 @@ pub fn run_debug_session(
 #[cfg(feature = "baked-image")]
 #[must_use]
 pub fn run_image(image: Vec<u8>) -> RunResult {
+    run_image_with(image, &mut |_vm| {})
+}
+
+/// [`run_image`] with a firmware hook that configures the fresh [`Vm`] before anything
+/// runs (static constructors included): a device installs its board seams here -- the
+/// clock, the networking backend -- exactly as a host embedder does after `Vm::default()`.
+/// The runner cannot know a board's backends (they live in the firmware crate), so the
+/// firmware hands them in per evaluation.
+#[cfg(feature = "baked-image")]
+#[must_use]
+pub fn run_image_with(image: Vec<u8>, configure: &mut dyn FnMut(&mut Vm)) -> RunResult {
     let image: &'static [u8] = Box::leak(image.into_boxed_slice());
     let (module, entry) = match lamella_cil_runtime::Module::from_baked(image) {
         Ok(booted) => booted,
@@ -502,6 +661,10 @@ pub fn run_image(image: Vec<u8>) -> RunResult {
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
     vm.set_memory_backend(Box::new(SafeMemory::new()));
+    configure(&mut vm);
+    if boot_static_ctors(&module, &mut vm).is_err() {
+        return RunResult { exit: 70, stdout: String::from_utf16_lossy(vm.output()) };
+    }
     let outcome = run(&module, &mut vm, entry, Vec::new());
     let exit = match outcome {
         Ok(Some(Value::Int32(code))) => code,
@@ -509,6 +672,28 @@ pub fn run_image(image: Vec<u8>) -> RunResult {
         Err(_) => 70,
     };
     RunResult { exit, stdout: String::from_utf16_lossy(vm.output()) }
+}
+
+/// Boots a baked image's static constructors EAGERLY (the lazy-trigger tables of
+/// II.10.5.3 are loader-built and not part of the baked format), then marks every type
+/// initialized. EVERY baked-image entry path must run this before the entry method --
+/// transient RUN_IMAGE, the flash boot-run, and a debug session alike; a path that skips it
+/// runs the program with null corlib statics (`IPAddress.Any`, `Encoding.ASCII`, ...).
+///
+/// # Errors
+/// The first trapping constructor's [`lamella_cil_runtime::Trap`] (its console output is in
+/// the [`Vm`] for the caller to flush).
+#[cfg(feature = "baked-image")]
+fn boot_static_ctors(
+    module: &lamella_cil_runtime::Module,
+    vm: &mut Vm,
+) -> Result<(), lamella_cil_runtime::Trap> {
+    for &cctor in module.static_ctors() {
+        lamella_cil_runtime::Session::new(module, cctor, Vec::new())
+            .and_then(|mut session| session.run(module, vm))?;
+    }
+    vm.mark_all_cctors_run(module);
+    Ok(())
 }
 
 /// Serve one pending request on a PE-less BAKED-IMAGE target: a `HELLO` gets a `HELLO_ACK`
@@ -525,7 +710,7 @@ pub fn serve_one_baked(transport: &mut impl Transport) -> Result<bool, Transport
     let Some(frame) = transport.poll()? else {
         return Ok(false);
     };
-    serve_frame_baked(transport, frame)?;
+    serve_frame_baked(transport, frame, &mut |_vm| {})?;
     Ok(true)
 }
 
@@ -538,16 +723,24 @@ pub fn serve_one_baked(transport: &mut impl Transport) -> Result<bool, Transport
 fn serve_frame_baked(
     transport: &mut impl Transport,
     frame: lamella_wire::Frame,
+    configure: &mut dyn FnMut(&mut Vm),
 ) -> Result<(), TransportError> {
     use lamella_wire::msg;
     match frame.msg_type {
         msg::HELLO => hello_reply(transport, &frame)?,
         repl::RUN_IMAGE => {
-            let result = run_image(frame.payload);
+            let result = run_image_with(frame.payload, configure);
             transport.send(repl::RUN_RESULT, frame.seq, &result.encode())?;
         }
         debug::DBG_IMAGE => {
             run_debug_session(transport, frame.payload, frame.seq)?;
+        }
+        profile::GET_PROFILE => {
+            let manifest = lamella_wire::ProfileManifest {
+                identity: profile_identity(),
+                intrinsic_ids: lamella_cil_runtime::intrinsic_registry::registry_ids().collect(),
+            };
+            transport.send(profile::PROFILE_MANIFEST, frame.seq, &manifest.encode())?;
         }
         _ => {}
     }
@@ -565,9 +758,23 @@ fn serve_frame_baked(
 pub fn serve_one_deploy(
     transport: &mut impl Transport,
     flash: &mut impl FlashSink,
-) -> Result<bool, TransportError> {
+) -> Result<Served, TransportError> {
+    serve_one_deploy_with(transport, flash, &mut |_vm| {})
+}
+
+/// [`serve_one_deploy`] with the firmware's [`Vm`]-configure hook (see
+/// [`run_image_with`]): every evaluation the serve runs gets the board seams installed.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+pub fn serve_one_deploy_with(
+    transport: &mut impl Transport,
+    flash: &mut impl FlashSink,
+    configure: &mut dyn FnMut(&mut Vm),
+) -> Result<Served, TransportError> {
     let Some(frame) = transport.poll()? else {
-        return Ok(false);
+        return Ok(Served::Nothing);
     };
     match frame.msg_type {
         deploy::DEPLOY_IMAGE => {
@@ -589,9 +796,26 @@ pub fn serve_one_deploy(
             };
             transport.send(deploy::DEPLOY_RESULT, frame.seq, &[u8::from(ok)])?;
         }
-        _ => serve_frame_baked(transport, frame)?,
+        deploy::DEPLOY_STATUS => {
+            let (present, checksum) = match baked_image_checksum(flash.image_slice()) {
+                Some(sum) => (1u8, sum),
+                None => (0u8, 0u64),
+            };
+            let mut payload = [0u8; 9];
+            payload[0] = present;
+            payload[1..].copy_from_slice(&checksum.to_le_bytes());
+            transport.send(deploy::DEPLOY_STATUS_RESULT, frame.seq, &payload)?;
+        }
+        deploy::DEPLOY_RUN => {
+            return Ok(Served::RunRequested);
+        }
+        lamella_wire::msg::HELLO => hello_reply_caps(transport, &frame, deploy_caps())?,
+        debug::DBG_ATTACH => {
+            run_debug_session_static(transport, flash.image_slice(), frame.seq, deploy_caps())?;
+        }
+        _ => serve_frame_baked(transport, frame, configure)?,
     }
-    Ok(true)
+    Ok(Served::Handled)
 }
 
 /// Run a DEPLOYED baked image (booted from flash) at full speed, staying interruptible: it
@@ -610,12 +834,37 @@ pub fn run_deployed(
     module: &lamella_cil_runtime::Module,
     entry: lamella_cil_runtime::MethodId,
 ) -> Result<Deployed, TransportError> {
+    run_deployed_with(transport, module, entry, &mut |_vm| {})
+}
+
+/// [`run_deployed`] with the firmware's [`Vm`]-configure hook (see [`run_image_with`]):
+/// the deployed app's [`Vm`] gets the board seams before its static constructors run.
+///
+/// # Errors
+/// Propagates a [`TransportError`] from the carrier.
+#[cfg(feature = "baked-image")]
+pub fn run_deployed_with(
+    transport: &mut impl Transport,
+    module: &lamella_cil_runtime::Module,
+    entry: lamella_cil_runtime::MethodId,
+    configure: &mut dyn FnMut(&mut Vm),
+) -> Result<Deployed, TransportError> {
     use lamella_cil_runtime::{Session, Status};
     use lamella_wire::msg;
     let mut vm = Vm::default();
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
     vm.set_memory_backend(Box::new(SafeMemory::new()));
+    configure(&mut vm);
+    if let Err(trap) = boot_static_ctors(module, &mut vm) {
+        return Ok(Deployed::Completed(RunResult {
+            exit: 70,
+            stdout: format!(
+                "{}BOOT TRAP (static constructor): {trap:?}",
+                String::from_utf16_lossy(vm.output())
+            ),
+        }));
+    }
     let mut session = match Session::new(module, entry, Vec::new()) {
         Ok(session) => session,
         Err(trap) => {
@@ -639,7 +888,7 @@ pub fn run_deployed(
         }
         if let Some(frame) = transport.poll()? {
             if frame.msg_type == msg::HELLO {
-                hello_reply(transport, &frame)?;
+                hello_reply_caps(transport, &frame, deploy_caps())?;
                 return Ok(Deployed::Interrupted);
             }
         }
@@ -791,6 +1040,246 @@ mod tests {
         let result = try_recv_result(&mut driver, 2).unwrap().expect("a result arrived");
         assert_eq!(result.exit, 7);
         assert_eq!(result.stdout, "hi\n");
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn hello_ack_and_get_profile_report_the_resident_surface() {
+        use lamella_cil_runtime::intrinsic_registry;
+        use lamella_wire::{
+            Capabilities, Hello, HelloAck, MemTransport, PROTOCOL_VERSION, ProfileManifest,
+            ProtocolRange, msg,
+        };
+
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        let hello = Hello {
+            range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+            caps: Capabilities(Capabilities::BAKED_IMAGE),
+        };
+        driver.send(msg::HELLO, 1, &hello.encode()).unwrap();
+        driver.send(profile::GET_PROFILE, 2, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(serve_one_baked(&mut runner).unwrap(), "the HELLO was served");
+        assert!(serve_one_baked(&mut runner).unwrap(), "the GET_PROFILE was served");
+        driver.feed(&runner.take_sent());
+
+        let ack = driver.poll().unwrap().expect("a HELLO_ACK");
+        let identity = HelloAck::decode(&ack.payload)
+            .expect("the ack decodes")
+            .profile
+            .expect("the ack advertises an identity");
+        assert_eq!(identity.abi, intrinsic_registry::INTRINSIC_ABI);
+        assert_eq!(identity.hash, intrinsic_registry::registry_fingerprint());
+        assert_eq!(identity.name(), intrinsic_registry::profile_name());
+
+        let frame = driver.poll().unwrap().expect("a manifest reply");
+        assert_eq!(frame.msg_type, profile::PROFILE_MANIFEST);
+        let manifest = ProfileManifest::decode(&frame.payload).expect("the manifest decodes");
+        assert_eq!(manifest.identity, identity);
+        assert_eq!(manifest.intrinsic_ids.len(), intrinsic_registry::registry_ids().count());
+        assert!(
+            manifest
+                .intrinsic_ids
+                .contains(&intrinsic_registry::intrinsic_id("console_write_line_empty")),
+            "a known intrinsic id is listed"
+        );
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_hello_reclaims_a_debug_session_resumed_into_an_infinite_program() {
+        use lamella_wire::{
+            Capabilities, Hello, HelloAck, MemTransport, PROTOCOL_VERSION, ProtocolRange, msg,
+        };
+
+        let Ok(program) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-wireline/tests/fixtures/spin.exe"
+        )) else {
+            return;
+        };
+        let program: &'static [u8] = Box::leak(program.into_boxed_slice());
+        let assembly = Assembly::read(program).expect("fixture parses");
+        let loaded = lamella_load::load(&assembly).expect("fixture loads");
+        let mut module = loaded.module;
+        let image = module.write_baked(Some(loaded.entry)).expect("fixture bakes");
+        let image: &'static [u8] = Box::leak(image.into_boxed_slice());
+
+        let mut driver = MemTransport::new();
+        let mut target = MemTransport::new();
+        driver.send(debug::DBG_RESUME, 7, &[]).unwrap();
+        let hello = Hello {
+            range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+            caps: Capabilities(Capabilities::BAKED_IMAGE),
+        };
+        driver.send(msg::HELLO, 8, &hello.encode()).unwrap();
+        target.feed(&driver.take_sent());
+
+        run_debug_session_static(&mut target, image, 3, serve_caps())
+            .expect("the session ends instead of spinning forever");
+        driver.feed(&target.take_sent());
+
+        let stopped = driver.poll().unwrap().expect("the entry stop report");
+        assert_eq!(stopped.msg_type, debug::EVT_STOPPED);
+        let ack_frame = driver.poll().unwrap().expect("the reclaim HELLO_ACK");
+        assert_eq!(ack_frame.msg_type, msg::HELLO_ACK);
+        let ack = HelloAck::decode(&ack_frame.payload).expect("the ack decodes");
+        assert!(ack.caps.has(Capabilities::BAKED_IMAGE));
+        assert!(driver.poll().unwrap().is_none(), "nothing else in flight");
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_breakpoint_set_while_running_fires_on_the_next_hit() {
+        use lamella_wire::MemTransport;
+
+        let Ok(program) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-wireline/tests/fixtures/spin.exe"
+        )) else {
+            return;
+        };
+        let program: &'static [u8] = Box::leak(program.into_boxed_slice());
+        let assembly = Assembly::read(program).expect("fixture parses");
+        let loaded = lamella_load::load(&assembly).expect("fixture loads");
+        let mut module = loaded.module;
+        let image = module.write_baked(Some(loaded.entry)).expect("fixture bakes");
+
+        let stopped = |frame: &lamella_wire::Frame| {
+            assert_eq!(frame.msg_type, debug::EVT_STOPPED, "expected a stop event");
+            let method = u32::from_le_bytes(frame.payload[1..5].try_into().unwrap());
+            let offset = u32::from_le_bytes(frame.payload[5..9].try_into().unwrap());
+            (frame.payload[0], method, offset)
+        };
+
+        const STEPS: u16 = 12;
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        driver.send(debug::DBG_IMAGE, 1, &image).unwrap();
+        for seq in 0..STEPS {
+            driver.send(debug::DBG_STEP, 2 + seq, &[]).unwrap();
+        }
+        driver.send(debug::DBG_DETACH, 2 + STEPS, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(serve_one_baked(&mut runner).unwrap(), "the target served the steps");
+        driver.feed(&runner.take_sent());
+        let (why, _, _) = stopped(&driver.poll().unwrap().expect("entry stop"));
+        assert_eq!(why, debug::reason::ENTRY);
+        let mut loop_method = 0;
+        let mut loop_offset = 0;
+        for _ in 0..STEPS {
+            let (why, method, offset) = stopped(&driver.poll().unwrap().expect("a step stop"));
+            assert_eq!(why, debug::reason::STEP);
+            loop_method = method;
+            loop_offset = offset;
+        }
+        assert_eq!(driver.poll().unwrap().expect("phase-1 detach ack").msg_type, debug::DBG_ACK);
+
+        let mut break_payload = Vec::new();
+        break_payload.extend_from_slice(&1u16.to_le_bytes());
+        break_payload.extend_from_slice(&loop_method.to_le_bytes());
+        break_payload.extend_from_slice(&loop_offset.to_le_bytes());
+        driver.send(debug::DBG_IMAGE, 4, &image).unwrap();
+        driver.send(debug::DBG_RESUME, 5, &[]).unwrap();
+        driver.send(debug::DBG_BREAK, 6, &break_payload).unwrap();
+        driver.send(debug::DBG_DETACH, 7, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(
+            serve_one_baked(&mut runner).unwrap(),
+            "the session stops at the mid-run breakpoint instead of spinning forever"
+        );
+        driver.feed(&runner.take_sent());
+        assert_eq!(
+            stopped(&driver.poll().unwrap().expect("phase-2 entry stop")).0,
+            debug::reason::ENTRY
+        );
+
+        let ack = driver.poll().unwrap().expect("the mid-run break ack");
+        assert_eq!(ack.msg_type, debug::DBG_ACK);
+        let (why, hit_method, hit_offset) = stopped(&driver.poll().unwrap().expect("breakpoint stop"));
+        assert_eq!(why, debug::reason::BREAKPOINT, "the mid-run breakpoint fired");
+        assert_eq!((hit_method, hit_offset), (loop_method, loop_offset));
+        let detach = driver.poll().unwrap().expect("the detach ack");
+        assert_eq!(detach.msg_type, debug::DBG_ACK);
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn dbg_attach_debugs_the_deployed_image_without_resending_it() {
+        use lamella_wire::{
+            Capabilities, Hello, HelloAck, MemTransport, PROTOCOL_VERSION, ProtocolRange, msg,
+        };
+
+        let Ok(program) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-wireline/tests/fixtures/hello.exe"
+        )) else {
+            return;
+        };
+        let program: &'static [u8] = Box::leak(program.into_boxed_slice());
+        let assembly = Assembly::read(program).expect("fixture parses");
+        let loaded = lamella_load::load(&assembly).expect("fixture loads");
+        let mut module = loaded.module;
+        let image = module.write_baked(Some(loaded.entry)).expect("fixture bakes");
+
+        struct Deployed(&'static [u8]);
+        impl FlashSink for Deployed {
+            fn image_slice(&self) -> &'static [u8] {
+                self.0
+            }
+            fn erase(&mut self) {}
+            fn program(&mut self, _image: &[u8]) -> bool {
+                false
+            }
+            fn program_chunk(&mut self, _offset: usize, _chunk: &[u8], _total: usize) -> bool {
+                false
+            }
+        }
+        let mut flash = Deployed(Box::leak(image.into_boxed_slice()));
+
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+
+        let hello = Hello {
+            range: ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION },
+            caps: Capabilities(Capabilities::BAKED_IMAGE | Capabilities::DEBUG_ATTACH),
+        };
+        driver.send(msg::HELLO, 1, &hello.encode()).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(matches!(serve_one_deploy(&mut runner, &mut flash).unwrap(), Served::Handled));
+        driver.feed(&runner.take_sent());
+        let ack = driver.poll().unwrap().expect("a HELLO_ACK");
+        assert_eq!(ack.msg_type, msg::HELLO_ACK);
+        let ack = HelloAck::decode(&ack.payload).expect("the ack decodes");
+        assert!(ack.caps.has(Capabilities::DEBUG_ATTACH), "the deploy serve advertises attach");
+
+        driver.send(debug::DBG_ATTACH, 2, &[]).unwrap();
+        driver.send(debug::DBG_STEP, 3, &[]).unwrap();
+        driver.send(debug::DBG_STACK, 4, &[]).unwrap();
+        driver.send(debug::DBG_DETACH, 5, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(matches!(serve_one_deploy(&mut runner, &mut flash).unwrap(), Served::Handled));
+        driver.feed(&runner.take_sent());
+
+        let entry = driver.poll().unwrap().expect("an entry stop");
+        assert_eq!(entry.msg_type, debug::EVT_STOPPED);
+        assert_eq!(entry.payload[0], debug::reason::ENTRY);
+        let step = driver.poll().unwrap().expect("a step stop");
+        assert_eq!(step.payload[0], debug::reason::STEP);
+        let frames = driver.poll().unwrap().expect("a stack reply");
+        assert_eq!(frames.msg_type, debug::DBG_FRAMES);
+        let ack = driver.poll().unwrap().expect("a detach ack");
+        assert_eq!(ack.msg_type, debug::DBG_ACK);
+
+        let mut empty = Deployed(&[0xFF; 64]);
+        driver.send(debug::DBG_ATTACH, 6, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(matches!(serve_one_deploy(&mut runner, &mut empty).unwrap(), Served::Handled));
+        driver.feed(&runner.take_sent());
+        let stop = driver.poll().unwrap().expect("a trap stop");
+        assert_eq!(stop.msg_type, debug::EVT_STOPPED);
+        assert_eq!(stop.payload[0], debug::reason::TRAP);
     }
 
     #[cfg(feature = "baked-image")]
@@ -969,7 +1458,11 @@ mod tests {
             let mut runner = MemTransport::new();
             driver.send(deploy::DEPLOY_CHUNK, seq, &payload).unwrap();
             runner.feed(&driver.take_sent());
-            assert!(serve_one_deploy(&mut runner, &mut sink).unwrap(), "the target handled a chunk");
+            assert_eq!(
+                serve_one_deploy(&mut runner, &mut sink).unwrap(),
+                Served::Handled,
+                "the target handled a chunk"
+            );
             driver.feed(&runner.take_sent());
             let ack = driver.poll().unwrap().expect("a chunk ack");
             assert_eq!(ack.msg_type, deploy::DEPLOY_RESULT);

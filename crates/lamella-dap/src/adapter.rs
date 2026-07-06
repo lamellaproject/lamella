@@ -787,7 +787,12 @@ mod tests {
 
     fn add_program() -> (Module, u32) {
         let mut module = Module::new();
-        let write_line = module.add_intrinsic(0, lamella_cil_runtime::intrinsics::console_write_line, 1);
+        let write_line = module.add_intrinsic(
+            0,
+            lamella_cil_runtime::intrinsics::console_write_line,
+            lamella_cil_runtime::intrinsic_registry::intrinsic_id("console_write_line"),
+            1,
+        );
         let write_line_token = Token(0x0A00_0001);
         module.bind_token(0, write_line_token, write_line);
         let hi: Vec<u16> = "hi".encode_utf16().collect();
