@@ -272,6 +272,11 @@ fn complex_method_id(name: &str) -> Option<u32> {
     }
 }
 
+pub(crate) const LAZY_MAP: u32 = 0;
+pub(crate) const LAZY_FILTER: u32 = 1;
+pub(crate) const LAZY_ZIP: u32 = 2;
+pub(crate) const LAZY_ENUMERATE: u32 = 3;
+
 const BYTES_HEX: u32 = 0;
 const BYTES_DECODE: u32 = 1;
 const BYTEARRAY_APPEND: u32 = 2;
@@ -298,6 +303,36 @@ fn bytes_method_id(name: &str, mutating: bool) -> Option<u32> {
         "lower" => Some(BYTES_LOWER),
         "append" if mutating => Some(BYTEARRAY_APPEND),
         "extend" if mutating => Some(BYTEARRAY_EXTEND),
+        _ => None,
+    }
+}
+
+const MV_TOBYTES: u32 = 0;
+const MV_TOLIST: u32 = 1;
+const MV_HEX: u32 = 2;
+
+/// The method id for a `memoryview` method `name`.
+fn memoryview_method_id(name: &str) -> Option<u32> {
+    match name {
+        "tobytes" => Some(MV_TOBYTES),
+        "tolist" => Some(MV_TOLIST),
+        "hex" => Some(MV_HEX),
+        _ => None,
+    }
+}
+
+const INT_BIT_LENGTH: u32 = 0;
+const INT_BIT_COUNT: u32 = 1;
+const INT_TO_BYTES: u32 = 2;
+const INT_CONJUGATE: u32 = 3;
+
+/// The method id for an `int` method `name`.
+fn int_method_id(name: &str) -> Option<u32> {
+    match name {
+        "bit_length" => Some(INT_BIT_LENGTH),
+        "bit_count" => Some(INT_BIT_COUNT),
+        "to_bytes" => Some(INT_TO_BYTES),
+        "conjugate" => Some(INT_CONJUGATE),
         _ => None,
     }
 }
@@ -511,8 +546,7 @@ fn str_repr(s: &str) -> String {
 
 /// Renders a `float` exactly as CPython 3.14's `repr(float)`/`str(float)` does (they are identical
 /// for a float): the SHORTEST decimal string that round-trips to the same double, in CPython's
-/// choice of fixed vs exponential notation. This is deliberately NOT .NET's `Double.ToString`
-/// (csharp's `G`-switch), whose thresholds and digit choices differ.
+/// choice of fixed vs exponential notation.
 ///
 /// The rules, from CPython's `format_float_short` (`Python/pystrtod.c`, format code `'r'`):
 /// - `nan`, `inf`, `-inf` render as those literals (lowercase; a NaN never carries a sign).
@@ -989,21 +1023,30 @@ pub struct ObjectModel {
     /// The GC type-descriptor id of a `Cell` -- a heap box holding one tagged `Value`, shared
     /// (mutably) between an enclosing function and a nested closure that captures the variable.
     cell_type_id: u32,
+    /// The GC type-descriptor id of a lazy iterator (`map`/`filter`/`zip`/`enumerate`): payload
+    /// `[kind@0 (raw), state@4 (the function / a counter / None), sources@8 (a tuple of source
+    /// iterators)]`. Produces each item on demand rather than materializing a list.
+    lazy_iter_type_id: u32,
+    /// The GC type-descriptor id of a `staticmethod`/`classmethod` wrapper: payload `[kind@0 (raw:
+    /// 0 static, 1 class), func@4 (the wrapped function)]`. Stored in a class namespace; the getattr
+    /// path unwraps it (static -> the raw function; class -> the function bound to the class).
+    method_wrapper_type_id: u32,
+    /// The GC type-descriptor id of a `memoryview`: payload `[base@0 (the viewed bytes/bytearray),
+    /// offset@4 (raw), length@8 (raw)]`. A zero-copy 1-D view; reads/writes go straight to the base's
+    /// `byte_buffers` slot (a bytearray-backed view is writable, a bytes-backed one read-only).
+    memoryview_type_id: u32,
     /// The suspended frames of live generators, indexed by a generator object's payload word.
     /// `None` = the generator is exhausted (its body returned) or currently running; `Some(frame)`
     /// = it is fresh (ip 0) or suspended at a `yield`. A suspended frame holds tagged Values
-    /// (locals, eval stack) that are GC roots, so a future moving collector must trace each frame
-    /// here -- the same follow-on the `seqs`/`dicts` element arenas need (the interpreter never
-    /// auto-collects today, so no live path exercises it yet).
+    /// (locals, eval stack) that are GC roots, so a moving collector traces each frame here. The
+    /// interpreter does not auto-collect, so a finished generator's slot is not reclaimed.
     generators: Vec<Option<Frame>>,
     /// A pool of returned call frames, kept for their Vec allocations (locals/eval-stack/caches) so a
     /// hot call/return cycle reuses buffers instead of allocating a fresh frame each call. Bounded;
     /// every pooled frame is cleared of Values (holds nothing to trace).
     frame_pool: Vec<Frame>,
     /// App-claimed GPIO pins -- the one-owner-per-pin reservation. A second claim of a held pin
-    /// fails LOUD (a `ValueError`, never a silent register
-    /// race. Language-neutral; the shared BSP-level registry both interpreters consult is the
-    /// coordinated follow-on.
+    /// fails LOUD (a `ValueError` for an already-in-use pin), never a silent register race.
     gpio_claimed: Vec<u32>,
     /// Firmware-reserved pins (seeded from the target profile): a claim of one fails loud, so an
     /// app-vs-firmware conflict is caught rather than silently colliding.
@@ -1199,9 +1242,9 @@ impl ObjectModel {
         });
         let py_function_type_id = descs.len() as u32;
         descs.push(TypeDesc {
-            payload_size: 12,
+            payload_size: 16,
             ref_offsets: Vec::new(),
-            tagged_offsets: (1..3).map(|i| i * 4).collect(),
+            tagged_offsets: (1..4).map(|i| i * 4).collect(),
         });
         let generator_type_id = descs.len() as u32;
         descs.push(TypeDesc {
@@ -1212,6 +1255,24 @@ impl ObjectModel {
         let cell_type_id = descs.len() as u32;
         descs.push(TypeDesc {
             payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0],
+        });
+        let lazy_iter_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 12,
+            ref_offsets: Vec::new(),
+            tagged_offsets: (1..3).map(|i| i * 4).collect(),
+        });
+        let method_wrapper_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![4],
+        });
+        let memoryview_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 12,
             ref_offsets: Vec::new(),
             tagged_offsets: alloc::vec![0],
         });
@@ -1294,6 +1355,9 @@ impl ObjectModel {
             py_function_type_id,
             generator_type_id,
             cell_type_id,
+            lazy_iter_type_id,
+            method_wrapper_type_id,
+            memoryview_type_id,
             generators: Vec::new(),
             frame_pool: Vec::new(),
             gpio_claimed: Vec::new(),
@@ -1310,15 +1374,14 @@ impl ObjectModel {
     }
 
     /// The single managed-allocation chokepoint: every `new_*` heap object is allocated here, so
-    /// the GC / allocation tier is chosen in ONE place (a `gc(none|bump|collected)` knob --
-    /// see [[gc-implementation-tiers]]). The default (allocation-capable) tier bumps the moving
+    /// the GC / allocation tier is chosen in ONE place (the `gc(none|bump|collected)` knob).
+    /// The default (allocation-capable) tier bumps the moving
     /// heap and returns `None` when full, at which point a collected tier drives `collect()` before
     /// retrying (the interpreter never auto-collects today, so it is allocate-only / bump). The
     /// `gc-none` tier has NO managed heap: every allocation is `None` -> a loud `OutOfMemory`, so a
     /// pure fixnum / mmio / control-flow driver runs (it never allocates) while an allocating
     /// program fails fast -- upholding "runs on interpreter-P => runs on device-P" for the tiniest
-    /// micros. Dropping the collector code itself (binary size) is the coordinated `lamella-gc`
-    /// allocation-mode follow-on (the `Allocator` trait's no-GC profile).
+    /// micros.
     #[must_use]
     fn alloc_object(&mut self, type_id: u32) -> Option<Ref> {
         #[cfg(feature = "gc-none")]
@@ -1361,6 +1424,8 @@ impl ObjectModel {
             s.chars().count()
         } else if let Some(data) = self.bytes_value(value) {
             data.len()
+        } else if self.is_memoryview(value) {
+            self.memoryview_parts(value).2
         } else if let Some(elems) = self.seq_value(value) {
             elems.len()
         } else if let Some(entries) = self.dict_value(value) {
@@ -1453,7 +1518,24 @@ impl ObjectModel {
         if self.seq_value(lhs).is_some() || self.seq_value(rhs).is_some() {
             return Ok(Some(self.seq_binary_op(op, lhs, rhs)?));
         }
+        if op == BinOp::BitOr && self.is_dict(lhs) && self.is_dict(rhs) {
+            return Ok(Some(self.dict_merge(lhs, rhs)?));
+        }
         Ok(None)
+    }
+
+    /// `dict | dict`: a new dict with the left's entries, then the right's (which override on a
+    /// shared key) -- CPython 3.9's mapping union.
+    fn dict_merge(&mut self, lhs: Value, rhs: Value) -> Result<Value, Trap> {
+        let mut entries = self.dict_value(lhs).cloned().unwrap_or_default();
+        let right = self.dict_value(rhs).cloned().unwrap_or_default();
+        for (key, value) in right {
+            match entries.iter().position(|(existing, _)| self.key_eq(*existing, key)) {
+                Some(slot) => entries[slot].1 = value,
+                None => entries.push((key, value)),
+            }
+        }
+        self.new_dict(entries)
     }
 
     /// `bytes`/`bytearray` `+` (concatenate two byte strings; the result kind follows the LEFT
@@ -1663,8 +1745,8 @@ impl ObjectModel {
         if self.is_set(lhs) || self.is_frozenset(lhs) {
             return Ok(Some(self.set_compare(op, lhs, rhs)?));
         }
-        if self.bytes_value(lhs).is_some() || self.bytes_value(rhs).is_some() {
-            return match (self.bytes_value(lhs), self.bytes_value(rhs)) {
+        if self.byte_view(lhs).is_some() || self.byte_view(rhs).is_some() {
+            return match (self.byte_view(lhs), self.byte_view(rhs)) {
                 (Some(a), Some(b)) => {
                     let ord = a.cmp(b);
                     let holds = match op {
@@ -1758,6 +1840,29 @@ impl ObjectModel {
     /// dispatch later -- the one-source-of-truth path the interpreter and the AOT
     /// `py_getitem` intrinsic both consume.
     pub fn py_getitem(&mut self, container: Value, index: Value) -> Result<Value, Trap> {
+        if self.is_memoryview(container) {
+            let (base, offset, length) = self.memoryview_parts(container);
+            if self.is_slice(index) {
+                let reference = index.as_ref().ok_or(Trap::TypeError)?;
+                let start_v = Value::from_bits(self.heap.read_u32(reference.0));
+                let stop_v = Value::from_bits(self.heap.read_u32(reference.0 + 4));
+                let step_v = Value::from_bits(self.heap.read_u32(reference.0 + 8));
+                if !step_v.is_none() && step_v.as_int() != Some(1) {
+                    return Err(Trap::Unsupported);
+                }
+                let (start, stop) = adjust_slice(start_v, stop_v, 1, length as i64)?;
+                let low = start.clamp(0, length as i64) as usize;
+                let high = stop.clamp(start, length as i64) as usize;
+                return self.new_memoryview(base, offset + low, high - low);
+            }
+            let i = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if i < 0 { i + length as i64 } else { i };
+            if at < 0 || at >= length as i64 {
+                return Err(self.with_message(Trap::IndexError, "index out of range"));
+            }
+            let byte = self.memoryview_bytes(container).ok_or(Trap::TypeError)?[at as usize];
+            return Value::fixnum(i32::from(byte)).ok_or(Trap::Overflow);
+        }
         if self.bytes_value(container).is_some() {
             if self.is_slice(index) {
                 let selected = self.slice_bytes(container, index)?;
@@ -2023,12 +2128,12 @@ impl ObjectModel {
     }
 
     /// The elements if `value` is a `list` or `tuple`.
-    fn seq_value(&self, value: Value) -> Option<&Vec<Value>> {
+    pub(crate) fn seq_value(&self, value: Value) -> Option<&Vec<Value>> {
         self.seq_slot(value).and_then(|i| self.seqs.get(i))
     }
 
     /// The key/value pairs if `value` is a `dict`.
-    fn dict_value(&self, value: Value) -> Option<&Vec<(Value, Value)>> {
+    pub(crate) fn dict_value(&self, value: Value) -> Option<&Vec<(Value, Value)>> {
         self.container_slot(value, self.dict_type_id)
             .and_then(|i| self.dicts.get(i))
     }
@@ -2137,7 +2242,7 @@ impl ObjectModel {
 
     /// The elements if `value` is a `set` or `frozenset` (both back onto the shared arena, so
     /// every read op -- len, `in`, iteration, repr, truthiness -- works for either).
-    fn set_value(&self, value: Value) -> Option<&Vec<Value>> {
+    pub(crate) fn set_value(&self, value: Value) -> Option<&Vec<Value>> {
         let slot = self
             .container_slot(value, self.set_type_id)
             .or_else(|| self.container_slot(value, self.frozenset_type_id))?;
@@ -2179,7 +2284,7 @@ impl ObjectModel {
         if let (Some(x), Some(y)) = (self.str_value(a), self.str_value(b)) {
             return x == y;
         }
-        if let (Some(x), Some(y)) = (self.bytes_value(a), self.bytes_value(b)) {
+        if let (Some(x), Some(y)) = (self.byte_view(a), self.byte_view(b)) {
             return x == y;
         }
         a == b
@@ -2189,6 +2294,24 @@ impl ObjectModel {
     /// from the end, `IndexError` out of range); a `dict` inserts or updates `index` as the
     /// key. A `tuple`/`str`/other is not assignable (`TypeError`).
     pub fn py_setitem(&mut self, container: Value, index: Value, value: Value) -> Result<(), Trap> {
+        if self.is_memoryview(container) {
+            if self.memoryview_is_readonly(container) {
+                return Err(Trap::TypeError);
+            }
+            let (base, offset, length) = self.memoryview_parts(container);
+            let at = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if at < 0 { at + length as i64 } else { at };
+            if at < 0 || at >= length as i64 {
+                return Err(self.with_message(Trap::IndexError, "index out of range"));
+            }
+            let byte = value.as_int().ok_or(Trap::TypeError)?;
+            if !(0..=255).contains(&byte) {
+                return Err(Trap::ValueError);
+            }
+            let slot = self.byte_buffer_slot(base).ok_or(Trap::TypeError)?;
+            self.byte_buffers[slot][offset + at as usize] = byte as u8;
+            return Ok(());
+        }
         if self.is_bytearray(container) {
             let slot = self.byte_buffer_slot(container).ok_or(Trap::TypeError)?;
             let len = self.byte_buffers[slot].len() as i64;
@@ -2278,8 +2401,7 @@ impl ObjectModel {
     /// `del container[index]` (a future `Op::DeleteItem`): a `list` removes an int index (negative
     /// from the end, `IndexError` out of range) or the elements a slice selects (the list shrinks);
     /// a `dict` removes `index` as a key (`KeyError` if absent). A `tuple`/`str`/other is a
-    /// `TypeError`. Ready for the frontend's `del x[i]` emission (co-design); an instance's
-    /// `__delitem__` is dispatched by the interpreter before this.
+    /// `TypeError`. An instance's `__delitem__` is dispatched by the interpreter before this.
     pub fn py_delitem(&mut self, container: Value, index: Value) -> Result<(), Trap> {
         if let Some(i) = self.container_slot(container, self.list_type_id) {
             if self.is_slice(index) {
@@ -2356,14 +2478,14 @@ impl ObjectModel {
             let sub = self.str_value(element).ok_or(Trap::TypeError)?;
             return Ok(s.contains(sub));
         }
-        if let Some(data) = self.bytes_value(container) {
+        if let Some(data) = self.byte_view(container) {
             if let Some(byte) = element.as_int() {
                 if !(0..=255).contains(&byte) {
                     return Err(Trap::ValueError);
                 }
                 return Ok(data.contains(&(byte as u8)));
             }
-            let needle = self.bytes_value(element).ok_or(Trap::TypeError)?;
+            let needle = self.byte_view(element).ok_or(Trap::TypeError)?;
             return Ok(needle.is_empty() || data.windows(needle.len()).any(|w| w == needle));
         }
         if let Some(elems) = self.seq_value(container) {
@@ -2600,8 +2722,7 @@ impl ObjectModel {
 
     /// An `int` value from an `i128`, normalized: one that fits the fixnum range stays a fixnum (so
     /// `10**10 == 10**10` and small results never allocate); a bigger one becomes a heap `long`.
-    /// This is the i128-range first increment; a result outside i128 is a `Trap::Overflow` (true
-    /// arbitrary precision -- limb arithmetic -- is the follow-on).
+    /// A result outside i128 is a `Trap::Overflow`; callers that need more precision use `new_bigint`.
     pub fn new_long(&mut self, n: i128) -> Result<Value, Trap> {
         if n >= i128::from(FIXNUM_MIN) && n <= i128::from(FIXNUM_MAX) {
             return Value::fixnum(n as i32).ok_or(Trap::Overflow);
@@ -2820,8 +2941,7 @@ impl ObjectModel {
 
     /// Provides a module `name` backed by `namespace` (a dict of its members), bound as a global so
     /// a program reaches it as `name.member` -- the injection path the native machine/board modules
-    /// use, here for a Python-authored namespace. (`import name` is the front-end follow-on; the
-    /// loader that RUNS a `.py` module body to build `namespace` is the co-design follow-on.)
+    /// use, here for a Python-authored namespace.
     pub fn provide_module(&mut self, name: &str, namespace: Value) -> Result<(), Trap> {
         let module = self.new_module(namespace)?;
         self.set_global(name, module);
@@ -2863,12 +2983,148 @@ impl ObjectModel {
         value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.cell_type_id)
     }
 
+    /// A new lazy iterator of `kind` (`LAZY_MAP`/`LAZY_FILTER`/`LAZY_ZIP`/`LAZY_ENUMERATE`) over
+    /// `sources` (a tuple of source iterators), carrying `state` (the map/filter function, the
+    /// enumerate counter, or `None`).
+    pub fn new_lazy_iter(&mut self, kind: u32, state: Value, sources: Value) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.lazy_iter_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, kind);
+        self.heap.write_u32(reference.0 + 4, state.bits());
+        self.heap.write_u32(reference.0 + 8, sources.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a lazy iterator (map/filter/zip/enumerate).
+    #[must_use]
+    pub fn is_lazy_iter(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.lazy_iter_type_id)
+    }
+
+    /// The kind tag of a lazy iterator.
+    pub(crate) fn lazy_iter_kind(&self, value: Value) -> u32 {
+        let reference = value.as_ref().expect("a lazy iterator");
+        self.heap.read_u32(reference.0)
+    }
+
+    /// A lazy iterator's state slot (the map/filter function, the enumerate counter, or `None`).
+    pub(crate) fn lazy_iter_state(&self, value: Value) -> Value {
+        let reference = value.as_ref().expect("a lazy iterator");
+        Value::from_bits(self.heap.read_u32(reference.0 + 4))
+    }
+
+    /// Overwrites a lazy iterator's state slot (the enumerate counter advances in place).
+    pub(crate) fn lazy_iter_set_state(&mut self, value: Value, state: Value) {
+        let reference = value.as_ref().expect("a lazy iterator");
+        self.heap.write_u32(reference.0 + 4, state.bits());
+    }
+
+    /// The source iterators of a lazy iterator (the elements of its sources tuple).
+    pub(crate) fn lazy_iter_sources(&self, value: Value) -> Vec<Value> {
+        let reference = value.as_ref().expect("a lazy iterator");
+        let sources = Value::from_bits(self.heap.read_u32(reference.0 + 8));
+        self.seq_value(sources).cloned().unwrap_or_default()
+    }
+
+    /// A `staticmethod(func)` wrapper (`is_class` false) or `classmethod(func)` (`is_class` true).
+    pub fn new_method_wrapper(&mut self, func: Value, is_class: bool) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.method_wrapper_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, u32::from(is_class));
+        self.heap.write_u32(reference.0 + 4, func.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a `staticmethod`/`classmethod` wrapper.
+    #[must_use]
+    pub fn is_method_wrapper(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.method_wrapper_type_id)
+    }
+
+    /// Whether a method wrapper is a `classmethod` (else a `staticmethod`).
+    pub(crate) fn method_wrapper_is_class(&self, value: Value) -> bool {
+        let reference = value.as_ref().expect("a method wrapper");
+        self.heap.read_u32(reference.0) != 0
+    }
+
+    /// The function a `staticmethod`/`classmethod` wrapper holds.
+    fn method_wrapper_func(&self, value: Value) -> Value {
+        let reference = value.as_ref().expect("a method wrapper");
+        Value::from_bits(self.heap.read_u32(reference.0 + 4))
+    }
+
+    /// Resolves a class member `found` for attribute access on `owner` (an instance or the class):
+    /// a `staticmethod` yields the raw function; a `classmethod` binds the function to the class; a
+    /// plain function binds to `owner` when it is an instance, else stays unbound. `class_value` is
+    /// the class to bind a classmethod to.
+    fn bind_class_member(&mut self, found: Value, owner: Value, class_value: Value) -> Result<Value, Trap> {
+        if self.is_method_wrapper(found) {
+            let func = self.method_wrapper_func(found);
+            return if self.method_wrapper_is_class(found) {
+                self.new_py_bound(class_value, func)
+            } else {
+                Ok(func)
+            };
+        }
+        if found.as_function_index().is_some() && self.is_instance(owner) {
+            return self.new_py_bound(owner, found);
+        }
+        Ok(found)
+    }
+
+    /// A `memoryview` over `[offset .. offset + length)` of `base` (a `bytes`/`bytearray`). Zero-copy:
+    /// reads and (for a bytearray base) writes go straight to `base`'s buffer.
+    pub fn new_memoryview(&mut self, base: Value, offset: usize, length: usize) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.memoryview_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, base.bits());
+        self.heap.write_u32(reference.0 + 4, offset as u32);
+        self.heap.write_u32(reference.0 + 8, length as u32);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a `memoryview`.
+    #[must_use]
+    pub fn is_memoryview(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.memoryview_type_id)
+    }
+
+    /// A memoryview's `(base, offset, length)`.
+    fn memoryview_parts(&self, value: Value) -> (Value, usize, usize) {
+        let reference = value.as_ref().expect("a memoryview");
+        let base = Value::from_bits(self.heap.read_u32(reference.0));
+        let offset = self.heap.read_u32(reference.0 + 4) as usize;
+        let length = self.heap.read_u32(reference.0 + 8) as usize;
+        (base, offset, length)
+    }
+
+    /// The bytes a memoryview covers (`base`'s buffer sliced to the view's window), or `None` if
+    /// `value` is not a memoryview.
+    fn memoryview_bytes(&self, value: Value) -> Option<&[u8]> {
+        if !self.is_memoryview(value) {
+            return None;
+        }
+        let (base, offset, length) = self.memoryview_parts(value);
+        self.bytes_value(base)?.get(offset..offset + length)
+    }
+
+    /// Whether a memoryview is read-only (it views a `bytes`; a `bytearray` view is writable).
+    fn memoryview_is_readonly(&self, value: Value) -> bool {
+        let (base, _, _) = self.memoryview_parts(value);
+        self.is_bytes(base)
+    }
+
+    /// The bytes a `bytes`/`bytearray`/`memoryview` exposes, so the three compare and hash by content.
+    fn byte_view(&self, value: Value) -> Option<&[u8]> {
+        self.bytes_value(value).or_else(|| self.memoryview_bytes(value))
+    }
+
+    /// A fresh built-in iterator over `iterable` (str/bytes/list/tuple/dict/range/set); `iter()` of
+    /// an existing iterator returns it unchanged. `py_next` advances it.
     pub fn new_iter(&mut self, iterable: Value) -> Result<Value, Trap> {
-        if self.is_iter(iterable) {
+        if self.is_iter(iterable) || self.is_lazy_iter(iterable) {
             return Ok(iterable);
         }
         let iterable_ok = self.str_value(iterable).is_some()
             || self.bytes_value(iterable).is_some()
+            || self.is_memoryview(iterable)
             || self.seq_value(iterable).is_some()
             || self.dict_value(iterable).is_some()
             || self.is_range(iterable)
@@ -2930,6 +3186,13 @@ impl ObjectModel {
                 return Ok(None);
             }
             let byte = data[pos];
+            self.heap.write_u32(reference.0 + 4, (pos + 1) as u32);
+            return Value::fixnum(i32::from(byte)).ok_or(Trap::Overflow).map(Some);
+        }
+        if self.is_memoryview(container) {
+            let Some(&byte) = self.memoryview_bytes(container).and_then(|data| data.get(pos)) else {
+                return Ok(None);
+            };
             self.heap.write_u32(reference.0 + 4, (pos + 1) as u32);
             return Value::fixnum(i32::from(byte)).ok_or(Trap::Overflow).map(Some);
         }
@@ -3014,7 +3277,35 @@ impl ObjectModel {
         self.heap.write_u32(reference.0, func_index);
         self.heap.write_u32(reference.0 + 4, defaults.bits());
         self.heap.write_u32(reference.0 + 8, kwdefaults.bits());
+        self.heap.write_u32(reference.0 + 12, Value::NONE.bits());
         Ok(Value::from_ref(reference))
+    }
+
+    /// A closure: a `PyFunction` carrying the `cells` (a tuple of Cells) it captured from the
+    /// enclosing frame. `MakeFunction` with the CLOSURE flag builds this; calling it seeds the
+    /// freevar half of the new frame's deref array.
+    pub fn new_closure(
+        &mut self,
+        func_index: u32,
+        defaults: Value,
+        kwdefaults: Value,
+        cells: Value,
+    ) -> Result<Value, Trap> {
+        let function = self.new_py_function(func_index, defaults, kwdefaults)?;
+        let reference = function.as_ref().ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0 + 12, cells.bits());
+        Ok(function)
+    }
+
+    /// The captured cells of a `PyFunction` (the closure's freevar cells as a `Vec`, or empty for a
+    /// plain function -- `cells` is `None`).
+    #[must_use]
+    pub fn py_function_cells(&self, func: Value) -> Vec<Value> {
+        let Some(reference) = func.as_ref() else {
+            return Vec::new();
+        };
+        let cells = Value::from_bits(self.heap.read_u32(reference.0 + 12));
+        self.seq_value(cells).cloned().unwrap_or_default()
     }
 
     /// Whether `value` is a `PyFunction` (a defaulted function object).
@@ -3206,10 +3497,10 @@ impl ObjectModel {
         }
         let class = self.read_slot(instance, 0);
         if let Some(found) = self.find_in_class(class, name) {
-            if found.as_function_index().is_some() {
-                return self.new_py_bound(instance, found);
-            }
-            return Ok(found);
+            return self.bind_class_member(found, instance, class);
+        }
+        if matches!(name, "__cause__" | "__context__") && self.is_exception_value(instance) {
+            return Ok(Value::NONE);
         }
         Err(Trap::AttributeError)
     }
@@ -3735,7 +4026,17 @@ impl ObjectModel {
             if id == Builtin::Dict.id() && name == "fromkeys" {
                 return Ok(Value::builtin_ref(Builtin::DictFromkeys.id()));
             }
+            if id == Builtin::Int.id() && name == "from_bytes" {
+                return Ok(Value::builtin_ref(Builtin::IntFromBytes.id()));
+            }
+            if id == Builtin::Bytes.id() && name == "fromhex" {
+                return Ok(Value::builtin_ref(Builtin::BytesFromhex.id()));
+            }
             return Err(Trap::AttributeError);
+        }
+        if self.is_int(obj) {
+            let method_id = int_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
         }
         let reference = obj.as_ref().ok_or(Trap::AttributeError)?;
         let type_id = self.heap.type_id_of(reference);
@@ -3747,6 +4048,24 @@ impl ObjectModel {
             let method_id = bytes_method_id(name, type_id == self.bytearray_type_id)
                 .ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.memoryview_type_id {
+            let (base, _, length) = self.memoryview_parts(obj);
+            return match name {
+                "readonly" => Ok(Value::from_bool(self.memoryview_is_readonly(obj))),
+                "obj" => Ok(base),
+                "nbytes" => Value::fixnum(length as i32).ok_or(Trap::Overflow),
+                "itemsize" | "ndim" => Value::fixnum(1).ok_or(Trap::Overflow),
+                "format" => self.new_str("B"),
+                "shape" => {
+                    let n = Value::fixnum(length as i32).ok_or(Trap::Overflow)?;
+                    self.new_tuple(alloc::vec![n])
+                }
+                _ => {
+                    let method_id = memoryview_method_id(name).ok_or(Trap::AttributeError)?;
+                    self.new_bound_method(obj, method_id)
+                }
+            };
         }
         if type_id == self.list_type_id {
             let method_id = list_method_id(name).ok_or(Trap::AttributeError)?;
@@ -3844,7 +4163,8 @@ impl ObjectModel {
             if name == "__name__" {
                 return Ok(self.read_slot(obj, 0));
             }
-            return self.find_in_class(obj, name).ok_or(Trap::AttributeError);
+            let found = self.find_in_class(obj, name).ok_or(Trap::AttributeError)?;
+            return self.bind_class_member(found, obj, obj);
         }
         if type_id == self.instance_type_id {
             return self.py_getattr_instance(obj, name);
@@ -4018,7 +4338,7 @@ impl ObjectModel {
 
     /// Opens `pin` in the given direction: claims it (fail-loud), configures the port through the
     /// board driver (clock ungate + the pin's MODER direction), and returns a `Pin`. Shared by the
-    /// clean `gpio` API.
+    /// clean `gpio` API and its shims.
     fn open_pin(&mut self, pin: u32, output: bool) -> Result<Value, Trap> {
         use crate::gpio::*;
         if pin > MAX_PIN {
@@ -4144,8 +4464,7 @@ impl ObjectModel {
             .is_some_and(|r| self.heap.type_id_of(r) == self.dio_type_id)
     }
 
-    /// Constructs `digitalio.DigitalInOut(pin)`: opens the pin (input by default -- 
-    /// and wraps it as a `DigitalInOut` whose `value`/`direction` are properties.
+    /// Constructs `digitalio.DigitalInOut(pin)`: opens the pin (input by default) and wraps it as a `DigitalInOut` whose `value`/`direction` are properties.
     pub(crate) fn call_dio_factory(&mut self, args: &[Value]) -> Result<Value, Trap> {
         let pin_id = match args {
             [p] => {
@@ -4304,13 +4623,12 @@ impl ObjectModel {
 
     /// Renders a `str.format(*args)` template: `{}` takes the next positional argument, `{N}` the
     /// N-th, and `{{` / `}}` are literal braces; each field is rendered with `str()` ([`display`]).
-    /// An out-of-range index is an `IndexError`. Named fields (`{name}`, kwargs-only) and format
-    /// specs (`{:spec}`) are follow-ons -- `Unsupported` for now, never wrong output.
-    /// Renders `value` under a format spec `[[fill]align][sign][#][0][width][.prec][type]`. Supports
-    /// the int presentation types (d/x/X/o/b/c) and str (s), plus alignment/width/fill/sign/zero-pad
-    /// and str precision (truncation). Float types (f/e/g) and grouping (`,`) are unsupported (no
-    /// float; a niche) -> `Unsupported`.
-    fn format_value_spec(&self, value: Value, spec: &str) -> Result<String, Trap> {
+    /// An out-of-range index is an `IndexError`. A `{:spec}` field is applied through the format-spec
+    /// mini-language below; named fields (`{name}`) are not supported.
+    /// Renders `value` under a format spec `[[fill]align][sign][#][0][width][,][.prec][type]`. Supports
+    /// the int presentation types (d/x/X/o/b/c), str (s), and the float types (f/F/e/E/g/G/%), plus
+    /// alignment/width/fill/sign/zero-pad, str precision (truncation), and digit grouping (`,` / `_`).
+    pub(crate) fn format_value_spec(&self, value: Value, spec: &str) -> Result<String, Trap> {
         let chars: Vec<char> = spec.chars().collect();
         let mut i = 0;
         let (mut fill, mut align) = (' ', '\0');
@@ -4596,6 +4914,12 @@ impl ObjectModel {
         }
         if self.is_bytes(receiver) || self.is_bytearray(receiver) {
             return self.call_bytes_method(receiver, method_id, args);
+        }
+        if self.is_memoryview(receiver) {
+            return self.call_memoryview_method(receiver, method_id, args);
+        }
+        if self.is_int(receiver) {
+            return self.call_int_method(receiver, method_id, args);
         }
         if self.is_gpio(receiver) {
             return self.call_gpio_method(receiver, method_id, args);
@@ -5400,6 +5724,94 @@ impl ObjectModel {
         }
     }
 
+    /// Dispatches an `int` method: `bit_length()` / `bit_count()` (arbitrary precision), `conjugate()`
+    /// (an int is its own conjugate), and `to_bytes(length, byteorder)` -> big/little-endian `bytes`
+    /// (non-negative, fits `length` bytes; a signed or bigint conversion is not supported here).
+    fn call_int_method(&mut self, receiver: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
+        match method_id {
+            INT_BIT_LENGTH => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let bits = self.as_bigint(receiver).ok_or(Trap::TypeError)?.bit_length();
+                self.new_long(i128::from(bits))
+            }
+            INT_BIT_COUNT => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let count = self.as_bigint(receiver).ok_or(Trap::TypeError)?.bit_count();
+                self.new_long(i128::from(count))
+            }
+            INT_CONJUGATE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                Ok(receiver)
+            }
+            INT_TO_BYTES => {
+                let (length, byteorder) = match args {
+                    [len, order] => (
+                        len.as_int().ok_or(Trap::TypeError)?,
+                        self.str_value(*order).map(String::from).ok_or(Trap::TypeError)?,
+                    ),
+                    _ => return Err(Trap::TypeError),
+                };
+                if length < 0 {
+                    return Err(Trap::ValueError);
+                }
+                let n = self.as_i128(receiver).ok_or(Trap::Overflow)?;
+                if n < 0 {
+                    return Err(Trap::Unsupported);
+                }
+                let length = length as usize;
+                let mut bytes = alloc::vec![0u8; length];
+                let mut value = n as u128;
+                for byte in &mut bytes {
+                    *byte = (value & 0xff) as u8;
+                    value >>= 8;
+                }
+                if value != 0 {
+                    return Err(Trap::Overflow);
+                }
+                match byteorder.as_str() {
+                    "little" => {}
+                    "big" => bytes.reverse(),
+                    _ => return Err(Trap::ValueError),
+                }
+                self.new_bytes(bytes)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a `memoryview` method (all no-argument): `tobytes()` copies out to `bytes`,
+    /// `tolist()` to a list of ints, `hex()` to the lowercase hex string.
+    fn call_memoryview_method(&mut self, receiver: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
+        if !args.is_empty() {
+            return Err(Trap::TypeError);
+        }
+        let data = self.memoryview_bytes(receiver).ok_or(Trap::TypeError)?.to_vec();
+        match method_id {
+            MV_TOBYTES => self.new_bytes(data),
+            MV_TOLIST => {
+                let mut elements = Vec::with_capacity(data.len());
+                for &byte in &data {
+                    elements.push(Value::fixnum(i32::from(byte)).ok_or(Trap::Overflow)?);
+                }
+                self.new_list(elements)
+            }
+            MV_HEX => {
+                let mut hex = String::new();
+                for byte in &data {
+                    hex.push_str(&alloc::format!("{byte:02x}"));
+                }
+                self.new_str(&hex)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
     /// Dispatches a `bytes`/`bytearray` method: `hex()` -> the lowercase hex string; `decode()` ->
     /// the utf-8 `str` (an invalid sequence is a `ValueError`); `append(int)` / `extend(bytes-like)`
     /// mutate a bytearray in place (returning None).
@@ -6125,6 +6537,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)]
     fn format_value_spec_float_types_match_python() {
         let mut model = ObjectModel::new(Vec::new(), 4096);
         let cases: &[(&str, f64, &str)] = &[
@@ -6479,6 +6892,47 @@ mod tests {
         let boxed = model.new_cell(s).unwrap();
         assert_eq!(model.str_value(model.cell_get(boxed).unwrap()), Some("captured"));
         assert!(matches!(model.cell_get(Value::NONE), Err(Trap::TypeError)));
+    }
+
+    #[test]
+    fn closure_carries_captured_cells() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let plain = model.new_py_function(0, Value::NONE, Value::NONE).unwrap();
+        assert!(model.py_function_cells(plain).is_empty());
+        let c1 = model.new_cell(Value::fixnum(1).unwrap()).unwrap();
+        let c2 = model.new_cell(Value::fixnum(2).unwrap()).unwrap();
+        let cells = model.new_tuple(alloc::vec![c1, c2]).unwrap();
+        let closure = model.new_closure(0, Value::NONE, Value::NONE, cells).unwrap();
+        let captured = model.py_function_cells(closure);
+        assert_eq!(captured.len(), 2);
+        assert_eq!(model.cell_get(captured[0]).unwrap().as_fixnum(), Some(1));
+        model.cell_set(captured[1], Value::fixnum(20).unwrap()).unwrap();
+        assert_eq!(model.cell_get(captured[1]).unwrap().as_fixnum(), Some(20));
+    }
+
+    #[test]
+    fn staticmethod_classmethod_unwrap_on_attribute_access() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let func = Value::function_ref(0);
+        let sm = model.new_method_wrapper(func, false).unwrap();
+        let cm = model.new_method_wrapper(func, true).unwrap();
+        assert!(model.is_method_wrapper(sm) && !model.method_wrapper_is_class(sm));
+        assert!(model.method_wrapper_is_class(cm));
+        let name = model.new_str("C").unwrap();
+        let sm_key = model.new_str("sm").unwrap();
+        let cm_key = model.new_str("cm").unwrap();
+        let plain_key = model.new_str("plain").unwrap();
+        let namespace = model
+            .new_dict(alloc::vec![(sm_key, sm), (cm_key, cm), (plain_key, func)])
+            .unwrap();
+        let class = model.new_class(name, Value::NONE, namespace).unwrap();
+        let instance = model.new_object(class).unwrap();
+        let sm_attr = model.py_getattr_instance(instance, "sm").unwrap();
+        assert_eq!(sm_attr, func);
+        let cm_attr = model.py_getattr_instance(instance, "cm").unwrap();
+        assert!(model.is_py_bound(cm_attr));
+        let plain_attr = model.py_getattr_instance(instance, "plain").unwrap();
+        assert!(model.is_py_bound(plain_attr));
     }
 
     #[test]

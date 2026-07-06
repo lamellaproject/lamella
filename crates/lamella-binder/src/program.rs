@@ -49,7 +49,19 @@ pub fn bind_compilation_unit_with_model(
     model.link_bases();
     let mut binder = Binder::with_model(model);
     bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
+    report_multiple_entry_points(&mut binder);
     binder.into_diagnostics()
+}
+
+/// CS0017: a program declares more than one entry point when two or more of its types have a
+/// valid `static Main` (10.1). lcsc has no `/main` selector, so any second entry point is an error.
+fn report_multiple_entry_points(binder: &mut Binder) {
+    if binder.model().entry_point_count() > 1 {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::MultipleEntryPoints,
+            lamella_syntax::span::Span::new(0, 0),
+        ));
+    }
 }
 
 /// Binds several compilation units as ONE program (a multi-file compilation, 16.1):
@@ -71,13 +83,22 @@ pub fn bind_compilation_units_with_references(
     model.canonicalize_signatures();
     model.link_bases();
     let mut binder = Binder::with_model(model);
-    units
+    let mut per_unit: Vec<Vec<Diagnostic>> = units
         .iter()
         .map(|unit| {
             bind_namespace_body(&mut binder, &unit.usings, &unit.members, "");
             binder.take_diagnostics()
         })
-        .collect()
+        .collect();
+    if binder.model().entry_point_count() > 1 {
+        if let Some(first) = per_unit.first_mut() {
+            first.push(Diagnostic::new(
+                DiagnosticKind::MultipleEntryPoints,
+                lamella_syntax::span::Span::new(0, 0),
+            ));
+        }
+    }
+    per_unit
 }
 
 fn bind_namespace_body(
@@ -437,6 +458,22 @@ mod tests {
     fn duplicate_field_name_is_cs0102() {
         assert_eq!(sorted_codes("class C { int x; int x; }"), [102]);
         assert_eq!(sorted_codes("class C { int x; int y; }"), []);
+    }
+
+    #[test]
+    fn multiple_entry_points_is_cs0017() {
+        assert_eq!(
+            sorted_codes("class A { static void Main() {} } class B { static void Main() {} }"),
+            [17]
+        );
+        assert_eq!(
+            sorted_codes("class A { static void Main() {} static void Main(int x) {} }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("class A { void Main() {} } class B { static void Main() {} }"),
+            []
+        );
     }
 
     #[test]

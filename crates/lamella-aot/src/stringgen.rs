@@ -314,8 +314,9 @@ fn string_concat_mir() -> Function {
 }
 
 /// Rewrites each `StringEquals` to a call to a generated `__string_eq` helper appended to the
-/// program, so ordinal string comparison reuses the normal call + structuring path on every backend
-/// rather than a bespoke inline expansion.
+/// program, so ordinal string comparison reuses the normal call + structuring path. The WASM and
+/// RISC-V backends use this; ARM lowers `StringEquals` inline, so it is gated to those two features.
+#[cfg(any(feature = "wasm", feature = "riscv32"))]
 pub(crate) fn lower_string_equals(program: &mut Vec<Function>) {
     let has_string_equals = program
         .iter()
@@ -346,6 +347,7 @@ pub(crate) fn lower_string_equals(program: &mut Vec<Function>) {
 /// string blob is the array layout `[u32 length][u16 units]`, so the content loop reads units with a
 /// length-2 array load. Built as MIR so it goes through the same verifier + structurer as any
 /// function (the loop and branches relooped, the reference null-checks lowered as i32 compares).
+#[cfg(any(feature = "wasm", feature = "riscv32"))]
 fn string_eq_mir() -> Function {
     let i32t = MirType::I32;
     let objt = MirType::ObjectRef;

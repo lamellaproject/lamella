@@ -3647,6 +3647,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             receiver,
             declaring_type,
             name,
+            ..
         } => {
             mint_in_expr(receiver, image, tokens);
             let getter = lamella_binder::MethodReference {
@@ -3708,12 +3709,13 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             mint_in_expr(value, image, tokens);
             if let BoundExprKind::PropertyAccess {
                 receiver,
-                declaring_type,
+                setter_declaring_type,
                 name,
+                ..
             } = &target.kind
             {
                 let setter = lamella_binder::MethodReference {
-                    declaring_type: declaring_type.clone(),
+                    declaring_type: setter_declaring_type.clone(),
                     name: accessor_name("set_", name).into(),
                     parameters: alloc::vec![target.ty.clone()],
                     return_type: TypeSymbol::Special(SpecialType::Void),

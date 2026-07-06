@@ -46,7 +46,8 @@ use lamella_cil_runtime::intrinsics::{
     datetime_now_ticks, delegate_combine, delegate_equals, delegate_not_equals, delegate_remove,
     environment_get_variable, environment_processor_count, environment_tick_count,
     enum_format, enum_get_name,
-    enum_get_names, enum_get_values, enum_is_defined, enum_parse, exception_ctor,
+    enum_get_names, enum_get_values, enum_has_flag, enum_is_defined, enum_parse,
+    enum_to_string_format, exception_ctor,
     exception_get_message, int32_to_string, int64_to_string, interlocked_compare_exchange,
     md_array_address, md_array_get,
     md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
@@ -1060,7 +1061,7 @@ fn load_assembly<'pe>(
         let mut nonvirtuals = Vec::new();
         let type_name = type_def.name();
         let is_delegate = is_delegate_type(assembly, type_def.extends());
-        let is_value_type = type_def.is_value_type();
+        let is_value_type = type_def.is_value_type() && !is_special_reference_base(type_def.name());
         type_is_value_type.push(is_value_type);
         if is_value_type {
             value_type_tokens.push(Token::new(TYPE_DEF, type_row));
@@ -1977,6 +1978,11 @@ fn bcl_intrinsic(
         ("Enum", "GetNames") => Some(intrinsic!(enum_get_names)),
         ("Enum", "GetValues") => Some(intrinsic!(enum_get_values)),
         ("Enum", "Format") => Some(intrinsic!(enum_format)),
+        ("Enum", "HasFlag") => Some(intrinsic!(enum_has_flag)),
+        ("Enum", "ToString") => match parameters_of(signature) {
+            [SigType::String] => Some(intrinsic!(enum_to_string_format)),
+            _ => None,
+        },
         ("Array", "get_Length") => Some(intrinsic!(md_array_length)),
         ("Array", "GetLength") => Some(intrinsic!(md_array_get_length)),
         ("Array", "get_Rank") => Some(intrinsic!(array_rank)),
@@ -2465,7 +2471,7 @@ fn record_custom_attributes(
                     namespace: String::from(type_name.namespace),
                     full_name,
                     is_enum,
-                    is_value_type: type_def.is_value_type(),
+                    is_value_type: type_def.is_value_type() && !is_special_reference_base(type_def.name()),
                     is_interface: type_def.is_interface(),
                     is_abstract: type_def.is_abstract(),
                     is_public: type_def.is_public(),
@@ -3151,6 +3157,17 @@ fn is_enum_type(assembly: &Assembly, extends: Token) -> bool {
     assembly
         .type_token_name(extends)
         .is_some_and(|name| name.namespace == "System" && name.name == "Enum")
+}
+
+/// Whether a type is one of the two special CLI base classes that extend a value-type base yet are
+/// themselves REFERENCE types: `System.ValueType` and `System.Enum`. The generic `is_value_type()`
+/// predicate (extends `ValueType`/`Enum`) flags them, but only a CONCRETE struct/enum deriving from
+/// them is a value type -- these two bases are not (III.4.2). Excluding them keeps `Enum`'s
+/// inherited instance methods (`HasFlag` / `ToString(format)`) dispatching on a boxed receiver as a
+/// reference, rather than being unboxed to a bare managed pointer -- which strips the enum's type
+/// identity, so the formatter can no longer name the constant.
+fn is_special_reference_base(name: Option<TypeName<'_>>) -> bool {
+    name.is_some_and(|name| name.namespace == "System" && matches!(name.name, "ValueType" | "Enum"))
 }
 
 /// Whether the type `type_token` (a `TypeDef`) carries `[System.FlagsAttribute]`, by scanning its

@@ -9,6 +9,9 @@ use alloc::vec::Vec;
 /// reference conversions that walk `model`'s inheritance graph (13.1).
 #[must_use]
 pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    if matches!(from, TypeSymbol::Special(SpecialType::Void)) {
+        return false;
+    }
     if let TypeSymbol::ByRef(element) = to {
         return from == element.as_ref();
     }
@@ -220,6 +223,14 @@ mod tests {
             &t(SpecialType::String),
             &t(SpecialType::String)
         ));
+    }
+
+    #[test]
+    fn void_converts_to_nothing() {
+        let model = Model::new();
+        assert!(!converts(&model, &t(SpecialType::Void), &t(SpecialType::Object)));
+        assert!(!converts(&model, &t(SpecialType::Void), &t(SpecialType::Int32)));
+        assert!(!converts(&model, &t(SpecialType::Void), &t(SpecialType::Void)));
     }
 
     #[test]

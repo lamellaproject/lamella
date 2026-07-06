@@ -1091,7 +1091,7 @@ impl Binder {
     fn bind_condition(&mut self, condition: &Expr) -> BoundExpr {
         let bound = self.bind_expression(condition);
         let boolean = TypeSymbol::Special(SpecialType::Boolean);
-        if bound.ty.is_error() || self.converts(&bound.ty, &boolean) {
+        if bound.ty.is_error() || crate::conversion::converts(self.model(), &bound.ty, &boolean) {
             return bound;
         }
         if self

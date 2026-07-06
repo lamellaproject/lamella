@@ -1007,14 +1007,15 @@ fn emit_statement_expression(
             }
             if let BoundExprKind::PropertyAccess {
                 receiver,
-                declaring_type,
+                setter_declaring_type,
                 name,
+                ..
             } = &target.kind
             {
                 return crate::expr::emit_property_store(
                     &target.ty,
                     receiver,
-                    declaring_type,
+                    setter_declaring_type,
                     name,
                     value,
                     false,
@@ -1209,6 +1210,7 @@ pub(crate) fn emit_compound(
         BoundExprKind::PropertyAccess {
             receiver,
             declaring_type,
+            setter_declaring_type,
             name,
         } => {
             let is_static = matches!(receiver.kind, BoundExprKind::TypeReference(_));
@@ -1219,7 +1221,7 @@ pub(crate) fn emit_compound(
                 .ok_or(EmitError::Unsupported("property getter outside this module"))?;
             let setter = tokens
                 .method(
-                    declaring_type,
+                    setter_declaring_type,
                     &crate::expr::accessor_name("set_", name),
                     core::slice::from_ref(&target.ty),
                 )

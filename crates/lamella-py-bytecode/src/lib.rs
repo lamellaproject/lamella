@@ -14,7 +14,10 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 
 /// The binary format version. Bumped when the container or instruction encoding
 /// changes incompatibly; readers reject a version they do not recognize.
-pub const FORMAT_VERSION: u16 = 12;
+///
+/// Version 14 added closures: the three deref ops, `CodeObject`'s `cellvars`/`freevars`,
+/// and the `CLOSURE` bit on [`Op::MakeFunction`]'s flags.
+pub const FORMAT_VERSION: u16 = 14;
 
 /// The feature-flag bits a module's header carries, declaring which language
 /// surface its bytecode assumes. A reader lacking a required feature rejects the
@@ -180,6 +183,9 @@ impl UnaryOp {
 /// |     39 | UnpackEx | starred unpacking |
 /// |     40 | CallKw | keyword calls |
 /// |     41 | Yield | generators |
+/// |     42 | CallEx | star-call unpacking |
+/// |  43-44 | DeleteItem, DeleteAttr | del subscript/attribute |
+/// |  45-47 | LoadDeref, StoreDeref, LoadClosure | closures |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -250,14 +256,20 @@ pub enum Op {
     /// Emitted for the `except ... as name` auto-deletion at the end of the handler.
     DeleteFast(u32),
     /// Push a function value for the Module function `names[func]`. `flags` (mirroring CPython's
-    /// MAKE_FUNCTION bits) says which default tables sit on the stack below, popped
-    /// kwdefaults-then-defaults: bit0 (`0x01`) a positional-defaults TUPLE, bit1 (`0x02`) a
-    /// kwdefaults DICT. `flags == 0` is a plain stateless function reference; `flags != 0` builds a
-    /// function object carrying the def-time defaults.
+    /// MAKE_FUNCTION bits) says what sits on the stack below, popped top-down: bit0 (`0x01`) a
+    /// positional-defaults TUPLE, bit1 (`0x02`) a kwdefaults DICT, bit2 (`0x04`, `CLOSURE`) the
+    /// captured cells for a closure. The stack layout, bottom to top, is
+    /// `[defaults-tuple?] [kwdefaults-dict?] [cell0 .. cell{f-1}]`, so the cells (on top) are popped
+    /// first, then the kwdefaults dict, then the defaults tuple. When `CLOSURE` is set, exactly
+    /// `functions[func].freevars.len()` cells were pushed (by [`Op::LoadClosure`], in freevar order)
+    /// and are stored in the new function object's captured-cells field -- a closure is just a
+    /// function object WITH cells. `flags == 0` is a plain stateless function reference; `flags != 0`
+    /// builds a function object carrying the def-time defaults and/or captured cells.
     MakeFunction {
         /// The index into `names` of the Module function to make.
         func: u32,
-        /// Which default tables sit on the stack below (bit0 a defaults tuple, bit1 a kwdefaults dict).
+        /// What sits on the stack below (bit0 a defaults tuple, bit1 a kwdefaults dict, bit2/`0x04`
+        /// `CLOSURE` the captured cells).
         flags: u8,
     },
     /// Pop the namespace dict, then the base, then the name, and push a new class object (a
@@ -354,6 +366,20 @@ pub enum Op {
         /// The index into `names` of the attribute name.
         name: u32,
     },
+    /// Push the value held by the cell at deref index `idx` (`cell[idx].get()`). The deref
+    /// index space is `[0 .. cellvars.len())` -- this frame's OWN cells (locals captured by a
+    /// nested function) -- then `[cellvars.len() .. cellvars.len() + freevars.len())` -- the cells
+    /// CAPTURED from the enclosing function (free variables). One index space covers both. For
+    /// reading a cell variable or a free variable.
+    LoadDeref(u32),
+    /// Pop a value and store it into the cell at deref index `idx` (`cell[idx].set(v)`). Same
+    /// deref index space as [`Op::LoadDeref`]. For writing a cell variable (or, with `nonlocal`,
+    /// a captured free variable), so the enclosing frame and the closure see one shared box.
+    StoreDeref(u32),
+    /// Push the CELL object itself at deref index `idx` (not its contents), to hand to a following
+    /// [`Op::MakeFunction`] carrying the `CLOSURE` flag. Emitted once per free variable of the
+    /// nested function, in that function's freevar order. For building a closure's captured cells.
+    LoadClosure(u32),
 }
 
 /// A compile-time constant in a code object's constant pool. Every value the running
@@ -385,6 +411,9 @@ pub enum Const {
     /// An integer literal too large for `i64` -- its decimal digits (no sign, no separators). The
     /// interpreter materializes it as an arbitrary-precision `int` (bigint); the typed lane rejects it.
     BigInt(String),
+    /// A bytes literal `b"..."` -- its raw bytes. The interpreter materializes a heap `bytes`; the
+    /// typed lane rejects it.
+    Bytes(Vec<u8>),
 }
 
 /// The first-light type lattice for an annotated value. Annotations (PEP 484), inert
@@ -464,6 +493,17 @@ pub struct CodeObject {
     /// The name of each local slot, indexed by slot number; `local_names.len() ==
     /// n_locals`. Kept for diagnostics and for the typed lowering.
     pub local_names: Vec<String>,
+    /// The locals of this function that a nested function captures, so they must live in heap
+    /// cells rather than plain slots. Their order defines the low half of the deref index space
+    /// (`0 .. cellvars.len()`), which [`Op::LoadDeref`] / [`Op::StoreDeref`] / [`Op::LoadClosure`]
+    /// index. Empty for a function that no nested function reads. A cellvar that is also a
+    /// parameter has its bound argument copied into its fresh cell at frame setup.
+    pub cellvars: Vec<String>,
+    /// The names this function uses that are cellvars of an enclosing function -- reached through
+    /// captured cells, not this frame's own locals. Their order continues the deref index space
+    /// after `cellvars` (`cellvars.len() .. cellvars.len() + freevars.len()`). A closure built with
+    /// [`Op::MakeFunction`]'s `CLOSURE` flag receives exactly `freevars.len()` cells in this order.
+    pub freevars: Vec<String>,
     /// The annotated/inferred type of each local slot, indexed by slot number;
     /// `local_types.len() == n_locals`. Drives the typed fast path.
     pub local_types: Vec<StaticType>,
@@ -594,6 +634,11 @@ fn put_const(buf: &mut Vec<u8>, c: &Const) {
         Const::BigInt(digits) => {
             buf.push(8);
             put_str(buf, digits);
+        }
+        Const::Bytes(data) => {
+            buf.push(9);
+            put_len(buf, data.len());
+            buf.extend_from_slice(data);
         }
     }
 }
@@ -738,6 +783,18 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(44);
             put_u32(buf, *name);
         }
+        Op::LoadDeref(i) => {
+            buf.push(45);
+            put_u32(buf, *i);
+        }
+        Op::StoreDeref(i) => {
+            buf.push(46);
+            put_u32(buf, *i);
+        }
+        Op::LoadClosure(i) => {
+            buf.push(47);
+            put_u32(buf, *i);
+        }
     }
 }
 
@@ -757,6 +814,14 @@ fn put_code_object(buf: &mut Vec<u8>, co: &CodeObject) {
     put_len(buf, co.n_locals);
     put_len(buf, co.local_names.len());
     for n in &co.local_names {
+        put_str(buf, n);
+    }
+    put_len(buf, co.cellvars.len());
+    for n in &co.cellvars {
+        put_str(buf, n);
+    }
+    put_len(buf, co.freevars.len());
+    for n in &co.freevars {
         put_str(buf, n);
     }
     put_len(buf, co.local_types.len());
@@ -901,6 +966,10 @@ impl<'a> Reader<'a> {
                 Const::ArgKinds(self.bytes(n)?.to_vec())
             }
             8 => Const::BigInt(self.string()?),
+            9 => {
+                let n = self.u32()? as usize;
+                Const::Bytes(self.bytes(n)?.to_vec())
+            }
             _ => return Err(DecodeError::BadTag("Const", tag)),
         };
         Ok(c)
@@ -984,6 +1053,9 @@ impl<'a> Reader<'a> {
             },
             43 => Op::DeleteItem,
             44 => Op::DeleteAttr { name: self.u32()? },
+            45 => Op::LoadDeref(self.u32()?),
+            46 => Op::StoreDeref(self.u32()?),
+            47 => Op::LoadClosure(self.u32()?),
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -1009,6 +1081,16 @@ impl<'a> Reader<'a> {
         let mut local_names = Vec::with_capacity(n_local_names);
         for _ in 0..n_local_names {
             local_names.push(self.string()?);
+        }
+        let n_cellvars = self.u32()? as usize;
+        let mut cellvars = Vec::with_capacity(n_cellvars);
+        for _ in 0..n_cellvars {
+            cellvars.push(self.string()?);
+        }
+        let n_freevars = self.u32()? as usize;
+        let mut freevars = Vec::with_capacity(n_freevars);
+        for _ in 0..n_freevars {
+            freevars.push(self.string()?);
         }
         let n_local_types = self.u32()? as usize;
         let mut local_types = Vec::with_capacity(n_local_types);
@@ -1052,6 +1134,8 @@ impl<'a> Reader<'a> {
             ret_ty,
             n_locals,
             local_names,
+            cellvars,
+            freevars,
             local_types,
             consts,
             names,
@@ -1082,6 +1166,8 @@ mod tests {
             ret_ty: StaticType::Int,
             n_locals: 1,
             local_names: vec![String::from("n")],
+            cellvars: Vec::new(),
+            freevars: Vec::new(),
             local_types: vec![StaticType::Int],
             consts: vec![Const::Int(1), Const::None, Const::KwNames(vec![String::from("x")])],
             names: vec![String::from("x")],
@@ -1115,6 +1201,8 @@ mod tests {
                 ret_ty: StaticType::Dynamic,
                 n_locals: 0,
                 local_names: Vec::new(),
+                cellvars: Vec::new(),
+                freevars: Vec::new(),
                 local_types: Vec::new(),
                 consts: vec![Const::None],
                 names: Vec::new(),
@@ -1177,6 +1265,12 @@ mod tests {
             Op::UnpackEx { before: 1, after: 1 },
             Op::CallKw { argc: 2, kwnames: 1 },
             Op::Yield,
+            Op::CallEx { argc: 3, kinds: 2, kwnames: 1 },
+            Op::DeleteItem,
+            Op::DeleteAttr { name: 4 },
+            Op::LoadDeref(2),
+            Op::StoreDeref(1),
+            Op::LoadClosure(0),
             Op::Return,
         ];
         let mut buf = Vec::new();
@@ -1190,6 +1284,42 @@ mod tests {
         for expected in &ops {
             assert_eq!(r.op().unwrap(), *expected);
         }
+    }
+
+    #[test]
+    fn code_object_cellvars_freevars_round_trip() {
+        let co = CodeObject {
+            name: String::from("inner"),
+            params: Vec::new(),
+            posonly_count: 0,
+            kwonly_count: 0,
+            is_generator: false,
+            has_varargs: false,
+            has_varkwargs: false,
+            ret_ty: StaticType::Dynamic,
+            n_locals: 1,
+            local_names: vec![String::from("n")],
+            cellvars: vec![String::from("n")],
+            freevars: vec![String::from("outer_x")],
+            local_types: vec![StaticType::Dynamic],
+            consts: vec![Const::Int(1)],
+            names: Vec::new(),
+            ops: vec![
+                Op::LoadDeref(1),
+                Op::LoadConst(0),
+                Op::Binary(BinOp::Add),
+                Op::StoreDeref(0),
+                Op::LoadClosure(0),
+                Op::MakeFunction { func: 0, flags: 0x04 },
+                Op::Return,
+            ],
+            cache_count: 0,
+            exc_table: Vec::new(),
+        };
+        let mut buf = Vec::new();
+        put_code_object(&mut buf, &co);
+        let mut r = Reader { data: &buf, pos: 0 };
+        assert_eq!(r.code_object().unwrap(), co);
     }
 
     #[test]

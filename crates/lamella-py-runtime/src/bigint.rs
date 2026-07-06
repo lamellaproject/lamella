@@ -12,6 +12,25 @@ pub struct BigInt {
     mag: Vec<u32>,
 }
 
+impl PartialOrd for BigInt {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for BigInt {
+    /// Orders two values (sign first, then magnitude). Consistent with `Eq`: values are normalized,
+    /// so there is no negative zero.
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.negative, other.negative) {
+            (false, true) => Ordering::Greater,
+            (true, false) => Ordering::Less,
+            (false, false) => mag_cmp(&self.mag, &other.mag),
+            (true, true) => mag_cmp(&other.mag, &self.mag),
+        }
+    }
+}
+
 impl BigInt {
     /// The value zero.
     #[must_use]
@@ -85,15 +104,20 @@ impl BigInt {
         }
     }
 
-    /// Orders two values (sign first, then magnitude).
+    /// The number of bits in the magnitude (Python's `int.bit_length`): 0 for zero, else the
+    /// position of the most-significant set bit.
     #[must_use]
-    pub fn cmp(&self, other: &BigInt) -> Ordering {
-        match (self.negative, other.negative) {
-            (false, true) => Ordering::Greater,
-            (true, false) => Ordering::Less,
-            (false, false) => mag_cmp(&self.mag, &other.mag),
-            (true, true) => mag_cmp(&other.mag, &self.mag),
+    pub fn bit_length(&self) -> u64 {
+        match self.mag.last() {
+            None => 0,
+            Some(&top) => (self.mag.len() as u64 - 1) * 32 + (32 - u64::from(top.leading_zeros())),
         }
+    }
+
+    /// The number of set bits in the magnitude (Python's `int.bit_count`).
+    #[must_use]
+    pub fn bit_count(&self) -> u64 {
+        self.mag.iter().map(|limb| u64::from(limb.count_ones())).sum()
     }
 
     /// The negation (`-self`); negating zero stays zero.
@@ -335,8 +359,8 @@ fn mag_add(a: &[u32], b: &[u32]) -> Vec<u32> {
 fn mag_sub(a: &[u32], b: &[u32]) -> Vec<u32> {
     let mut result = Vec::with_capacity(a.len());
     let mut borrow = 0i64;
-    for i in 0..a.len() {
-        let diff = i64::from(a[i]) - i64::from(b.get(i).copied().unwrap_or(0)) - borrow;
+    for (i, &limb) in a.iter().enumerate() {
+        let diff = i64::from(limb) - i64::from(b.get(i).copied().unwrap_or(0)) - borrow;
         if diff < 0 {
             result.push((diff + (1i64 << 32)) as u32);
             borrow = 1;

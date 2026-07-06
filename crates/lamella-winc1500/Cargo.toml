@@ -1,0 +1,14 @@
+[package]
+name = "lamella-winc1500"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "DEVICE networking backend for the interpreter's NetBackend seam, targeting the Microchip ATWINC1500 Wi-Fi network CONTROLLER. The WINC hosts its own TCP/IP stack and exposes a socket API over SPI (its HIF protocol), so socket ops map straight onto NetBackend -- no smoltcp. Generic over a board's SPI bus + control pins (e.g. a SAMD21 SERCOM-SPI on the Arduino MKR1000)."
+
+[dependencies]
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+
+[lints]
+workspace = true

@@ -118,6 +118,8 @@ fn type_info(
                     ty,
                     is_static: symbol.is_static,
                     accessibility: Accessibility::Public,
+                    has_getter: method_name.starts_with("get_"),
+                    has_setter: method_name.starts_with("set_"),
                 });
             }
         }

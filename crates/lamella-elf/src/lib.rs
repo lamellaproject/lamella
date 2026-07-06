@@ -19,6 +19,14 @@ pub mod riscv {
     pub const R_RISCV_PCREL_LO12_I: u32 = 24;
     /// `R_RISCV_RELAX` -- a linker-relaxation hint paired with a real relocation; nothing to patch.
     pub const R_RISCV_RELAX: u32 = 51;
+    /// A lamella-private 32-bit data relocation, `S + A - P` -- the RISC-V twin of
+    /// [`super::arm::R_LAMELLA_REL_DESC`]. It stores a signed, placement-invariant relative offset into
+    /// a data word: a type descriptor's vtable/itable slot holds `(method_entry - type_desc)` (the
+    /// addend absorbs `slot_addr - type_desc` so `S + A - P` reduces to that), so a `--gc-sections`
+    /// re-layout that moves the slot and its target leaves it correct. RISC-V has no interworking bit,
+    /// so unlike ARM it needs no Thumb-bit care. Same private number as the ARM constant (112); the
+    /// linker keys off `(machine, kind)`, so the shared value never clashes with a standard RISC-V type.
+    pub const R_LAMELLA_REL_DESC: u32 = 112;
 }
 
 /// ARM (AArch32) ELF relocation type numbers (the `r_info` low byte), from "ELF for the ARM
@@ -87,7 +95,7 @@ pub enum SymbolType {
 /// The prefix on a canonical type-descriptor's data symbol name (`__lamella_typedesc_<handle>`). The AOT
 /// backend NAMES descriptor symbols with it and the linker's gc-sections COLLECTS them by it (a descriptor
 /// unreachable from the entry is dropped, so its vtable relocations cannot pin an otherwise-trimmed
-/// method).
+/// method); shared here so the two crates agree on one string.
 pub const TYPE_DESC_PREFIX: &str = "__lamella_typedesc_";
 
 /// Where a symbol is defined.

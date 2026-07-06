@@ -4527,6 +4527,43 @@ pub fn enum_format(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Optio
     Ok(Some(Value::Object(vm.heap_mut().alloc_string(&chars))))
 }
 
+/// `System.Enum.HasFlag(Enum flag)`: whether every bit set in `flag` is also set in the receiver --
+/// `(this & flag) == flag` over the underlying values (so `HasFlag(0)` is always true, matching
+/// .NET). Both operands arrive BOXED: csc `box`es an enum passed where the reference type
+/// `System.Enum` is expected (the receiver of this instance call, and the `flag` argument).
+///
+/// # Errors
+/// Never errors (a non-enum operand reads as 0). .NET throws `ArgumentException` when the two enum
+/// types differ; the corpus never mixes types, and the bit test is exact for a same-type call.
+pub fn enum_has_flag(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let this = enum_arg_value(vm, args.first()).unwrap_or(0);
+    let flag = enum_arg_value(vm, args.get(1)).unwrap_or(0);
+    Ok(Some(Value::Int32(i32::from((this & flag) == flag))))
+}
+
+/// `System.Enum.ToString(string format)`: the boxed receiver rendered per the format specifier
+/// ("G"/"D"/"X"/"F", case-insensitive; empty/unrecognized = "G"), sharing `format_enum` with
+/// `Enum.Format`. Unlike `Enum.Format` (which takes the `Type` and value separately), the boxed
+/// receiver here carries BOTH the enum's type token and the underlying value.
+///
+/// # Errors
+/// Never errors.
+pub fn enum_to_string_format(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let value = enum_arg_value(vm, args.first()).unwrap_or(0);
+    let token = match args.first() {
+        Some(Value::Object(reference)) => vm.heap().boxed_type_token(*reference).unwrap_or(0),
+        _ => 0,
+    };
+    let format = string_value(vm, args.get(1)).unwrap_or_default();
+    let text = format_enum(module, token, value, &format);
+    let chars: Vec<u16> = text.encode_utf16().collect();
+    Ok(Some(Value::Object(vm.heap_mut().alloc_string(&chars))))
+}
+
 /// Renders `value` of the enum named by `token` per a single-letter `format` ("G"/"D"/"X"/"F",
 /// case-insensitive), defaulting to "G" for anything else -- the shared engine behind
 /// `Enum.Format` and `Enum.ToString(string)`.

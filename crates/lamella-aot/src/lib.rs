@@ -24,5 +24,5 @@ pub mod riscv32;
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-#[cfg(any(feature = "arm32", feature = "wasm"))]
+#[cfg(any(feature = "arm32", feature = "wasm", feature = "riscv32"))]
 pub mod build;

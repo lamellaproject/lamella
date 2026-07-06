@@ -1,6 +1,7 @@
 //! Lowering the AST to our bytecode.
 
 use alloc::boxed::Box;
+use alloc::collections::BTreeSet;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -45,13 +46,7 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
                 }
             }
             Stmt::ClassDef { name, body, .. } => {
-                for member in body {
-                    if let Stmt::FuncDef(method) = member {
-                        let (co, lambdas) = compile_method(name, method)?;
-                        functions.push(co);
-                        functions.extend(lambdas);
-                    }
-                }
+                compile_class_method_bodies(name, body, &mut functions)?;
                 top_level.push(stmt);
             }
             Stmt::Decorated { inner, .. } => {
@@ -62,13 +57,7 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
                         functions.extend(lambdas);
                     }
                     Stmt::ClassDef { name, body, .. } => {
-                        for member in body {
-                            if let Stmt::FuncDef(method) = member {
-                                let (co, lambdas) = compile_method(name, method)?;
-                                functions.push(co);
-                                functions.extend(lambdas);
-                            }
-                        }
+                        compile_class_method_bodies(name, body, &mut functions)?;
                     }
                     _ => {}
                 }
@@ -78,7 +67,7 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
         }
     }
     let (body, body_lambdas) =
-        compile_code_object(Scope::Module, "<module>", &[], &None, &top_level, None)?;
+        compile_code_object(Scope::Module, "<module>", &[], &None, &top_level, None, &[])?;
     functions.extend(body_lambdas);
     Ok(bc::Module {
         name: String::from(name),
@@ -99,7 +88,7 @@ fn compile_function(
     func: &FuncDef,
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let body: Vec<&Stmt> = func.body.iter().collect();
-    compile_code_object(Scope::Function, &func.name, &func.params, &func.ret, &body, None)
+    compile_code_object(Scope::Function, &func.name, &func.params, &func.ret, &body, None, &[])
 }
 
 /// Compile a class method as a Module function named `"ClassName.method"`; the class body
@@ -119,7 +108,35 @@ fn compile_method(
         &method.ret,
         &body,
         Some(class_name),
+        &[],
     )
+}
+
+/// Compile every method in a class body -- bare `def` or decorated -- as a Module function named
+/// "Class.method", appending each (and any lambdas it hoists) to `functions`. The class body's
+/// namespace dict references them by that qualified name; a decorated method also wraps the
+/// reference with its decorators at the def site.
+fn compile_class_method_bodies(
+    class_name: &str,
+    body: &[Stmt],
+    functions: &mut Vec<bc::CodeObject>,
+) -> Result<(), CompileError> {
+    for member in body {
+        let method = match member {
+            Stmt::FuncDef(m) => Some(m),
+            Stmt::Decorated { inner, .. } => match &**inner {
+                Stmt::FuncDef(m) => Some(m),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(method) = method {
+            let (co, lambdas) = compile_method(class_name, method)?;
+            functions.push(co);
+            functions.extend(lambdas);
+        }
+    }
+    Ok(())
 }
 
 /// Resolve an annotation expression to a static type: a bare `int` is the typed
@@ -139,6 +156,7 @@ fn compile_code_object(
     ret: &Option<Expr>,
     body: &[&Stmt],
     current_class: Option<&str>,
+    enclosing: &[BTreeSet<String>],
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let mut local_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
     let mut local_types: Vec<bc::StaticType> =
@@ -149,6 +167,31 @@ fn compile_code_object(
     }
     infer_local_types(params, body, &local_names, &mut local_types);
 
+    let bound = bound_names(params, body);
+    let (cellvars, freevars) = if scope == Scope::Module {
+        (Vec::new(), Vec::new())
+    } else {
+        let mut u = Uses::default();
+        for stmt in body {
+            walk_stmt_uses(stmt, &mut u);
+        }
+        let cellvars: Vec<String> = bound.intersection(&u.child_free).cloned().collect();
+        let mut free_uses = u.direct;
+        free_uses.extend(u.child_free);
+        for n in &bound {
+            free_uses.remove(n);
+        }
+        let freevars: Vec<String> = free_uses
+            .into_iter()
+            .filter(|n| enclosing.iter().any(|s| s.contains(n)))
+            .collect();
+        (cellvars, freevars)
+    };
+    let mut child_scopes: Vec<BTreeSet<String>> = enclosing.to_vec();
+    if scope == Scope::Function {
+        child_scopes.push(bound);
+    }
+
     let mut compiler = Compiler {
         scope,
         asm: Assembler::new(),
@@ -156,6 +199,9 @@ fn compile_code_object(
         names: Vec::new(),
         local_names,
         local_types,
+        cellvars: cellvars.clone(),
+        freevars: freevars.clone(),
+        child_scopes,
         loops: Vec::new(),
         finallys: Vec::new(),
         current_class: current_class.map(String::from),
@@ -190,6 +236,8 @@ fn compile_code_object(
         ret_ty: resolve_type(ret),
         n_locals: compiler.local_names.len(),
         local_names: compiler.local_names,
+        cellvars,
+        freevars,
         local_types: compiler.local_types,
         consts: compiler.consts,
         names: compiler.names,
@@ -328,9 +376,7 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
             }
         }
         Stmt::FuncDef(func) => {
-            if func.params.iter().any(|p| p.default.is_some()) {
-                add_dynamic_local(&func.name, names, types);
-            }
+            add_dynamic_local(&func.name, names, types);
         }
         Stmt::Decorated { decorators, inner } => {
             match &**inner {
@@ -564,6 +610,7 @@ fn collect_comp_targets_expr(
         | Expr::Float(_)
         | Expr::Imaginary(_)
         | Expr::BigInt(_)
+        | Expr::Bytes(_)
         | Expr::Str(_)
         | Expr::Bool(_)
         | Expr::None
@@ -577,91 +624,273 @@ fn collect_comp_targets_expr(
     }
 }
 
-/// Collect every name referenced anywhere in `expr` into `out` -- the input to a lambda's
-/// capture check. Conservative: it descends through nested lambdas and comprehensions rather
-/// than modelling their binders, so it may over-approximate the free set. That is safe, since
-/// the only use is to REJECT a capture, never to silently allow one.
-fn collect_names(expr: &Expr, out: &mut Vec<String>) {
+
+/// The name references a scope contributes to the closure analysis.
+#[derive(Default)]
+struct Uses {
+    /// Names read directly in this scope's own expressions.
+    direct: BTreeSet<String>,
+    /// Names that functions nested in this scope need from this scope or an outer one -- a nested
+    /// function's free variables, bubbled up so an enclosing scope can satisfy them with a cell.
+    child_free: BTreeSet<String>,
+}
+
+/// The user-visible names a function scope binds: its parameters plus every name assigned in its
+/// body plus comprehension/walrus targets -- exactly the set the pre-pass turns into local slots.
+fn bound_names(params: &[ast::ParamDef], body: &[&Stmt]) -> BTreeSet<String> {
+    let mut names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
+    let mut types: Vec<bc::StaticType> = vec![bc::StaticType::Dynamic; names.len()];
+    collect_locals(body, &mut names, &mut types);
+    for stmt in body {
+        collect_comp_targets_stmt(stmt, &mut names, &mut types);
+    }
+    names.into_iter().collect()
+}
+
+/// The free variables of a function scope: names its subtree references that it does not bind
+/// locally. Each such name resolves, in an enclosing scope, either to a cell (an enclosing
+/// function local) or to a global.
+fn func_free_uses(params: &[ast::ParamDef], body: &[&Stmt]) -> BTreeSet<String> {
+    let mut u = Uses::default();
+    for stmt in body {
+        walk_stmt_uses(stmt, &mut u);
+    }
+    let bound = bound_names(params, body);
+    let mut all = u.direct;
+    all.extend(u.child_free);
+    all.difference(&bound).cloned().collect()
+}
+
+/// Accumulate `stmt`'s name references into `u`, descending into nested `def` bodies as child
+/// scopes (their free variables bubble into `child_free`; their parameter defaults are uses of
+/// THIS scope).
+fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
+    match stmt {
+        Stmt::FuncDef(f) => {
+            let body: Vec<&Stmt> = f.body.iter().collect();
+            u.child_free.extend(func_free_uses(&f.params, &body));
+            for p in &f.params {
+                if let Some(d) = &p.default {
+                    walk_expr_uses(d, u);
+                }
+            }
+        }
+        Stmt::Decorated { decorators, inner } => {
+            for d in decorators {
+                walk_expr_uses(d, u);
+            }
+            walk_stmt_uses(inner, u);
+        }
+        Stmt::Return(value) => {
+            if let Some(e) = value {
+                walk_expr_uses(e, u);
+            }
+        }
+        Stmt::Assign(a) => {
+            if let Some(v) = &a.value {
+                walk_expr_uses(v, u);
+            }
+        }
+        Stmt::MultiAssign { targets, value } => {
+            walk_expr_uses(value, u);
+            for t in targets {
+                walk_target_uses(t, u);
+            }
+        }
+        Stmt::TupleAssign { targets, value, .. } => {
+            walk_expr_uses(value, u);
+            for t in targets {
+                walk_target_uses(t, u);
+            }
+        }
+        Stmt::SetItem { container, index, value, .. } => {
+            walk_expr_uses(container, u);
+            walk_expr_uses(index, u);
+            walk_expr_uses(value, u);
+        }
+        Stmt::SetAttr { obj, value, .. } => {
+            walk_expr_uses(obj, u);
+            walk_expr_uses(value, u);
+        }
+        Stmt::Expr(e) => walk_expr_uses(e, u),
+        Stmt::Delete(targets) => {
+            for t in targets {
+                walk_expr_uses(t, u);
+            }
+        }
+        Stmt::If { test, body, orelse } => {
+            walk_expr_uses(test, u);
+            walk_body_uses(body, u);
+            walk_body_uses(orelse, u);
+        }
+        Stmt::While { test, body, orelse } => {
+            walk_expr_uses(test, u);
+            walk_body_uses(body, u);
+            walk_body_uses(orelse, u);
+        }
+        Stmt::For { start, stop, body, orelse, .. } => {
+            walk_expr_uses(start, u);
+            walk_expr_uses(stop, u);
+            walk_body_uses(body, u);
+            walk_body_uses(orelse, u);
+        }
+        Stmt::ForIter { iterable, body, orelse, .. } => {
+            walk_expr_uses(iterable, u);
+            walk_body_uses(body, u);
+            walk_body_uses(orelse, u);
+        }
+        Stmt::Raise { exc, cause } => {
+            if let Some(e) = exc {
+                walk_expr_uses(e, u);
+            }
+            if let Some(c) = cause {
+                walk_expr_uses(c, u);
+            }
+        }
+        Stmt::Try { body, handlers, orelse, finalbody } => {
+            walk_body_uses(body, u);
+            for h in handlers {
+                if let Some(t) = &h.typ {
+                    walk_expr_uses(t, u);
+                }
+                walk_body_uses(&h.body, u);
+            }
+            walk_body_uses(orelse, u);
+            walk_body_uses(finalbody, u);
+        }
+        Stmt::With { context, body, .. } => {
+            walk_expr_uses(context, u);
+            walk_body_uses(body, u);
+        }
+        Stmt::ClassDef { base, body, .. } => {
+            if let Some(b) = base {
+                walk_expr_uses(b, u);
+            }
+            walk_body_uses(body, u);
+        }
+        Stmt::Break | Stmt::Continue | Stmt::Pass => {}
+    }
+}
+
+/// Accumulate the name references of every statement in `body`.
+fn walk_body_uses(body: &[Stmt], u: &mut Uses) {
+    for stmt in body {
+        walk_stmt_uses(stmt, u);
+    }
+}
+
+/// Accumulate the name references in a store target -- a bare name binds (no use), while a
+/// subscript/attribute target uses the container/object (and index) it stores through.
+fn walk_target_uses(target: &ast::AssignTarget, u: &mut Uses) {
+    match target {
+        ast::AssignTarget::Name(_) => {}
+        ast::AssignTarget::Subscript { container, index } => {
+            walk_expr_uses(container, u);
+            walk_expr_uses(index, u);
+        }
+        ast::AssignTarget::Attribute { obj, .. } => walk_expr_uses(obj, u),
+        ast::AssignTarget::Tuple(targets) => {
+            for t in targets {
+                walk_target_uses(t, u);
+            }
+        }
+    }
+}
+
+/// Accumulate `expr`'s name references into `u`. A nested `lambda` is a child scope (its body's
+/// free variables bubble into `child_free`); every other form recurses. Comprehension targets are
+/// this scope's locals (the compiler inlines comprehensions), so a clause's iterable/conditions are
+/// this-scope uses.
+fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
     match expr {
-        Expr::Name(n) => out.push(n.clone()),
-        Expr::Int(_) | Expr::Float(_) | Expr::Imaginary(_) | Expr::BigInt(_) | Expr::Str(_) | Expr::Bool(_) | Expr::None => {}
-        Expr::Attribute { value, .. } => collect_names(value, out),
+        Expr::Name(n) => {
+            u.direct.insert(n.clone());
+        }
+        Expr::Int(_) | Expr::Float(_) | Expr::Imaginary(_) | Expr::BigInt(_) | Expr::Bytes(_)
+        | Expr::Str(_) | Expr::Bool(_) | Expr::None => {}
+        Expr::Lambda { params, body } => {
+            let ret = Stmt::Return(Some((**body).clone()));
+            let refs: Vec<&Stmt> = vec![&ret];
+            u.child_free.extend(func_free_uses(params, &refs));
+            for p in params {
+                if let Some(d) = &p.default {
+                    walk_expr_uses(d, u);
+                }
+            }
+        }
+        Expr::Attribute { value, .. } => walk_expr_uses(value, u),
         Expr::Binary { lhs, rhs, .. }
         | Expr::BoolBinary { lhs, rhs, .. }
         | Expr::Compare { lhs, rhs, .. } => {
-            collect_names(lhs, out);
-            collect_names(rhs, out);
+            walk_expr_uses(lhs, u);
+            walk_expr_uses(rhs, u);
         }
-        Expr::Unary { operand, .. } | Expr::Not { operand } => collect_names(operand, out),
+        Expr::Unary { operand, .. } | Expr::Not { operand } => walk_expr_uses(operand, u),
         Expr::Conditional { test, body, orelse } => {
-            collect_names(test, out);
-            collect_names(body, out);
-            collect_names(orelse, out);
-        }
-        Expr::CallEx { func, args } => {
-            collect_names(func, out);
-            for a in args {
-                collect_names(call_arg_expr(a), out);
-            }
+            walk_expr_uses(test, u);
+            walk_expr_uses(body, u);
+            walk_expr_uses(orelse, u);
         }
         Expr::Call { func, args, keywords } => {
-            collect_names(func, out);
+            walk_expr_uses(func, u);
             for a in args {
-                collect_names(a, out);
+                walk_expr_uses(a, u);
             }
             for k in keywords {
-                collect_names(&k.value, out);
+                walk_expr_uses(&k.value, u);
+            }
+        }
+        Expr::CallEx { func, args } => {
+            walk_expr_uses(func, u);
+            for a in args {
+                walk_expr_uses(call_arg_expr(a), u);
             }
         }
         Expr::Subscript { value, index } => {
-            collect_names(value, out);
-            collect_names(index, out);
+            walk_expr_uses(value, u);
+            walk_expr_uses(index, u);
         }
         Expr::Slice { lower, upper, step } => {
             for e in [lower, upper, step].into_iter().flatten() {
-                collect_names(e, out);
+                walk_expr_uses(e, u);
             }
-        }
-        Expr::Walrus { target, value } => {
-            out.push(target.clone());
-            collect_names(value, out);
         }
         Expr::List(es) | Expr::Tuple(es) | Expr::Set(es) => {
             for e in es {
-                collect_names(e, out);
+                walk_expr_uses(e, u);
             }
         }
-        Expr::Dict(ps) => {
-            for (k, v) in ps {
-                collect_names(k, out);
-                collect_names(v, out);
+        Expr::Dict(pairs) => {
+            for (k, v) in pairs {
+                walk_expr_uses(k, u);
+                walk_expr_uses(v, u);
             }
         }
         Expr::ListComp { element, clauses }
         | Expr::SetComp { element, clauses }
         | Expr::GeneratorExp { element, clauses } => {
-            collect_names(element, out);
+            walk_expr_uses(element, u);
             for c in clauses {
-                collect_names(&c.iterable, out);
+                walk_expr_uses(&c.iterable, u);
                 for cond in &c.conditions {
-                    collect_names(cond, out);
+                    walk_expr_uses(cond, u);
                 }
             }
         }
         Expr::DictComp { key, value, clauses } => {
-            collect_names(key, out);
-            collect_names(value, out);
+            walk_expr_uses(key, u);
+            walk_expr_uses(value, u);
             for c in clauses {
-                collect_names(&c.iterable, out);
+                walk_expr_uses(&c.iterable, u);
                 for cond in &c.conditions {
-                    collect_names(cond, out);
+                    walk_expr_uses(cond, u);
                 }
             }
         }
-        Expr::Lambda { body, .. } => collect_names(body, out),
+        Expr::Walrus { value, .. } => walk_expr_uses(value, u),
         Expr::Yield(value) => {
             if let Some(v) = value {
-                collect_names(v, out);
+                walk_expr_uses(v, u);
             }
         }
     }
@@ -912,6 +1141,16 @@ struct Compiler {
     names: Vec<String>,
     local_names: Vec<String>,
     local_types: Vec<bc::StaticType>,
+    /// The locals promoted to heap cells because a nested function captures them (deref indices
+    /// `0..cellvars.len()`). Reads/writes of these names emit `LoadDeref`/`StoreDeref`, not Fast.
+    cellvars: Vec<String>,
+    /// The names captured from an enclosing function (deref indices continue after `cellvars`).
+    /// Reads emit `LoadDeref`; a nested function's def site loads them with `LoadClosure`.
+    freevars: Vec<String>,
+    /// The scope chain a nested function of this one sees -- the enclosing FUNCTION scopes' bound
+    /// names plus this function's own -- so a nested function can tell a captured free variable
+    /// (bound in some entry here) from a global.
+    child_scopes: Vec<BTreeSet<String>>,
     /// A stack of the enclosing loops' `(continue, break, finally_depth)`: the jump targets
     /// plus `self.finallys.len()` at loop entry, so a break/continue re-emits only the
     /// `finally` bodies entered inside that loop.
@@ -957,15 +1196,69 @@ impl Compiler {
         self.local_names.iter().position(|n| n == name).map(|i| i as u32)
     }
 
+    /// The deref index for a cell or free variable of this function, if `name` is one. Cellvars
+    /// occupy `0..cellvars.len()`, then freevars follow -- one index space, so `LoadDeref` /
+    /// `StoreDeref` reach both this frame's own cells and the cells captured from an enclosing one.
+    fn deref_slot(&self, name: &str) -> Option<u32> {
+        if let Some(i) = self.cellvars.iter().position(|n| n == name) {
+            return Some(i as u32);
+        }
+        self.freevars
+            .iter()
+            .position(|n| n == name)
+            .map(|i| (self.cellvars.len() + i) as u32)
+    }
+
+    /// Emit a read of `name`: a cell/free variable through `LoadDeref`, a plain local through
+    /// `LoadFast`, otherwise a `LoadGlobal`.
+    fn emit_load_name(&mut self, name: &str) {
+        if let Some(deref) = self.deref_slot(name) {
+            self.asm.emit(bc::Op::LoadDeref(deref));
+        } else if let Some(slot) = self.local_slot(name) {
+            self.asm.emit(bc::Op::LoadFast(slot));
+        } else {
+            let idx = self.name_index(name);
+            self.asm.emit(bc::Op::LoadGlobal(idx));
+        }
+    }
+
+    /// Emit a store to `name`: a cell variable through `StoreDeref`, otherwise `StoreFast` to its
+    /// local slot (every bound name has one, from the pre-pass; a module-level store set_globals it).
+    fn emit_store_name(&mut self, name: &str) {
+        if let Some(deref) = self.deref_slot(name) {
+            self.asm.emit(bc::Op::StoreDeref(deref));
+        } else {
+            let slot = self
+                .local_slot(name)
+                .expect("an assigned name is always a local (added by the pre-pass)");
+            self.asm.emit(bc::Op::StoreFast(slot));
+        }
+    }
+
+    /// Emit one `LoadClosure` per free variable of a nested function (in that function's freevar
+    /// order), pushing the matching cell from this frame's deref array. Returns the `CLOSURE` flag
+    /// bit for `MakeFunction` (0 when the nested function captures nothing).
+    fn emit_captured_cells(&mut self, freevars: &[String]) -> u8 {
+        if freevars.is_empty() {
+            return 0;
+        }
+        for fv in freevars {
+            let deref = self
+                .deref_slot(fv)
+                .expect("a nested function's freevar is a cell or free variable of this one");
+            self.asm.emit(bc::Op::LoadClosure(deref));
+        }
+        0x04
+    }
+
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         match stmt {
             Stmt::FuncDef(func) => {
                 if self.scope == Scope::Function {
-                    return Err(error(
-                        "nested function definitions are not supported in this subset",
-                    ));
+                    self.compile_nested_def(func)
+                } else {
+                    self.compile_defaulted_def(func)
                 }
-                self.compile_defaulted_def(func)
             }
             Stmt::Delete(targets) => {
                 for target in targets {
@@ -1151,10 +1444,7 @@ impl Compiler {
             return Ok(());
         };
         self.compile_expr(value)?;
-        let slot = self
-            .local_slot(&assign.target)
-            .expect("an assigned name is always a local (added by the pre-pass)");
-        self.asm.emit(bc::Op::StoreFast(slot));
+        self.emit_store_name(&assign.target);
         Ok(())
     }
 
@@ -1245,10 +1535,6 @@ impl Compiler {
         self.asm.emit(bc::Op::StoreFast(counter));
         self.compile_expr(stop)?;
         self.asm.emit(bc::Op::StoreFast(stop_tmp));
-        let target_slot = self
-            .local_slot(target)
-            .expect("the loop variable is a local (added by the pre-pass)");
-
         let top = self.asm.new_label();
         let cont = self.asm.new_label();
         let else_label = self.asm.new_label();
@@ -1264,7 +1550,7 @@ impl Compiler {
         self.asm.emit(bc::Op::Compare(cmp));
         self.asm.emit_branch(else_label);
         self.asm.emit(bc::Op::LoadFast(counter));
-        self.asm.emit(bc::Op::StoreFast(target_slot));
+        self.emit_store_name(target);
         self.loops.push((cont, after, self.finallys.len()));
         for stmt in body {
             self.compile_stmt(stmt)?;
@@ -1320,10 +1606,7 @@ impl Compiler {
             }
             if let Some(name) = &handler.name {
                 self.asm.emit(bc::Op::LoadExc);
-                let slot = self
-                    .local_slot(name)
-                    .expect("the except-clause name is a local");
-                self.asm.emit(bc::Op::StoreFast(slot));
+                self.emit_store_name(name);
             }
             self.asm.emit(bc::Op::PopExcept);
             for stmt in &handler.body {
@@ -1426,12 +1709,7 @@ impl Compiler {
         };
         self.compile_expr(&enter)?;
         match optional_name {
-            Some(name) => {
-                let slot = self
-                    .local_slot(name)
-                    .expect("a with-target is a local (added by the pre-pass)");
-                self.asm.emit(bc::Op::StoreFast(slot));
-            }
+            Some(name) => self.emit_store_name(name),
             None => self.asm.emit(bc::Op::PopTop),
         }
         let exit = Stmt::Expr(Expr::Call {
@@ -1484,6 +1762,28 @@ impl Compiler {
                     self.asm.emit(bc::Op::MakeFunction { func: f, flags: 0 });
                     n_members += 1;
                 }
+                Stmt::Decorated { decorators, inner } => {
+                    let Stmt::FuncDef(method) = &**inner else {
+                        return Err(error("only a method may be decorated in a class body"));
+                    };
+                    if method.params.iter().any(|p| p.default.is_some()) {
+                        return Err(error(
+                            "default parameter values on a method are not yet supported",
+                        ));
+                    }
+                    let key = self.const_index(bc::Const::Str(method.name.clone()));
+                    self.asm.emit(bc::Op::LoadConst(key));
+                    for decorator in decorators {
+                        self.compile_expr(decorator)?;
+                    }
+                    let qualified = format!("{}.{}", name, method.name);
+                    let f = self.name_index(&qualified);
+                    self.asm.emit(bc::Op::MakeFunction { func: f, flags: 0 });
+                    for _ in decorators {
+                        self.asm.emit(bc::Op::Call(1));
+                    }
+                    n_members += 1;
+                }
                 Stmt::Assign(assign) => {
                     if let Some(value) = &assign.value {
                         let key = self.const_index(bc::Const::Str(assign.target.clone()));
@@ -1497,10 +1797,7 @@ impl Compiler {
         }
         self.asm.emit(bc::Op::BuildDict(n_members));
         self.asm.emit(bc::Op::BuildClass);
-        let slot = self
-            .local_slot(name)
-            .expect("the class name is a local (added by the pre-pass)");
-        self.asm.emit(bc::Op::StoreFast(slot));
+        self.emit_store_name(name);
         Ok(())
     }
 
@@ -1524,10 +1821,7 @@ impl Compiler {
         self.asm.place(top);
         self.asm.emit(bc::Op::LoadFast(iter_slot));
         self.asm.emit_for_iter(else_label);
-        let target_slot = self
-            .local_slot(target)
-            .expect("the loop variable is a local (added by the pre-pass)");
-        self.asm.emit(bc::Op::StoreFast(target_slot));
+        self.emit_store_name(target);
         self.loops.push((top, after, self.finallys.len()));
         for stmt in body {
             self.compile_stmt(stmt)?;
@@ -1550,11 +1844,8 @@ impl Compiler {
             }
             Expr::Walrus { target, value } => {
                 self.compile_expr(value)?;
-                let slot = self
-                    .local_slot(target)
-                    .expect("a walrus target is a local (added by the pre-pass)");
-                self.asm.emit(bc::Op::StoreFast(slot));
-                self.asm.emit(bc::Op::LoadFast(slot));
+                self.emit_store_name(target);
+                self.emit_load_name(target);
             }
             Expr::Float(bits) => {
                 let idx = self.const_index(bc::Const::Float(*bits));
@@ -1566,6 +1857,10 @@ impl Compiler {
             }
             Expr::BigInt(digits) => {
                 let idx = self.const_index(bc::Const::BigInt(digits.clone()));
+                self.asm.emit(bc::Op::LoadConst(idx));
+            }
+            Expr::Bytes(data) => {
+                let idx = self.const_index(bc::Const::Bytes(data.clone()));
                 self.asm.emit(bc::Op::LoadConst(idx));
             }
             Expr::Str(value) => {
@@ -1580,13 +1875,7 @@ impl Compiler {
                 let idx = self.const_index(bc::Const::None);
                 self.asm.emit(bc::Op::LoadConst(idx));
             }
-            Expr::Name(name) => match self.local_slot(name) {
-                Some(slot) => self.asm.emit(bc::Op::LoadFast(slot)),
-                None => {
-                    let idx = self.name_index(name);
-                    self.asm.emit(bc::Op::LoadGlobal(idx));
-                }
-            },
+            Expr::Name(name) => self.emit_load_name(name),
             Expr::Attribute { value, attr } => {
                 self.compile_expr(value)?;
                 let name = self.name_index(attr);
@@ -1746,7 +2035,7 @@ impl Compiler {
         Ok(())
     }
 
-    /// Emit a module-level defaulted def at its source position: 
+    /// Emit a module-level defaulted def at its source position:
     /// push each default value, build the defaults tuple, `MakeFunction` (flag bit0 =
     /// defaults) resolving the function by name, then `StoreFast` -- which set_global's the
     /// PyFunction so a later `LoadGlobal` prefers it (it carries the defaults) over the plain
@@ -1766,18 +2055,66 @@ impl Compiler {
             func: func_name,
             flags: 0x01,
         });
-        let slot = self
-            .local_slot(&func.name)
-            .expect("a defaulted def name is a body local (added by the pre-pass)");
-        self.asm.emit(bc::Op::StoreFast(slot));
+        self.emit_store_name(&func.name);
         Ok(())
     }
 
-    /// Compile a lambda: hoist it to a synthetic module function and push a reference to it
-    /// (`MakeFunction`, as a class method does). Its body is `return <body>`. Capturing an
-    /// enclosing function's local (a closure) is rejected loudly -- hoisting to a module
-    /// function would otherwise silently read a same-named global instead; at module scope
-    /// every name is a global, so no capture is possible.
+    /// Compile a nested `def` as a hoisted closure. Its body becomes a `CodeObject` named for its
+    /// nesting path (so the module function table stays flat), carrying its own cellvars/freevars
+    /// analyzed against this function's scope chain. At the def site emit any positional-defaults
+    /// tuple, then one `LoadClosure` per captured free variable, then `MakeFunction` with the
+    /// CLOSURE (and defaults) flags, then bind the def's name in this scope. (Two sibling nested
+    /// defs sharing a name -- a redefinition -- would collide on the qualified name; that rare
+    /// re-`def` is out of this increment.)
+    fn compile_nested_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
+        if func.params.iter().any(|p| p.keyword_only && p.default.is_some()) {
+            return Err(error(
+                "keyword-only default values on a nested function are not yet supported",
+            ));
+        }
+        let qualified = format!("{}.{}", self.name, func.name);
+        let body: Vec<&Stmt> = func.body.iter().collect();
+        let (co, hoisted) = compile_code_object(
+            Scope::Function,
+            &qualified,
+            &func.params,
+            &func.ret,
+            &body,
+            None,
+            &self.child_scopes,
+        )?;
+        let freevars = co.freevars.clone();
+        self.hoisted.push(co);
+        self.hoisted.extend(hoisted);
+        let mut flags = 0u8;
+        let n_defaults = func
+            .params
+            .iter()
+            .filter(|p| !p.keyword_only && p.default.is_some())
+            .count() as u32;
+        if n_defaults > 0 {
+            for p in &func.params {
+                if !p.keyword_only {
+                    if let Some(default) = &p.default {
+                        self.compile_expr(default)?;
+                    }
+                }
+            }
+            self.asm.emit(bc::Op::BuildTuple(n_defaults));
+            flags |= 0x01;
+        }
+        flags |= self.emit_captured_cells(&freevars);
+        let func_idx = self.name_index(&qualified);
+        self.asm.emit(bc::Op::MakeFunction { func: func_idx, flags });
+        self.emit_store_name(&func.name);
+        Ok(())
+    }
+
+    /// Compile a lambda: hoist it to a synthetic function (named for uniqueness) and reference it
+    /// with `MakeFunction`. Its body is `return <body>`. A lambda that captures an enclosing
+    /// function's local is a closure -- its free variables are pushed as cells (`LoadClosure`) and
+    /// `MakeFunction` carries the CLOSURE flag, exactly like a nested def. At module scope there is
+    /// no enclosing function, so a lambda there captures nothing (every name is a global).
     fn compile_lambda(
         &mut self,
         params: &[ast::ParamDef],
@@ -1788,29 +2125,25 @@ impl Compiler {
                 "default parameter values on a lambda are not yet supported",
             ));
         }
-        if self.scope == Scope::Function {
-            let mut used = Vec::new();
-            collect_names(body, &mut used);
-            for used_name in &used {
-                let is_param = params.iter().any(|p| p.name == *used_name);
-                if !is_param && self.local_names.iter().any(|l| l == used_name) {
-                    return Err(error(&format!(
-                        "a lambda cannot use the enclosing local '{used_name}' \
-                         (closures are not yet supported)"
-                    )));
-                }
-            }
-        }
         let lambda_name = format!("{}.<lambda.{}>", self.name, self.lambda_counter);
         self.lambda_counter += 1;
         let lambda_body = [Stmt::Return(Some(body.clone()))];
         let body_refs: Vec<&Stmt> = lambda_body.iter().collect();
-        let (lambda_co, nested) =
-            compile_code_object(Scope::Function, &lambda_name, params, &None, &body_refs, None)?;
+        let (lambda_co, nested) = compile_code_object(
+            Scope::Function,
+            &lambda_name,
+            params,
+            &None,
+            &body_refs,
+            None,
+            &self.child_scopes,
+        )?;
+        let freevars = lambda_co.freevars.clone();
         self.hoisted.push(lambda_co);
         self.hoisted.extend(nested);
+        let flags = self.emit_captured_cells(&freevars);
         let idx = self.name_index(&lambda_name);
-        self.asm.emit(bc::Op::MakeFunction { func: idx, flags: 0 });
+        self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
         Ok(())
     }
 
@@ -1903,10 +2236,7 @@ impl Compiler {
             self.asm.emit(bc::Op::UnpackSequence(targets.len() as u32));
         }
         for t in targets {
-            let slot = self
-                .local_slot(t)
-                .expect("the comprehension target is a local (added by the pre-pass)");
-            self.asm.emit(bc::Op::StoreFast(slot));
+            self.emit_store_name(t);
         }
     }
 
@@ -1979,12 +2309,7 @@ impl Compiler {
     /// exactly the stack order Setitem `[value, container, index]` / SetAttr `[value, obj]` expect.
     fn compile_unpack_target(&mut self, target: &ast::AssignTarget) -> Result<(), CompileError> {
         match target {
-            ast::AssignTarget::Name(name) => {
-                let slot = self
-                    .local_slot(name)
-                    .expect("a tuple-unpacking name target is a local (added by the pre-pass)");
-                self.asm.emit(bc::Op::StoreFast(slot));
-            }
+            ast::AssignTarget::Name(name) => self.emit_store_name(name),
             ast::AssignTarget::Subscript { container, index } => {
                 self.compile_expr(container)?;
                 self.compile_expr(index)?;
@@ -2412,14 +2737,120 @@ mod tests {
     }
 
     #[test]
-    fn lambda_capturing_an_enclosing_local_is_rejected() {
-        let err =
-            compile_src("def f():\n    n = 5\n    g = lambda: n\n    return g\n").unwrap_err();
-        assert!(
-            err.message.contains("closures are not yet supported"),
-            "{}",
-            err.message
+    fn lambda_capturing_an_enclosing_local_is_a_closure() {
+        let module =
+            compile_src("def f():\n    n = 5\n    g = lambda: n\n    return g\n").unwrap();
+        let f = module.functions.iter().find(|c| c.name == "f").expect("f present");
+        assert_eq!(f.cellvars.len(), 1);
+        assert_eq!(f.cellvars[0], "n");
+        assert!(f.ops.iter().any(|op| matches!(op, Op::StoreDeref(0))));
+        assert!(f.ops.iter().any(|op| matches!(op, Op::LoadClosure(0))));
+        assert!(f
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x04 != 0)));
+        let lam = module
+            .functions
+            .iter()
+            .find(|c| c.name.contains("<lambda."))
+            .expect("lambda present");
+        assert_eq!(lam.freevars.len(), 1);
+        assert_eq!(lam.freevars[0], "n");
+        assert!(lam.ops.iter().any(|op| matches!(op, Op::LoadDeref(0))));
+    }
+
+    #[test]
+    fn a_nested_def_capturing_a_param_is_a_closure() {
+        let src = "def make_adder(k):\n    def add(n):\n        return n + k\n    return add\n";
+        let module = compile_src(src).unwrap();
+        let outer = func(&module, "make_adder");
+        assert_eq!(outer.cellvars, [String::from("k")]);
+        assert!(outer.freevars.is_empty());
+        assert!(outer.ops.iter().any(|op| matches!(op, Op::LoadClosure(0))));
+        assert!(outer
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x04 != 0)));
+        let inner = func(&module, "make_adder.add");
+        assert!(inner.cellvars.is_empty());
+        assert_eq!(inner.freevars, [String::from("k")]);
+        assert_eq!(
+            &inner.ops[..4],
+            &[Op::LoadFast(0), Op::LoadDeref(0), Op::Binary(BinOp::Add), Op::Return]
         );
+    }
+
+    #[test]
+    fn a_freevar_bubbles_through_an_intermediate_closure() {
+        let src = "def repeat(times):\n    def deco(fn):\n        def wrapper(x):\n            \
+                   return fn(x) + times\n        return wrapper\n    return deco\n";
+        let module = compile_src(src).unwrap();
+
+        let repeat = func(&module, "repeat");
+        assert_eq!(repeat.cellvars, [String::from("times")]);
+        assert!(repeat.freevars.is_empty());
+
+        let deco = func(&module, "repeat.deco");
+        assert_eq!(deco.cellvars, [String::from("fn")]);
+        assert_eq!(deco.freevars, [String::from("times")]);
+        let closures: Vec<u32> = deco
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::LoadClosure(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closures, [0, 1]);
+
+        let wrapper = func(&module, "repeat.deco.wrapper");
+        assert!(wrapper.cellvars.is_empty());
+        assert_eq!(wrapper.freevars, [String::from("fn"), String::from("times")]);
+        assert!(wrapper.ops.iter().any(|op| matches!(op, Op::LoadDeref(0))));
+        assert!(wrapper.ops.iter().any(|op| matches!(op, Op::LoadDeref(1))));
+    }
+
+    #[test]
+    fn a_top_level_function_reads_a_global_not_a_cell() {
+        let module = compile_src("G = 10\ndef f():\n    return G\n").unwrap();
+        let f = func(&module, "f");
+        assert!(f.cellvars.is_empty());
+        assert!(f.freevars.is_empty());
+        assert!(f.ops.iter().any(|op| matches!(op, Op::LoadGlobal(_))));
+        assert!(!f.ops.iter().any(|op| matches!(op, Op::LoadDeref(_))));
+    }
+
+    #[test]
+    fn a_closure_mutating_a_captured_list_reads_it_through_a_cell() {
+        let src = "def make_counter():\n    box = [0]\n    def step():\n        \
+                   box[0] = box[0] + 1\n        return box[0]\n    return step\n";
+        let module = compile_src(src).unwrap();
+        assert_eq!(func(&module, "make_counter").cellvars, [String::from("box")]);
+        let step = func(&module, "make_counter.step");
+        assert_eq!(step.freevars, [String::from("box")]);
+        assert!(step.ops.iter().any(|op| matches!(op, Op::LoadDeref(0))));
+        assert!(step.ops.iter().any(|op| matches!(op, Op::Setitem)));
+        assert!(!step.ops.iter().any(|op| matches!(op, Op::StoreDeref(_))));
+    }
+
+    #[test]
+    fn a_decorated_method_lands_in_the_class_namespace() {
+        let src = "def tag(f):\n    return f\nclass C:\n    @tag\n    def m(self):\n        return 1\n";
+        let module = compile_src(src).unwrap();
+        assert!(module.functions.iter().any(|c| c.name == "C.m"), "method body compiled");
+        let ops = &module.body.ops;
+        assert!(ops.iter().any(|op| matches!(op, Op::MakeFunction { .. })));
+        assert!(ops.iter().any(|op| matches!(op, Op::Call(1))), "the decorator is applied");
+        assert!(ops.iter().any(|op| matches!(op, Op::BuildClass)));
+    }
+
+    #[test]
+    fn stacked_method_decorators_apply_bottom_up() {
+        let src = "def a(f):\n    return f\ndef b(f):\n    return f\n\
+                   class C:\n    @a\n    @b\n    def m(self):\n        return 1\n";
+        let module = compile_src(src).unwrap();
+        let calls = module.body.ops.iter().filter(|op| matches!(op, Op::Call(1))).count();
+        assert_eq!(calls, 2, "two stacked decorators -> two Call(1)");
     }
 
     #[test]

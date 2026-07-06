@@ -11,6 +11,7 @@ pub mod cmd {
     pub const TRANSFER: u8 = 0x05;
     pub const TRANSFER_BLOCK: u8 = 0x06;
     pub const RESET_TARGET: u8 = 0x0A;
+    pub const SWJ_PINS: u8 = 0x10;
     pub const SWJ_CLOCK: u8 = 0x11;
     pub const SWJ_SEQUENCE: u8 = 0x12;
     pub const SWD_CONFIGURE: u8 = 0x13;
@@ -89,6 +90,18 @@ pub fn disconnect() -> [u8; 1] {
 pub fn swj_clock(hz: u32) -> [u8; 5] {
     let b = hz.to_le_bytes();
     [cmd::SWJ_CLOCK, b[0], b[1], b[2], b[3]]
+}
+
+/// The `DAP_SWJ_Pins` bit for the target reset line (nRESET). Bit 7 in the CMSIS-DAP pin mask;
+/// driving it low asserts reset (holds the core), high releases it.
+pub const PIN_NRESET: u8 = 1 << 7;
+
+/// Encodes `DAP_SWJ_Pins`: drive the pins named in `select` to the levels in `output`, then wait up
+/// to `wait_us` microseconds for them to settle (the reply reports the pins' resulting input levels).
+/// Used to release the nRESET a probe may assert on connect, so the core can run / be halted.
+pub fn swj_pins(output: u8, select: u8, wait_us: u32) -> [u8; 7] {
+    let w = wait_us.to_le_bytes();
+    [cmd::SWJ_PINS, output, select, w[0], w[1], w[2], w[3]]
 }
 
 /// Encodes `DAP_SWJ_Sequence`: `bit_count` clocks shifting `bits` out on SWDIO,

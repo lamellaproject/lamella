@@ -2174,7 +2174,7 @@ impl Session {
                     return Ok(Status::Running);
                 }
                 let (target, method) = invocations.remove(0);
-                let call_args = delegate_call_args(&target, &params);
+                let call_args = delegate_receiver_args(module, vm, method, &target, &params);
                 if frames.len() >= MAX_CALL_DEPTH {
                     return Err(Trap::CallStackOverflow);
                 }
@@ -2454,6 +2454,31 @@ fn delegate_call_args(target: &Value, params: &[Value]) -> Vec<Value> {
     }
     call_args.extend_from_slice(params);
     call_args
+}
+
+/// The argument list for invoking a delegate's bound `method` on `target`: `delegate_call_args`
+/// prepends the bound target as `this`, then -- for a delegate over a VALUE-TYPE instance method,
+/// whose receiver was boxed at delegate construction -- the box reference is replaced with a
+/// managed pointer INTO the box. The value type's own method takes `this` as a managed pointer
+/// (ECMA-335 III.4.2, the `unbox` a `box` callvirt-ed to its value type's method reduces to), so
+/// the body reads the boxed value through `this` (`ldarg.0; ldfld` / `ldind`). This mirrors the
+/// ordinary boxed-callvirt path; a reference-type target keeps its object `this`.
+fn delegate_receiver_args(
+    module: &Module,
+    vm: &Vm,
+    method: MethodId,
+    target: &Value,
+    params: &[Value],
+) -> Vec<Value> {
+    let mut args = delegate_call_args(target, params);
+    if module.method_declares_value_type(method) {
+        if let Some(&Value::Object(reference)) = args.first() {
+            if vm.heap().boxed_type_token(reference).is_some() {
+                args[0] = Value::ByRef(Location::Boxed { object: reference });
+            }
+        }
+    }
+    args
 }
 
 /// Writes `value` into field `slot` of the value-type instance at `location`,
@@ -3237,7 +3262,7 @@ fn step(
                 return match invocations.split_first() {
                     Some(((target, method), [])) => Ok(Flow::Call {
                         method: *method,
-                        args: delegate_call_args(target, &params),
+                        args: delegate_receiver_args(module, vm, *method, target, &params),
                     }),
                     Some(_) => Ok(Flow::InvokeMulticast {
                         invocations,

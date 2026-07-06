@@ -38,9 +38,6 @@ math-transcendental = ["NETMFv4_4", "float", "lamella-cil-runtime/math-transcend
 # OFF = the Safe bounds-checked block table only (a constrained target's compile-time gate, so the
 # unsafe path is never built). At runtime, LAMELLA_MEMORY_MODE=safe switches Real -> Safe.
 real-memory = []
-# Host-only, OPT-IN: build lamella-tls-host's mbedTLS stack (the second desktop stack, the same
-# library a device links) so tls_seam's mbedTLS conformance test runs. Requires libclang (bindgen).
-tls-mbedtls = ["lamella-tls-host/tls-mbedtls"]
 # Source-level debugger names: the loader records each method's qualified name + argument names (for
 # the DAP backend / Session::this). Default ON (dev + the debugger); a constrained, non-debug profile
 # omits it -- for the full corlib that drops ~300 KB of resident Strings, with only graceful loss of
@@ -59,12 +56,6 @@ flash-image = ["lamella-cil-runtime/flash-image"]
 # slice). Default (both off) = on_use lazy decode. See lamella-cil-runtime.
 code-preload = ["lamella-cil-runtime/code-preload"]
 code-in-place = ["lamella-cil-runtime/code-in-place", "flash-image"]
-
-[dev-dependencies]
-lamella-tls-host = { path = "../lamella-tls-host" }
-rustls = "0.23"
-rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
-p12 = "0.6"
 
 [lints]
 workspace = true

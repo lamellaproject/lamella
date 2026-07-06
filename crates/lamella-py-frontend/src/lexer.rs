@@ -33,6 +33,8 @@ pub enum Tok {
     Imaginary(u64),
     /// A decimal integer literal too large for `i64` -- its digits (a bignum).
     BigInt(String),
+    /// A bytes literal `b"..."` -- its decoded bytes.
+    Bytes(Vec<u8>),
     /// A short string literal -- its decoded value, with escape sequences resolved.
     /// Single-line `'...'` and `"..."` are handled; triple-quoted and `r`/`b`-prefixed
     /// strings are outside this subset.
@@ -422,6 +424,8 @@ impl Lexer {
             self.lex_fstring()
         } else if (c == 'r' || c == 'R') && matches!(self.peek2(), Some('\'' | '"')) {
             self.lex_raw_string()
+        } else if (c == 'b' || c == 'B') && matches!(self.peek2(), Some('\'' | '"')) {
+            self.lex_bytes()
         } else if c == '_' || c.is_ascii_alphabetic() {
             self.lex_name();
             Ok(())
@@ -550,6 +554,97 @@ impl Lexer {
                 }
             }
         }
+    }
+
+    /// Lex a single-line bytes literal `b"..."` / `b'...'` (the `b`/`B` not yet consumed): ASCII
+    /// source with the usual escapes, each contributing a BYTE (`\xhh` is one byte, not a code point).
+    /// Non-ASCII source characters are rejected (bytes literals are ASCII source). Produces `Tok::Bytes`.
+    fn lex_bytes(&mut self) -> Result<(), LexError> {
+        self.pos += 1;
+        let quote = self.peek().expect("lex_bytes called at a quote");
+        self.pos += 1;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            match self.peek() {
+                None | Some('\n' | '\r') => return Err(self.err("unterminated bytes literal")),
+                Some(c) if c == quote => {
+                    self.pos += 1;
+                    self.push(Tok::Bytes(out));
+                    return Ok(());
+                }
+                Some('\\') => {
+                    self.pos += 1;
+                    self.lex_bytes_escape(&mut out)?;
+                }
+                Some(c) if c.is_ascii() => {
+                    out.push(c as u8);
+                    self.pos += 1;
+                }
+                Some(_) => {
+                    return Err(self.err("a bytes literal may contain only ASCII characters"));
+                }
+            }
+        }
+    }
+
+    /// One escape inside a bytes literal (the `\` already consumed): the same set as a string, but
+    /// each produces a byte -- `\xhh` is the single byte `0xhh`, and `\ooo` an octal byte.
+    fn lex_bytes_escape(&mut self, out: &mut Vec<u8>) -> Result<(), LexError> {
+        let c = match self.peek() {
+            Some(c) => c,
+            None => return Err(self.err("unterminated bytes literal")),
+        };
+        if ('0'..='7').contains(&c) {
+            let mut value: u32 = 0;
+            for _ in 0..3 {
+                match self.peek() {
+                    Some(d @ '0'..='7') => {
+                        value = value * 8 + (d as u32 - '0' as u32);
+                        self.pos += 1;
+                    }
+                    _ => break,
+                }
+            }
+            out.push(value as u8);
+            return Ok(());
+        }
+        self.pos += 1;
+        match c {
+            '\n' => self.line += 1,
+            '\r' => {
+                if matches!(self.peek(), Some('\n')) {
+                    self.pos += 1;
+                }
+                self.line += 1;
+            }
+            '\\' => out.push(b'\\'),
+            '\'' => out.push(b'\''),
+            '"' => out.push(b'"'),
+            'a' => out.push(0x07),
+            'b' => out.push(0x08),
+            'f' => out.push(0x0C),
+            'n' => out.push(b'\n'),
+            'r' => out.push(b'\r'),
+            't' => out.push(b'\t'),
+            'v' => out.push(0x0B),
+            'x' => {
+                let mut byte: u32 = 0;
+                for _ in 0..2 {
+                    let digit = self
+                        .peek()
+                        .and_then(|d| d.to_digit(16))
+                        .ok_or_else(|| self.err("`\\x` needs two hex digits in a bytes literal"))?;
+                    byte = byte * 16 + digit;
+                    self.pos += 1;
+                }
+                out.push(byte as u8);
+            }
+            other => {
+                out.push(b'\\');
+                out.push(other as u8);
+            }
+        }
+        Ok(())
     }
 
     fn lex_string_escape(&mut self, out: &mut String) -> Result<(), LexError> {
@@ -1181,6 +1276,15 @@ mod tests {
             kinds("100_000_000_000_000_000_000\n")[0],
             Tok::BigInt("100000000000000000000".into())
         );
+    }
+
+    #[test]
+    fn bytes_literals_lex_to_their_bytes() {
+        assert_eq!(kinds("b\"hi\"\n")[0], Tok::Bytes(vec![b'h', b'i']));
+        assert_eq!(kinds("b'\\xff\\n'\n")[0], Tok::Bytes(vec![0xff, b'\n']));
+        assert_eq!(kinds("b'\\101'\n")[0], Tok::Bytes(vec![b'A']));
+        assert_eq!(kinds("B\"\"\n")[0], Tok::Bytes(Vec::new()));
+        assert!(crate::lexer::tokenize("b'\u{e9}'\n").is_err());
     }
 
     #[test]

@@ -588,6 +588,17 @@ impl ReplSession {
         let result = self.submit_in(&source, prior_field_count, &reset_slots, &work);
         work.cleanup();
         if result.is_err() {
+            if let Submission::Expression { .. } = &submission {
+                let statement = self.emit_class(&format!("{};", line.trim()));
+                self.counter += 1;
+                let retry_work = TempProgram::new()?;
+                let retried =
+                    self.submit_in(&statement, prior_field_count, &reset_slots, &retry_work);
+                retry_work.cleanup();
+                if retried.is_ok() {
+                    return retried;
+                }
+            }
             self.fields = fields_snapshot;
         }
         result
@@ -702,13 +713,25 @@ fn classify(line: &str) -> Submission {
     if let Some((decls, body)) = parse_declaration(trimmed) {
         return Submission::Declaration { decls, body };
     }
-    if trimmed.ends_with(';') {
+    if trimmed.ends_with(';') || looks_like_declaration(trimmed) {
         return Submission::Statement {
             body: trimmed.to_owned(),
         };
     }
     Submission::Expression {
         body: format!("System.Console.WriteLine({});", trimmed.trim_end()),
+    }
+}
+
+fn looks_like_declaration(line: &str) -> bool {
+    match split_type_token(line) {
+        Some((type_text, after)) => {
+            is_plausible_type(type_text)
+                && after
+                    .trim_start()
+                    .starts_with(|c: char| c.is_alphabetic() || c == '_')
+        }
+        None => false,
     }
 }
 
@@ -1160,6 +1183,9 @@ mod tests {
         }
         assert!(matches!(classify("x == 5"), Submission::Expression { .. }));
         assert!(matches!(classify("x = 5;"), Submission::Statement { .. }));
+        assert!(matches!(classify("int x = 5"), Submission::Statement { .. }));
+        assert!(matches!(classify("Foo bar"), Submission::Statement { .. }));
+        assert!(matches!(classify("x = 5"), Submission::Expression { .. }));
     }
 
     #[test]

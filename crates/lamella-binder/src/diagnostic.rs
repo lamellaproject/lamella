@@ -121,6 +121,8 @@ pub enum DiagnosticKind {
     },
     /// `CS0139`: a `break`/`continue` with no enclosing loop (or switch, for `break`).
     NoEnclosingLoop,
+    /// `CS0017`: the program declares more than one entry point (two or more valid `static Main`).
+    MultipleEntryPoints,
     /// `CS0428`: a method group is used where a non-delegate type is expected (it was not
     /// invoked and does not convert to the target).
     MethodGroupToNonDelegate {
@@ -305,6 +307,7 @@ impl DiagnosticKind {
             DiagnosticKind::Inaccessible { .. } => 122,
             DiagnosticKind::EventOutsideAddRemove { .. } => 70,
             DiagnosticKind::NoEnclosingLoop => 139,
+            DiagnosticKind::MultipleEntryPoints => 17,
             DiagnosticKind::MethodGroupToNonDelegate { .. } => 428,
             DiagnosticKind::ConstantExpected => 150,
             DiagnosticKind::DuplicateCaseLabel { .. } => 152,
@@ -411,6 +414,11 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NoEnclosingLoop => {
                 write!(f, "No enclosing loop out of which to break or continue")
             }
+            DiagnosticKind::MultipleEntryPoints => write!(
+                f,
+                "Program has more than one entry point defined. Compile with /main to specify \
+                 the type that contains the entry point"
+            ),
             DiagnosticKind::MethodGroupToNonDelegate { method, target } => write!(
                 f,
                 "Cannot convert method group '{method}' to non-delegate type '{target}'"

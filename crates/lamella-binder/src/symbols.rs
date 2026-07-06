@@ -69,6 +69,12 @@ pub struct PropertySymbol {
     pub is_static: bool,
     /// The property's accessibility.
     pub accessibility: Accessibility,
+    /// Whether this declaration provides a `get` accessor. A partially-overridden property may
+    /// declare only one accessor and inherit the other, so each accessor is named on the type
+    /// that declares it (14.5.4).
+    pub has_getter: bool,
+    /// Whether this declaration provides a `set` accessor.
+    pub has_setter: bool,
 }
 
 /// A field-like event of a type (17.7): its `add`/`remove` accessors combine/remove a
@@ -220,6 +226,21 @@ impl Model {
     pub fn get(&self, namespace: &str, name: &str) -> Option<&TypeInfo> {
         self.types
             .get(&(String::from(namespace), String::from(name)))
+    }
+
+    /// The number of program entry points declared in THIS compilation (10.1): a `static Main`
+    /// returning `void` or `int` and taking no parameters or a single `string[]`. Types loaded
+    /// from a reference assembly are excluded. Two or more is a CS0017 (multiple entry points).
+    #[must_use]
+    pub fn entry_point_count(&self) -> usize {
+        self.types
+            .values()
+            .filter(|info| !info.is_external)
+            .flat_map(|info| info.methods.iter())
+            .filter(|method| {
+                &*method.name == "Main" && method.is_static && is_entry_point_method(method)
+            })
+            .count()
     }
 
     /// The type a [`TypeSymbol`] refers to, if present. A predefined type resolves
@@ -478,6 +499,22 @@ impl SignatureCanon {
 }
 
 /// Splits a type's dotted name parts into its namespace and simple name.
+/// Whether `method` has a valid program-entry-point signature (10.1): it returns `void` or `int`
+/// and takes no parameters or a single one-dimensional `string[]`. The caller checks the name is
+/// `Main` and it is `static`.
+fn is_entry_point_method(method: &MethodSymbol) -> bool {
+    let return_ok = method.return_type.is_void()
+        || matches!(method.return_type, TypeSymbol::Special(SpecialType::Int32));
+    let parameters_ok = match method.parameters.as_slice() {
+        [] => true,
+        [TypeSymbol::Array { element, rank: 1 }] => {
+            matches!(**element, TypeSymbol::Special(SpecialType::String))
+        }
+        _ => false,
+    };
+    return_ok && parameters_ok
+}
+
 fn split_named(parts: &[Box<str>]) -> (String, &str) {
     match parts.split_last() {
         Some((name, namespace_parts)) => {

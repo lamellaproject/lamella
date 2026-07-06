@@ -50,6 +50,8 @@ pub(crate) fn machine_pin_const(name: &str) -> Option<u32> {
     }
 }
 
+/// The `digitalio.Direction` constant for `name` -- `OUTPUT`/`INPUT`, valued to match
+/// the `Pin` mode words so `led.direction == Direction.OUTPUT` compares directly.
 pub(crate) fn direction_const(name: &str) -> Option<u32> {
     match name {
         "OUTPUT" => Some(PIN_MODE_OUTPUT),

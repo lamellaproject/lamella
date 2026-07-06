@@ -132,9 +132,13 @@ pub enum BoundExprKind {
     PropertyAccess {
         /// The receiver the property is read from.
         receiver: Box<BoundExpr>,
-        /// The type that declares the property (a base, for an inherited one) -- the
-        /// `get_`/`set_` accessor is named on it, not the receiver's static type.
+        /// The type that declares the `get_` accessor (a base, for an inherited getter) -- it is
+        /// named on that type, not the receiver's static type. A partially-overridden property
+        /// (e.g. a `sealed override { set; }` that inherits its getter) declares its two accessors
+        /// on DIFFERENT types, so the setter carries its own (14.5.4).
         declaring_type: TypeSymbol,
+        /// The type that declares the `set_` accessor.
+        setter_declaring_type: TypeSymbol,
         /// The property name.
         name: Box<str>,
     },
@@ -621,7 +625,7 @@ impl Binder {
         for owner in [from, to] {
             for method in self.methods_in_chain(owner, name) {
                 if method.parameters.len() == 1
-                    && &method.parameters[0] == from
+                    && converts(&self.model, from, &method.parameters[0])
                     && &method.return_type == to
                 {
                     let declaring_type =
@@ -1545,17 +1549,28 @@ impl Binder {
                 operand,
                 target,
             } => {
+                let span = target.span;
                 let operand = self.bind_expression(operand);
-                let target = self.resolve_named_type(&bind_type(target), target.span);
+                let resolved = self.resolve_named_type(&bind_type(target), span);
+                if operand.ty.is_void() && matches!(operation, TypeTestOperation::As) {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::CannotCast {
+                            from: operand.ty.to_string().into(),
+                            to: resolved.to_string().into(),
+                        },
+                        span,
+                    ));
+                    return error_expr();
+                }
                 let ty = match operation {
                     TypeTestOperation::Is => TypeSymbol::Special(SpecialType::Boolean),
-                    TypeTestOperation::As => target.clone(),
+                    TypeTestOperation::As => resolved.clone(),
                 };
                 BoundExpr {
                     kind: BoundExprKind::TypeTest {
                         operation: *operation,
                         operand: Box::new(operand),
-                        target,
+                        target: resolved,
                     },
                     ty,
                 }
@@ -2761,10 +2776,13 @@ impl Binder {
             } => {
                 self.check_accessible(&declaring_type, accessibility, name, span);
                 self.check_static_instance(receiver_kind, is_static, &declaring_type, name, span);
+                let (getter_declaring, setter_declaring) =
+                    self.property_accessor_declarers(&receiver.ty, name);
                 BoundExpr {
                     kind: BoundExprKind::PropertyAccess {
                         receiver: Box::new(receiver),
-                        declaring_type,
+                        declaring_type: getter_declaring,
+                        setter_declaring_type: setter_declaring,
                         name: name.into(),
                     },
                     ty,
@@ -3660,15 +3678,17 @@ impl Binder {
                     });
                 }
                 MemberResolution::Property {
-                    declaring_type,
                     ty: property_ty,
                     is_static: true,
                     ..
                 } => {
+                    let (getter_declaring, setter_declaring) =
+                        self.property_accessor_declarers(&ty, name);
                     return Some(BoundExpr {
                         kind: BoundExprKind::PropertyAccess {
                             receiver: type_reference(),
-                            declaring_type,
+                            declaring_type: getter_declaring,
+                            setter_declaring_type: setter_declaring,
                             name: name.into(),
                         },
                         ty: property_ty,
@@ -4028,6 +4048,54 @@ impl Binder {
         }
     }
 
+    /// The types that declare a property's `get_`/`set_` accessors, reached from `receiver_ty`.
+    /// They differ for a partially-overridden property -- a `sealed override { set; }` inherits its
+    /// getter -- so each accessor is named on the most-derived type whose declaration of the
+    /// property provides it (14.5.4). For a whole property both are the property's own declaring
+    /// type. Walks the property up the base chain because accessors are not model `methods`.
+    fn property_accessor_declarers(
+        &self,
+        receiver_ty: &TypeSymbol,
+        name: &str,
+    ) -> (TypeSymbol, TypeSymbol) {
+        let fallback = member_lookup_type(receiver_ty);
+        let mut getter: Option<TypeSymbol> = None;
+        let mut setter: Option<TypeSymbol> = None;
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut pending = alloc::vec![fallback.clone()];
+        while let Some(ty) = pending.pop() {
+            if visited.contains(&ty) {
+                continue;
+            }
+            visited.push(ty.clone());
+            let Some(info) = self.type_info_of(&ty) else {
+                continue;
+            };
+            if let Some(property) = info.find_property(name) {
+                let declaring = type_symbol_in(&info.namespace, &info.name);
+                if getter.is_none() && property.has_getter {
+                    getter = Some(declaring.clone());
+                }
+                if setter.is_none() && property.has_setter {
+                    setter = Some(declaring);
+                }
+            }
+            if getter.is_some() && setter.is_some() {
+                break;
+            }
+            for base in &info.bases {
+                pending.push(base.clone());
+            }
+            if let Some(base) = &info.base {
+                pending.push(base.clone());
+            }
+        }
+        (
+            getter.unwrap_or_else(|| fallback.clone()),
+            setter.unwrap_or(fallback),
+        )
+    }
+
     /// The type a resolved method reference should name: the most-derived type from
     /// `ty` up its base chain that declares the method `name(parameters)`. An override
     /// names the deriving type; a method only inherited names the base that declares
@@ -4134,7 +4202,6 @@ impl Binder {
                     };
                 }
                 MemberResolution::Property {
-                    declaring_type,
                     ty,
                     is_static,
                     ..
@@ -4147,10 +4214,13 @@ impl Binder {
                     } else {
                         self.implicit_receiver()
                     };
+                    let (getter_declaring, setter_declaring) =
+                        self.property_accessor_declarers(&current, name);
                     return BoundExpr {
                         kind: BoundExprKind::PropertyAccess {
                             receiver: Box::new(receiver),
-                            declaring_type,
+                            declaring_type: getter_declaring,
+                            setter_declaring_type: setter_declaring,
                             name: name.into(),
                         },
                         ty,

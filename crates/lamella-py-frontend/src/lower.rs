@@ -917,7 +917,8 @@ fn lower_op(
                 | bc::Const::KwNames(_)
                 | bc::Const::ArgKinds(_)
                 | bc::Const::Imaginary(_)
-                | bc::Const::BigInt(_) => {
+                | bc::Const::BigInt(_)
+                | bc::Const::Bytes(_) => {
                     return Err(LowerError::UnsupportedConst);
                 }
                 bc::Const::Float(_) => unreachable!("a float constant is materialized above"),
@@ -1142,7 +1143,10 @@ fn lower_op(
         | bc::Op::DictInsert
         | bc::Op::LoadSuper(_)
         | bc::Op::BuildSet(_)
-        | bc::Op::UnpackEx { .. } => {
+        | bc::Op::UnpackEx { .. }
+        | bc::Op::LoadDeref(_)
+        | bc::Op::StoreDeref(_)
+        | bc::Op::LoadClosure(_) => {
             return Err(LowerError::DynamicOperation);
         }
         bc::Op::PopTop => {

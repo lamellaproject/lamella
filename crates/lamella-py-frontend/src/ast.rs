@@ -92,6 +92,8 @@ pub enum Expr {
     Imaginary(u64),
     /// An integer literal too large for `i64` -- its decimal digits. Dynamic (an arbitrary-precision int).
     BigInt(String),
+    /// A bytes literal `b"..."` -- its decoded bytes. Dynamic (a heap `bytes`).
+    Bytes(Vec<u8>),
     /// A string literal (its decoded value). A dynamic value -- no typed AOT lowering.
     Str(String),
     /// A `True` or `False` literal.

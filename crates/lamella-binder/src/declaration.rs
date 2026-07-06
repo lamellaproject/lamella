@@ -463,12 +463,16 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 modifiers,
                 ty,
                 name,
+                getter,
+                setter,
                 ..
             } => info.properties.push(PropertySymbol {
                 name: name.clone(),
                 ty: bind_type(ty),
                 is_static: is_static(modifiers),
                 accessibility: access(modifiers),
+                has_getter: getter.is_some(),
+                has_setter: setter.is_some(),
             }),
             Member::Indexer {
                 modifiers,

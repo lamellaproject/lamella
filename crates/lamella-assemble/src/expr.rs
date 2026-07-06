@@ -176,6 +176,7 @@ pub fn emit_expression(
             receiver,
             declaring_type,
             name,
+            ..
         } => emit_property_load(receiver, declaring_type, name, frame, tokens, out),
         BoundExprKind::This | BoundExprKind::Base => {
             out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
@@ -259,6 +260,10 @@ pub fn emit_expression(
             target,
         } => {
             emit_expression(operand, frame, tokens, out)?;
+            if operand.ty.is_void() {
+                out.push(load_i4(0));
+                return Ok(());
+            }
             if is_value_type(&operand.ty, tokens) {
                 let box_token = tokens.type_token(&operand.ty).ok_or(EmitError::Unsupported(
                     "boxing a value type for a type test with no metadata token",
@@ -303,12 +308,13 @@ pub fn emit_expression(
             }
             BoundExprKind::PropertyAccess {
                 receiver,
-                declaring_type,
+                setter_declaring_type,
                 name,
+                ..
             } => emit_property_store(
                 &target.ty,
                 receiver,
-                declaring_type,
+                setter_declaring_type,
                 name,
                 value,
                 true,

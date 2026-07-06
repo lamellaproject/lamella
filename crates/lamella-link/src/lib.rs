@@ -489,6 +489,7 @@ fn apply_relocation(
                 Ok(())
             }
             riscv::R_RISCV_32 => apply_abs32(text, site, text_base, target + addend, false),
+            riscv::R_LAMELLA_REL_DESC => encode_rel32(text, site, target + addend - site_i),
             other => Err(LinkError::UnsupportedRelocation(other)),
         },
         Machine::Arm => match r.kind {
@@ -1320,6 +1321,52 @@ mod tests {
             &img.text[8..16],
             &[0x13, 0x05, 0xa0, 0x02, 0x67, 0x80, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn resolves_a_riscv_rel_desc_data_word() {
+        let desc = obj(
+            &[0xAA, 0xBB, 0xCC, 0xDD],
+            &[Symbol {
+                name: "desc",
+                value: 0,
+                size: 4,
+                binding: Binding::Global,
+                kind: SymbolType::NoType,
+                section: SymbolSection::Text,
+            }],
+            &[],
+        );
+        let caller = obj(
+            &[0, 0, 0, 0],
+            &[
+                Symbol {
+                    name: "caller",
+                    value: 0,
+                    size: 4,
+                    binding: Binding::Global,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::Text,
+                },
+                Symbol {
+                    name: "desc",
+                    value: 0,
+                    size: 0,
+                    binding: Binding::Global,
+                    kind: SymbolType::NoType,
+                    section: SymbolSection::Undefined,
+                },
+            ],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: riscv::R_LAMELLA_REL_DESC,
+                addend: 12,
+            }],
+        );
+        let img = link(&[caller, desc], "caller").unwrap();
+        let slot = u32::from_le_bytes([img.text[0], img.text[1], img.text[2], img.text[3]]);
+        assert_eq!(slot, 16, "REL_DESC resolves to S + A - P (4 + 12 - 0)");
     }
 
     #[test]

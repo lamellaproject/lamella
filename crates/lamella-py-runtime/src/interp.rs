@@ -42,6 +42,11 @@ pub struct Frame {
     /// cleared by `PopExcept` -- or `None`. A GC root while set (traced by [`Frame::trace`]), so an
     /// allocation inside a handler body cannot free the in-flight exception out from under it.
     active_exception: Option<Value>,
+    /// The deref array for closures: `[0 .. cellvars.len())` are this frame's OWN cells (locals a
+    /// nested function captures), then the captured cells the closure carried in. `LoadDeref` /
+    /// `StoreDeref` / `LoadClosure` index it; empty for a function with no cell/free variables. Each
+    /// slot is a `Cell` (a heap object), so all are GC roots (traced by [`Frame::trace`]).
+    derefs: Vec<Value>,
 }
 
 impl Frame {
@@ -62,6 +67,7 @@ impl Frame {
             stack: Vec::new(),
             caches,
             active_exception: None,
+            derefs: Vec::new(),
         }
     }
 
@@ -74,6 +80,7 @@ impl Frame {
         self.stack.clear();
         self.caches.clear();
         self.active_exception = None;
+        self.derefs.clear();
     }
 
     /// Pushes a value onto the evaluation stack.
@@ -111,6 +118,9 @@ impl Frame {
         for slot in self.stack.iter_mut() {
             Value::trace_slot(slot, visit);
         }
+        for slot in self.derefs.iter_mut() {
+            Value::trace_slot(slot, visit);
+        }
         if let Some(exc) = self.active_exception.as_mut() {
             Value::trace_slot(exc, visit);
         }
@@ -138,7 +148,8 @@ fn const_value(c: &Const) -> Result<Value, Trap> {
         | Const::ArgKinds(_)
         | Const::Float(_)
         | Const::Imaginary(_)
-        | Const::BigInt(_) => Err(Trap::Unsupported),
+        | Const::BigInt(_)
+        | Const::Bytes(_) => Err(Trap::Unsupported),
     }
 }
 
@@ -239,9 +250,8 @@ pub(crate) fn binary(op: BinOp, a: Value, b: Value, model: &mut ObjectModel) -> 
 }
 
 /// Evaluates a binary operator with an arbitrary-precision `int` operand (or an i128 op that
-/// overflowed): `+ - *` and floor division / modulo in full `BigInt` precision, normalized back down
-/// to the smallest int tier. Shifts and the bitwise operators on a `bigint` are a follow-on
-/// increment, so a huge operand there is a clean `OverflowError` until they land.
+/// overflowed): `+ - *`, floor division / modulo, shifts, and the bitwise operators in full
+/// `BigInt` precision, normalized back down to the smallest int tier.
 fn bigint_binary(op: BinOp, a: Value, b: Value, model: &mut ObjectModel) -> Result<Value, Trap> {
     let x = model.as_bigint(a).ok_or(Trap::TypeError)?;
     let y = model.as_bigint(b).ok_or(Trap::TypeError)?;
@@ -779,8 +789,9 @@ enum Flow {
     /// pushes a new [`Frame`] onto the explicit frame stack, so a deep Python call chain never
     /// grows the native stack. Only a DIRECT call of a plain or defaulted Python function
     /// reaches here; builtins, bound methods, class init, and dunders stay on [`call_value`]
-    /// (bounded native recursion).
-    Call { index: u32, args: Vec<Value> },
+    /// (bounded native recursion). `cells` are the captured cells if the callee is a closure
+    /// (empty otherwise); the driver seeds the freevar half of the new frame's deref array with them.
+    Call { index: u32, args: Vec<Value>, cells: Vec<Value> },
     /// The current (generator) frame yielded `value`: [`drive`] stops and returns it, leaving the
     /// yielding frame on top of the stack for the resumer to re-suspend. Reached only during a
     /// generator resume -- a generator function's body runs nowhere else.
@@ -826,7 +837,7 @@ fn invoke_function(
 ) -> Result<Value, Trap> {
     let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
     if code.is_generator {
-        let generator = new_frame(code, CodeId::Func(index), args, false, model)?;
+        let generator = new_frame(code, CodeId::Func(index), args, false, &[], model)?;
         model.new_generator(generator)
     } else {
         run_frames(code, functions, args, model, false, depth)
@@ -895,8 +906,7 @@ pub(crate) fn call_value(
 /// Dispatches a call carrying KEYWORD arguments (`Op::CallKw`). Like [`call_value`] but binds
 /// `posargs` + `kwargs` (+ any defaults) to the callee's parameters via [`bind_arguments`]. Handles
 /// Python functions (plain + defaulted), bound methods, and class instantiation. A keyword call to a
-/// BUILT-IN is not wired yet (the kwarg-aware built-in surface -- `sorted(key=)`, `dict(a=1)` -- is a
-/// follow-on); positional built-in calls use `Op::Call`.
+/// BUILT-IN is not supported (built-ins take positional arguments via `Op::Call`).
 fn call_value_kw(
     callee: Value,
     posargs: &[Value],
@@ -984,8 +994,7 @@ fn list_sort_kw(
 /// producing exactly `code.params.len()` locals -- CPython's call binding (Language Reference
 /// 6.3.4). `defaults` fill the TRAILING positional parameters; a keyword binds by name to a
 /// `pos_or_keyword` parameter. Pure over `Value`s + the code object (the caller pre-extracts the
-/// defaults tuple). Keyword-only parameters and `*args`/`**kwargs` are later increments.
-/// Slot layout is `[regular.., *args?, keyword-only.., **kwargs?]`.
+/// defaults tuple). The slot layout is `[regular.., *args?, keyword-only.., **kwargs?]`.
 fn bind_arguments(
     code: &CodeObject,
     posargs: &[Value],
@@ -1236,7 +1245,7 @@ pub(crate) fn iterator_for(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    if model.is_generator(value) {
+    if model.is_generator(value) || model.is_lazy_iter(value) {
         return Ok(value);
     }
     if let Some(iter_method) = model.find_dunder(value, "__iter__") {
@@ -1268,6 +1277,8 @@ pub(crate) fn py_next_value(
     if model.is_generator(iterator) {
         let value = resume_generator(iterator, Resume::Send(Value::NONE), functions, model, depth)?;
         Ok(if value.is_stop() { None } else { Some(value) })
+    } else if model.is_lazy_iter(iterator) {
+        lazy_iter_next(iterator, functions, model, depth)
     } else if let Some(next_method) = model.find_dunder(iterator, "__next__") {
         match call_value(next_method, &[], functions, model, depth) {
             Ok(value) => Ok(Some(value)),
@@ -1279,6 +1290,73 @@ pub(crate) fn py_next_value(
         }
     } else {
         model.py_next(iterator)
+    }
+}
+
+/// Advances a lazy `map`/`filter`/`zip`/`enumerate` one step, pulling from its source iterator(s)
+/// and applying its function. `None` when a source is exhausted.
+fn lazy_iter_next(
+    iterator: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    let sources = model.lazy_iter_sources(iterator);
+    match model.lazy_iter_kind(iterator) {
+        crate::object::LAZY_MAP => {
+            let mut row = Vec::with_capacity(sources.len());
+            for source in &sources {
+                match py_next_value(*source, functions, model, depth)? {
+                    Some(value) => row.push(value),
+                    None => return Ok(None),
+                }
+            }
+            let func = model.lazy_iter_state(iterator);
+            Ok(Some(call_value(func, &row, functions, model, depth)?))
+        }
+        crate::object::LAZY_FILTER => {
+            let source = sources[0];
+            let func = model.lazy_iter_state(iterator);
+            loop {
+                let Some(value) = py_next_value(source, functions, model, depth)? else {
+                    return Ok(None);
+                };
+                let keep = if func.is_none() {
+                    py_truthy_dyn(value, functions, model, depth)?
+                } else {
+                    let result = call_value(func, &[value], functions, model, depth)?;
+                    py_truthy_dyn(result, functions, model, depth)?
+                };
+                if keep {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        crate::object::LAZY_ZIP => {
+            if sources.is_empty() {
+                return Ok(None);
+            }
+            let mut row = Vec::with_capacity(sources.len());
+            for source in &sources {
+                match py_next_value(*source, functions, model, depth)? {
+                    Some(value) => row.push(value),
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(model.new_tuple(row)?))
+        }
+        crate::object::LAZY_ENUMERATE => {
+            let source = sources[0];
+            let Some(value) = py_next_value(source, functions, model, depth)? else {
+                return Ok(None);
+            };
+            let count = model.lazy_iter_state(iterator);
+            let pair = model.new_tuple(alloc::vec![count, value])?;
+            let next = model.new_long(model.as_i128(count).unwrap_or(0) + 1)?;
+            model.lazy_iter_set_state(iterator, next);
+            Ok(Some(pair))
+        }
+        _ => Err(Trap::TypeError),
     }
 }
 
@@ -1303,6 +1381,7 @@ fn new_frame(
     id: CodeId,
     args: &[Value],
     is_module: bool,
+    captured_cells: &[Value],
     model: &mut ObjectModel,
 ) -> Result<Frame, Trap> {
     if args.len() != code.params.len() {
@@ -1326,6 +1405,18 @@ fn new_frame(
     for (i, arg) in args.iter().enumerate() {
         frame.locals[i] = *arg;
     }
+    frame.derefs.clear();
+    for cellvar in &code.cellvars {
+        let init = code
+            .local_names
+            .iter()
+            .position(|name| name == cellvar)
+            .filter(|&slot| slot < code.params.len())
+            .map_or(Value::UNBOUND, |slot| frame.locals[slot]);
+        let cell = model.new_cell(init)?;
+        frame.derefs.push(cell);
+    }
+    frame.derefs.extend_from_slice(captured_cells);
     Ok(frame)
 }
 
@@ -1352,7 +1443,7 @@ fn run_frames(
         return Err(Trap::RecursionError);
     }
     let mut frames: Vec<Frame> = Vec::new();
-    frames.push(new_frame(entry, CodeId::Entry, args, is_module, model)?);
+    frames.push(new_frame(entry, CodeId::Entry, args, is_module, &[], model)?);
     match drive(&mut frames, entry, functions, model, depth)? {
         DriveOutcome::Returned(value) => Ok(value),
         DriveOutcome::Yielded(_) => Err(Trap::Malformed),
@@ -1396,6 +1487,7 @@ fn drive(
                             .ok_or(Trap::Malformed)?;
                         model.new_bigint(big)?
                     }
+                    Const::Bytes(data) => model.new_bytes(data.clone())?,
                     other => const_value(other)?,
                 };
                 frame.push(value);
@@ -1587,21 +1679,22 @@ fn drive(
                         call_args
                     };
                     if callee_code.is_generator {
-                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, model)?;
+                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &[], model)?;
                         frame.push(model.new_generator(generator)?);
                     } else {
-                        return Ok(Flow::Call { index, args: bound });
+                        return Ok(Flow::Call { index, args: bound, cells: Vec::new() });
                     }
                 } else if model.is_py_function(callee) {
                     let index = model.py_function_index(callee);
                     let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
                     let defaults = model.py_function_defaults(callee);
                     let bound = bind_arguments(callee_code, &call_args, &[], &defaults, model)?;
+                    let cells = model.py_function_cells(callee);
                     if callee_code.is_generator {
-                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, model)?;
+                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &cells, model)?;
                         frame.push(model.new_generator(generator)?);
                     } else {
-                        return Ok(Flow::Call { index, args: bound });
+                        return Ok(Flow::Call { index, args: bound, cells });
                     }
                 } else {
                     let result = call_value(callee, &call_args, functions, model, depth + 1)?;
@@ -1611,9 +1704,12 @@ fn drive(
             Op::Return => return Ok(Flow::Return(frame.pop()?)),
             Op::Raise(argc) => {
                 let exception = if argc == 2 {
-                    let _cause = frame.pop()?;
+                    let cause = frame.pop()?;
                     let value = frame.pop()?;
-                    model.raise_value(value)?
+                    let exception = model.raise_value(value)?;
+                    let cause = if model.is_class(cause) { model.new_object(cause)? } else { cause };
+                    model.py_setattr_instance(exception, "__cause__", cause)?;
+                    exception
                 } else if argc == 1 {
                     let value = frame.pop()?;
                     model.raise_value(value)?
@@ -1656,9 +1752,25 @@ fn drive(
                 if flags == 0 {
                     frame.push(Value::function_ref(index));
                 } else {
+                    let cells = if flags & 0x04 != 0 {
+                        let ncells =
+                            functions.get(index as usize).ok_or(Trap::Malformed)?.freevars.len();
+                        let mut cells = Vec::with_capacity(ncells);
+                        for _ in 0..ncells {
+                            cells.push(frame.pop()?);
+                        }
+                        cells.reverse();
+                        Some(model.new_tuple(cells)?)
+                    } else {
+                        None
+                    };
                     let kwdefaults = if flags & 0x02 != 0 { frame.pop()? } else { Value::NONE };
                     let defaults = if flags & 0x01 != 0 { frame.pop()? } else { Value::NONE };
-                    frame.push(model.new_py_function(index, defaults, kwdefaults)?);
+                    let function = match cells {
+                        Some(cells) => model.new_closure(index, defaults, kwdefaults, cells)?,
+                        None => model.new_py_function(index, defaults, kwdefaults)?,
+                    };
+                    frame.push(function);
                 }
             }
             Op::CallKw { argc, kwnames } => {
@@ -1683,21 +1795,22 @@ fn drive(
                     let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
                     let bound = bind_arguments(callee_code, &call_args, &kwargs, &[], model)?;
                     if callee_code.is_generator {
-                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, model)?;
+                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &[], model)?;
                         frame.push(model.new_generator(generator)?);
                     } else {
-                        return Ok(Flow::Call { index, args: bound });
+                        return Ok(Flow::Call { index, args: bound, cells: Vec::new() });
                     }
                 } else if model.is_py_function(callee) {
                     let index = model.py_function_index(callee);
                     let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
                     let defaults = model.py_function_defaults(callee);
                     let bound = bind_arguments(callee_code, &call_args, &kwargs, &defaults, model)?;
+                    let cells = model.py_function_cells(callee);
                     if callee_code.is_generator {
-                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, model)?;
+                        let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &cells, model)?;
                         frame.push(model.new_generator(generator)?);
                     } else {
-                        return Ok(Flow::Call { index, args: bound });
+                        return Ok(Flow::Call { index, args: bound, cells });
                     }
                 } else {
                     let result =
@@ -1778,7 +1891,11 @@ fn drive(
             Op::DeleteItem => {
                 let index = frame.pop()?;
                 let container = frame.pop()?;
-                model.py_delitem(container, index)?;
+                if let Some(method) = model.find_dunder(container, "__delitem__") {
+                    call_value(method, &[index], functions, model, depth + 1)?;
+                } else {
+                    model.py_delitem(container, index)?;
+                }
             }
             Op::DeleteAttr { name } => {
                 let object = frame.pop()?;
@@ -1836,6 +1953,19 @@ fn drive(
                 elements.reverse();
                 frame.push(model.new_set(elements)?);
             }
+            Op::LoadDeref(idx) => {
+                let cell = *frame.derefs.get(idx as usize).ok_or(Trap::Malformed)?;
+                frame.push(model.cell_get(cell)?);
+            }
+            Op::StoreDeref(idx) => {
+                let value = frame.pop()?;
+                let cell = *frame.derefs.get(idx as usize).ok_or(Trap::Malformed)?;
+                model.cell_set(cell, value)?;
+            }
+            Op::LoadClosure(idx) => {
+                let cell = *frame.derefs.get(idx as usize).ok_or(Trap::Malformed)?;
+                frame.push(cell);
+            }
             }
             Ok(Flow::Next)
         })();
@@ -1851,12 +1981,12 @@ fn drive(
                 }
             }
             Ok(Flow::Yield(value)) => return Ok(DriveOutcome::Yielded(value)),
-            Ok(Flow::Call { index, args }) => {
+            Ok(Flow::Call { index, args, cells }) => {
                 let callee = functions.get(index as usize).ok_or(Trap::Malformed)?;
                 if frames.len() >= MAX_CALL_DEPTH {
                     return Err(Trap::RecursionError);
                 }
-                frames.push(new_frame(callee, CodeId::Func(index), &args, false, model)?);
+                frames.push(new_frame(callee, CodeId::Func(index), &args, false, &cells, model)?);
             }
             Err(trap) => {
                 let exception = match model.take_pending_exception() {
@@ -1901,10 +2031,10 @@ mod tests {
     fn frame_pool_recycles_buffers() {
         let mut model = no_objects();
         let c = code(2, 0, vec![], vec![], 0, vec![]);
-        let f1 = new_frame(&c, CodeId::Entry, &[], false, &mut model).unwrap();
+        let f1 = new_frame(&c, CodeId::Entry, &[], false, &[], &mut model).unwrap();
         let cap = f1.locals.capacity();
         model.recycle_frame(f1);
-        let f2 = new_frame(&c, CodeId::Func(0), &[], false, &mut model).unwrap();
+        let f2 = new_frame(&c, CodeId::Func(0), &[], false, &[], &mut model).unwrap();
         assert_eq!(f2.locals.len(), 2);
         assert!(f2.locals.iter().all(|v| v.is_unbound()));
         assert_eq!(f2.locals.capacity(), cap);
@@ -1961,6 +2091,8 @@ mod tests {
             ret_ty: StaticType::Dynamic,
             n_locals,
             local_names: (0..n_locals).map(|i| format!("v{i}")).collect(),
+            cellvars: Vec::new(),
+            freevars: Vec::new(),
             local_types: vec![StaticType::Dynamic; n_locals],
             consts,
             names,
@@ -2069,6 +2201,46 @@ mod tests {
         assert!(model.is_py_function(pyfunc));
         assert_eq!(model.py_function_index(pyfunc), 0);
         assert_eq!(model.py_function_defaults(pyfunc), vec![Value::fixnum(10).unwrap()]);
+    }
+
+    #[test]
+    fn closure_reads_a_captured_enclosing_local() {
+        use Op::*;
+        let mut inner = code(0, 0, vec![Const::Int(1)], Vec::new(), 0,
+            vec![LoadDeref(0), LoadConst(0), Binary(BinOp::Add), Return]);
+        inner.name = String::from("inner");
+        inner.freevars = vec![String::from("v0")];
+        let mut outer = code(2, 1, Vec::new(), vec![String::from("inner")], 0,
+            vec![LoadClosure(0), MakeFunction { func: 0, flags: 0x04 }, StoreFast(1), LoadFast(1), Return]);
+        outer.name = String::from("outer");
+        outer.cellvars = vec![String::from("v0")];
+        let entry = code(0, 0, vec![Const::Int(10)], vec![String::from("outer")], 0,
+            vec![MakeFunction { func: 0, flags: 0 }, LoadConst(0), Call(1), Call(0), Return]);
+        let functions = [outer, inner];
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let result = run(&entry, &functions, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(11));
+    }
+
+    #[test]
+    fn closure_shares_a_mutable_cell_across_calls() {
+        use Op::*;
+        let mut inc = code(0, 0, vec![Const::Int(1)], Vec::new(), 0,
+            vec![LoadDeref(0), LoadConst(0), Binary(BinOp::Add), StoreDeref(0), LoadDeref(0), Return]);
+        inc.name = String::from("inc");
+        inc.freevars = vec![String::from("v0")];
+        let mut make_counter = code(2, 0, vec![Const::Int(0)], vec![String::from("inc")], 0,
+            vec![LoadConst(0), StoreDeref(0), LoadClosure(0),
+                 MakeFunction { func: 0, flags: 0x04 }, StoreFast(1), LoadFast(1), Return]);
+        make_counter.name = String::from("make_counter");
+        make_counter.cellvars = vec![String::from("v0")];
+        let entry = code(1, 0, Vec::new(), vec![String::from("make_counter")], 0,
+            vec![MakeFunction { func: 0, flags: 0 }, Call(0), StoreFast(0),
+                 LoadFast(0), Call(0), LoadFast(0), Call(0), Binary(BinOp::Add), Return]);
+        let functions = [make_counter, inc];
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let result = run(&entry, &functions, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(3));
     }
 
     #[test]

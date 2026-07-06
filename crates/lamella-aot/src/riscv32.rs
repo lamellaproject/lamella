@@ -64,6 +64,94 @@ fn scratch() -> Reg {
 /// static base; a device build threads the linker-provided `.bss` address instead.
 const STATIC_FIELD_BASE: u32 = 0x8030_0000;
 
+/// Marks a call relocation whose target is an EXTERNAL symbol (an `Inst::CallNative`) rather than an
+/// intra-module function index, so `lower_object` maps it to an undefined symbol the linker resolves
+/// from another object. The high bit, disjoint from the small function/extern indices it flags.
+const EXTERN_SYMBOL_FLAG: u32 = 0x8000_0000;
+
+/// Where an allocation's `lamella_gc_alloc(size [a0], &TypeDesc [a1]) -> block* [a0]` call resolves.
+/// The flat image calls a FIXED absolute address (the runtime bump stub baked into the image); the
+/// relocatable object calls an EXTERN symbol the linker resolves against a gc_alloc provider object.
+/// `None` means no allocator is wired, so an allocation is rejected (loud).
+#[derive(Clone, Copy)]
+enum AllocSite {
+    /// No allocator wired: an `Alloc`/`AllocArray`/`AllocArray2D` is `Unsupported`.
+    None,
+    /// Flat path: call the runtime allocator at this fixed absolute address.
+    Address(u32),
+    /// Object path: call the `lamella_gc_alloc` extern at this interned symbol index (an
+    /// `R_RISCV_CALL_PLT` the linker resolves) -- like an `Inst::CallNative` target.
+    Extern(u32),
+}
+
+/// Interns `name` into the module's extern-symbol table, returning its index (deduplicating a repeat).
+/// The RISC-V twin of the ARM backend's helper: a `CallNative { symbol: i }` names `externs[i]`.
+fn intern_extern(externs: &mut Vec<alloc::string::String>, name: &str) -> u32 {
+    if let Some(i) = externs.iter().position(|s| s == name) {
+        i as u32
+    } else {
+        externs.push(name.into());
+        (externs.len() - 1) as u32
+    }
+}
+
+/// Does the function contain a heap allocation (so the object path must wire `lamella_gc_alloc`, and
+/// the spilled frame must save `ra` for the call)?
+fn func_allocates(func: &Function) -> bool {
+    func.blocks.iter().any(|b| {
+        b.insts.iter().any(|(_, i)| {
+            matches!(
+                i,
+                Inst::Alloc { .. } | Inst::AllocArray { .. } | Inst::AllocArray2D { .. }
+            )
+        })
+    })
+}
+
+/// Rewrites each `Inst::PInvoke { import, args }` to an `Inst::CallNative { symbol, args }`, interning
+/// the import name into `externs` -- the object path resolves a P/Invoke through the linker exactly as
+/// it resolves a `CallNative` (the ARM `lower_runtime_calls` PInvoke arm, RISC-V side). Marshalling
+/// P/Invokes (`str_to_native`/`frame_end`) are ordinary imports the same rewrite interns.
+fn rewrite_pinvoke(func: &Function, externs: &mut Vec<alloc::string::String>) -> Function {
+    let mut func = func.clone();
+    for block in &mut func.blocks {
+        for (_, inst) in &mut block.insts {
+            if let Inst::PInvoke { import, args } = inst {
+                let symbol = intern_extern(externs, import);
+                *inst = Inst::CallNative {
+                    symbol,
+                    args: core::mem::take(args),
+                };
+            }
+        }
+    }
+    func
+}
+
+/// Emits the `lamella_gc_alloc` call (a0 = size, a1 = &TypeDesc already set by the caller; result in
+/// a0). The flat path calls the fixed runtime address via a scratch register; the object path emits an
+/// `R_RISCV_CALL_PLT` to the interned extern (like [`emit_call`] of a `CallNative`). No allocator wired
+/// is a loud `Unsupported`.
+fn emit_alloc_call(
+    enc: &mut Encoder,
+    alloc: AllocSite,
+    func_labels: &[Label],
+    relocs: &mut Vec<(u32, u32)>,
+    relocate: bool,
+) -> Result<(), LowerError> {
+    match alloc {
+        AllocSite::None => Err(LowerError::Unsupported),
+        AllocSite::Address(addr) => {
+            enc.li(Reg::T0, addr as i32);
+            enc.jalr(Reg::RA, Reg::T0, 0);
+            Ok(())
+        }
+        AllocSite::Extern(symbol) => {
+            emit_call(enc, func_labels, relocs, relocate, EXTERN_SYMBOL_FLAG | symbol)
+        }
+    }
+}
+
 /// Lowers a single [`Function`] to RV32IM machine code -- a one-function module.
 pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
     lower_module(core::slice::from_ref(func))
@@ -100,7 +188,11 @@ fn lower_module_inner(
     alloc_addr: Option<u32>,
     descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_module_to_image(funcs, alloc_addr, descriptors, false).map(|(bytes, _, _)| bytes)
+    let alloc = match alloc_addr {
+        Some(addr) => AllocSite::Address(addr),
+        None => AllocSite::None,
+    };
+    lower_module_to_image(funcs, alloc, descriptors, false).map(|(bytes, _, _)| bytes)
 }
 
 /// A lowered module: the code bytes, each function's entry offset, and the call relocations as
@@ -135,7 +227,7 @@ type TypeDescs = Vec<DescEmit>;
 /// the basis for the symbol table when emitting a relocatable object.
 fn lower_module_to_image(
     funcs: &[Function],
-    alloc_addr: Option<u32>,
+    alloc: AllocSite,
     descriptors: &[TypeMeta],
     relocate: bool,
 ) -> Result<LoweredModule, LowerError> {
@@ -162,7 +254,7 @@ fn lower_module_to_image(
             &mut enc,
             func,
             &func_labels,
-            alloc_addr,
+            alloc,
             descriptors,
             &mut call_relocs,
             relocate,
@@ -179,9 +271,36 @@ fn lower_module_to_image(
 /// symbol (named by `names[i]`) at its entry offset, and every call becomes an `R_RISCV_CALL_PLT`
 /// relocation to the callee's symbol -- so a linker (ours or another) resolves them and can see the
 /// call graph for `--gc-sections`. `names` must have one entry per function in `funcs`.
-pub fn lower_object(funcs: &[Function], names: &[&str]) -> Result<Vec<u8>, LowerError> {
-    let (text, offsets, call_relocs) = lower_module_to_image(funcs, None, &[], true)?;
-    let symbols: Vec<lamella_elf::Symbol> = (0..funcs.len())
+///
+/// The object path resolves the runtime seams through the linker: a `PInvoke` is rewritten to a
+/// `CallNative` of its import name, a heap allocation calls the `lamella_gc_alloc` extern, and each such
+/// name (plus any the caller passes in `externs`, whose indices lead so a hand-built `CallNative` still
+/// names them) becomes an UNDEFINED symbol. `externs` may be `&[]`; the pass discovers the rest.
+///
+/// `descriptors` are the per-type vtables/itables (the resolver's `type_descriptors()`), laid IN-IMAGE
+/// after each allocating function's code (addressed PC-relatively via `la`, so position-independent
+/// through the link) -- so a dispatched/cast type's `Alloc` writes its `obj-4` descriptor pointer and
+/// `CallVirtual`/`CallInterface`/`castclass` work over the link, exactly as on the flat path. Pass `&[]`
+/// for a module with no dispatch. (The LINKABLE-symbol descriptor lane -- for `--gc-sections` and
+/// cross-assembly vtables -- is a later brick; these in-image descriptors serve self-contained programs.)
+pub fn lower_object(
+    funcs: &[Function],
+    names: &[&str],
+    externs: &[&str],
+    descriptors: &[TypeMeta],
+) -> Result<Vec<u8>, LowerError> {
+    let mut extern_names: Vec<alloc::string::String> = externs.iter().map(|s| (*s).into()).collect();
+    let program: Vec<Function> = funcs
+        .iter()
+        .map(|f| rewrite_pinvoke(f, &mut extern_names))
+        .collect();
+    let alloc = if program.iter().any(func_allocates) {
+        AllocSite::Extern(intern_extern(&mut extern_names, "lamella_gc_alloc"))
+    } else {
+        AllocSite::None
+    };
+    let (text, offsets, call_relocs) = lower_module_to_image(&program, alloc, descriptors, true)?;
+    let mut symbols: Vec<lamella_elf::Symbol> = (0..program.len())
         .map(|i| {
             let end = offsets.get(i + 1).copied().unwrap_or(text.len() as u32);
             lamella_elf::Symbol {
@@ -194,11 +313,25 @@ pub fn lower_object(funcs: &[Function], names: &[&str]) -> Result<Vec<u8>, Lower
             }
         })
         .collect();
+    for name in &extern_names {
+        symbols.push(lamella_elf::Symbol {
+            name: name.as_str(),
+            value: 0,
+            size: 0,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Undefined,
+        });
+    }
     let relocations: Vec<lamella_elf::Relocation> = call_relocs
         .iter()
         .map(|&(offset, callee)| lamella_elf::Relocation {
             offset,
-            symbol: callee,
+            symbol: if callee & EXTERN_SYMBOL_FLAG != 0 {
+                program.len() as u32 + (callee & !EXTERN_SYMBOL_FLAG)
+            } else {
+                callee
+            },
             kind: lamella_elf::riscv::R_RISCV_CALL_PLT,
             addend: 0,
         })
@@ -219,21 +352,14 @@ fn lower_function(
     enc: &mut Encoder,
     func: &Function,
     func_labels: &[Label],
-    alloc_addr: Option<u32>,
+    alloc: AllocSite,
     descriptors: &[TypeMeta],
     relocs: &mut Vec<(u32, u32)>,
     relocate: bool,
 ) -> Result<(), LowerError> {
     let pool = allocatable();
     let value_count = func.value_types.len();
-    let allocates = func.blocks.iter().any(|b| {
-        b.insts.iter().any(|(_, i)| {
-            matches!(
-                i,
-                Inst::Alloc { .. } | Inst::AllocArray { .. } | Inst::AllocArray2D { .. }
-            )
-        })
-    });
+    let allocates = func_allocates(func);
     let has_value_types = func
         .value_types
         .iter()
@@ -251,6 +377,7 @@ fn lower_function(
                     | Inst::LoadTypeDesc { .. }
                     | Inst::TypeDescAddr { .. }
                     | Inst::CastClassScan { .. }
+                    | Inst::CallNative { .. }
             )
         })
     });
@@ -268,7 +395,7 @@ fn lower_function(
             enc,
             func,
             func_labels,
-            alloc_addr,
+            alloc,
             descriptors,
             relocs,
             relocate,
@@ -643,7 +770,7 @@ fn lower_function_spilled(
     enc: &mut Encoder,
     func: &Function,
     func_labels: &[Label],
-    alloc_addr: Option<u32>,
+    alloc: AllocSite,
     descriptors: &[TypeMeta],
     relocs: &mut Vec<(u32, u32)>,
     relocate: bool,
@@ -661,6 +788,7 @@ fn lower_function_spilled(
                     | Inst::InvokeDelegate { .. }
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
+                    | Inst::CallNative { .. }
             )
         })
     });
@@ -719,7 +847,7 @@ fn lower_function_spilled(
                 func_labels,
                 *result,
                 inst,
-                alloc_addr,
+                alloc,
                 descriptors,
                 &mut type_descs,
                 &mut type_desc_labels,
@@ -865,7 +993,7 @@ fn lower_inst_spilled(
     func_labels: &[Label],
     result: ValueId,
     inst: &Inst,
-    alloc_addr: Option<u32>,
+    alloc: AllocSite,
     descriptors: &[TypeMeta],
     type_descs: &mut TypeDescs,
     type_desc_labels: &mut Vec<(TypeHandle, Label)>,
@@ -964,7 +1092,6 @@ fn lower_inst_spilled(
             dim1,
             element_size,
         } => {
-            let alloc = alloc_addr.ok_or(LowerError::Unsupported)?;
             let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
                 Some((_, l)) => *l,
                 None => {
@@ -987,8 +1114,7 @@ fn lower_inst_spilled(
             enc.mul(t0, t0, t1);
             enc.addi(Reg::A0, t0, 8);
             enc.la(Reg::A1, desc_label);
-            enc.li(t0, alloc as i32);
-            enc.jalr(Reg::RA, t0, 0);
+            emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
@@ -1217,7 +1343,6 @@ fn lower_inst_spilled(
             payload_size,
             ref_offsets,
         } => {
-            let alloc = alloc_addr.ok_or(LowerError::Unsupported)?;
             let has_descriptor = !descriptor_vtable(descriptors, *handle).is_empty()
                 || !descriptor_itable(descriptors, *handle).is_empty();
             let desc_label = descriptor_label(
@@ -1231,8 +1356,7 @@ fn lower_inst_spilled(
             );
             enc.li(Reg::A0, (*payload_size + if has_descriptor { 4 } else { 0 }) as i32);
             enc.la(Reg::A1, desc_label);
-            enc.li(t0, alloc as i32);
-            enc.jalr(Reg::RA, t0, 0);
+            emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
@@ -1249,7 +1373,6 @@ fn lower_inst_spilled(
             length,
             element_size,
         } => {
-            let alloc = alloc_addr.ok_or(LowerError::Unsupported)?;
             let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
                 Some((_, l)) => *l,
                 None => {
@@ -1270,8 +1393,7 @@ fn lower_inst_spilled(
             enc.mul(t0, t0, t1);
             enc.addi(Reg::A0, t0, 4);
             enc.la(Reg::A1, desc_label);
-            enc.li(t0, alloc as i32);
-            enc.jalr(Reg::RA, t0, 0);
+            emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
@@ -1291,6 +1413,17 @@ fn lower_inst_spilled(
                 enc.lw(target, Reg::SP, slot(arg));
             }
             emit_call(enc, func_labels, relocs, relocate, *callee)?;
+            enc.sw(Reg::A0, Reg::SP, slot(result));
+        }
+        Inst::CallNative { symbol, args } => {
+            if !relocate {
+                return Err(LowerError::Unsupported);
+            }
+            for (i, &arg) in args.iter().enumerate() {
+                let target = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
+                enc.lw(target, Reg::SP, slot(arg));
+            }
+            emit_call(enc, func_labels, relocs, relocate, EXTERN_SYMBOL_FLAG | *symbol)?;
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         Inst::FuncAddr { func } => {
@@ -1716,7 +1849,8 @@ fn materialize_compare(enc: &mut Encoder, dest: Reg, lhs: Reg, rhs: Reg, op: Cmp
 /// sub-word forms narrow to the low 8/16 bits and re-extend to the 32-bit stack width, signed
 /// (`slli`/`srai` shift pair) or unsigned (`andi` mask / `slli`+`srli`); the reference/integer
 /// reinterprets are a no-op move (both are one machine word). `dest` and `src` may be the same
-/// register (the spilled path converts in `t0`).
+/// register (the spilled path converts in `t0`). Float conversions need the soft-float helpers
+/// (a `CallNative` boundary) and are not lowered yet.
 fn emit_convert(enc: &mut Encoder, dest: Reg, src: Reg, kind: ConvKind) -> Result<(), LowerError> {
     match kind {
         ConvKind::SignExtend8 => {
@@ -2970,6 +3104,48 @@ mod tests {
             )
             .is_ok(),
             "castclass base-pointer chain scan + synthesized ancestor lowers to RV32IM"
+        );
+    }
+
+    #[test]
+    fn lower_object_emits_a_callnative_extern_reloc() {
+        let i32t = MirType::I32;
+        let n = ValueId;
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(i32t),
+            value_types: vec![i32t, i32t],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (n(0), Inst::ConstInt { ty: i32t, value: 14 }),
+                    (
+                        n(1),
+                        Inst::CallNative {
+                            symbol: 0,
+                            args: vec![n(0)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(n(1)))),
+            }],
+        };
+        let bytes =
+            lower_object(&[main], &["main"], &["triple"], &[]).expect("lower_object with extern");
+        let obj = lamella_elf::read_object(&bytes).expect("read the object back");
+        let triple = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "triple")
+            .expect("the extern `triple` symbol is present");
+        assert!(!triple.defined, "`triple` is an undefined extern the linker resolves");
+        assert!(
+            obj.relocations.iter().any(|r| {
+                r.kind == lamella_elf::riscv::R_RISCV_CALL_PLT
+                    && obj.symbols.get(r.symbol as usize).map(|s| s.name.as_str()) == Some("triple")
+            }),
+            "an R_RISCV_CALL_PLT relocation names `triple`"
         );
     }
 

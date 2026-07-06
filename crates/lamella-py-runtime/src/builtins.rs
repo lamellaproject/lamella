@@ -9,7 +9,7 @@ use lamella_py_bytecode::{BinOp, CmpOp, CodeObject};
 
 use crate::bigint::BigInt;
 use crate::interp::{binary, bigint_pow, call_value, iterator_for, py_next_value};
-use crate::object::{InlineCache, ObjectModel};
+use crate::object::{InlineCache, ObjectModel, LAZY_ENUMERATE, LAZY_FILTER, LAZY_MAP, LAZY_ZIP};
 use crate::trap::Trap;
 use crate::value::Value;
 
@@ -128,6 +128,18 @@ pub enum Builtin {
     Issubclass = 49,
     /// `slice([start,] stop[, step])` -- a slice object (as `a[start:stop:step]` builds implicitly).
     Slice = 50,
+    /// `staticmethod(func)` -- a method that receives no implicit first argument.
+    Staticmethod = 51,
+    /// `classmethod(func)` -- a method that receives the class as its first argument.
+    Classmethod = 52,
+    /// `memoryview(obj)` -- a zero-copy 1-D view over a bytes/bytearray buffer.
+    Memoryview = 53,
+    /// `format(value[, spec])` -- render `value` under the format-spec mini-language.
+    Format = 54,
+    /// `int.from_bytes(bytes, byteorder)` -- reached via the `int` type (not a global name).
+    IntFromBytes = 55,
+    /// `bytes.fromhex(str)` -- reached via the `bytes` type (not a global name).
+    BytesFromhex = 56,
 }
 
 impl Builtin {
@@ -187,6 +199,12 @@ impl Builtin {
             48 => Some(Builtin::Bytearray),
             49 => Some(Builtin::Issubclass),
             50 => Some(Builtin::Slice),
+            51 => Some(Builtin::Staticmethod),
+            52 => Some(Builtin::Classmethod),
+            53 => Some(Builtin::Memoryview),
+            54 => Some(Builtin::Format),
+            55 => Some(Builtin::IntFromBytes),
+            56 => Some(Builtin::BytesFromhex),
             _ => None,
         }
     }
@@ -253,6 +271,12 @@ impl Builtin {
             Builtin::Bytearray => "bytearray",
             Builtin::Issubclass => "issubclass",
             Builtin::Slice => "slice",
+            Builtin::Staticmethod => "staticmethod",
+            Builtin::Classmethod => "classmethod",
+            Builtin::Memoryview => "memoryview",
+            Builtin::Format => "format",
+            Builtin::IntFromBytes => "from_bytes",
+            Builtin::BytesFromhex => "fromhex",
         }
     }
 
@@ -272,6 +296,7 @@ impl Builtin {
                 | Builtin::Str
                 | Builtin::Bytes
                 | Builtin::Bytearray
+                | Builtin::Memoryview
                 | Builtin::List
                 | Builtin::Tuple
                 | Builtin::Dict
@@ -306,6 +331,8 @@ fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
         Builtin::Bytes
     } else if model.is_bytearray(value) {
         Builtin::Bytearray
+    } else if model.is_memoryview(value) {
+        Builtin::Memoryview
     } else if model.is_list(value) {
         Builtin::List
     } else if model.is_tuple(value) {
@@ -318,6 +345,20 @@ fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
         Builtin::Frozenset
     } else if model.is_range(value) {
         Builtin::Range
+    } else if model.is_lazy_iter(value) {
+        match model.lazy_iter_kind(value) {
+            LAZY_MAP => Builtin::Map,
+            LAZY_FILTER => Builtin::Filter,
+            LAZY_ZIP => Builtin::Zip,
+            LAZY_ENUMERATE => Builtin::Enumerate,
+            _ => return None,
+        }
+    } else if model.is_method_wrapper(value) {
+        if model.method_wrapper_is_class(value) {
+            Builtin::Classmethod
+        } else {
+            Builtin::Staticmethod
+        }
     } else {
         return None;
     };
@@ -352,6 +393,10 @@ pub fn builtin_id(name: &str) -> Option<u32> {
         "bytearray" => Builtin::Bytearray,
         "issubclass" => Builtin::Issubclass,
         "slice" => Builtin::Slice,
+        "staticmethod" => Builtin::Staticmethod,
+        "classmethod" => Builtin::Classmethod,
+        "memoryview" => Builtin::Memoryview,
+        "format" => Builtin::Format,
         "iter" => Builtin::Iter,
         "set" => Builtin::Set,
         "map" => Builtin::Map,
@@ -474,19 +519,14 @@ pub fn call_builtin(
         }
         Builtin::Enumerate => {
             let (iterable, start) = match args {
-                [it] => (*it, 0),
+                [it] => (*it, 0i64),
                 [it, s] => (*it, s.as_int().ok_or(Trap::TypeError)?),
                 _ => return Err(Trap::TypeError),
             };
-            let elements = collect_iterable(model, &[iterable], functions, depth)?;
-            let mut pairs = Vec::with_capacity(elements.len());
-            for (i, element) in elements.into_iter().enumerate() {
-                let index =
-                    Value::fixnum(i32::try_from(start + i as i64).map_err(|_| Trap::Overflow)?)
-                        .ok_or(Trap::Overflow)?;
-                pairs.push(model.new_tuple(alloc::vec![index, element])?);
-            }
-            model.new_list(pairs)
+            let source = iterator_for(iterable, functions, model, depth)?;
+            let sources = model.new_tuple(alloc::vec![source])?;
+            let start_value = model.new_long(i128::from(start))?;
+            model.new_lazy_iter(LAZY_ENUMERATE, start_value, sources)
         }
         Builtin::Sum => {
             let (iterable, start) = match args {
@@ -625,51 +665,19 @@ pub fn call_builtin(
             if args.len() < 2 {
                 return Err(Trap::TypeError);
             }
-            let func = args[0];
-            let mut columns: Vec<Vec<Value>> = Vec::with_capacity(args.len() - 1);
-            for arg in &args[1..] {
-                columns.push(collect_iterable(model, &[*arg], functions, depth)?);
-            }
-            let rows = columns.iter().map(|c| c.len()).min().unwrap_or(0);
-            let mut result = Vec::with_capacity(rows);
-            for r in 0..rows {
-                let call_args: Vec<Value> = columns.iter().map(|c| c[r]).collect();
-                result.push(call_value(func, &call_args, functions, model, depth)?);
-            }
-            model.new_list(result)
+            let sources = source_iters(model, &args[1..], functions, depth)?;
+            model.new_lazy_iter(LAZY_MAP, args[0], sources)
         }
         Builtin::Filter => {
             if args.len() != 2 {
                 return Err(Trap::TypeError);
             }
-            let func = args[0];
-            let elements = collect_iterable(model, &[args[1]], functions, depth)?;
-            let mut result = Vec::new();
-            for element in elements {
-                let keep = if func.is_none() {
-                    model.py_truthy(element)?.unwrap_or(true)
-                } else {
-                    let outcome = call_value(func, &[element], functions, model, depth)?;
-                    model.py_truthy(outcome)?.unwrap_or(true)
-                };
-                if keep {
-                    result.push(element);
-                }
-            }
-            model.new_list(result)
+            let sources = source_iters(model, &args[1..2], functions, depth)?;
+            model.new_lazy_iter(LAZY_FILTER, args[0], sources)
         }
         Builtin::Zip => {
-            let mut columns: Vec<Vec<Value>> = Vec::with_capacity(args.len());
-            for arg in args {
-                columns.push(collect_iterable(model, &[*arg], functions, depth)?);
-            }
-            let rows = columns.iter().map(|c| c.len()).min().unwrap_or(0);
-            let mut result = Vec::with_capacity(rows);
-            for r in 0..rows {
-                let row: Vec<Value> = columns.iter().map(|c| c[r]).collect();
-                result.push(model.new_tuple(row)?);
-            }
-            model.new_list(result)
+            let sources = source_iters(model, args, functions, depth)?;
+            model.new_lazy_iter(LAZY_ZIP, Value::NONE, sources)
         }
         Builtin::Any => {
             if args.len() != 1 {
@@ -833,6 +841,7 @@ pub fn call_builtin(
             };
             if !model.is_iter(iterator)
                 && !model.is_generator(iterator)
+                && !model.is_lazy_iter(iterator)
                 && model.find_dunder(iterator, "__next__").is_none()
             {
                 return Err(Trap::TypeError);
@@ -894,6 +903,68 @@ pub fn call_builtin(
                 _ => return Err(Trap::TypeError),
             };
             model.new_slice(start, stop, step)
+        }
+        Builtin::Staticmethod => {
+            let [func] = args else { return Err(Trap::TypeError); };
+            model.new_method_wrapper(*func, false)
+        }
+        Builtin::Classmethod => {
+            let [func] = args else { return Err(Trap::TypeError); };
+            model.new_method_wrapper(*func, true)
+        }
+        Builtin::Memoryview => {
+            let [obj] = args else { return Err(Trap::TypeError); };
+            let len = model.bytes_value(*obj).map(<[u8]>::len).ok_or(Trap::TypeError)?;
+            model.new_memoryview(*obj, 0, len)
+        }
+        Builtin::Format => {
+            let (value, spec) = match args {
+                [v] => (*v, String::new()),
+                [v, s] => (*v, model.str_value(*s).map(String::from).ok_or(Trap::TypeError)?),
+                _ => return Err(Trap::TypeError),
+            };
+            if let Some(method) = model.find_dunder(value, "__format__") {
+                let spec_value = model.new_str(&spec)?;
+                let result = call_value(method, &[spec_value], functions, model, depth + 1)?;
+                return Ok(result);
+            }
+            let rendered = model.format_value_spec(value, &spec)?;
+            model.new_str(&rendered)
+        }
+        Builtin::IntFromBytes => {
+            let (bytes, byteorder) = match args {
+                [b, order] => (
+                    model.bytes_value(*b).map(<[u8]>::to_vec).ok_or(Trap::TypeError)?,
+                    model.str_value(*order).map(String::from).ok_or(Trap::TypeError)?,
+                ),
+                _ => return Err(Trap::TypeError),
+            };
+            let ordered: alloc::vec::Vec<u8> = match byteorder.as_str() {
+                "big" => bytes,
+                "little" => bytes.into_iter().rev().collect(),
+                _ => return Err(Trap::ValueError),
+            };
+            let base = crate::bigint::BigInt::from_i128(256);
+            let mut result = crate::bigint::BigInt::from_i128(0);
+            for byte in &ordered {
+                result = result.mul(&base).add(&crate::bigint::BigInt::from_i128(i128::from(*byte)));
+            }
+            model.new_bigint(result)
+        }
+        Builtin::BytesFromhex => {
+            let [s] = args else { return Err(Trap::TypeError); };
+            let hex = model.str_value(*s).map(String::from).ok_or(Trap::TypeError)?;
+            let digits: alloc::vec::Vec<char> = hex.chars().filter(|c| !c.is_whitespace()).collect();
+            if digits.len() % 2 != 0 {
+                return Err(Trap::ValueError);
+            }
+            let mut bytes = alloc::vec::Vec::with_capacity(digits.len() / 2);
+            for pair in digits.chunks(2) {
+                let hi = pair[0].to_digit(16).ok_or(Trap::ValueError)?;
+                let lo = pair[1].to_digit(16).ok_or(Trap::ValueError)?;
+                bytes.push((hi * 16 + lo) as u8);
+            }
+            model.new_bytes(bytes)
         }
         Builtin::Type => {
             let [value] = args else {
@@ -1004,6 +1075,7 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
             Some(Builtin::Str) => model.is_str(value),
             Some(Builtin::Bytes) => model.is_bytes(value),
             Some(Builtin::Bytearray) => model.is_bytearray(value),
+            Some(Builtin::Memoryview) => model.is_memoryview(value),
             Some(Builtin::List) => model.is_list(value),
             Some(Builtin::Tuple) => model.is_tuple(value),
             Some(Builtin::Dict) => model.is_dict(value),
@@ -1275,20 +1347,71 @@ fn display_arg(
     if let Some(method) = model.find_dunder(value, "__repr__") {
         return call_str_dunder(method, functions, model, depth);
     }
+    if model.seq_value(value).is_some()
+        || model.set_value(value).is_some()
+        || model.dict_value(value).is_some()
+    {
+        return repr_arg(value, functions, model, depth);
+    }
     Ok(model.display(value))
 }
 
-/// The repr form of `value` for `repr()`: an instance's `__repr__`, else the default repr. (A
-/// `__repr__` inside a CONTAINER repr -- `print([obj])` -- still uses the default: `model.repr` has
-/// no interpreter context to call the method; that is a noted follow-on.)
+/// The repr form of `value` for `repr()`: an instance's `__repr__`, else the default repr. Recurses
+/// into containers so a nested instance uses its own `__repr__` (`print([obj])`), which `model.repr`
+/// cannot do without the interpreter. A self-referential container is a `RecursionError`.
 fn repr_arg(
     value: Value,
     functions: &[CodeObject],
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<String, Trap> {
+    if depth > 256 {
+        return Err(Trap::RecursionError);
+    }
     if let Some(method) = model.find_dunder(value, "__repr__") {
         return call_str_dunder(method, functions, model, depth);
+    }
+    if let Some(elems) = model.seq_value(value).cloned() {
+        let is_tuple = model.is_tuple(value);
+        let mut parts = Vec::with_capacity(elems.len());
+        for element in &elems {
+            parts.push(repr_arg(*element, functions, model, depth + 1)?);
+        }
+        let inner = parts.join(", ");
+        return Ok(if is_tuple {
+            if elems.len() == 1 {
+                alloc::format!("({inner},)")
+            } else {
+                alloc::format!("({inner})")
+            }
+        } else {
+            alloc::format!("[{inner}]")
+        });
+    }
+    if let Some(elements) = model.set_value(value).cloned() {
+        let frozen = model.is_frozenset(value);
+        if elements.is_empty() {
+            return Ok(String::from(if frozen { "frozenset()" } else { "set()" }));
+        }
+        let mut parts = Vec::with_capacity(elements.len());
+        for element in &elements {
+            parts.push(repr_arg(*element, functions, model, depth + 1)?);
+        }
+        let inner = parts.join(", ");
+        return Ok(if frozen {
+            alloc::format!("frozenset({{{inner}}})")
+        } else {
+            alloc::format!("{{{inner}}}")
+        });
+    }
+    if let Some(entries) = model.dict_value(value).cloned() {
+        let mut parts = Vec::with_capacity(entries.len());
+        for (key, val) in &entries {
+            let key = repr_arg(*key, functions, model, depth + 1)?;
+            let val = repr_arg(*val, functions, model, depth + 1)?;
+            parts.push(alloc::format!("{key}: {val}"));
+        }
+        return Ok(alloc::format!("{{{}}}", parts.join(", ")));
     }
     Ok(model.repr(value))
 }
@@ -1408,6 +1531,21 @@ fn bytes_from_args(
         }
         _ => Err(Trap::TypeError),
     }
+}
+
+/// Builds the sources tuple for a lazy `map`/`filter`/`zip`: one live iterator per iterable argument
+/// (so they advance in lock-step on demand rather than being materialized up front).
+fn source_iters(
+    model: &mut ObjectModel,
+    iterables: &[Value],
+    functions: &[CodeObject],
+    depth: usize,
+) -> Result<Value, Trap> {
+    let mut iters = Vec::with_capacity(iterables.len());
+    for iterable in iterables {
+        iters.push(iterator_for(*iterable, functions, model, depth)?);
+    }
+    model.new_tuple(iters)
 }
 
 /// Drains `list(...)`/`tuple(...)`'s optional single iterable argument into a vector (empty for

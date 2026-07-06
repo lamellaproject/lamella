@@ -159,6 +159,81 @@ fn build_case_tree(cases: &[MatchCase], subj: &str) -> Vec<Stmt> {
     }
 }
 
+/// One element of a list or set display: a plain value, or a `*`-spread iterable.
+enum DisplayElem {
+    Plain(Expr),
+    Star(Expr),
+}
+
+/// `list(e)` / `set(e)` -- materialize an iterable as a new list / set (to spread `*e` in a display).
+fn call1(func: &str, arg: Expr) -> Expr {
+    Expr::Call {
+        func: Box::new(Expr::Name(String::from(func))),
+        args: vec![arg],
+        keywords: Vec::new(),
+    }
+}
+
+/// Build a list display, desugaring any `*` spread: runs of plain elements become `[..]` literals,
+/// concatenated with `+` around each `list(star)`. With no stars this is a plain `Expr::List`.
+fn build_list_display(elems: Vec<DisplayElem>) -> Expr {
+    build_spread_display(elems, Expr::List, |e| call1("list", e), BinOp::Add)
+}
+
+/// Build a set display, desugaring any `*` spread: runs of plain elements become `{..}` set literals,
+/// unioned with `|` around each `set(star)`. With no stars this is a plain `Expr::Set`.
+fn build_set_display(elems: Vec<DisplayElem>) -> Expr {
+    build_spread_display(elems, Expr::Set, |e| call1("set", e), BinOp::BitOr)
+}
+
+fn build_spread_display(
+    elems: Vec<DisplayElem>,
+    literal: impl Fn(Vec<Expr>) -> Expr,
+    spread: impl Fn(Expr) -> Expr,
+    join: BinOp,
+) -> Expr {
+    if elems.iter().all(|e| matches!(e, DisplayElem::Plain(_))) {
+        let plains = elems
+            .into_iter()
+            .map(|e| match e {
+                DisplayElem::Plain(x) => x,
+                DisplayElem::Star(_) => unreachable!("checked all-plain"),
+            })
+            .collect();
+        return literal(plains);
+    }
+    let mut parts: Vec<Expr> = Vec::new();
+    let mut run: Vec<Expr> = Vec::new();
+    for e in elems {
+        match e {
+            DisplayElem::Plain(x) => run.push(x),
+            DisplayElem::Star(x) => {
+                if !run.is_empty() {
+                    parts.push(literal(core::mem::take(&mut run)));
+                }
+                parts.push(spread(x));
+            }
+        }
+    }
+    if !run.is_empty() {
+        parts.push(literal(run));
+    }
+    parts
+        .into_iter()
+        .reduce(|a, b| Expr::Binary {
+            op: join,
+            lhs: Box::new(a),
+            rhs: Box::new(b),
+        })
+        .expect("a starred display has at least one part")
+}
+
+/// One entry of a dict display: a `key: value` pair, or a `**mapping` unpack.
+enum DictItem {
+    Pair(Expr, Expr),
+    DoubleStar(Expr),
+}
+
 impl Parser {
     fn peek(&self) -> &Tok {
         &self.tokens[self.pos].kind
@@ -489,7 +564,8 @@ impl Parser {
     }
 
     /// `assert test [, msg] NEWLINE` -- desugars to `if not test: raise AssertionError[(msg)]`,
-    /// reusing the existing If + Not + Raise.
+    /// reusing the existing If + Not + Raise. (@python-runtime: needs AssertionError as a built-in
+    /// exception -- flagged as a co-design; the desugar is inert until then.)
     fn parse_assert(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwAssert, "'assert'")?;
         let test = self.parse_expr()?;
@@ -1818,11 +1894,88 @@ impl Parser {
 
     /// A dict display `{key: value, ...}` (the `{` not yet consumed); `{}` is the empty
     /// dict. A set display `{x, ...}` (no colon) is out of subset.
+    /// One list/set display element: `*iterable` (a spread) or a plain expression.
+    fn parse_display_elem(&mut self) -> Result<DisplayElem, ParseError> {
+        if self.eat(&Tok::Star) {
+            Ok(DisplayElem::Star(self.parse_expr()?))
+        } else {
+            Ok(DisplayElem::Plain(self.parse_expr()?))
+        }
+    }
+
+    /// Build a dict display, desugaring any `**` unpack: `{**d1, k: v, **d2}` becomes
+    /// `{_k: _v for _t in (D0, d1, ...) for _k, _v in _t.items()}` -- consecutive `key: value` pairs
+    /// group into a dict literal, each `**` contributes its mapping, and the comprehension merges them
+    /// left to right (later keys win, like Python). With no `**` this is a plain `Expr::Dict`.
+    fn build_dict_display(&mut self, items: Vec<DictItem>) -> Expr {
+        if items.iter().all(|i| matches!(i, DictItem::Pair(_, _))) {
+            let pairs = items
+                .into_iter()
+                .map(|i| match i {
+                    DictItem::Pair(k, v) => (k, v),
+                    DictItem::DoubleStar(_) => unreachable!("checked all-pairs"),
+                })
+                .collect();
+            return Expr::Dict(pairs);
+        }
+        let mut mappings: Vec<Expr> = Vec::new();
+        let mut run: Vec<(Expr, Expr)> = Vec::new();
+        for item in items {
+            match item {
+                DictItem::Pair(k, v) => run.push((k, v)),
+                DictItem::DoubleStar(m) => {
+                    if !run.is_empty() {
+                        mappings.push(Expr::Dict(core::mem::take(&mut run)));
+                    }
+                    mappings.push(m);
+                }
+            }
+        }
+        if !run.is_empty() {
+            mappings.push(Expr::Dict(run));
+        }
+        let t = self.fresh_temp("dm");
+        let k = self.fresh_temp("dk");
+        let v = self.fresh_temp("dv");
+        let items_call = Expr::Call {
+            func: Box::new(Expr::Attribute {
+                value: Box::new(Expr::Name(t.clone())),
+                attr: String::from("items"),
+            }),
+            args: Vec::new(),
+            keywords: Vec::new(),
+        };
+        Expr::DictComp {
+            key: Box::new(Expr::Name(k.clone())),
+            value: Box::new(Expr::Name(v.clone())),
+            clauses: vec![
+                CompClause {
+                    targets: vec![t],
+                    iterable: Expr::Tuple(mappings),
+                    conditions: Vec::new(),
+                },
+                CompClause {
+                    targets: vec![k, v],
+                    iterable: items_call,
+                    conditions: Vec::new(),
+                },
+            ],
+        }
+    }
+
     fn parse_dict(&mut self) -> Result<Expr, ParseError> {
         self.advance();
         if self.at(&Tok::RBrace) {
             self.advance();
             return Ok(Expr::Dict(Vec::new()));
+        }
+        if self.at(&Tok::DoubleStar) {
+            let first = self.parse_dict_item()?;
+            return self.finish_dict(first);
+        }
+        if self.at(&Tok::Star) {
+            let first = self.parse_display_elem()?;
+            return self.finish_set(first);
         }
         let key = self.parse_expr()?;
         if !self.eat(&Tok::Colon) {
@@ -1834,17 +1987,7 @@ impl Parser {
                     clauses,
                 });
             }
-            let mut elems = vec![key];
-            if self.eat(&Tok::Comma) {
-                while !self.at(&Tok::RBrace) {
-                    elems.push(self.parse_expr()?);
-                    if !self.eat(&Tok::Comma) {
-                        break;
-                    }
-                }
-            }
-            self.expect(&Tok::RBrace, "'}' closing the set")?;
-            return Ok(Expr::Set(elems));
+            return self.finish_set(DisplayElem::Plain(key));
         }
         let value = self.parse_expr()?;
         if self.at(&Tok::KwFor) {
@@ -1856,20 +1999,46 @@ impl Parser {
                 clauses,
             });
         }
-        let mut pairs = vec![(key, value)];
-        if self.eat(&Tok::Comma) {
-            while !self.at(&Tok::RBrace) {
-                let k = self.parse_expr()?;
-                self.expect(&Tok::Colon, "':' in the dict")?;
-                let v = self.parse_expr()?;
-                pairs.push((k, v));
-                if !self.eat(&Tok::Comma) {
-                    break;
-                }
+        self.finish_dict(DictItem::Pair(key, value))
+    }
+
+    /// Parse the remaining `{...}` set elements after `first` (each a value or `*iterable`), then
+    /// desugar any spreads via build_set_display.
+    fn finish_set(&mut self, first: DisplayElem) -> Result<Expr, ParseError> {
+        let mut elems = vec![first];
+        while self.eat(&Tok::Comma) {
+            if self.at(&Tok::RBrace) {
+                break;
             }
+            elems.push(self.parse_display_elem()?);
+        }
+        self.expect(&Tok::RBrace, "'}' closing the set")?;
+        Ok(build_set_display(elems))
+    }
+
+    /// Parse the remaining `{...}` dict entries after `first` (each `key: value` or `**mapping`),
+    /// then desugar any unpacks via build_dict_display.
+    fn finish_dict(&mut self, first: DictItem) -> Result<Expr, ParseError> {
+        let mut items = vec![first];
+        while self.eat(&Tok::Comma) {
+            if self.at(&Tok::RBrace) {
+                break;
+            }
+            items.push(self.parse_dict_item()?);
         }
         self.expect(&Tok::RBrace, "'}' closing the dict")?;
-        Ok(Expr::Dict(pairs))
+        Ok(self.build_dict_display(items))
+    }
+
+    fn parse_dict_item(&mut self) -> Result<DictItem, ParseError> {
+        if self.eat(&Tok::DoubleStar) {
+            Ok(DictItem::DoubleStar(self.parse_expr()?))
+        } else {
+            let k = self.parse_expr()?;
+            self.expect(&Tok::Colon, "':' in the dict")?;
+            let v = self.parse_expr()?;
+            Ok(DictItem::Pair(k, v))
+        }
     }
 
     /// A call's argument list: positional arguments, then keyword arguments `name=value`.
@@ -1979,6 +2148,11 @@ impl Parser {
                 self.advance();
                 Ok(Expr::BigInt(digits))
             }
+            Tok::Bytes(data) => {
+                let data = data.clone();
+                self.advance();
+                Ok(Expr::Bytes(data))
+            }
             Tok::Str(value) => {
                 self.advance();
                 let mut joined = value;
@@ -1998,21 +2172,27 @@ impl Parser {
                     self.advance();
                     return Ok(Expr::List(Vec::new()));
                 }
-                let first = self.parse_expr()?;
-                if self.at(&Tok::KwFor) {
+                let first = self.parse_display_elem()?;
+                if matches!(first, DisplayElem::Plain(_)) && self.at(&Tok::KwFor) {
+                    let DisplayElem::Plain(element) = first else {
+                        unreachable!("guarded to a plain element")
+                    };
                     let clauses = self.parse_comp_clauses()?;
                     self.expect(&Tok::RBracket, "']' closing the comprehension")?;
                     Ok(Expr::ListComp {
-                        element: Box::new(first),
+                        element: Box::new(element),
                         clauses,
                     })
                 } else {
-                    let mut elements = vec![first];
-                    if self.eat(&Tok::Comma) {
-                        elements.extend(self.parse_expr_list(&Tok::RBracket)?);
+                    let mut elems = vec![first];
+                    while self.eat(&Tok::Comma) {
+                        if self.at(&Tok::RBracket) {
+                            break;
+                        }
+                        elems.push(self.parse_display_elem()?);
                     }
                     self.expect(&Tok::RBracket, "']' closing the list")?;
-                    Ok(Expr::List(elements))
+                    Ok(build_list_display(elems))
                 }
             }
             Tok::KwTrue => {
@@ -2493,6 +2673,22 @@ mod tests {
         assert!(matches!(parse_ok("match = 5\n").body[0], Stmt::Assign(_)));
         assert!(matches!(parse_ok("match(x)\n").body[0], Stmt::Expr(_)));
         assert!(matches!(parse_ok("y = match + 1\n").body[0], Stmt::Assign(_)));
+    }
+
+    #[test]
+    fn star_displays_desugar_but_plain_displays_do_not() {
+        let value = |src: &str| -> Option<Expr> {
+            match &parse_ok(src).body[0] {
+                Stmt::Assign(a) => a.value.clone(),
+                other => panic!("expected an assignment, got {other:?}"),
+            }
+        };
+        assert!(matches!(value("v = [1, 2]\n"), Some(Expr::List(_))));
+        assert!(!matches!(value("v = [*a, *b]\n"), Some(Expr::List(_))));
+        assert!(matches!(value("v = {1, 2}\n"), Some(Expr::Set(_))));
+        assert!(!matches!(value("v = {*a, 1}\n"), Some(Expr::Set(_))));
+        assert!(matches!(value("v = {'k': 1}\n"), Some(Expr::Dict(_))));
+        assert!(matches!(value("v = {**a, **b}\n"), Some(Expr::DictComp { .. })));
     }
 
     #[test]

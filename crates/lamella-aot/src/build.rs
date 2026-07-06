@@ -22,6 +22,8 @@ use lamella_token::Token;
 use crate::arm32;
 use crate::cil;
 use crate::resolver::MetadataResolver;
+#[cfg(feature = "riscv32")]
+use crate::riscv32;
 #[cfg(feature = "wasm")]
 use crate::wasm;
 
@@ -38,6 +40,13 @@ pub enum BuildError {
     /// A function could not be lowered to the ARM32 target.
     #[cfg(feature = "arm32")]
     LowerArm(arm32::LowerError),
+    /// A function could not be lowered to the RISC-V (RV32IM) target.
+    #[cfg(feature = "riscv32")]
+    LowerRiscv(riscv32::LowerError),
+    /// The assembly declares no static `Main`, so there is no entry point to build a runnable object
+    /// around. (`build_object_riscv` requires one; a library object has no entry -- that path differs.)
+    #[cfg(feature = "riscv32")]
+    NoEntryPoint,
     /// A method's CIL body could not be lowered to MIR (e.g. an unsupported construct). Reported rather
     /// than silently leaving the method an empty stub, which would miscompile the program -- a stubbed
     /// `Main` returns nothing.
@@ -208,6 +217,139 @@ fn build_object_inner(cil: &[u8], corlib: Option<&[u8]>) -> Result<Vec<u8>, Buil
         }
     }
     arm32::lower_object_vtables(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerArm)
+}
+
+/// Compiles a self-contained CIL assembly to ONE RV32IM relocatable ELF object through the RELOCATING
+/// path ([`riscv32::lower_object`]): every reachable method becomes an `f<rid>` `STT_FUNC` symbol
+/// (`f0` is the entry trampoline -> `Main`), and each cross-method call becomes an `R_RISCV_CALL_PLT`
+/// relocation OUR linker resolves. This is the RISC-V twin of the ARM [`build_object`] -- it proves the
+/// object path handles real compiler output, and it is the substrate the linked-path bricks (native
+/// calls, cross-assembly calls, the descriptor object lane) build on.
+///
+/// It is REACHABILITY-LIMITED: only methods reachable from `Main` (direct `Call` edges, the `.cctor`s
+/// the startup chains, and every this-assembly vtable/itable dispatch target) are lowered; every other
+/// rid -- notably the implicit `.ctor`, which calls `object::.ctor()` in corlib -- stays a stub. That
+/// lets a SELF-CONTAINED program (no `/reference`) build with no external call to resolve, exactly as
+/// the flat `lower_module_gc` driver does. Once the cross-assembly `Call` + gc-sections path lands this
+/// converges to the lower-all shape of [`build_object`] (the implicit `.ctor` becomes an extern the
+/// linker drops when unreached). A reachable method that fails to lower is reported, never silently
+/// stubbed. Emitting the object stays linker-free (the driver/examples own the link + boot).
+#[cfg(feature = "riscv32")]
+pub fn build_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let entry = find_main(&assembly).ok_or(BuildError::NoEntryPoint)?;
+    let descriptors = MetadataResolver::new(&assembly).type_descriptors();
+    let funcs = lower_reachable(&assembly, entry, &descriptors)?;
+    let names: Vec<alloc::string::String> =
+        (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    riscv32::lower_object(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerRiscv)
+}
+
+/// Lowers the methods of a self-contained assembly REACHABLE from `entry`, rid-indexed, into a dense
+/// module for [`riscv32::lower_object`]. Index 0 is the entry [`startup`] (board-init hook, then each
+/// `.cctor`, then `Main`); each reachable method sits at its `MethodDef` rid; every unreached rid is a
+/// [`stub`]. Reachability is a BFS over direct `Call` edges seeded with `Main`, the `.cctor`s, the
+/// board-init hook, and every this-assembly vtable/itable dispatch target (an indirect call has no
+/// `Call` edge). Skipping the unreached rids keeps the implicit `.ctor`'s `object::.ctor()` corlib call
+/// out of a self-contained build -- the flat driver relies on the same property.
+#[cfg(feature = "riscv32")]
+fn lower_reachable(
+    assembly: &Assembly,
+    entry: u32,
+    descriptors: &[crate::resolver::TypeMeta],
+) -> Result<Vec<Function>, BuildError> {
+    let mut max_rid = entry;
+    for type_def in assembly.type_defs() {
+        for method in type_def.methods() {
+            max_rid = max_rid.max(method.rid());
+        }
+    }
+    let mut funcs: Vec<Function> = (0..=max_rid).map(|_| stub()).collect();
+    let mut lowered = vec![false; funcs.len()];
+    let cctors = find_cctors(assembly);
+    let init = find_native_export(assembly, "lamella_time_init");
+    let resolver = MetadataResolver::new(assembly);
+    let mut worklist: Vec<u32> = core::iter::once(entry)
+        .chain(cctors.iter().copied())
+        .chain(init)
+        .collect();
+    for meta in descriptors {
+        for slot in &meta.vtable {
+            if let crate::resolver::VtableEntry::Func(index) = slot {
+                worklist.push(*index);
+            }
+        }
+        for (_, index) in &meta.itable {
+            worklist.push(*index);
+        }
+    }
+    while let Some(rid) = worklist.pop() {
+        let Some(seen) = lowered.get_mut(rid as usize) else {
+            continue;
+        };
+        if *seen {
+            continue;
+        }
+        *seen = true;
+        let Some(func) = lower_one_reachable(assembly, &resolver, rid)? else {
+            continue;
+        };
+        for block in &func.blocks {
+            for (_, inst) in &block.insts {
+                if let Inst::Call { callee, .. } = inst {
+                    if lowered.get(*callee as usize) == Some(&false) {
+                        worklist.push(*callee);
+                    }
+                }
+            }
+        }
+        funcs[rid as usize] = func;
+    }
+    funcs[0] = startup(init, &cctors, entry);
+    Ok(funcs)
+}
+
+/// Lowers the method at `MethodDef` rid `rid` to MIR (its plain managed body -- the same path
+/// [`lower_assembly_debug`] takes for an ordinary method), or `Ok(None)` if there is no such method or
+/// it has no body (abstract/extern). A body that fails to lower is `Err(BuildError::LowerCil)` -- FAIL
+/// LOUD, never a silent stub (a stubbed reachable method would miscompile the program).
+#[cfg(feature = "riscv32")]
+fn lower_one_reachable(
+    assembly: &Assembly,
+    resolver: &MetadataResolver,
+    rid: u32,
+) -> Result<Option<Function>, BuildError> {
+    for type_def in assembly.type_defs() {
+        for method in type_def.methods() {
+            if method.rid() != rid {
+                continue;
+            }
+            let Some(body) = method.body() else {
+                return Ok(None);
+            };
+            let signature = method.signature();
+            let mut arg_types = Vec::new();
+            if let Some(sig) = &signature {
+                if sig.has_this {
+                    arg_types.push(MirType::ObjectRef);
+                }
+                for parameter in &sig.parameters {
+                    arg_types.push(mir_type(parameter, assembly));
+                }
+            }
+            let local_types: Vec<MirType> = method
+                .local_variables()
+                .iter()
+                .map(|sig| mir_type(sig, assembly))
+                .collect();
+            return match cil::lower_method_typed(&body, resolver, &arg_types, &local_types) {
+                Ok((func, _map)) => Ok(Some(func)),
+                Err(error) => Err(BuildError::LowerCil { rid, error }),
+            };
+        }
+    }
+    Ok(None)
 }
 
 /// AOT-lowers a whole assembly as a LINKABLE LIBRARY object (a corlib, a helper library): every public

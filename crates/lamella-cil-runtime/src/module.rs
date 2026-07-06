@@ -5346,6 +5346,19 @@ impl Module {
     /// `handle`, or `None` if the handle names no recorded type.
     #[must_use]
     pub fn reflect_type(&self, handle: u64) -> Option<ReflectType> {
+        if let Some(direct) = self.reflect_type_direct(handle) {
+            return Some(direct);
+        }
+        let canonical = self.type_handle_of(self.type_id_by_handle(handle)?)?;
+        if canonical == handle {
+            return None;
+        }
+        self.reflect_type_direct(canonical)
+    }
+
+    /// The reflection record keyed DIRECTLY by `handle` (no cross-assembly folding): the frozen
+    /// table first, then the mutable one. [`Self::reflect_type`] adds the shared-`TypeId` fallback.
+    fn reflect_type_direct(&self, handle: u64) -> Option<ReflectType> {
         if let Some((namespace, full, flags, base)) = self.frozen.reflect_types.get(&self.arena, handle) {
             let pool_str = |id: u32| {
                 self.frozen

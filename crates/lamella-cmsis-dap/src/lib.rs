@@ -394,6 +394,17 @@ impl<T: Transport> Dap<T> {
         self.resume()
     }
 
+    /// Drives the target reset line (`nRESET`) via `DAP_SWJ_Pins`: `assert = true` holds the core in
+    /// reset (drives the line low), `false` releases it (drives it high). Some probes -- the MCU-Link
+    /// among them -- assert nRESET while idle, holding the target stopped even after a good SWD
+    /// attach; releasing it lets the core run again (or, with halting debug already armed, boot
+    /// straight into a halt). Waits up to 100 ms for the line to settle.
+    pub fn set_reset(&mut self, assert: bool) -> Result<u8, DapError> {
+        let output = if assert { 0 } else { proto::PIN_NRESET };
+        let reply = self.command(&proto::swj_pins(output, proto::PIN_NRESET, 100_000))?;
+        Ok(reply.get(1).copied().unwrap_or(0))
+    }
+
     /// Sets hardware breakpoint comparator 0 at a code `address`: the core halts when its
     /// PC reaches that instruction. Uses the Cortex-M0 Breakpoint Unit.
     pub fn set_breakpoint(&mut self, address: u32) -> Result<(), DapError> {
