@@ -2601,7 +2601,8 @@ fn emit_destructor(
     debug: Option<&DebugContext>,
 ) -> Result<(), crate::EmitError> {
     let void = TypeSymbol::Special(SpecialType::Void);
-    let bound = binder.bind_method(Some(enclosing.clone()), "Finalize", void.clone(), &[], body);
+    let bound =
+        binder.bind_method(Some(enclosing.clone()), "Finalize", void.clone(), &[], &[], false, body);
     let bound = wrap_finalizer(bound, &base_finalizer_reference(base_class, tokens));
     let finalize = emit_bound_body(
         image,
@@ -2718,6 +2719,8 @@ fn emit_method_body(
         name,
         return_symbol.clone(),
         params,
+        &[],
+        is_static,
         body,
     );
     emit_bound_body(

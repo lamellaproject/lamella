@@ -50,12 +50,13 @@ interpreter = [
     "lamella-cil-runtime/typed-references",
 ]
 
-# The wireline DEVICE server: DAP-JSON over stdio on one side, wireline frames over a
-# serial port on the other -- the on-device interpreter debugged from VS Code with zero
-# adapter changes (WirelineBackend implements the same DebugBackend seam).
+# The wireline DEVICE server: DAP-JSON over stdio on one side, wireline frames over a serial
+# port OR the board's native driverless-WinUSB device on the other -- the on-device interpreter
+# debugged from VS Code with zero adapter changes (WirelineBackend implements the same DebugBackend seam).
 wireline-device = [
     "dep:lamella-wireline",
     "lamella-wireline/serial",
+    "lamella-wireline/usb",
     "lamella-wireline/debug-backend",
 ]
 

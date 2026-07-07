@@ -9,6 +9,7 @@ use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
+use lamella_metadata::flags::{method_is_abstract, method_is_newslot, method_is_virtual};
 use lamella_metadata::tables::table;
 use lamella_metadata::{Assembly, ConstantValue, SigType, TypeName};
 use lamella_syntax::ast::Literal;
@@ -98,6 +99,9 @@ fn type_info(
             is_params: method
                 .params()
                 .any(|parameter| param_array.contains(&parameter.token().row())),
+            is_virtual: method_is_virtual(method.flags()),
+            is_abstract: method_is_abstract(method.flags()),
+            is_override: method_is_virtual(method.flags()) && !method_is_newslot(method.flags()),
             accessibility: member_accessibility(method.flags()),
             conditional: conditional.get(&method.rid()).cloned().unwrap_or_default(),
         };

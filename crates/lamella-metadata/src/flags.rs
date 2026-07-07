@@ -42,6 +42,8 @@ pub mod method_attr {
     pub const FINAL: u32 = 0x0020;
     /// The method is virtual.
     pub const VIRTUAL: u32 = 0x0040;
+    /// The method takes a new vtable slot (a fresh virtual, not an override of a base slot).
+    pub const NEWSLOT: u32 = 0x0100;
     /// The method is abstract (no body).
     pub const ABSTRACT: u32 = 0x0400;
 }
@@ -125,6 +127,13 @@ pub fn method_is_virtual(flags: u32) -> bool {
 #[must_use]
 pub fn method_is_abstract(flags: u32) -> bool {
     flags & method_attr::ABSTRACT != 0
+}
+
+/// Whether a method's flags mark it as taking a new vtable slot (a fresh virtual). A virtual
+/// method WITHOUT this bit reuses -- overrides -- its base's slot.
+#[must_use]
+pub fn method_is_newslot(flags: u32) -> bool {
+    flags & method_attr::NEWSLOT != 0
 }
 
 /// The code-type a method's implementation flags select (II.23.1.11): one of

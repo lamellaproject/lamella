@@ -320,12 +320,14 @@ pub enum BoundExprKind {
     Error,
 }
 
-/// The method currently being bound: its name (for `CS0127`) and declared return
-/// type (for checking `return`).
+/// The method currently being bound: its name (for `CS0127`), declared return
+/// type (for checking `return`), and whether it is `static` (for `CS0120`/`CS0026`,
+/// which forbid an implicit `this` where there is no object).
 #[derive(Debug, Clone)]
 struct MethodContext {
     name: Box<str>,
     return_type: TypeSymbol,
+    is_static: bool,
 }
 
 /// The result of binding one REPL submission ([`Binder::bind_submission`]): the bound
@@ -371,15 +373,21 @@ pub struct Binder {
     /// unqualified `X` resolves to the target (16.4.1). Scoped per namespace block alongside
     /// `imported_namespaces`.
     aliases: Vec<(Box<str>, TypeSymbol)>,
-    /// Locals referenced in `switch` case-label expressions of the method being
-    /// bound -- they are folded out of the bound tree, so the unused-local check
-    /// (`CS0168`/`CS0219`) is seeded with them to avoid a false warning. Reset per
-    /// method.
+    /// Locals to EXEMPT from the unused-local check (`CS0168`/`CS0219`) of the method being
+    /// bound: a local referenced only in a `switch` case-label expression (folded out of the
+    /// bound tree, so its use is otherwise invisible), and a local whose initializer failed to
+    /// convert (csc lets that conversion error stand alone rather than also warning it unused).
+    /// Reset per method.
     case_label_uses: alloc::collections::BTreeSet<Box<str>>,
     /// Whether expressions are currently bound in a `checked` context (14.5.12),
     /// tracked as the binder descends so each arithmetic/cast node records whether
     /// emission should use the overflow-checking form. C# 1.0 defaults to unchecked.
     pub(crate) checked_context: bool,
+    /// Whether expressions are currently in an explicit `unchecked` context (14.16). Distinct
+    /// from `checked_context`: a CONSTANT operation is checked by DEFAULT, so a constant overflow
+    /// is CS0220 even at the top level (where `checked_context` is false), and only an explicit
+    /// `unchecked` block/expression suppresses it. False at the top level and inside `checked`.
+    pub(crate) unchecked_context: bool,
     /// In REPL session mode, the name of the parameter standing in for the persistent
     /// `__Repl` instance (`s`). When set, an unqualified name that resolves to a member
     /// of the enclosing type reads through `s` (a parameter) instead of `this` -- the
@@ -406,6 +414,20 @@ pub struct Binder {
     /// nothing. Reset per method. Keyed by name; a local constant is also declared as a local
     /// so a redeclaration is still `CS0128`/`CS0136`.
     const_locals: BTreeMap<String, (Literal, TypeSymbol)>,
+    /// CS0414 field-use tracking, accumulated across a whole compilation unit. Each pair is a
+    /// field's declaring type (dotted name) and its name. A WRITE is a simple `=` target or an
+    /// initializer; a READ is every other access. A private, non-const field that the unit
+    /// writes but never reads is warned. Deferred to a final pass (not per method or per type)
+    /// because a nested type may read an enclosing field either side of its declaration; reset
+    /// per unit by [`Binder::report_unused_fields`].
+    field_reads: alloc::collections::BTreeSet<(Box<str>, Box<str>)>,
+    field_writes: alloc::collections::BTreeSet<(Box<str>, Box<str>)>,
+    /// Candidate CS0414/CS0169 fields: each private, non-const field's declaring type (dotted
+    /// name), name, declarator span, and whether it is eligible for the CS0169 "never used"
+    /// warning (additionally: a resolved type, no initializer, not a duplicate -- csc suppresses
+    /// the unused-field warning when the declaration has any of those issues). The final pass
+    /// warns a written-never-read field CS0414, and an eligible never-written-never-read one CS0169.
+    private_fields: Vec<(Box<str>, Box<str>, Span, bool, Box<str>)>,
 }
 
 impl Binder {
@@ -452,11 +474,69 @@ impl Binder {
         self.diagnostics.push(diagnostic);
     }
 
+    /// Records a private, non-const field (its declaring type, name, declarator span, and CS0169
+    /// eligibility) as a candidate for the unused-field warnings, judged in the final pass.
+    pub(crate) fn record_private_field(
+        &mut self,
+        declaring: &TypeSymbol,
+        name: &str,
+        span: Span,
+        eligible_never_used: bool,
+        default_value: Box<str>,
+    ) {
+        if let Some(key) = crate::flow::field_type_key(declaring) {
+            self.private_fields
+                .push((key, name.into(), span, eligible_never_used, default_value));
+        }
+    }
+
+    /// Emits `CS0414` for every private, non-const field the unit assigned (an initializer or a
+    /// simple `=`) but never read, then clears the field-use accumulators for the next unit. A
+    /// private field's every access is within its own type, so once the whole unit is bound the
+    /// read set is complete -- including a read from a nested type on either side of the field's
+    /// declaration, which a per-type pass would miss.
+    pub(crate) fn report_unused_fields(&mut self) {
+        for (declaring, name, span, eligible_never_used, default_value) in
+            core::mem::take(&mut self.private_fields)
+        {
+            let key = (declaring.clone(), name.clone());
+            let read = self.field_reads.contains(&key);
+            let written = self.field_writes.contains(&key);
+            let kind = if written && !read {
+                Some(DiagnosticKind::UnusedField {
+                    field: format!("{declaring}.{name}").into(),
+                })
+            } else if eligible_never_used && !written && !read {
+                Some(DiagnosticKind::FieldNeverUsed {
+                    field: format!("{declaring}.{name}").into(),
+                })
+            } else if eligible_never_used && read && !written {
+                Some(DiagnosticKind::FieldNeverAssigned {
+                    field: format!("{declaring}.{name}").into(),
+                    default: default_value,
+                })
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                self.report(Diagnostic::new(kind, span));
+            }
+        }
+        self.field_reads.clear();
+        self.field_writes.clear();
+    }
+
     /// Records the locals a `switch` case-label expression references, so the
     /// unused-local check (`CS0168`/`CS0219`) is not misled by a label folded out of
     /// the bound tree.
     pub(crate) fn record_case_label_uses(&mut self, expr: &BoundExpr) {
         crate::flow::collect_uses(expr, &mut self.case_label_uses);
+    }
+
+    /// Exempts a local from the unused-local check (`CS0168`/`CS0219`): a local whose initializer
+    /// failed to convert, which csc does not also warn unused.
+    pub(crate) fn exempt_local_from_unused(&mut self, name: &str) {
+        self.case_label_uses.insert(name.into());
     }
 
     /// Resolves a syntactic type name to its canonical type via the namespaces and aliases
@@ -605,11 +685,39 @@ impl Binder {
             }
             return;
         }
+        if let BoundExprKind::TypeReference(ty) = &value.kind {
+            self.report(Diagnostic::new(
+                DiagnosticKind::TypeUsedAsValue {
+                    type_name: ty.to_string().into(),
+                },
+                span,
+            ));
+            return;
+        }
         if value.ty.is_error() {
             return;
         }
         if !self.assignable(value, target) {
-            self.report_no_implicit_conversion(&value.ty, target, span);
+            if let Some(value_text) = constant_out_of_range(value, target) {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::ConstantOutOfRange {
+                        value: value_text,
+                        to: target.to_string().into(),
+                    },
+                    span,
+                ));
+            } else if matches!(value.kind, BoundExprKind::Literal(Literal::Null))
+                && self.is_value_type(target)
+            {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::CannotConvertNullToValueType {
+                        to: target.to_string().into(),
+                    },
+                    span,
+                ));
+            } else {
+                self.report_no_implicit_conversion(&value.ty, target, span);
+            }
         }
     }
 
@@ -1021,6 +1129,8 @@ impl Binder {
         name: &str,
         return_type: TypeSymbol,
         parameters: &[(Box<str>, TypeSymbol)],
+        out_parameters: &[Box<str>],
+        is_static: bool,
         body: &lamella_syntax::ast::Stmt,
     ) -> crate::statement::BoundStmt {
         let return_type = self.canonicalize(&return_type);
@@ -1030,6 +1140,7 @@ impl Binder {
         self.current_method = Some(MethodContext {
             name: name.into(),
             return_type,
+            is_static,
         });
         self.enter_scope();
         self.case_label_uses.clear();
@@ -1053,8 +1164,12 @@ impl Binder {
             .iter()
             .map(|(parameter, _)| parameter.clone())
             .collect();
-        let unassigned =
-            crate::flow::check_definite_assignment(&bound, &parameter_names, &self.model);
+        let unassigned = crate::flow::check_definite_assignment(
+            &bound,
+            &parameter_names,
+            out_parameters,
+            &self.model,
+        );
         self.diagnostics.extend(unassigned);
         self.diagnostics.extend(crate::flow::check_unused_locals(
             &bound,
@@ -1063,6 +1178,7 @@ impl Binder {
         self.diagnostics
             .extend(crate::flow::check_unreachable(&bound));
         self.diagnostics.extend(crate::flow::check_labels(&bound));
+        crate::flow::collect_field_accesses(&bound, &mut self.field_reads, &mut self.field_writes);
         self.current_method = None;
         self.current_type = None;
         bound
@@ -1107,6 +1223,7 @@ impl Binder {
         self.current_method = Some(MethodContext {
             name: "Submit".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
+            is_static: true,
         });
         self.enter_scope();
         self.case_label_uses.clear();
@@ -1287,15 +1404,22 @@ impl Binder {
     pub fn bind_field_initializer(
         &mut self,
         enclosing: TypeSymbol,
+        field_name: &str,
         field_type: &TypeSymbol,
         initializer: &Expr,
     ) {
-        self.current_type = Some(enclosing);
+        self.current_type = Some(enclosing.clone());
         self.enter_scope();
         let value = self.bind_expression(initializer);
         self.check_assignable(&value, field_type, initializer.span);
         self.exit_scope();
         self.current_type = None;
+        if !value.ty.is_error() && self.assignable(&value, field_type) {
+            if let Some(key) = crate::flow::field_type_key(&enclosing) {
+                self.field_writes.insert((key, field_name.into()));
+            }
+        }
+        crate::flow::collect_field_uses(&value, &mut self.field_reads, &mut self.field_writes);
     }
 
     /// Checks a `return` statement against the enclosing method's return type
@@ -1405,7 +1529,17 @@ impl Binder {
                 ty: literal_type(literal),
             },
             ExprKind::Name(name) => self.bind_name(name, expr.span),
-            ExprKind::This => self.this_expr(),
+            ExprKind::This => {
+                if self.in_static_method() {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::ThisInStaticContext,
+                        expr.span,
+                    ));
+                    error_expr()
+                } else {
+                    self.this_expr()
+                }
+            }
             ExprKind::Base => self.base_expr(),
             ExprKind::MemberAccess { receiver, name } => {
                 self.bind_member_access(receiver, name, expr.span)
@@ -1480,6 +1614,51 @@ impl Binder {
             ExprKind::Cast { target, operand } => {
                 let operand = self.bind_expression(operand);
                 let ty = self.resolve_named_type(&bind_type(target), target.span);
+                if matches!(operand.kind, BoundExprKind::MethodGroup { .. }) && !ty.is_error() {
+                    let candidates: Vec<(Box<str>, MethodSymbol)> = self
+                        .type_info_of(&ty)
+                        .map(|info| {
+                            info.methods
+                                .iter()
+                                .filter(|m| {
+                                    (&*m.name == "op_Explicit" || &*m.name == "op_Implicit")
+                                        && m.parameters.len() == 1
+                                        && m.return_type == ty
+                                        && self
+                                            .type_info_of(&m.parameters[0])
+                                            .is_some_and(|d| d.kind == TypeKind::Delegate)
+                                })
+                                .map(|m| (m.name.clone(), m.clone()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for (op_name, method) in candidates {
+                        let delegate = method.parameters[0].clone();
+                        let as_delegate = self.bind_delegate_creation(
+                            &delegate,
+                            core::slice::from_ref(&operand),
+                            target.span,
+                        );
+                        if matches!(as_delegate.kind, BoundExprKind::DelegateCreation { .. }) {
+                            let declaring_type =
+                                self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
+                            return BoundExpr {
+                                ty: ty.clone(),
+                                kind: BoundExprKind::Call {
+                                    callee: Box::new(error_expr()),
+                                    arguments: alloc::vec![as_delegate],
+                                    method: Some(MethodReference {
+                                        declaring_type,
+                                        name: op_name,
+                                        parameters: method.parameters,
+                                        return_type: method.return_type,
+                                        is_static: true,
+                                    }),
+                                },
+                            };
+                        }
+                    }
+                }
                 if !operand.ty.is_error() && !ty.is_error() {
                     if let Some(method) = self
                         .user_conversion(&operand.ty, &ty, "op_Explicit")
@@ -1493,6 +1672,40 @@ impl Binder {
                                 method: Some(method),
                             },
                         };
+                    }
+                    if let Some(value) = constant_int_value(&operand) {
+                        let via = self.type_info_of(&ty).and_then(|info| {
+                            info.methods.iter().find_map(|m| {
+                                ((&*m.name == "op_Explicit" || &*m.name == "op_Implicit")
+                                    && m.parameters.len() == 1
+                                    && m.return_type == ty
+                                    && matches!(
+                                        m.parameters.first(),
+                                        Some(TypeSymbol::Special(t)) if constant_fits(value, *t)
+                                    ))
+                                .then(|| (m.name.clone(), m.clone()))
+                            })
+                        });
+                        if let Some((op_name, method)) = via {
+                            let param = method.parameters[0].clone();
+                            let argument = self.convert(operand, &param);
+                            let declaring_type =
+                                self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
+                            return BoundExpr {
+                                ty: ty.clone(),
+                                kind: BoundExprKind::Call {
+                                    callee: Box::new(error_expr()),
+                                    arguments: alloc::vec![argument],
+                                    method: Some(MethodReference {
+                                        declaring_type,
+                                        name: op_name,
+                                        parameters: method.parameters,
+                                        return_type: method.return_type,
+                                        is_static: true,
+                                    }),
+                                },
+                            };
+                        }
                     }
                     if let Some(underlying) = self.enum_underlying_type(&ty) {
                         if let Some(method) = self
@@ -1554,7 +1767,7 @@ impl Binder {
                 let resolved = self.resolve_named_type(&bind_type(target), span);
                 if operand.ty.is_void() && matches!(operation, TypeTestOperation::As) {
                     self.diagnostics.push(Diagnostic::new(
-                        DiagnosticKind::CannotCast {
+                        DiagnosticKind::AsConversionMissing {
                             from: operand.ty.to_string().into(),
                             to: resolved.to_string().into(),
                         },
@@ -1657,10 +1870,13 @@ impl Binder {
                 }
             }
             ExprKind::Checked(inner) => {
-                let saved = self.checked_context;
+                let saved_checked = self.checked_context;
+                let saved_unchecked = self.unchecked_context;
                 self.checked_context = true;
+                self.unchecked_context = false;
                 let inner = self.bind_expression(inner);
-                self.checked_context = saved;
+                self.checked_context = saved_checked;
+                self.unchecked_context = saved_unchecked;
                 let ty = inner.ty.clone();
                 BoundExpr {
                     kind: BoundExprKind::Checked(Box::new(inner)),
@@ -1668,10 +1884,13 @@ impl Binder {
                 }
             }
             ExprKind::Unchecked(inner) => {
-                let saved = self.checked_context;
+                let saved_checked = self.checked_context;
+                let saved_unchecked = self.unchecked_context;
                 self.checked_context = false;
+                self.unchecked_context = true;
                 let inner = self.bind_expression(inner);
-                self.checked_context = saved;
+                self.checked_context = saved_checked;
+                self.unchecked_context = saved_unchecked;
                 let ty = inner.ty.clone();
                 BoundExpr {
                     kind: BoundExprKind::Unchecked(Box::new(inner)),
@@ -1770,6 +1989,24 @@ impl Binder {
             ));
             TypeSymbol::Error
         };
+        if matches!(
+            operator,
+            BinaryOperator::Add | BinaryOperator::Subtract | BinaryOperator::Multiply
+        ) {
+            let fold = |operand: &BoundExpr| {
+                constant_literal_value(operand).and_then(|literal| literal_int_value(&literal))
+            };
+            if let (Some(left_value), Some(right_value)) = (fold(&left), fold(&right)) {
+                let (left_value, right_value) = (i128::from(left_value), i128::from(right_value));
+                let value = match operator {
+                    BinaryOperator::Add => left_value + right_value,
+                    BinaryOperator::Subtract => left_value - right_value,
+                    BinaryOperator::Multiply => left_value * right_value,
+                    _ => unreachable!(),
+                };
+                self.report_constant_overflow(value, &ty, span);
+            }
+        }
         let (left, right) = if matches!(operator, BinaryOperator::Add)
             && matches!(ty, TypeSymbol::Special(SpecialType::String))
         {
@@ -1796,6 +2033,35 @@ impl Binder {
     /// stays unsigned rather than promoting `uint op <signed>` to `long` (14.2.6.2). `uint` is the
     /// only case that diverges -- every other unsigned type already promotes to itself or to `int`.
     /// Any other operand pair is returned unchanged, so numeric promotion proceeds as before.
+    /// Reports CS0220 when a constant integer `+`/`-`/`*` (or unary `-`) overflows its result
+    /// type in a checked context. Constant expressions are checked by DEFAULT (14.16), so this
+    /// fires unless an explicit `unchecked` context suppresses it. `ty` is the operation's own
+    /// result type (the binder's numeric promotion), and `value` its true mathematical result in
+    /// i128 -- so a fitting constant is never flagged and this cannot misfire on a valid program
+    /// (a valid program has no overflowing constant). sbyte/short never reach here (they promote
+    /// to int for arithmetic); ulong is not folded (its range exceeds i64), a deliberate
+    /// under-report; a checked CAST overflow is CS0221, a separate rule left untouched.
+    fn report_constant_overflow(&mut self, value: i128, ty: &TypeSymbol, span: Span) {
+        if self.unchecked_context {
+            return;
+        }
+        let TypeSymbol::Special(target) = ty else {
+            return;
+        };
+        let (min, max) = match target {
+            SpecialType::Int32 => (i128::from(i32::MIN), i128::from(i32::MAX)),
+            SpecialType::UInt32 => (0, i128::from(u32::MAX)),
+            SpecialType::Int64 => (i128::from(i64::MIN), i128::from(i64::MAX)),
+            _ => return,
+        };
+        if value < min || value > max {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::ConstantOverflowInCheckedContext,
+                span,
+            ));
+        }
+    }
+
     fn adjust_binary_constant(
         &self,
         operator: BinaryOperator,
@@ -2160,6 +2426,13 @@ impl Binder {
                 },
                 ty,
             };
+        }
+        if operator == UnaryOperator::Minus {
+            if let Some(value) =
+                constant_literal_value(&operand).and_then(|literal| literal_int_value(&literal))
+            {
+                self.report_constant_overflow(-i128::from(value), &ty, span);
+            }
         }
         BoundExpr {
             kind: BoundExprKind::Unary {
@@ -2647,6 +2920,13 @@ impl Binder {
                 }
             }
         }
+        if let BoundExprKind::MethodGroup { name, .. } = &target.kind {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::CannotAssignToMethodGroup { name: name.clone() },
+                target_span,
+            ));
+            return error_expr();
+        }
         let this_in_struct =
             matches!(target.kind, BoundExprKind::This) && self.is_value_type(&target.ty);
         if !target.ty.is_error() && !is_lvalue(&target) && !this_in_struct {
@@ -2947,6 +3227,12 @@ impl Binder {
             }
         }
         if let (Some(kind), Some(method)) = (receiver_kind, &resolved) {
+            if matches!(kind, Receiver::ImplicitThis)
+                && !method.is_static
+                && self.in_static_method()
+            {
+                self.report_no_object_reference(&method.declaring_type, &method.name, true, span);
+            }
             self.check_static_instance(
                 kind,
                 method.is_static,
@@ -3076,6 +3362,32 @@ impl Binder {
     /// converts to it (15.4), and `convert` builds the delegate at the call site. Returns the
     /// unique applicable method (reporting CS0122 if inaccessible, CS0121 if two apply),
     /// else `None`.
+    /// Whether a method-group argument is applicable to a parameter (15.4): the parameter must be a
+    /// delegate type and the group must contain a candidate whose signature exactly matches the
+    /// delegate's `Invoke` (parameters + return), the same test `bind_delegate_creation` applies.
+    /// Without it a `void()` group looks applicable to EVERY delegate parameter, so overloads like
+    /// `F(D0)`/`F(D1)` both match and the call is falsely reported ambiguous (CS0121).
+    fn method_group_matches_delegate(&self, argument: &BoundExpr, parameter: &TypeSymbol) -> bool {
+        let BoundExprKind::MethodGroup { receiver, name } = &argument.kind else {
+            return false;
+        };
+        let Some(invoke) = self.type_info_of(parameter).and_then(|info| {
+            if info.kind == TypeKind::Delegate {
+                info.methods.iter().find(|m| &*m.name == "Invoke").cloned()
+            } else {
+                None
+            }
+        }) else {
+            return false;
+        };
+        self.methods_in_chain(&receiver.ty, name)
+            .iter()
+            .any(|candidate| {
+                candidate.parameters == invoke.parameters
+                    && candidate.return_type == invoke.return_type
+            })
+    }
+
     fn resolve_with_method_groups(
         &mut self,
         name: &str,
@@ -3095,8 +3407,7 @@ impl Binder {
                             {
                                 argument_type(argument) == *parameter
                             } else if matches!(argument.kind, BoundExprKind::MethodGroup { .. }) {
-                                self.type_info_of(parameter)
-                                    .is_some_and(|info| info.kind == TypeKind::Delegate)
+                                self.method_group_matches_delegate(argument, parameter)
                             } else {
                                 self.assignable(argument, parameter)
                             }
@@ -3529,6 +3840,40 @@ impl Binder {
         }
     }
 
+    /// Whether the method currently being bound is a `static` method with no `this` --
+    /// so an unqualified instance member (read through an implicit `this`) is `CS0120`,
+    /// and the `this` keyword itself is `CS0026`. A REPL submission is exempt: its
+    /// `Submit$N` is static but reaches session members through the `s` parameter (not a
+    /// `this`), so `session_receiver` standing in for `this` makes those accesses legal.
+    fn in_static_method(&self) -> bool {
+        self.session_receiver.is_none()
+            && self.current_method.as_ref().is_some_and(|method| method.is_static)
+    }
+
+    /// Reports `CS0120` for an instance member reached with no object -- an implicit `this`
+    /// in a static method, where there is none. The member is rendered qualified by its
+    /// declaring type (`C.x`), with `()` appended for a method (`C.Foo()`), matching csc.
+    fn report_no_object_reference(
+        &mut self,
+        declaring: &TypeSymbol,
+        member: &str,
+        is_method: bool,
+        span: Span,
+    ) {
+        let mut qualified = declaring.to_string();
+        qualified.push('.');
+        qualified.push_str(member);
+        if is_method {
+            qualified.push_str("()");
+        }
+        self.report(Diagnostic::new(
+            DiagnosticKind::ObjectReferenceRequired {
+                member: qualified.into(),
+            },
+            span,
+        ));
+    }
+
     /// Reports the static/instance mismatch of accessing a member through `receiver`
     /// (`CS0120` for an instance member named through a type, `CS0176` for a static
     /// member through an instance). An access through `this`/`base` is exempt.
@@ -3774,6 +4119,226 @@ impl Binder {
                     declaration.span,
                 ));
             }
+        }
+    }
+
+    /// Reports `CS0115` for each source `override` method in `declaration` whose name and
+    /// parameter types match no method up the base *class* chain (including the implicit
+    /// `System.Object` root every type derives from). The check keys on the EXISTENCE of a
+    /// same-signature base member, not on its `virtual`/`abstract`/`override`-ness: a base
+    /// member that exists but is not overridable is `CS0506`, and one that matches but for the
+    /// return type is `CS0508` -- both are left to those rules, so this stays a strict subset of
+    /// csc. Interfaces are not override targets (implementing one is `CS0535`), so only the
+    /// `base` chain is walked. Conservative: if the chain cannot be fully resolved (an unknown
+    /// base type, or no model `System.Object`), nothing is reported -- the target might be there.
+    pub(crate) fn check_overrides_have_base(
+        &mut self,
+        class_ty: &TypeSymbol,
+        declaration: &lamella_syntax::ast::TypeDecl,
+    ) {
+        for member in &declaration.members {
+            let lamella_syntax::ast::Member::Method {
+                modifiers,
+                name,
+                parameters,
+                explicit_interface: None,
+                span,
+                ..
+            } = member
+            else {
+                continue;
+            };
+            if !modifiers
+                .iter()
+                .any(|modifier| matches!(modifier, lamella_syntax::ast::Modifier::Override))
+            {
+                continue;
+            }
+            let query: Vec<TypeSymbol> = parameters
+                .iter()
+                .map(|parameter| {
+                    self.normalize_for_signature(&crate::bind::parameter_symbol(parameter))
+                })
+                .collect();
+            let (found, resolved) = self.base_signature_exists(class_ty, name, &query);
+            if !found && resolved {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::NoMethodToOverride {
+                        method: crate::program::method_signature(
+                            &declaration.name,
+                            name,
+                            parameters,
+                        ),
+                    },
+                    *span,
+                ));
+            }
+        }
+    }
+
+    /// Reports `CS0534` for each inherited abstract member a non-abstract class does not
+    /// implement -- one diagnostic per unimplemented member, naming its declaring type
+    /// (`'D' does not implement inherited abstract member 'B.M()'`). Walks the base *class*
+    /// chain most-derived first, keeping the most-derived declaration of each instance-method
+    /// slot; a slot whose winning declaration is still `abstract` is unimplemented. An abstract
+    /// class (or a struct/interface/enum) is exempt. Conservative: an unresolved base truncates
+    /// the walk, and property/indexer/event accessors are not modeled here, so this under-reports
+    /// rather than risk a false diagnostic. (Interface members are `CS0535`, checked separately.)
+    pub(crate) fn check_abstract_implementations(
+        &mut self,
+        class_ty: &TypeSymbol,
+        declaration: &lamella_syntax::ast::TypeDecl,
+    ) {
+        if declaration
+            .modifiers
+            .iter()
+            .any(|modifier| matches!(modifier, lamella_syntax::ast::Modifier::Abstract))
+        {
+            return;
+        }
+        if !self
+            .model
+            .get_by_symbol(class_ty)
+            .is_some_and(|info| info.kind == TypeKind::Class)
+        {
+            return;
+        }
+        let mut slots: Vec<(Box<str>, Vec<TypeSymbol>, Box<str>, bool, bool)> = Vec::new();
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut current = Some(class_ty.clone());
+        while let Some(ty) = current.take() {
+            if visited.contains(&ty) {
+                break;
+            }
+            let declared_here = ty == *class_ty;
+            visited.push(ty.clone());
+            let Some(info) = self.model.get_by_symbol(&ty) else {
+                break;
+            };
+            let declaring = info.name.clone();
+            for method in &info.methods {
+                if method.is_static || is_special_member_name(&method.name) {
+                    continue;
+                }
+                let key: Vec<TypeSymbol> = method
+                    .parameters
+                    .iter()
+                    .map(|parameter| self.normalize_for_signature(parameter))
+                    .collect();
+                let already = slots
+                    .iter()
+                    .any(|(name, params, ..)| **name == *method.name && *params == key);
+                if !already {
+                    slots.push((
+                        method.name.clone(),
+                        key,
+                        declaring.clone(),
+                        method.is_abstract,
+                        declared_here,
+                    ));
+                }
+            }
+            current = info.base.clone();
+        }
+        for (name, params, declaring, is_abstract, declared_here) in &slots {
+            if *is_abstract && !declared_here {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::AbstractMemberNotImplemented {
+                        type_name: declaration.name.clone(),
+                        member: abstract_member_signature(declaring, name, params),
+                    },
+                    declaration.span,
+                ));
+            }
+        }
+    }
+
+    /// Whether the base *class* chain of `class_ty` -- plus the implicit `System.Object` (and,
+    /// for a struct, `System.ValueType`) root every type derives from -- declares a method named
+    /// `name` whose parameters match `query` (both sides normalized so a metadata `System.String`
+    /// and the `string` keyword compare equal). Returns `(found, resolved)`; `resolved` is false
+    /// when an unknown base type truncated the walk or `System.Object` is absent from the model,
+    /// so the caller can decline to report.
+    fn base_signature_exists(
+        &self,
+        class_ty: &TypeSymbol,
+        name: &str,
+        query: &[TypeSymbol],
+    ) -> (bool, bool) {
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut current = self
+            .model
+            .get_by_symbol(class_ty)
+            .and_then(|info| info.base.clone());
+        while let Some(ty) = current.take() {
+            if visited.contains(&ty) {
+                break;
+            }
+            visited.push(ty.clone());
+            let Some(info) = self.model.get_by_symbol(&ty) else {
+                return (false, false);
+            };
+            if self.type_declares_signature(info, name, query) {
+                return (true, true);
+            }
+            current = info.base.clone();
+        }
+        for root in ["Object", "ValueType"] {
+            let root_ty = type_symbol_in("System", root);
+            if *class_ty == root_ty || visited.contains(&root_ty) {
+                continue;
+            }
+            match self.model.get_by_symbol(&root_ty) {
+                Some(info) if self.type_declares_signature(info, name, query) => return (true, true),
+                Some(_) => {}
+                None if root == "Object" => return (false, false),
+                None => {}
+            }
+        }
+        (false, true)
+    }
+
+    /// Whether `info` declares a method named `name` whose parameter types match `query` (already
+    /// normalized); each candidate parameter is normalized so metadata- and source-derived
+    /// framework types compare equal.
+    fn type_declares_signature(&self, info: &TypeInfo, name: &str, query: &[TypeSymbol]) -> bool {
+        info.methods.iter().any(|method| {
+            &*method.name == name
+                && method.parameters.len() == query.len()
+                && method
+                    .parameters
+                    .iter()
+                    .zip(query)
+                    .all(|(candidate, wanted)| self.normalize_for_signature(candidate) == *wanted)
+        })
+    }
+
+    /// Normalizes a type for cross-source signature comparison: a framework-named primitive/
+    /// `object`/`string` folds to its special form, at every level of an array/pointer/byref, so
+    /// a metadata `System.Object` parameter and the `object` keyword are the same type.
+    fn normalize_for_signature(&self, ty: &TypeSymbol) -> TypeSymbol {
+        match ty {
+            TypeSymbol::Array { element, rank } => TypeSymbol::Array {
+                element: Box::new(self.normalize_for_signature(element)),
+                rank: *rank,
+            },
+            TypeSymbol::Pointer(inner) => {
+                TypeSymbol::Pointer(Box::new(self.normalize_for_signature(inner)))
+            }
+            TypeSymbol::ByRef(inner) => {
+                TypeSymbol::ByRef(Box::new(self.normalize_for_signature(inner)))
+            }
+            TypeSymbol::Named(parts) => {
+                let qualified = if parts.len() == 1 {
+                    self.model
+                        .type_with_simple_name(&parts[0])
+                        .unwrap_or_else(|| ty.clone())
+                } else {
+                    ty.clone()
+                };
+                qualified.fold_builtin()
+            }
+            _ => ty.clone(),
         }
     }
 
@@ -4192,6 +4757,14 @@ impl Binder {
         if let Some(current) = self.current_type.clone() {
             match self.resolve_member(&current, name) {
                 MemberResolution::Field(field) => {
+                    if !field.is_static && self.in_static_method() {
+                        self.report_no_object_reference(
+                            &field.declaring_type,
+                            name,
+                            false,
+                            span,
+                        );
+                    }
                     return BoundExpr {
                         ty: field.ty.clone(),
                         kind: BoundExprKind::FieldAccess {
@@ -4202,10 +4775,14 @@ impl Binder {
                     };
                 }
                 MemberResolution::Property {
+                    declaring_type,
                     ty,
                     is_static,
                     ..
                 } => {
+                    if !is_static && self.in_static_method() {
+                        self.report_no_object_reference(&declaring_type, name, false, span);
+                    }
                     let receiver = if is_static {
                         BoundExpr {
                             kind: BoundExprKind::TypeReference(current.clone()),
@@ -4612,6 +5189,37 @@ fn implicit_constant_conversion(expr: &BoundExpr, target: &TypeSymbol) -> bool {
     }
 }
 
+/// The rendered value of an int/long CONSTANT that is out of range of the integral type it is
+/// narrowing to under the constant-expression conversion (13.1.7) -- so an out-of-range one is
+/// CS0031, not the generic narrowing CS0266. An `int` constant converts to
+/// sbyte/byte/short/ushort/uint/ulong; a `long` constant only to ulong; every other target (char,
+/// a floating type, an identity or widening target, or a `uint`/other non-int/long source) is
+/// outside this rule, so those keep the CS0266/CS0029 path. `None` when the rule does not apply or
+/// the value is in range.
+fn constant_out_of_range(value: &BoundExpr, target: &TypeSymbol) -> Option<Box<str>> {
+    use SpecialType as S;
+    let (TypeSymbol::Special(source), TypeSymbol::Special(target)) = (&value.ty, target) else {
+        return None;
+    };
+    let eligible = match source {
+        S::Int32 => matches!(
+            target,
+            S::SByte | S::Byte | S::Int16 | S::UInt16 | S::UInt32 | S::UInt64
+        ),
+        S::Int64 => *target == S::UInt64,
+        _ => false,
+    };
+    if !eligible {
+        return None;
+    }
+    let folded = constant_int_value(value)?;
+    if constant_fits(folded, *target) {
+        None
+    } else {
+        Some(alloc::string::ToString::to_string(&folded).into())
+    }
+}
+
 /// Whether `ty` is `uint` -- the only unsigned type whose binary numeric promotion with a
 /// signed operand widens to `long`, so a fitting `int` constant is instead retyped `uint` (13.1.7).
 fn is_uint(ty: &TypeSymbol) -> bool {
@@ -4893,25 +5501,84 @@ fn resolve_overload(
     if !applicable.is_empty() {
         return OverloadResult::Ambiguous;
     }
-    let Some(count_matched) = candidates
+    let mut expanded = None;
+    for candidate in candidates {
+        if candidate.parameters.len() == arguments.len() {
+            if let Some(bad) = first_bad_normal(model, candidate, arguments, arg_constants) {
+                return bad;
+            }
+        }
+        if candidate.is_params && expanded.is_none() {
+            expanded = first_bad_expanded(model, candidate, arguments, arg_constants);
+        }
+    }
+    expanded.unwrap_or(OverloadResult::WrongArgumentCount)
+}
+
+/// The first argument that does not convert to `method`'s same-position parameter
+/// (the arities already match), as a [`OverloadResult::BadArgument`]; `None` when
+/// every argument converts -- in which case the method would have been applicable.
+fn first_bad_normal(
+    model: &Model,
+    method: &MethodSymbol,
+    arguments: &[TypeSymbol],
+    arg_constants: &[Option<i64>],
+) -> Option<OverloadResult> {
+    arguments
         .iter()
-        .find(|candidate| candidate.parameters.len() == arguments.len())
-    else {
-        return OverloadResult::WrongArgumentCount;
-    };
-    for (index, (argument, parameter)) in
-        arguments.iter().zip(&count_matched.parameters).enumerate()
-    {
-        if !arg_applicable(model, argument, arg_constants.get(index).copied().flatten(), parameter)
-        {
-            return OverloadResult::BadArgument {
+        .zip(&method.parameters)
+        .enumerate()
+        .find_map(|(index, (argument, parameter))| {
+            (!arg_applicable(
+                model,
+                argument,
+                arg_constants.get(index).copied().flatten(),
+                parameter,
+            ))
+            .then(|| OverloadResult::BadArgument {
                 index,
                 from: argument.clone(),
                 to: parameter.clone(),
-            };
-        }
+            })
+        })
+}
+
+/// The first argument that does not convert to a `params` `method` in EXPANDED form
+/// -- each leading argument against its fixed parameter, each trailing argument
+/// against the array element type (14.4.2.1) -- as a [`OverloadResult::BadArgument`].
+/// `None` when the method cannot take this many arguments expanded, its last
+/// parameter is not an array, or every argument converts.
+fn first_bad_expanded(
+    model: &Model,
+    method: &MethodSymbol,
+    arguments: &[TypeSymbol],
+    arg_constants: &[Option<i64>],
+) -> Option<OverloadResult> {
+    let fixed = method.parameters.len().saturating_sub(1);
+    if arguments.len() < fixed {
+        return None;
     }
-    OverloadResult::WrongArgumentCount
+    let TypeSymbol::Array { element, .. } = &method.parameters[fixed] else {
+        return None;
+    };
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        let parameter = if index < fixed {
+            &method.parameters[index]
+        } else {
+            &**element
+        };
+        (!arg_applicable(
+            model,
+            argument,
+            arg_constants.get(index).copied().flatten(),
+            parameter,
+        ))
+        .then(|| OverloadResult::BadArgument {
+            index,
+            from: argument.clone(),
+            to: parameter.clone(),
+        })
+    })
 }
 
 /// Whether a method is applicable to the arguments: in normal form the counts match
@@ -5081,6 +5748,36 @@ fn dotted_type_name(ty: &TypeSymbol) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// Whether `name` is a compiler-emitted special member -- a property/event/indexer accessor,
+/// an operator, or a constructor -- which the CS0534 abstract-member check skips (its message
+/// formats an ordinary method signature, and source properties/events are modeled separately).
+fn is_special_member_name(name: &str) -> bool {
+    name.starts_with("get_")
+        || name.starts_with("set_")
+        || name.starts_with("add_")
+        || name.starts_with("remove_")
+        || name.starts_with("op_")
+        || name == ".ctor"
+        || name == ".cctor"
+}
+
+/// The qualified signature of an abstract member for a `CS0534` message (`B.M(int)`): the
+/// declaring type's simple name, the method name, and the parameter types.
+fn abstract_member_signature(declaring: &str, name: &str, params: &[TypeSymbol]) -> Box<str> {
+    let mut signature = String::from(declaring);
+    signature.push('.');
+    signature.push_str(name);
+    signature.push('(');
+    for (index, parameter) in params.iter().enumerate() {
+        if index > 0 {
+            signature.push_str(", ");
+        }
+        signature.push_str(&alloc::format!("{parameter}"));
+    }
+    signature.push(')');
+    signature.into()
 }
 
 /// The `System.Type` named type, the result of a `typeof` expression (14.5.11).
@@ -5587,6 +6284,9 @@ mod tests {
             parameters: Vec::new(),
             is_static: false,
             is_params: false,
+            is_virtual: false,
+            is_abstract: false,
+            is_override: false,
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
         });
@@ -5707,6 +6407,9 @@ mod tests {
             parameters: Vec::new(),
             is_static: false,
             is_params: false,
+            is_virtual: false,
+            is_abstract: false,
+            is_override: false,
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
         });
@@ -5954,7 +6657,7 @@ mod tests {
         let codes = |return_type: TypeSymbol, source: &str| {
             let mut binder = Binder::new();
             let body = parse_statement(source).statement;
-            binder.bind_method(None, "M", return_type, &[], &body);
+            binder.bind_method(None, "M", return_type, &[], &[], false, &body);
             binder
                 .into_diagnostics()
                 .iter()
@@ -5970,7 +6673,7 @@ mod tests {
 
         let mut binder = Binder::new();
         let body = parse_statement("{ return n; }").statement;
-        binder.bind_method(None, "M", int.clone(), &[("n".into(), int)], &body);
+        binder.bind_method(None, "M", int.clone(), &[("n".into(), int)], &[], false, &body);
         assert!(binder.diagnostics().is_empty());
     }
 
@@ -5982,7 +6685,7 @@ mod tests {
         let codes = |source: &str| {
             let mut binder = Binder::new();
             let body = parse_statement(source).statement;
-            binder.bind_method(None, "M", void.clone(), &[], &body);
+            binder.bind_method(None, "M", void.clone(), &[], &[], false, &body);
             binder
                 .into_diagnostics()
                 .iter()
@@ -6011,10 +6714,53 @@ mod tests {
 
         let mut binder = Binder::new();
         let body = parse_statement("{ int y = p; }").statement;
-        binder.bind_method(None, "M", void, &[("p".into(), int)], &body);
+        binder.bind_method(None, "M", void, &[("p".into(), int)], &[], false, &body);
         assert!(!binder.diagnostics().iter().any(|diagnostic| {
             diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
         }));
+    }
+
+    #[test]
+    fn definite_assignment_ignores_unreachable_switch_sections() {
+        use lamella_syntax::parser::parse_statement;
+        let int = TypeSymbol::Special(SpecialType::Int32);
+        let void = TypeSymbol::Special(SpecialType::Void);
+        let codes = |source: &str, params: &[(Box<str>, TypeSymbol)]| {
+            let mut binder = Binder::new();
+            let body = parse_statement(source).statement;
+            binder.bind_method(None, "M", void.clone(), params, &[], false, &body);
+            binder
+                .into_diagnostics()
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+                })
+                .map(Diagnostic::code)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            codes(
+                "{ int x; switch (2) { case 1: break; case 2: x = 1; break; } int y = x; }",
+                &[],
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "{ int x; switch (2) { case 1: x = 1; break; case 2: goto case 1; case 3: break; } \
+                 int y = x; }",
+                &[],
+            ),
+            []
+        );
+        assert_eq!(
+            codes(
+                "{ int x; switch (n) { case 1: break; case 2: x = 1; break; } int y = x; }",
+                &[("n".into(), int.clone())],
+            ),
+            [165]
+        );
     }
 
     #[test]
@@ -6026,7 +6772,7 @@ mod tests {
         let codes = |return_type: TypeSymbol, source: &str| {
             let mut binder = Binder::new();
             let body = parse_statement(source).statement;
-            binder.bind_method(None, "M", return_type, &[], &body);
+            binder.bind_method(None, "M", return_type, &[], &[], false, &body);
             binder
                 .into_diagnostics()
                 .iter()
@@ -6062,6 +6808,9 @@ mod tests {
                 parameters,
                 is_static: false,
                 is_params: false,
+                is_virtual: false,
+                is_abstract: false,
+                is_override: false,
                 accessibility: crate::symbols::Accessibility::Public,
                 conditional: Vec::new(),
             }
@@ -6085,6 +6834,16 @@ mod tests {
         ));
         calc.methods
             .push(method("G", void, alloc::vec![long, int.clone()]));
+        let mut take_all = method(
+            "P",
+            TypeSymbol::Special(SpecialType::Void),
+            alloc::vec![
+                TypeSymbol::Special(SpecialType::String),
+                int.clone().into_array(1),
+            ],
+        );
+        take_all.is_params = true;
+        calc.methods.push(take_all);
         let mut model = Model::new();
         model.insert(calc);
 
@@ -6113,6 +6872,10 @@ mod tests {
         assert_eq!(call_codes("c.Take(1, 2)"), [1501]);
         assert_eq!(call_codes("c.Take(\"x\")"), [1503]);
         assert_eq!(call_codes("c.G(1, 1)"), [121]);
+        assert!(call_codes("c.P(\"s\", 1, 2)").is_empty());
+        assert_eq!(call_codes("c.P(1, 2, 3)"), [1503]);
+        assert_eq!(call_codes("c.P(\"s\", 1, \"x\")"), [1503]);
+        assert_eq!(call_codes("c.P()"), [1501]);
     }
 
     #[test]
@@ -6339,6 +7102,10 @@ mod tests {
             [219]
         );
         assert_eq!(
+            codes("class C { static int Run() { bool b = 1; return 0; } }"),
+            [29]
+        );
+        assert_eq!(
             codes("class C { static int Run() { int spare; return 0; } }"),
             [168]
         );
@@ -6349,6 +7116,52 @@ mod tests {
         assert_eq!(
             codes("class C { static int Run() { Bogus b = null; return 0; } }"),
             [246]
+        );
+    }
+
+    #[test]
+    fn unused_private_field_warns_cs0414() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes("class C { int f = 5; static int Run() { return 0; } }"),
+            [414]
+        );
+        assert_eq!(
+            codes("class C { int f; C() { f = 5; } static int Run() { return 0; } }"),
+            [414]
+        );
+        assert_eq!(
+            codes(
+                "class C { int f; C() { f = 5; } int Get() { return f; } \
+                 static int Run() { return 0; } }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes("class C { int f = 0; void Bump() { f += 1; } static int Run() { return 0; } }"),
+            []
+        );
+        assert_eq!(
+            codes("class C { public int f = 5; static int Run() { return 0; } }"),
+            []
+        );
+        assert_eq!(
+            codes("class C { const int f = 5; static int Run() { return 0; } }"),
+            []
+        );
+        assert_eq!(
+            codes("class C { int f; static int Run() { return 0; } }"),
+            [169]
         );
     }
 
@@ -6398,6 +7211,9 @@ mod tests {
             parameters: alloc::vec![int.clone()],
             is_static: false,
             is_params: false,
+            is_virtual: false,
+            is_abstract: false,
+            is_override: false,
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
         });

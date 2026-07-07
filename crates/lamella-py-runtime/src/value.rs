@@ -43,6 +43,9 @@ const STOP_BITS: u32 = 0b1_0010;
 /// error living in the EH runtime's current-error slot. Another reserved `2 (mod 4)`
 /// immediate.
 const ERROR_BITS: u32 = 0b1_0110;
+/// `Ellipsis` (`...`) -- a reserved `2 (mod 4)` singleton the GC skips, distinct from
+/// None=2/False=6/True=10, the callable nibble `...1110`, STOP=18, ERROR=22.
+const ELLIPSIS_BITS: u32 = 0b1_1010;
 
 /// The most negative integer representable as a fixnum (the rest overflow to a
 /// bignum).
@@ -66,6 +69,14 @@ impl Value {
     /// The error sentinel (`PY_ERROR`): a runtime-support entry returns it after raising;
     /// the actual error lives in the EH runtime's current-error slot. Never user-visible.
     pub const PY_ERROR: Value = Value(ERROR_BITS);
+    /// The Python `Ellipsis` (`...`) singleton.
+    pub const ELLIPSIS: Value = Value(ELLIPSIS_BITS);
+
+    /// Whether this word is the `Ellipsis` singleton.
+    #[must_use]
+    pub const fn is_ellipsis(self) -> bool {
+        self.0 == ELLIPSIS_BITS
+    }
 
     /// Wraps `n` as a fixnum, or `None` if it falls outside the 31-bit fixnum range
     /// (the caller promotes to a bignum, or traps).
@@ -256,7 +267,7 @@ impl Value {
         } else if self.is_pointer() || self.is_function_ref() || self.is_builtin_ref() {
             true
         } else {
-            self == Value::TRUE
+            self == Value::TRUE || self.is_ellipsis()
         }
     }
 

@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use lamella_gc::{Heap, Ref, TypeDesc};
-use lamella_py_bytecode::{BinOp, CmpOp};
+use lamella_py_bytecode::{BinOp, CmpOp, CodeObject};
 
 use crate::bigint::BigInt;
 use crate::builtins::Builtin;
@@ -76,6 +76,21 @@ fn format_radix(mut n: u32, radix: u32, upper: bool) -> String {
     }
     buf.reverse();
     String::from_utf8(buf).unwrap_or_default()
+}
+
+/// Zero-pads the digit portion of a rendered int (the `%`-format int precision = minimum digits) to
+/// at least `precision` digits, keeping a leading sign and any `0x`/`0o`/`0b` prefix in front.
+fn zero_pad_int(rendered: &str, precision: usize) -> String {
+    let (sign, rest) = match rendered.strip_prefix(['-', '+', ' ']) {
+        Some(rest) => (&rendered[..1], rest),
+        None => ("", rendered),
+    };
+    let (prefix, digits) = match rest.get(..2) {
+        Some(p @ ("0x" | "0X" | "0o" | "0O" | "0b" | "0B")) => (p, &rest[2..]),
+        _ => ("", rest),
+    };
+    let pad = "0".repeat(precision.saturating_sub(digits.chars().count()));
+    alloc::format!("{sign}{prefix}{pad}{digits}")
 }
 
 /// Pads `s` to `width` code points with `fill`, per `align` (`<` left, `>`/`=` right, `^` centre).
@@ -176,6 +191,9 @@ const DICT_SETDEFAULT: u32 = 6;
 const DICT_CLEAR: u32 = 7;
 const DICT_COPY: u32 = 8;
 const DICT_POPITEM: u32 = 9;
+/// A synthetic method id: a `super().__init__(*args)` that resolves to the built-in
+/// `BaseException.__init__` (sets `self.args`). Reserved (`u32::MAX`) -- never a real per-type id.
+const EXC_INIT: u32 = u32::MAX;
 const SET_UNION: u32 = 0;
 const SET_INTERSECTION: u32 = 1;
 const SET_DIFFERENCE: u32 = 2;
@@ -276,6 +294,8 @@ pub(crate) const LAZY_MAP: u32 = 0;
 pub(crate) const LAZY_FILTER: u32 = 1;
 pub(crate) const LAZY_ZIP: u32 = 2;
 pub(crate) const LAZY_ENUMERATE: u32 = 3;
+/// `iter(callable, sentinel)`: state = the callable, the single source element = the sentinel.
+pub(crate) const LAZY_CALLABLE: u32 = 4;
 
 const BYTES_HEX: u32 = 0;
 const BYTES_DECODE: u32 = 1;
@@ -288,6 +308,10 @@ const BYTES_COUNT: u32 = 7;
 const BYTES_REPLACE: u32 = 8;
 const BYTES_UPPER: u32 = 9;
 const BYTES_LOWER: u32 = 10;
+const BYTES_SPLIT: u32 = 11;
+const BYTES_STRIP: u32 = 12;
+const BYTES_LSTRIP: u32 = 13;
+const BYTES_RSTRIP: u32 = 14;
 
 /// The method id for a `bytes`/`bytearray` method `name` (`mutating` allows the bytearray-only ones).
 fn bytes_method_id(name: &str, mutating: bool) -> Option<u32> {
@@ -301,6 +325,10 @@ fn bytes_method_id(name: &str, mutating: bool) -> Option<u32> {
         "replace" => Some(BYTES_REPLACE),
         "upper" => Some(BYTES_UPPER),
         "lower" => Some(BYTES_LOWER),
+        "split" => Some(BYTES_SPLIT),
+        "strip" => Some(BYTES_STRIP),
+        "lstrip" => Some(BYTES_LSTRIP),
+        "rstrip" => Some(BYTES_RSTRIP),
         "append" if mutating => Some(BYTEARRAY_APPEND),
         "extend" if mutating => Some(BYTEARRAY_EXTEND),
         _ => None,
@@ -325,6 +353,8 @@ const INT_BIT_LENGTH: u32 = 0;
 const INT_BIT_COUNT: u32 = 1;
 const INT_TO_BYTES: u32 = 2;
 const INT_CONJUGATE: u32 = 3;
+const INT_AS_INTEGER_RATIO: u32 = 4;
+const INT_INDEX: u32 = 5;
 
 /// The method id for an `int` method `name`.
 fn int_method_id(name: &str) -> Option<u32> {
@@ -333,6 +363,65 @@ fn int_method_id(name: &str) -> Option<u32> {
         "bit_count" => Some(INT_BIT_COUNT),
         "to_bytes" => Some(INT_TO_BYTES),
         "conjugate" => Some(INT_CONJUGATE),
+        "as_integer_ratio" => Some(INT_AS_INTEGER_RATIO),
+        "__index__" => Some(INT_INDEX),
+        _ => None,
+    }
+}
+
+const FLOAT_IS_INTEGER: u32 = 0;
+const FLOAT_AS_INTEGER_RATIO: u32 = 1;
+const FLOAT_CONJUGATE: u32 = 2;
+
+/// The method id for a `float` method `name`.
+fn float_method_id(name: &str) -> Option<u32> {
+    match name {
+        "is_integer" => Some(FLOAT_IS_INTEGER),
+        "as_integer_ratio" => Some(FLOAT_AS_INTEGER_RATIO),
+        "conjugate" => Some(FLOAT_CONJUGATE),
+        _ => None,
+    }
+}
+
+/// The exact `(numerator, denominator)` of a finite float, as reduced BigInts (the denominator a
+/// power of two). `None` for a non-finite float (`inf`/`nan`). Backs `float.as_integer_ratio`.
+fn float_as_integer_ratio(f: f64) -> Option<(BigInt, BigInt)> {
+    if !f.is_finite() {
+        return None;
+    }
+    if f == 0.0 {
+        return Some((BigInt::from_i128(0), BigInt::from_i128(1)));
+    }
+    let bits = f.to_bits();
+    let sign: i128 = if bits >> 63 == 1 { -1 } else { 1 };
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let raw_mantissa = bits & 0x000f_ffff_ffff_ffff;
+    let (mut mantissa, mut exp) = if raw_exp == 0 {
+        (raw_mantissa, -1074i64)
+    } else {
+        (raw_mantissa | 0x0010_0000_0000_0000, raw_exp - 1075)
+    };
+    let tz = mantissa.trailing_zeros();
+    mantissa >>= tz;
+    exp += i64::from(tz);
+    let magnitude = BigInt::from_i128(sign * i128::from(mantissa));
+    if exp >= 0 {
+        Some((magnitude.shl(exp as u64), BigInt::from_i128(1)))
+    } else {
+        Some((magnitude, BigInt::from_i128(1).shl((-exp) as u64)))
+    }
+}
+
+const PROPERTY_GETTER: u32 = 0;
+const PROPERTY_SETTER: u32 = 1;
+const PROPERTY_DELETER: u32 = 2;
+
+/// The method id for a `property` builder method `name`.
+fn property_method_id(name: &str) -> Option<u32> {
+    match name {
+        "getter" => Some(PROPERTY_GETTER),
+        "setter" => Some(PROPERTY_SETTER),
+        "deleter" => Some(PROPERTY_DELETER),
         _ => None,
     }
 }
@@ -781,6 +870,49 @@ fn replace_bytes(data: &[u8], old: &[u8], new: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Splits `data` on non-overlapping occurrences of `sep` (which must be non-empty).
+fn split_on_bytes(data: &[u8], sep: &[u8]) -> Vec<Vec<u8>> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i + sep.len() <= data.len() {
+        if &data[i..i + sep.len()] == sep {
+            parts.push(data[start..i].to_vec());
+            i += sep.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    parts.push(data[start..].to_vec());
+    parts
+}
+
+/// Splits `data` on runs of ASCII whitespace; leading/trailing whitespace yields no empty parts.
+fn split_whitespace_bytes(data: &[u8]) -> Vec<Vec<u8>> {
+    data.split(u8::is_ascii_whitespace)
+        .filter(|part| !part.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// Trims the bytes in `chars` from the chosen ends of `data`.
+fn strip_bytes(data: &[u8], chars: &[u8], left: bool, right: bool) -> Vec<u8> {
+    let mut start = 0;
+    let mut end = data.len();
+    if left {
+        while start < end && chars.contains(&data[start]) {
+            start += 1;
+        }
+    }
+    if right {
+        while end > start && chars.contains(&data[end - 1]) {
+            end -= 1;
+        }
+    }
+    data[start..end].to_vec()
+}
+
 /// The number of elements in `range(start, stop, step)` (CPython's length formula).
 fn range_len(start: i64, stop: i64, step: i64) -> i64 {
     if step > 0 {
@@ -990,6 +1122,15 @@ pub struct ObjectModel {
     /// module body produces, which a function reaches by `LoadGlobal`. The body mirrors its locals
     /// here as it binds them.
     globals: Vec<(String, Value)>,
+    /// The import cache (CPython's `sys.modules`): an imported module name -> its module object, so
+    /// a repeated `import` returns the same object and a module body runs at most once. A GC root
+    /// (with `globals`), keeping every imported module and its members reachable.
+    modules: Vec<(String, Value)>,
+    /// Per-function attribute dicts (`f.tag = ...`): a function value's `bits()` -> its `__dict__`.
+    /// A function value has no `__dict__` slot, so its user attributes live here, keyed by `bits()` so
+    /// a bare `function_ref` (stable per def) and each PyFunction instance (distinct per closure) map
+    /// correctly. A GC root (like `modules`), keeping every function attribute dict reachable.
+    function_dicts: Vec<(u32, Value)>,
     /// Captured `print(...)` output (the interpreter is `no_std`, so it buffers rather than
     /// writing a stream; the host drains it).
     stdout: String,
@@ -1035,6 +1176,13 @@ pub struct ObjectModel {
     /// offset@4 (raw), length@8 (raw)]`. A zero-copy 1-D view; reads/writes go straight to the base's
     /// `byte_buffers` slot (a bytearray-backed view is writable, a bytes-backed one read-only).
     memoryview_type_id: u32,
+    /// The GC type-descriptor id of a `property`: payload `[fget@0, fset@4, fdel@8]` (each a function
+    /// or None). Stored in a class namespace; the interpreter's attribute access calls the accessor.
+    property_type_id: u32,
+    /// The GC type-descriptor id of an unbound built-in method (`str.lower`, `str.strip`, ...): a
+    /// one-slot payload holding the method NAME. Called with the receiver as the first argument
+    /// (`str.lower(s)` == `s.lower()`), so it works as a `key=`/`map` function.
+    unbound_method_type_id: u32,
     /// The suspended frames of live generators, indexed by a generator object's payload word.
     /// `None` = the generator is exhausted (its body returned) or currently running; `Some(frame)`
     /// = it is fresh (ip 0) or suspended at a `yield`. A suspended frame holds tagged Values
@@ -1276,6 +1424,18 @@ impl ObjectModel {
             ref_offsets: Vec::new(),
             tagged_offsets: alloc::vec![0],
         });
+        let property_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 12,
+            ref_offsets: Vec::new(),
+            tagged_offsets: (0..3).map(|i| i * 4).collect(),
+        });
+        let unbound_method_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0],
+        });
         let long_type_id = descs.len() as u32;
         descs.push(TypeDesc {
             payload_size: 16,
@@ -1342,6 +1502,8 @@ impl ObjectModel {
             exception_classes: Vec::new(),
             pending_exception: None,
             globals: Vec::new(),
+            modules: Vec::new(),
+            function_dicts: Vec::new(),
             stdout: String::new(),
             gpio_type_id,
             board_type_id,
@@ -1358,6 +1520,8 @@ impl ObjectModel {
             lazy_iter_type_id,
             method_wrapper_type_id,
             memoryview_type_id,
+            property_type_id,
+            unbound_method_type_id,
             generators: Vec::new(),
             frame_pool: Vec::new(),
             gpio_claimed: Vec::new(),
@@ -1615,11 +1779,12 @@ impl ObjectModel {
     /// `%%` a literal `%`; the args are consumed left to right. A conversion with flags/width/
     /// precision (`%5d`) or an unhandled type (`%f`, `%x`) is `Unsupported` (never wrong output);
     /// too few or too many args is a `TypeError` (matching CPython's "not enough/all ... converted").
-    fn percent_format(&self, template: &str, args: &[Value]) -> Result<String, Trap> {
+    fn percent_format(&mut self, template: &str, args: &[Value]) -> Result<String, Trap> {
         let mut out = String::new();
         let chars: Vec<char> = template.chars().collect();
         let mut i = 0;
         let mut next_arg = 0usize;
+        let mut used_mapping = false;
         while i < chars.len() {
             if chars[i] != '%' {
                 out.push(chars[i]);
@@ -1632,6 +1797,36 @@ impl ObjectModel {
                 i += 1;
                 continue;
             }
+            let mapped_arg = if chars.get(i) == Some(&'(') {
+                used_mapping = true;
+                i += 1;
+                let mut key = String::new();
+                while let Some(&c) = chars.get(i) {
+                    if c == ')' {
+                        break;
+                    }
+                    key.push(c);
+                    i += 1;
+                }
+                if chars.get(i) != Some(&')') {
+                    return Err(Trap::ValueError);
+                }
+                i += 1;
+                let dict = *args.first().ok_or(Trap::TypeError)?;
+                let found = {
+                    let entries = self.dict_value(dict).ok_or(Trap::TypeError)?;
+                    entries
+                        .iter()
+                        .find(|(k, _)| self.str_value(*k) == Some(key.as_str()))
+                        .map(|(_, value)| *value)
+                };
+                match found {
+                    Some(value) => Some(value),
+                    None => return Err(self.with_message(Trap::KeyError, &key)),
+                }
+            } else {
+                None
+            };
             let mut flags = String::new();
             while chars.get(i).is_some_and(|c| matches!(c, '-' | '+' | ' ' | '0' | '#')) {
                 flags.push(chars[i]);
@@ -1654,8 +1849,14 @@ impl ObjectModel {
             }
             let ty = *chars.get(i).ok_or(Trap::ValueError)?;
             i += 1;
-            let arg = *args.get(next_arg).ok_or(Trap::TypeError)?;
-            next_arg += 1;
+            let arg = match mapped_arg {
+                Some(value) => value,
+                None => {
+                    let value = *args.get(next_arg).ok_or(Trap::TypeError)?;
+                    next_arg += 1;
+                    value
+                }
+            };
             let width_n = width.parse::<usize>().unwrap_or(0);
             match ty {
                 's' | 'r' => {
@@ -1682,13 +1883,34 @@ impl ObjectModel {
                     if flags.contains('0') && !flags.contains('-') {
                         spec.push('0');
                     }
-                    spec.push_str(&width);
-                    spec.push(if ty == 'i' || ty == 'u' { 'd' } else { ty });
-                    out.push_str(&self.format_value_spec(arg, &spec)?);
+                    let float_ty = matches!(ty, 'f' | 'F' | 'e' | 'E' | 'g' | 'G');
+                    if has_precision && !float_ty {
+                        let mut digit_spec = String::new();
+                        if flags.contains('+') {
+                            digit_spec.push('+');
+                        } else if flags.contains(' ') {
+                            digit_spec.push(' ');
+                        }
+                        if flags.contains('#') {
+                            digit_spec.push('#');
+                        }
+                        digit_spec.push(if ty == 'i' || ty == 'u' { 'd' } else { ty });
+                        let body = zero_pad_int(&self.format_value_spec(arg, &digit_spec)?, precision);
+                        let align = if flags.contains('-') { '<' } else { '>' };
+                        out.push_str(&pad_field(&body, width_n, ' ', align));
+                    } else {
+                        spec.push_str(&width);
+                        if has_precision && float_ty {
+                            spec.push('.');
+                            spec.push_str(&alloc::format!("{precision}"));
+                        }
+                        spec.push(if ty == 'i' || ty == 'u' { 'd' } else { ty });
+                        out.push_str(&self.format_value_spec(arg, &spec)?);
+                    }
                 }
             }
         }
-        if next_arg != args.len() {
+        if !used_mapping && next_arg != args.len() {
             return Err(Trap::TypeError);
         }
         Ok(out)
@@ -1769,6 +1991,31 @@ impl ObjectModel {
                 },
             };
         }
+        let both_sequence =
+            (self.is_list(lhs) && self.is_list(rhs)) || (self.is_tuple(lhs) && self.is_tuple(rhs));
+        if both_sequence {
+            if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                let equal = self.key_eq(lhs, rhs);
+                let holds = if matches!(op, CmpOp::Eq) { equal } else { !equal };
+                return Ok(Some(Value::from_bool(holds)));
+            }
+            let ord = self.compare_ordered(lhs, rhs)?;
+            let holds = match op {
+                CmpOp::Lt => ord == Ordering::Less,
+                CmpOp::Le => ord != Ordering::Greater,
+                CmpOp::Gt => ord == Ordering::Greater,
+                CmpOp::Ge => ord != Ordering::Less,
+                _ => unreachable!("==/!= handled above; is/is not in the Op::Compare path"),
+            };
+            return Ok(Some(Value::from_bool(holds)));
+        }
+        if self.is_dict(lhs) && self.is_dict(rhs) {
+            return match op {
+                CmpOp::Eq => Ok(Some(Value::from_bool(self.dict_equal(lhs, rhs)))),
+                CmpOp::Ne => Ok(Some(Value::from_bool(!self.dict_equal(lhs, rhs)))),
+                _ => Err(Trap::TypeError),
+            };
+        }
         match (self.str_value(lhs), self.str_value(rhs)) {
             (None, None) => Ok(None),
             (Some(a), Some(b)) => {
@@ -1826,6 +2073,13 @@ impl ObjectModel {
         if self.is_range(value) {
             let (start, stop, step) = self.range_bounds(value);
             return Ok(Some(range_len(start, stop, step) > 0));
+        }
+        if let Some(f) = self.float_value(value) {
+            return Ok(Some(f != 0.0));
+        }
+        #[cfg(feature = "complex")]
+        if let Some((re, im)) = self.complex_value(value) {
+            return Ok(Some(re != 0.0 || im != 0.0));
         }
         Ok(Some(true))
     }
@@ -1945,6 +2199,23 @@ impl ObjectModel {
         if self.is_range(container) {
             let (start, stop, step) = self.range_bounds(container);
             let len = range_len(start, stop, step);
+            if self.is_slice(index) {
+                let reference = index.as_ref().ok_or(Trap::TypeError)?;
+                let start_v = Value::from_bits(self.heap.read_u32(reference.0));
+                let stop_v = Value::from_bits(self.heap.read_u32(reference.0 + 4));
+                let step_v = Value::from_bits(self.heap.read_u32(reference.0 + 8));
+                let sub_step = if step_v.is_none() {
+                    1
+                } else {
+                    let s = step_v.as_int().ok_or(Trap::TypeError)?;
+                    if s == 0 {
+                        return Err(Trap::ValueError);
+                    }
+                    s
+                };
+                let (sub_start, sub_stop) = adjust_slice(start_v, stop_v, sub_step, len)?;
+                return self.new_range(start + sub_start * step, start + sub_stop * step, step * sub_step);
+            }
             let i = index.as_int().ok_or(Trap::TypeError)?;
             let at = if i < 0 { i + len } else { i };
             if at < 0 || at >= len {
@@ -2138,6 +2409,16 @@ impl ObjectModel {
             .and_then(|i| self.dicts.get(i))
     }
 
+    /// The value bound to the string key `name` in `dict`, or `None` if `dict` is not a dict or has
+    /// no such key. Backs the class-body namespace lookup (`LoadName`).
+    #[must_use]
+    pub(crate) fn dict_get_str(&self, dict: Value, name: &str) -> Option<Value> {
+        self.dict_value(dict)?
+            .iter()
+            .find(|(key, _)| self.str_value(*key) == Some(name))
+            .map(|(_, value)| *value)
+    }
+
     /// A clone of a dict's `(key, value)` pairs, if `value` is a dict (so a caller can rebuild
     /// or copy the dict without holding a borrow on the model). `dict(other_dict)`.
     #[must_use]
@@ -2193,11 +2474,80 @@ impl ObjectModel {
                 None => entries.push((key, value)),
             }
         }
+        self.alloc_dict(entries)
+    }
+
+    /// Allocates a `dict` over already-deduped `entries` -- the shared tail of [`ObjectModel::new_dict`]
+    /// (value-equality dedup) and [`ObjectModel::new_dict_dyn`] (interp-aware `__eq__` dedup).
+    fn alloc_dict(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, Trap> {
         let index = self.dicts.len() as u32;
         self.dicts.push(entries);
         let reference = self.alloc_object(self.dict_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
+    }
+
+    /// Allocates a `dict` from `pairs`, deduping keys interp-aware (an element's `__eq__`, so a value
+    /// object collapses with an equal key; the last value wins, the key keeps its first position) --
+    /// the dict literal (`BuildDict`). Mirrors [`ObjectModel::new_dict`] but consults `__eq__`; see
+    /// [`ObjectModel::dict_find_dyn`] for the guard + caveat.
+    pub(crate) fn new_dict_dyn(
+        &mut self,
+        pairs: Vec<(Value, Value)>,
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<Value, Trap> {
+        let entries = crate::interp::dedup_pairs(pairs, functions, self, depth)?;
+        self.alloc_dict(entries)
+    }
+
+    /// Finds the slot of `key` in `dict`, honoring a user `__eq__` on the query key or a stored key
+    /// (a value object used as a dict key looks up correctly). Fast path: when neither the query key
+    /// nor any stored key is a user instance, no `__eq__` can participate, so the identity/value
+    /// `key_eq` scan is exact -- no clone, no interpreter re-entry. Only when an instance is involved
+    /// does it clone the keys (Values are `Copy`) and rescan with [`crate::interp::elem_eq`], which
+    /// re-enters the interpreter to run `__eq__`.
+    ///
+    /// Caveat: the guard tests whether a KEY is *directly* a user instance; a container key that merely
+    /// CONTAINS an instance (a tuple `(V(1),)`) still compares by `key_eq`, so a custom `__eq__` nested
+    /// inside a tuple key is not consulted. The direct-instance-key pattern (the common case) is covered.
+    pub(crate) fn dict_find_dyn(
+        &mut self,
+        dict: Value,
+        key: Value,
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<Option<usize>, Trap> {
+        let i = self.container_slot(dict, self.dict_type_id).ok_or(Trap::TypeError)?;
+        self.require_hashable(key)?;
+        if !self.is_instance(key) {
+            let mut saw_instance_key = false;
+            for (idx, (k, _)) in self.dicts[i].iter().enumerate() {
+                if self.key_eq(*k, key) {
+                    return Ok(Some(idx));
+                }
+                saw_instance_key |= self.is_instance(*k);
+            }
+            if !saw_instance_key {
+                return Ok(None);
+            }
+        }
+        let keys: Vec<Value> = self.dicts[i].iter().map(|(k, _)| *k).collect();
+        for (idx, &k) in keys.iter().enumerate() {
+            if crate::interp::elem_eq(key, k, functions, self, depth)? {
+                return Ok(Some(idx));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether any key or value of `dict` is a user class instance -- the guard that keeps a plain
+    /// `dict ==` on the fast identity path ([`ObjectModel::dict_equal`]) rather than the interp-aware
+    /// [`ObjectModel::dict_equal_dyn`].
+    pub(crate) fn dict_has_instance(&self, dict: Value) -> bool {
+        self.dict_value(dict).is_some_and(|entries| {
+            entries.iter().any(|(k, v)| self.is_instance(*k) || self.is_instance(*v))
+        })
     }
 
     /// Allocates a `set`/`frozenset` over `elements`, deduped by value equality in first-seen
@@ -2259,6 +2609,15 @@ impl ObjectModel {
         Ok(())
     }
 
+    /// Appends `value` to a set WITHOUT a membership check -- the caller (the interp-aware set ops)
+    /// has already established that no equal element is present, testing membership via an element's
+    /// `__eq__`, which the model's identity-based `key_eq` cannot do.
+    pub(crate) fn set_push(&mut self, set: Value, value: Value) -> Result<(), Trap> {
+        let index = self.container_slot(set, self.set_type_id).ok_or(Trap::TypeError)?;
+        self.sets[index].push(value);
+        Ok(())
+    }
+
     /// Appends `value` to the list in place -- `list.append` and the `ListAppend` comprehension op.
     pub fn list_append(&mut self, list: Value, value: Value) -> Result<(), Trap> {
         let index = self.container_slot(list, self.list_type_id).ok_or(Trap::TypeError)?;
@@ -2269,7 +2628,7 @@ impl ObjectModel {
     /// Python value equality for container keys/membership over the value subset we have:
     /// `int`/`bool` compare numerically (so `True == 1`), `str` by content, everything else
     /// by identity (`None`, the same object). Enough for `in`, dict keys, and `==` on these.
-    fn key_eq(&self, a: Value, b: Value) -> bool {
+    pub(crate) fn key_eq(&self, a: Value, b: Value) -> bool {
         if let (Some(x), Some(y)) = (self.as_i128(a), self.as_i128(b)) {
             return x == y;
         }
@@ -2287,7 +2646,73 @@ impl ObjectModel {
         if let (Some(x), Some(y)) = (self.byte_view(a), self.byte_view(b)) {
             return x == y;
         }
+        let both_sequence =
+            (self.is_list(a) && self.is_list(b)) || (self.is_tuple(a) && self.is_tuple(b));
+        if both_sequence {
+            if let (Some(xs), Some(ys)) = (self.seq_value(a), self.seq_value(b)) {
+                return xs.len() == ys.len()
+                    && xs.iter().zip(ys).all(|(&x, &y)| self.key_eq(x, y));
+            }
+        }
+        if self.is_dict(a) && self.is_dict(b) {
+            return self.dict_equal(a, b);
+        }
+        if (self.is_set(a) || self.is_frozenset(a)) && (self.is_set(b) || self.is_frozenset(b)) {
+            let (Some(ea), Some(eb)) = (self.set_value(a), self.set_value(b)) else {
+                return a == b;
+            };
+            return ea.len() == eb.len() && ea.iter().all(|&x| eb.iter().any(|&y| self.key_eq(x, y)));
+        }
         a == b
+    }
+
+    /// Whether two dicts hold the same `key -> value` content (order-independent). Backs dict `==`
+    /// and nested-dict `key_eq`.
+    fn dict_equal(&self, a: Value, b: Value) -> bool {
+        let (Some(ea), Some(eb)) = (self.dict_value(a), self.dict_value(b)) else {
+            return false;
+        };
+        ea.len() == eb.len()
+            && ea.iter().all(|(key, value)| {
+                eb.iter()
+                    .any(|(other_key, other_value)| {
+                        self.key_eq(*key, *other_key) && self.key_eq(*value, *other_value)
+                    })
+            })
+    }
+
+    /// Whether two dicts hold the same `key -> value` content, honoring a user `__eq__` on keys and
+    /// values -- the interp-aware [`ObjectModel::dict_equal`] for `dict == dict`. Guarded by
+    /// [`ObjectModel::dict_has_instance`], so a plain dict `==` never reaches here.
+    pub(crate) fn dict_equal_dyn(
+        &mut self,
+        a: Value,
+        b: Value,
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<bool, Trap> {
+        let (ea, eb) = match (self.dict_value(a), self.dict_value(b)) {
+            (Some(ea), Some(eb)) => (ea.clone(), eb.clone()),
+            _ => return Ok(false),
+        };
+        if ea.len() != eb.len() {
+            return Ok(false);
+        }
+        for (key, value) in &ea {
+            let mut matched = false;
+            for (other_key, other_value) in &eb {
+                if crate::interp::elem_eq(*key, *other_key, functions, self, depth)?
+                    && crate::interp::elem_eq(*value, *other_value, functions, self, depth)?
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// `container[index] = value` (`Op::Setitem`): a `list` stores at an int index (negative
@@ -2497,7 +2922,107 @@ impl ObjectModel {
         if let Some(elements) = self.set_value(container) {
             return Ok(elements.iter().any(|&e| self.key_eq(e, element)));
         }
+        if self.is_range(container) {
+            let x = if let Some(n) = element.as_int() {
+                n
+            } else if let Some(f) = self.as_f64(element) {
+                if f.is_finite() && f % 1.0 == 0.0 {
+                    f as i64
+                } else {
+                    return Ok(false);
+                }
+            } else {
+                return Ok(false);
+            };
+            let (start, stop, step) = self.range_bounds(container);
+            let in_bounds = if step > 0 { x >= start && x < stop } else { x <= start && x > stop };
+            return Ok(in_bounds && (x - start) % step == 0);
+        }
         Err(Trap::TypeError)
+    }
+
+    /// `container[index]` interp-aware ([`Op::Subscript`]): a `dict` looks its key up by an element's
+    /// `__eq__` via [`ObjectModel::dict_find_dyn`] (a value object keys correctly); every other
+    /// container defers to [`ObjectModel::py_getitem`].
+    pub(crate) fn py_getitem_dyn(
+        &mut self,
+        container: Value,
+        index: Value,
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<Value, Trap> {
+        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+            return match self.dict_find_dyn(container, index, functions, depth)? {
+                Some(slot) if slot < self.dicts[i].len() => Ok(self.dicts[i][slot].1),
+                _ => {
+                    self.set_trap_arg(index);
+                    Err(Trap::KeyError)
+                }
+            };
+        }
+        self.py_getitem(container, index)
+    }
+
+    /// `container[index] = value` interp-aware ([`Op::Setitem`], [`Op::DictInsert`]): a `dict` finds
+    /// the key by `__eq__` (updating in place) or appends a new entry; every other container defers to
+    /// [`ObjectModel::py_setitem`].
+    pub(crate) fn py_setitem_dyn(
+        &mut self,
+        container: Value,
+        index: Value,
+        value: Value,
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<(), Trap> {
+        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+            match self.dict_find_dyn(container, index, functions, depth)? {
+                Some(slot) if slot < self.dicts[i].len() => self.dicts[i][slot].1 = value,
+                _ => self.dicts[i].push((index, value)),
+            }
+            return Ok(());
+        }
+        self.py_setitem(container, index, value)
+    }
+
+    /// `del container[index]` interp-aware ([`Op::DeleteItem`]): a `dict` finds the key by `__eq__`
+    /// and removes it (`KeyError`, carrying the key, if absent); every other container defers to
+    /// [`ObjectModel::py_delitem`].
+    pub(crate) fn py_delitem_dyn(
+        &mut self,
+        container: Value,
+        index: Value,
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<(), Trap> {
+        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+            return match self.dict_find_dyn(container, index, functions, depth)? {
+                Some(slot) if slot < self.dicts[i].len() => {
+                    self.dicts[i].remove(slot);
+                    Ok(())
+                }
+                _ => {
+                    self.set_trap_arg(index);
+                    Err(Trap::KeyError)
+                }
+            };
+        }
+        self.py_delitem(container, index)
+    }
+
+    /// `element in container` interp-aware ([`Op::Contains`]): a `dict` tests key membership by
+    /// `__eq__` via [`ObjectModel::dict_find_dyn`]; every other container defers to
+    /// [`ObjectModel::py_contains`]. (Set membership is handled inline in the interpreter loop.)
+    pub(crate) fn py_contains_dyn(
+        &mut self,
+        container: Value,
+        element: Value,
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<bool, Trap> {
+        if self.is_dict(container) {
+            return Ok(self.dict_find_dyn(container, element, functions, depth)?.is_some());
+        }
+        self.py_contains(container, element)
     }
 
     /// The Python `repr()` of `value` over the value subset we have, so a container (and its
@@ -2513,6 +3038,9 @@ impl ObjectModel {
         }
         if value.is_none() {
             return String::from("None");
+        }
+        if value.is_ellipsis() {
+            return String::from("Ellipsis");
         }
         if let Some(n) = value.as_fixnum() {
             return alloc::format!("{n}");
@@ -2594,6 +3122,9 @@ impl ObjectModel {
                     alloc::format!("<built-in function {}>", builtin.python_name())
                 };
             }
+            if let Some(name) = crate::stdlib::stdlib_name(id) {
+                return alloc::format!("<built-in function {name}>");
+            }
         }
         if self.is_class(value) {
             let name = self.str_value(self.read_slot(value, 0)).unwrap_or("?");
@@ -2601,6 +3132,16 @@ impl ObjectModel {
         }
         if self.is_instance(value) {
             let name = self.instance_class_name(value).unwrap_or("object");
+            if self.is_exception_value(value) {
+                let args = self
+                    .instance_attr(value, "args")
+                    .and_then(|a| self.seq_value(a))
+                    .map(|elements| {
+                        elements.iter().map(|&e| self.repr(e)).collect::<Vec<_>>().join(", ")
+                    })
+                    .unwrap_or_default();
+                return alloc::format!("{name}({args})");
+            }
             return alloc::format!("<{name} object>");
         }
         alloc::format!("{value:?}")
@@ -2686,6 +3227,14 @@ impl ObjectModel {
                 let element_hash = self.py_hash(element)?.as_fixnum().unwrap_or(0) as u32;
                 hash ^= element_hash;
                 hash = hash.wrapping_mul(16_777_619);
+            }
+            return Ok(hash);
+        }
+        if self.is_frozenset(value) {
+            let elements = self.set_value(value).ok_or(Trap::TypeError)?;
+            let mut hash: u32 = 2_166_136_261;
+            for &element in elements {
+                hash ^= self.py_hash(element)?.as_fixnum().unwrap_or(0) as u32;
             }
             return Ok(hash);
         }
@@ -2948,6 +3497,48 @@ impl ObjectModel {
         Ok(())
     }
 
+    /// Imports the module `name`, returning its module object: a cached `sys.modules` entry if it
+    /// was imported before (so `import` is idempotent and a module body runs at most once), else a
+    /// native stdlib module built on demand and cached, else a `ModuleNotFoundError`. Backs
+    /// [`crate::interp`]'s `ImportName` op. (Managed Python-authored modules -- running a compiled
+    /// module body in a fresh namespace -- are the next layer; this resolves the native modules.)
+    pub fn import_module(&mut self, name: &str) -> Result<Value, Trap> {
+        if let Some((_, module)) = self.modules.iter().find(|(n, _)| n == name) {
+            return Ok(*module);
+        }
+        if let Some(module) = self.get_global(name).filter(|&g| self.is_module_object(g)) {
+            self.modules.push((String::from(name), module));
+            return Ok(module);
+        }
+        if let Some(result) = crate::stdlib::build_module(name, self) {
+            let module = result?;
+            self.modules.push((String::from(name), module));
+            return Ok(module);
+        }
+        let message = alloc::format!("No module named '{name}'");
+        Err(self.raise_named_exception("ModuleNotFoundError", &message))
+    }
+
+    /// Reads member `name` off an imported `module` -- `from module import name`. The member is
+    /// resolved in the module's namespace; a missing member is an `ImportError` ("cannot import
+    /// name 'name' from 'module'"), matching CPython (not the `AttributeError` a plain `module.name`
+    /// attribute read would give). Backs [`crate::interp`]'s `ImportFrom` op.
+    pub fn import_from(&mut self, module: Value, name: &str) -> Result<Value, Trap> {
+        if self.is_module_object(module) {
+            let namespace = self.module_namespace(module);
+            if let Some(value) = self.dict_get_str(namespace, name) {
+                return Ok(value);
+            }
+        }
+        let module_name = self
+            .modules
+            .iter()
+            .find(|(_, m)| *m == module)
+            .map_or_else(String::new, |(n, _)| n.clone());
+        let message = alloc::format!("cannot import name '{name}' from '{module_name}'");
+        Err(self.raise_named_exception("ImportError", &message))
+    }
+
     /// `iter(iterable)` (`Op::GetIter`): an iterator over a `str`/`list`/`tuple`/`dict` (a
     /// dict iterates its keys). A non-iterable value is a `TypeError`.
     /// A fresh `Cell` boxing `value` (the closure primitive: a shared mutable box for a variable
@@ -3055,6 +3646,14 @@ impl ObjectModel {
     /// a `staticmethod` yields the raw function; a `classmethod` binds the function to the class; a
     /// plain function binds to `owner` when it is an instance, else stays unbound. `class_value` is
     /// the class to bind a classmethod to.
+    /// Whether `value` is a user-defined Python function -- a bare module `function_ref` OR a
+    /// `PyFunction` (a function carrying default args or captured cells). Used to decide both whether a
+    /// class member binds as a method (a defaulted method is a PyFunction, so it must bind too) and
+    /// whether an attribute get/set targets a function object (`f.tag`).
+    pub(crate) fn is_user_function(&self, value: Value) -> bool {
+        value.as_function_index().is_some() || self.is_py_function(value)
+    }
+
     fn bind_class_member(&mut self, found: Value, owner: Value, class_value: Value) -> Result<Value, Trap> {
         if self.is_method_wrapper(found) {
             let func = self.method_wrapper_func(found);
@@ -3064,7 +3663,7 @@ impl ObjectModel {
                 Ok(func)
             };
         }
-        if found.as_function_index().is_some() && self.is_instance(owner) {
+        if self.is_user_function(found) && self.is_instance(owner) {
             return self.new_py_bound(owner, found);
         }
         Ok(found)
@@ -3114,6 +3713,63 @@ impl ObjectModel {
     /// The bytes a `bytes`/`bytearray`/`memoryview` exposes, so the three compare and hash by content.
     fn byte_view(&self, value: Value) -> Option<&[u8]> {
         self.bytes_value(value).or_else(|| self.memoryview_bytes(value))
+    }
+
+    /// A `property` from its accessors (`fget`/`fset`/`fdel`, each a function or `None`).
+    pub fn new_property(&mut self, fget: Value, fset: Value, fdel: Value) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.property_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, fget.bits());
+        self.heap.write_u32(reference.0 + 4, fset.bits());
+        self.heap.write_u32(reference.0 + 8, fdel.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a `property`.
+    #[must_use]
+    pub fn is_property(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.property_type_id)
+    }
+
+    /// An unbound built-in method wrapping the method `name` (e.g. `str.lower`).
+    pub fn new_unbound_method(&mut self, name: &str) -> Result<Value, Trap> {
+        let name = self.new_str(name)?;
+        let reference = self.alloc_object(self.unbound_method_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, name.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is an unbound built-in method.
+    #[must_use]
+    pub fn is_unbound_method(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.unbound_method_type_id)
+    }
+
+    /// The method name an unbound built-in method wraps (`str.lower` -> `"lower"`).
+    #[must_use]
+    pub fn unbound_method_name(&self, value: Value) -> Value {
+        let reference = value.as_ref().expect("an unbound method");
+        Value::from_bits(self.heap.read_u32(reference.0))
+    }
+
+    /// A property's accessors as `(fget, fset, fdel)` (each a function or `None`).
+    pub fn property_accessors(&self, value: Value) -> (Value, Value, Value) {
+        let reference = value.as_ref().expect("a property");
+        (
+            Value::from_bits(self.heap.read_u32(reference.0)),
+            Value::from_bits(self.heap.read_u32(reference.0 + 4)),
+            Value::from_bits(self.heap.read_u32(reference.0 + 8)),
+        )
+    }
+
+    /// The `property` an instance's class defines for `name`, if any -- so an assignment or delete on
+    /// that attribute routes through the property's setter/deleter instead of the instance `__dict__`.
+    pub(crate) fn class_property(&self, instance: Value, name: &str) -> Option<Value> {
+        if !self.is_instance(instance) {
+            return None;
+        }
+        let class = self.read_slot(instance, 0);
+        let found = self.find_in_class(class, name)?;
+        self.is_property(found).then_some(found)
     }
 
     /// A fresh built-in iterator over `iterable` (str/bytes/list/tuple/dict/range/set); `iter()` of
@@ -3332,6 +3988,17 @@ impl ObjectModel {
         self.seq_value(defaults).cloned().unwrap_or_default()
     }
 
+    /// The keyword-only DEFAULTS of a `PyFunction` -- the kwdefaults dict (a `{name: value}` map), or
+    /// `None` if it has none. Bound by name to the keyword-only parameters at bind time (via
+    /// [`ObjectModel::dict_get_str`]).
+    #[must_use]
+    pub fn py_function_kwdefaults(&self, func: Value) -> Value {
+        match func.as_ref() {
+            Some(reference) => Value::from_bits(self.heap.read_u32(reference.0 + 8)),
+            None => Value::NONE,
+        }
+    }
+
     /// Allocates a generator object owning `frame` (its fresh, not-yet-run activation, with args
     /// already bound to locals), returning the heap value. The body does not run until the first
     /// resume; the frame lives in the `generators` arena and the heap object holds its index.
@@ -3456,8 +4123,16 @@ impl ObjectModel {
         let class = self.read_slot(super_obj, 0);
         let receiver = self.read_slot(super_obj, 1);
         let base = self.read_slot(class, 1);
-        let found = self.find_in_class(base, name).ok_or(Trap::AttributeError)?;
-        if found.as_function_index().is_some() {
+        let found = match self.find_in_class(base, name) {
+            Some(found) => found,
+            None => {
+                if name == "__init__" && self.is_exception_value(receiver) {
+                    return self.new_bound_method(receiver, EXC_INIT);
+                }
+                return Err(Trap::AttributeError);
+            }
+        };
+        if self.is_user_function(found) {
             self.new_py_bound(receiver, found)
         } else {
             Ok(found)
@@ -3512,6 +4187,46 @@ impl ObjectModel {
         self.py_setitem(dict, key, value)
     }
 
+    /// `C.name = value` (`Op::SetAttr` on a class object): stores into the class's OWN namespace dict
+    /// (slot 2), never a base's -- so a class decorator can mutate the class it returns
+    /// (`cls.tagged = True`), a class-level rebinding (`C.count = 0`) works, and instances then read
+    /// the new value through the class. The base chain is the READ path ([`ObjectModel::find_in_class`]);
+    /// a write always targets this class, matching CPython.
+    pub fn py_setattr_class(&mut self, class: Value, name: &str, value: Value) -> Result<(), Trap> {
+        let key = self.new_str(name)?;
+        let namespace = self.read_slot(class, 2);
+        self.py_setitem(namespace, key, value)
+    }
+
+    /// `f.name = value` (`Op::SetAttr` on a function object): a function has no `__dict__` slot, so its
+    /// user attributes live in the `function_dicts` side-table, keyed by the function's identity. The
+    /// dict is created on first write. Reads go through [`ObjectModel::function_attr`].
+    pub fn py_setattr_function(&mut self, func: Value, name: &str, value: Value) -> Result<(), Trap> {
+        let dict = self.function_dict_or_create(func);
+        let key = self.new_str(name)?;
+        self.py_setitem(dict, key, value)
+    }
+
+    /// The attribute `__dict__` for function `func`, creating an empty one on first access. Keyed by
+    /// `func.bits()` -- a bare `function_ref` is stable per def, a PyFunction distinct per instance.
+    fn function_dict_or_create(&mut self, func: Value) -> Value {
+        let key = func.bits();
+        if let Some((_, dict)) = self.function_dicts.iter().find(|(k, _)| *k == key) {
+            return *dict;
+        }
+        let dict = self.new_dict(Vec::new()).unwrap_or(Value::NONE);
+        self.function_dicts.push((key, dict));
+        dict
+    }
+
+    /// The value of function attribute `name` (`f.tag`), or `None` if `func` has no such attribute.
+    #[must_use]
+    fn function_attr(&self, func: Value, name: &str) -> Option<Value> {
+        let key = func.bits();
+        let dict = self.function_dicts.iter().find(|(k, _)| *k == key).map(|(_, d)| *d)?;
+        self.dict_get_str(dict, name)
+    }
+
     /// Deletes the named attribute from `instance`'s `__dict__` (`delattr(obj, name)` / `del
     /// obj.name`). An `AttributeError` if the value is not an instance or has no such attribute.
     pub fn py_delattr_instance(&mut self, instance: Value, name: &str) -> Result<(), Trap> {
@@ -3555,7 +4270,7 @@ impl ObjectModel {
         }
         let class = self.read_slot(instance, 0);
         let found = self.find_in_class(class, name)?;
-        if found.as_function_index().is_some() {
+        if self.is_user_function(found) {
             self.new_py_bound(instance, found).ok()
         } else {
             None
@@ -3587,6 +4302,8 @@ impl ObjectModel {
             ("RecursionError", "RuntimeError"),
             ("NotImplementedError", "RuntimeError"),
             ("StopIteration", "Exception"),
+            ("ImportError", "Exception"),
+            ("ModuleNotFoundError", "ImportError"),
             ("GeneratorExit", "BaseException"),
         ];
         for &(name, base_name) in HIERARCHY {
@@ -3892,6 +4609,30 @@ impl ObjectModel {
         self.str_value(self.read_slot(class, 0))
     }
 
+    /// Raises `TypeError: unhashable type: '<Class>'` if `value` is a user instance whose class defines
+    /// `__eq__` but not `__hash__` -- CPython makes such a class unhashable (defining `__eq__` nulls the
+    /// inherited `__hash__`), so it cannot be a set element or dict key. A non-instance, or an instance
+    /// whose class defines both dunders (or neither), is hashable. Our sets/dicts linear-scan `__eq__`
+    /// and never call `__hash__`, so this is the guard that rejects an unhashable key/element the way
+    /// CPython's hashing does.
+    ///
+    /// Caveat: the test is by MRO presence, so a subclass that adds `__eq__` while a BASE supplies
+    /// `__hash__` is (leniently) treated as hashable, where CPython would null it -- a rare pattern.
+    pub(crate) fn require_hashable(&mut self, value: Value) -> Result<(), Trap> {
+        if !self.is_instance(value) {
+            return Ok(());
+        }
+        if self.find_dunder(value, "__eq__").is_some() && self.find_dunder(value, "__hash__").is_none() {
+            let name = self.instance_class_name(value).map(String::from);
+            let message = match name.as_deref() {
+                Some(class) => alloc::format!("unhashable type: '{class}'"),
+                None => String::from("unhashable type"),
+            };
+            return Err(self.with_message(Trap::TypeError, &message));
+        }
+        Ok(())
+    }
+
     /// Appends a `print()` line (already formatted) plus a newline to the captured output.
     pub fn write_line(&mut self, line: &str) {
         self.stdout.push_str(line);
@@ -4017,10 +4758,18 @@ impl ObjectModel {
         name: &str,
         cache: &mut InlineCache,
     ) -> Result<Value, Trap> {
+        if name == "__class__" {
+            if let Some(class) = crate::builtins::type_of(obj, self) {
+                return Ok(class);
+            }
+        }
         if let Some(id) = obj.as_builtin_id() {
             if name == "__name__" {
                 if let Some(builtin) = Builtin::from_id(id) {
                     return self.new_str(builtin.python_name());
+                }
+                if let Some(stdlib_name) = crate::stdlib::stdlib_name(id) {
+                    return self.new_str(stdlib_name);
                 }
             }
             if id == Builtin::Dict.id() && name == "fromkeys" {
@@ -4032,15 +4781,34 @@ impl ObjectModel {
             if id == Builtin::Bytes.id() && name == "fromhex" {
                 return Ok(Value::builtin_ref(Builtin::BytesFromhex.id()));
             }
+            if id == Builtin::Str.id() && name == "maketrans" {
+                return Ok(Value::builtin_ref(Builtin::StrMaketrans.id()));
+            }
+            let unbound = (id == Builtin::Str.id() && str_method_id(name).is_some())
+                || (id == Builtin::Int.id() && int_method_id(name).is_some())
+                || (id == Builtin::Bytes.id() && bytes_method_id(name, false).is_some());
+            if unbound {
+                return self.new_unbound_method(name);
+            }
             return Err(Trap::AttributeError);
         }
         if self.is_int(obj) {
             let method_id = int_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
+        if self.is_float(obj) {
+            let method_id = float_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if self.is_user_function(obj) {
+            return self.function_attr(obj, name).ok_or(Trap::AttributeError);
+        }
         let reference = obj.as_ref().ok_or(Trap::AttributeError)?;
         let type_id = self.heap.type_id_of(reference);
         if type_id == self.str_type_id {
+            if name == "maketrans" {
+                return Ok(Value::builtin_ref(Builtin::StrMaketrans.id()));
+            }
             let method_id = str_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
@@ -4063,6 +4831,18 @@ impl ObjectModel {
                 }
                 _ => {
                     let method_id = memoryview_method_id(name).ok_or(Trap::AttributeError)?;
+                    self.new_bound_method(obj, method_id)
+                }
+            };
+        }
+        if type_id == self.property_type_id {
+            let (fget, fset, fdel) = self.property_accessors(obj);
+            return match name {
+                "fget" => Ok(fget),
+                "fset" => Ok(fset),
+                "fdel" => Ok(fdel),
+                _ => {
+                    let method_id = property_method_id(name).ok_or(Trap::AttributeError)?;
                     self.new_bound_method(obj, method_id)
                 }
             };
@@ -4685,7 +5465,8 @@ impl ObjectModel {
             return Err(Trap::Unsupported);
         }
 
-        if let Some(n) = value.as_int() {
+        let float_type = matches!(type_char, Some('f' | 'F' | 'e' | 'E' | 'g' | 'G' | '%'));
+        if let Some(n) = value.as_int().filter(|_| !float_type) {
             let magnitude = n.unsigned_abs() as u32;
             let (digits, prefix) = match type_char.unwrap_or('d') {
                 'd' | 'n' => (format_radix(magnitude, 10, false), ""),
@@ -4736,7 +5517,7 @@ impl ObjectModel {
             };
             let align = if align == '\0' { '<' } else { align };
             Ok(pad_field(&body, width, fill, align))
-        } else if let Some(f) = self.float_value(value) {
+        } else if let Some(f) = self.float_value(value).or_else(|| value.as_int().map(|n| n as f64)) {
             let negative = f < 0.0 || (f == 0.0 && f.is_sign_negative());
             let magnitude = if negative { -f } else { f };
             let upper = matches!(type_char, Some('E' | 'F' | 'G'));
@@ -4787,7 +5568,30 @@ impl ObjectModel {
         }
     }
 
-    fn format_template(&self, template: &str, args: &[Value]) -> Result<String, Trap> {
+    /// Applies a `str.format` field conversion (`!r`/`!s`/`!a`) to `value`, producing a string value;
+    /// `None` returns it unchanged. `!r` and `!a` use `repr` (a close approximation of `ascii()` for
+    /// the ASCII content this subset handles), `!s` uses `str`. An unknown conversion is a `ValueError`.
+    fn apply_conversion(&mut self, value: Value, conversion: Option<&str>) -> Result<Value, Trap> {
+        match conversion {
+            None => Ok(value),
+            Some("r" | "a") => {
+                let s = self.repr(value);
+                self.new_str(&s)
+            }
+            Some("s") => {
+                let s = self.display(value);
+                self.new_str(&s)
+            }
+            Some(_) => Err(Trap::ValueError),
+        }
+    }
+
+    pub(crate) fn format_template(
+        &mut self,
+        template: &str,
+        args: &[Value],
+        kwargs: &[(&str, Value)],
+    ) -> Result<String, Trap> {
         let mut out = String::new();
         let mut chars = template.chars().peekable();
         let mut auto_index = 0usize;
@@ -4810,18 +5614,28 @@ impl ObjectModel {
                     if !closed {
                         return Err(Trap::Unsupported);
                     }
-                    let (name, spec) = match field.split_once(':') {
-                        Some((n, s)) => (n, Some(s)),
+                    let (name_conv, spec) = match field.split_once(':') {
+                        Some((nc, s)) => (nc, Some(s)),
                         None => (field.as_str(), None),
                     };
-                    let index = if name.is_empty() {
+                    let (name, conversion) = match name_conv.split_once('!') {
+                        Some((n, c)) => (n, Some(c)),
+                        None => (name_conv, None),
+                    };
+                    let arg = if name.is_empty() {
                         let i = auto_index;
                         auto_index += 1;
-                        i
+                        *args.get(i).ok_or(Trap::IndexError)?
+                    } else if let Ok(index) = name.parse::<usize>() {
+                        *args.get(index).ok_or(Trap::IndexError)?
+                    } else if let Some(&(_, v)) = kwargs.iter().find(|(k, _)| *k == name) {
+                        v
                     } else {
-                        name.parse::<usize>().map_err(|_| Trap::Unsupported)?
+                        let key = self.new_str(name)?;
+                        self.set_trap_arg(key);
+                        return Err(Trap::KeyError);
                     };
-                    let arg = *args.get(index).ok_or(Trap::IndexError)?;
+                    let arg = self.apply_conversion(arg, conversion)?;
                     match spec {
                         None => out.push_str(&self.display(arg)),
                         Some(spec) => out.push_str(&self.format_value_spec(arg, spec)?),
@@ -4896,6 +5710,10 @@ impl ObjectModel {
         let reference = callee.as_ref().ok_or(Trap::TypeError)?;
         let receiver = Value::from_bits(self.heap.read_u32(reference.0));
         let method_id = self.heap.read_u32(reference.0 + 4);
+        if method_id == EXC_INIT && self.is_instance(receiver) {
+            self.init_default_args(receiver, args)?;
+            return Ok(Value::NONE);
+        }
         if self.is_list(receiver) {
             return self.call_list_method(receiver, method_id, args);
         }
@@ -4921,6 +5739,12 @@ impl ObjectModel {
         if self.is_int(receiver) {
             return self.call_int_method(receiver, method_id, args);
         }
+        if self.is_float(receiver) {
+            return self.call_float_method(receiver, method_id, args);
+        }
+        if self.is_property(receiver) {
+            return self.call_property_method(receiver, method_id, args);
+        }
         if self.is_gpio(receiver) {
             return self.call_gpio_method(receiver, method_id, args);
         }
@@ -4942,7 +5766,7 @@ impl ObjectModel {
             }
             STR_FORMAT => {
                 let template = self.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
-                let rendered = self.format_template(&template, args)?;
+                let rendered = self.format_template(&template, args, &[])?;
                 self.new_str(&rendered)
             }
             STR_FORMAT_MAP => {
@@ -5435,6 +6259,29 @@ impl ObjectModel {
 
     /// Dispatches a `list` method: `append(x)` (-> None), `pop([i])` (-> the removed element,
     /// default last, `IndexError` on empty / out of range).
+    /// `list.index` / `tuple.index`: the first index in `[start, stop)` whose element equals the first
+    /// argument (negative bounds count from the end, clamped), else `ValueError`. Args are
+    /// `(value[, start[, stop]])`; `slot` is the sequence's arena slot.
+    fn seq_index(&self, slot: usize, args: &[Value]) -> Result<Value, Trap> {
+        let len = self.seqs[slot].len() as i64;
+        let clamp = |i: i64| (if i < 0 { i + len } else { i }).clamp(0, len) as usize;
+        let (value, lo, hi) = match args {
+            [v] => (*v, 0usize, len as usize),
+            [v, s] => (*v, clamp(s.as_int().ok_or(Trap::TypeError)?), len as usize),
+            [v, s, e] => (
+                *v,
+                clamp(s.as_int().ok_or(Trap::TypeError)?),
+                clamp(e.as_int().ok_or(Trap::TypeError)?),
+            ),
+            _ => return Err(Trap::TypeError),
+        };
+        let hi = hi.max(lo);
+        match self.seqs[slot][lo..hi].iter().position(|e| self.key_eq(*e, value)) {
+            Some(p) => Value::fixnum((p + lo) as i32).ok_or(Trap::Overflow),
+            None => Err(Trap::ValueError),
+        }
+    }
+
     fn call_list_method(&mut self, list: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
         let index = self.container_slot(list, self.list_type_id).ok_or(Trap::TypeError)?;
         match method_id {
@@ -5499,15 +6346,7 @@ impl ObjectModel {
                     None => Err(Trap::ValueError),
                 }
             }
-            LIST_INDEX => {
-                let [value] = args else {
-                    return Err(Trap::TypeError);
-                };
-                match self.seqs[index].iter().position(|e| self.key_eq(*e, *value)) {
-                    Some(p) => Value::fixnum(p as i32).ok_or(Trap::Overflow),
-                    None => Err(Trap::ValueError),
-                }
-            }
+            LIST_INDEX => self.seq_index(index, args),
             LIST_COUNT => {
                 let [value] = args else {
                     return Err(Trap::TypeError);
@@ -5577,8 +6416,10 @@ impl ObjectModel {
                 self.new_list(items)
             }
             DICT_UPDATE => {
-                let [other] = args else {
-                    return Err(Trap::TypeError);
+                let other = match args {
+                    [] => return Ok(Value::NONE),
+                    [other] => other,
+                    _ => return Err(Trap::TypeError),
                 };
                 let pairs = if let Some(entries) = self.dict_entries(*other) {
                     entries
@@ -5645,17 +6486,99 @@ impl ObjectModel {
         }
     }
 
-    /// `dict.fromkeys(iterable, value)`: a new dict with each distinct element of `iterable` as a
-    /// key, all mapped to `value`.
-    pub fn new_dict_fromkeys(&mut self, iterable: Value, value: Value) -> Result<Value, Trap> {
-        let keys = self.collect_elements(iterable)?;
-        let mut entries: Vec<(Value, Value)> = Vec::new();
-        for key in keys {
-            if !entries.iter().any(|(existing, _)| self.key_eq(*existing, key)) {
-                entries.push((key, value));
+    /// The interp-aware `dict` method dispatch: the equality-sensitive lookups (`get`/`pop`/
+    /// `setdefault`) and `update` test the key by an element's `__eq__` (threaded through the
+    /// interpreter, via [`ObjectModel::dict_find_dyn`]), so a value-object key resolves correctly. The
+    /// equality-free methods (keys/values/items/clear/copy/popitem) delegate to the plain
+    /// [`ObjectModel::call_dict_method`].
+    pub(crate) fn call_dict_method_dyn(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        args: &[Value],
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<Value, Trap> {
+        let index = self.container_slot(receiver, self.dict_type_id).ok_or(Trap::TypeError)?;
+        match method_id {
+            DICT_GET => {
+                let (key, default) = match args {
+                    [k] => (*k, Value::NONE),
+                    [k, d] => (*k, *d),
+                    _ => return Err(Trap::TypeError),
+                };
+                match self.dict_find_dyn(receiver, key, functions, depth)? {
+                    Some(slot) if slot < self.dicts[index].len() => Ok(self.dicts[index][slot].1),
+                    _ => Ok(default),
+                }
             }
+            DICT_POP => {
+                let (key, default) = match args {
+                    [k] => (*k, None),
+                    [k, d] => (*k, Some(*d)),
+                    _ => return Err(Trap::TypeError),
+                };
+                match self.dict_find_dyn(receiver, key, functions, depth)? {
+                    Some(slot) if slot < self.dicts[index].len() => Ok(self.dicts[index].remove(slot).1),
+                    _ => default.ok_or(Trap::KeyError),
+                }
+            }
+            DICT_SETDEFAULT => {
+                let (key, default) = match args {
+                    [k] => (*k, Value::NONE),
+                    [k, d] => (*k, *d),
+                    _ => return Err(Trap::TypeError),
+                };
+                match self.dict_find_dyn(receiver, key, functions, depth)? {
+                    Some(slot) if slot < self.dicts[index].len() => Ok(self.dicts[index][slot].1),
+                    _ => {
+                        self.dicts[index].push((key, default));
+                        Ok(default)
+                    }
+                }
+            }
+            DICT_UPDATE => {
+                let other = match args {
+                    [] => return Ok(Value::NONE),
+                    [other] => *other,
+                    _ => return Err(Trap::TypeError),
+                };
+                let pairs = if let Some(entries) = self.dict_entries(other) {
+                    entries
+                } else {
+                    let iterator = self.new_iter(other)?;
+                    let mut kv = Vec::new();
+                    while let Some(pair) = self.py_next(iterator)? {
+                        let parts = self.unpack_sequence(pair, 2)?;
+                        kv.push((parts[0], parts[1]));
+                    }
+                    kv
+                };
+                for (key, value) in pairs {
+                    match self.dict_find_dyn(receiver, key, functions, depth)? {
+                        Some(slot) if slot < self.dicts[index].len() => self.dicts[index][slot].1 = value,
+                        _ => self.dicts[index].push((key, value)),
+                    }
+                }
+                Ok(Value::NONE)
+            }
+            _ => self.call_dict_method(receiver, method_id, args),
         }
-        self.new_dict(entries)
+    }
+
+    /// `dict.fromkeys(iterable, value)`: a new dict with each distinct element of `iterable` as a
+    /// key, all mapped to `value`. Keys dedup interp-aware (a value object collapses with an equal
+    /// one via its `__eq__`); every value is the same, so first- vs last-wins is moot.
+    pub fn new_dict_fromkeys(
+        &mut self,
+        iterable: Value,
+        value: Value,
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<Value, Trap> {
+        let keys = self.collect_elements(iterable)?;
+        let pairs: Vec<(Value, Value)> = keys.into_iter().map(|key| (key, value)).collect();
+        self.new_dict_dyn(pairs, functions, depth)
     }
 
     /// Collects any iterable into an owned `Vec` (a set/frozenset or list/tuple is cloned, else
@@ -5708,17 +6631,49 @@ impl ObjectModel {
     /// `count(x)` -- the immutable sequence reads over the shared arena.
     fn call_tuple_method(&mut self, tuple: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
         let index = self.container_slot(tuple, self.tuple_type_id).ok_or(Trap::TypeError)?;
-        let [value] = args else {
-            return Err(Trap::TypeError);
-        };
         match method_id {
-            TUPLE_INDEX => match self.seqs[index].iter().position(|e| self.key_eq(*e, *value)) {
-                Some(p) => Value::fixnum(p as i32).ok_or(Trap::Overflow),
-                None => Err(Trap::ValueError),
-            },
+            TUPLE_INDEX => self.seq_index(index, args),
             TUPLE_COUNT => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
                 let n = self.seqs[index].iter().filter(|e| self.key_eq(**e, *value)).count();
                 Value::fixnum(n as i32).ok_or(Trap::Overflow)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a `property` builder method (`getter`/`setter`/`deleter`): returns a NEW property
+    /// with that one accessor replaced by `args[0]` (so `x = x.setter(f)` adds a setter).
+    fn call_property_method(&mut self, receiver: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
+        let [func] = args else {
+            return Err(Trap::TypeError);
+        };
+        let (fget, fset, fdel) = self.property_accessors(receiver);
+        match method_id {
+            PROPERTY_GETTER => self.new_property(*func, fset, fdel),
+            PROPERTY_SETTER => self.new_property(fget, *func, fdel),
+            PROPERTY_DELETER => self.new_property(fget, fset, *func),
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a `float` method: `is_integer()` (finite with no fractional part), `conjugate()`
+    /// (returns the float), and `as_integer_ratio()` -> the exact `(numerator, denominator)`.
+    fn call_float_method(&mut self, receiver: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
+        if !args.is_empty() {
+            return Err(Trap::TypeError);
+        }
+        let f = self.float_value(receiver).ok_or(Trap::TypeError)?;
+        match method_id {
+            FLOAT_IS_INTEGER => Ok(Value::from_bool(f.is_finite() && libm::floor(f) == f)),
+            FLOAT_CONJUGATE => Ok(receiver),
+            FLOAT_AS_INTEGER_RATIO => {
+                let (num, den) = float_as_integer_ratio(f).ok_or(Trap::ValueError)?;
+                let numerator = self.new_bigint(num)?;
+                let denominator = self.new_bigint(den)?;
+                self.new_tuple(alloc::vec![numerator, denominator])
             }
             _ => Err(Trap::AttributeError),
         }
@@ -5743,11 +6698,18 @@ impl ObjectModel {
                 let count = self.as_bigint(receiver).ok_or(Trap::TypeError)?.bit_count();
                 self.new_long(i128::from(count))
             }
-            INT_CONJUGATE => {
+            INT_CONJUGATE | INT_INDEX => {
                 if !args.is_empty() {
                     return Err(Trap::TypeError);
                 }
                 Ok(receiver)
+            }
+            INT_AS_INTEGER_RATIO => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let one = Value::fixnum(1).ok_or(Trap::Overflow)?;
+                self.new_tuple(alloc::vec![receiver, one])
             }
             INT_TO_BYTES => {
                 let (length, byteorder) = match args {
@@ -5932,6 +6894,50 @@ impl ObjectModel {
                     self.new_bytes(data)
                 }
             }
+            BYTES_SPLIT => {
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let bytearray = self.is_bytearray(receiver);
+                let parts = match args {
+                    [] => split_whitespace_bytes(&data),
+                    [sep] => {
+                        let sep = self.bytes_value(*sep).ok_or(Trap::TypeError)?.to_vec();
+                        if sep.is_empty() {
+                            return Err(Trap::ValueError);
+                        }
+                        split_on_bytes(&data, &sep)
+                    }
+                    _ => return Err(Trap::TypeError),
+                };
+                let mut elements = Vec::with_capacity(parts.len());
+                for part in parts {
+                    elements.push(if bytearray {
+                        self.new_bytearray(part)?
+                    } else {
+                        self.new_bytes(part)?
+                    });
+                }
+                self.new_list(elements)
+            }
+            BYTES_STRIP | BYTES_LSTRIP | BYTES_RSTRIP => {
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let bytearray = self.is_bytearray(receiver);
+                let chars = match args {
+                    [] => alloc::vec![b' ', b'\t', b'\n', b'\r', 0x0b, 0x0c],
+                    [set] => self.bytes_value(*set).ok_or(Trap::TypeError)?.to_vec(),
+                    _ => return Err(Trap::TypeError),
+                };
+                let stripped = strip_bytes(
+                    &data,
+                    &chars,
+                    method_id != BYTES_RSTRIP,
+                    method_id != BYTES_LSTRIP,
+                );
+                if bytearray {
+                    self.new_bytearray(stripped)
+                } else {
+                    self.new_bytes(stripped)
+                }
+            }
             _ => Err(Trap::AttributeError),
         }
     }
@@ -6056,6 +7062,112 @@ impl ObjectModel {
         }
     }
 
+    /// The interp-aware `set`/`frozenset` method dispatch: the equality-sensitive methods (the
+    /// algebra union/intersection/difference/symmetric_difference, the predicates issubset/
+    /// issuperset/isdisjoint, the mutators add/discard/remove/update) test membership via an
+    /// element's `__eq__` (threaded through the interpreter), so a user object dedups in a set. The
+    /// equality-free methods (copy/clear/pop) delegate to the plain [`ObjectModel::call_set_method`].
+    pub(crate) fn call_set_method_dyn(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        args: &[Value],
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<Value, Trap> {
+        let frozen = self.is_frozenset(receiver);
+        match method_id {
+            SET_UNION | SET_INTERSECTION | SET_DIFFERENCE | SET_SYMMETRIC_DIFFERENCE => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                let b = self.collect_elements(*other)?;
+                let result = match method_id {
+                    SET_UNION => crate::interp::union_elems_dyn(&a, &b, functions, self, depth)?,
+                    SET_INTERSECTION => {
+                        crate::interp::filter_elems_dyn(&a, &b, true, functions, self, depth)?
+                    }
+                    SET_DIFFERENCE => {
+                        crate::interp::filter_elems_dyn(&a, &b, false, functions, self, depth)?
+                    }
+                    _ => {
+                        let mut r =
+                            crate::interp::filter_elems_dyn(&a, &b, false, functions, self, depth)?;
+                        r.extend(crate::interp::filter_elems_dyn(&b, &a, false, functions, self, depth)?);
+                        r
+                    }
+                };
+                if frozen {
+                    self.new_frozenset(result)
+                } else {
+                    self.new_set(result)
+                }
+            }
+            SET_ISSUBSET | SET_ISSUPERSET | SET_ISDISJOINT => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                let b = self.collect_elements(*other)?;
+                let result = match method_id {
+                    SET_ISSUBSET => crate::interp::subset_dyn(&a, &b, functions, self, depth)?,
+                    SET_ISSUPERSET => crate::interp::subset_dyn(&b, &a, functions, self, depth)?,
+                    _ => crate::interp::disjoint_dyn(&a, &b, functions, self, depth)?,
+                };
+                Ok(Value::from_bool(result))
+            }
+            SET_ADD => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                if !crate::interp::elems_contain(*value, &a, functions, self, depth)? {
+                    self.set_push(receiver, *value)?;
+                }
+                Ok(Value::NONE)
+            }
+            SET_DISCARD | SET_REMOVE => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                self.require_hashable(*value)?;
+                let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                let mut position = None;
+                for (i, &e) in a.iter().enumerate() {
+                    if crate::interp::elem_eq(*value, e, functions, self, depth)? {
+                        position = Some(i);
+                        break;
+                    }
+                }
+                match position {
+                    Some(p) => {
+                        let slot =
+                            self.container_slot(receiver, self.set_type_id).ok_or(Trap::TypeError)?;
+                        self.sets[slot].remove(p);
+                        Ok(Value::NONE)
+                    }
+                    None if method_id == SET_REMOVE => Err(Trap::KeyError),
+                    None => Ok(Value::NONE),
+                }
+            }
+            SET_UPDATE => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let b = self.collect_elements(*other)?;
+                for e in b {
+                    let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                    if !crate::interp::elems_contain(e, &a, functions, self, depth)? {
+                        self.set_push(receiver, e)?;
+                    }
+                }
+                Ok(Value::NONE)
+            }
+            _ => self.call_set_method(receiver, method_id, args),
+        }
+    }
+
     /// `set <op> set` for the `| & - ^` operators (both operands must be sets/frozensets); the
     /// result takes the LEFT operand's kind.
     pub(crate) fn set_binary_op(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, Trap> {
@@ -6135,6 +7247,9 @@ impl ObjectModel {
         if let (Some(x), Some(y)) = (self.str_value(a), self.str_value(b)) {
             return Ok(x.cmp(y));
         }
+        if let (Some(x), Some(y)) = (self.byte_view(a), self.byte_view(b)) {
+            return Ok(x.cmp(y));
+        }
         let same_sequence =
             (self.is_tuple(a) && self.is_tuple(b)) || (self.is_list(a) && self.is_list(b));
         if same_sequence {
@@ -6212,6 +7327,19 @@ impl ObjectModel {
         })
     }
 
+    /// Whether `callee` is a bound `dict.update` -- the interpreter intercepts it so the keyword form
+    /// `d.update(a=1, b=2)` (and `d.update(other, a=1)`) merges the keywords too.
+    #[must_use]
+    pub(crate) fn is_dict_update_bound(&self, callee: Value) -> bool {
+        callee.as_ref().is_some_and(|reference| {
+            self.heap.type_id_of(reference) == self.bound_method_type_id && {
+                let receiver = Value::from_bits(self.heap.read_u32(reference.0));
+                let method_id = self.heap.read_u32(reference.0 + 4);
+                self.is_dict(receiver) && method_id == DICT_UPDATE
+            }
+        })
+    }
+
     /// The receiver a bound method is bound to (its `self`); the precondition is that `callee` is a
     /// bound method (e.g. [`ObjectModel::is_list_sort_bound`]).
     #[must_use]
@@ -6226,6 +7354,23 @@ impl ObjectModel {
     pub fn bound_method_id(&self, callee: Value) -> u32 {
         let reference = callee.as_ref().expect("a bound method");
         self.heap.read_u32(reference.0 + 4)
+    }
+
+    /// Whether `callee` is a bound `str.join` -- the interpreter intercepts it to iterate ANY
+    /// iterable argument (a str, a lazy map/filter, a generator), not just a materialized sequence.
+    #[must_use]
+    pub(crate) fn is_str_join(&self, callee: Value) -> bool {
+        self.is_bound_method(callee)
+            && self.bound_method_id(callee) == STR_JOIN
+            && self.is_str(self.bound_receiver(callee))
+    }
+
+    /// Whether `callee` is a bound `str.format` -- the built-in method with a keyword surface
+    /// (`"{name}".format(name=v)`), so the keyword-call path routes it to the template renderer.
+    pub(crate) fn is_str_format_bound(&self, callee: Value) -> bool {
+        self.is_bound_method(callee)
+            && self.bound_method_id(callee) == STR_FORMAT
+            && self.is_str(self.bound_receiver(callee))
     }
 
     /// A clone of a list/tuple's elements (so a caller can compute over them without holding a
@@ -6591,7 +7736,7 @@ mod tests {
             ])
             .unwrap();
         let zero = Value::fixnum(0).unwrap();
-        let d = model.new_dict_fromkeys(keys, zero).unwrap();
+        let d = model.new_dict_fromkeys(keys, zero, &[], 0).unwrap();
         assert_eq!(model.py_len(d).unwrap().as_fixnum(), Some(2));
     }
 
@@ -6623,7 +7768,8 @@ mod tests {
         let s = model.new_str("abcdef").unwrap();
         assert_eq!(model.format_value_spec(s, ".3").unwrap(), "abc");
         assert_eq!(model.format_value_spec(s, "^8").unwrap(), " abcdef ");
-        assert_eq!(model.format_value_spec(n, ".2f"), Err(Trap::Unsupported));
+        assert_eq!(model.format_value_spec(n, ".2f").unwrap(), "42.00");
+        assert_eq!(model.format_value_spec(n, "08.2f").unwrap(), "00042.00");
     }
 
     #[test]
@@ -7068,6 +8214,23 @@ mod tests {
         assert_eq!(model.bound_func(bound_b).as_function_index(), Some(0));
         assert_eq!(model.py_getattr_instance(obj_b, "k").unwrap().as_fixnum(), Some(10));
         assert_eq!(model.find_init(class_b).unwrap().as_function_index(), Some(1));
+    }
+
+    #[test]
+    fn getattr_binds_a_defaulted_method() {
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let name = model.new_str("C").unwrap();
+        let key_m = model.new_str("m").unwrap();
+        let defaults = model.new_tuple(alloc::vec![n(1)]).unwrap();
+        let m = model.new_py_function(0, defaults, Value::NONE).unwrap();
+        let ns = model.new_dict(alloc::vec![(key_m, m)]).unwrap();
+        let class = model.new_class(name, Value::NONE, ns).unwrap();
+        let obj = model.new_object(class).unwrap();
+        let bound = model.py_getattr_instance(obj, "m").unwrap();
+        assert!(model.is_py_bound(bound));
+        assert_eq!(model.bound_self(bound), obj);
+        assert!(model.is_py_function(model.bound_func(bound)));
     }
 
     #[test]

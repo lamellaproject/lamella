@@ -96,6 +96,9 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     .collect(),
                 is_static: false,
                 is_params: has_params_array(&declaration.parameters),
+                is_virtual: false,
+                is_abstract: false,
+                is_override: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
             });
@@ -318,6 +321,7 @@ pub(crate) fn fold_const_binary(
 /// methods.
 fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
     let mut info = TypeInfo::new(namespace, &declaration.name, map_kind(declaration.kind));
+    info.accessibility = accessibility_of(&declaration.modifiers);
     info.bases = declaration.bases.iter().map(bind_type).collect();
     if matches!(declaration.kind, SyntaxTypeKind::Struct) {
         info.bases.push(named_symbol("System", "ValueType"));
@@ -425,6 +429,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: explicit_interface.is_none() && is_static(modifiers),
                 is_params: has_params_array(parameters),
+                is_virtual: is_virtual(modifiers),
+                is_abstract: is_abstract_member(modifiers, info.kind),
+                is_override: is_override(modifiers),
                 accessibility: match explicit_interface {
                     Some(_) => Accessibility::Private,
                     None => access(modifiers),
@@ -442,6 +449,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: true,
                 is_params: false,
+                is_virtual: false,
+                is_abstract: false,
+                is_override: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
             }),
@@ -456,6 +466,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: true,
                 is_params: false,
+                is_virtual: false,
+                is_abstract: false,
+                is_override: false,
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
             }),
@@ -485,6 +498,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let element = bind_type(ty);
                 let indices: Vec<TypeSymbol> = parameters.iter().map(parameter_symbol).collect();
                 let accessibility = access(modifiers);
+                let indexer_is_virtual = is_virtual(modifiers);
+                let indexer_is_abstract = is_abstract_member(modifiers, info.kind);
+                let indexer_is_override = is_override(modifiers);
                 if getter.is_some() {
                     info.methods.push(MethodSymbol {
                         name: "get_Item".into(),
@@ -492,6 +508,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         parameters: indices.clone(),
                         is_static: false,
                         is_params: has_params_array(parameters),
+                        is_virtual: indexer_is_virtual,
+                        is_abstract: indexer_is_abstract,
+                        is_override: indexer_is_override,
                         accessibility,
                         conditional: Vec::new(),
                     });
@@ -505,6 +524,9 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         parameters,
                         is_static: false,
                         is_params: false,
+                        is_virtual: indexer_is_virtual,
+                        is_abstract: indexer_is_abstract,
+                        is_override: indexer_is_override,
                         accessibility,
                         conditional: Vec::new(),
                     });
@@ -549,6 +571,9 @@ fn constructor(
         parameters: parameters.iter().map(parameter_symbol).collect(),
         is_static: false,
         is_params: has_params_array(parameters),
+        is_virtual: false,
+        is_abstract: false,
+        is_override: false,
         accessibility,
         conditional: Vec::new(),
     }
@@ -611,6 +636,20 @@ fn map_kind(kind: SyntaxTypeKind) -> TypeKind {
 
 fn is_static(modifiers: &[Modifier]) -> bool {
     modifiers.contains(&Modifier::Static)
+}
+
+fn is_virtual(modifiers: &[Modifier]) -> bool {
+    modifiers.contains(&Modifier::Virtual)
+}
+
+fn is_override(modifiers: &[Modifier]) -> bool {
+    modifiers.contains(&Modifier::Override)
+}
+
+/// Whether a member declared with `modifiers` in a type of `kind` is abstract: an `abstract`
+/// modifier, or -- implicitly -- any member of an interface (17.2.2 / 20.2).
+fn is_abstract_member(modifiers: &[Modifier], kind: TypeKind) -> bool {
+    modifiers.contains(&Modifier::Abstract) || kind == TypeKind::Interface
 }
 
 /// The accessibility a member's modifiers declare; a class member with none is

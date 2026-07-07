@@ -102,6 +102,17 @@ pub enum DiagnosticKind {
     SemicolonExpected,
     /// A block or similar construct was not closed by the required `}`.
     CloseBraceExpected,
+    /// A token appeared in a class/struct/interface member declaration where a member name
+    /// (or `operator`/`this`) was required, so it can begin no member (clause 17).
+    InvalidTokenInMemberDeclaration {
+        /// The offending token's source spelling, for example `}` or `;`.
+        token: Box<str>,
+    },
+    /// The same declaration modifier appeared twice (clause 10.2.2 / 17.2).
+    DuplicateModifier {
+        /// The repeated modifier's keyword, for example `public`.
+        modifier: Box<str>,
+    },
     /// A block was required (for example a `try`, `catch`, or `finally` body) but
     /// no `{` was found.
     OpenBraceExpected,
@@ -160,6 +171,8 @@ impl DiagnosticKind {
             DiagnosticKind::TypeExpected => 1031,
             DiagnosticKind::SemicolonExpected => 1002,
             DiagnosticKind::CloseBraceExpected => 1513,
+            DiagnosticKind::InvalidTokenInMemberDeclaration { .. } => 1519,
+            DiagnosticKind::DuplicateModifier { .. } => 1004,
             DiagnosticKind::OpenBraceExpected => 1514,
             DiagnosticKind::ExpectedCatchOrFinally => 1524,
             DiagnosticKind::TypeDeclarationExpected => 1518,
@@ -234,6 +247,12 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::TypeExpected => f.write_str("Type expected"),
             DiagnosticKind::SemicolonExpected => f.write_str("; expected"),
             DiagnosticKind::CloseBraceExpected => f.write_str("} expected"),
+            DiagnosticKind::InvalidTokenInMemberDeclaration { token } => {
+                write!(f, "Invalid token '{token}' in a member declaration")
+            }
+            DiagnosticKind::DuplicateModifier { modifier } => {
+                write!(f, "Duplicate '{modifier}' modifier")
+            }
             DiagnosticKind::OpenBraceExpected => f.write_str("{ expected"),
             DiagnosticKind::ExpectedCatchOrFinally => {
                 f.write_str("Expected catch or finally")

@@ -370,7 +370,7 @@ impl<'a> Lexer<'a> {
     /// undefined for the rest of the file when this section is being compiled.
     fn scan_define_or_undef(&mut self, start: usize, active: bool, is_define: bool) {
         self.skip_inline_whitespace();
-        let symbol = self.read_directive_name();
+        let symbol = self.read_pp_symbol();
         if symbol.is_empty() || symbol == "true" || symbol == "false" {
             self.report(DiagnosticKind::IdentifierExpected, start);
             self.consume_to_line_end();
@@ -383,7 +383,7 @@ impl<'a> Lexer<'a> {
             if is_define {
                 self.defined_symbols.insert(symbol.into());
             } else {
-                self.defined_symbols.remove(symbol);
+                self.defined_symbols.remove(symbol.as_str());
             }
         }
         self.expect_directive_line_end(start);
@@ -585,6 +585,50 @@ impl<'a> Lexer<'a> {
         &self.source[name_start..self.position]
     }
 
+    /// Reads a pre-processing conditional symbol (9.5.1) at the current position, decoding
+    /// `\u`/`\U` unicode escapes and removing Formatting (Cf) characters, so two symbols that
+    /// are equal under 9.4.2 -- e.g. `A` and `AFFFB` -- reduce to the same string. Returns
+    /// the normalized symbol (empty when none is there). `#define`/`#undef` and an `#if`/`#elif`
+    /// expression compare symbols by this reduced spelling, so both the definition and the use
+    /// read through here; unlike the token lexer's identifier scan, the Cf strip is applied at
+    /// read time because a pre-processing symbol has no later normalization pass.
+    fn read_pp_symbol(&mut self) -> String {
+        let mut symbol = String::new();
+        match self.peek() {
+            Some(c) if is_identifier_start(c) => {
+                symbol.push(c);
+                self.bump();
+            }
+            Some('\\') => match self.unicode_escape_char() {
+                Some(c) if is_identifier_start(c) => symbol.push(c),
+                _ => return symbol,
+            },
+            _ => return symbol,
+        }
+        loop {
+            match self.peek() {
+                Some(c) if is_identifier_part(c) => {
+                    if !is_format_char(c) {
+                        symbol.push(c);
+                    }
+                    self.bump();
+                }
+                Some('\\') if matches!(self.peek_second(), Some('u' | 'U')) => {
+                    match self.unicode_escape_char() {
+                        Some(c) if is_identifier_part(c) => {
+                            if !is_format_char(c) {
+                                symbol.push(c);
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                _ => break,
+            }
+        }
+        symbol
+    }
+
     /// Skips white space within a line (9.3.3), stopping at a line terminator.
     fn skip_inline_whitespace(&mut self) {
         while self.peek().is_some_and(is_whitespace) {
@@ -690,7 +734,7 @@ impl<'a> Lexer<'a> {
                 }
                 value
             }
-            Some(c) if is_identifier_start(c) => match self.read_directive_name() {
+            Some(c) if is_identifier_start(c) => match self.read_pp_symbol().as_str() {
                 "true" => true,
                 "false" => false,
                 symbol => self.defined_symbols.contains(symbol),
@@ -1328,18 +1372,36 @@ fn parse_decimal_literal(text: &str) -> Option<(u32, u32, u32, u8)> {
         Some((mantissa, exp)) => (mantissa, exp.parse::<i32>().ok()?),
         None => (text, 0),
     };
+    const CEILING: u128 = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
     let mut mantissa: u128 = 0;
     let mut fractional_digits: i32 = 0;
     let mut after_point = false;
+    let mut first_dropped: Option<u32> = None;
+    let mut rest_nonzero = false;
     for ch in mantissa_text.chars() {
         if ch == '.' {
             after_point = true;
             continue;
         }
         let digit = ch.to_digit(10)?;
-        mantissa = mantissa.checked_mul(10)?.checked_add(u128::from(digit))?;
-        if after_point {
-            fractional_digits += 1;
+        if mantissa <= (CEILING - u128::from(digit)) / 10 {
+            mantissa = mantissa * 10 + u128::from(digit);
+            if after_point {
+                fractional_digits += 1;
+            }
+        } else if after_point {
+            match first_dropped {
+                None => first_dropped = Some(digit),
+                Some(_) if digit != 0 => rest_nonzero = true,
+                Some(_) => {}
+            }
+        } else {
+            return None;
+        }
+    }
+    if let Some(dropped) = first_dropped {
+        if dropped > 5 || (dropped == 5 && (rest_nonzero || mantissa % 2 == 1)) {
+            mantissa += 1;
         }
     }
     let mut scale = fractional_digits - exponent;
@@ -1418,6 +1480,16 @@ fn is_identifier_part(c: char) -> bool {
             lamella_unicode::general_category(c as u32),
             DecimalDigitNumber | ConnectorPunctuation | NonSpacingMark | SpacingCombiningMark | Format
         )
+}
+
+/// Whether `c` is a Unicode Formatting (Cf) character. These are valid identifier PARTS but are
+/// removed when two identifiers are compared for equality (9.4.2), so a pre-processing symbol
+/// strips them before it is matched against the defined set.
+fn is_format_char(c: char) -> bool {
+    matches!(
+        lamella_unicode::general_category(c as u32),
+        lamella_unicode::GeneralCategory::Format
+    )
 }
 
 /// The Unicode replacement character (U+FFFD), stood in for one ill-formed
@@ -2113,6 +2185,32 @@ mod tests {
                 .diagnostics
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn a_format_char_in_a_conditional_symbol_is_ignored() {
+        let used = "#define A\n#if A == A\\uFFFB\nclass C {}\n#endif";
+        assert_eq!(
+            significant(used),
+            vec![
+                TokenKind::Keyword(Keyword::Class),
+                ident("C"),
+                TokenKind::Punctuator(Punctuator::OpenBrace),
+                TokenKind::Punctuator(Punctuator::CloseBrace),
+            ]
+        );
+        assert!(tokenize(used).diagnostics.is_empty());
+        let defined = "#define B\\uFFFB\n#if B\nclass D {}\n#endif";
+        assert_eq!(
+            significant(defined),
+            vec![
+                TokenKind::Keyword(Keyword::Class),
+                ident("D"),
+                TokenKind::Punctuator(Punctuator::OpenBrace),
+                TokenKind::Punctuator(Punctuator::CloseBrace),
+            ]
+        );
+        assert!(tokenize(defined).diagnostics.is_empty());
     }
 
     #[test]

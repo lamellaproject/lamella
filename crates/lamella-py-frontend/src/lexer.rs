@@ -11,16 +11,26 @@ use alloc::vec::Vec;
 pub enum FStringPart {
     /// Literal text between replacement fields.
     Literal(String),
-    /// A `{expr[!conversion][:spec]}` replacement field.
+    /// A `{expr[=][!conversion][:spec]}` replacement field.
     Expr {
-        /// The raw source of the expression (before any `!`/`:`).
+        /// The raw source of the expression (before any `=`/`!`/`:`).
         text: String,
         /// A `!r` / `!s` / `!a` conversion, if present.
         conversion: Option<char>,
         /// A `:format_spec`, if present (captured literally, up to the closing `}`).
         spec: Option<String>,
+        /// For a `{expr=}` self-documenting field, the literal prefix emitted before the value
+        /// (the expression source through the `=`, with surrounding whitespace preserved, e.g.
+        /// `x=` or `x = `); `None` for an ordinary field. Such a field renders with `repr` by
+        /// default (rather than `str`).
+        debug: Option<String>,
     },
 }
+
+/// The scanned parts of one f-string replacement field: the expression source, an optional
+/// `!r`/`!s`/`!a` conversion, an optional `:format_spec`, and (for a `{expr=}` field) the debug
+/// prefix literal.
+type FStringField = (String, Option<char>, Option<String>, Option<String>);
 
 /// A lexical token kind.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,8 +131,10 @@ pub enum Tok {
     DoubleSlash,
     /// `%`
     Percent,
-    /// `@` -- the decorator marker (matrix-multiply is out of subset).
+    /// `@` -- the decorator marker (at statement start) or the matrix-multiply operator (infix).
     At,
+    /// `@=` -- augmented matrix-multiply assignment.
+    AtEq,
     /// `&`
     Amper,
     /// `|`
@@ -155,6 +167,10 @@ pub enum Tok {
     MinusEq,
     /// `*=`
     StarEq,
+    /// `**=`
+    DoubleStarEq,
+    /// `/=`
+    SlashEq,
     /// `//=`
     SlashSlashEq,
     /// `%=`
@@ -175,8 +191,12 @@ pub enum Tok {
     ColonEqual,
     /// `,`
     Comma,
+    /// `;` -- separates simple statements on one line.
+    Semicolon,
     /// `.`
     Dot,
+    /// `...` -- the Ellipsis literal.
+    Ellipsis,
     /// `->`
     Arrow,
     /// `(`
@@ -418,7 +438,9 @@ impl Lexer {
 
     fn lex_token(&mut self) -> Result<(), LexError> {
         let c = self.peek().expect("lex_token called at end of input");
-        if c.is_ascii_digit() {
+        if c.is_ascii_digit()
+            || (c == '.' && matches!(self.peek2(), Some(d) if d.is_ascii_digit()))
+        {
             self.lex_number()
         } else if (c == 'f' || c == 'F') && matches!(self.peek2(), Some('\'' | '"')) {
             self.lex_fstring()
@@ -719,9 +741,9 @@ impl Lexer {
 
     /// Lex a single-line f-string `f"..."` / `f'...'` (the `f`/`F` not yet consumed):
     /// literal text (escapes resolved, `{{`/`}}` -> `{`/`}`) interspersed with
-    /// `{expr[!conversion][:spec]}` replacement fields. The expression source is captured
-    /// for the parser; a `!r`/`!s` conversion and a `:spec` are split off here. `=`-debug and
-    /// raw/triple-quoted f-strings are out of subset.
+    /// `{expr[=][!conversion][:spec]}` replacement fields. The expression source is captured
+    /// for the parser; a `=` self-documenting marker, a `!r`/`!s` conversion, and a `:spec` are
+    /// split off here. Raw/triple-quoted f-strings are out of subset.
     fn lex_fstring(&mut self) -> Result<(), LexError> {
         self.pos += 1;
         let quote = self.peek().expect("lex_fstring called at a quote");
@@ -752,11 +774,12 @@ impl Lexer {
                         parts.push(FStringPart::Literal(core::mem::take(&mut literal)));
                     }
                     self.pos += 1;
-                    let (text, conversion, spec) = self.scan_fstring_expr(quote)?;
+                    let (text, conversion, spec, debug) = self.scan_fstring_expr(quote)?;
                     parts.push(FStringPart::Expr {
                         text,
                         conversion,
                         spec,
+                        debug,
                     });
                 }
                 Some('}') => {
@@ -775,15 +798,16 @@ impl Lexer {
     }
 
     /// Capture the raw source of a replacement field, from just after `{` to the matching
-    /// `}` (tracking `()`/`[]`/`{}` nesting). First light does not handle a `}` inside a
-    /// string within the field.
-    fn scan_fstring_expr(
-        &mut self,
-        quote: char,
-    ) -> Result<(String, Option<char>, Option<String>), LexError> {
+    /// `}` (tracking `()`/`[]`/`{}` nesting). A top-level `=` that is not part of a comparison
+    /// operator makes it a `{expr=}` self-documenting field: the returned `debug` string is the
+    /// literal to emit before the value -- the expression source through the `=` and any trailing
+    /// whitespace, up to a conversion/spec/`}`. First light does not handle a `}` inside a string
+    /// within the field.
+    fn scan_fstring_expr(&mut self, quote: char) -> Result<FStringField, LexError> {
         let mut text = String::new();
         let mut conversion: Option<char> = None;
         let mut spec: Option<String> = None;
+        let mut debug: Option<String> = None;
         let mut depth = 0i32;
         loop {
             match self.peek() {
@@ -795,7 +819,7 @@ impl Lexer {
                 }
                 Some('}') if depth == 0 => {
                     self.pos += 1;
-                    return Ok((text, conversion, spec));
+                    return Ok((text, conversion, spec, debug));
                 }
                 Some(c) if spec.is_some() => {
                     match c {
@@ -813,6 +837,26 @@ impl Lexer {
                 Some('!') if depth == 0 && matches!(self.peek2(), Some('r' | 's' | 'a')) => {
                     conversion = self.peek2();
                     self.pos += 2;
+                }
+                Some('=')
+                    if depth == 0
+                        && debug.is_none()
+                        && self.peek2() != Some('=')
+                        && !matches!(text.chars().last(), Some('=' | '!' | '<' | '>')) =>
+                {
+                    let mut prefix = text.clone();
+                    prefix.push('=');
+                    debug = Some(prefix);
+                    self.pos += 1;
+                }
+                Some(c) if debug.is_some() => {
+                    match c {
+                        '(' | '[' | '{' => depth += 1,
+                        ')' | ']' | '}' => depth -= 1,
+                        _ => {}
+                    }
+                    debug.as_mut().expect("debug is Some").push(c);
+                    self.pos += 1;
                 }
                 Some(c @ ('(' | '[' | '{')) => {
                     depth += 1;
@@ -838,7 +882,10 @@ impl Lexer {
     /// right after the prefix). A `.` or `e`/`E` continues into `lex_float_tail`, and a
     /// `j`/`J` suffix makes the number an imaginary literal.
     fn lex_number(&mut self) -> Result<(), LexError> {
-        let first = self.peek().expect("lex_number called at a digit");
+        let first = self.peek().expect("lex_number called at a digit or a leading `.`");
+        if first == '.' {
+            return self.lex_float_tail(String::new());
+        }
         if first == '0' {
             let radix = match self.peek2() {
                 Some('x' | 'X') => Some(16),
@@ -1050,14 +1097,17 @@ impl Lexer {
             '-' if next == Some('>') => (Tok::Arrow, 2),
             '-' if next == Some('=') => (Tok::MinusEq, 2),
             '-' => (Tok::Minus, 1),
+            '*' if next == Some('*') && third == Some('=') => (Tok::DoubleStarEq, 3),
             '*' if next == Some('*') => (Tok::DoubleStar, 2),
             '*' if next == Some('=') => (Tok::StarEq, 2),
             '*' => (Tok::Star, 1),
             '/' if next == Some('/') && third == Some('=') => (Tok::SlashSlashEq, 3),
             '/' if next == Some('/') => (Tok::DoubleSlash, 2),
+            '/' if next == Some('=') => (Tok::SlashEq, 2),
             '/' => (Tok::Slash, 1),
             '%' if next == Some('=') => (Tok::PercentEq, 2),
             '%' => (Tok::Percent, 1),
+            '@' if next == Some('=') => (Tok::AtEq, 2),
             '@' => (Tok::At, 1),
             '&' if next == Some('=') => (Tok::AmperEq, 2),
             '&' => (Tok::Amper, 1),
@@ -1081,6 +1131,8 @@ impl Lexer {
             ':' if next == Some('=') => (Tok::ColonEqual, 2),
             ':' => (Tok::Colon, 1),
             ',' => (Tok::Comma, 1),
+            ';' => (Tok::Semicolon, 1),
+            '.' if next == Some('.') && third == Some('.') => (Tok::Ellipsis, 3),
             '.' => (Tok::Dot, 1),
             '(' => (Tok::LParen, 1),
             ')' => (Tok::RParen, 1),
@@ -1266,6 +1318,21 @@ mod tests {
     }
 
     #[test]
+    fn leading_dot_floats_lex_as_floats() {
+        assert_eq!(kinds(".5\n")[0], Tok::Float(0.5f64.to_bits()));
+        assert_eq!(kinds(".25e1\n")[0], Tok::Float(2.5f64.to_bits()));
+        assert_eq!(kinds("x.y\n")[1], Tok::Dot);
+        assert_eq!(kinds("1.5\n")[0], Tok::Float(1.5f64.to_bits()));
+    }
+
+    #[test]
+    fn ellipsis_lexes_as_one_token() {
+        assert_eq!(kinds("...\n")[0], Tok::Ellipsis);
+        assert_eq!(kinds("a.b\n")[1], Tok::Dot);
+        assert_eq!(kinds(".5\n")[0], Tok::Float(0.5f64.to_bits()));
+    }
+
+    #[test]
     fn oversized_integer_literals_lex_to_bigint() {
         assert_eq!(
             kinds("123456789012345678901234567890\n")[0],
@@ -1285,6 +1352,43 @@ mod tests {
         assert_eq!(kinds("b'\\101'\n")[0], Tok::Bytes(vec![b'A']));
         assert_eq!(kinds("B\"\"\n")[0], Tok::Bytes(Vec::new()));
         assert!(crate::lexer::tokenize("b'\u{e9}'\n").is_err());
+    }
+
+    #[test]
+    fn fstring_debug_fields_capture_the_prefix() {
+        assert_eq!(
+            kinds("f\"{x=}\"\n")[0],
+            Tok::FString(vec![FStringPart::Expr {
+                text: "x".into(),
+                conversion: None,
+                spec: None,
+                debug: Some("x=".into()),
+            }])
+        );
+        assert_eq!(
+            kinds("f\"{ x = }\"\n")[0],
+            Tok::FString(vec![FStringPart::Expr {
+                text: " x ".into(),
+                conversion: None,
+                spec: None,
+                debug: Some(" x = ".into()),
+            }])
+        );
+        assert_eq!(
+            kinds("f\"{x=:d}\"\n")[0],
+            Tok::FString(vec![FStringPart::Expr {
+                text: "x".into(),
+                conversion: None,
+                spec: Some("d".into()),
+                debug: Some("x=".into()),
+            }])
+        );
+        for src in ["f\"{a==b}\"\n", "f\"{a<=b}\"\n", "f\"{a!=b}\"\n"] {
+            let Tok::FString(parts) = &kinds(src)[0] else {
+                panic!("an f-string");
+            };
+            assert!(matches!(&parts[0], FStringPart::Expr { debug: None, .. }));
+        }
     }
 
     #[test]

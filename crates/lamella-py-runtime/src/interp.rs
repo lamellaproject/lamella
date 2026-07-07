@@ -47,6 +47,10 @@ pub struct Frame {
     /// `StoreDeref` / `LoadClosure` index it; empty for a function with no cell/free variables. Each
     /// slot is a `Cell` (a heap object), so all are GC roots (traced by [`Frame::trace`]).
     derefs: Vec<Value>,
+    /// The active class-body namespace dict while executing a `class` body (`SetupClassNamespace`
+    /// sets it, `StoreName`/`LoadName` target it, `BuildClass` consumes it), else `None`. A GC root
+    /// while set (traced by [`Frame::trace`]) so building the namespace cannot free it.
+    class_namespace: Option<Value>,
 }
 
 impl Frame {
@@ -68,6 +72,7 @@ impl Frame {
             caches,
             active_exception: None,
             derefs: Vec::new(),
+            class_namespace: None,
         }
     }
 
@@ -81,6 +86,7 @@ impl Frame {
         self.caches.clear();
         self.active_exception = None;
         self.derefs.clear();
+        self.class_namespace = None;
     }
 
     /// Pushes a value onto the evaluation stack.
@@ -91,6 +97,13 @@ impl Frame {
     /// Pops a value, or [`Trap::StackUnderflow`] on an empty stack.
     fn pop(&mut self) -> Result<Value, Trap> {
         self.stack.pop().ok_or(Trap::StackUnderflow)
+    }
+
+    /// Reads the top of the evaluation stack WITHOUT removing it, or [`Trap::StackUnderflow`] if
+    /// empty. For an op that inspects the top and leaves it (e.g. `ImportFrom` reads a member off
+    /// the module it keeps on the stack for the next one).
+    fn peek(&self) -> Result<Value, Trap> {
+        self.stack.last().copied().ok_or(Trap::StackUnderflow)
     }
 
     /// Reads local slot `idx`, trapping on an out-of-range slot or an unbound local.
@@ -123,6 +136,9 @@ impl Frame {
         }
         if let Some(exc) = self.active_exception.as_mut() {
             Value::trace_slot(exc, visit);
+        }
+        if let Some(namespace) = self.class_namespace.as_mut() {
+            Value::trace_slot(namespace, visit);
         }
     }
 }
@@ -245,6 +261,7 @@ pub(crate) fn binary(op: BinOp, a: Value, b: Value, model: &mut ObjectModel) -> 
             let r = x.checked_rem(y).ok_or(Trap::Overflow)?;
             if r != 0 && (r < 0) != (y < 0) { r + y } else { r }
         }
+        BinOp::MatMul => return Err(Trap::TypeError),
     };
     model.new_long(result)
 }
@@ -279,6 +296,7 @@ fn bigint_binary(op: BinOp, a: Value, b: Value, model: &mut ObjectModel) -> Resu
         BinOp::BitOr => model.new_bigint(x.bitor(&y)),
         BinOp::BitXor => model.new_bigint(x.bitxor(&y)),
         BinOp::TrueDiv | BinOp::Pow => Err(Trap::Overflow),
+        BinOp::MatMul => Err(Trap::TypeError),
     }
 }
 
@@ -341,7 +359,8 @@ fn float_binary(op: BinOp, x: f64, y: f64, model: &mut ObjectModel) -> Result<Va
             float_mod(x, y)
         }
         BinOp::Pow => return float_pow(x, y, model),
-        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::LShift | BinOp::RShift => {
+        BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::LShift | BinOp::RShift
+        | BinOp::MatMul => {
             return Err(Trap::TypeError);
         }
     };
@@ -521,6 +540,7 @@ fn binop_dunder_names(op: BinOp) -> (&'static str, &'static str) {
         BinOp::RShift => ("__rshift__", "__rrshift__"),
         BinOp::TrueDiv => ("__truediv__", "__rtruediv__"),
         BinOp::Pow => ("__pow__", "__rpow__"),
+        BinOp::MatMul => ("__matmul__", "__rmatmul__"),
     }
 }
 
@@ -640,6 +660,292 @@ pub(crate) fn py_truthy_dyn(
         }
     }
     Ok(model.py_truthy(value)?.unwrap_or_else(|| value.is_truthy()))
+}
+
+/// Interp-aware element equality for set membership and dedup: when either operand is a user
+/// instance, its `__eq__` (with the reflected fallback) decides; otherwise the model's value
+/// equality (`key_eq`). This is to sets what the interp-aware repr is to `print` -- the model's
+/// `key_eq` is identity for a user object (it cannot call a dunder), so the equality a set uses to
+/// dedup and test membership is threaded through the interpreter here.
+pub(crate) fn elem_eq(
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    if model.is_instance(a) || model.is_instance(b) {
+        if let Some(result) = try_compare_dunder(CmpOp::Eq, a, b, functions, model, depth)? {
+            return Ok(result == Value::TRUE);
+        }
+    }
+    Ok(model.key_eq(a, b))
+}
+
+/// Whether `elements` (a detached snapshot -- NOT a borrow of model state, since [`elem_eq`] may
+/// re-enter the interpreter) holds a value equal to `needle`.
+pub(crate) fn elems_contain(
+    needle: Value,
+    elements: &[Value],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    model.require_hashable(needle)?;
+    for &e in elements {
+        if elem_eq(needle, e, functions, model, depth)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Dedups `elements` interp-aware, first-seen order -- a set literal / comprehension / `set(iter)`.
+pub(crate) fn dedup_elems(
+    elements: Vec<Value>,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<Value>, Trap> {
+    let mut out: Vec<Value> = Vec::new();
+    for e in elements {
+        if !elems_contain(e, &out, functions, model, depth)? {
+            out.push(e);
+        }
+    }
+    Ok(out)
+}
+
+/// The union of set snapshots `a` and `b` (`a`'s elements, then `b`'s new ones), interp-aware.
+pub(crate) fn union_elems_dyn(
+    a: &[Value],
+    b: &[Value],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<Value>, Trap> {
+    let mut result = a.to_vec();
+    for &e in b {
+        if !elems_contain(e, &result, functions, model, depth)? {
+            result.push(e);
+        }
+    }
+    Ok(result)
+}
+
+/// The elements of set snapshot `a` that are (intersection, `keep_common == true`) / are not
+/// (difference) also in `b`, interp-aware.
+pub(crate) fn filter_elems_dyn(
+    a: &[Value],
+    b: &[Value],
+    keep_common: bool,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<Value>, Trap> {
+    let mut result = Vec::new();
+    for &x in a {
+        if elems_contain(x, b, functions, model, depth)? == keep_common {
+            result.push(x);
+        }
+    }
+    Ok(result)
+}
+
+/// Whether every element of set snapshot `a` is in `b` (`a` is a subset of `b`), interp-aware.
+pub(crate) fn subset_dyn(
+    a: &[Value],
+    b: &[Value],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    for &x in a {
+        if !elems_contain(x, b, functions, model, depth)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether set snapshots `a` and `b` share no element (they are disjoint), interp-aware.
+pub(crate) fn disjoint_dyn(
+    a: &[Value],
+    b: &[Value],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    for &x in a {
+        if elems_contain(x, b, functions, model, depth)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The interp-aware `set <op> set` for `| & - ^`, or `None` if this is not a two-set operation (so
+/// the model's binary dispatch raises the type error). Honors the elements' `__eq__`.
+fn try_set_binop_dyn(
+    op: BinOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    let both_sets = (model.is_set(a) || model.is_frozenset(a))
+        && (model.is_set(b) || model.is_frozenset(b));
+    if !both_sets || !matches!(op, BinOp::BitOr | BinOp::BitAnd | BinOp::Sub | BinOp::BitXor) {
+        return Ok(None);
+    }
+    let a_elems = model.set_value(a).ok_or(Trap::TypeError)?.clone();
+    let b_elems = model.set_value(b).ok_or(Trap::TypeError)?.clone();
+    let result = match op {
+        BinOp::BitOr => union_elems_dyn(&a_elems, &b_elems, functions, model, depth)?,
+        BinOp::BitAnd => filter_elems_dyn(&a_elems, &b_elems, true, functions, model, depth)?,
+        BinOp::Sub => filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?,
+        BinOp::BitXor => {
+            let mut r = filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?;
+            r.extend(filter_elems_dyn(&b_elems, &a_elems, false, functions, model, depth)?);
+            r
+        }
+        _ => unreachable!("guarded by the matches! above"),
+    };
+    let set = if model.is_frozenset(a) {
+        model.new_frozenset(result)?
+    } else {
+        model.new_set(result)?
+    };
+    Ok(Some(set))
+}
+
+/// The interp-aware set comparison (the left operand is a set/frozenset), or `None` if the left is
+/// not a set (so the model handles it). `==`/`!=` test set equality (a set never equals a non-set);
+/// `< <= > >=` are (proper) subset/superset and require the right to be a set (else `TypeError`).
+/// Membership throughout is by the elements' `__eq__`, so a set of user objects compares correctly.
+fn try_set_compare_dyn(
+    op: CmpOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if !(model.is_set(a) || model.is_frozenset(a)) {
+        return Ok(None);
+    }
+    let b_is_set = model.is_set(b) || model.is_frozenset(b);
+    let value = match op {
+        CmpOp::Eq | CmpOp::Ne => {
+            let equal = if b_is_set {
+                let a_elems = model.set_value(a).ok_or(Trap::TypeError)?.clone();
+                let b_elems = model.set_value(b).ok_or(Trap::TypeError)?.clone();
+                a_elems.len() == b_elems.len()
+                    && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
+            } else {
+                false
+            };
+            if matches!(op, CmpOp::Ne) { !equal } else { equal }
+        }
+        CmpOp::Le | CmpOp::Ge | CmpOp::Lt | CmpOp::Gt => {
+            if !b_is_set {
+                return Err(Trap::TypeError);
+            }
+            let a_elems = model.set_value(a).ok_or(Trap::TypeError)?.clone();
+            let b_elems = model.set_value(b).ok_or(Trap::TypeError)?.clone();
+            match op {
+                CmpOp::Le => subset_dyn(&a_elems, &b_elems, functions, model, depth)?,
+                CmpOp::Ge => subset_dyn(&b_elems, &a_elems, functions, model, depth)?,
+                CmpOp::Lt => {
+                    a_elems.len() < b_elems.len()
+                        && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
+                }
+                CmpOp::Gt => {
+                    b_elems.len() < a_elems.len()
+                        && subset_dyn(&b_elems, &a_elems, functions, model, depth)?
+                }
+                _ => unreachable!("guarded by the outer match arm"),
+            }
+        }
+        CmpOp::Is | CmpOp::IsNot => return Ok(None),
+    };
+    Ok(Some(Value::from_bool(value)))
+}
+
+/// Dedups `pairs` into dict entries interp-aware -- first-seen key position, last value winning (a
+/// dict literal `{...}`, `BuildDict`). A key with a user `__eq__` collapses with an equal one. This
+/// is to dicts what [`dedup_elems`] is to sets.
+pub(crate) fn dedup_pairs(
+    pairs: Vec<(Value, Value)>,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<(Value, Value)>, Trap> {
+    let mut out: Vec<(Value, Value)> = Vec::new();
+    for (key, value) in pairs {
+        model.require_hashable(key)?;
+        let mut found = None;
+        for (idx, (k, _)) in out.iter().enumerate() {
+            if elem_eq(key, *k, functions, model, depth)? {
+                found = Some(idx);
+                break;
+            }
+        }
+        match found {
+            Some(idx) => out[idx].1 = value,
+            None => out.push((key, value)),
+        }
+    }
+    Ok(out)
+}
+
+/// The interp-aware `dict == dict` / `dict != dict`, or `None` when this is not two dicts, not an
+/// equality op (dict ordering is a `TypeError`, left to the model), or neither dict holds a user
+/// instance (the model's fast [`ObjectModel::dict_equal`] is then exact). Honors a user `__eq__` on
+/// the dicts' keys and values.
+fn try_dict_compare_dyn(
+    op: CmpOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if !(model.is_dict(a) && model.is_dict(b)) {
+        return Ok(None);
+    }
+    if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
+        return Ok(None);
+    }
+    if !model.dict_has_instance(a) && !model.dict_has_instance(b) {
+        return Ok(None);
+    }
+    let equal = model.dict_equal_dyn(a, b, functions, depth)?;
+    Ok(Some(Value::from_bool(if matches!(op, CmpOp::Ne) { !equal } else { equal })))
+}
+
+/// The interp-aware `dict | dict` merge (PEP 584; the right dict wins a key conflict, the key keeps
+/// its first position), or `None` when this is not a `|` of two dicts, or neither dict holds a user
+/// instance (the model's fast [`ObjectModel::py_binary`] merge is then exact). Collapsing equal keys
+/// by their `__eq__` keeps `|` consistent with `dict.update`.
+fn try_dict_binop_dyn(
+    op: BinOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if op != BinOp::BitOr || !(model.is_dict(a) && model.is_dict(b)) {
+        return Ok(None);
+    }
+    if !model.dict_has_instance(a) && !model.dict_has_instance(b) {
+        return Ok(None);
+    }
+    let mut pairs = model.dict_entries(a).unwrap_or_default();
+    pairs.extend(model.dict_entries(b).unwrap_or_default());
+    Ok(Some(model.new_dict_dyn(pairs, functions, depth)?))
 }
 
 /// Evaluates a unary `-`/`+`/`~` over an `int`/`bool` operand (Python int semantics:
@@ -764,7 +1070,7 @@ pub fn run(
     args: &[Value],
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
-    run_frames(code, functions, args, model, false, 0)
+    run_frames(code, functions, args, &[], model, false, 0)
 }
 
 /// Runs the module body (the top-level statements). Its local bindings mirror into the module
@@ -775,7 +1081,7 @@ pub fn run_module(
     functions: &[CodeObject],
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
-    run_frames(body, functions, &[], model, true, 0)
+    run_frames(body, functions, &[], &[], model, true, 0)
 }
 
 /// One op's control-flow outcome, returned from the per-op block to the [`run_frames`]
@@ -828,19 +1134,41 @@ fn find_handler(exc_table: &[ExcEntry], ip: u32) -> Option<ExcEntry> {
 /// generator object (its body runs only when resumed). The shared tail of the [`call_value`]
 /// Python-callee branches (the callback path); the DIRECT `Op::Call` path instead pushes a frame
 /// onto the explicit stack.
+/// Resolves `name` in the module GLOBAL namespace: a defaulted function's PyFunction (which shadows
+/// its bare function-table ref, since the ref carries no defaults), else an intra-module function,
+/// else a module-level global (a class or other top-level binding), else a built-in, else a built-in
+/// exception class (so `except IndexError` / `raise ValueError` find the type). `None` if unbound (a
+/// `NameError` at the use site). Shared by `LoadGlobal` and the outer fallback of `LoadName`.
+fn resolve_global(name: &str, functions: &[CodeObject], model: &mut ObjectModel) -> Option<Value> {
+    if let Some(pyfunc) = model.get_global(name).filter(|&g| model.is_py_function(g)) {
+        Some(pyfunc)
+    } else if let Some(index) = functions.iter().position(|f| f.name == *name) {
+        Some(Value::function_ref(index as u32))
+    } else if let Some(global) = model.get_global(name) {
+        Some(global)
+    } else if let Some(id) = crate::builtins::builtin_id(name) {
+        Some(Value::builtin_ref(id))
+    } else if name == "Ellipsis" {
+        Some(Value::ELLIPSIS)
+    } else {
+        model.exception_class(name)
+    }
+}
+
 fn invoke_function(
     index: u32,
     args: &[Value],
+    cells: &[Value],
     functions: &[CodeObject],
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
     let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
     if code.is_generator {
-        let generator = new_frame(code, CodeId::Func(index), args, false, &[], model)?;
+        let generator = new_frame(code, CodeId::Func(index), args, false, cells, model)?;
         model.new_generator(generator)
     } else {
-        run_frames(code, functions, args, model, false, depth)
+        run_frames(code, functions, args, cells, model, false, depth)
     }
 }
 
@@ -855,39 +1183,69 @@ pub(crate) fn call_value(
     depth: usize,
 ) -> Result<Value, Trap> {
     if let Some(index) = callee.as_function_index() {
-        invoke_function(index, args, functions, model, depth)
+        invoke_function(index, args, &[], functions, model, depth)
     } else if model.is_py_function(callee) {
         let index = model.py_function_index(callee);
         let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
         let defaults = model.py_function_defaults(callee);
-        let bound = bind_arguments(code, args, &[], &defaults, model)?;
-        invoke_function(index, &bound, functions, model, depth)
+        let kwdefaults = model.py_function_kwdefaults(callee);
+        let bound = bind_arguments(code, args, &[], &defaults, kwdefaults, model)?;
+        let cells = model.py_function_cells(callee);
+        invoke_function(index, &bound, &cells, functions, model, depth)
     } else if let Some(id) = callee.as_builtin_id() {
         crate::builtins::call_builtin(id, args, functions, model, depth)
+    } else if model.is_str_join(callee) {
+        let [iterable] = args else {
+            return Err(Trap::TypeError);
+        };
+        let items = crate::builtins::collect_iterable(model, &[*iterable], functions, depth)?;
+        let list = model.new_list(items)?;
+        model.call_bound_method(callee, &[list])
     } else if model.is_bound_method(callee) {
         let receiver = model.bound_receiver(callee);
+        let method_id = model.bound_method_id(callee);
         if model.is_generator(receiver) {
-            let method_id = model.bound_method_id(callee);
             call_generator_method(receiver, method_id, args, functions, model, depth)
+        } else if model.is_set(receiver) || model.is_frozenset(receiver) {
+            model.call_set_method_dyn(receiver, method_id, args, functions, depth)
+        } else if model.is_dict(receiver) {
+            model.call_dict_method_dyn(receiver, method_id, args, functions, depth)
         } else {
             model.call_bound_method(callee, args)
         }
     } else if model.is_py_bound(callee) {
         let func = model.bound_func(callee);
-        let index = func.as_function_index().ok_or(Trap::TypeError)?;
+        let (index, defaults, kwdefaults, cells) = if let Some(index) = func.as_function_index() {
+            (index, Vec::new(), Value::NONE, Vec::new())
+        } else if model.is_py_function(func) {
+            (
+                model.py_function_index(func),
+                model.py_function_defaults(func),
+                model.py_function_kwdefaults(func),
+                model.py_function_cells(func),
+            )
+        } else {
+            return Err(Trap::TypeError);
+        };
+        let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
         let mut method_args = Vec::with_capacity(args.len() + 1);
         method_args.push(model.bound_self(callee));
         method_args.extend_from_slice(args);
-        invoke_function(index, &method_args, functions, model, depth)
+        let bound = bind_arguments(code, &method_args, &[], &defaults, kwdefaults, model)?;
+        invoke_function(index, &bound, &cells, functions, model, depth)
+    } else if model.is_unbound_method(callee) {
+        let (receiver, rest) = args.split_first().ok_or(Trap::TypeError)?;
+        let name_value = model.unbound_method_name(callee);
+        let name = model.str_value(name_value).ok_or(Trap::TypeError)?.to_string();
+        let bound = model.getattr(*receiver, &name, &mut crate::object::InlineCache::empty())?;
+        call_value(bound, rest, functions, model, depth)
     } else if model.is_class(callee) {
         let instance = model.new_object(callee)?;
         if let Some(init) = model.find_init(callee) {
-            let index = init.as_function_index().ok_or(Trap::TypeError)?;
-            let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
             let mut init_args = Vec::with_capacity(args.len() + 1);
             init_args.push(instance);
             init_args.extend_from_slice(args);
-            run_frames(code, functions, &init_args, model, false, depth)?;
+            call_value(init, &init_args, functions, model, depth)?;
         } else if !args.is_empty() {
             model.init_default_args(instance, args)?;
         }
@@ -917,14 +1275,16 @@ fn call_value_kw(
 ) -> Result<Value, Trap> {
     if let Some(index) = callee.as_function_index() {
         let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-        let bound = bind_arguments(code, posargs, kwargs, &[], model)?;
-        invoke_function(index, &bound, functions, model, depth)
+        let bound = bind_arguments(code, posargs, kwargs, &[], Value::NONE, model)?;
+        invoke_function(index, &bound, &[], functions, model, depth)
     } else if model.is_py_function(callee) {
         let index = model.py_function_index(callee);
         let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
         let defaults = model.py_function_defaults(callee);
-        let bound = bind_arguments(code, posargs, kwargs, &defaults, model)?;
-        invoke_function(index, &bound, functions, model, depth)
+        let kwdefaults = model.py_function_kwdefaults(callee);
+        let bound = bind_arguments(code, posargs, kwargs, &defaults, kwdefaults, model)?;
+        let cells = model.py_function_cells(callee);
+        invoke_function(index, &bound, &cells, functions, model, depth)
     } else if model.is_py_bound(callee) {
         let func = model.bound_func(callee);
         let mut all_pos = Vec::with_capacity(posargs.len() + 1);
@@ -945,6 +1305,25 @@ fn call_value_kw(
     } else if model.is_list_sort_bound(callee) {
         let receiver = model.bound_receiver(callee);
         list_sort_kw(posargs, kwargs, receiver, functions, model, depth)
+    } else if model.is_str_format_bound(callee) {
+        let receiver = model.bound_receiver(callee);
+        let template = model.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
+        let rendered = model.format_template(&template, posargs, kwargs)?;
+        model.new_str(&rendered)
+    } else if model.is_dict_update_bound(callee) {
+        let receiver = model.bound_receiver(callee);
+        match posargs {
+            [] => {}
+            [other] => {
+                model.call_bound_method(callee, &[*other])?;
+            }
+            _ => return Err(Trap::TypeError),
+        }
+        for &(name, value) in kwargs {
+            let key = model.new_str(name)?;
+            model.py_setitem(receiver, key, value)?;
+        }
+        Ok(Value::NONE)
     } else if model.is_bound_method(callee) {
         Err(Trap::TypeError)
     } else if let Some(id) = callee.as_builtin_id() {
@@ -1000,6 +1379,7 @@ fn bind_arguments(
     posargs: &[Value],
     kwargs: &[(&str, Value)],
     defaults: &[Value],
+    kwdefaults: Value,
     model: &mut ObjectModel,
 ) -> Result<Vec<Value>, Trap> {
     let nparams = code.params.len();
@@ -1048,6 +1428,19 @@ fn bind_arguments(
     }
     if let Some(vk) = varkwargs_idx {
         slots[vk] = Some(model.new_dict(extra)?);
+    }
+
+    if kwonly > 0 && !kwdefaults.is_none() {
+        let kwonly_start = n_regular + code.has_varargs as usize;
+        let kwonly_range = kwonly_start..kwonly_start + kwonly;
+        let params = &code.params[kwonly_range.clone()];
+        for (slot, param) in slots[kwonly_range].iter_mut().zip(params) {
+            if slot.is_none() {
+                if let Some(default) = model.dict_get_str(kwdefaults, &param.name) {
+                    *slot = Some(default);
+                }
+            }
+        }
     }
 
     let first_default = n_regular.saturating_sub(defaults.len());
@@ -1356,6 +1749,12 @@ fn lazy_iter_next(
             model.lazy_iter_set_state(iterator, next);
             Ok(Some(pair))
         }
+        crate::object::LAZY_CALLABLE => {
+            let callable = model.lazy_iter_state(iterator);
+            let sentinel = sources.first().copied().unwrap_or(Value::NONE);
+            let result = call_value(callable, &[], functions, model, depth)?;
+            Ok((!model.key_eq(result, sentinel)).then_some(result))
+        }
         _ => Err(Trap::TypeError),
     }
 }
@@ -1435,6 +1834,7 @@ fn run_frames(
     entry: &CodeObject,
     functions: &[CodeObject],
     args: &[Value],
+    cells: &[Value],
     model: &mut ObjectModel,
     is_module: bool,
     depth: usize,
@@ -1443,7 +1843,7 @@ fn run_frames(
         return Err(Trap::RecursionError);
     }
     let mut frames: Vec<Frame> = Vec::new();
-    frames.push(new_frame(entry, CodeId::Entry, args, is_module, &[], model)?);
+    frames.push(new_frame(entry, CodeId::Entry, args, is_module, cells, model)?);
     match drive(&mut frames, entry, functions, model, depth)? {
         DriveOutcome::Returned(value) => Ok(value),
         DriveOutcome::Yielded(_) => Err(Trap::Malformed),
@@ -1506,20 +1906,7 @@ fn drive(
             }
             Op::LoadGlobal(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
-                let py_func = model.get_global(name).filter(|&g| model.is_py_function(g));
-                let value = if let Some(pyfunc) = py_func {
-                    pyfunc
-                } else if let Some(index) = functions.iter().position(|f| f.name == *name) {
-                    Value::function_ref(index as u32)
-                } else if let Some(global) = model.get_global(name) {
-                    global
-                } else if let Some(id) = crate::builtins::builtin_id(name) {
-                    Value::builtin_ref(id)
-                } else if let Some(class) = model.exception_class(name) {
-                    class
-                } else {
-                    return Err(Trap::NameError);
-                };
+                let value = resolve_global(name, functions, model).ok_or(Trap::NameError)?;
                 frame.push(value);
             }
             Op::LoadAttr { name, cache } => {
@@ -1527,7 +1914,16 @@ fn drive(
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
                 let slot = frame.caches.get_mut(cache as usize).ok_or(Trap::Malformed)?;
                 let value = model.getattr(receiver, attr, slot)?;
-                frame.push(value);
+                if model.is_property(value) && model.is_instance(receiver) {
+                    let (fget, _, _) = model.property_accessors(value);
+                    if fget.is_none() {
+                        return Err(Trap::AttributeError);
+                    }
+                    let result = call_value(fget, &[receiver], functions, model, depth + 1)?;
+                    frame.push(result);
+                } else {
+                    frame.push(value);
+                }
             }
             Op::Binary(binop) => {
                 let rhs = frame.pop()?;
@@ -1535,6 +1931,10 @@ fn drive(
                 let result = if let Some(value) =
                     try_binop_dunder(binop, lhs, rhs, functions, model, depth)?
                 {
+                    value
+                } else if let Some(value) = try_set_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
+                    value
+                } else if let Some(value) = try_dict_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
                     value
                 } else if let Some(value) = model.py_binary(binop, lhs, rhs)? {
                     value
@@ -1562,6 +1962,10 @@ fn drive(
                     try_compare_dunder(cmpop, lhs, rhs, functions, model, depth)?
                 {
                     value
+                } else if let Some(value) = try_set_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+                    value
+                } else if let Some(value) = try_dict_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+                    value
                 } else {
                     match model.py_compare(cmpop, lhs, rhs)? {
                         Some(value) => value,
@@ -1576,7 +1980,7 @@ fn drive(
                 let result = if let Some(method) = model.find_dunder(container, "__getitem__") {
                     call_value(method, &[index], functions, model, depth + 1)?
                 } else {
-                    model.py_getitem(container, index)?
+                    model.py_getitem_dyn(container, index, functions, depth)?
                 };
                 frame.push(result);
             }
@@ -1610,7 +2014,7 @@ fn drive(
                     pairs.push((key, value));
                 }
                 pairs.reverse();
-                frame.push(model.new_dict(pairs)?);
+                frame.push(model.new_dict_dyn(pairs, functions, depth)?);
             }
             Op::Setitem => {
                 let index = frame.pop()?;
@@ -1622,7 +2026,7 @@ fn drive(
                     let elements = crate::builtins::collect_iterable(model, &[value], functions, depth)?;
                     model.seq_setitem_slice(container, index, elements)?;
                 } else {
-                    model.py_setitem(container, index, value)?;
+                    model.py_setitem_dyn(container, index, value, functions, depth)?;
                 }
             }
             Op::Contains { negate } => {
@@ -1631,8 +2035,11 @@ fn drive(
                 let contained = if let Some(method) = model.find_dunder(container, "__contains__") {
                     let result = call_value(method, &[element], functions, model, depth + 1)?;
                     model.py_truthy(result)?.unwrap_or(false)
+                } else if model.is_set(container) || model.is_frozenset(container) {
+                    let elems = model.set_value(container).ok_or(Trap::TypeError)?.clone();
+                    elems_contain(element, &elems, functions, model, depth)?
                 } else {
-                    model.py_contains(container, element)?
+                    model.py_contains_dyn(container, element, functions, depth)?
                 };
                 frame.push(Value::from_bool(contained ^ negate));
             }
@@ -1674,7 +2081,7 @@ fn drive(
                         || callee_code.has_varkwargs
                         || callee_code.kwonly_count > 0
                     {
-                        bind_arguments(callee_code, &call_args, &[], &[], model)?
+                        bind_arguments(callee_code, &call_args, &[], &[], Value::NONE, model)?
                     } else {
                         call_args
                     };
@@ -1688,7 +2095,8 @@ fn drive(
                     let index = model.py_function_index(callee);
                     let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
                     let defaults = model.py_function_defaults(callee);
-                    let bound = bind_arguments(callee_code, &call_args, &[], &defaults, model)?;
+                    let kwdefaults = model.py_function_kwdefaults(callee);
+                    let bound = bind_arguments(callee_code, &call_args, &[], &defaults, kwdefaults, model)?;
                     let cells = model.py_function_cells(callee);
                     if callee_code.is_generator {
                         let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &cells, model)?;
@@ -1729,7 +2137,12 @@ fn drive(
             Op::MatchExc => {
                 let exc_type = frame.pop()?;
                 let active = frame.active_exception.ok_or(Trap::Malformed)?;
-                frame.push(Value::from_bool(model.exception_isinstance(active, exc_type)));
+                let matched = if let Some(types) = model.seq_value(exc_type).cloned() {
+                    types.iter().any(|&ty| model.exception_isinstance(active, ty))
+                } else {
+                    model.exception_isinstance(active, exc_type)
+                };
+                frame.push(Value::from_bool(matched));
             }
             Op::LoadExc => {
                 let active = frame.active_exception.ok_or(Trap::Malformed)?;
@@ -1793,7 +2206,7 @@ fn drive(
                     names.iter().map(|s| s.as_str()).zip(kwvals).collect();
                 if let Some(index) = callee.as_function_index() {
                     let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-                    let bound = bind_arguments(callee_code, &call_args, &kwargs, &[], model)?;
+                    let bound = bind_arguments(callee_code, &call_args, &kwargs, &[], Value::NONE, model)?;
                     if callee_code.is_generator {
                         let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &[], model)?;
                         frame.push(model.new_generator(generator)?);
@@ -1804,7 +2217,8 @@ fn drive(
                     let index = model.py_function_index(callee);
                     let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
                     let defaults = model.py_function_defaults(callee);
-                    let bound = bind_arguments(callee_code, &call_args, &kwargs, &defaults, model)?;
+                    let kwdefaults = model.py_function_kwdefaults(callee);
+                    let bound = bind_arguments(callee_code, &call_args, &kwargs, &defaults, kwdefaults, model)?;
                     let cells = model.py_function_cells(callee);
                     if callee_code.is_generator {
                         let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &cells, model)?;
@@ -1872,8 +2286,44 @@ fn drive(
             Op::Yield => {
                 return Ok(Flow::Yield(frame.pop()?));
             }
+            Op::SetupClassNamespace => {
+                let namespace = model.new_dict(Vec::new())?;
+                frame.class_namespace = Some(namespace);
+            }
+            Op::StoreName(name_idx) => {
+                let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                let value = frame.pop()?;
+                let namespace = frame.class_namespace.ok_or(Trap::Malformed)?;
+                let key = model.new_str(name)?;
+                model.py_setitem(namespace, key, value)?;
+            }
+            Op::LoadName(name_idx) => {
+                let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                let from_namespace = frame
+                    .class_namespace
+                    .and_then(|namespace| model.dict_get_str(namespace, name));
+                let value = match from_namespace {
+                    Some(value) => value,
+                    None => resolve_global(name, functions, model).ok_or(Trap::NameError)?,
+                };
+                frame.push(value);
+            }
+            Op::ImportName(name_idx) => {
+                let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                let module = model.import_module(name)?;
+                frame.push(module);
+            }
+            Op::ImportFrom(name_idx) => {
+                let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                let module = frame.peek()?;
+                let value = model.import_from(module, name)?;
+                frame.push(value);
+            }
             Op::BuildClass => {
-                let namespace = frame.pop()?;
+                let namespace = match frame.class_namespace.take() {
+                    Some(namespace) => namespace,
+                    None => frame.pop()?,
+                };
                 let base = frame.pop()?;
                 let name = frame.pop()?;
                 frame.push(model.new_class(name, base, namespace)?);
@@ -1883,7 +2333,19 @@ fn drive(
                 let value = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
                 if model.is_instance(object) {
-                    model.py_setattr_instance(object, attr, value)?;
+                    if let Some(property) = model.class_property(object, attr) {
+                        let (_, fset, _) = model.property_accessors(property);
+                        if fset.is_none() {
+                            return Err(Trap::AttributeError);
+                        }
+                        call_value(fset, &[object, value], functions, model, depth + 1)?;
+                    } else {
+                        model.py_setattr_instance(object, attr, value)?;
+                    }
+                } else if model.is_class(object) {
+                    model.py_setattr_class(object, attr, value)?;
+                } else if model.is_user_function(object) {
+                    model.py_setattr_function(object, attr, value)?;
                 } else {
                     model.py_setattr_native(object, attr, value)?;
                 }
@@ -1894,7 +2356,7 @@ fn drive(
                 if let Some(method) = model.find_dunder(container, "__delitem__") {
                     call_value(method, &[index], functions, model, depth + 1)?;
                 } else {
-                    model.py_delitem(container, index)?;
+                    model.py_delitem_dyn(container, index, functions, depth)?;
                 }
             }
             Op::DeleteAttr { name } => {
@@ -1911,7 +2373,10 @@ fn drive(
             }
             Op::UnpackSequence(count) => {
                 let value = frame.pop()?;
-                let elements = model.unpack_sequence(value, count as usize)?;
+                let elements = crate::builtins::collect_iterable(model, &[value], functions, depth)?;
+                if elements.len() != count as usize {
+                    return Err(Trap::ValueError);
+                }
                 for &element in elements.iter().rev() {
                     frame.push(element);
                 }
@@ -1931,13 +2396,16 @@ fn drive(
             Op::SetAdd => {
                 let value = frame.pop()?;
                 let set = frame.pop()?;
-                model.set_add(set, value)?;
+                let elems = model.set_value(set).ok_or(Trap::TypeError)?.clone();
+                if !elems_contain(value, &elems, functions, model, depth)? {
+                    model.set_push(set, value)?;
+                }
             }
             Op::DictInsert => {
                 let value = frame.pop()?;
                 let key = frame.pop()?;
                 let dict = frame.pop()?;
-                model.py_setitem(dict, key, value)?;
+                model.py_setitem_dyn(dict, key, value, functions, depth)?;
             }
             Op::LoadSuper(name_idx) => {
                 let class_name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
@@ -1951,7 +2419,8 @@ fn drive(
                     elements.push(frame.pop()?);
                 }
                 elements.reverse();
-                frame.push(model.new_set(elements)?);
+                let deduped = dedup_elems(elements, functions, model, depth)?;
+                frame.push(model.new_set(deduped)?);
             }
             Op::LoadDeref(idx) => {
                 let cell = *frame.derefs.get(idx as usize).ok_or(Trap::Malformed)?;
@@ -2161,18 +2630,18 @@ mod tests {
         let c = code(2, 2, Vec::new(), Vec::new(), 0, Vec::new());
         let f = |n: i32| Value::fixnum(n).unwrap();
         let mut m = no_objects();
-        assert_eq!(bind_arguments(&c, &[f(5)], &[], &[f(10)], &mut m).unwrap(), vec![f(5), f(10)]);
+        assert_eq!(bind_arguments(&c, &[f(5)], &[], &[f(10)], Value::NONE, &mut m).unwrap(), vec![f(5), f(10)]);
         assert_eq!(
-            bind_arguments(&c, &[f(5)], &[("a1", f(20))], &[], &mut m).unwrap(),
+            bind_arguments(&c, &[f(5)], &[("a1", f(20))], &[], Value::NONE, &mut m).unwrap(),
             vec![f(5), f(20)]
         );
         assert_eq!(
-            bind_arguments(&c, &[f(5), f(6)], &[], &[f(10)], &mut m).unwrap(),
+            bind_arguments(&c, &[f(5), f(6)], &[], &[f(10)], Value::NONE, &mut m).unwrap(),
             vec![f(5), f(6)]
         );
         let mut va = code(2, 2, Vec::new(), Vec::new(), 0, Vec::new());
         va.has_varargs = true;
-        let bound = bind_arguments(&va, &[f(5), f(6), f(7)], &[], &[], &mut m).unwrap();
+        let bound = bind_arguments(&va, &[f(5), f(6), f(7)], &[], &[], Value::NONE, &mut m).unwrap();
         assert_eq!(bound.len(), 2);
         assert_eq!(bound[0], f(5));
     }
@@ -2182,10 +2651,10 @@ mod tests {
         let c = code(2, 2, Vec::new(), Vec::new(), 0, Vec::new());
         let f = |n: i32| Value::fixnum(n).unwrap();
         let mut m = no_objects();
-        assert_eq!(bind_arguments(&c, &[f(1), f(2), f(3)], &[], &[], &mut m), Err(Trap::TypeError));
-        assert_eq!(bind_arguments(&c, &[f(1)], &[("nope", f(2))], &[], &mut m), Err(Trap::TypeError));
-        assert_eq!(bind_arguments(&c, &[f(1)], &[("a0", f(2))], &[], &mut m), Err(Trap::TypeError));
-        assert_eq!(bind_arguments(&c, &[f(1)], &[], &[], &mut m), Err(Trap::TypeError));
+        assert_eq!(bind_arguments(&c, &[f(1), f(2), f(3)], &[], &[], Value::NONE, &mut m), Err(Trap::TypeError));
+        assert_eq!(bind_arguments(&c, &[f(1)], &[("nope", f(2))], &[], Value::NONE, &mut m), Err(Trap::TypeError));
+        assert_eq!(bind_arguments(&c, &[f(1)], &[("a0", f(2))], &[], Value::NONE, &mut m), Err(Trap::TypeError));
+        assert_eq!(bind_arguments(&c, &[f(1)], &[], &[], Value::NONE, &mut m), Err(Trap::TypeError));
     }
 
     #[test]
@@ -2201,6 +2670,58 @@ mod tests {
         assert!(model.is_py_function(pyfunc));
         assert_eq!(model.py_function_index(pyfunc), 0);
         assert_eq!(model.py_function_defaults(pyfunc), vec![Value::fixnum(10).unwrap()]);
+    }
+
+    #[test]
+    fn bound_method_binds_positional_defaults() {
+        use Op::*;
+        let m = code(2, 2, Vec::new(), Vec::new(), 0, vec![LoadFast(1), Return]);
+        let functions = [m];
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let f = |n: i32| Value::fixnum(n).unwrap();
+        let defaults = model.new_tuple(vec![f(10)]).unwrap();
+        let pyfunc = model.new_py_function(0, defaults, Value::NONE).unwrap();
+        let bound = model.new_py_bound(f(0), pyfunc).unwrap();
+        assert_eq!(call_value(bound, &[], &functions, &mut model, 0).unwrap(), f(10));
+        assert_eq!(call_value(bound, &[f(5)], &functions, &mut model, 0).unwrap(), f(5));
+    }
+
+    #[test]
+    fn bind_arguments_applies_keyword_only_defaults() {
+        let mut c = code(2, 2, Vec::new(), Vec::new(), 0, Vec::new());
+        c.kwonly_count = 1;
+        c.params[1].name = String::from("b");
+        let f = |n: i32| Value::fixnum(n).unwrap();
+        let mut m = ObjectModel::new(Vec::new(), 16 * 1024);
+        let b_key = m.new_str("b").unwrap();
+        let kwdefaults = m.new_dict(vec![(b_key, f(1))]).unwrap();
+        assert_eq!(bind_arguments(&c, &[f(5)], &[], &[], kwdefaults, &mut m).unwrap(), vec![f(5), f(1)]);
+        assert_eq!(
+            bind_arguments(&c, &[f(5)], &[("b", f(9))], &[], kwdefaults, &mut m).unwrap(),
+            vec![f(5), f(9)]
+        );
+        assert_eq!(bind_arguments(&c, &[f(5)], &[], &[], Value::NONE, &mut m), Err(Trap::TypeError));
+    }
+
+    #[test]
+    fn instantiating_a_class_binds_a_defaulted_init() {
+        use Op::*;
+        let init = code(2, 2, vec![Const::None], vec![String::from("val")], 1,
+            vec![LoadFast(1), LoadFast(0), SetAttr { name: 0, cache: 0 }, LoadConst(0), Return]);
+        let functions = [init];
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let f = |n: i32| Value::fixnum(n).unwrap();
+        let name = model.new_str("C").unwrap();
+        let key_init = model.new_str("__init__").unwrap();
+        let defaults = model.new_tuple(vec![f(7)]).unwrap();
+        let init_fn = model.new_py_function(0, defaults, Value::NONE).unwrap();
+        let ns = model.new_dict(vec![(key_init, init_fn)]).unwrap();
+        let class = model.new_class(name, Value::NONE, ns).unwrap();
+        let obj = call_value(class, &[], &functions, &mut model, 0).unwrap();
+        assert!(model.is_instance(obj));
+        assert_eq!(model.py_getattr_instance(obj, "val").unwrap(), f(7));
+        let obj2 = call_value(class, &[f(9)], &functions, &mut model, 0).unwrap();
+        assert_eq!(model.py_getattr_instance(obj2, "val").unwrap(), f(9));
     }
 
     #[test]
@@ -2241,6 +2762,173 @@ mod tests {
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let result = run(&entry, &functions, &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(3));
+    }
+
+    #[test]
+    fn class_body_reads_a_name_it_just_bound() {
+        use Op::*;
+        let entry = code(
+            1,
+            0,
+            vec![Const::Str(String::from("C")), Const::None, Const::Int(5), Const::Int(1)],
+            vec![String::from("a"), String::from("b")],
+            1,
+            vec![
+                LoadConst(0),
+                LoadConst(1),
+                SetupClassNamespace,
+                LoadConst(2),
+                StoreName(0),
+                LoadName(0),
+                LoadConst(3),
+                Binary(BinOp::Add),
+                StoreName(1),
+                BuildClass,
+                StoreFast(0),
+                LoadFast(0),
+                LoadAttr { name: 1, cache: 0 },
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let result = run(&entry, &[], &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(6));
+    }
+
+    #[test]
+    fn class_body_name_read_falls_back_to_a_builtin() {
+        use Op::*;
+        let entry = code(
+            1,
+            0,
+            vec![Const::Str(String::from("C")), Const::None],
+            vec![String::from("len"), String::from("n")],
+            1,
+            vec![
+                LoadConst(0),
+                LoadConst(1),
+                SetupClassNamespace,
+                LoadName(0),
+                StoreName(1),
+                BuildClass,
+                StoreFast(0),
+                LoadFast(0),
+                LoadAttr { name: 1, cache: 0 },
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let result = run(&entry, &[], &[], &mut model).unwrap();
+        assert!(result.as_builtin_id().is_some(), "C.n resolved to the len built-in");
+    }
+
+    #[test]
+    fn import_math_and_call_a_function() {
+        use Op::*;
+        let entry = code(
+            1,
+            0,
+            vec![Const::Int(4)],
+            vec![String::from("math"), String::from("sqrt")],
+            1,
+            vec![
+                ImportName(0),
+                StoreFast(0),
+                LoadFast(0),
+                LoadAttr { name: 1, cache: 0 },
+                LoadConst(0),
+                Call(1),
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let result = run(&entry, &[], &[], &mut model).unwrap();
+        assert_eq!(model.as_f64(result), Some(2.0));
+    }
+
+    #[test]
+    fn from_import_binds_a_member() {
+        use Op::*;
+        let entry = code(
+            1,
+            0,
+            vec![Const::Int(9)],
+            vec![String::from("math"), String::from("sqrt")],
+            0,
+            vec![
+                ImportName(0),
+                ImportFrom(1),
+                StoreFast(0),
+                PopTop,
+                LoadFast(0),
+                LoadConst(0),
+                Call(1),
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let result = run(&entry, &[], &[], &mut model).unwrap();
+        assert_eq!(model.as_f64(result), Some(3.0));
+    }
+
+    #[test]
+    fn from_import_reads_a_constant() {
+        use Op::*;
+        let entry = code(
+            1,
+            0,
+            Vec::new(),
+            vec![String::from("math"), String::from("pi")],
+            0,
+            vec![ImportName(0), ImportFrom(1), StoreFast(0), PopTop, LoadFast(0), Return],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let result = run(&entry, &[], &[], &mut model).unwrap();
+        assert_eq!(model.as_f64(result), Some(core::f64::consts::PI));
+    }
+
+    #[test]
+    fn import_is_idempotent_and_cached() {
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let first = model.import_module("math").unwrap();
+        let second = model.import_module("math").unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn import_unknown_module_raises_module_not_found() {
+        use Op::*;
+        let entry = code(
+            1,
+            0,
+            Vec::new(),
+            vec![String::from("nonexistent_xyz")],
+            0,
+            vec![ImportName(0), StoreFast(0), Return],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let err = run(&entry, &[], &[], &mut model).unwrap_err();
+        assert_eq!(err, Trap::Raised);
+        let exc = model.take_pending_exception().unwrap();
+        assert_eq!(model.exception_type_name(exc), Some("ModuleNotFoundError"));
+    }
+
+    #[test]
+    fn from_import_of_a_missing_member_raises_import_error() {
+        use Op::*;
+        let entry = code(
+            1,
+            0,
+            Vec::new(),
+            vec![String::from("math"), String::from("nope")],
+            0,
+            vec![ImportName(0), ImportFrom(1), StoreFast(0), PopTop, Return],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let err = run(&entry, &[], &[], &mut model).unwrap_err();
+        assert_eq!(err, Trap::Raised);
+        let exc = model.take_pending_exception().unwrap();
+        assert_eq!(model.exception_type_name(exc), Some("ImportError"));
     }
 
     #[test]

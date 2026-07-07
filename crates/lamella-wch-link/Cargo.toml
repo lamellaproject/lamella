@@ -1,0 +1,21 @@
+[package]
+name = "lamella-wch-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "WCH-Link (RV mode) debug-probe host: the vendor USB command protocol wrapping a from-scratch RISC-V Debug Module core."
+
+[dependencies]
+# The host USB transport reuses the shared bulk backend (WinUSB on Windows, usbfs on Linux); it opens
+# by VID/PID and matches any class-0xFF interface with bulk IN/OUT -- exactly the WCH-Link's interface 0.
+lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }
+
+[features]
+# The concrete host USB transport (a `Transport` impl over lamella-usbbulk). Off by default so the
+# protocol + Debug Module core build + unit-test with no USB backend.
+usbbulk = ["dep:lamella-usbbulk"]
+
+[lints]
+workspace = true

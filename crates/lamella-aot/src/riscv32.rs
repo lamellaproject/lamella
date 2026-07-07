@@ -3,7 +3,9 @@
 use alloc::vec::Vec;
 
 use lamella_asm_riscv32::{BranchCond, Encoder, Label, Reg};
-use lamella_ir::{BinOp, CmpOp, ConvKind, Function, Inst, MirType, Terminator, TypeHandle, ValueId};
+use lamella_ir::{
+    BinOp, CmpOp, ConvKind, Function, Inst, MirType, Terminator, TypeHandle, ValueId,
+};
 
 use crate::resolver::{TypeMeta, VtableEntry};
 
@@ -23,38 +25,149 @@ pub enum LowerError {
     CodeTooLarge,
 }
 
-/// The callee-saved registers the trivial value map hands out, in order: s0-s11 (x8, x9, x18-x27).
-/// Callee-saved means a value survives a `call` without spilling -- the prologue saves each one the
-/// function uses and the epilogue restores it. `a0`-`a7` carry call arguments and the return value;
-/// `t6` is array-addressing scratch ([`scratch`]); `ra`/`sp`/`x0` are reserved by the ABI.
-fn allocatable() -> [Reg; 12] {
-    let r = |n: u8| Reg::new(n).unwrap_or(Reg::ZERO);
-    [
-        r(8),
-        r(9),
-        r(18),
-        r(19),
-        r(20),
-        r(21),
-        r(22),
-        r(23),
-        r(24),
-        r(25),
-        r(26),
-        r(27),
-    ]
+/// The target register profile. `Rv32im` uses all 32 registers + hardware mul/div (QEMU `virt` and
+/// larger cores); `Rv32ec` -- the CH32V003 and other tiny cores -- is RV32E(C): only x0-x15 exist and
+/// there is no M-extension. RV32E therefore takes an EMPTY allocatable pool (so every value-bearing
+/// function goes down the all-spilled path, which stays within x0-x15), swaps `t6` for `s1` as the
+/// spilled scratch ([`spilled_scratch`]), caps arguments at a0-a5 (six), and lowers mul/div/rem to
+/// soft-routine calls.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RiscvProfile {
+    /// RV32IM: 32 registers, hardware mul/div. The default.
+    #[default]
+    Rv32im,
+    /// RV32E(C): 16 registers (x0-x15 only), no M-extension.
+    Rv32ec,
 }
 
-/// The argument/return register `a<index>` (x10-x17), or `None` past the eighth (stack-passed
-/// arguments are not lowered by this backend yet).
+/// The number of argument registers a profile passes in registers: a0-a7 on RV32IM, a0-a5 on RV32E.
+fn arg_reg_count(profile: RiscvProfile) -> usize {
+    match profile {
+        RiscvProfile::Rv32im => 8,
+        RiscvProfile::Rv32ec => 6,
+    }
+}
+
+/// The callee-saved registers the trivial value map hands out (RV32IM: s0-s11 = x8, x9, x18-x27).
+/// Callee-saved means a value survives a `call` without spilling -- the prologue saves each one the
+/// function uses and the epilogue restores it. RV32E has no x18-x31, so its pool is EMPTY: every
+/// value-bearing function takes the all-spilled path instead, which this backend keeps within x0-x15.
+/// `a0`-`a7`/`a0`-`a5` carry call arguments and the return value; `ra`/`sp`/`x0` are ABI-reserved.
+fn allocatable(profile: RiscvProfile) -> Vec<Reg> {
+    let r = |n: u8| Reg::new(n).unwrap_or(Reg::ZERO);
+    match profile {
+        RiscvProfile::Rv32im => {
+            alloc::vec![
+                r(8),
+                r(9),
+                r(18),
+                r(19),
+                r(20),
+                r(21),
+                r(22),
+                r(23),
+                r(24),
+                r(25),
+                r(26),
+                r(27)
+            ]
+        }
+        RiscvProfile::Rv32ec => Vec::new(),
+    }
+}
+
+/// The argument/return register `a<index>` (x10-x17), or `None` past the eighth. RV32E callers
+/// pre-validate that no function passes more than six arguments (see [`arg_reg_count`]), so on that
+/// profile this is only ever indexed `0..6` (a0-a5).
 fn arg_reg(index: usize) -> Option<Reg> {
     (index < 8).then(|| Reg::new(10 + index as u8).unwrap_or(Reg::ZERO))
 }
 
-/// `t6` (x31), reserved out of the allocatable pool as scratch for array addressing -- the length
-/// load, the index scaling, and the element address -- so it never aliases an allocated value.
+/// The all-spilled path's extra scratch register -- the array-element address, and the fourth temporary
+/// in the int64 helpers. `t6` (x31) on RV32IM; `s1` (x9) on RV32E, which has no x31. The RV32E spilled
+/// prologue saves + restores `s1`, so borrowing it here never clobbers a caller's value.
+fn spilled_scratch(profile: RiscvProfile) -> Reg {
+    let n = match profile {
+        RiscvProfile::Rv32im => 31,
+        RiscvProfile::Rv32ec => 9,
+    };
+    Reg::new(n).unwrap_or(Reg::ZERO)
+}
+
+/// `t6` (x31), the REGISTER-path array-addressing scratch. RV32E never takes the register path for a
+/// value-bearing function (its pool is empty), so this stays x31; the all-spilled path uses
+/// [`spilled_scratch`] instead.
 fn scratch() -> Reg {
     Reg::new(31).unwrap_or(Reg::ZERO)
+}
+
+/// The number of argument REGISTERS a call-like instruction marshals -- so RV32E can reject one that
+/// would spill past a0-a5 into a6/a7. A direct/native/indirect/delegate call passes its `args` in
+/// a0..; a virtual or interface call passes the receiver in a0 and its `args` from a1, so one more.
+fn register_arg_count(inst: &Inst) -> usize {
+    match inst {
+        Inst::Call { args, .. }
+        | Inst::CallNative { args, .. }
+        | Inst::CallIndirect { args, .. }
+        | Inst::InvokeDelegate { args, .. } => args.len(),
+        Inst::CallVirtual { args, .. } | Inst::CallInterface { args, .. } => args.len() + 1,
+        _ => 0,
+    }
+}
+
+/// True if `op` is an integer mul/div/rem -- the operations RV32E must lower to a soft-routine CALL,
+/// since it has no M-extension. Add/sub, bitwise, and shifts stay native (base RV32I).
+fn is_soft_int_binop(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Mul | BinOp::DivSigned | BinOp::DivUnsigned | BinOp::RemSigned | BinOp::RemUnsigned
+    )
+}
+
+/// The compiler-rt soft-routine symbol for an integer mul/div/rem `op`, called `(a0, a1) -> a0`. These
+/// are the standard names a `libgcc`/`compiler-builtins` (or the hand-written provider) exports.
+fn soft_int_routine(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Mul => "__mulsi3",
+        BinOp::DivSigned => "__divsi3",
+        BinOp::DivUnsigned => "__udivsi3",
+        BinOp::RemSigned => "__modsi3",
+        BinOp::RemUnsigned => "__umodsi3",
+        _ => "__mulsi3",
+    }
+}
+
+/// Emits `product = a * b` (low 32 bits). RV32IM uses the hardware `mul`; RV32E has no M-extension, so
+/// it shifts and adds INLINE (no call, so it never clobbers other live registers). The RV32E path
+/// MUTATES `a` (shifted left) and `b` (shifted down to zero), so the caller must not need either after
+/// -- true at the array-address helpers + the int64 cross-terms, where the operands are dead once the
+/// product is formed. `product`/`a`/`b`/`tmp` must be four distinct registers.
+fn emit_soft_mul32(
+    enc: &mut Encoder,
+    product: Reg,
+    a: Reg,
+    b: Reg,
+    tmp: Reg,
+    profile: RiscvProfile,
+) {
+    if !matches!(profile, RiscvProfile::Rv32ec) {
+        enc.mul(product, a, b);
+        return;
+    }
+    enc.li(product, 0);
+    let top = enc.new_label();
+    let skip = enc.new_label();
+    let done = enc.new_label();
+    enc.bind_label(top);
+    enc.branch(BranchCond::Eq, b, Reg::ZERO, done);
+    enc.andi(tmp, b, 1);
+    enc.branch(BranchCond::Eq, tmp, Reg::ZERO, skip);
+    enc.add(product, product, a);
+    enc.bind_label(skip);
+    enc.slli(a, a, 1);
+    enc.srli(b, b, 1);
+    enc.j(top);
+    enc.bind_label(done);
 }
 
 /// The absolute RAM address where the module's static-field region begins -- a static field at MIR
@@ -68,6 +181,24 @@ const STATIC_FIELD_BASE: u32 = 0x8030_0000;
 /// intra-module function index, so `lower_object` maps it to an undefined symbol the linker resolves
 /// from another object. The high bit, disjoint from the small function/extern indices it flags.
 const EXTERN_SYMBOL_FLAG: u32 = 0x8000_0000;
+
+/// Marks a relocation whose low bits are a TYPE HANDLE, targeting that type's canonical descriptor
+/// symbol (`__lamella_typedesc_<handle>`) rather than a function. `lower_object` resolves it to the
+/// descriptor's symbol index (its WORDS, via a `+vtable_bytes` addend). Bit 30, disjoint from
+/// [`EXTERN_SYMBOL_FLAG`]; a type handle is a small metadata row, so it never collides.
+const DESC_SYMBOL_FLAG: u32 = 0x4000_0000;
+
+/// One emitted descriptor SYMBOL on the object path: `(type handle, its vtable-start byte offset, its
+/// total byte size, its vtable byte size)`. The symbol value is the vtable start (so it spans
+/// vtable+words+itable and `--gc-sections` copies the whole descriptor + follows its relocations); a
+/// reference to the descriptor resolves to the WORDS = symbol + vtable_bytes.
+type DescSym = (u32, u32, u32, u32);
+
+/// One descriptor `R_LAMELLA_REL_DESC` relocation on the object path: `(site byte offset, target, signed
+/// addend)`. The target is a plain function index, an `EXTERN_SYMBOL_FLAG`-tagged extern (an inherited
+/// library virtual), or a `DESC_SYMBOL_FLAG`-tagged type handle (a base_ptr chain link); the addend pins
+/// the slot to its descriptor so `S + A - P` reduces to `entry - type_desc`.
+type DescReloc = (u32, u32, i32);
 
 /// Where an allocation's `lamella_gc_alloc(size [a0], &TypeDesc [a1]) -> block* [a0]` call resolves.
 /// The flat image calls a FIXED absolute address (the runtime bump stub baked into the image); the
@@ -146,9 +277,13 @@ fn emit_alloc_call(
             enc.jalr(Reg::RA, Reg::T0, 0);
             Ok(())
         }
-        AllocSite::Extern(symbol) => {
-            emit_call(enc, func_labels, relocs, relocate, EXTERN_SYMBOL_FLAG | symbol)
-        }
+        AllocSite::Extern(symbol) => emit_call(
+            enc,
+            func_labels,
+            relocs,
+            relocate,
+            EXTERN_SYMBOL_FLAG | symbol,
+        ),
     }
 }
 
@@ -162,7 +297,17 @@ pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
 /// result returns in a0. Module order fixes call indices -- function 0 is the entry. Values live
 /// in callee-saved registers so they survive a call; each function saves the ones it uses.
 pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, None, &[])
+    lower_module_inner(funcs, None, &[], RiscvProfile::Rv32im)
+}
+
+/// As [`lower_module`], but for a chosen register [`RiscvProfile`] -- e.g. `Rv32ec` restricts the output
+/// to the CH32V003's x0-x15 and lowers scalar i32 mul/div/rem to soft-routine calls. A self-contained
+/// flat image (no GC).
+pub fn lower_module_profile(
+    funcs: &[Function],
+    profile: RiscvProfile,
+) -> Result<Vec<u8>, LowerError> {
+    lower_module_inner(funcs, None, &[], profile)
 }
 
 /// As [`lower_module`], but with the garbage-collected allocator threaded: `Alloc` lowers to a
@@ -172,6 +317,7 @@ pub fn lower_module_gc(funcs: &[Function], alloc_addr: u32) -> Result<Vec<u8>, L
     lower_module_gc_with_descriptors(funcs, alloc_addr, &[])
 }
 
+
 /// As [`lower_module_gc`], but also threading the per-type descriptors so a virtual type's `Alloc`
 /// lays its vtable + a descriptor and writes the descriptor pointer at `obj-4`, and `CallVirtual`
 /// dispatches through it. A plain type (no vtable) keeps the header-free layout.
@@ -180,24 +326,33 @@ pub fn lower_module_gc_with_descriptors(
     alloc_addr: u32,
     descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_module_inner(funcs, Some(alloc_addr), descriptors)
+    lower_module_inner(funcs, Some(alloc_addr), descriptors, RiscvProfile::Rv32im)
 }
 
 fn lower_module_inner(
     funcs: &[Function],
     alloc_addr: Option<u32>,
     descriptors: &[TypeMeta],
+    profile: RiscvProfile,
 ) -> Result<Vec<u8>, LowerError> {
     let alloc = match alloc_addr {
         Some(addr) => AllocSite::Address(addr),
         None => AllocSite::None,
     };
-    lower_module_to_image(funcs, alloc, descriptors, false).map(|(bytes, _, _)| bytes)
+    lower_module_to_image(funcs, alloc, descriptors, &mut Vec::new(), profile, false)
+        .map(|(bytes, ..)| bytes)
 }
 
-/// A lowered module: the code bytes, each function's entry offset, and the call relocations as
-/// `(auipc offset, callee index)` pairs (empty unless lowering for a relocatable object).
-type LoweredModule = (Vec<u8>, Vec<u32>, Vec<(u32, u32)>);
+/// A lowered module: the code bytes, each function's entry offset, the call relocations as `(auipc
+/// offset, callee index)` pairs, and -- on the object path -- the type-descriptor symbols + their
+/// `R_LAMELLA_REL_DESC` relocations (all empty on the flat, non-relocatable path).
+type LoweredModule = (
+    Vec<u8>,
+    Vec<u32>,
+    Vec<(u32, u32)>,
+    Vec<DescSym>,
+    Vec<DescReloc>,
+);
 
 /// One emitted type descriptor for an allocated reference type. The vtable is laid BEFORE the
 /// descriptor (slot k at `desc - 4 - k*4`) as `func - desc` diffs; the `words` are the fixed header
@@ -229,6 +384,8 @@ fn lower_module_to_image(
     funcs: &[Function],
     alloc: AllocSite,
     descriptors: &[TypeMeta],
+    externs: &mut Vec<alloc::string::String>,
+    profile: RiscvProfile,
     relocate: bool,
 ) -> Result<LoweredModule, LowerError> {
     let mut program = funcs.to_vec();
@@ -247,6 +404,8 @@ fn lower_module_to_image(
     let func_labels: Vec<Label> = (0..funcs.len()).map(|_| enc.new_label()).collect();
     let mut offsets: Vec<u32> = Vec::with_capacity(funcs.len());
     let mut call_relocs: Vec<(u32, u32)> = Vec::new();
+    let mut type_descs: TypeDescs = Vec::new();
+    let mut type_desc_labels: Vec<(TypeHandle, Label)> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
         enc.bind_label(func_labels[index]);
         offsets.push(enc.position());
@@ -256,15 +415,26 @@ fn lower_module_to_image(
             &func_labels,
             alloc,
             descriptors,
+            &mut type_descs,
+            &mut type_desc_labels,
+            externs,
+            profile,
             &mut call_relocs,
             relocate,
         )?;
     }
+    let (desc_syms, desc_relocs) = emit_descriptors(
+        &mut enc,
+        &type_descs,
+        &type_desc_labels,
+        &func_labels,
+        relocate,
+    );
     let bytes = enc
         .finish()
         .map(|assembled| assembled.bytes)
         .map_err(|_| LowerError::CodeTooLarge)?;
-    Ok((bytes, offsets, call_relocs))
+    Ok((bytes, offsets, call_relocs, desc_syms, desc_relocs))
 }
 
 /// Lowers a module into an ELF32 relocatable object: each function becomes a global `STT_FUNC`
@@ -289,7 +459,21 @@ pub fn lower_object(
     externs: &[&str],
     descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
-    let mut extern_names: Vec<alloc::string::String> = externs.iter().map(|s| (*s).into()).collect();
+    lower_object_profile(funcs, names, externs, descriptors, RiscvProfile::Rv32im)
+}
+
+/// As [`lower_object`], but for a chosen register [`RiscvProfile`]. `Rv32ec` restricts every function to
+/// the CH32V003's x0-x15 (empty allocatable pool -> all-spilled path, `s1` scratch, a0-a5 arguments) and
+/// lowers scalar i32 mul/div/rem to soft-routine calls -- the CH32V003 register and instruction model.
+pub fn lower_object_profile(
+    funcs: &[Function],
+    names: &[&str],
+    externs: &[&str],
+    descriptors: &[TypeMeta],
+    profile: RiscvProfile,
+) -> Result<Vec<u8>, LowerError> {
+    let mut extern_names: Vec<alloc::string::String> =
+        externs.iter().map(|s| (*s).into()).collect();
     let program: Vec<Function> = funcs
         .iter()
         .map(|f| rewrite_pinvoke(f, &mut extern_names))
@@ -299,7 +483,14 @@ pub fn lower_object(
     } else {
         AllocSite::None
     };
-    let (text, offsets, call_relocs) = lower_module_to_image(&program, alloc, descriptors, true)?;
+    let (text, offsets, call_relocs, desc_syms, desc_relocs) = lower_module_to_image(
+        &program,
+        alloc,
+        descriptors,
+        &mut extern_names,
+        profile,
+        true,
+    )?;
     let mut symbols: Vec<lamella_elf::Symbol> = (0..program.len())
         .map(|i| {
             let end = offsets.get(i + 1).copied().unwrap_or(text.len() as u32);
@@ -323,7 +514,23 @@ pub fn lower_object(
             section: lamella_elf::SymbolSection::Undefined,
         });
     }
-    let relocations: Vec<lamella_elf::Relocation> = call_relocs
+    let desc_names: Vec<alloc::string::String> = desc_syms
+        .iter()
+        .map(|(handle, ..)| alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle))
+        .collect();
+    let mut desc_index: Vec<(u32, u32, u32)> = Vec::with_capacity(desc_syms.len());
+    for (i, &(handle, vtable_start, total_size, vtable_bytes)) in desc_syms.iter().enumerate() {
+        desc_index.push((handle, symbols.len() as u32, vtable_bytes));
+        symbols.push(lamella_elf::Symbol {
+            name: desc_names[i].as_str(),
+            value: vtable_start,
+            size: total_size,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        });
+    }
+    let mut relocations: Vec<lamella_elf::Relocation> = call_relocs
         .iter()
         .map(|&(offset, callee)| lamella_elf::Relocation {
             offset,
@@ -336,6 +543,30 @@ pub fn lower_object(
             addend: 0,
         })
         .collect();
+    for &(offset, target, addend) in &desc_relocs {
+        let (symbol, final_addend) = if target & DESC_SYMBOL_FLAG != 0 {
+            let handle = target & !DESC_SYMBOL_FLAG;
+            let (_, symbol_index, vtable_bytes) = desc_index
+                .iter()
+                .copied()
+                .find(|(h, _, _)| *h == handle)
+                .expect("a base_ptr chain link names a laid descriptor");
+            (symbol_index, addend + vtable_bytes as i32)
+        } else if target & EXTERN_SYMBOL_FLAG != 0 {
+            (
+                program.len() as u32 + (target & !EXTERN_SYMBOL_FLAG),
+                addend,
+            )
+        } else {
+            (target, addend)
+        };
+        relocations.push(lamella_elf::Relocation {
+            offset,
+            symbol,
+            kind: lamella_elf::riscv::R_LAMELLA_REL_DESC,
+            addend: final_addend,
+        });
+    }
     Ok(lamella_elf::write_relocatable_object(
         lamella_elf::Machine::RiscV,
         &text,
@@ -348,16 +579,21 @@ pub fn lower_object(
 /// registers it uses (plus `ra` if it calls), the incoming arguments moved from a0-a7 into the
 /// entry block's parameters, the block bodies, and -- at each return -- a value moved to a0 then
 /// the saved registers restored and `ret`.
+#[allow(clippy::too_many_arguments)]
 fn lower_function(
     enc: &mut Encoder,
     func: &Function,
     func_labels: &[Label],
     alloc: AllocSite,
     descriptors: &[TypeMeta],
+    type_descs: &mut TypeDescs,
+    type_desc_labels: &mut Vec<(TypeHandle, Label)>,
+    externs: &mut Vec<alloc::string::String>,
+    profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
     relocate: bool,
 ) -> Result<(), LowerError> {
-    let pool = allocatable();
+    let pool = allocatable(profile);
     let value_count = func.value_types.len();
     let allocates = func_allocates(func);
     let has_value_types = func
@@ -381,10 +617,11 @@ fn lower_function(
             )
         })
     });
-    let has_string_literal = func
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::StringLiteral { .. })));
+    let has_string_literal = func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|(_, i)| matches!(i, Inst::StringLiteral { .. }))
+    });
     if value_count > pool.len()
         || allocates
         || has_value_types
@@ -397,6 +634,10 @@ fn lower_function(
             func_labels,
             alloc,
             descriptors,
+            type_descs,
+            type_desc_labels,
+            externs,
+            profile,
             relocs,
             relocate,
         );
@@ -626,7 +867,13 @@ fn lower_inst(
             if !matches!(*element_size, 1 | 2 | 4) {
                 return Err(LowerError::Unsupported);
             }
-            emit_element_address(enc, reg(*array), reg(*index), *element_size);
+            emit_element_address(
+                enc,
+                reg(*array),
+                reg(*index),
+                *element_size,
+                RiscvProfile::Rv32im,
+            );
             match (*element_size, *signed) {
                 (1, true) => enc.lb(reg(result), scratch(), 4),
                 (1, false) => enc.lbu(reg(result), scratch(), 4),
@@ -644,7 +891,13 @@ fn lower_inst(
             if !matches!(*element_size, 1 | 2 | 4) {
                 return Err(LowerError::Unsupported);
             }
-            emit_element_address(enc, reg(*array), reg(*index), *element_size);
+            emit_element_address(
+                enc,
+                reg(*array),
+                reg(*index),
+                *element_size,
+                RiscvProfile::Rv32im,
+            );
             match *element_size {
                 1 => enc.sb(reg(*value), scratch(), 4),
                 2 => enc.sh(reg(*value), scratch(), 4),
@@ -656,7 +909,13 @@ fn lower_inst(
             index,
             element_size,
         } => {
-            emit_element_address(enc, reg(*array), reg(*index), *element_size);
+            emit_element_address(
+                enc,
+                reg(*array),
+                reg(*index),
+                *element_size,
+                RiscvProfile::Rv32im,
+            );
             enc.addi(reg(result), scratch(), 4);
         }
         Inst::Binary { op, lhs, rhs } => {
@@ -685,7 +944,7 @@ fn lower_inst(
             enc.mv(Reg::T0, reg(*dst));
             enc.mv(Reg::T1, reg(*src));
             enc.mv(Reg::T2, reg(*size));
-            emit_copy_block(enc, Reg::T0, Reg::T1, Reg::T2);
+            emit_copy_block(enc, Reg::T0, Reg::T1, Reg::T2, RiscvProfile::Rv32im);
         }
         Inst::FillBlock { dst, value, size } => {
             enc.mv(Reg::T0, reg(*dst));
@@ -719,6 +978,7 @@ fn lower_inst(
                 *element_size,
                 Reg::T0,
                 Reg::T1,
+                RiscvProfile::Rv32im,
             );
             match (*element_size, *signed) {
                 (1, true) => enc.lb(reg(result), scratch(), 0),
@@ -746,6 +1006,7 @@ fn lower_inst(
                 *element_size,
                 Reg::T0,
                 Reg::T1,
+                RiscvProfile::Rv32im,
             );
             match *element_size {
                 1 => enc.sb(reg(*value), scratch(), 0),
@@ -766,18 +1027,34 @@ fn lower_inst(
 /// must fit the 12-bit `lw`/`sw` immediate, so a function past ~500 values is rejected (deferred).
 /// Block parameters move slot-to-slot through `t0`: every value has a distinct slot, so the
 /// sequential move is sound (the register path's no-alias assumption).
+#[allow(clippy::too_many_arguments)]
 fn lower_function_spilled(
     enc: &mut Encoder,
     func: &Function,
     func_labels: &[Label],
     alloc: AllocSite,
     descriptors: &[TypeMeta],
+    type_descs: &mut TypeDescs,
+    type_desc_labels: &mut Vec<(TypeHandle, Label)>,
+    externs: &mut Vec<alloc::string::String>,
+    profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
     relocate: bool,
 ) -> Result<(), LowerError> {
+    let max_args = arg_reg_count(profile);
+    let arg_overflow = func.blocks[func.entry.index()].params.len() > max_args
+        || func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .any(|(_, inst)| register_arg_count(inst) > max_args);
+    if arg_overflow {
+        return Err(LowerError::ControlFlowUnsupported);
+    }
+    let saves_scratch = matches!(profile, RiscvProfile::Rv32ec);
     let value_count = func.value_types.len();
     let has_calls = func.blocks.iter().any(|b| {
-        b.insts.iter().any(|(_, i)| {
+        b.insts.iter().any(|(r, i)| {
             matches!(
                 i,
                 Inst::Call { .. }
@@ -789,6 +1066,11 @@ fn lower_function_spilled(
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
                     | Inst::CallNative { .. }
+            ) || matches!(
+                (profile, i),
+                (RiscvProfile::Rv32ec, Inst::Binary { op, .. })
+                    if (is_soft_int_binop(*op) && !is_i64(&func.value_types, *r))
+                        || (matches!(op, BinOp::Mul) && is_i64(&func.value_types, *r))
             )
         })
     });
@@ -799,13 +1081,13 @@ fn lower_function_spilled(
         used += ty.stack_slot_bytes() as i32;
     }
     let ra_off = used;
-    let frame = ((used + has_calls as i32 * 4) as usize).div_ceil(16) * 16;
+    let scratch_off = ra_off + has_calls as i32 * 4;
+    let frame =
+        ((used + has_calls as i32 * 4 + saves_scratch as i32 * 4) as usize).div_ceil(16) * 16;
     if frame > 2047 {
         return Err(LowerError::TooManyValues);
     }
     let slot = |v: ValueId| offsets[v.index()];
-    let mut type_descs: TypeDescs = Vec::new();
-    let mut type_desc_labels: Vec<(TypeHandle, Label)> = Vec::new();
     let mut string_blobs: Vec<(Label, Vec<u16>)> = Vec::new();
 
     if frame > 0 {
@@ -813,6 +1095,9 @@ fn lower_function_spilled(
     }
     if has_calls {
         enc.sw(Reg::RA, Reg::SP, ra_off);
+    }
+    if saves_scratch {
+        enc.sw(spilled_scratch(profile), Reg::SP, scratch_off);
     }
     let entry = &func.blocks[func.entry.index()];
     for (i, &param) in entry.params.iter().enumerate() {
@@ -849,9 +1134,11 @@ fn lower_function_spilled(
                 inst,
                 alloc,
                 descriptors,
-                &mut type_descs,
-                &mut type_desc_labels,
+                type_descs,
+                type_desc_labels,
                 &mut string_blobs,
+                externs,
+                profile,
                 relocs,
                 relocate,
             )?;
@@ -863,6 +1150,9 @@ fn lower_function_spilled(
                 }
                 if has_calls {
                     enc.lw(Reg::RA, Reg::SP, ra_off);
+                }
+                if saves_scratch {
+                    enc.lw(spilled_scratch(profile), Reg::SP, scratch_off);
                 }
                 if frame > 0 {
                     enc.addi(Reg::SP, Reg::SP, frame as i32);
@@ -938,38 +1228,6 @@ fn lower_function_spilled(
         }
         ancestor += 1;
     }
-    for desc in &type_descs {
-        for slot in desc.vtable.iter().rev() {
-            match slot {
-                Some(idx) => enc.emit_word_diff(desc.label, func_labels[*idx as usize]),
-                None => enc.emit_word(0),
-            }
-        }
-        enc.bind_label(desc.label);
-        for (idx, &w) in desc.words.iter().enumerate() {
-            if idx == 3 {
-                match desc.base.and_then(|b| {
-                    type_desc_labels
-                        .iter()
-                        .find(|(h, _)| *h == b)
-                        .map(|(_, l)| *l)
-                }) {
-                    Some(base_label) => enc.emit_word_diff(desc.label, base_label),
-                    None => enc.emit_word(0),
-                }
-            } else {
-                enc.emit_word(w);
-            }
-        }
-        enc.emit_word(desc.itable.len() as u32);
-        for (tag, method) in &desc.itable {
-            enc.emit_word(*tag);
-            match method {
-                Some(idx) => enc.emit_word_diff(desc.label, func_labels[*idx as usize]),
-                None => enc.emit_word(0),
-            }
-        }
-    }
     for (label, units) in &string_blobs {
         enc.bind_label(*label);
         enc.emit_word(units.len() as u32);
@@ -998,10 +1256,13 @@ fn lower_inst_spilled(
     type_descs: &mut TypeDescs,
     type_desc_labels: &mut Vec<(TypeHandle, Label)>,
     string_blobs: &mut Vec<(Label, Vec<u16>)>,
+    externs: &mut Vec<alloc::string::String>,
+    profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
     relocate: bool,
 ) -> Result<(), LowerError> {
     let (t0, t1, t2) = (Reg::T0, Reg::T1, Reg::T2);
+    let scratch = spilled_scratch(profile);
     match inst {
         Inst::ConstInt { ty, value } => {
             enc.li(t0, *value as i32);
@@ -1027,7 +1288,28 @@ fn lower_inst_spilled(
         }
         Inst::Binary { op, lhs, rhs } => {
             if is_i64(value_types, result) {
-                emit_i64_binary(enc, slot, *op, result, *lhs, *rhs)?;
+                if matches!(profile, RiscvProfile::Rv32ec) && matches!(op, BinOp::Mul) {
+                    let (a2, a3) = (
+                        Reg::new(12).unwrap_or(Reg::ZERO),
+                        Reg::new(13).unwrap_or(Reg::ZERO),
+                    );
+                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
+                    enc.lw(Reg::A1, Reg::SP, slot(*lhs) + 4);
+                    enc.lw(a2, Reg::SP, slot(*rhs));
+                    enc.lw(a3, Reg::SP, slot(*rhs) + 4);
+                    let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, "__muldi3");
+                    emit_call(enc, func_labels, relocs, relocate, target)?;
+                    enc.sw(Reg::A0, Reg::SP, slot(result));
+                    enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
+                } else {
+                    emit_i64_binary(enc, slot, *op, result, *lhs, *rhs, profile)?;
+                }
+            } else if matches!(profile, RiscvProfile::Rv32ec) && is_soft_int_binop(*op) {
+                enc.lw(Reg::A0, Reg::SP, slot(*lhs));
+                enc.lw(Reg::A1, Reg::SP, slot(*rhs));
+                let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, soft_int_routine(*op));
+                emit_call(enc, func_labels, relocs, relocate, target)?;
+                enc.sw(Reg::A0, Reg::SP, slot(result));
             } else {
                 enc.lw(t0, Reg::SP, slot(*lhs));
                 enc.lw(t1, Reg::SP, slot(*rhs));
@@ -1051,7 +1333,7 @@ fn lower_inst_spilled(
         }
         Inst::Compare { op, lhs, rhs } => {
             if is_i64(value_types, *lhs) {
-                emit_i64_compare(enc, slot, *op, result, *lhs, *rhs)?;
+                emit_i64_compare(enc, slot, *op, result, *lhs, *rhs, profile)?;
             } else {
                 enc.lw(t0, Reg::SP, slot(*lhs));
                 enc.lw(t1, Reg::SP, slot(*rhs));
@@ -1068,7 +1350,7 @@ fn lower_inst_spilled(
             enc.lw(t0, Reg::SP, slot(*dst));
             enc.lw(t1, Reg::SP, slot(*src));
             enc.lw(t2, Reg::SP, slot(*size));
-            emit_copy_block(enc, t0, t1, t2);
+            emit_copy_block(enc, t0, t1, t2, profile);
         }
         Inst::FillBlock { dst, value, size } => {
             enc.lw(t0, Reg::SP, slot(*dst));
@@ -1109,10 +1391,14 @@ fn lower_inst_spilled(
             };
             enc.lw(t0, Reg::SP, slot(*dim0));
             enc.lw(t1, Reg::SP, slot(*dim1));
-            enc.mul(t0, t0, t1);
-            enc.li(t1, *element_size as i32);
-            enc.mul(t0, t0, t1);
-            enc.addi(Reg::A0, t0, 8);
+            emit_soft_mul32(enc, t2, t0, t1, scratch, profile);
+            if element_size.is_power_of_two() {
+                enc.slli(t2, t2, element_size.trailing_zeros());
+            } else {
+                enc.li(t1, *element_size as i32);
+                enc.mul(t2, t2, t1);
+            }
+            enc.addi(Reg::A0, t2, 8);
             enc.la(Reg::A1, desc_label);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
@@ -1138,13 +1424,13 @@ fn lower_inst_spilled(
             enc.lw(t0, Reg::SP, slot(*array));
             enc.lw(t1, Reg::SP, slot(*index0));
             enc.lw(t2, Reg::SP, slot(*index1));
-            emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1);
+            emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1, profile);
             match (*element_size, *signed) {
-                (1, true) => enc.lb(t0, scratch(), 0),
-                (1, false) => enc.lbu(t0, scratch(), 0),
-                (2, true) => enc.lh(t0, scratch(), 0),
-                (2, false) => enc.lhu(t0, scratch(), 0),
-                _ => enc.lw(t0, scratch(), 0),
+                (1, true) => enc.lb(t0, scratch, 0),
+                (1, false) => enc.lbu(t0, scratch, 0),
+                (2, true) => enc.lh(t0, scratch, 0),
+                (2, false) => enc.lhu(t0, scratch, 0),
+                _ => enc.lw(t0, scratch, 0),
             }
             enc.sw(t0, Reg::SP, slot(result));
         }
@@ -1161,12 +1447,12 @@ fn lower_inst_spilled(
             enc.lw(t0, Reg::SP, slot(*array));
             enc.lw(t1, Reg::SP, slot(*index0));
             enc.lw(t2, Reg::SP, slot(*index1));
-            emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1);
+            emit_2d_element_address(enc, t0, t1, t2, *element_size, Reg::A0, Reg::A1, profile);
             enc.lw(t0, Reg::SP, slot(*value));
             match *element_size {
-                1 => enc.sb(t0, scratch(), 0),
-                2 => enc.sh(t0, scratch(), 0),
-                _ => enc.sw(t0, scratch(), 0),
+                1 => enc.sb(t0, scratch, 0),
+                2 => enc.sh(t0, scratch, 0),
+                _ => enc.sw(t0, scratch, 0),
             }
         }
         Inst::Load {
@@ -1284,20 +1570,20 @@ fn lower_inst_spilled(
             }
             enc.lw(t0, Reg::SP, slot(*array));
             enc.lw(t1, Reg::SP, slot(*index));
-            emit_element_address(enc, t0, t1, *element_size);
+            emit_element_address(enc, t0, t1, *element_size, profile);
             match (*element_size, *signed) {
-                (1, true) => enc.lb(t2, scratch(), 4),
-                (1, false) => enc.lbu(t2, scratch(), 4),
-                (2, true) => enc.lh(t2, scratch(), 4),
-                (2, false) => enc.lhu(t2, scratch(), 4),
+                (1, true) => enc.lb(t2, scratch, 4),
+                (1, false) => enc.lbu(t2, scratch, 4),
+                (2, true) => enc.lh(t2, scratch, 4),
+                (2, false) => enc.lhu(t2, scratch, 4),
                 (8, _) => {
-                    enc.lw(t2, scratch(), 4);
+                    enc.lw(t2, scratch, 4);
                     enc.sw(t2, Reg::SP, slot(result));
-                    enc.lw(t2, scratch(), 8);
+                    enc.lw(t2, scratch, 8);
                     enc.sw(t2, Reg::SP, slot(result) + 4);
                     return Ok(());
                 }
-                _ => enc.lw(t2, scratch(), 4),
+                _ => enc.lw(t2, scratch, 4),
             }
             enc.sw(t2, Reg::SP, slot(result));
         }
@@ -1312,19 +1598,19 @@ fn lower_inst_spilled(
             }
             enc.lw(t0, Reg::SP, slot(*array));
             enc.lw(t1, Reg::SP, slot(*index));
-            emit_element_address(enc, t0, t1, *element_size);
+            emit_element_address(enc, t0, t1, *element_size, profile);
             if *element_size == 8 {
                 enc.lw(t2, Reg::SP, slot(*value));
-                enc.sw(t2, scratch(), 4);
+                enc.sw(t2, scratch, 4);
                 enc.lw(t2, Reg::SP, slot(*value) + 4);
-                enc.sw(t2, scratch(), 8);
+                enc.sw(t2, scratch, 8);
                 return Ok(());
             }
             enc.lw(t2, Reg::SP, slot(*value));
             match *element_size {
-                1 => enc.sb(t2, scratch(), 4),
-                2 => enc.sh(t2, scratch(), 4),
-                _ => enc.sw(t2, scratch(), 4),
+                1 => enc.sb(t2, scratch, 4),
+                2 => enc.sh(t2, scratch, 4),
+                _ => enc.sw(t2, scratch, 4),
             }
         }
         Inst::ArrayElemAddr {
@@ -1334,8 +1620,8 @@ fn lower_inst_spilled(
         } => {
             enc.lw(t0, Reg::SP, slot(*array));
             enc.lw(t1, Reg::SP, slot(*index));
-            emit_element_address(enc, t0, t1, *element_size);
-            enc.addi(t2, scratch(), 4);
+            emit_element_address(enc, t0, t1, *element_size, profile);
+            enc.addi(t2, scratch, 4);
             enc.sw(t2, Reg::SP, slot(result));
         }
         Inst::Alloc {
@@ -1343,8 +1629,10 @@ fn lower_inst_spilled(
             payload_size,
             ref_offsets,
         } => {
-            let has_descriptor = !descriptor_vtable(descriptors, *handle).is_empty()
-                || !descriptor_itable(descriptors, *handle).is_empty();
+            let has_descriptor = descriptors
+                .iter()
+                .find(|d| d.handle == *handle)
+                .is_some_and(|m| !m.vtable.is_empty() || !m.itable.is_empty());
             let desc_label = descriptor_label(
                 enc,
                 *handle,
@@ -1353,8 +1641,12 @@ fn lower_inst_spilled(
                 ref_offsets,
                 type_descs,
                 type_desc_labels,
+                externs,
             );
-            enc.li(Reg::A0, (*payload_size + if has_descriptor { 4 } else { 0 }) as i32);
+            enc.li(
+                Reg::A0,
+                (*payload_size + if has_descriptor { 4 } else { 0 }) as i32,
+            );
             enc.la(Reg::A1, desc_label);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
@@ -1389,8 +1681,12 @@ fn lower_inst_spilled(
                 }
             };
             enc.lw(t0, Reg::SP, slot(*length));
-            enc.li(t1, *element_size as i32);
-            enc.mul(t0, t0, t1);
+            if element_size.is_power_of_two() {
+                enc.slli(t0, t0, element_size.trailing_zeros());
+            } else {
+                enc.li(t1, *element_size as i32);
+                enc.mul(t0, t0, t1);
+            }
             enc.addi(Reg::A0, t0, 4);
             enc.la(Reg::A1, desc_label);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
@@ -1404,7 +1700,9 @@ fn lower_inst_spilled(
         }
         Inst::Call { callee, args } => {
             if value_type_words(value_types, result).is_some()
-                || args.iter().any(|&a| value_type_words(value_types, a).is_some())
+                || args
+                    .iter()
+                    .any(|&a| value_type_words(value_types, a).is_some())
             {
                 return Err(LowerError::Unsupported);
             }
@@ -1423,7 +1721,13 @@ fn lower_inst_spilled(
                 let target = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
                 enc.lw(target, Reg::SP, slot(arg));
             }
-            emit_call(enc, func_labels, relocs, relocate, EXTERN_SYMBOL_FLAG | *symbol)?;
+            emit_call(
+                enc,
+                func_labels,
+                relocs,
+                relocate,
+                EXTERN_SYMBOL_FLAG | *symbol,
+            )?;
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         Inst::FuncAddr { func } => {
@@ -1434,12 +1738,12 @@ fn lower_inst_spilled(
             enc.sw(t0, Reg::SP, slot(result));
         }
         Inst::CallIndirect { target, args, .. } => {
-            enc.lw(scratch(), Reg::SP, slot(*target));
+            enc.lw(scratch, Reg::SP, slot(*target));
             for (i, &arg) in args.iter().enumerate() {
                 let r = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
                 enc.lw(r, Reg::SP, slot(arg));
             }
-            enc.jalr(Reg::RA, scratch(), 0);
+            enc.jalr(Reg::RA, scratch, 0);
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         Inst::InvokeDelegate { delegate, args, .. } => {
@@ -1447,7 +1751,7 @@ fn lower_inst_spilled(
                 return Err(LowerError::ControlFlowUnsupported);
             }
             enc.lw(t0, Reg::SP, slot(*delegate));
-            enc.lw(scratch(), t0, 4);
+            enc.lw(scratch, t0, 4);
             enc.lw(t1, t0, 0);
             let static_call = enc.new_label();
             let do_call = enc.new_label();
@@ -1464,7 +1768,7 @@ fn lower_inst_spilled(
                 enc.lw(r, Reg::SP, slot(arg));
             }
             enc.bind_label(do_call);
-            enc.jalr(Reg::RA, scratch(), 0);
+            enc.jalr(Reg::RA, scratch, 0);
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         Inst::CallVirtual {
@@ -1479,12 +1783,12 @@ fn lower_inst_spilled(
             enc.lw(t0, Reg::SP, slot(receiver));
             enc.lw(t0, t0, -4);
             enc.lw(t1, t0, -(entry_off as i32));
-            enc.add(scratch(), t0, t1);
+            enc.add(scratch, t0, t1);
             for (i, &arg) in args.iter().enumerate() {
                 let r = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
                 enc.lw(r, Reg::SP, slot(arg));
             }
-            enc.jalr(Reg::RA, scratch(), 0);
+            enc.jalr(Reg::RA, scratch, 0);
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         Inst::CallInterface { tag, args, .. } => {
@@ -1503,24 +1807,27 @@ fn lower_inst_spilled(
             let found = enc.new_label();
             enc.bind_label(loop_top);
             enc.branch(BranchCond::Eq, t2, Reg::ZERO, notfound);
-            enc.lw(scratch(), t1, 0);
-            enc.branch(BranchCond::Eq, scratch(), Reg::A0, found);
+            enc.lw(scratch, t1, 0);
+            enc.branch(BranchCond::Eq, scratch, Reg::A0, found);
             enc.addi(t1, t1, 8);
             enc.addi(t2, t2, -1);
             enc.j(loop_top);
             enc.bind_label(notfound);
             enc.ebreak();
             enc.bind_label(found);
-            enc.lw(scratch(), t1, 4);
-            enc.add(scratch(), t0, scratch());
+            enc.lw(scratch, t1, 4);
+            enc.add(scratch, t0, scratch);
             for (i, &arg) in args.iter().enumerate() {
                 let r = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
                 enc.lw(r, Reg::SP, slot(arg));
             }
-            enc.jalr(Reg::RA, scratch(), 0);
+            enc.jalr(Reg::RA, scratch, 0);
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
-        Inst::VirtualFuncAddr { object, slot: vslot } => {
+        Inst::VirtualFuncAddr {
+            object,
+            slot: vslot,
+        } => {
             let entry_off = vslot
                 .checked_mul(4)
                 .and_then(|x| x.checked_add(4))
@@ -1538,8 +1845,16 @@ fn lower_inst_spilled(
             enc.sw(t0, Reg::SP, slot(result));
         }
         Inst::TypeDescAddr { handle } => {
-            let desc_label =
-                descriptor_label(enc, *handle, descriptors, 0, &[], type_descs, type_desc_labels);
+            let desc_label = descriptor_label(
+                enc,
+                *handle,
+                descriptors,
+                0,
+                &[],
+                type_descs,
+                type_desc_labels,
+                externs,
+            );
             enc.la(t0, desc_label);
             enc.sw(t0, Reg::SP, slot(result));
         }
@@ -1567,7 +1882,10 @@ fn lower_inst_spilled(
             enc.sw(t0, Reg::SP, slot(result));
         }
         Inst::StringLiteral { utf16 } => {
-            let label = match string_blobs.iter().find(|(_, u)| u.as_slice() == utf16.as_ref()) {
+            let label = match string_blobs
+                .iter()
+                .find(|(_, u)| u.as_slice() == utf16.as_ref())
+            {
                 Some((l, _)) => *l,
                 None => {
                     let l = enc.new_label();
@@ -1611,8 +1929,9 @@ fn emit_i64_binary(
     result: ValueId,
     lhs: ValueId,
     rhs: ValueId,
+    profile: RiscvProfile,
 ) -> Result<(), LowerError> {
-    let (t0, t1, t2, carry) = (Reg::T0, Reg::T1, Reg::T2, scratch());
+    let (t0, t1, t2, carry) = (Reg::T0, Reg::T1, Reg::T2, spilled_scratch(profile));
     match op {
         BinOp::Add => {
             enc.lw(t0, Reg::SP, slot(lhs));
@@ -1666,7 +1985,7 @@ fn emit_i64_binary(
             enc.sw(t2, Reg::SP, slot(result) + 4);
         }
         BinOp::Shl | BinOp::ShrSigned | BinOp::ShrUnsigned => {
-            emit_i64_shift(enc, slot, op, result, lhs, rhs)?;
+            emit_i64_shift(enc, slot, op, result, lhs, rhs, profile)?;
         }
         _ => return Err(LowerError::Unsupported),
     }
@@ -1685,8 +2004,9 @@ fn emit_i64_shift(
     result: ValueId,
     lhs: ValueId,
     rhs: ValueId,
+    profile: RiscvProfile,
 ) -> Result<(), LowerError> {
-    let (lo, hi, sh, tmp) = (Reg::T0, Reg::T1, Reg::T2, scratch());
+    let (lo, hi, sh, tmp) = (Reg::T0, Reg::T1, Reg::T2, spilled_scratch(profile));
     let lo_out = arg_reg(0).ok_or(LowerError::ControlFlowUnsupported)?;
     let hi_out = arg_reg(1).ok_or(LowerError::ControlFlowUnsupported)?;
     enc.lw(lo, Reg::SP, slot(lhs));
@@ -1760,8 +2080,9 @@ fn emit_i64_compare(
     result: ValueId,
     lhs: ValueId,
     rhs: ValueId,
+    profile: RiscvProfile,
 ) -> Result<(), LowerError> {
-    let (t0, t1, t2, tmp) = (Reg::T0, Reg::T1, Reg::T2, scratch());
+    let (t0, t1, t2, tmp) = (Reg::T0, Reg::T1, Reg::T2, spilled_scratch(profile));
     let hi0 = arg_reg(0).ok_or(LowerError::ControlFlowUnsupported)?;
     let hi1 = arg_reg(1).ok_or(LowerError::ControlFlowUnsupported)?;
     if matches!(op, CmpOp::Eq | CmpOp::Ne) {
@@ -1898,7 +2219,11 @@ fn is_pointer(value_types: &[MirType], value: ValueId) -> bool {
 /// The vtable of the type `handle`, as one entry per slot: a module function index (`Some`) or
 /// `None` for an inherited referenced-assembly implementation the flat path cannot resolve. Empty
 /// when the type has no descriptor or no virtual methods (a plain, non-dispatched object).
-fn descriptor_vtable(descriptors: &[TypeMeta], handle: TypeHandle) -> Vec<Option<u32>> {
+fn descriptor_vtable(
+    descriptors: &[TypeMeta],
+    handle: TypeHandle,
+    externs: &mut Vec<alloc::string::String>,
+) -> Vec<Option<u32>> {
     descriptors
         .iter()
         .find(|d| d.handle == handle)
@@ -1907,10 +2232,92 @@ fn descriptor_vtable(descriptors: &[TypeMeta], handle: TypeHandle) -> Vec<Option
                 .iter()
                 .map(|entry| match entry {
                     VtableEntry::Func(index) => Some(*index),
-                    VtableEntry::Extern(_) => None,
+                    VtableEntry::Extern(symbol) => {
+                        Some(EXTERN_SYMBOL_FLAG | intern_extern(externs, symbol))
+                    }
                 })
                 .collect()
         })
+}
+
+/// Emits the module's deduplicated type descriptors after all function code, one per handle
+/// (`type_descs[i]` pairs with `type_desc_labels[i]`). The vtable is laid BEFORE each descriptor (slot
+/// `k` at `desc - 4 - 4k`), the words next (`desc.label` binds the words start = obj-4 + the dispatch
+/// base), and the itable after (`[count, (tag, method)...]`).
+///
+/// On the FLAT path each vtable/itable slot is an in-image `entry - desc` diff (`emit_word_diff`,
+/// resolved at finish, local functions only). On the OBJECT path each is an `R_LAMELLA_REL_DESC`
+/// relocation whose target is a function index, an `EXTERN_SYMBOL_FLAG`-tagged inherited library virtual,
+/// or (base_ptr@12) a `DESC_SYMBOL_FLAG`-tagged base handle -- so a slot can point across the link and
+/// survive `--gc-sections`; each descriptor also becomes a `__lamella_typedesc_<handle>` symbol. The
+/// per-slot addend pins the slot to its descriptor so the linker's `S + A - P` reduces to `entry - desc`.
+fn emit_descriptors(
+    enc: &mut Encoder,
+    type_descs: &[DescEmit],
+    type_desc_labels: &[(TypeHandle, Label)],
+    func_labels: &[Label],
+    relocate: bool,
+) -> (Vec<DescSym>, Vec<DescReloc>) {
+    let mut desc_syms: Vec<DescSym> = Vec::new();
+    let mut desc_relocs: Vec<DescReloc> = Vec::new();
+    for (desc, (handle, _)) in type_descs.iter().zip(type_desc_labels) {
+        let vtable_start = enc.position();
+        for (k, slot) in desc.vtable.iter().enumerate().rev() {
+            match slot {
+                Some(target) if relocate => {
+                    desc_relocs.push((enc.position(), *target, -(4 + 4 * k as i32)));
+                    enc.emit_word(0);
+                }
+                Some(target) => enc.emit_word_diff(desc.label, func_labels[*target as usize]),
+                None => enc.emit_word(0),
+            }
+        }
+        enc.bind_label(desc.label);
+        let words_bytes = desc.words.len() as i32 * 4;
+        for (idx, &w) in desc.words.iter().enumerate() {
+            if idx == 3 {
+                let base = desc
+                    .base
+                    .filter(|b| type_desc_labels.iter().any(|(h, _)| h == b));
+                match base {
+                    Some(base) if relocate => {
+                        desc_relocs.push((enc.position(), DESC_SYMBOL_FLAG | base.0, 12));
+                        enc.emit_word(0);
+                    }
+                    Some(base) => {
+                        let label = type_desc_labels
+                            .iter()
+                            .find(|(h, _)| *h == base)
+                            .map(|(_, l)| *l)
+                            .expect("base descriptor present");
+                        enc.emit_word_diff(desc.label, label);
+                    }
+                    None => enc.emit_word(0),
+                }
+            } else {
+                enc.emit_word(w);
+            }
+        }
+        enc.emit_word(desc.itable.len() as u32);
+        for (i, (tag, method)) in desc.itable.iter().enumerate() {
+            enc.emit_word(*tag);
+            match method {
+                Some(target) if relocate => {
+                    desc_relocs.push((enc.position(), *target, words_bytes + 8 + 8 * i as i32));
+                    enc.emit_word(0);
+                }
+                Some(target) => enc.emit_word_diff(desc.label, func_labels[*target as usize]),
+                None => enc.emit_word(0),
+            }
+        }
+        desc_syms.push((
+            handle.0,
+            vtable_start,
+            enc.position() - vtable_start,
+            desc.vtable.len() as u32 * 4,
+        ));
+    }
+    (desc_syms, desc_relocs)
 }
 
 /// Finds or creates the canonical descriptor label for `handle`, deduplicated so an `Alloc` and a
@@ -1927,6 +2334,7 @@ fn descriptor_label(
     ref_offsets: &[u32],
     type_descs: &mut TypeDescs,
     type_desc_labels: &mut Vec<(TypeHandle, Label)>,
+    externs: &mut Vec<alloc::string::String>,
 ) -> Label {
     if let Some((_, label)) = type_desc_labels.iter().find(|(h, _)| *h == handle) {
         return *label;
@@ -1940,7 +2348,7 @@ fn descriptor_label(
     words.extend_from_slice(ref_offsets);
     type_descs.push(DescEmit {
         label,
-        vtable: descriptor_vtable(descriptors, handle),
+        vtable: descriptor_vtable(descriptors, handle, externs),
         words,
         itable: descriptor_itable(descriptors, handle),
         base: descriptors
@@ -2016,8 +2424,14 @@ fn field_offset(offset: u32) -> Result<i32, LowerError> {
 /// `array + index*element_size` in [`scratch`] so the caller's access at offset 4 hits the element
 /// past the length word. The `[u32 length]` prefix is one word regardless of element size, so the +4
 /// is element-size-independent. A power-of-two size scales with a shift; any other with a multiply.
-fn emit_element_address(enc: &mut Encoder, array: Reg, index: Reg, element_size: u32) {
-    let s = scratch();
+fn emit_element_address(
+    enc: &mut Encoder,
+    array: Reg,
+    index: Reg,
+    element_size: u32,
+    profile: RiscvProfile,
+) {
+    let s = spilled_scratch(profile);
     enc.lw(s, array, 0);
     let ok = enc.new_label();
     enc.branch(BranchCond::LtU, index, s, ok);
@@ -2038,6 +2452,7 @@ fn emit_element_address(enc: &mut Encoder, array: Reg, index: Reg, element_size:
 /// `array + 8 + (index0*dim1 + index1)*element_size` in [`scratch`] so the caller accesses the
 /// element at offset 0. `array`/`index0`/`index1` are read-only; `ta`/`tb` are caller-supplied temps
 /// distinct from those and from `t6` (the register path passes t0/t1, the spilled path a0/a1).
+#[allow(clippy::too_many_arguments)]
 fn emit_2d_element_address(
     enc: &mut Encoder,
     array: Reg,
@@ -2046,8 +2461,9 @@ fn emit_2d_element_address(
     element_size: u32,
     ta: Reg,
     tb: Reg,
+    profile: RiscvProfile,
 ) {
-    let s = scratch();
+    let s = spilled_scratch(profile);
     enc.lw(ta, array, 0);
     let ok0 = enc.new_label();
     enc.branch(BranchCond::LtU, index0, ta, ok0);
@@ -2058,7 +2474,7 @@ fn emit_2d_element_address(
     enc.branch(BranchCond::LtU, index1, tb, ok1);
     enc.ebreak();
     enc.bind_label(ok1);
-    enc.mul(s, index0, tb);
+    emit_soft_mul32(enc, s, index0, tb, ta, profile);
     enc.add(s, s, index1);
     if element_size.is_power_of_two() {
         enc.slli(s, s, element_size.trailing_zeros());
@@ -2073,13 +2489,14 @@ fn emit_2d_element_address(
 /// Emits a byte-copy loop (`cpblk`): copies `size` bytes from `src` to `dst`, using `t6` (the array
 /// scratch, free outside an array op) as the transfer register. `dst`/`src`/`size` are scratch
 /// registers the loop mutates; it is test-first, so a zero size copies nothing.
-fn emit_copy_block(enc: &mut Encoder, dst: Reg, src: Reg, size: Reg) {
+fn emit_copy_block(enc: &mut Encoder, dst: Reg, src: Reg, size: Reg, profile: RiscvProfile) {
+    let s = spilled_scratch(profile);
     let body = enc.new_label();
     let done = enc.new_label();
     enc.branch(BranchCond::Eq, size, Reg::ZERO, done);
     enc.bind_label(body);
-    enc.lbu(scratch(), src, 0);
-    enc.sb(scratch(), dst, 0);
+    enc.lbu(s, src, 0);
+    enc.sb(s, dst, 0);
     enc.addi(dst, dst, 1);
     enc.addi(src, src, 1);
     enc.addi(size, size, -1);
@@ -2105,6 +2522,60 @@ fn emit_fill_block(enc: &mut Encoder, dst: Reg, value: Reg, size: Reg) {
 mod tests {
     use super::*;
     use lamella_ir::{BasicBlock, BlockId};
+
+    #[test]
+    fn rv32e_register_model_stays_within_x0_x15() {
+        assert!(
+            allocatable(RiscvProfile::Rv32ec).is_empty(),
+            "RV32E has no callee-saved pool (x18-x27 do not exist) -> every function spills"
+        );
+        assert_eq!(
+            spilled_scratch(RiscvProfile::Rv32ec).number(),
+            9,
+            "RV32E borrows s1 (x9) as scratch (RV32IM's t6/x31 does not exist)"
+        );
+        assert_eq!(arg_reg_count(RiscvProfile::Rv32ec), 6, "RV32E passes a0-a5");
+        for i in 0..arg_reg_count(RiscvProfile::Rv32ec) {
+            assert!(
+                arg_reg(i).expect("RV32E argument register").number() < 16,
+                "argument {i} is within x0-x15"
+            );
+        }
+        assert_eq!(allocatable(RiscvProfile::Rv32im).len(), 12);
+        assert_eq!(spilled_scratch(RiscvProfile::Rv32im).number(), 31);
+    }
+
+    #[test]
+    fn rv32e_maps_int_mul_div_rem_to_soft_routines() {
+        for (op, name) in [
+            (BinOp::Mul, "__mulsi3"),
+            (BinOp::DivSigned, "__divsi3"),
+            (BinOp::DivUnsigned, "__udivsi3"),
+            (BinOp::RemSigned, "__modsi3"),
+            (BinOp::RemUnsigned, "__umodsi3"),
+        ] {
+            assert!(
+                is_soft_int_binop(op),
+                "{op:?} needs a soft routine on RV32E"
+            );
+            assert_eq!(soft_int_routine(op), name);
+        }
+        for op in [
+            BinOp::Add,
+            BinOp::Sub,
+            BinOp::And,
+            BinOp::Or,
+            BinOp::Xor,
+            BinOp::Shl,
+            BinOp::ShrSigned,
+            BinOp::ShrUnsigned,
+        ] {
+            assert!(
+                !is_soft_int_binop(op),
+                "{op:?} stays a native RV32I instruction"
+            );
+        }
+    }
 
     /// A reference-field round-trip: store 40 at `[base+4]`, load it back, add 2, store the 42
     /// through a computed field address, and load it -- exercising FieldStore/FieldLoad/FieldAddr
@@ -3031,7 +3502,8 @@ mod tests {
             }],
         };
         assert!(
-            lower_module_gc_with_descriptors(core::slice::from_ref(&func), 0x8000_0004, &[]).is_ok(),
+            lower_module_gc_with_descriptors(core::slice::from_ref(&func), 0x8000_0004, &[])
+                .is_ok(),
             "LoadTypeDesc/TypeDescAddr identity compare lowers to RV32IM"
         );
     }
@@ -3119,7 +3591,13 @@ mod tests {
             blocks: vec![BasicBlock {
                 params: Vec::new(),
                 insts: vec![
-                    (n(0), Inst::ConstInt { ty: i32t, value: 14 }),
+                    (
+                        n(0),
+                        Inst::ConstInt {
+                            ty: i32t,
+                            value: 14,
+                        },
+                    ),
                     (
                         n(1),
                         Inst::CallNative {
@@ -3139,7 +3617,10 @@ mod tests {
             .iter()
             .find(|s| s.name == "triple")
             .expect("the extern `triple` symbol is present");
-        assert!(!triple.defined, "`triple` is an undefined extern the linker resolves");
+        assert!(
+            !triple.defined,
+            "`triple` is an undefined extern the linker resolves"
+        );
         assert!(
             obj.relocations.iter().any(|r| {
                 r.kind == lamella_elf::riscv::R_RISCV_CALL_PLT
@@ -3247,13 +3728,7 @@ mod tests {
             blocks: vec![BasicBlock {
                 params: Vec::new(),
                 insts: vec![
-                    (
-                        n(0),
-                        Inst::ConstInt {
-                            ty: i64t,
-                            value: 3,
-                        },
-                    ),
+                    (n(0), Inst::ConstInt { ty: i64t, value: 3 }),
                     (
                         n(1),
                         Inst::Binary {

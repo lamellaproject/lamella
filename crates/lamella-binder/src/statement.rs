@@ -432,17 +432,23 @@ impl Binder {
                 body,
             } => self.bind_fixed(ty, name, init, body),
             StmtKind::Checked(inner) => {
-                let saved = self.checked_context;
+                let saved_checked = self.checked_context;
+                let saved_unchecked = self.unchecked_context;
                 self.checked_context = true;
+                self.unchecked_context = false;
                 let bound = self.bind_statement(inner);
-                self.checked_context = saved;
+                self.checked_context = saved_checked;
+                self.unchecked_context = saved_unchecked;
                 BoundStmtKind::Checked(Box::new(bound))
             }
             StmtKind::Unchecked(inner) => {
-                let saved = self.checked_context;
+                let saved_checked = self.checked_context;
+                let saved_unchecked = self.unchecked_context;
                 self.checked_context = false;
+                self.unchecked_context = true;
                 let bound = self.bind_statement(inner);
-                self.checked_context = saved;
+                self.checked_context = saved_checked;
+                self.unchecked_context = saved_unchecked;
                 BoundStmtKind::Unchecked(Box::new(bound))
             }
             StmtKind::Labeled { label, statement } => BoundStmtKind::Labeled {
@@ -1031,6 +1037,9 @@ impl Binder {
                     };
                 }
                 let value = self.bind_expression(expr);
+                if value.ty.is_error() || !self.assignable(&value, &declared) {
+                    self.exempt_local_from_unused(&declarator.name);
+                }
                 self.check_assignable(&value, &declared, declarator.span);
                 self.convert(value, &declared)
             });

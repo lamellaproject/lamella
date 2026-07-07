@@ -1512,7 +1512,7 @@ mod tests {
             .iter()
             .map(|name| ((*name).into(), int()))
             .collect();
-        let bound = Binder::new().bind_method(None, "M", int(), &params, &body);
+        let bound = Binder::new().bind_method(None, "M", int(), &params, &[], false, &body);
         let names: Vec<Box<str>> = parameter_names.iter().map(|name| (*name).into()).collect();
         emit_method(&names, &bound).expect("should lower")
     }
@@ -1559,7 +1559,7 @@ mod tests {
     #[test]
     fn emission_records_a_sequence_point_per_statement() {
         let body = parse_statement("{ int x = 1; return x; }").statement;
-        let bound = Binder::new().bind_method(None, "M", int(), &[], &body);
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
         let emitted =
             emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None).expect("should lower");
 

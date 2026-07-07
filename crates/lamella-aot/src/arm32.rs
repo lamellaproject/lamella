@@ -1350,7 +1350,7 @@ fn emit_f2i(enc: &mut Encoder) -> Result<(), LowerError> {
 /// loop: sign and `|v|` are split out, `|v|` is shifted left until its top bit is the implicit 1,
 /// and the exponent (`158 - shifts`) and the 23-bit mantissa (the next bits) are assembled with the
 /// sign. Exact for magnitudes below 2^24; larger values truncate the low bits (round-to-nearest is
-/// a follow-on). r1-r3 are scratch.
+/// unsupported). r1-r3 are scratch.
 fn emit_i2f(enc: &mut Encoder) -> Result<(), LowerError> {
     let oops = |_| LowerError::TooManyValues;
     let done = enc.new_label();

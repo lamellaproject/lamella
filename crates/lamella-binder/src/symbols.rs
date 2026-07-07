@@ -106,6 +106,15 @@ pub struct MethodSymbol {
     /// Whether the last parameter is a `params` array (a variable-length trailing
     /// argument list at the call site).
     pub is_params: bool,
+    /// Whether the method is declared `virtual` -- an overridable vtable slot. An
+    /// interface's members are implicitly virtual+abstract.
+    pub is_virtual: bool,
+    /// Whether the method is `abstract` (has no body and must be overridden by a concrete
+    /// derived class). An interface's members are implicitly abstract.
+    pub is_abstract: bool,
+    /// Whether the method is declared `override` -- it replaces a base `virtual`/`abstract`/
+    /// `override` slot rather than introducing a new one.
+    pub is_override: bool,
     /// The method's accessibility.
     pub accessibility: Accessibility,
     /// The `[Conditional("SYMBOL")]` symbols (24.4.2): a call to this method is omitted unless
@@ -148,6 +157,10 @@ pub struct TypeInfo {
     /// For an external type, the simple name of the assembly that defines it (so its `TypeRef`
     /// is scoped to the right `AssemblyRef`, not just mscorlib). `None` for a this-module type.
     pub assembly: Option<Box<str>>,
+    /// The type's declared accessibility (10.2.3), for the accessibility-consistency checks
+    /// (CS0050-CS0053). Defaults to `public`; a source type sets it from its modifiers, so a
+    /// reference or synthetic type is treated as public (a safe under-report of a non-public one).
+    pub accessibility: Accessibility,
 }
 
 impl TypeInfo {
@@ -168,6 +181,7 @@ impl TypeInfo {
             enclosing: None,
             is_external: false,
             assembly: None,
+            accessibility: Accessibility::Public,
         }
     }
 
@@ -564,6 +578,9 @@ mod tests {
             parameters: Vec::new(),
             is_static: false,
             is_params: false,
+            is_virtual: false,
+            is_abstract: false,
+            is_override: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
         });
@@ -573,6 +590,9 @@ mod tests {
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Int32)],
             is_static: false,
             is_params: false,
+            is_virtual: false,
+            is_abstract: false,
+            is_override: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
         });
@@ -582,6 +602,9 @@ mod tests {
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Double)],
             is_static: false,
             is_params: false,
+            is_virtual: false,
+            is_abstract: false,
+            is_override: false,
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
         });

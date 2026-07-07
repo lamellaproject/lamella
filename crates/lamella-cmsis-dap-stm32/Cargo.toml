@@ -14,5 +14,5 @@ workspace = true
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 
 [dev-dependencies]
-# Examples open a real probe over the native USB-HID transport (e.g. an MCU-Link Pro or Atmel-ICE).
+# Real-probe HID access for the examples (native USB-HID; e.g. an MCU-Link Pro or Atmel-ICE).
 lamella-usbhid = { path = "../lamella-usbhid" }

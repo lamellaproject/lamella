@@ -1,7 +1,7 @@
-//! DEVICE networking backend for the interpreter's [`NetBackend`] seam, targeting the Microchip
+//! DEVICE networking backend for the interpreter's `NetBackend` seam, targeting the Microchip
 //! ATWINC1500 Wi-Fi network CONTROLLER. Unlike `lamella-net-smoltcp` (which runs a Rust TCP/IP stack
 //! over a raw MAC), the ATWINC1500 hosts its OWN TCP/IP stack on-module and exposes a SOCKET API over
-//! SPI -- the WINC "HIF" host-interface protocol. So this backend maps each [`NetBackend`] op straight
+//! SPI -- the WINC "HIF" host-interface protocol. So this backend maps each seam op straight
 //! onto a WINC HIF socket request (no smoltcp), and the module's IRQ-signalled response events drive
 //! the readiness reactor.
 
@@ -10,8 +10,12 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
-use lamella_cil_runtime::net::{Interest, NetBackend, NetResult, SocketHandle};
+pub mod boot;
+pub mod hif;
+pub mod net;
+pub mod socket;
+pub mod spi;
+pub mod wifi;
 
 /// A host-agnostic, full-duplex SPI link to the ATWINC1500: every byte clocked out clocks a byte in.
 /// A board supplies the concrete bus (a SAMD21 SERCOM-SPI on the MKR1000; a test double in unit
@@ -35,12 +39,16 @@ pub trait WincControl {
     fn set_reset(&mut self, asserted: bool);
     /// Reads IRQN (active low): `true` when the WINC is signalling that a response/event is waiting.
     fn irq_asserted(&mut self) -> bool;
+    /// Sleeps at least `ms` milliseconds -- the power-up sequence's settle times. A firmware
+    /// board spins a timer; a host-side board sleeps the thread.
+    fn delay_ms(&mut self, ms: u32);
 }
 
-/// A driver for one ATWINC1500 reached over an SPI bus `S` and its control pins `C`. Owns both, plus
-/// (as later slices land) the driver-side socket table that maps [`SocketHandle`]s to WINC sockets.
+/// A driver for one ATWINC1500 reached over an SPI bus `S` and its control pins `C`: the bring-up
+/// half (power, SPI protocol, firmware boot) -- [`net::WincNet`] takes the parts over for the
+/// socket-serving half via [`into_net_parts`](Self::into_net_parts).
 pub struct Winc1500<S, C> {
-    spi: S,
+    link: spi::Link<S>,
     ctrl: C,
 }
 
@@ -51,86 +59,72 @@ impl<S, C> core::fmt::Debug for Winc1500<S, C> {
 }
 
 impl<S: SpiBus, C: WincControl> Winc1500<S, C> {
-    /// Wraps the SPI bus + control pins. Does NOT touch the module yet -- `start` (next slice) toggles
-    /// CHIP_EN / RESET_N and waits for the firmware-ready handshake before any socket op is valid.
+    /// Wraps the SPI bus + control pins. Does NOT touch the module yet -- [`start`](Self::start)
+    /// runs the power-up sequence before any register access is valid.
     pub fn new(spi: S, ctrl: C) -> Self {
-        Self { spi, ctrl }
+        Self { link: spi::Link::new(spi), ctrl }
     }
 
     /// Releases the SPI bus and control pins.
     pub fn into_parts(self) -> (S, C) {
-        (self.spi, self.ctrl)
+        (self.link.into_bus(), self.ctrl)
     }
 
-}
-
-/// Every socket op is stubbed against the seam until the SPI + HIF layers land: each reports
-/// [`NetResult::Error`] (the WINC is not driven yet), so a program can link + run against this backend
-/// without panicking, and the readiness reactor ([`NetBackend::poll`]) yields nothing until HIF events
-/// are wired to [`WincControl::irq_asserted`].
-impl<S: SpiBus, C: WincControl> NetBackend for Winc1500<S, C> {
-    fn resolve(&mut self, _host: &str) -> Vec<Vec<u8>> {
-        Vec::new()
+    /// Powers the module up and brings the SPI protocol to its CRC-less operating state: the
+    /// vendor power-up sequence (CHIP_EN low + RESET_N low, 1 ms; CHIP_EN high, 10 ms; RESET_N
+    /// high, then a settle) followed by the protocol-config handshake. After this, registers are
+    /// readable -- the firmware boot (HIF) is a later slice.
+    pub fn start(&mut self) -> Result<(), spi::SpiError> {
+        self.ctrl.set_chip_enable(false);
+        self.ctrl.set_reset(true);
+        self.ctrl.delay_ms(1);
+        self.ctrl.set_chip_enable(true);
+        self.ctrl.delay_ms(10);
+        self.ctrl.set_reset(false);
+        self.ctrl.delay_ms(10);
+        self.link.init()?;
+        Ok(())
     }
 
-    fn tcp_connect(&mut self, _addr: &[u8], _port: u16) -> NetResult<SocketHandle> {
-        NetResult::Error
+    /// Reads the module's chip-identity register (`NMI_CHIPID`) -- the WINC first-light readout:
+    /// an ATWINC1500 answers an id in the 0x1500xx/0x1503xx family, and any sane value proves the
+    /// SPI wiring + protocol end to end.
+    pub fn chip_id(&mut self) -> Result<u32, spi::SpiError> {
+        self.link.read_reg(spi::NMI_CHIPID)
     }
 
-    fn connect_check(&mut self, _socket: SocketHandle) -> NetResult<()> {
-        NetResult::Error
+    /// The module-memory bus (registers + blocks) -- what the [`hif`]/[`wifi`] request and
+    /// event functions drive.
+    pub fn bus(&mut self) -> &mut spi::Link<S> {
+        &mut self.link
     }
 
-    fn tcp_listen(&mut self, _addr: &[u8], _port: u16, _backlog: i32) -> NetResult<SocketHandle> {
-        NetResult::Error
+    /// The board's millisecond delay, for event-poll pacing.
+    pub fn delay_ms(&mut self, ms: u32) {
+        self.ctrl.delay_ms(ms);
     }
 
-    fn accept(&mut self, _listener: SocketHandle) -> NetResult<SocketHandle> {
-        NetResult::Error
+    /// The module's IRQN line (active low): `true` when the WINC signals a pending
+    /// response/event -- the vendor-faithful gate for [`hif::poll_event`] on a fast transport
+    /// (hammering the interrupt register between events costs bus time for nothing).
+    pub fn irq_asserted(&mut self) -> bool {
+        self.ctrl.irq_asserted()
     }
 
-    fn recv(&mut self, _socket: SocketHandle, _buf: &mut [u8]) -> NetResult<usize> {
-        NetResult::Error
+    /// Boots the module's Wi-Fi firmware (from its own serial flash) to M2M readiness and
+    /// returns its version. Call after [`start`](Self::start).
+    pub fn boot_firmware(&mut self) -> Result<boot::FirmwareVersion, boot::BootError> {
+        let chip_rev = self.link.read_reg(spi::NMI_CHIPID)? & 0xfff;
+        let Self { link, ctrl } = self;
+        boot::boot_firmware(link, |ms| ctrl.delay_ms(ms), chip_rev)?;
+        boot::firmware_version(link).map_err(boot::BootError::Spi)
     }
 
-    fn send(&mut self, _socket: SocketHandle, _buf: &[u8]) -> NetResult<usize> {
-        NetResult::Error
-    }
-
-    fn udp_bind(&mut self, _addr: &[u8], _port: u16) -> NetResult<SocketHandle> {
-        NetResult::Error
-    }
-
-    fn udp_send_to(
-        &mut self,
-        _socket: SocketHandle,
-        _buf: &[u8],
-        _addr: &[u8],
-        _port: u16,
-    ) -> NetResult<usize> {
-        NetResult::Error
-    }
-
-    fn udp_recv_from(
-        &mut self,
-        _socket: SocketHandle,
-        _buf: &mut [u8],
-        _sender_addr: &mut [u8],
-    ) -> NetResult<(usize, usize, u16)> {
-        NetResult::Error
-    }
-
-    fn local_port(&mut self, _socket: SocketHandle) -> Option<u16> {
-        None
-    }
-
-    fn close(&mut self, _socket: SocketHandle) {}
-
-    fn register(&mut self, _socket: SocketHandle, _interest: Interest) {}
-
-    fn deregister(&mut self, _socket: SocketHandle) {}
-
-    fn poll(&mut self, _timeout_ms: Option<u64>) -> Vec<SocketHandle> {
-        Vec::new()
+    /// Splits the driver into the protocol link + control pins -- the parts
+    /// [`net::WincNet::new`] takes over once the bring-up (start / firmware boot / join) is
+    /// done. The association lives on the module, so it survives the handoff.
+    pub fn into_net_parts(self) -> (spi::Link<S>, C) {
+        (self.link, self.ctrl)
     }
 }
+

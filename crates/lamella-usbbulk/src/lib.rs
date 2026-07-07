@@ -1,9 +1,9 @@
 //! Cross-platform USB *bulk* transport for CMSIS-DAP v2 debug probes -- the v2 sibling of
 //! `lamella-usbhid`. Same small shape (enumerate, open by vendor/product id, exchange packets),
 //! but over a vendor-specific interface's bulk IN/OUT pipes instead of HID reports, so there is no
-//! report id or padding. Implemented directly against each OS's native USB API (WinUSB on Windows,
-//! IOKit IOUSBLib on macOS) with no external crates. Linux (usbfs) is a stub for now; HID-on-Linux
-//! is covered by `lamella-usbhid` (hidraw).
+//! report id or padding. Implemented directly against each OS's native USB API -- WinUSB + SetupAPI on
+//! Windows, IOKit IOUSBLib on macOS, sysfs + usbfs on Linux -- with no external USB crates. Enumeration,
+//! open-by-VID/PID, serial/product strings, and bulk I/O are supported on all three.
 #![allow(unsafe_code)]
 
 use std::time::Duration;
@@ -50,7 +50,10 @@ pub struct DeviceInfo {
     pub product: Option<String>,
 }
 
-/// Lists the connected CMSIS-DAP v2 (bulk) devices.
+/// Lists every connected vendor-bulk device -- a CMSIS-DAP v2 probe OR e.g. a Lamella wireline board (both
+/// expose a vendor-specific class-0xFF interface with bulk IN/OUT) -- with its ids and, where the OS reports
+/// them, serial/product strings. No VID filter: a caller keeps the vendor id(s) it wants (a probe consumer
+/// filters to probe vendors; the wireline picker keeps its own VID). Cross-platform (Windows/macOS/Linux).
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     imp::enumerate()
 }

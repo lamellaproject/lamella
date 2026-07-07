@@ -10,6 +10,7 @@ pub mod builtins;
 pub mod gpio;
 pub mod interp;
 pub mod object;
+pub mod stdlib;
 pub mod trap;
 pub mod value;
 

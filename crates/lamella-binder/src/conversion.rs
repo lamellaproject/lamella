@@ -17,7 +17,8 @@ pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
     }
     if matches!(from, TypeSymbol::Special(SpecialType::Null)) {
         return is_reference_type(model, to)
-            || matches!(to, TypeSymbol::Special(SpecialType::Null));
+            || matches!(to, TypeSymbol::Special(SpecialType::Null))
+            || matches!(to, TypeSymbol::Pointer(_));
     }
     has_implicit_conversion(from, to)
         || reference_conversion(model, from, to)

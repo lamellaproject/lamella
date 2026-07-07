@@ -38,6 +38,8 @@ math-transcendental = ["NETMFv4_4", "float", "lamella-cil-runtime/math-transcend
 # OFF = the Safe bounds-checked block table only (a constrained target's compile-time gate, so the
 # unsafe path is never built). At runtime, LAMELLA_MEMORY_MODE=safe switches Real -> Safe.
 real-memory = []
+# The host-only `tls-mbedtls` feature and the tls_seam conformance test live in the separate
+# lamella-host-tests crate, keeping their host-only dependencies out of this crate.
 # Source-level debugger names: the loader records each method's qualified name + argument names (for
 # the DAP backend / Session::this). Default ON (dev + the debugger); a constrained, non-debug profile
 # omits it -- for the full corlib that drops ~300 KB of resident Strings, with only graceful loss of

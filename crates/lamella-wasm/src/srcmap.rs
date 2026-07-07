@@ -77,6 +77,20 @@ fn srcmap_inner(corlib: &'static [u8], library: &'static [u8], app: &'static [u8
         Err(error) => return error_payload(&format!("pdb parse: {error:?}")),
     };
 
+    let mut method_names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    for type_def in app_asm.type_defs() {
+        let type_name = type_def.name();
+        for method in type_def.methods() {
+            let leaf = method.name().unwrap_or_default();
+            let qualified = match &type_name {
+                Some(name) if !name.namespace.is_empty() => format!("{}.{}.{}", name.namespace, name.name, leaf),
+                Some(name) => format!("{}.{}", name.name, leaf),
+                None => leaf.to_string(),
+            };
+            method_names.insert(method.rid(), qualified);
+        }
+    }
+
     let mut methods = serde_json::Map::new();
     for rid in 1..=pdb.method_count() {
         let Some(method_id) = loaded.module.resolve(app_asm_index, Token::new(METHOD_DEF, rid)) else {
@@ -92,7 +106,8 @@ fn srcmap_inner(corlib: &'static [u8], library: &'static [u8], app: &'static [u8
             continue;
         }
         let document = pdb.method_document(rid).unwrap_or_default();
-        methods.insert(method_id.to_string(), serde_json::json!({ "document": document, "points": points }));
+        let name = method_names.get(&rid).cloned().unwrap_or_default();
+        methods.insert(method_id.to_string(), serde_json::json!({ "document": document, "name": name, "points": points }));
     }
     let entry_point = pdb
         .entry_point()

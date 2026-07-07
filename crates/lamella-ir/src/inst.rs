@@ -86,7 +86,7 @@ pub enum ConvKind {
     /// magnitudes below 2^24. The soft form on a no-FPU target.
     IntToFloat32,
     /// Truncate a 64-bit float toward zero to a signed `int32` (`conv.i4` from an `R8`). wasm has a
-    /// native truncate; a no-FPU ARM target needs the aeabi soft helper (a follow-on, not yet wired).
+    /// native truncate; a no-FPU ARM target needs the aeabi soft helper (unsupported).
     Float64ToInt,
     /// Convert a signed `int32` to a 64-bit float (`conv.r8` from an int32 -- e.g. `double d = intVar`).
     /// The no-FPU ARM form is the `__aeabi_i2d` soft helper; wasm has `f64.convert_i32_s`.

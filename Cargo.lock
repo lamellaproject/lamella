@@ -308,7 +308,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "lamella-mcp"
+name = "lamella-mcp-csharp"
 version = "0.0.0"
 dependencies = [
  "lamella-wireline",
@@ -439,10 +439,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-wch-link"
+version = "0.0.0"
+dependencies = [
+ "lamella-usbbulk",
+]
+
+[[package]]
 name = "lamella-winc1500"
 version = "0.0.0"
 dependencies = [
  "lamella-cil-runtime",
+ "lamella-cmsis-dap",
+ "lamella-usbhid",
 ]
 
 [[package]]
@@ -460,6 +469,8 @@ dependencies = [
  "lamella-runner",
  "lamella-usbbulk",
  "lamella-wire",
+ "serde",
+ "serde_json",
  "serialport",
 ]
 

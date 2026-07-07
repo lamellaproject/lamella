@@ -355,7 +355,7 @@ impl<'a> MetadataResolver<'a> {
     /// itable to find the implementation. Implicit implementations only -- the implementing method is
     /// found by name + signature through the base chain ([`vtable_methods`](Self::vtable_methods), which
     /// already collects the virtual methods overrides included). Explicit (MethodImpl) and
-    /// external-interface dispatch are follow-ons.
+    /// external-interface dispatch are unsupported.
     #[must_use]
     pub fn itables(&self) -> Vec<(TypeHandle, Vec<(u32, u32)>)> {
         let mut result = Vec::new();
@@ -595,8 +595,8 @@ pub fn interface_method_tag(interface: &TypeName, method: &str, params: &[SigTyp
 }
 
 /// The ECMA-335 element-type byte for a parameter type, folded into an interface-method tag to
-/// distinguish overloads. Reference/value types contribute their kind byte (not yet their name -- a
-/// follow-on for overloads differing only by user-defined parameter type).
+/// distinguish overloads. Reference/value types contribute their kind byte, not their name, so
+/// overloads differing only by user-defined parameter type are not distinguished.
 fn sig_element_byte(ty: &SigType) -> u8 {
     match ty {
         SigType::Void => 0x01,

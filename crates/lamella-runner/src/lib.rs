@@ -274,15 +274,43 @@ fn failure(reason: &str) -> RunResult {
 /// Answers a `HELLO` with this baked target's honest advertisement (or a `NAK` on a
 /// version mismatch). A malformed `HELLO` is dropped; the host times out and retries.
 #[cfg(feature = "baked-image")]
-/// The capability set every baked-image serve advertises.
+/// The capability set every baked-image serve advertises. `PROFILE_CHIPID` is unconditional
+/// -- this build's identity always carries the structured board/chip fields, even when a
+/// firmware left them `0` = unknown.
 fn serve_caps() -> lamella_wire::Capabilities {
     use lamella_wire::Capabilities;
     Capabilities(
         Capabilities::BAKED_IMAGE
             | Capabilities::DEBUG_BASIC
             | Capabilities::BREAKPOINTS
-            | Capabilities::STEPPING,
+            | Capabilities::STEPPING
+            | Capabilities::PROFILE_CHIPID,
     )
+}
+
+/// The board/chip identity words the firmware installed at boot ([`set_board_identity`]):
+/// `board_model` in the low half of the first word; the IDCODE and device-id whole. Statics
+/// (not parameters) because the identity is a property of the running FIRMWARE, set once at
+/// boot and read wherever a `HELLO_ACK`/manifest is built -- the same shape as the other
+/// boot-installed seams.
+#[cfg(feature = "baked-image")]
+static BOARD_MODEL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "baked-image")]
+static CHIP_IDCODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+#[cfg(feature = "baked-image")]
+static CHIP_DEVID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Installs the board/chip identity this firmware advertises in its `HELLO_ACK` profile
+/// (docs in [`lamella_wire::ProfileIdentity`]): the board-model code from
+/// [`lamella_wire::board_model`] (0 for a custom board), the chip's SW-DP IDCODE, and the
+/// vendor device-id register value the firmware read from its own silicon (each 0 =
+/// unknown). Call once at boot, before serving.
+#[cfg(feature = "baked-image")]
+pub fn set_board_identity(board_model: u16, chip_idcode: u32, chip_devid: u32) {
+    use core::sync::atomic::Ordering;
+    BOARD_MODEL.store(u32::from(board_model), Ordering::Relaxed);
+    CHIP_IDCODE.store(chip_idcode, Ordering::Relaxed);
+    CHIP_DEVID.store(chip_devid, Ordering::Relaxed);
 }
 
 /// [`serve_caps`] plus the deploy tier's extras: a target with a persistent image region
@@ -298,11 +326,17 @@ fn deploy_caps() -> lamella_wire::Capabilities {
 /// folds its resident corlib's content hash in once one is resident.
 #[cfg(feature = "baked-image")]
 fn profile_identity() -> lamella_wire::ProfileIdentity {
+    use core::sync::atomic::Ordering;
     use lamella_cil_runtime::intrinsic_registry;
     lamella_wire::ProfileIdentity::new(
         intrinsic_registry::INTRINSIC_ABI,
         intrinsic_registry::registry_fingerprint(),
         intrinsic_registry::profile_name(),
+    )
+    .with_chip(
+        BOARD_MODEL.load(Ordering::Relaxed) as u16,
+        CHIP_IDCODE.load(Ordering::Relaxed),
+        CHIP_DEVID.load(Ordering::Relaxed),
     )
 }
 
@@ -482,13 +516,16 @@ pub fn run_debug_session(
     image_seq: u16,
 ) -> Result<(), TransportError> {
     let image: &'static [u8] = Box::leak(image.into_boxed_slice());
-    run_debug_session_static(transport, image, image_seq, serve_caps())
+    run_debug_session_static(transport, image, image_seq, serve_caps(), &mut |_| {})
 }
 
 /// [`run_debug_session`] over an ALREADY-RESIDENT image -- the [`debug::DBG_ATTACH`] arm:
 /// a deploy-capable target debugs the flash region it already holds, so nothing but
 /// commands crosses the wire. `caps` is what a mid-session `HELLO` (a NEW host adopting a
-/// stale session) is answered with -- the serve tier's own set.
+/// stale session) is answered with -- the serve tier's own set. `configure` is the
+/// firmware's [`Vm`] hook, the SAME one every other run path gets -- an attach-run must see
+/// the board's backends (network, output policy), or "attach and resume to completion"
+/// silently runs a lesser machine than a deployed boot does.
 ///
 /// # Errors
 /// Propagates a [`TransportError`] from the carrier.
@@ -498,6 +535,7 @@ pub fn run_debug_session_static(
     image: &'static [u8],
     image_seq: u16,
     caps: lamella_wire::Capabilities,
+    configure: &mut dyn FnMut(&mut Vm),
 ) -> Result<(), TransportError> {
     use debug::reason;
     use lamella_cil_runtime::{Module, Session, Status};
@@ -517,6 +555,7 @@ pub fn run_debug_session_static(
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
     vm.set_memory_backend(Box::new(SafeMemory::new()));
+    configure(&mut vm);
     if let Err(trap) = boot_static_ctors(&module, &mut vm) {
         let result = failure(&format!("static constructor: {trap:?}"));
         return send_stopped(transport, image_seq, reason::TRAP, (0, 0), Some(&result));
@@ -674,8 +713,8 @@ pub fn run_image_with(image: Vec<u8>, configure: &mut dyn FnMut(&mut Vm)) -> Run
     RunResult { exit, stdout: String::from_utf16_lossy(vm.output()) }
 }
 
-/// Boots a baked image's static constructors EAGERLY (the lazy-trigger tables of
-/// II.10.5.3 are loader-built and not part of the baked format), then marks every type
+/// Boots a baked image's static constructors EAGERLY (the lazy-trigger tables
+/// of II.10.5.3 are loader-built and not part of the baked format), then marks every type
 /// initialized. EVERY baked-image entry path must run this before the entry method --
 /// transient RUN_IMAGE, the flash boot-run, and a debug session alike; a path that skips it
 /// runs the program with null corlib statics (`IPAddress.Any`, `Encoding.ASCII`, ...).
@@ -733,7 +772,8 @@ fn serve_frame_baked(
             transport.send(repl::RUN_RESULT, frame.seq, &result.encode())?;
         }
         debug::DBG_IMAGE => {
-            run_debug_session(transport, frame.payload, frame.seq)?;
+            let image: &'static [u8] = alloc::boxed::Box::leak(frame.payload.into_boxed_slice());
+            run_debug_session_static(transport, image, frame.seq, serve_caps(), configure)?;
         }
         profile::GET_PROFILE => {
             let manifest = lamella_wire::ProfileManifest {
@@ -811,7 +851,7 @@ pub fn serve_one_deploy_with(
         }
         lamella_wire::msg::HELLO => hello_reply_caps(transport, &frame, deploy_caps())?,
         debug::DBG_ATTACH => {
-            run_debug_session_static(transport, flash.image_slice(), frame.seq, deploy_caps())?;
+            run_debug_session_static(transport, flash.image_slice(), frame.seq, deploy_caps(), configure)?;
         }
         _ => serve_frame_baked(transport, frame, configure)?,
     }
@@ -1116,7 +1156,7 @@ mod tests {
         driver.send(msg::HELLO, 8, &hello.encode()).unwrap();
         target.feed(&driver.take_sent());
 
-        run_debug_session_static(&mut target, image, 3, serve_caps())
+        run_debug_session_static(&mut target, image, 3, serve_caps(), &mut |_| {})
             .expect("the session ends instead of spinning forever");
         driver.feed(&target.take_sent());
 

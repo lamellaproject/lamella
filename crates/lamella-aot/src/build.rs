@@ -236,14 +236,73 @@ fn build_object_inner(cil: &[u8], corlib: Option<&[u8]>) -> Result<Vec<u8>, Buil
 /// stubbed. Emitting the object stays linker-free (the driver/examples own the link + boot).
 #[cfg(feature = "riscv32")]
 pub fn build_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+    build_object_riscv_inner(cil, None, riscv32::RiscvProfile::Rv32im)
+}
+
+/// As [`build_object_riscv`], but for a chosen RISC-V [`RiscvProfile`](riscv32::RiscvProfile). `Rv32ec`
+/// restricts the object to the CH32V003's x0-x15 (all-spilled path, `s1` scratch, a0-a5 arguments) and
+/// lowers a scalar i32 mul/div/rem to a soft-routine call (`__mulsi3`/`__divsi3`/...), so a purely-i32
+/// object carries no M-extension opcodes. int64 mul/div/rem and the array-address multiplies keep the
+/// hardware M path, so an object using those runs on an M-capable core (QEMU `virt`).
+#[cfg(feature = "riscv32")]
+pub fn build_object_riscv_profile(
+    cil: &[u8],
+    profile: riscv32::RiscvProfile,
+) -> Result<Vec<u8>, BuildError> {
+    build_object_riscv_inner(cil, None, profile)
+}
+
+/// As [`build_object_riscv`], but with a REFERENCED assembly (a corlib or helper library) attached, so
+/// the CIL lowering resolves a cross-assembly `new`/call: the resolver reads the referenced type's field
+/// layout (an `Alloc`'s payload size) and numbers cross-assembly vtable slots, and a call to a referenced
+/// method becomes an extern the linker binds against [`build_library_object_riscv`]'s export. The RISC-V
+/// twin of [`build_object_with_corlib`].
+#[cfg(feature = "riscv32")]
+pub fn build_object_riscv_with_reference(
+    cil: &[u8],
+    reference: &[u8],
+) -> Result<Vec<u8>, BuildError> {
+    build_object_riscv_inner(cil, Some(reference), riscv32::RiscvProfile::Rv32im)
+}
+
+#[cfg(feature = "riscv32")]
+fn build_object_riscv_inner(
+    cil: &[u8],
+    reference_cil: Option<&[u8]>,
+    profile: riscv32::RiscvProfile,
+) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let reference = match reference_cil {
+        Some(bytes) => Some(Assembly::read(bytes).map_err(|_| BuildError::Parse)?),
+        None => None,
+    };
     let entry = find_main(&assembly).ok_or(BuildError::NoEntryPoint)?;
-    let descriptors = MetadataResolver::new(&assembly).type_descriptors();
-    let funcs = lower_reachable(&assembly, entry, &descriptors)?;
+    let mut resolver = MetadataResolver::new(&assembly);
+    if let Some(reference) = reference.as_ref() {
+        resolver = resolver.with_reference(reference);
+    }
+    let mut descriptors = resolver.type_descriptors();
+    let funcs = lower_reachable(&assembly, entry, &descriptors, reference.as_ref())?;
+    let mut added: Vec<u32> = Vec::new();
+    for func in &funcs {
+        for (_, inst) in func.blocks.iter().flat_map(|b| &b.insts) {
+            if let Inst::Alloc { handle, .. } = inst {
+                let known =
+                    descriptors.iter().any(|d| d.handle == *handle) || added.contains(&handle.0);
+                if !known {
+                    if let Some(meta) = resolver.reference_type_meta(*handle) {
+                        added.push(handle.0);
+                        descriptors.push(meta);
+                    }
+                }
+            }
+        }
+    }
     let names: Vec<alloc::string::String> =
         (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    riscv32::lower_object(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerRiscv)
+    riscv32::lower_object_profile(&funcs, &name_refs, &[], &descriptors, profile)
+        .map_err(BuildError::LowerRiscv)
 }
 
 /// Lowers the methods of a self-contained assembly REACHABLE from `entry`, rid-indexed, into a dense
@@ -254,10 +313,11 @@ pub fn build_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 /// `Call` edge). Skipping the unreached rids keeps the implicit `.ctor`'s `object::.ctor()` corlib call
 /// out of a self-contained build -- the flat driver relies on the same property.
 #[cfg(feature = "riscv32")]
-fn lower_reachable(
-    assembly: &Assembly,
+fn lower_reachable<'a>(
+    assembly: &'a Assembly<'a>,
     entry: u32,
     descriptors: &[crate::resolver::TypeMeta],
+    reference: Option<&'a Assembly<'a>>,
 ) -> Result<Vec<Function>, BuildError> {
     let mut max_rid = entry;
     for type_def in assembly.type_defs() {
@@ -269,7 +329,10 @@ fn lower_reachable(
     let mut lowered = vec![false; funcs.len()];
     let cctors = find_cctors(assembly);
     let init = find_native_export(assembly, "lamella_time_init");
-    let resolver = MetadataResolver::new(assembly);
+    let resolver = match reference {
+        Some(reference) => MetadataResolver::new(assembly).with_reference(reference),
+        None => MetadataResolver::new(assembly),
+    };
     let mut worklist: Vec<u32> = core::iter::once(entry)
         .chain(cctors.iter().copied())
         .chain(init)
@@ -350,6 +413,25 @@ fn lower_one_reachable(
         }
     }
     Ok(None)
+}
+
+/// AOT-lowers a whole assembly as a LINKABLE LIBRARY object for RISC-V (a corlib, a helper library) --
+/// the RISC-V twin of [`build_library_object`]: every method is lowered with NO entry/startup, a public
+/// method takes its stable cross-assembly symbol ([`extern_method_symbol`](crate::resolver::extern_method_symbol))
+/// so a program's extern call binds against it, and every other method takes an assembly-unique internal
+/// name (`L<hash>.f<rid>`, so two libraries' internals never clash). A method whose CIL body does not
+/// lower stays a stub (the rest of the library still builds); a method whose MIR the RISC-V backend
+/// cannot lower is a LOUD error (there is no RISC-V-level dry-run tolerance), fine for a small
+/// library where every method lowers.
+#[cfg(feature = "riscv32")]
+pub fn build_library_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+    let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
+    let (funcs, _maps, _fails) = lower_assembly_debug(&assembly, None, None);
+    let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
+    let names = library_symbol_names(&assembly, funcs.len(), &prefix);
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let descriptors = MetadataResolver::new(&assembly).type_descriptors();
+    riscv32::lower_object(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerRiscv)
 }
 
 /// AOT-lowers a whole assembly as a LINKABLE LIBRARY object (a corlib, a helper library): every public
@@ -539,8 +621,8 @@ fn stub() -> Function {
 /// The program startup at index 0 (exported as `main`): runs each type initializer (`.cctor`) for
 /// its side effects, then `return entry()`. With no `.cctor`s this is just `return entry()` -- the
 /// plain trampoline. Eager static init before `main` is spec-compliant for the `beforefieldinit`
-/// types the C# compiler emits for field initializers; precise lazy (before-first-access) init is a
-/// follow-on.
+/// types the C# compiler emits for field initializers; precise lazy (before-first-access) init is
+/// unsupported.
 fn startup(init: Option<u32>, cctors: &[u32], entry_rid: u32) -> Function {
     let callees: Vec<u32> = init
         .into_iter()
@@ -658,18 +740,74 @@ fn synthesize_runtime_reader(
         (Some("get_Chars"), 1) => Some(Function {
             params: vec![MirType::ObjectRef, MirType::I32],
             ret: Some(MirType::I32),
-            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::I32, MirType::I32, MirType::I32, MirType::I32, MirType::I32, MirType::I32, MirType::I32],
+            value_types: vec![
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+            ],
             entry: BlockId(0),
             blocks: vec![BasicBlock {
                 params: vec![ValueId(0), ValueId(1)],
                 insts: vec![
-                    (ValueId(2), Inst::Convert { value: ValueId(0), kind: ConvKind::RefToInt }),
-                    (ValueId(3), Inst::ConstInt { ty: MirType::I32, value: 2 }),
-                    (ValueId(4), Inst::Binary { op: BinOp::Mul, lhs: ValueId(1), rhs: ValueId(3) }),
-                    (ValueId(5), Inst::ConstInt { ty: MirType::I32, value: 4 }),
-                    (ValueId(6), Inst::Binary { op: BinOp::Add, lhs: ValueId(2), rhs: ValueId(5) }),
-                    (ValueId(7), Inst::Binary { op: BinOp::Add, lhs: ValueId(6), rhs: ValueId(4) }),
-                    (ValueId(8), Inst::Load { address: ValueId(7), width: 2, signed: false }),
+                    (
+                        ValueId(2),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 2,
+                        },
+                    ),
+                    (
+                        ValueId(4),
+                        Inst::Binary {
+                            op: BinOp::Mul,
+                            lhs: ValueId(1),
+                            rhs: ValueId(3),
+                        },
+                    ),
+                    (
+                        ValueId(5),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 4,
+                        },
+                    ),
+                    (
+                        ValueId(6),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(2),
+                            rhs: ValueId(5),
+                        },
+                    ),
+                    (
+                        ValueId(7),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(6),
+                            rhs: ValueId(4),
+                        },
+                    ),
+                    (
+                        ValueId(8),
+                        Inst::Load {
+                            address: ValueId(7),
+                            width: 2,
+                            signed: false,
+                        },
+                    ),
                 ],
                 terminator: Some(Terminator::Return(Some(ValueId(8)))),
             }],
@@ -994,46 +1132,82 @@ fn lower_assembly_debug<'a>(
         if has_runtime_provided_attribute(assembly, Token::new(table::METHOD_DEF, method.rid())) {
             if let Some(type_name) = type_name {
                 let params = signature.as_ref().map_or(0, |sig| sig.parameters.len());
-                if let Some(func) =
-                    synthesize_runtime_reader(type_name.namespace, type_name.name, method.name(), params)
-                {
+                if let Some(func) = synthesize_runtime_reader(
+                    type_name.namespace,
+                    type_name.name,
+                    method.name(),
+                    params,
+                ) {
                     funcs[*rid as usize] = func;
                     continue;
                 }
                 if (type_name.namespace, type_name.name) == ("System", "Console") {
-                    let params = signature.as_ref().map(|s| s.parameters.as_slice()).unwrap_or(&[]);
+                    let params = signature
+                        .as_ref()
+                        .map(|s| s.parameters.as_slice())
+                        .unwrap_or(&[]);
                     let s = |sym| Some(sym);
                     let body = match (method.name(), params) {
-                        (Some("Write"), [SigType::String]) => {
-                            Some(console_body(Some(MirType::ObjectRef), true, s("lamella_console_write"), false))
-                        }
-                        (Some("WriteLine"), [SigType::String]) => {
-                            Some(console_body(Some(MirType::ObjectRef), true, s("lamella_console_write"), true))
-                        }
-                        (Some("Write"), [SigType::I4]) => {
-                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_i32"), false))
-                        }
-                        (Some("WriteLine"), [SigType::I4]) => {
-                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_i32"), true))
-                        }
-                        (Some("WriteLine"), [SigType::U4]) => {
-                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_u32"), true))
-                        }
-                        (Some("Write"), [SigType::Char]) => {
-                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_char"), false))
-                        }
-                        (Some("WriteLine"), [SigType::Char]) => {
-                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_char"), true))
-                        }
-                        (Some("WriteLine"), [SigType::Boolean]) => {
-                            Some(console_body(Some(MirType::I32), false, s("lamella_console_write_bool"), true))
-                        }
-                        (Some("WriteLine"), [SigType::I8]) => {
-                            Some(console_body(Some(MirType::I64), false, s("lamella_console_write_i64"), true))
-                        }
-                        (Some("WriteLine"), [SigType::U8]) => {
-                            Some(console_body(Some(MirType::I64), false, s("lamella_console_write_u64"), true))
-                        }
+                        (Some("Write"), [SigType::String]) => Some(console_body(
+                            Some(MirType::ObjectRef),
+                            true,
+                            s("lamella_console_write"),
+                            false,
+                        )),
+                        (Some("WriteLine"), [SigType::String]) => Some(console_body(
+                            Some(MirType::ObjectRef),
+                            true,
+                            s("lamella_console_write"),
+                            true,
+                        )),
+                        (Some("Write"), [SigType::I4]) => Some(console_body(
+                            Some(MirType::I32),
+                            false,
+                            s("lamella_console_write_i32"),
+                            false,
+                        )),
+                        (Some("WriteLine"), [SigType::I4]) => Some(console_body(
+                            Some(MirType::I32),
+                            false,
+                            s("lamella_console_write_i32"),
+                            true,
+                        )),
+                        (Some("WriteLine"), [SigType::U4]) => Some(console_body(
+                            Some(MirType::I32),
+                            false,
+                            s("lamella_console_write_u32"),
+                            true,
+                        )),
+                        (Some("Write"), [SigType::Char]) => Some(console_body(
+                            Some(MirType::I32),
+                            false,
+                            s("lamella_console_write_char"),
+                            false,
+                        )),
+                        (Some("WriteLine"), [SigType::Char]) => Some(console_body(
+                            Some(MirType::I32),
+                            false,
+                            s("lamella_console_write_char"),
+                            true,
+                        )),
+                        (Some("WriteLine"), [SigType::Boolean]) => Some(console_body(
+                            Some(MirType::I32),
+                            false,
+                            s("lamella_console_write_bool"),
+                            true,
+                        )),
+                        (Some("WriteLine"), [SigType::I8]) => Some(console_body(
+                            Some(MirType::I64),
+                            false,
+                            s("lamella_console_write_i64"),
+                            true,
+                        )),
+                        (Some("WriteLine"), [SigType::U8]) => Some(console_body(
+                            Some(MirType::I64),
+                            false,
+                            s("lamella_console_write_u64"),
+                            true,
+                        )),
                         _ => None,
                     };
                     if let Some(func) = body {
@@ -1136,15 +1310,36 @@ mod tests {
     #[test]
     fn synthesized_console_writers_verify_and_lower() {
         let bodies = [
-            console_body(Some(MirType::ObjectRef), true, Some("lamella_console_write"), true),
-            console_body(Some(MirType::I32), false, Some("lamella_console_write_i32"), true),
-            console_body(Some(MirType::I64), false, Some("lamella_console_write_i64"), true),
-            console_body(Some(MirType::I32), false, Some("lamella_console_write_char"), false),
+            console_body(
+                Some(MirType::ObjectRef),
+                true,
+                Some("lamella_console_write"),
+                true,
+            ),
+            console_body(
+                Some(MirType::I32),
+                false,
+                Some("lamella_console_write_i32"),
+                true,
+            ),
+            console_body(
+                Some(MirType::I64),
+                false,
+                Some("lamella_console_write_i64"),
+                true,
+            ),
+            console_body(
+                Some(MirType::I32),
+                false,
+                Some("lamella_console_write_char"),
+                false,
+            ),
             console_body(None, false, None, true),
         ];
         for f in bodies {
             lamella_ir::verify(&f).expect("a synthesized console body verifies");
-            crate::arm32::lower_object(&[f], &["c"], &[]).expect("a synthesized console body lowers");
+            crate::arm32::lower_object(&[f], &["c"], &[])
+                .expect("a synthesized console body lowers");
         }
     }
 
@@ -1167,8 +1362,9 @@ mod tests {
     fn synthesized_double_to_string_verifies_and_lowers() {
         let f = double_to_string_body();
         lamella_ir::verify(&f).expect("Double.ToString body verifies");
-        let obj = lamella_elf::read_object(&crate::arm32::lower_object(&[f], &["dts"], &[]).unwrap())
-            .unwrap();
+        let obj =
+            lamella_elf::read_object(&crate::arm32::lower_object(&[f], &["dts"], &[]).unwrap())
+                .unwrap();
         assert!(
             obj.symbols
                 .iter()

@@ -91,19 +91,53 @@ fn compile_function(
     compile_code_object(Scope::Function, &func.name, &func.params, &func.ret, &body, None, &[])
 }
 
-/// Compile a class method as a Module function named `"ClassName.method"`; the class body
-/// emits `MakeFunction` referencing it by that qualified name.
+/// The simple method name of a class-body member (a `def` or a decorated `def`), else `None`.
+fn class_member_method_name(member: &Stmt) -> Option<&str> {
+    match member {
+        Stmt::FuncDef(m) => Some(&m.name),
+        Stmt::Decorated { inner, .. } => match &**inner {
+            Stmt::FuncDef(m) => Some(&m.name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The unique qualified name for each class-body method, disambiguating siblings that share a name
+/// (a `@property` getter and its `@x.setter` are both `def x`, and must be DISTINCT code objects):
+/// the first occurrence is `Class.name`, a later one `Class.name$1`, `$2`, ... (`$` cannot appear in
+/// a source identifier, so it never clashes with a real method). Returns one entry per body member
+/// (`None` for a non-method), index-aligned so the body compiler and the emitter agree on the name.
+fn method_qualified_names(class_name: &str, body: &[Stmt]) -> Vec<Option<String>> {
+    body.iter()
+        .enumerate()
+        .map(|(i, member)| {
+            let mn = class_member_method_name(member)?;
+            let prior = body[..i]
+                .iter()
+                .filter(|m| class_member_method_name(m) == Some(mn))
+                .count();
+            Some(if prior == 0 {
+                format!("{class_name}.{mn}")
+            } else {
+                format!("{class_name}.{mn}${prior}")
+            })
+        })
+        .collect()
+}
+
+/// Compile a class method as a Module function named `qualified` (`"ClassName.method"`, or a
+/// `$`-suffixed variant for a same-named sibling); the class body emits `MakeFunction` referencing it
+/// by that same qualified name.
 fn compile_method(
+    qualified: &str,
     class_name: &str,
     method: &FuncDef,
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
-    let mut qualified = String::from(class_name);
-    qualified.push('.');
-    qualified.push_str(&method.name);
     let body: Vec<&Stmt> = method.body.iter().collect();
     compile_code_object(
         Scope::Function,
-        &qualified,
+        qualified,
         &method.params,
         &method.ret,
         &body,
@@ -121,7 +155,8 @@ fn compile_class_method_bodies(
     body: &[Stmt],
     functions: &mut Vec<bc::CodeObject>,
 ) -> Result<(), CompileError> {
-    for member in body {
+    let names = method_qualified_names(class_name, body);
+    for (i, member) in body.iter().enumerate() {
         let method = match member {
             Stmt::FuncDef(m) => Some(m),
             Stmt::Decorated { inner, .. } => match &**inner {
@@ -131,12 +166,45 @@ fn compile_class_method_bodies(
             _ => None,
         };
         if let Some(method) = method {
-            let (co, lambdas) = compile_method(class_name, method)?;
+            let qualified = names[i].as_ref().expect("a method has a qualified name");
+            let (co, lambdas) = compile_method(qualified, class_name, method)?;
             functions.push(co);
             functions.extend(lambdas);
         }
     }
     Ok(())
+}
+
+/// Whether a nested class would need to CAPTURE an enclosing function local -- in its body (a
+/// statement-level read, which goes through the class namespace `LoadName` and cannot reach a fast
+/// local) or in a method (which would need the class-body emitter to load the cell into the method's
+/// closure). A self-contained nested class (reading only globals, built-ins, and its own names) is
+/// compiled; one that captures an enclosing local is rejected. Returns the first offending name,
+/// if any.
+fn class_captures_enclosing_local(
+    body: &[Stmt],
+    base: &Option<Expr>,
+    child_scopes: &[BTreeSet<String>],
+) -> Option<String> {
+    let mut u = Uses::default();
+    for member in body {
+        walk_stmt_uses(member, &mut u);
+    }
+    if let Some(b) = base {
+        walk_expr_uses(b, &mut u);
+    }
+    let mut bound = BTreeSet::new();
+    for member in body {
+        if let Stmt::Assign(a) = member {
+            bound.insert(a.target.clone());
+        } else if let Some(method) = class_member_method_name(member) {
+            bound.insert(String::from(method));
+        }
+    }
+    u.direct
+        .into_iter()
+        .chain(u.child_free)
+        .find(|name| !bound.contains(name) && child_scopes.iter().any(|s| s.contains(name)))
 }
 
 /// Resolve an annotation expression to a static type: a bare `int` is the typed
@@ -165,6 +233,28 @@ fn compile_code_object(
     for stmt in body {
         collect_comp_targets_stmt(stmt, &mut local_names, &mut local_types);
     }
+    let mut nonlocals = BTreeSet::new();
+    collect_nonlocals(body, &mut nonlocals);
+    if !nonlocals.is_empty() {
+        for n in &nonlocals {
+            if params.iter().any(|p| &p.name == n) {
+                return Err(error(&format!("name '{n}' is parameter and nonlocal")));
+            }
+            if scope == Scope::Module || !enclosing.iter().any(|s| s.contains(n)) {
+                return Err(error(&format!("no binding for nonlocal '{n}' found")));
+            }
+        }
+        let mut kept_names = Vec::with_capacity(local_names.len());
+        let mut kept_types = Vec::with_capacity(local_types.len());
+        for (name, ty) in local_names.iter().zip(&local_types) {
+            if !nonlocals.contains(name) {
+                kept_names.push(name.clone());
+                kept_types.push(*ty);
+            }
+        }
+        local_names = kept_names;
+        local_types = kept_types;
+    }
     infer_local_types(params, body, &local_names, &mut local_types);
 
     let bound = bound_names(params, body);
@@ -178,6 +268,7 @@ fn compile_code_object(
         let cellvars: Vec<String> = bound.intersection(&u.child_free).cloned().collect();
         let mut free_uses = u.direct;
         free_uses.extend(u.child_free);
+        free_uses.extend(nonlocals.iter().cloned());
         for n in &bound {
             free_uses.remove(n);
         }
@@ -204,6 +295,8 @@ fn compile_code_object(
         child_scopes,
         loops: Vec::new(),
         finallys: Vec::new(),
+        handler_depth: 0,
+        in_class_body: false,
         current_class: current_class.map(String::from),
         name: String::from(name),
         hoisted: Vec::new(),
@@ -228,7 +321,7 @@ fn compile_code_object(
     let code_object = bc::CodeObject {
         name: String::from(name),
         params: co_params,
-        posonly_count: 0,
+        posonly_count: params.iter().filter(|p| p.positional_only).count() as u32,
         kwonly_count: params.iter().filter(|p| p.keyword_only).count() as u32,
         is_generator: compiler.has_yield,
         has_varargs: params.iter().any(|p| p.is_vararg),
@@ -291,6 +384,16 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 for name in bound {
                     add_dynamic_local(name, names, types);
                 }
+            }
+        }
+        Stmt::Import { modules } => {
+            for (_, bound) in modules {
+                add_dynamic_local(bound, names, types);
+            }
+        }
+        Stmt::ImportFrom { names: imports, .. } => {
+            for (_, bound) in imports {
+                add_dynamic_local(bound, names, types);
             }
         }
         Stmt::If { body, orelse, .. } => {
@@ -392,6 +495,7 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
         Stmt::Return(_)
         | Stmt::Expr(_)
         | Stmt::Delete(_)
+        | Stmt::Nonlocal(_)
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass
@@ -515,6 +619,9 @@ fn collect_comp_targets_stmt(
         Stmt::Return(None)
         | Stmt::FuncDef(_)
         | Stmt::ClassDef { .. }
+        | Stmt::Import { .. }
+        | Stmt::ImportFrom { .. }
+        | Stmt::Nonlocal(_)
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass
@@ -533,6 +640,69 @@ fn call_arg_expr(arg: &ast::CallArg) -> &Expr {
     }
 }
 
+/// Build the body of the hidden generator function a generator expression compiles to (CPython's
+/// `<genexpr>`): the `for`/`if` clause chain wrapping `yield element`, with the OUTERMOST clause
+/// iterating the `.0` parameter -- the pre-evaluated, pre-iter'd outermost iterable. A multi-name
+/// clause target unpacks through a temp. Shared by the emitter and the free-variable analysis so
+/// both see the same synthetic scope.
+fn build_genexpr_body(element: &Expr, clauses: &[CompClause]) -> Vec<Stmt> {
+    let mut body = vec![Stmt::Expr(Expr::Yield(Some(Box::new(element.clone()))))];
+    for (i, clause) in clauses.iter().enumerate().rev() {
+        for cond in clause.conditions.iter().rev() {
+            body = vec![Stmt::If {
+                test: cond.clone(),
+                body,
+                orelse: Vec::new(),
+            }];
+        }
+        let iterable = if i == 0 {
+            Expr::Name(String::from(".0"))
+        } else {
+            clause.iterable.clone()
+        };
+        body = if clause.targets.len() == 1 {
+            vec![Stmt::ForIter {
+                target: clause.targets[0].clone(),
+                iterable,
+                body,
+                orelse: Vec::new(),
+            }]
+        } else {
+            let loopvar = format!(".g{i}");
+            let mut inner = vec![Stmt::TupleAssign {
+                targets: clause
+                    .targets
+                    .iter()
+                    .map(|t| ast::AssignTarget::Name(t.clone()))
+                    .collect(),
+                star: None,
+                value: Expr::Name(loopvar.clone()),
+            }];
+            inner.extend(body);
+            vec![Stmt::ForIter {
+                target: loopvar,
+                iterable,
+                body: inner,
+                orelse: Vec::new(),
+            }]
+        };
+    }
+    body
+}
+
+/// The single `.0` parameter of a generator expression's hidden function (the outermost iterable).
+fn genexpr_param() -> ast::ParamDef {
+    ast::ParamDef {
+        name: String::from(".0"),
+        annotation: None,
+        default: None,
+        keyword_only: false,
+        positional_only: false,
+        is_vararg: false,
+        is_varkwarg: false,
+    }
+}
+
 /// Walk an expression, collecting comprehension loop variables (recursing into nested
 /// comprehensions) as dynamic locals.
 fn collect_comp_targets_expr(
@@ -542,10 +712,14 @@ fn collect_comp_targets_expr(
 ) {
     match expr {
         Expr::ListComp { element, clauses }
-        | Expr::SetComp { element, clauses }
-        | Expr::GeneratorExp { element, clauses } => {
+        | Expr::SetComp { element, clauses } => {
             collect_comp_clauses(clauses, names, types);
             collect_comp_targets_expr(element, names, types);
+        }
+        Expr::GeneratorExp { clauses, .. } => {
+            if let Some(first) = clauses.first() {
+                collect_comp_targets_expr(&first.iterable, names, types);
+            }
         }
         Expr::DictComp { key, value, clauses } => {
             collect_comp_clauses(clauses, names, types);
@@ -644,7 +818,57 @@ fn bound_names(params: &[ast::ParamDef], body: &[&Stmt]) -> BTreeSet<String> {
     for stmt in body {
         collect_comp_targets_stmt(stmt, &mut names, &mut types);
     }
-    names.into_iter().collect()
+    let mut set: BTreeSet<String> = names.into_iter().collect();
+    let mut nonlocals = BTreeSet::new();
+    collect_nonlocals(body, &mut nonlocals);
+    for n in &nonlocals {
+        set.remove(n);
+    }
+    set
+}
+
+/// Collect the names declared `nonlocal` anywhere in a function body -- descending into control-flow
+/// blocks but NOT into nested functions (a `nonlocal` declaration binds the function it appears in).
+fn collect_nonlocals(body: &[&Stmt], out: &mut BTreeSet<String>) {
+    for stmt in body {
+        collect_nonlocals_stmt(stmt, out);
+    }
+}
+
+fn collect_nonlocals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
+    match stmt {
+        Stmt::Nonlocal(names) => {
+            for n in names {
+                out.insert(n.clone());
+            }
+        }
+        Stmt::If { body, orelse, .. } | Stmt::While { body, orelse, .. } => {
+            for s in body.iter().chain(orelse.iter()) {
+                collect_nonlocals_stmt(s, out);
+            }
+        }
+        Stmt::For { body, orelse, .. } | Stmt::ForIter { body, orelse, .. } => {
+            for s in body.iter().chain(orelse.iter()) {
+                collect_nonlocals_stmt(s, out);
+            }
+        }
+        Stmt::Try { body, handlers, orelse, finalbody } => {
+            for s in body.iter().chain(orelse.iter()).chain(finalbody.iter()) {
+                collect_nonlocals_stmt(s, out);
+            }
+            for h in handlers {
+                for s in &h.body {
+                    collect_nonlocals_stmt(s, out);
+                }
+            }
+        }
+        Stmt::With { body, .. } => {
+            for s in body {
+                collect_nonlocals_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The free variables of a function scope: names its subtree references that it does not bind
@@ -658,6 +882,7 @@ fn func_free_uses(params: &[ast::ParamDef], body: &[&Stmt]) -> BTreeSet<String> 
     let bound = bound_names(params, body);
     let mut all = u.direct;
     all.extend(u.child_free);
+    collect_nonlocals(body, &mut all);
     all.difference(&bound).cloned().collect()
 }
 
@@ -768,7 +993,12 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
             }
             walk_body_uses(body, u);
         }
-        Stmt::Break | Stmt::Continue | Stmt::Pass => {}
+        Stmt::Import { .. }
+        | Stmt::ImportFrom { .. }
+        | Stmt::Nonlocal(_)
+        | Stmt::Break
+        | Stmt::Continue
+        | Stmt::Pass => {}
     }
 }
 
@@ -867,8 +1097,7 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
             }
         }
         Expr::ListComp { element, clauses }
-        | Expr::SetComp { element, clauses }
-        | Expr::GeneratorExp { element, clauses } => {
+        | Expr::SetComp { element, clauses } => {
             walk_expr_uses(element, u);
             for c in clauses {
                 walk_expr_uses(&c.iterable, u);
@@ -876,6 +1105,15 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
                     walk_expr_uses(cond, u);
                 }
             }
+        }
+        Expr::GeneratorExp { element, clauses } => {
+            if let Some(first) = clauses.first() {
+                walk_expr_uses(&first.iterable, u);
+            }
+            let gen_body = build_genexpr_body(element, clauses);
+            let refs: Vec<&Stmt> = gen_body.iter().collect();
+            u.child_free
+                .extend(func_free_uses(&[genexpr_param()], &refs));
         }
         Expr::DictComp { key, value, clauses } => {
             walk_expr_uses(key, u);
@@ -1067,8 +1305,11 @@ fn gather_assignments_stmt(
         Stmt::Return(_)
         | Stmt::Expr(_)
         | Stmt::Delete(_)
+        | Stmt::Nonlocal(_)
         | Stmt::FuncDef(_)
         | Stmt::Decorated { .. }
+        | Stmt::Import { .. }
+        | Stmt::ImportFrom { .. }
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass
@@ -1151,14 +1392,24 @@ struct Compiler {
     /// names plus this function's own -- so a nested function can tell a captured free variable
     /// (bound in some entry here) from a global.
     child_scopes: Vec<BTreeSet<String>>,
-    /// A stack of the enclosing loops' `(continue, break, finally_depth)`: the jump targets
-    /// plus `self.finallys.len()` at loop entry, so a break/continue re-emits only the
-    /// `finally` bodies entered inside that loop.
-    loops: Vec<(Label, Label, usize)>,
+    /// A stack of the enclosing loops' `(continue, break, finally_depth, handler_depth)`: the jump
+    /// targets plus `self.finallys.len()` and `self.handler_depth` at loop entry, so a
+    /// break/continue re-emits only the `finally` bodies -- and clears only the `except` handlers --
+    /// entered inside that loop.
+    loops: Vec<(Label, Label, usize, usize)>,
     /// A stack of active `finally` bodies (innermost last). An exit -- fall-through, return,
     /// break, continue, or the exception copy -- re-emits the crossed bodies (the duplication
     /// model). The bodies are stack-neutral, so a held return value survives across them.
     finallys: Vec<Vec<Stmt>>,
+    /// How many `except` HANDLER bodies enclose the current point. The runtime keeps the exception
+    /// being handled in a single per-frame slot (cleared by `PopExcept` at the handler's end), so a
+    /// `break`/`continue` that leaves a handler must clear that slot too -- otherwise a later bare
+    /// `raise` would re-raise a stale, already-handled exception.
+    handler_depth: usize,
+    /// True while compiling the statements directly in a `class` body (not a nested def/lambda),
+    /// so a bare-name read emits `LoadName` (namespace -> global -> built-in) instead of
+    /// `LoadGlobal` -- letting a member read a name the body bound earlier.
+    in_class_body: bool,
     /// The enclosing class name, so `super()` in a method resolves to its base.
     current_class: Option<String>,
     /// This code object's own name, used to prefix hoisted-lambda names for uniqueness.
@@ -1210,7 +1461,10 @@ impl Compiler {
     }
 
     /// Emit a read of `name`: a cell/free variable through `LoadDeref`, a plain local through
-    /// `LoadFast`, otherwise a `LoadGlobal`.
+    /// `LoadFast`; otherwise a `LoadGlobal`, or -- directly in a class body -- a `LoadName`, which
+    /// resolves the class namespace first (so a member can read a name the body bound earlier), then
+    /// falls back to global -> built-in. A nested def/lambda inside the body compiles in its own
+    /// scope (not `in_class_body`), so its reads stay Global/Fast/Deref, matching CPython.
     fn emit_load_name(&mut self, name: &str) {
         if let Some(deref) = self.deref_slot(name) {
             self.asm.emit(bc::Op::LoadDeref(deref));
@@ -1218,7 +1472,11 @@ impl Compiler {
             self.asm.emit(bc::Op::LoadFast(slot));
         } else {
             let idx = self.name_index(name);
-            self.asm.emit(bc::Op::LoadGlobal(idx));
+            if self.in_class_body {
+                self.asm.emit(bc::Op::LoadName(idx));
+            } else {
+                self.asm.emit(bc::Op::LoadGlobal(idx));
+            }
         }
     }
 
@@ -1387,25 +1645,47 @@ impl Compiler {
                 body,
             } => self.compile_with(context, optional_name, body),
             Stmt::Break => {
-                let (_, target, depth) = self
+                let (_, target, fin_depth, handler_depth) = self
                     .loops
                     .last()
                     .copied()
                     .ok_or_else(|| error("'break' outside a loop"))?;
-                self.emit_finallys_from(depth)?;
+                self.emit_finallys_from(fin_depth)?;
+                self.emit_pop_handlers_to(handler_depth);
                 self.asm.emit_jump(target);
                 Ok(())
             }
             Stmt::Continue => {
-                let (target, _, depth) = self
+                let (target, _, fin_depth, handler_depth) = self
                     .loops
                     .last()
                     .copied()
                     .ok_or_else(|| error("'continue' outside a loop"))?;
-                self.emit_finallys_from(depth)?;
+                self.emit_finallys_from(fin_depth)?;
+                self.emit_pop_handlers_to(handler_depth);
                 self.asm.emit_jump(target);
                 Ok(())
             }
+            Stmt::Import { modules } => {
+                for (module, bound) in modules {
+                    let midx = self.name_index(module);
+                    self.asm.emit(bc::Op::ImportName(midx));
+                    self.emit_store_name(bound);
+                }
+                Ok(())
+            }
+            Stmt::ImportFrom { module, names } => {
+                let midx = self.name_index(module);
+                self.asm.emit(bc::Op::ImportName(midx));
+                for (member, bound) in names {
+                    let nidx = self.name_index(member);
+                    self.asm.emit(bc::Op::ImportFrom(nidx));
+                    self.emit_store_name(bound);
+                }
+                self.asm.emit(bc::Op::PopTop);
+                Ok(())
+            }
+            Stmt::Nonlocal(_) => Ok(()),
             Stmt::Pass => Ok(()),
         }
     }
@@ -1503,7 +1783,7 @@ impl Compiler {
         self.asm.place(top_label);
         self.compile_expr(test)?;
         self.asm.emit_branch(else_label);
-        self.loops.push((top_label, after_label, self.finallys.len()));
+        self.loops.push((top_label, after_label, self.finallys.len(), self.handler_depth));
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
@@ -1551,7 +1831,7 @@ impl Compiler {
         self.asm.emit_branch(else_label);
         self.asm.emit(bc::Op::LoadFast(counter));
         self.emit_store_name(target);
-        self.loops.push((cont, after, self.finallys.len()));
+        self.loops.push((cont, after, self.finallys.len(), self.handler_depth));
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
@@ -1608,22 +1888,35 @@ impl Compiler {
                 self.asm.emit(bc::Op::LoadExc);
                 self.emit_store_name(name);
             }
-            self.asm.emit(bc::Op::PopExcept);
+            self.handler_depth += 1;
             for stmt in &handler.body {
                 self.compile_stmt(stmt)?;
             }
+            self.handler_depth -= 1;
             if let Some(name) = &handler.name {
                 let slot = self
                     .local_slot(name)
                     .expect("the except-clause name is a local");
                 self.asm.emit(bc::Op::DeleteFast(slot));
             }
+            self.asm.emit(bc::Op::PopExcept);
             self.asm.emit_jump(after);
             self.asm.place(next);
         }
         self.asm.emit(bc::Op::Reraise);
         self.asm.place(after);
         Ok(())
+    }
+
+    /// Clear the exception slot for each `except` handler crossed by a `break`/`continue` that
+    /// leaves it -- from `self.handler_depth` down to `target_depth` (the loop's handler depth at
+    /// entry). The runtime keeps the handled exception in one per-frame slot, so a `PopExcept`
+    /// clears it; leaving a handler this way must clear it, else a later bare `raise` would see a
+    /// stale exception.
+    fn emit_pop_handlers_to(&mut self, target_depth: usize) {
+        for _ in target_depth..self.handler_depth {
+            self.asm.emit(bc::Op::PopExcept);
+        }
     }
 
     /// Re-emit the active finally bodies `self.finallys[from..]` innermost-first (top-down),
@@ -1682,13 +1975,27 @@ impl Compiler {
         Ok(())
     }
 
-    /// Compile `with context [as name]: body` by desugaring to the context-manager protocol over a
-    /// try/finally (reusing that machinery, so `__exit__` runs on normal fall-through, on
-    /// return/break/continue, AND on exception):
-    ///   `_mgr = context; [name =] _mgr.__enter__(); try: body finally: _mgr.__exit__(None,None,None)`
-    /// The manager lives in a temp local. Passing the exception info to `__exit__` and honouring its
-    /// return value for exception SUPPRESSION are follow-ons -- this increment always passes
-    /// `None, None, None` and lets any exception propagate (correct for a cleanup manager).
+    /// Compile `with context [as name]: body` by desugaring to the full context-manager protocol
+    /// (PEP 343) over a try/except/finally, so `__exit__` runs on every exit -- normal fall-through,
+    /// return/break/continue, AND exception -- with the correct arguments and honouring suppression:
+    /// ```text
+    /// _mgr = context; [name =] _mgr.__enter__()
+    /// _hit = False
+    /// try:
+    ///     body
+    /// except <any> as _exc:            # catch-all that binds the exception value
+    ///     _hit = True
+    ///     if not _mgr.__exit__(type(_exc), _exc, None):
+    ///         raise                    # __exit__ returned falsy -> propagate (a bare re-raise)
+    /// finally:
+    ///     if not _hit:
+    ///         _mgr.__exit__(None, None, None)
+    /// ```
+    /// The `_hit` flag routes the exception exit (where `__exit__` already ran with the exception
+    /// info) away from the finally's normal-exit `__exit__(None, None, None)`. A truthy `__exit__`
+    /// return SUPPRESSES the exception (the handler falls through); a falsy one re-raises it. The
+    /// traceback argument is `None` (no traceback objects in this subset). The manager, the flag, and
+    /// the caught exception each live in a temp local.
     fn compile_with(
         &mut self,
         context: &Expr,
@@ -1712,29 +2019,84 @@ impl Compiler {
             Some(name) => self.emit_store_name(name),
             None => self.asm.emit(bc::Op::PopTop),
         }
-        let exit = Stmt::Expr(Expr::Call {
+        let hit = self.alloc_temp();
+        let hit_name = format!(".t{hit}");
+        let exc = self.alloc_temp();
+        let exc_name = format!(".t{exc}");
+        self.compile_expr(&Expr::Bool(false))?;
+        self.asm.emit(bc::Op::StoreFast(hit));
+
+        let exit_call = |args: Vec<Expr>| Expr::Call {
             func: Box::new(Expr::Attribute {
-                value: Box::new(Expr::Name(mgr_name)),
+                value: Box::new(Expr::Name(mgr_name.clone())),
                 attr: String::from("__exit__"),
             }),
-            args: vec![Expr::None, Expr::None, Expr::None],
+            args,
             keywords: Vec::new(),
-        });
-        self.compile_try_finally(body, &[], &[], &[exit])
+        };
+        let type_of_exc = Expr::Call {
+            func: Box::new(Expr::Name(String::from("type"))),
+            args: vec![Expr::Name(exc_name.clone())],
+            keywords: Vec::new(),
+        };
+        let handler_exit = exit_call(vec![type_of_exc, Expr::Name(exc_name.clone()), Expr::None]);
+        let handler = ExceptHandler {
+            typ: None,
+            name: Some(exc_name),
+            body: vec![
+                Stmt::Assign(Assign {
+                    target: hit_name.clone(),
+                    annotation: None,
+                    value: Some(Expr::Bool(true)),
+                }),
+                Stmt::If {
+                    test: Expr::Not {
+                        operand: Box::new(handler_exit),
+                    },
+                    body: vec![Stmt::Raise {
+                        exc: None,
+                        cause: None,
+                    }],
+                    orelse: Vec::new(),
+                },
+            ],
+        };
+        let final_exit = exit_call(vec![Expr::None, Expr::None, Expr::None]);
+        let finalbody = vec![Stmt::If {
+            test: Expr::Not {
+                operand: Box::new(Expr::Name(hit_name)),
+            },
+            body: vec![Stmt::Expr(final_exit)],
+            orelse: Vec::new(),
+        }];
+        self.compile_try_finally(body, &[handler], &[], &finalbody)
     }
 
-    /// `class Name [(Base)]:` -- push the name and base, build the namespace dict (class
-    /// attributes + a `MakeFunction("Name.method")` for each method), `BuildClass` over
-    /// `[name, base, namespace]`, and bind the class object to its name.
+    /// `class Name [(Base)]:` -- push the name and base, `SetupClassNamespace` a fresh namespace,
+    /// bind each member into it with `StoreName` (a method as `MakeFunction("Name.method")`, an
+    /// attribute as its compiled value), `BuildClass` over the namespace register + `[name, base]`,
+    /// and bind the class to its name. Member expressions are compiled with `in_class_body` set, so a
+    /// bare-name read emits `LoadName` (namespace -> global -> built-in): a member can read a name the
+    /// body bound earlier (`b = a + 1`, `x = property(get, set)`, `@radius.setter`). The base is
+    /// evaluated BEFORE the namespace is set up, in the enclosing scope.
     fn compile_classdef(
         &mut self,
         name: &str,
         base: &Option<Expr>,
         body: &[Stmt],
     ) -> Result<(), CompileError> {
-        if self.scope != Scope::Module {
-            return Err(error("nested class definitions are out of the subset"));
-        }
+        let class_qual = if self.scope == Scope::Module {
+            String::from(name)
+        } else {
+            if class_captures_enclosing_local(body, base, &self.child_scopes).is_some() {
+                return Err(error(
+                    "a nested class capturing an enclosing function local is not yet supported",
+                ));
+            }
+            let qualified = format!("{}.{}", self.name, name);
+            compile_class_method_bodies(&qualified, body, &mut self.hoisted)?;
+            qualified
+        };
         let name_const = self.const_index(bc::Const::Str(String::from(name)));
         self.asm.emit(bc::Op::LoadConst(name_const));
         match base {
@@ -1744,61 +2106,55 @@ impl Compiler {
                 self.asm.emit(bc::Op::LoadConst(none));
             }
         }
-        let mut n_members = 0u32;
-        for member in body {
+        self.asm.emit(bc::Op::SetupClassNamespace);
+        self.in_class_body = true;
+        let names = method_qualified_names(&class_qual, body);
+        for (i, member) in body.iter().enumerate() {
             match member {
                 Stmt::FuncDef(method) => {
-                    if method.params.iter().any(|p| p.default.is_some()) {
-                        return Err(error(
-                            "default parameter values on a method are not yet supported",
-                        ));
-                    }
-                    let key = self.const_index(bc::Const::Str(method.name.clone()));
-                    self.asm.emit(bc::Op::LoadConst(key));
-                    let mut qualified = String::from(name);
-                    qualified.push('.');
-                    qualified.push_str(&method.name);
-                    let f = self.name_index(&qualified);
-                    self.asm.emit(bc::Op::MakeFunction { func: f, flags: 0 });
-                    n_members += 1;
+                    let qualified = names[i].as_ref().expect("a method has a qualified name");
+                    let f = self.name_index(qualified);
+                    let flags = self.emit_param_defaults(&method.params)?;
+                    self.asm.emit(bc::Op::MakeFunction { func: f, flags });
+                    self.emit_store_member(&method.name);
                 }
                 Stmt::Decorated { decorators, inner } => {
                     let Stmt::FuncDef(method) = &**inner else {
+                        self.in_class_body = false;
                         return Err(error("only a method may be decorated in a class body"));
                     };
-                    if method.params.iter().any(|p| p.default.is_some()) {
-                        return Err(error(
-                            "default parameter values on a method are not yet supported",
-                        ));
-                    }
-                    let key = self.const_index(bc::Const::Str(method.name.clone()));
-                    self.asm.emit(bc::Op::LoadConst(key));
                     for decorator in decorators {
                         self.compile_expr(decorator)?;
                     }
-                    let qualified = format!("{}.{}", name, method.name);
-                    let f = self.name_index(&qualified);
-                    self.asm.emit(bc::Op::MakeFunction { func: f, flags: 0 });
+                    let qualified = names[i].as_ref().expect("a method has a qualified name");
+                    let f = self.name_index(qualified);
+                    let flags = self.emit_param_defaults(&method.params)?;
+                    self.asm.emit(bc::Op::MakeFunction { func: f, flags });
                     for _ in decorators {
                         self.asm.emit(bc::Op::Call(1));
                     }
-                    n_members += 1;
+                    self.emit_store_member(&method.name);
                 }
                 Stmt::Assign(assign) => {
                     if let Some(value) = &assign.value {
-                        let key = self.const_index(bc::Const::Str(assign.target.clone()));
-                        self.asm.emit(bc::Op::LoadConst(key));
                         self.compile_expr(value)?;
-                        n_members += 1;
+                        self.emit_store_member(&assign.target);
                     }
                 }
                 _ => {}
             }
         }
-        self.asm.emit(bc::Op::BuildDict(n_members));
+        self.in_class_body = false;
         self.asm.emit(bc::Op::BuildClass);
         self.emit_store_name(name);
         Ok(())
+    }
+
+    /// Bind a class-body member's value (on the stack top) into the class namespace under its simple
+    /// name (a NAMES-pool index), via `StoreName`.
+    fn emit_store_member(&mut self, simple_name: &str) {
+        let idx = self.name_index(simple_name);
+        self.asm.emit(bc::Op::StoreName(idx));
     }
 
     /// `for target in <iterable>:` over a general iterable -- the iterator protocol. The
@@ -1822,7 +2178,7 @@ impl Compiler {
         self.asm.emit(bc::Op::LoadFast(iter_slot));
         self.asm.emit_for_iter(else_label);
         self.emit_store_name(target);
-        self.loops.push((top, after, self.finallys.len()));
+        self.loops.push((top, after, self.finallys.len(), self.handler_depth));
         for stmt in body {
             self.compile_stmt(stmt)?;
         }
@@ -1923,7 +2279,29 @@ impl Compiler {
                 self.compile_comprehension(CompKind::List(element), clauses)?
             }
             Expr::GeneratorExp { element, clauses } => {
-                self.compile_comprehension(CompKind::List(element), clauses)?
+                let name = format!("{}.<genexpr.{}>", self.name, self.lambda_counter);
+                self.lambda_counter += 1;
+                let gen_body = build_genexpr_body(element, clauses);
+                let params = [genexpr_param()];
+                let body_refs: Vec<&Stmt> = gen_body.iter().collect();
+                let (co, nested) = compile_code_object(
+                    Scope::Function,
+                    &name,
+                    &params,
+                    &None,
+                    &body_refs,
+                    None,
+                    &self.child_scopes,
+                )?;
+                let freevars = co.freevars.clone();
+                self.hoisted.push(co);
+                self.hoisted.extend(nested);
+                let flags = self.emit_captured_cells(&freevars);
+                let idx = self.name_index(&name);
+                self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
+                self.compile_expr(&clauses[0].iterable)?;
+                self.asm.emit(bc::Op::GetIter);
+                self.asm.emit(bc::Op::Call(1));
             }
             Expr::DictComp {
                 key,
@@ -2035,28 +2413,63 @@ impl Compiler {
         Ok(())
     }
 
-    /// Emit a module-level defaulted def at its source position:
-    /// push each default value, build the defaults tuple, `MakeFunction` (flag bit0 =
+    /// Emit a module-level defaulted def at its source position: push each default value, build
+    /// the defaults tuple, `MakeFunction` (flag bit0 =
     /// defaults) resolving the function by name, then `StoreFast` -- which set_global's the
     /// PyFunction so a later `LoadGlobal` prefers it (it carries the defaults) over the plain
     /// function-table ref. Emitted at the source position because a default may reference an
     /// earlier module var.
     fn compile_defaulted_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
-        let mut n_defaults = 0u32;
-        for p in &func.params {
-            if let Some(default) = &p.default {
-                self.compile_expr(default)?;
-                n_defaults += 1;
-            }
-        }
-        self.asm.emit(bc::Op::BuildTuple(n_defaults));
+        let flags = self.emit_param_defaults(&func.params)?;
         let func_name = self.name_index(&func.name);
         self.asm.emit(bc::Op::MakeFunction {
             func: func_name,
-            flags: 0x01,
+            flags,
         });
         self.emit_store_name(&func.name);
         Ok(())
+    }
+
+    /// Emit a def / lambda / method's default operands at its def site, bottom-to-top to match
+    /// MakeFunction's pop order: the positional-defaults TUPLE (flag bit0 = 0x01), then the
+    /// keyword-only-defaults DICT `{name: value}` (flag bit1 = 0x02). Returns the combined flag bits
+    /// (the caller ORs in bit2 = 0x04 for closure cells, which it pushes on top). The default
+    /// expressions are evaluated here, in the enclosing scope.
+    fn emit_param_defaults(&mut self, params: &[ast::ParamDef]) -> Result<u8, CompileError> {
+        let mut flags = 0u8;
+        let n_pos = params
+            .iter()
+            .filter(|p| !p.keyword_only && p.default.is_some())
+            .count() as u32;
+        if n_pos > 0 {
+            for p in params {
+                if !p.keyword_only {
+                    if let Some(default) = &p.default {
+                        self.compile_expr(default)?;
+                    }
+                }
+            }
+            self.asm.emit(bc::Op::BuildTuple(n_pos));
+            flags |= 0x01;
+        }
+        let n_kw = params
+            .iter()
+            .filter(|p| p.keyword_only && p.default.is_some())
+            .count() as u32;
+        if n_kw > 0 {
+            for p in params {
+                if p.keyword_only {
+                    if let Some(default) = &p.default {
+                        let key = self.const_index(bc::Const::Str(p.name.clone()));
+                        self.asm.emit(bc::Op::LoadConst(key));
+                        self.compile_expr(default)?;
+                    }
+                }
+            }
+            self.asm.emit(bc::Op::BuildDict(n_kw));
+            flags |= 0x02;
+        }
+        Ok(flags)
     }
 
     /// Compile a nested `def` as a hoisted closure. Its body becomes a `CodeObject` named for its
@@ -2067,11 +2480,6 @@ impl Compiler {
     /// defs sharing a name -- a redefinition -- would collide on the qualified name; that rare
     /// re-`def` is out of this increment.)
     fn compile_nested_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
-        if func.params.iter().any(|p| p.keyword_only && p.default.is_some()) {
-            return Err(error(
-                "keyword-only default values on a nested function are not yet supported",
-            ));
-        }
         let qualified = format!("{}.{}", self.name, func.name);
         let body: Vec<&Stmt> = func.body.iter().collect();
         let (co, hoisted) = compile_code_object(
@@ -2086,23 +2494,7 @@ impl Compiler {
         let freevars = co.freevars.clone();
         self.hoisted.push(co);
         self.hoisted.extend(hoisted);
-        let mut flags = 0u8;
-        let n_defaults = func
-            .params
-            .iter()
-            .filter(|p| !p.keyword_only && p.default.is_some())
-            .count() as u32;
-        if n_defaults > 0 {
-            for p in &func.params {
-                if !p.keyword_only {
-                    if let Some(default) = &p.default {
-                        self.compile_expr(default)?;
-                    }
-                }
-            }
-            self.asm.emit(bc::Op::BuildTuple(n_defaults));
-            flags |= 0x01;
-        }
+        let mut flags = self.emit_param_defaults(&func.params)?;
         flags |= self.emit_captured_cells(&freevars);
         let func_idx = self.name_index(&qualified);
         self.asm.emit(bc::Op::MakeFunction { func: func_idx, flags });
@@ -2120,11 +2512,6 @@ impl Compiler {
         params: &[ast::ParamDef],
         body: &Expr,
     ) -> Result<(), CompileError> {
-        if params.iter().any(|p| p.default.is_some()) {
-            return Err(error(
-                "default parameter values on a lambda are not yet supported",
-            ));
-        }
         let lambda_name = format!("{}.<lambda.{}>", self.name, self.lambda_counter);
         self.lambda_counter += 1;
         let lambda_body = [Stmt::Return(Some(body.clone()))];
@@ -2141,7 +2528,8 @@ impl Compiler {
         let freevars = lambda_co.freevars.clone();
         self.hoisted.push(lambda_co);
         self.hoisted.extend(nested);
-        let flags = self.emit_captured_cells(&freevars);
+        let mut flags = self.emit_param_defaults(params)?;
+        flags |= self.emit_captured_cells(&freevars);
         let idx = self.name_index(&lambda_name);
         self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
         Ok(())
@@ -2432,6 +2820,7 @@ fn binop_sel(op: ast::BinOp) -> bc::BinOp {
         ast::BinOp::FloorDiv => bc::BinOp::FloorDiv,
         ast::BinOp::TrueDiv => bc::BinOp::TrueDiv,
         ast::BinOp::Pow => bc::BinOp::Pow,
+        ast::BinOp::MatMul => bc::BinOp::MatMul,
         ast::BinOp::Mod => bc::BinOp::Mod,
         ast::BinOp::BitAnd => bc::BinOp::BitAnd,
         ast::BinOp::BitOr => bc::BinOp::BitOr,
@@ -2652,12 +3041,6 @@ mod tests {
     }
 
     #[test]
-    fn defaults_on_lambdas_and_methods_are_still_gated() {
-        assert!(compile_src("f = lambda a, b=1: a + b\n").is_err());
-        assert!(compile_src("class C:\n    def m(self, x=1):\n        return x\n").is_err());
-    }
-
-    #[test]
     fn keyword_only_params_set_kwonly_count() {
         let module = compile_src("def f(a, b, *, c, d):\n    return a\n").unwrap();
         let f = func(&module, "f");
@@ -2707,6 +3090,9 @@ mod tests {
         let module = compile_src("with mgr() as x:\n    print(x)\n").unwrap();
         assert!(module.body.names.iter().any(|n| n == "__enter__"));
         assert!(module.body.names.iter().any(|n| n == "__exit__"));
+        assert!(module.body.names.iter().any(|n| n == "type"), "type(exc) passes the exception type");
+        assert!(module.body.ops.iter().any(|op| matches!(op, Op::PopExcept)), "the exception handler");
+        assert!(module.body.ops.iter().any(|op| matches!(op, Op::Reraise)));
     }
 
     #[test]
@@ -2717,6 +3103,23 @@ mod tests {
         assert_eq!(g.ops.iter().filter(|op| matches!(op, Op::Yield)).count(), 2);
         let plain = compile_src("def h():\n    return 5\n").unwrap();
         assert!(!func(&plain, "h").is_generator);
+    }
+
+    #[test]
+    fn genexpr_compiles_to_a_lazy_generator_function() {
+        let module = compile_src("g = (x * x for x in xs)\n").unwrap();
+        let genfn = module
+            .functions
+            .iter()
+            .find(|f| f.name.contains("<genexpr."))
+            .expect("a hoisted genexpr function");
+        assert!(genfn.is_generator, "the genexpr function is a generator");
+        assert!(genfn.ops.iter().any(|op| matches!(op, Op::Yield)));
+        assert_eq!(genfn.params.len(), 1, "the .0 parameter (the outermost iterable)");
+        assert!(module.body.ops.iter().any(|op| matches!(op, Op::MakeFunction { .. })));
+        assert!(module.body.ops.iter().any(|op| matches!(op, Op::GetIter)));
+        assert!(module.body.ops.iter().any(|op| matches!(op, Op::Call(1))));
+        assert!(!module.body.ops.iter().any(|op| matches!(op, Op::ListAppend)));
     }
 
     #[test]
@@ -2734,6 +3137,27 @@ mod tests {
             module.body.ops.iter().any(|op| matches!(op, Op::MakeFunction { .. })),
             "the module body references the lambda with MakeFunction"
         );
+    }
+
+    #[test]
+    fn lambda_with_a_default_emits_the_defaults_tuple() {
+        let module = compile_src("f = lambda a, b=10: a + b\n").unwrap();
+        assert!(
+            module.body.ops.iter().any(|op| matches!(op, Op::BuildTuple(1))),
+            "the (10,) defaults tuple"
+        );
+        assert!(
+            module.body.ops.iter().any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x01 != 0)),
+            "MakeFunction carries the defaults flag"
+        );
+        let plain = compile_src("g = lambda a: a\n").unwrap();
+        assert!(plain
+            .body
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x01 == 0)));
+        let method = compile_src("class C:\n    def m(self, x=1):\n        return x\n").unwrap();
+        assert!(method.functions.iter().any(|c| c.name == "C.m"), "the method body compiled");
     }
 
     #[test]
@@ -2834,6 +3258,42 @@ mod tests {
     }
 
     #[test]
+    fn nonlocal_makes_a_write_through_cell() {
+        let src = "def make_counter():\n    n = 0\n    def step():\n        nonlocal n\n        \
+                   n = n + 1\n        return n\n    return step\n";
+        let module = compile_src(src).unwrap();
+        let outer = func(&module, "make_counter");
+        assert_eq!(outer.cellvars, [String::from("n")]);
+        assert!(outer.ops.iter().any(|op| matches!(op, Op::StoreDeref(0))), "n = 0 writes the cell");
+        let step = func(&module, "make_counter.step");
+        assert!(step.cellvars.is_empty());
+        assert_eq!(step.freevars, [String::from("n")]);
+        assert!(step.ops.iter().any(|op| matches!(op, Op::LoadDeref(0))));
+        assert!(step.ops.iter().any(|op| matches!(op, Op::StoreDeref(0))), "n is written through");
+        assert!(!step.local_names.iter().any(|n| n == "n"));
+    }
+
+    #[test]
+    fn nonlocal_without_an_enclosing_binding_is_rejected() {
+        let top = compile_src("def f():\n    nonlocal x\n    x = 1\n").unwrap_err();
+        assert!(top.message.contains("no binding for nonlocal 'x'"), "{}", top.message);
+        let deeper = compile_src(
+            "def outer():\n    def inner():\n        nonlocal y\n        y = 1\n    return inner\n",
+        )
+        .unwrap_err();
+        assert!(deeper.message.contains("no binding for nonlocal 'y'"), "{}", deeper.message);
+    }
+
+    #[test]
+    fn nonlocal_on_a_parameter_is_rejected() {
+        let err = compile_src(
+            "def outer():\n    a = 0\n    def inner(a):\n        nonlocal a\n        return a\n    return inner\n",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("parameter and nonlocal"), "{}", err.message);
+    }
+
+    #[test]
     fn a_decorated_method_lands_in_the_class_namespace() {
         let src = "def tag(f):\n    return f\nclass C:\n    @tag\n    def m(self):\n        return 1\n";
         let module = compile_src(src).unwrap();
@@ -2842,6 +3302,126 @@ mod tests {
         assert!(ops.iter().any(|op| matches!(op, Op::MakeFunction { .. })));
         assert!(ops.iter().any(|op| matches!(op, Op::Call(1))), "the decorator is applied");
         assert!(ops.iter().any(|op| matches!(op, Op::BuildClass)));
+    }
+
+    #[test]
+    fn class_body_uses_the_namespace_protocol() {
+        let module = compile_src("class C:\n    a = 5\n    b = a + 1\n").unwrap();
+        let ops = &module.body.ops;
+        assert!(ops.iter().any(|op| matches!(op, Op::SetupClassNamespace)));
+        assert!(
+            ops.iter().filter(|op| matches!(op, Op::StoreName(_))).count() >= 2,
+            "a and b are bound with StoreName"
+        );
+        assert!(ops.iter().any(|op| matches!(op, Op::LoadName(_))), "b = a + 1 reads `a` via LoadName");
+        assert!(ops.iter().any(|op| matches!(op, Op::BuildClass)));
+        assert!(!ops.iter().any(|op| matches!(op, Op::BuildDict(_))), "the namespace is a register");
+        let m = compile_src("g = 1\nclass C:\n    def f(self):\n        return g\n").unwrap();
+        let f = func(&m, "C.f");
+        assert!(f.ops.iter().any(|op| matches!(op, Op::LoadGlobal(_))), "method read stays global");
+        assert!(!f.ops.iter().any(|op| matches!(op, Op::LoadName(_))));
+    }
+
+    #[test]
+    fn same_named_methods_get_distinct_code_objects() {
+        let module = compile_src(
+            "class C:\n    @property\n    def x(self):\n        return 1\n    @x.setter\n    def x(self, v):\n        self._x = v\n",
+        )
+        .unwrap();
+        let xs: Vec<&str> = module
+            .functions
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|n| n.starts_with("C.x"))
+            .collect();
+        assert_eq!(xs.len(), 2, "two distinct code objects for the two `def x`");
+        assert!(xs.contains(&"C.x"));
+        assert!(xs.iter().any(|n| n.contains('$')), "the sibling is $-disambiguated");
+    }
+
+    #[test]
+    fn method_defaults_emit_the_defaults_flags() {
+        let m = compile_src("class C:\n    def __init__(self, x=0):\n        self.x = x\n").unwrap();
+        assert!(
+            m.body
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x01 != 0)),
+            "the defaulted __init__ carries the defaults-tuple flag"
+        );
+        let m2 = compile_src("class C:\n    def m(self, *, k=1):\n        return k\n").unwrap();
+        assert!(
+            m2.body
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x02 != 0)),
+            "the keyword-only method default sets the kwdefaults bit"
+        );
+    }
+
+    #[test]
+    fn nested_classes_hoist_scope_qualified_methods() {
+        let m = compile_src(
+            "def make():\n    class Local:\n        def hi(self):\n            return 1\n    return Local()\n",
+        )
+        .unwrap();
+        assert!(
+            m.functions.iter().any(|f| f.name == "make.Local.hi"),
+            "the method hoists under a scope-qualified name"
+        );
+        let m2 = compile_src(
+            "def a():\n    class Inner:\n        def m(self):\n            return 1\ndef b():\n    class Inner:\n        def m(self):\n            return 2\n",
+        )
+        .unwrap();
+        assert!(m2.functions.iter().any(|f| f.name == "a.Inner.m"));
+        assert!(m2.functions.iter().any(|f| f.name == "b.Inner.m"));
+        assert!(compile_src("G = 1\ndef f():\n    class C:\n        x = G\n    return C\n").is_ok());
+        assert!(compile_src(
+            "def f(n):\n    class C:\n        def g(self):\n            return n\n    return C()\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn import_statements_emit_the_import_ops() {
+        let m = compile_src("import math\n").unwrap();
+        assert!(m.body.ops.iter().any(|op| matches!(op, Op::ImportName(_))));
+        let m2 = compile_src("from math import sqrt, pi\n").unwrap();
+        let ops = &m2.body.ops;
+        assert_eq!(
+            ops.iter().filter(|op| matches!(op, Op::ImportName(_))).count(),
+            1,
+            "one ImportName leads the `from`"
+        );
+        assert_eq!(
+            ops.iter().filter(|op| matches!(op, Op::ImportFrom(_))).count(),
+            2,
+            "one ImportFrom per imported member"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op, Op::PopTop)),
+            "the module is discarded after the last member"
+        );
+    }
+
+    #[test]
+    fn keyword_only_defaults_emit_a_kwdefaults_dict() {
+        let m = compile_src("def f(a, *, b=1):\n    return b\n").unwrap();
+        let ops = &m.body.ops;
+        assert!(ops.iter().any(|op| matches!(op, Op::BuildDict(1))), "the kwdefaults dict");
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x02 != 0)),
+            "MakeFunction sets the kwdefaults bit (0x02)"
+        );
+        let m2 = compile_src("def g(a, b=2, *, c=3):\n    return c\n").unwrap();
+        assert!(
+            m2.body
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x03 == 0x03)),
+            "both the defaults-tuple and kwdefaults-dict bits are set"
+        );
     }
 
     #[test]
@@ -2859,12 +3439,6 @@ mod tests {
             compile_src("LIMIT = 10\ndef f(xs):\n    g = lambda x: x + LIMIT\n    return g\n")
                 .unwrap();
         assert!(module.functions.iter().any(|f| f.name.contains("<lambda.")));
-    }
-
-    #[test]
-    fn defaulted_lambda_is_gated_like_a_defaulted_def() {
-        let err = compile_src("f = lambda a, n=2: a + n\n").unwrap_err();
-        assert!(err.message.contains("default parameter"), "{}", err.message);
     }
 
     #[test]
@@ -2983,6 +3557,28 @@ mod tests {
         assert!(ops.iter().any(|op| matches!(op, Op::LoadExc)));
         assert!(ops.iter().any(|op| matches!(op, Op::PopExcept)));
         assert!(ops.iter().any(|op| matches!(op, Op::Reraise)));
+    }
+
+    #[test]
+    fn except_handler_clears_the_exception_after_its_body() {
+        let src = "def f():\n    try:\n        pass\n    except ValueError:\n        x = 1\n        raise\n";
+        let module = compile_src(src).unwrap();
+        let co = func(&module, "f");
+        let store = co.ops.iter().position(|op| matches!(op, Op::StoreFast(_)))
+            .expect("the handler body stores x");
+        let pop = co.ops.iter().position(|op| matches!(op, Op::PopExcept))
+            .expect("a PopExcept");
+        assert!(store < pop, "PopExcept must come after the handler body, not before");
+        assert!(co.ops.iter().any(|op| matches!(op, Op::Raise(0))));
+    }
+
+    #[test]
+    fn break_out_of_a_handler_clears_the_exception() {
+        let src = "def f():\n    while True:\n        try:\n            raise E\n        except E:\n            break\n";
+        let module = compile_src(src).unwrap();
+        let co = func(&module, "f");
+        let pops = co.ops.iter().filter(|op| matches!(op, Op::PopExcept)).count();
+        assert_eq!(pops, 2, "break out of a handler emits a PopExcept before the loop-exit jump");
     }
 
     #[test]

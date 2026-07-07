@@ -1008,6 +1008,7 @@ fn lower_op(
                 }, MirType::I32),
                 bc::BinOp::TrueDiv => return Err(LowerError::DynamicOperation),
                 bc::BinOp::Pow => return Err(LowerError::DynamicOperation),
+                bc::BinOp::MatMul => return Err(LowerError::DynamicOperation),
             };
             stack.push(StackEntry::Value(id, MirType::I32));
         }
@@ -1146,7 +1147,12 @@ fn lower_op(
         | bc::Op::UnpackEx { .. }
         | bc::Op::LoadDeref(_)
         | bc::Op::StoreDeref(_)
-        | bc::Op::LoadClosure(_) => {
+        | bc::Op::LoadClosure(_)
+        | bc::Op::SetupClassNamespace
+        | bc::Op::StoreName(_)
+        | bc::Op::LoadName(_)
+        | bc::Op::ImportName(_)
+        | bc::Op::ImportFrom(_) => {
             return Err(LowerError::DynamicOperation);
         }
         bc::Op::PopTop => {

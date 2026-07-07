@@ -1,12 +1,13 @@
 //! Flow analysis (ECMA-334 1st ed, clause 12).
 
-use crate::bound::{BoundExpr, BoundExprKind};
+use crate::bound::{constant_int_value, constant_literal_value, BoundExpr, BoundExprKind};
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::statement::{BoundStmt, BoundStmtKind, BoundSwitchLabel};
+use crate::statement::{BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection};
 use crate::symbols::{Model, TypeKind};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_syntax::ast::{AssignmentOperator, Literal, UnaryOperator};
 use lamella_syntax::span::Span;
@@ -78,23 +79,26 @@ enum Flow {
 /// Reports `CS0168`/`CS0219` for a local whose name never appears anywhere in the
 /// body. Counting *every* occurrence -- even an assignment target -- as a use makes
 /// this a safe subset of csc (it under-reports rather than risk a false warning): it
-/// fires only when a declared local is truly never referenced again. `CS0219` when
-/// the local has an initializer (its assigned value is unused), `CS0168` otherwise.
+/// fires only when a declared local is truly never referenced again. `CS0219` "assigned
+/// but its value is never used" fires only when the initializer is a compile-time
+/// CONSTANT -- csc does not warn a local initialized with a non-constant expression
+/// (`s.Length`, `M()`), whose evaluation may matter -- and `CS0168` "declared but never
+/// used" when there is no initializer at all.
 #[must_use]
 pub fn check_unused_locals(body: &BoundStmt, also_used: &BTreeSet<Box<str>>) -> Vec<Diagnostic> {
     let mut used: BTreeSet<Box<str>> = also_used.clone();
-    let mut declared: Vec<(Box<str>, Span, bool)> = Vec::new();
+    let mut declared: Vec<(Box<str>, Span, Option<bool>)> = Vec::new();
     collect_locals(body, &mut used, &mut declared);
     declared
         .into_iter()
         .filter(|(name, _, _)| !used.contains(name))
-        .map(|(name, span, has_initializer)| {
-            let kind = if has_initializer {
-                DiagnosticKind::UnusedLocalValue { name }
-            } else {
-                DiagnosticKind::UnusedLocal { name }
+        .filter_map(|(name, span, initializer)| {
+            let kind = match initializer {
+                Some(true) => DiagnosticKind::UnusedLocalValue { name },
+                None => DiagnosticKind::UnusedLocal { name },
+                Some(false) => return None,
             };
-            Diagnostic::new(kind, span)
+            Some(Diagnostic::new(kind, span))
         })
         .collect()
 }
@@ -104,18 +108,18 @@ pub fn check_unused_locals(body: &BoundStmt, also_used: &BTreeSet<Box<str>>) -> 
 fn collect_locals(
     stmt: &BoundStmt,
     used: &mut BTreeSet<Box<str>>,
-    declared: &mut Vec<(Box<str>, Span, bool)>,
+    declared: &mut Vec<(Box<str>, Span, Option<bool>)>,
 ) {
     match &stmt.kind {
         BoundStmtKind::Local { ty, declarators } => {
             let report = !ty.is_error();
             for declarator in declarators {
                 if report {
-                    declared.push((
-                        declarator.name.clone(),
-                        stmt.span,
-                        declarator.initializer.is_some(),
-                    ));
+                    let initializer = declarator
+                        .initializer
+                        .as_ref()
+                        .map(|init| constant_literal_value(init).is_some());
+                    declared.push((declarator.name.clone(), stmt.span, initializer));
                 }
                 if let Some(initializer) = &declarator.initializer {
                     collect_uses(initializer, used);
@@ -311,6 +315,289 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
     }
 }
 
+/// A set of `(declaring-type dotted name, field name)` pairs -- the key a field access and
+/// a field declaration both reduce to, for the `CS0414` "assigned but never used" warning.
+type FieldSet = BTreeSet<(Box<str>, Box<str>)>;
+
+/// The dotted name of a field's declaring type, the key both a field access and a field
+/// declaration reduce to. Only a source-declared (`Named`) type owns a private field; any
+/// other form yields `None` and is simply not tracked (so never mis-warned).
+pub(crate) fn field_type_key(ty: &TypeSymbol) -> Option<Box<str>> {
+    match ty {
+        TypeSymbol::Named(parts) => {
+            let mut name = String::new();
+            for (index, part) in parts.iter().enumerate() {
+                if index > 0 {
+                    name.push('.');
+                }
+                name.push_str(part);
+            }
+            Some(name.into())
+        }
+        _ => None,
+    }
+}
+
+/// Records every field read and write in `stmt`, keyed by the field's declaring type and
+/// name, for `CS0414`. A WRITE is a field that is the direct target of a simple `=` (an
+/// initializer write is recorded at the declaration); every other field access -- a compound
+/// `+=` target, a `ref`/`out` argument, any read position -- is a READ. Counting every
+/// ambiguous position as a read keeps the warning a safe subset of csc (it under-warns rather
+/// than risk a false positive).
+pub(crate) fn collect_field_accesses(stmt: &BoundStmt, reads: &mut FieldSet, writes: &mut FieldSet) {
+    match &stmt.kind {
+        BoundStmtKind::Local { declarators, .. } => {
+            for declarator in declarators {
+                if let Some(initializer) = &declarator.initializer {
+                    collect_field_uses(initializer, reads, writes);
+                }
+            }
+        }
+        BoundStmtKind::Empty
+        | BoundStmtKind::Error
+        | BoundStmtKind::Break
+        | BoundStmtKind::Continue
+        | BoundStmtKind::Goto(_)
+        | BoundStmtKind::GotoCase(_)
+        | BoundStmtKind::GotoCaseString(_)
+        | BoundStmtKind::GotoDefault => {}
+        BoundStmtKind::Block(statements) => {
+            for statement in statements {
+                collect_field_accesses(statement, reads, writes);
+            }
+        }
+        BoundStmtKind::Expression(expr) => collect_field_uses(expr, reads, writes),
+        BoundStmtKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_field_uses(condition, reads, writes);
+            collect_field_accesses(then_branch, reads, writes);
+            if let Some(else_branch) = else_branch {
+                collect_field_accesses(else_branch, reads, writes);
+            }
+        }
+        BoundStmtKind::While { condition, body } | BoundStmtKind::DoWhile { condition, body } => {
+            collect_field_uses(condition, reads, writes);
+            collect_field_accesses(body, reads, writes);
+        }
+        BoundStmtKind::For {
+            initializer,
+            condition,
+            iterators,
+            body,
+        } => {
+            for statement in initializer {
+                collect_field_accesses(statement, reads, writes);
+            }
+            if let Some(condition) = condition {
+                collect_field_uses(condition, reads, writes);
+            }
+            for iterator in iterators {
+                collect_field_uses(iterator, reads, writes);
+            }
+            collect_field_accesses(body, reads, writes);
+        }
+        BoundStmtKind::ForEach {
+            collection, body, ..
+        } => {
+            collect_field_uses(collection, reads, writes);
+            collect_field_accesses(body, reads, writes);
+        }
+        BoundStmtKind::Return(value) | BoundStmtKind::Throw(value) => {
+            if let Some(value) = value {
+                collect_field_uses(value, reads, writes);
+            }
+        }
+        BoundStmtKind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            collect_field_accesses(body, reads, writes);
+            for catch in catches {
+                collect_field_accesses(&catch.body, reads, writes);
+            }
+            if let Some(finally) = finally {
+                collect_field_accesses(finally, reads, writes);
+            }
+        }
+        BoundStmtKind::Switch {
+            expression,
+            sections,
+        } => {
+            collect_field_uses(expression, reads, writes);
+            for section in sections {
+                for statement in &section.statements {
+                    collect_field_accesses(statement, reads, writes);
+                }
+            }
+        }
+        BoundStmtKind::Lock { expression, body } => {
+            collect_field_uses(expression, reads, writes);
+            collect_field_accesses(body, reads, writes);
+        }
+        BoundStmtKind::Fixed { init, body, .. } => {
+            collect_field_uses(init, reads, writes);
+            collect_field_accesses(body, reads, writes);
+        }
+        BoundStmtKind::Using { resource, body } => {
+            for statement in resource {
+                collect_field_accesses(statement, reads, writes);
+            }
+            collect_field_accesses(body, reads, writes);
+        }
+        BoundStmtKind::Checked(inner)
+        | BoundStmtKind::Unchecked(inner)
+        | BoundStmtKind::Labeled { body: inner, .. } => {
+            collect_field_accesses(inner, reads, writes);
+        }
+    }
+}
+
+/// Records the field reads and writes in `expr` (see [`collect_field_accesses`]). Also the
+/// entry point for a field initializer's own expression.
+/// Marks a field-access expression's field as WRITTEN. Used for the in-place assignment forms --
+/// a compound `+=`, a `ref`/`out` argument, an address-of, and `++`/`--` -- so a field mutated only
+/// that way is not mistaken for read-never-written (which CS0649 would otherwise flag on valid code).
+fn mark_field_write(expr: &BoundExpr, writes: &mut FieldSet) {
+    if let BoundExprKind::FieldAccess {
+        field: Some(field), ..
+    } = &expr.kind
+    {
+        if let Some(key) = field_type_key(&field.declaring_type) {
+            writes.insert((key, field.name.clone()));
+        }
+    }
+}
+
+pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes: &mut FieldSet) {
+    match &expr.kind {
+        BoundExprKind::Assignment {
+            operator,
+            target,
+            value,
+            ..
+        } => {
+            if matches!(operator, AssignmentOperator::Assign) {
+                if let BoundExprKind::FieldAccess {
+                    receiver,
+                    field: Some(field),
+                    ..
+                } = &target.kind
+                {
+                    if let Some(key) = field_type_key(&field.declaring_type) {
+                        writes.insert((key, field.name.clone()));
+                    }
+                    collect_field_uses(receiver, reads, writes);
+                    collect_field_uses(value, reads, writes);
+                    return;
+                }
+            } else {
+                mark_field_write(target, writes);
+            }
+            collect_field_uses(target, reads, writes);
+            collect_field_uses(value, reads, writes);
+        }
+        BoundExprKind::FieldAccess {
+            receiver, field, ..
+        } => {
+            if let Some(field) = field {
+                if let Some(key) = field_type_key(&field.declaring_type) {
+                    reads.insert((key, field.name.clone()));
+                }
+            }
+            collect_field_uses(receiver, reads, writes);
+        }
+        BoundExprKind::Literal(_)
+        | BoundExprKind::This
+        | BoundExprKind::Base
+        | BoundExprKind::Local(_)
+        | BoundExprKind::TypeReference(_)
+        | BoundExprKind::NamespaceReference(_)
+        | BoundExprKind::TypeOf(_)
+        | BoundExprKind::SizeOf(_)
+        | BoundExprKind::Error => {}
+        BoundExprKind::PropertyAccess { receiver, .. }
+        | BoundExprKind::MethodGroup { receiver, .. } => collect_field_uses(receiver, reads, writes),
+        BoundExprKind::Ref { operand, .. } | BoundExprKind::AddressOf { operand } => {
+            mark_field_write(operand, writes);
+            collect_field_uses(operand, reads, writes);
+        }
+        BoundExprKind::Dereference { operand } => collect_field_uses(operand, reads, writes),
+        BoundExprKind::MakeRef(operand) | BoundExprKind::RefType(operand) => {
+            collect_field_uses(operand, reads, writes);
+        }
+        BoundExprKind::RefValue { reference, .. } => collect_field_uses(reference, reads, writes),
+        BoundExprKind::StackAlloc { count, .. } => collect_field_uses(count, reads, writes),
+        BoundExprKind::Call {
+            callee, arguments, ..
+        } => {
+            collect_field_uses(callee, reads, writes);
+            for argument in arguments {
+                collect_field_uses(argument, reads, writes);
+            }
+        }
+        BoundExprKind::ElementAccess { receiver, indices } => {
+            collect_field_uses(receiver, reads, writes);
+            for index in indices {
+                collect_field_uses(index, reads, writes);
+            }
+        }
+        BoundExprKind::ArrayCreation { lengths, elements } => {
+            for length in lengths {
+                collect_field_uses(length, reads, writes);
+            }
+            for element in elements {
+                collect_field_uses(element, reads, writes);
+            }
+        }
+        BoundExprKind::ObjectCreation { arguments, .. } => {
+            for argument in arguments {
+                collect_field_uses(argument, reads, writes);
+            }
+        }
+        BoundExprKind::DelegateCreation { receiver, .. } => {
+            if let Some(receiver) = receiver {
+                collect_field_uses(receiver, reads, writes);
+            }
+        }
+        BoundExprKind::Binary { left, right, .. } => {
+            collect_field_uses(left, reads, writes);
+            collect_field_uses(right, reads, writes);
+        }
+        BoundExprKind::Postfix { operand, .. } => {
+            mark_field_write(operand, writes);
+            collect_field_uses(operand, reads, writes);
+        }
+        BoundExprKind::Unary { operator, operand } => {
+            if matches!(
+                operator,
+                UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
+            ) {
+                mark_field_write(operand, writes);
+            }
+            collect_field_uses(operand, reads, writes);
+        }
+        BoundExprKind::Cast { operand, .. }
+        | BoundExprKind::TypeTest { operand, .. }
+        | BoundExprKind::Conversion { operand, .. } => collect_field_uses(operand, reads, writes),
+        BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
+            collect_field_uses(inner, reads, writes);
+        }
+        BoundExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            collect_field_uses(condition, reads, writes);
+            collect_field_uses(when_true, reads, writes);
+            collect_field_uses(when_false, reads, writes);
+        }
+    }
+}
+
 /// Reports `CS0162` for the first statement in each block whose start point cannot be
 /// reached (8.1). This is deliberately conservative: a statement is flagged only when
 /// control *definitely* cannot reach it -- after a `return`/`throw`/`break`/
@@ -320,8 +607,15 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
 /// rather than risk flagging reachable code.
 #[must_use]
 pub fn check_unreachable(body: &BoundStmt) -> Vec<Diagnostic> {
+    let mut goto_targets: BTreeSet<Box<str>> = BTreeSet::new();
+    visit_statements(body, &mut |stmt| {
+        if let BoundStmtKind::Goto(label) = &stmt.kind {
+            goto_targets.insert(label.clone());
+        }
+    });
     let mut check = Unreachable {
         diagnostics: Vec::new(),
+        goto_targets,
     };
     check.statement(body);
     check.diagnostics
@@ -329,6 +623,9 @@ pub fn check_unreachable(body: &BoundStmt) -> Vec<Diagnostic> {
 
 struct Unreachable {
     diagnostics: Vec<Diagnostic>,
+    /// The labels that some `goto` targets; a labeled statement among them is a jump landing
+    /// point, so it is reachable even after a statement whose control does not fall through.
+    goto_targets: BTreeSet<Box<str>>,
 }
 
 impl Unreachable {
@@ -337,6 +634,9 @@ impl Unreachable {
     fn block(&mut self, statements: &[BoundStmt]) -> bool {
         let mut reachable = true;
         for statement in statements {
+            if !reachable && self.is_goto_target(statement) {
+                reachable = true;
+            }
             if !reachable {
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::UnreachableCode,
@@ -347,6 +647,11 @@ impl Unreachable {
             reachable = self.statement(statement);
         }
         reachable
+    }
+
+    /// Whether `stmt` is a labeled statement whose label some `goto` targets.
+    fn is_goto_target(&self, stmt: &BoundStmt) -> bool {
+        matches!(&stmt.kind, BoundStmtKind::Labeled { label, .. } if self.goto_targets.contains(label))
     }
 
     /// Whether control can reach the end point of `stmt`, given its start is reached.
@@ -558,6 +863,63 @@ pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
     diagnostics
 }
 
+/// The section indices of a switch that a jump can land in: a `goto case`/`goto default`
+/// reaching a labeled section, or a `goto label` reaching a named label declared inside one.
+/// Under a constant governing value a section the constant does not select is still reachable
+/// -- and so still contributes to the switch's definite-assignment intersection -- when a jump
+/// targets it. Keeping a jump-targeted section is the conservative direction (it matches the
+/// analysis's prior, jump-blind behavior); only a section that NO jump can reach and no case
+/// selects is dropped. Nested switches are descended for `goto case`/`goto default` too, which
+/// can only over-attribute (keep a section that a constant would otherwise drop), never the
+/// reverse -- so it cannot turn a real diagnostic into a false one.
+fn switch_jump_targets(sections: &[BoundSwitchSection]) -> BTreeSet<usize> {
+    let mut case_section: BTreeMap<i64, usize> = BTreeMap::new();
+    let mut default_section: Option<usize> = None;
+    let mut label_section: BTreeMap<Box<str>, usize> = BTreeMap::new();
+    for (index, section) in sections.iter().enumerate() {
+        for label in &section.labels {
+            match label {
+                BoundSwitchLabel::Case(value) => {
+                    case_section.insert(*value, index);
+                }
+                BoundSwitchLabel::Default => default_section = Some(index),
+                _ => {}
+            }
+        }
+        for statement in &section.statements {
+            visit_statements(statement, &mut |stmt| {
+                if let BoundStmtKind::Labeled { label, .. } = &stmt.kind {
+                    label_section.insert(label.clone(), index);
+                }
+            });
+        }
+    }
+    let mut targets = BTreeSet::new();
+    for section in sections {
+        for statement in &section.statements {
+            visit_statements(statement, &mut |stmt| match &stmt.kind {
+                BoundStmtKind::GotoCase(value) => {
+                    if let Some(&index) = case_section.get(value) {
+                        targets.insert(index);
+                    }
+                }
+                BoundStmtKind::GotoDefault => {
+                    if let Some(index) = default_section {
+                        targets.insert(index);
+                    }
+                }
+                BoundStmtKind::Goto(label) => {
+                    if let Some(&index) = label_section.get(label) {
+                        targets.insert(index);
+                    }
+                }
+                _ => {}
+            });
+        }
+    }
+    targets
+}
+
 /// Reports `CS0165` for every read of a local that is not definitely assigned on
 /// all paths to it (clause 12, Annex A). `parameters` start definitely assigned.
 /// `model` distinguishes a struct (whose field assignment assigns the local) from a
@@ -566,15 +928,31 @@ pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
 pub fn check_definite_assignment(
     body: &BoundStmt,
     parameters: &[Box<str>],
+    out_parameters: &[Box<str>],
     model: &Model,
 ) -> Vec<Diagnostic> {
     let mut analyzer = Analyzer {
         diagnostics: Vec::new(),
         model,
         break_frames: Vec::new(),
+        out_parameters: out_parameters.iter().cloned().collect(),
+        unassigned_out: BTreeSet::new(),
     };
-    let assigned: Assigned = parameters.iter().cloned().collect();
-    analyzer.statement(body, assigned);
+    let mut assigned: Assigned = parameters.iter().cloned().collect();
+    for out in out_parameters {
+        assigned.remove(out);
+    }
+    let flow = analyzer.statement(body, assigned);
+    if let Flow::Reaches(final_assigned) = flow {
+        analyzer.record_unassigned_out(&final_assigned);
+    }
+    let unassigned: Vec<Box<str>> = analyzer.unassigned_out.iter().cloned().collect();
+    for parameter in unassigned {
+        analyzer.diagnostics.push(Diagnostic::new(
+            DiagnosticKind::OutParameterNotAssigned { parameter },
+            body.span,
+        ));
+    }
     analyzer.diagnostics
 }
 
@@ -585,6 +963,11 @@ struct Analyzer<'a> {
     /// records the definitely-assigned set at that point into the top frame; a `switch`
     /// then intersects its breaks (and fall-throughs) to know what is assigned after it.
     break_frames: Vec<Vec<Assigned>>,
+    /// The method's `out` parameters, each of which must be assigned before every exit (CS0177).
+    out_parameters: BTreeSet<Box<str>>,
+    /// The `out` parameters found unassigned at some exit (a `return` or the reachable endpoint),
+    /// accumulated across the walk and reported once each at the end.
+    unassigned_out: BTreeSet<Box<str>>,
 }
 
 impl Analyzer<'_> {
@@ -593,6 +976,16 @@ impl Analyzer<'_> {
         self.model
             .get_by_symbol(ty)
             .is_some_and(|info| info.kind == TypeKind::Struct)
+    }
+
+    /// Records every `out` parameter not in `assigned` as unassigned at this exit (CS0177). A
+    /// `throw` is not an exit for this purpose -- an out parameter need not be assigned before it.
+    fn record_unassigned_out(&mut self, assigned: &Assigned) {
+        for parameter in &self.out_parameters {
+            if !assigned.contains(parameter) {
+                self.unassigned_out.insert(parameter.clone());
+            }
+        }
     }
 
     fn statement(&mut self, stmt: &BoundStmt, assigned: Assigned) -> Flow {
@@ -700,7 +1093,15 @@ impl Analyzer<'_> {
                 self.statement_in_loop(body, body_set);
                 Flow::Reaches(assigned)
             }
-            BoundStmtKind::Return(value) | BoundStmtKind::Throw(value) => {
+            BoundStmtKind::Return(value) => {
+                let mut assigned = assigned;
+                if let Some(value) = value {
+                    self.expression(value, &mut assigned, span);
+                }
+                self.record_unassigned_out(&assigned);
+                Flow::Exits
+            }
+            BoundStmtKind::Throw(value) => {
                 if let Some(value) = value {
                     let mut assigned = assigned;
                     self.expression(value, &mut assigned, span);
@@ -724,9 +1125,43 @@ impl Analyzer<'_> {
             } => {
                 let mut assigned = assigned;
                 self.expression(expression, &mut assigned, span);
+                let has_default = sections
+                    .iter()
+                    .any(|section| section.labels.contains(&BoundSwitchLabel::Default));
+                let reachable: Option<Vec<bool>> = constant_int_value(expression).map(|value| {
+                    let entry = sections
+                        .iter()
+                        .position(|section| {
+                            section.labels.iter().any(
+                                |label| matches!(label, BoundSwitchLabel::Case(v) if *v == value),
+                            )
+                        })
+                        .or_else(|| {
+                            has_default.then(|| {
+                                sections
+                                    .iter()
+                                    .position(|section| {
+                                        section.labels.contains(&BoundSwitchLabel::Default)
+                                    })
+                                    .expect("has_default")
+                            })
+                        });
+                    match entry {
+                        None => alloc::vec![false; sections.len()],
+                        Some(entry) => {
+                            let targets = switch_jump_targets(sections);
+                            (0..sections.len())
+                                .map(|index| index == entry || targets.contains(&index))
+                                .collect()
+                        }
+                    }
+                });
                 self.break_frames.push(Vec::new());
                 let mut after = Flow::Exits;
-                for section in sections {
+                for (index, section) in sections.iter().enumerate() {
+                    if reachable.as_ref().is_some_and(|r| !r[index]) {
+                        continue;
+                    }
                     if let Flow::Reaches(set) = self.block(&section.statements, assigned.clone()) {
                         after = merge(after, Flow::Reaches(set));
                     }
@@ -734,13 +1169,14 @@ impl Analyzer<'_> {
                 for set in self.break_frames.pop().unwrap_or_default() {
                     after = merge(after, Flow::Reaches(set));
                 }
-                let has_default = sections
-                    .iter()
-                    .any(|section| section.labels.contains(&BoundSwitchLabel::Default));
-                if has_default {
-                    after
-                } else {
+                let can_skip = match &reachable {
+                    Some(reachable) => reachable.iter().all(|&reachable| !reachable),
+                    None => !has_default,
+                };
+                if can_skip {
                     merge(after, Flow::Reaches(assigned))
+                } else {
+                    after
                 }
             }
             BoundStmtKind::Try {

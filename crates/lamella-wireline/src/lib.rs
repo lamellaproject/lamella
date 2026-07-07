@@ -126,9 +126,53 @@ impl UsbTransport {
     /// # Errors
     /// [`TransportError::Carrier`] if the platform cannot enumerate by interface GUID.
     pub fn list() -> Result<Vec<lamella_usbbulk::DeviceInfo>, TransportError> {
-        lamella_usbbulk::enumerate_interface(lamella_wire::usb::WINUSB_INTERFACE_GUID)
-            .map_err(|_| TransportError::Carrier)
+        match lamella_usbbulk::enumerate_interface(lamella_wire::usb::WINUSB_INTERFACE_GUID) {
+            Ok(boards) => Ok(boards),
+            Err(lamella_usbbulk::Error::Unsupported) => Ok(lamella_usbbulk::enumerate()
+                .map_err(|_| TransportError::Carrier)?
+                .into_iter()
+                .filter(|board| board.vendor_id == lamella_wire::usb::VID)
+                .collect()),
+            Err(_) => Err(TransportError::Carrier),
+        }
     }
+}
+
+/// A serial port the OS reports, with its USB identity when it is a USB device -- the serial half of the
+/// board picker (an RPi Debug Probe / FTDI / EDBG UART, etc.). Cross-platform via `serialport::available_ports`.
+#[cfg(feature = "serial")]
+#[derive(Debug, Clone)]
+pub struct SerialPortDesc {
+    /// The OS port name (`COM8`, `/dev/ttyACM0`, `/dev/cu.usbmodemXXXX`, ...).
+    pub port: String,
+    /// USB vendor id, when the port is a USB device.
+    pub vid: Option<u16>,
+    /// USB product id, when the port is a USB device.
+    pub pid: Option<u16>,
+    /// USB serial-number string, if the OS reported one.
+    pub serial_number: Option<String>,
+    /// USB product string, if the OS reported one.
+    pub product: Option<String>,
+}
+
+/// List the OS serial ports (cross-platform: Windows / macOS / Linux), with USB identity where the port is a
+/// USB device -- the serial half of the board picker. A bare (non-USB) UART comes back with `vid`/`pid` `None`.
+#[cfg(feature = "serial")]
+#[must_use]
+pub fn list_serial() -> Vec<SerialPortDesc> {
+    serialport::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|port| {
+            let (vid, pid, serial_number, product) = match port.port_type {
+                serialport::SerialPortType::UsbPort(info) => {
+                    (Some(info.vid), Some(info.pid), info.serial_number, info.product)
+                }
+                _ => (None, None, None, None),
+            };
+            SerialPortDesc { port: port.port_name, vid, pid, serial_number, product }
+        })
+        .collect()
 }
 
 /// Parse an example's `usb` target argument into (vid, pid, serial-substring):

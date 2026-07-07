@@ -4,7 +4,8 @@
 //! array layout `[u32 unit_count][u16 units]`, so the helpers build/read their results with
 //! `AllocArray` (element size 2), array loads/stores, `FieldLoad` of the count word, and the integer
 //! Div/Rem. A backend rewrites the marker to a call to the appended helper and lowers it through its
-//! usual path.
+//! usual path. Kept out of the feature-gated WASM module so the always-compiled ARM + RISC-V backends
+//! can use them too.
 
 use alloc::vec;
 use alloc::vec::Vec;

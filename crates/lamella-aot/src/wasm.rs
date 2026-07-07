@@ -53,8 +53,8 @@ pub fn lower_vtables(func: &Function, descriptors: &[TypeMeta]) -> Result<Vec<u8
 
 /// Lowers a module of [`Function`]s to WebAssembly. Module order fixes call indices -- function 0
 /// is the entry and is exported as `main` for the host/JS to call; an `Inst::Call`'s `callee` is
-/// the callee's index in this slice (which is also its WebAssembly function index, as there are no
-/// imports yet).
+/// the callee's index in this slice. A module with P/Invokes (host imports) offsets each defined
+/// function by the import count, since imported functions occupy the low WebAssembly indices.
 pub fn lower_module(funcs: &[Function]) -> Result<Vec<u8>, LowerError> {
     let main_export: &[(&str, u32)] = if funcs.is_empty() {
         &[]
@@ -96,8 +96,11 @@ fn lower_module_inner(
         }
     }
 
+    let native_import_sigs = collect_native_imports(&program)?;
+    let import_count = native_import_sigs.len() as u32;
+
     let (desc_segments, desc_addr, desc_end) =
-        layout_descriptors(&program, descriptors, strings.heap_base as u32);
+        layout_descriptors(&program, descriptors, strings.heap_base as u32, import_count);
 
     let mut module = Module::new();
     let has_memory =
@@ -157,10 +160,19 @@ fn lower_module_inner(
         module.enable_func_table();
     }
 
+    let mut native_imports: BTreeMap<alloc::string::String, u32> = BTreeMap::new();
+    for (name, sig) in native_import_sigs {
+        let type_index = module.add_type(sig);
+        let index = module.add_import_func("lamella_native", &name, type_index);
+        native_imports.insert(name, index);
+    }
+
     let ctx = WasmCtx {
         funcs: &program,
         desc_addr,
         sig_types,
+        import_count,
+        native_imports,
     };
     for func in &program {
         let type_index = module.add_type(func_type(func)?);
@@ -168,7 +180,7 @@ fn lower_module_inner(
         module.add_function(type_index, body);
     }
     if with_allocator && has_memory {
-        let alloc_index = program.len() as u32;
+        let alloc_index = import_count + program.len() as u32;
         let alloc_type = module.add_type(FuncType {
             params: alloc::vec![ValType::I32],
             results: alloc::vec![ValType::I32],
@@ -183,7 +195,7 @@ fn lower_module_inner(
         module.export_func("dealloc", alloc_index + 1);
     }
     for (name, index) in exports {
-        module.export_func(name, *index);
+        module.export_func(name, import_count + *index);
     }
     Ok(module.finish())
 }
@@ -330,6 +342,12 @@ struct WasmCtx<'a> {
     funcs: &'a [Function],
     desc_addr: BTreeMap<u32, i32>,
     sig_types: Vec<(FuncType, u32)>,
+    /// The number of imported functions. Imports occupy the low function indices, so every DEFINED
+    /// function reference (a `Call` callee, a `FuncAddr`/vtable table index, an export) is
+    /// `import_count + its index in `funcs``.
+    import_count: u32,
+    /// Each `Inst::PInvoke` import name -> its wasm function index (in the `"lamella_native"` module).
+    native_imports: BTreeMap<alloc::string::String, u32>,
 }
 
 impl WasmCtx<'_> {
@@ -384,6 +402,50 @@ fn intern_sig(module: &mut Module, sig_types: &mut Vec<(FuncType, u32)>, sig: Fu
     sig_types.push((sig, index));
 }
 
+/// The distinct host imports a module needs, one per `Inst::PInvoke` import name (in first-appearance
+/// order), each with the marshaled signature: parameters from the call's argument value types, and a
+/// single result from the call-result value's type. This is the WASM analog of the RISC-V/ARM
+/// extern-by-name -- except on wasm the symbol binds to a HOST IMPORT (module `"lamella_native"`, per
+/// the embedding ABI), not a linked object. A `[DllImport]` and the corlib's `Console.Write` (which
+/// lowers to a P/Invoke of `lamella_console_write_*`) both resolve this way; a `void` call's result
+/// value is a dead placeholder (typed `i32`), so its import returns `i32` too (the host ignores it).
+fn collect_native_imports(
+    program: &[Function],
+) -> Result<Vec<(alloc::string::String, FuncType)>, LowerError> {
+    let mut imports: Vec<(alloc::string::String, FuncType)> = Vec::new();
+    for func in program {
+        for (result, inst) in func.blocks.iter().flat_map(|b| &b.insts) {
+            let Inst::PInvoke { import, args } = inst else {
+                continue;
+            };
+            if imports.iter().any(|(name, _)| name.as_str() == &**import) {
+                continue;
+            }
+            let mut params = Vec::with_capacity(args.len());
+            for &a in args {
+                params.push(valtype(
+                    func.value_types
+                        .get(a.index())
+                        .copied()
+                        .ok_or(LowerError::Unsupported)?,
+                )?);
+            }
+            let results = alloc::vec![valtype(
+                func.value_types
+                    .get(result.index())
+                    .copied()
+                    .ok_or(LowerError::Unsupported)?,
+            )?];
+            imports.push((alloc::string::String::from(&**import), FuncType { params, results }));
+        }
+    }
+    Ok(imports)
+}
+
+/// The result of [`layout_descriptors`]: the linear-memory data segments (`(offset, bytes)`), the
+/// `type handle -> descriptor address` map, and the next free linear-memory offset.
+type DescriptorLayout = (Vec<(u32, Vec<u8>)>, BTreeMap<u32, i32>, u32);
+
 /// Lays each allocated or queried type's descriptor in linear memory from `base`. Per type the vtable
 /// (function = table indices) is laid BEFORE a fixed metadata block so slot `k` is `[desc - 4 - k*4]`,
 /// and `desc` (the address in the map -- the object header + `TypeDescAddr` value) points at:
@@ -396,7 +458,8 @@ fn layout_descriptors(
     program: &[Function],
     descriptors: &[TypeMeta],
     base: u32,
-) -> (Vec<(u32, Vec<u8>)>, BTreeMap<u32, i32>, u32) {
+    import_count: u32,
+) -> DescriptorLayout {
     let base_of = |h: u32| {
         descriptors
             .iter()
@@ -455,14 +518,14 @@ fn layout_descriptors(
                     0
                 }
             };
-            blob.extend_from_slice(&index.to_le_bytes());
+            blob.extend_from_slice(&(index + import_count).to_le_bytes());
         }
         blob.extend_from_slice(&handle.to_le_bytes());
         blob.extend_from_slice(&base_ptr.to_le_bytes());
         blob.extend_from_slice(&(itable.len() as u32).to_le_bytes());
         for &(tag, func_index) in itable {
             blob.extend_from_slice(&tag.to_le_bytes());
-            blob.extend_from_slice(&func_index.to_le_bytes());
+            blob.extend_from_slice(&(func_index + import_count).to_le_bytes());
         }
         segments.push((desc_addr - (vtable.len() as u32) * 4, blob));
     }
@@ -1009,7 +1072,7 @@ fn lower_inst(
             for &arg in args {
                 body.local_get(local(arg));
             }
-            body.call(*callee);
+            body.call(ctx.import_count + *callee);
             let returns_value = ctx
                 .funcs
                 .get(*callee as usize)
@@ -1017,6 +1080,17 @@ fn lower_inst(
             if returns_value {
                 body.local_set(local(result));
             }
+        }
+        Inst::PInvoke { import, args } => {
+            for &arg in args {
+                body.local_get(local(arg));
+            }
+            let index = *ctx
+                .native_imports
+                .get(&**import)
+                .ok_or(LowerError::Unsupported)?;
+            body.call(index);
+            body.local_set(local(result));
         }
         Inst::Load {
             address,
@@ -1254,7 +1328,7 @@ fn lower_inst(
             emit_array_store(body, *element_size, value_types[value.index()])?;
         }
         Inst::FuncAddr { func } => {
-            body.i32_const(*func as i32);
+            body.i32_const((ctx.import_count + *func) as i32);
             body.local_set(local(result));
         }
         Inst::VirtualFuncAddr { object, slot } => {

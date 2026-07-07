@@ -20,6 +20,8 @@ type mach_port_t = u32;
 type CFAllocatorRef = *const c_void;
 type CFUUIDRef = *const c_void;
 type CFDictionaryRef = *const c_void;
+type CFStringRef = *const c_void;
+type CFTypeRef = *const c_void;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -32,8 +34,7 @@ const kUSBIn: u8 = 1;
 const kUSBOut: u8 = 0;
 const kUSBBulk: u8 = 2;
 const DONT_CARE: u16 = 0xFFFF;
-
-const PROBE_VIDS: [u16; 5] = [0x2e8a, 0x0d28, 0x1fc9, 0xc251, 0x03eb];
+const kCFStringEncodingUTF8: u32 = 0x0800_0100;
 
 const ID_CFPLUGIN: [u8; 16] = [0xC2, 0x44, 0xE8, 0x58, 0x10, 0x9C, 0x11, 0xD4, 0x91, 0xD4, 0x00, 0x50, 0xE4, 0xC6, 0x42, 0x6F];
 const ID_DEV_USERCLIENT: [u8; 16] = [0x9d, 0xc7, 0xb7, 0x80, 0x9e, 0xc0, 0x11, 0xD4, 0xa5, 0x4f, 0x00, 0x0a, 0x27, 0x05, 0x28, 0x61];
@@ -83,7 +84,7 @@ struct IOUSBDeviceInterface500 {
     GetDeviceSpeed: *const c_void,
     GetNumberOfConfigurations: *const c_void,
     GetLocationID: *const c_void,
-    GetConfigurationDescriptorPtr: *const c_void,
+    GetConfigurationDescriptorPtr: extern "C" fn(*mut c_void, u8, *mut *const u8) -> IOReturn,
     GetConfiguration: *const c_void,
     SetConfiguration: extern "C" fn(*mut c_void, u8) -> IOReturn,
     GetBusFrameNumber: *const c_void,
@@ -144,6 +145,9 @@ unsafe extern "C" {
         alloc: CFAllocatorRef, b0: u8, b1: u8, b2: u8, b3: u8, b4: u8, b5: u8, b6: u8, b7: u8,
         b8: u8, b9: u8, b10: u8, b11: u8, b12: u8, b13: u8, b14: u8, b15: u8,
     ) -> CFUUIDRef;
+    fn CFStringCreateWithCString(alloc: CFAllocatorRef, c_str: *const c_char, encoding: u32) -> CFStringRef;
+    fn CFStringGetCString(the_string: CFStringRef, buffer: *mut c_char, buffer_size: isize, encoding: u32) -> u8;
+    fn CFRelease(cf: CFTypeRef);
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -154,6 +158,30 @@ unsafe extern "C" {
     fn IOObjectRelease(object: io_object_t) -> kern_return_t;
     fn IOCreatePlugInInterfaceForService(service: io_service_t, pluginType: CFUUIDRef, interfaceType: CFUUIDRef, theInterface: *mut *mut *mut IOCFPlugInInterface, theScore: *mut i32) -> kern_return_t;
     fn IODestroyPlugInInterface(interface: *mut *mut IOCFPlugInInterface) -> kern_return_t;
+    fn IORegistryEntryCreateCFProperty(entry: io_object_t, key: CFStringRef, allocator: CFAllocatorRef, options: u32) -> CFTypeRef;
+}
+
+/// Read a string property (`"USB Serial Number"`, `"USB Product Name"`) from a device's IORegistry entry,
+/// without opening the device. `None` if absent, empty, or not a string.
+unsafe fn registry_string(entry: io_object_t, key: &str) -> Option<String> {
+    let key_c = std::ffi::CString::new(key).ok()?;
+    let cf_key = CFStringCreateWithCString(null(), key_c.as_ptr(), kCFStringEncodingUTF8);
+    if cf_key.is_null() {
+        return None;
+    }
+    let value = IORegistryEntryCreateCFProperty(entry, cf_key, null(), 0);
+    CFRelease(cf_key);
+    if value.is_null() {
+        return None;
+    }
+    let mut buf = [0 as c_char; 256];
+    let ok = CFStringGetCString(value, buf.as_mut_ptr(), buf.len() as isize, kCFStringEncodingUTF8);
+    CFRelease(value);
+    if ok == 0 {
+        return None;
+    }
+    let text = std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 unsafe fn cfuuid(b: &[u8; 16]) -> CFUUIDRef {
@@ -362,51 +390,30 @@ unsafe fn try_device(
     }
 }
 
-/// Does this (unopened) device expose a vendor-specific (class 0xFF) interface? That's the CMSIS-DAP
-/// v2 signature. Reads interface descriptors only -- opens nothing, so it is safe to probe any device
-/// (it won't disturb a v1-only board that happens to share a probe vendor id).
-unsafe fn has_vendor_iface(dev: *mut *mut IOUSBDeviceInterface500, plugin_id: CFUUIDRef) -> bool {
-    let intf_user = cfuuid(&ID_INTF_USERCLIENT);
-    let intf_iid = CFUUIDBytes { b: ID_INTF_IFACE500 };
-    let req = IOUSBFindInterfaceRequest {
-        bInterfaceClass: DONT_CARE,
-        bInterfaceSubClass: DONT_CARE,
-        bInterfaceProtocol: DONT_CARE,
-        bAlternateSetting: DONT_CARE,
-    };
-    let mut iter: io_iterator_t = 0;
-    if ((**dev).CreateInterfaceIterator)(dev as *mut c_void, &req, &mut iter) != kIOReturnSuccess {
+/// Does this device declare a vendor-specific (class 0xFF) interface -- the CMSIS-DAP v2 / wireline bulk
+/// shape? Reads the CONFIGURATION DESCRIPTOR the OS cached at enumeration (`GetConfigurationDescriptorPtr`),
+/// NOT the live interface nodes: a vendor-only device the OS never configured (no class driver to claim it --
+/// e.g. the Pico's native-USB wireline carrier) exposes NO live interface objects to iterate, but its config
+/// descriptor is always present. Opens nothing, so it is safe to probe any device.
+unsafe fn has_vendor_iface(dev: *mut *mut IOUSBDeviceInterface500) -> bool {
+    let mut desc: *const u8 = null();
+    if ((**dev).GetConfigurationDescriptorPtr)(dev as *mut c_void, 0, &mut desc) != kIOReturnSuccess || desc.is_null() {
         return false;
     }
-    let mut found = false;
-    loop {
-        let svc = IOIteratorNext(iter);
-        if svc == 0 {
+    let total = usize::from(u16::from_le_bytes([*desc.add(2), *desc.add(3)]));
+    let mut offset = 0usize;
+    while offset + 6 <= total {
+        let b_length = usize::from(*desc.add(offset));
+        let b_type = *desc.add(offset + 1);
+        if b_length == 0 {
             break;
         }
-        let mut plugin: *mut *mut IOCFPlugInInterface = null_mut();
-        let mut score = 0i32;
-        if IOCreatePlugInInterfaceForService(svc, intf_user, plugin_id, &mut plugin, &mut score) == kIOReturnSuccess && !plugin.is_null() {
-            let mut raw: *mut c_void = null_mut();
-            ((**plugin).QueryInterface)(plugin as *mut c_void, intf_iid, &mut raw);
-            IODestroyPlugInInterface(plugin);
-            let intf = raw as *mut *mut IOUSBInterfaceInterface500;
-            if !intf.is_null() {
-                let mut cls: u8 = 0;
-                ((**intf).GetInterfaceClass)(intf as *mut c_void, &mut cls);
-                ((**intf).Release)(intf as *mut c_void);
-                if cls == 0xFF {
-                    found = true;
-                }
-            }
+        if b_type == 0x04 && *desc.add(offset + 5) == 0xFF {
+            return true;
         }
-        IOObjectRelease(svc);
-        if found {
-            break;
-        }
+        offset += b_length;
     }
-    IOObjectRelease(iter);
-    found
+    false
 }
 
 /// The VID/PID of the device behind `svc` if it is a usable CMSIS-DAP v2 probe: a known probe vendor
@@ -428,16 +435,16 @@ unsafe fn device_info(svc: io_service_t, plugin_id: CFUUIDRef, dev_user: CFUUIDR
     ((**dev).GetDeviceVendor)(dev as *mut c_void, &mut vid);
     let mut pid: u16 = 0;
     ((**dev).GetDeviceProduct)(dev as *mut c_void, &mut pid);
-    let is_v2 = PROBE_VIDS.contains(&vid) && has_vendor_iface(dev, plugin_id);
+    let is_bulk = has_vendor_iface(dev);
     ((**dev).Release)(dev as *mut c_void);
-    if !is_v2 {
+    if !is_bulk {
         return None;
     }
     Some(DeviceInfo {
         vendor_id: vid,
         product_id: pid,
-        serial_number: None,
-        product: None,
+        serial_number: registry_string(svc, "USB Serial Number"),
+        product: registry_string(svc, "USB Product Name"),
     })
 }
 

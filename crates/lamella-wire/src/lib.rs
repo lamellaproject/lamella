@@ -95,9 +95,31 @@ impl FrameReader {
         Self { buf: Vec::new() }
     }
 
-    /// Append received carrier bytes.
+    /// Append received carrier bytes. Growth is RESERVE-EXACT to the frame length the
+    /// header declares (once enough of it has arrived), not amplify-by-doubling: on a
+    /// bump-allocator target each stale doubling of a multi-KB frame's buffer is permanent
+    /// arena spend within the request, roughly doubling the assembly's high-water.
     pub fn push(&mut self, bytes: &[u8]) {
+        let needed = self.buf.len() + bytes.len();
+        if needed > self.buf.capacity() {
+            let target = needed.max(self.expected_frame_end());
+            self.buf.reserve_exact(target - self.buf.len());
+        }
         self.buf.extend_from_slice(bytes);
+    }
+
+    /// Where the frame currently being assembled ends in `buf` (its sync offset plus the
+    /// header-declared full frame length), or `0` when no header is readable yet -- the
+    /// exact capacity [`FrameReader::push`] reserves toward.
+    fn expected_frame_end(&self) -> usize {
+        let Some(sync) = find_sync(&self.buf) else {
+            return 0;
+        };
+        if self.buf.len() < sync + HEADER_LEN {
+            return 0;
+        }
+        let len = u16::from_le_bytes([self.buf[sync + 2], self.buf[sync + 3]]) as usize;
+        sync + HEADER_LEN + len + CRC_LEN
     }
 
     /// Pull the next complete, CRC-valid frame, or `None` if more bytes are needed. Leading garbage and
@@ -202,6 +224,11 @@ impl Capabilities {
     /// Debug the PERSISTENTLY DEPLOYED image in place (a 0-byte debug attach instead of
     /// re-sending the image over the wire) -- deploy-capable targets only.
     pub const DEBUG_ATTACH: u32 = 1 << 9;
+    /// The `HELLO_ACK` profile identity carries the STRUCTURED board/chip fields
+    /// ([`ProfileIdentity::board_model`] / `chip_idcode` / `chip_devid`), so a host can
+    /// identify the hardware without parsing a display name. The fields may still read
+    /// `0` = unknown (a custom board reports no model; a firmware may not know its ids).
+    pub const PROFILE_CHIPID: u32 = 1 << 10;
 
     /// Whether this set includes `flag`.
     #[must_use]
@@ -268,6 +295,17 @@ pub struct ProfileIdentity {
     pub abi: u16,
     /// The content hash of the resident surface.
     pub hash: u64,
+    /// The BOARD model code from [`board_model`] -- the product the firmware was built for,
+    /// so a host names it without parsing a string. `0` = unknown (a custom board).
+    pub board_model: u16,
+    /// The chip's debug-port IDCODE (the SW-DP `DPIDR` the silicon answers to a probe) --
+    /// the same value a probe-side identify reads, so the host's chip registry serves both
+    /// paths. Known per chip family at firmware build time. `0` = unknown.
+    pub chip_idcode: u32,
+    /// The vendor DEVICE-ID register value (the family's DSU DID / DBGMCU_IDCODE / CHIP_ID
+    /// style die id), read by the firmware from its own silicon at boot where the read is
+    /// implemented. Distinguishes SKUs a shared `DPIDR` cannot. `0` = unknown.
+    pub chip_devid: u32,
     name_len: u8,
     name: [u8; Self::NAME_CAP],
 }
@@ -277,8 +315,12 @@ impl ProfileIdentity {
     pub const NAME_CAP: usize = 16;
     /// Encoded size: `abi(2) | hash(8) | name_len(1)` before the name bytes.
     const FIXED_LEN: usize = 11;
+    /// Encoded size of the board/chip identity tail: `board_model(2) | chip_idcode(4) |
+    /// chip_devid(4)`, after the name bytes ([`Capabilities::PROFILE_CHIPID`]).
+    const CHIP_LEN: usize = 10;
 
     /// Build an identity; a `name` past [`Self::NAME_CAP`] bytes is truncated at a char boundary.
+    /// The board/chip fields start `0` = unknown; [`Self::with_chip`] fills them.
     #[must_use]
     pub fn new(abi: u16, hash: u64, name: &str) -> Self {
         let mut take = name.len().min(Self::NAME_CAP);
@@ -287,7 +329,25 @@ impl ProfileIdentity {
         }
         let mut buf = [0u8; Self::NAME_CAP];
         buf[..take].copy_from_slice(&name.as_bytes()[..take]);
-        Self { abi, hash, name_len: take as u8, name: buf }
+        Self {
+            abi,
+            hash,
+            board_model: 0,
+            chip_idcode: 0,
+            chip_devid: 0,
+            name_len: take as u8,
+            name: buf,
+        }
+    }
+
+    /// The identity with its board/chip fields filled (each `0` = unknown stays honest --
+    /// a custom board passes `board_model::UNKNOWN` and still names its silicon).
+    #[must_use]
+    pub fn with_chip(mut self, board_model: u16, chip_idcode: u32, chip_devid: u32) -> Self {
+        self.board_model = board_model;
+        self.chip_idcode = chip_idcode;
+        self.chip_devid = chip_devid;
+        self
     }
 
     /// The profile name.
@@ -301,10 +361,26 @@ impl ProfileIdentity {
         payload.extend_from_slice(&self.hash.to_le_bytes());
         payload.push(self.name_len);
         payload.extend_from_slice(&self.name[..self.name_len as usize]);
+        payload.extend_from_slice(&self.board_model.to_le_bytes());
+        payload.extend_from_slice(&self.chip_idcode.to_le_bytes());
+        payload.extend_from_slice(&self.chip_devid.to_le_bytes());
     }
 
-    /// Decode from `bytes`; `None` if the fixed head or the declared name is not fully present.
+    /// Decode from `bytes` as a message TAIL (the `HELLO_ACK` shape): the board/chip fields
+    /// are read when present and stay `0` = unknown when a pre-chip-id target sent only the
+    /// shorter identity. `None` if the fixed head or the declared name is not fully present.
     fn decode_from(bytes: &[u8]) -> Option<Self> {
+        let (identity, consumed) = Self::decode_head(bytes, false)?;
+        match bytes.get(consumed..consumed + Self::CHIP_LEN) {
+            Some(_) => Some(Self::decode_head(bytes, true)?.0),
+            None => Some(identity),
+        }
+    }
+
+    /// Decode the identity head, `with_chip` selecting whether the board/chip tail is part of
+    /// the layout (a versioned container like [`ProfileManifest`] knows; a message tail
+    /// detects by length). Returns the identity and the bytes consumed.
+    fn decode_head(bytes: &[u8], with_chip: bool) -> Option<(Self, usize)> {
         if bytes.len() < Self::FIXED_LEN {
             return None;
         }
@@ -314,8 +390,56 @@ impl ProfileIdentity {
         let name_bytes = bytes.get(Self::FIXED_LEN..Self::FIXED_LEN + name_len)?;
         let mut name = [0u8; Self::NAME_CAP];
         name[..name_len].copy_from_slice(name_bytes);
-        Some(Self { abi, hash, name_len: name_len as u8, name })
+        let mut consumed = Self::FIXED_LEN + name_len;
+        let (board_model, chip_idcode, chip_devid) = if with_chip {
+            let tail = bytes.get(consumed..consumed + Self::CHIP_LEN)?;
+            consumed += Self::CHIP_LEN;
+            (
+                u16::from_le_bytes([tail[0], tail[1]]),
+                u32::from_le_bytes([tail[2], tail[3], tail[4], tail[5]]),
+                u32::from_le_bytes([tail[6], tail[7], tail[8], tail[9]]),
+            )
+        } else {
+            (0, 0, 0)
+        };
+        Some((
+            Self {
+                abi,
+                hash,
+                board_model,
+                chip_idcode,
+                chip_devid,
+                name_len: name_len as u8,
+                name,
+            },
+            consumed,
+        ))
     }
+}
+
+/// Known BOARD model codes for [`ProfileIdentity::board_model`] -- the products the in-tree
+/// serve firmwares are built for. The host registries (Studio's `boards.js`, Code's device UI)
+/// mirror these codes to display names; `0` stays "unknown" so a custom board never lies.
+/// Codes are wire values: append-only, never renumber.
+pub mod board_model {
+    /// Unknown / custom board (the chip fields may still identify the silicon).
+    pub const UNKNOWN: u16 = 0;
+    /// BBC micro:bit v1 (nRF51822).
+    pub const MICROBIT_V1: u16 = 1;
+    /// Raspberry Pi Pico 2 (RP2350).
+    pub const PICO2: u16 = 2;
+    /// SAM4S Xplained Pro (ATSAM4SD32C).
+    pub const SAM4S_XPLAINED_PRO: u16 = 3;
+    /// SAM E54 Xplained Pro (ATSAME54P20A).
+    pub const SAME54_XPLAINED_PRO: u16 = 4;
+    /// SAM D21 Xplained Pro (ATSAMD21J18A).
+    pub const SAMD21_XPLAINED_PRO: u16 = 5;
+    /// SAM W25 Xplained Pro (ATSAMW25: a SAMD21G18A host MCU + WINC1500 WiFi module).
+    pub const SAMW25_XPLAINED_PRO: u16 = 6;
+    /// The STM32L476 bench board.
+    pub const STM32L476: u16 = 8;
+    /// Arduino MKR1000 (SAMD21G18A host MCU + WINC1500).
+    pub const MKR1000: u16 = 9;
 }
 
 /// The target's `HELLO_ACK`: the negotiated version + the target's capabilities, optionally
@@ -440,14 +564,22 @@ pub struct ProfileManifest {
 }
 
 impl ProfileManifest {
-    /// Manifest layout version.
-    pub const VERSION: u8 = 1;
+    /// Manifest layout version. v2 added the identity's board/chip tail
+    /// (`board_model(2) | chip_idcode(4) | chip_devid(4)` between the name and the count);
+    /// v1 manifests (pre-chip-id targets) still decode, their chip fields reading `0`.
+    pub const VERSION: u8 = 2;
 
-    /// `version(1) | abi(2) | hash(8) | name_len(1) | name | count(2) | count x id(4)`, LE.
+    /// `version(1) | abi(2) | hash(8) | name_len(1) | name | board_model(2) |
+    /// chip_idcode(4) | chip_devid(4) | count(2) | count x id(4)`, LE.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut payload =
-            Vec::with_capacity(1 + ProfileIdentity::FIXED_LEN + ProfileIdentity::NAME_CAP + 2 + self.intrinsic_ids.len() * 4);
+        let mut payload = Vec::with_capacity(
+            1 + ProfileIdentity::FIXED_LEN
+                + ProfileIdentity::NAME_CAP
+                + ProfileIdentity::CHIP_LEN
+                + 2
+                + self.intrinsic_ids.len() * 4,
+        );
         payload.push(Self::VERSION);
         self.identity.encode_into(&mut payload);
         let count = self.intrinsic_ids.len().min(u16::MAX as usize);
@@ -459,13 +591,16 @@ impl ProfileManifest {
     }
 
     /// Decode, tolerating a longer payload; `None` on an unknown version or a truncated list.
+    /// A v1 payload (a pre-chip-id target) decodes with its chip fields at `0` = unknown.
     #[must_use]
     pub fn decode(payload: &[u8]) -> Option<Self> {
-        if payload.first() != Some(&Self::VERSION) {
-            return None;
-        }
-        let identity = ProfileIdentity::decode_from(payload.get(1..)?)?;
-        let ids_at = 1 + ProfileIdentity::FIXED_LEN + identity.name_len as usize;
+        let with_chip = match payload.first() {
+            Some(1) => false,
+            Some(&Self::VERSION) => true,
+            _ => return None,
+        };
+        let (identity, consumed) = ProfileIdentity::decode_head(payload.get(1..)?, with_chip)?;
+        let ids_at = 1 + consumed;
         let count_bytes = payload.get(ids_at..ids_at + 2)?;
         let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
         let mut intrinsic_ids = Vec::with_capacity(count);
@@ -611,6 +746,50 @@ mod tests {
         let identity = ProfileIdentity::new(1, 7, "a-very-long-profile-name-indeed");
         assert_eq!(identity.name().len(), ProfileIdentity::NAME_CAP);
         assert!("a-very-long-profile-name-indeed".starts_with(identity.name()));
+    }
+
+    #[test]
+    fn board_chip_identity_rides_the_ack_and_degrades_to_unknown() {
+        let identity = ProfileIdentity::new(1, 42, "kernel-floor").with_chip(
+            board_model::SAMW25_XPLAINED_PRO,
+            0x0bc1_1477,
+            0xDEAD_0001,
+        );
+        let ack = HelloAck { chosen: 1, caps: Capabilities(Capabilities::PROFILE_CHIPID), profile: Some(identity) };
+        let back = HelloAck::decode(&ack.encode()).expect("decodes");
+        let profile = back.profile.expect("identity present");
+        assert_eq!(profile.board_model, board_model::SAMW25_XPLAINED_PRO);
+        assert_eq!(profile.chip_idcode, 0x0bc1_1477);
+        assert_eq!(profile.chip_devid, 0xDEAD_0001);
+        assert_eq!(profile, identity);
+
+        let mut old_wire = ack.encode();
+        old_wire.truncate(old_wire.len() - ProfileIdentity::CHIP_LEN);
+        let old = HelloAck::decode(&old_wire).expect("still an ack").profile.expect("identity present");
+        assert_eq!((old.board_model, old.chip_idcode, old.chip_devid), (0, 0, 0));
+        assert_eq!(old.name(), "kernel-floor");
+
+        let mut ragged = ack.encode();
+        ragged.truncate(ragged.len() - 3);
+        let ragged = HelloAck::decode(&ragged).expect("still an ack").profile.expect("present");
+        assert_eq!(ragged.chip_idcode, 0);
+    }
+
+    #[test]
+    fn profile_manifest_v1_still_decodes_with_unknown_chip() {
+        let mut v1 = vec![1u8];
+        v1.extend_from_slice(&7u16.to_le_bytes());
+        v1.extend_from_slice(&99u64.to_le_bytes());
+        v1.push(2);
+        v1.extend_from_slice(b"kf");
+        v1.extend_from_slice(&2u16.to_le_bytes());
+        v1.extend_from_slice(&10u32.to_le_bytes());
+        v1.extend_from_slice(&11u32.to_le_bytes());
+        let manifest = ProfileManifest::decode(&v1).expect("a v1 manifest decodes");
+        assert_eq!(manifest.identity.abi, 7);
+        assert_eq!(manifest.identity.name(), "kf");
+        assert_eq!(manifest.identity.chip_idcode, 0, "v1 carries no chip identity");
+        assert_eq!(manifest.intrinsic_ids, vec![10, 11]);
     }
 
     #[test]

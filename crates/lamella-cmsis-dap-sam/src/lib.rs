@@ -14,6 +14,39 @@ const SAMD21_PAGE: usize = 64;
 const SAMD21_ROW: u32 = 256;
 const SAMD21_MANW: u32 = 1 << 7;
 
+const DSU_STATUSA: u32 = 0x4100_2001;
+const DSU_STATUSA_EXT: u32 = 0x4100_2101;
+const DSU_CRSTEXT: u8 = 1 << 1;
+
+/// SAM D21 debug attach beyond the chip-agnostic operations.
+pub trait Samd21Debug {
+    /// Halts the SAM D21 at its reset vector regardless of what the running firmware does
+    /// (an armed watchdog defeats a plain halt request; the DSU reset extension defeats a
+    /// plain vector catch): catch armed under held `nRESET`, then the cold-plugging
+    /// extension released INTO the catch.
+    fn samd21_reset_halt(&mut self) -> Result<(), DapError>;
+}
+
+impl<T: Transport> Samd21Debug for Dap<T> {
+    fn samd21_reset_halt(&mut self) -> Result<(), DapError> {
+        let _ = self.set_reset(true);
+        self.arm_reset_catch()?;
+        let _ = self.set_reset(false);
+        for _ in 0..256 {
+            if self.is_halted().unwrap_or(false) {
+                let _ = self.disarm_reset_catch();
+                return Ok(());
+            }
+            if self.read_byte(DSU_STATUSA).map(|s| s & DSU_CRSTEXT != 0).unwrap_or(false) {
+                let _ = self.write_byte(DSU_STATUSA, DSU_CRSTEXT);
+                let _ = self.write_byte(DSU_STATUSA_EXT, DSU_CRSTEXT);
+            }
+        }
+        let _ = self.disarm_reset_catch();
+        Err(DapError::Timeout("reset catch"))
+    }
+}
+
 /// SAM D21 (ATSAMD21) flash programming, added to a CMSIS-DAP [`Dap`] probe. Halt the core before
 /// erasing or writing so it is not fetching from flash during the operation.
 pub trait Samd21Flash {

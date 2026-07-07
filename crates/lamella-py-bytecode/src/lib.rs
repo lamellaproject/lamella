@@ -17,7 +17,14 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 ///
 /// Version 14 added closures: the three deref ops, `CodeObject`'s `cellvars`/`freevars`,
 /// and the `CLOSURE` bit on [`Op::MakeFunction`]'s flags.
-pub const FORMAT_VERSION: u16 = 14;
+///
+/// Version 15 added the class-body namespace: `SetupClassNamespace` / `StoreName` / `LoadName`,
+/// so a class body can read a name it just bound (namespace -> global -> built-in).
+///
+/// Version 16 added the import system: `ImportName` (import a module and push it) and
+/// `ImportFrom` (read a name off the module on top of the stack), so `import m` and
+/// `from m import a` bind their names.
+pub const FORMAT_VERSION: u16 = 16;
 
 /// The feature-flag bits a module's header carries, declaring which language
 /// surface its bytecode assumes. A reader lacking a required feature rejects the
@@ -67,6 +74,10 @@ pub enum BinOp {
     /// `a ** b` -- exponentiation, right-associative. A non-negative integer exponent gives an
     /// integer (promoting past the fixnum range to a long); a negative exponent produces a float.
     Pow = 11,
+    /// `a @ b` -- matrix multiplication (`__matmul__` / `__rmatmul__`). No builtin numeric type
+    /// implements it (int/float `@` is a `TypeError`); it exists for user classes that define the
+    /// dunder.
+    MatMul = 12,
 }
 
 impl BinOp {
@@ -86,6 +97,7 @@ impl BinOp {
             9 => Some(BinOp::RShift),
             10 => Some(BinOp::TrueDiv),
             11 => Some(BinOp::Pow),
+            12 => Some(BinOp::MatMul),
             _ => None,
         }
     }
@@ -186,6 +198,8 @@ impl UnaryOp {
 /// |     42 | CallEx | star-call unpacking |
 /// |  43-44 | DeleteItem, DeleteAttr | del subscript/attribute |
 /// |  45-47 | LoadDeref, StoreDeref, LoadClosure | closures |
+/// |  48-50 | SetupClassNamespace, StoreName, LoadName | class-body namespace |
+/// |  51-52 | ImportName, ImportFrom | imports |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -380,6 +394,29 @@ pub enum Op {
     /// [`Op::MakeFunction`] carrying the `CLOSURE` flag. Emitted once per free variable of the
     /// nested function, in that function's freevar order. For building a closure's captured cells.
     LoadClosure(u32),
+    /// Install a fresh, empty class-body namespace dict as the frame's active namespace. Emitted at
+    /// the start of a `class` body; [`Op::StoreName`] / [`Op::LoadName`] then target it, and
+    /// [`Op::BuildClass`] consumes it. This is how a class body reads a name it just bound
+    /// (`class C: a = 5; b = a + 1`, `@radius.setter`), which a plain dict-display cannot.
+    SetupClassNamespace,
+    /// Pop a value and bind it as `names[idx]` in the active class-body namespace (the class-body
+    /// form of a name store). A member assignment / method definition in a `class` body.
+    StoreName(u32),
+    /// Push the value bound to `names[idx]`, resolving the active class-body namespace FIRST, then
+    /// the module global / built-in namespace (a `NameError` if unbound). The class-body read that
+    /// sees earlier class-body bindings and falls back outward, mirroring CPython's `LOAD_NAME`.
+    LoadName(u32),
+    /// Import the module named `names[idx]` and push the module object: resolve it (a cached
+    /// `sys.modules` entry, else a native stdlib module, else `ModuleNotFoundError`), running its
+    /// body once. Emitted for BOTH `import m` (the pushed module is then stored) and the lead-in of
+    /// `from m import ...` (the module is the source for the following [`Op::ImportFrom`]s). A dotted
+    /// name (`a.b`) is a single string here; package submodules are a later addition.
+    ImportName(u32),
+    /// Read `names[idx]` off the module on top of the stack (WITHOUT popping it) and push the value
+    /// -- `getattr(module, name)`, an `ImportError` if the module has no such member. For each name in
+    /// `from m import a, b`; the frontend emits a following store, then one [`Op::PopTop`] after the
+    /// last to discard the module.
+    ImportFrom(u32),
 }
 
 /// A compile-time constant in a code object's constant pool. Every value the running
@@ -795,6 +832,23 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(47);
             put_u32(buf, *i);
         }
+        Op::SetupClassNamespace => buf.push(48),
+        Op::StoreName(name) => {
+            buf.push(49);
+            put_u32(buf, *name);
+        }
+        Op::LoadName(name) => {
+            buf.push(50);
+            put_u32(buf, *name);
+        }
+        Op::ImportName(name) => {
+            buf.push(51);
+            put_u32(buf, *name);
+        }
+        Op::ImportFrom(name) => {
+            buf.push(52);
+            put_u32(buf, *name);
+        }
     }
 }
 
@@ -1056,6 +1110,11 @@ impl<'a> Reader<'a> {
             45 => Op::LoadDeref(self.u32()?),
             46 => Op::StoreDeref(self.u32()?),
             47 => Op::LoadClosure(self.u32()?),
+            48 => Op::SetupClassNamespace,
+            49 => Op::StoreName(self.u32()?),
+            50 => Op::LoadName(self.u32()?),
+            51 => Op::ImportName(self.u32()?),
+            52 => Op::ImportFrom(self.u32()?),
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -1271,6 +1330,11 @@ mod tests {
             Op::LoadDeref(2),
             Op::StoreDeref(1),
             Op::LoadClosure(0),
+            Op::SetupClassNamespace,
+            Op::StoreName(1),
+            Op::LoadName(2),
+            Op::ImportName(3),
+            Op::ImportFrom(4),
             Op::Return,
         ];
         let mut buf = Vec::new();
@@ -1337,7 +1401,7 @@ mod tests {
 
     #[test]
     fn selector_bytes_round_trip() {
-        for byte in 0u8..=11 {
+        for byte in 0u8..=12 {
             assert_eq!(BinOp::from_u8(byte).unwrap() as u8, byte);
         }
         for byte in 0u8..=7 {
@@ -1346,7 +1410,7 @@ mod tests {
         for byte in 0u8..=2 {
             assert_eq!(UnaryOp::from_u8(byte).unwrap() as u8, byte);
         }
-        assert_eq!(BinOp::from_u8(12), None);
+        assert_eq!(BinOp::from_u8(13), None);
         assert_eq!(CmpOp::from_u8(8), None);
         assert_eq!(UnaryOp::from_u8(3), None);
     }

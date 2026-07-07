@@ -30,6 +30,10 @@ lamella-load = { path = "../lamella-load", optional = true, default-features = f
 # The debug seam (the DebugBackend trait, a dependency-free leaf): WirelineBackend
 # implements it over the wire's debug channel, so lamella-dap drives a DEVICE unchanged.
 lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
+# Host-only (debug-backend): parse the pre-built source map JSON (method_id -> source lines) so a wireline debug
+# session is SOURCE-LEVEL, not IL-level.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 # The serial (USB-CDC / UART) transport. Default ON for a host build; a wasm32 build turns it off
@@ -52,7 +56,7 @@ baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata
 # WirelineBackend: the lamella-debug-backend seam over the wire's debug channel (serial
 # carrier). A code location crosses the seam as an opaque address packing the wire's
 # (method_id, offset) pair.
-debug-backend = ["serial", "dep:lamella-debug-backend"]
+debug-backend = ["serial", "dep:lamella-debug-backend", "dep:serde", "dep:serde_json"]
 
 # (The interactive REPL CLI now lives in the dedicated `lamella-repl` crate; the former
 # `lamella-repl` bin here was a duplicate of that binary name -- removed on merge to avoid a

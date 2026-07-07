@@ -625,6 +625,46 @@ pub fn string_substring_len(
     Ok(Some(Value::Object(reference)))
 }
 
+/// `System.String.CreateFromChars(char[] chars, int start, int len)`: a new string of the `len`
+/// code units of `chars` starting at `start`. This is the ONE runtime seam the managed
+/// `System.Text.StringBuilder` materializes its `char[] _chars` buffer through (its `ToString`,
+/// `ToString(start, len)`, and the substring paths) -- so the whole builder is ordinary managed C#
+/// over a `char[]`, with only this code-unit-range-to-String copy provided by the runtime (the AOT
+/// twin lowers it to `lamella_string_substring`). A `char[]` element is a `Value::Int32` holding a
+/// UTF-16 code unit (see `string_to_char_array`).
+///
+/// # Errors
+/// [`Trap::NullReference`] on a null array; [`Trap::TypeMismatch`] for a non-array / non-int
+/// argument; [`Trap::ArgumentOutOfRange`] if the `[start, start + len)` range is outside the array.
+pub fn string_create_from_chars(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let reference = match args.first() {
+        Some(&Value::Object(reference)) => reference,
+        Some(&Value::Null) => return Err(Trap::NullReference),
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    let Some(&Value::Int32(start)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(len)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let start = usize::try_from(start).map_err(|_| Trap::ArgumentOutOfRange(1))?;
+    let len = usize::try_from(len).map_err(|_| Trap::ArgumentOutOfRange(2))?;
+    let units = match vm.heap().array_utf16_units(reference, start, len) {
+        Some(units) => units,
+        None if vm.heap().array_element_type(reference).is_none() => {
+            return Err(Trap::TypeMismatch(Opcode::Call));
+        }
+        None => return Err(Trap::ArgumentOutOfRange(2)),
+    };
+    let reference = vm.heap_mut().alloc_string(&units);
+    Ok(Some(Value::Object(reference)))
+}
+
 /// `System.String.Concat(string, string, string)`: join three strings into a new
 /// one (a null argument is the empty string).
 ///
@@ -665,7 +705,7 @@ pub fn datetime_now_ticks(
 /// intrinsics are re-exported below so `crate::intrinsics::*` paths are unchanged.
 #[cfg(feature = "NETMFv4_4")]
 mod extended {
-    use super::{scalar_text, string_arg_chars};
+    use super::string_arg_chars;
     use crate::interp::Vm;
     use crate::module::Module;
     use crate::object::{Object, ObjectRef};
@@ -1872,7 +1912,8 @@ mod extended {
         Ok(Some(Value::Object(reference)))
     }
 
-    /// `System.String.ToCharArray()`: a fresh `char[]` of the string's UTF-16 code units.
+    /// `System.String.ToCharArray()`: a fresh `char[]` of the string's UTF-16 code units --
+    /// packed at the character width, exactly as a `newarr` `char[]` is.
     ///
     /// # Errors
     /// [`Trap::TypeMismatch`] if the receiver is not a string.
@@ -1881,11 +1922,13 @@ mod extended {
         _module: &Module,
         args: &[Value],
     ) -> Result<Option<Value>, Trap> {
-        let elements: Vec<Value> = string_arg_chars(vm, args.first())?
+        let bytes: Vec<u8> = string_arg_chars(vm, args.first())?
             .iter()
-            .map(|&unit| Value::Int32(i32::from(unit)))
+            .flat_map(|unit| unit.to_le_bytes())
             .collect();
-        let reference = vm.heap_mut().alloc_array(elements);
+        let reference = vm
+            .heap_mut()
+            .alloc_packed_from_bytes(crate::object::PrimKind::U2, bytes, 0);
         Ok(Some(Value::Object(reference)))
     }
 
@@ -1895,310 +1938,6 @@ mod extended {
             Some(&Value::Object(reference)) => Ok(reference),
             _ => Err(Trap::TypeMismatch(Opcode::Call)),
         }
-    }
-
-    /// Appends `units` to the string builder at `reference`, growing its tracked
-    /// `Capacity` by .NET's rule when the result outgrows it.
-    fn string_builder_extend(vm: &mut Vm, reference: ObjectRef, units: &[u16]) -> Result<(), Trap> {
-        match vm.heap_mut().string_builder_buf_mut(reference) {
-            Some(buffer) => {
-                buffer.extend_from_slice(units);
-                let length = buffer.len();
-                vm.heap_mut().string_builder_grow_capacity(reference, length);
-                Ok(())
-            }
-            None => Err(Trap::TypeMismatch(Opcode::Call)),
-        }
-    }
-
-    /// `System.Text.StringBuilder.Append(string)`: appends the argument's code units and
-    /// returns the builder, so `Append` calls chain.
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] if the receiver is not a string builder.
-    pub fn string_builder_append_string(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let chars = string_arg_chars(vm, args.get(1))?;
-        let this = receiver_ref(args)?;
-        string_builder_extend(vm, this, &chars)?;
-        Ok(Some(Value::Object(this)))
-    }
-
-    /// `StringBuilder.Append(char)`: appends one UTF-16 code unit and returns the builder.
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] for a non-builder receiver or non-char argument.
-    pub fn string_builder_append_char(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let unit = match args.get(1) {
-            Some(&Value::Int32(code)) => code as u16,
-            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
-        };
-        let this = receiver_ref(args)?;
-        string_builder_extend(vm, this, &[unit])?;
-        Ok(Some(Value::Object(this)))
-    }
-
-    /// `StringBuilder.Append(int)`: appends the integer's decimal text and returns the builder.
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] for a non-builder receiver or non-int argument.
-    pub fn string_builder_append_int(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let value = match args.get(1) {
-            Some(&Value::Int32(value)) => value,
-            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
-        };
-        let units: Vec<u16> = scalar_text(&Value::Int32(value)).encode_utf16().collect();
-        let this = receiver_ref(args)?;
-        string_builder_extend(vm, this, &units)?;
-        Ok(Some(Value::Object(this)))
-    }
-
-    /// `StringBuilder.ToString()`: a fresh `System.String` of the accumulated code units.
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] if the receiver is not a string builder.
-    pub fn string_builder_to_string(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let this = receiver_ref(args)?;
-        let units = vm
-            .heap()
-            .string_builder_buf(this)
-            .ok_or(Trap::TypeMismatch(Opcode::Call))?
-            .to_vec();
-        let reference = vm.heap_mut().alloc_string(&units);
-        Ok(Some(Value::Object(reference)))
-    }
-
-    /// `StringBuilder.Length` getter: the accumulated code-unit count.
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] if the receiver is not a string builder.
-    pub fn string_builder_get_length(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let this = receiver_ref(args)?;
-        let length = vm
-            .heap()
-            .string_builder_buf(this)
-            .ok_or(Trap::TypeMismatch(Opcode::Call))?
-            .len();
-        Ok(Some(Value::Int32(length as i32)))
-    }
-
-    /// `System.Text.StringBuilder.Insert(int, string)`: inserts the string's code units at the
-    /// index and returns the builder.
-    ///
-    /// # Errors
-    /// [`Trap::ArgumentOutOfRange`] if the index is past the end; [`Trap::TypeMismatch`] for a
-    /// non-builder receiver or non-int index.
-    pub fn string_builder_insert(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let chars = string_arg_chars(vm, args.get(2))?;
-        let index = match args.get(1) {
-            Some(&Value::Int32(index)) => index,
-            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
-        };
-        let this = receiver_ref(args)?;
-        match vm.heap_mut().string_builder_buf_mut(this) {
-            Some(buffer) => {
-                let index = usize::try_from(index).unwrap_or(usize::MAX);
-                if index > buffer.len() {
-                    return Err(Trap::ArgumentOutOfRange(1));
-                }
-                buffer.splice(index..index, chars.iter().copied());
-                Ok(Some(Value::Object(this)))
-            }
-            None => Err(Trap::TypeMismatch(Opcode::Call)),
-        }
-    }
-
-    /// `StringBuilder.Remove(int start, int length)`: removes a range and returns the builder.
-    ///
-    /// # Errors
-    /// [`Trap::ArgumentOutOfRange`] if the range is out of bounds; [`Trap::TypeMismatch`] for a
-    /// non-builder receiver or non-int arguments.
-    pub fn string_builder_remove(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let start = match args.get(1) {
-            Some(&Value::Int32(start)) => start,
-            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
-        };
-        let length = match args.get(2) {
-            Some(&Value::Int32(length)) => length,
-            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
-        };
-        let this = receiver_ref(args)?;
-        match vm.heap_mut().string_builder_buf_mut(this) {
-            Some(buffer) => {
-                let start = usize::try_from(start).map_err(|_| Trap::ArgumentOutOfRange(1))?;
-                let length = usize::try_from(length).map_err(|_| Trap::ArgumentOutOfRange(2))?;
-                match start.checked_add(length).filter(|end| *end <= buffer.len()) {
-                    Some(end) => {
-                        buffer.drain(start..end);
-                        Ok(Some(Value::Object(this)))
-                    }
-                    None => Err(Trap::ArgumentOutOfRange(2)),
-                }
-            }
-            None => Err(Trap::TypeMismatch(Opcode::Call)),
-        }
-    }
-
-    /// `StringBuilder.Replace(char, char)`: replaces every occurrence and returns the builder.
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] for a non-builder receiver or non-char arguments.
-    pub fn string_builder_replace_char(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let (old, new) = match (args.get(1), args.get(2)) {
-            (Some(&Value::Int32(old)), Some(&Value::Int32(new))) => (old as u16, new as u16),
-            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
-        };
-        let this = receiver_ref(args)?;
-        match vm.heap_mut().string_builder_buf_mut(this) {
-            Some(buffer) => {
-                for unit in buffer.iter_mut() {
-                    if *unit == old {
-                        *unit = new;
-                    }
-                }
-                Ok(Some(Value::Object(this)))
-            }
-            None => Err(Trap::TypeMismatch(Opcode::Call)),
-        }
-    }
-
-    /// `StringBuilder.Length` setter core (`SetLengthCore`): truncates the buffer when
-    /// `value` is below the current length, or extends it with NUL (`\0`) code units when
-    /// above -- exactly .NET's `Length` set, which pads the grown tail with `'\0'`. The
-    /// observable `Capacity` grows by the usual rule when the new length outgrows it. The
-    /// public managed `Length` setter rejects a negative value (a catchable
-    /// `ArgumentOutOfRangeException`) before this runs; a stray negative here is also
-    /// rejected, defensively, as out of range.
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] for a non-builder receiver or non-int argument;
-    /// [`Trap::ArgumentOutOfRange`] for a negative length.
-    pub fn string_builder_set_length(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let Some(&Value::Int32(value)) = args.get(1) else {
-            return Err(Trap::TypeMismatch(Opcode::Call));
-        };
-        let length = usize::try_from(value).map_err(|_| Trap::ArgumentOutOfRange(1))?;
-        let this = receiver_ref(args)?;
-        match vm.heap_mut().string_builder_buf_mut(this) {
-            Some(buffer) => {
-                buffer.resize(length, 0u16);
-                vm.heap_mut().string_builder_grow_capacity(this, length);
-                Ok(None)
-            }
-            None => Err(Trap::TypeMismatch(Opcode::Call)),
-        }
-    }
-
-    /// `StringBuilder.Capacity` getter: the tracked capacity (>= `Length`).
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] if the receiver is not a string builder.
-    pub fn string_builder_get_capacity(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let this = receiver_ref(args)?;
-        let capacity = vm
-            .heap()
-            .string_builder_capacity(this)
-            .ok_or(Trap::TypeMismatch(Opcode::Call))?;
-        Ok(Some(Value::Int32(capacity as i32)))
-    }
-
-    /// `StringBuilder.this[int]` getter (`get_Chars`): the code unit at `index`. .NET's
-    /// indexer getter raises `IndexOutOfRangeException` (NOT `ArgumentOutOfRangeException`,
-    /// which is what its *setter* raises) outside `[0, Length)`, so the bound is checked
-    /// here and surfaces as [`Trap::IndexOutOfRange`] -- the trap that presents as
-    /// `IndexOutOfRangeException` to a managed `catch`.
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] for a non-builder receiver or non-int index;
-    /// [`Trap::IndexOutOfRange`] if `index` is outside the live content.
-    pub fn string_builder_get_char(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let Some(&Value::Int32(index)) = args.get(1) else {
-            return Err(Trap::TypeMismatch(Opcode::Call));
-        };
-        let this = receiver_ref(args)?;
-        let buffer = vm
-            .heap()
-            .string_builder_buf(this)
-            .ok_or(Trap::TypeMismatch(Opcode::Call))?;
-        let unit = usize::try_from(index)
-            .ok()
-            .and_then(|i| buffer.get(i))
-            .copied()
-            .ok_or(Trap::IndexOutOfRange(index))?;
-        Ok(Some(Value::Int32(i32::from(unit))))
-    }
-
-    /// `StringBuilder.this[int]` setter core (`SetCharCore`): stores `value` at `index`.
-    /// The public managed setter performs the `[0, Length)` bound check (raising a catchable
-    /// `ArgumentOutOfRangeException`, matching .NET's indexer setter) before this runs; an
-    /// out-of-range index here is rejected defensively as [`Trap::IndexOutOfRange`].
-    ///
-    /// # Errors
-    /// [`Trap::TypeMismatch`] for a non-builder receiver or bad argument types;
-    /// [`Trap::IndexOutOfRange`] if `index` is outside the live content.
-    pub fn string_builder_set_char(
-        vm: &mut Vm,
-        _module: &Module,
-        args: &[Value],
-    ) -> Result<Option<Value>, Trap> {
-        let (index, unit) = match (args.get(1), args.get(2)) {
-            (Some(&Value::Int32(index)), Some(&Value::Int32(unit))) => (index, unit as u16),
-            _ => return Err(Trap::TypeMismatch(Opcode::Call)),
-        };
-        let this = receiver_ref(args)?;
-        let buffer = vm
-            .heap_mut()
-            .string_builder_buf_mut(this)
-            .ok_or(Trap::TypeMismatch(Opcode::Call))?;
-        let slot = usize::try_from(index)
-            .ok()
-            .and_then(|i| buffer.get_mut(i))
-            .ok_or(Trap::IndexOutOfRange(index))?;
-        *slot = unit;
-        Ok(None)
     }
 
     /// `System.BitConverter.DoubleToInt64Bits(double)`: the IEEE-754 bit pattern of the
@@ -3662,15 +3401,23 @@ pub fn socket_send(
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
     let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
-    let mut buf = alloc::vec![0u8; count];
-    for (i, slot) in buf.iter_mut().enumerate() {
-        if let Some(Value::Int32(byte)) = vm.heap_mut().array_get(array, offset + i) {
-            *slot = byte as u8;
+    let result = {
+        let (heap, backend) = vm.heap_and_net();
+        let Some(backend) = backend else {
+            return Ok(Some(Value::Int32(SOCK_ERROR)));
+        };
+        match heap.array_u8_slice(array, offset, count) {
+            Some(segment) => backend.send(handle, segment),
+            None => {
+                let mut buf = alloc::vec![0u8; count];
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    if let Some(Value::Int32(byte)) = heap.array_get(array, offset + i) {
+                        *slot = byte as u8;
+                    }
+                }
+                backend.send(handle, &buf)
+            }
         }
-    }
-    let result = match vm.net_backend() {
-        Some(backend) => backend.send(handle, &buf),
-        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
     };
     Ok(Some(Value::Int32(match result {
         NetResult::Ready(n) => n as i32,
@@ -3701,19 +3448,27 @@ pub fn socket_recv(
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
     let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
-    let mut buf = alloc::vec![0u8; count];
-    let result = match vm.net_backend() {
-        Some(backend) => backend.recv(handle, &mut buf),
-        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    let result = {
+        let (heap, backend) = vm.heap_and_net();
+        let Some(backend) = backend else {
+            return Ok(Some(Value::Int32(SOCK_ERROR)));
+        };
+        match heap.array_u8_slice_mut(array, offset, count) {
+            Some(segment) => backend.recv(handle, segment),
+            None => {
+                let mut buf = alloc::vec![0u8; count];
+                let result = backend.recv(handle, &mut buf);
+                if let NetResult::Ready(n) = result {
+                    for i in 0..n {
+                        heap.array_set(array, offset + i, Value::Int32(i32::from(buf[i])));
+                    }
+                }
+                result
+            }
+        }
     };
     match result {
-        NetResult::Ready(n) => {
-            for i in 0..n {
-                vm.heap_mut()
-                    .array_set(array, offset + i, Value::Int32(i32::from(buf[i])));
-            }
-            Ok(Some(Value::Int32(n as i32)))
-        }
+        NetResult::Ready(n) => Ok(Some(Value::Int32(n as i32))),
         NetResult::WouldBlock => {
             vm.request_block_on_io(handle, Interest::Read);
             Ok(Some(Value::Int32(WOULD_BLOCK)))
@@ -3797,16 +3552,24 @@ pub fn socket_udp_send_to(
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
     let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
-    let mut buf = alloc::vec![0u8; count];
-    for (i, slot) in buf.iter_mut().enumerate() {
-        if let Some(Value::Int32(byte)) = vm.heap_mut().array_get(array, offset + i) {
-            *slot = byte as u8;
-        }
-    }
     let addr = read_addr_bytes(vm, addr_array);
-    let result = match vm.net_backend() {
-        Some(backend) => backend.udp_send_to(handle, &buf, &addr, port as u16),
-        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    let result = {
+        let (heap, backend) = vm.heap_and_net();
+        let Some(backend) = backend else {
+            return Ok(Some(Value::Int32(SOCK_ERROR)));
+        };
+        match heap.array_u8_slice(array, offset, count) {
+            Some(segment) => backend.udp_send_to(handle, segment, &addr, port as u16),
+            None => {
+                let mut buf = alloc::vec![0u8; count];
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    if let Some(Value::Int32(byte)) = heap.array_get(array, offset + i) {
+                        *slot = byte as u8;
+                    }
+                }
+                backend.udp_send_to(handle, &buf, &addr, port as u16)
+            }
+        }
     };
     Ok(Some(Value::Int32(match result {
         NetResult::Ready(n) => n as i32,
@@ -3844,18 +3607,28 @@ pub fn socket_udp_recv_from(
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
     let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
-    let mut buf = alloc::vec![0u8; count];
     let mut sender = alloc::vec![0u8; 16];
-    let result = match vm.net_backend() {
-        Some(backend) => backend.udp_recv_from(handle, &mut buf, &mut sender),
-        None => return Ok(Some(Value::Int32(SOCK_ERROR))),
+    let result = {
+        let (heap, backend) = vm.heap_and_net();
+        let Some(backend) = backend else {
+            return Ok(Some(Value::Int32(SOCK_ERROR)));
+        };
+        match heap.array_u8_slice_mut(array, offset, count) {
+            Some(segment) => backend.udp_recv_from(handle, segment, &mut sender),
+            None => {
+                let mut buf = alloc::vec![0u8; count];
+                let result = backend.udp_recv_from(handle, &mut buf, &mut sender);
+                if let NetResult::Ready((n, _, _)) = result {
+                    for i in 0..n {
+                        heap.array_set(array, offset + i, Value::Int32(i32::from(buf[i])));
+                    }
+                }
+                result
+            }
+        }
     };
     match result {
         NetResult::Ready((n, addr_len, port)) => {
-            for i in 0..n {
-                vm.heap_mut()
-                    .array_set(array, offset + i, Value::Int32(i32::from(buf[i])));
-            }
             for i in 0..addr_len {
                 vm.heap_mut()
                     .array_set(sender_addr_array, i, Value::Int32(i32::from(sender[i])));
@@ -3923,13 +3696,7 @@ const TLS_CLOSED: i32 = -2;
 /// Reads an entire managed `byte[]` into a Rust vector for the seam.
 fn read_whole_array(vm: &mut Vm, array: ObjectRef) -> alloc::vec::Vec<u8> {
     let len = vm.heap_mut().array_len(array).unwrap_or(0);
-    let mut bytes = alloc::vec![0u8; len];
-    for (i, slot) in bytes.iter_mut().enumerate() {
-        if let Some(Value::Int32(byte)) = vm.heap_mut().array_get(array, i) {
-            *slot = byte as u8;
-        }
-    }
-    bytes
+    read_byte_segment(vm, array, 0, len)
 }
 
 /// Reads a managed `byte[]` segment `[offset, offset+count)` into a Rust vector for the seam.
@@ -3939,6 +3706,9 @@ fn read_byte_segment(
     offset: usize,
     count: usize,
 ) -> alloc::vec::Vec<u8> {
+    if let Some(view) = vm.heap().array_u8_slice(array, offset, count) {
+        return view.to_vec();
+    }
     let mut buf = alloc::vec![0u8; count];
     for (i, slot) in buf.iter_mut().enumerate() {
         if let Some(Value::Int32(byte)) = vm.heap_mut().array_get(array, offset + i) {
@@ -3950,6 +3720,10 @@ fn read_byte_segment(
 
 /// Writes `bytes` into a managed `byte[]` starting at `offset`.
 fn write_byte_segment(vm: &mut Vm, array: ObjectRef, offset: usize, bytes: &[u8]) {
+    if let Some(view) = vm.heap_mut().array_u8_slice_mut(array, offset, bytes.len()) {
+        view.copy_from_slice(bytes);
+        return;
+    }
     for (i, &byte) in bytes.iter().enumerate() {
         vm.heap_mut()
             .array_set(array, offset + i, Value::Int32(i32::from(byte)));
@@ -6217,6 +5991,9 @@ pub fn initialize_array(
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
     if length == 0 {
+        return Ok(None);
+    }
+    if vm.heap_mut().packed_init_from_blob(array, data) {
         return Ok(None);
     }
     let width_bytes = data.len() / length;

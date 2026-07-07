@@ -2,6 +2,7 @@
 //! the intrinsics they reach, and the strings `ldstr` loads.
 
 use crate::interp::Vm;
+use crate::object::PrimKind;
 use crate::trap::Trap;
 use crate::value::Value;
 use alloc::boxed::Box;
@@ -574,12 +575,12 @@ pub struct Module {
     field_types: BTreeMap<u64, TypeId>,
     /// A `newarr` element-type token mapped to its elements' zero value.
     array_defaults: BTreeMap<u64, Value>,
-    /// A `newarr` element-type token mapped to the element type's true byte width (`Byte` = 1,
-    /// `Int16`/`Char` = 2, `Int32` = 4, `Int64`/`Double` = 8). Only sized primitive element types
-    /// appear; a reference / value-type element array is absent (its `Buffer` width is undefined).
-    /// Stamped onto each array at `newarr` so `System.Buffer` can size its byte image -- a width a
-    /// `byte[]` and an `int[]` (both `Value::Int32` elements) cannot otherwise be told apart by.
-    array_element_sizes: BTreeMap<u64, u8>,
+    /// A `newarr` element-type token mapped to the element type's primitive kind
+    /// ([`PrimKind`]: byte width + read/write encoding). Only sized primitive element types
+    /// appear; a reference / value-type element array is absent. `newarr` packs an array of a
+    /// mapped kind ([`crate::object::ArrayStorage::Packed`]) -- element storage at the true
+    /// byte width -- which is also what tells a `byte[]` from an `int[]` for `System.Buffer`.
+    array_prim_kinds: BTreeMap<u64, PrimKind>,
     /// A virtual method's vtable slot (only virtual methods appear).
     method_slots: BTreeMap<MethodId, u32>,
     /// A static field token mapped to its storage slot in the [`crate::interp::Vm`].
@@ -1123,8 +1124,8 @@ struct FrozenTables {
     field_types: SortedTokenTable,
     /// The frozen `static_fields` (static field token -> [`crate::interp::Vm`] storage slot).
     static_fields: SortedTokenTable,
-    /// The frozen `array_element_sizes` (`newarr` element token -> element byte width).
-    array_element_sizes: SortedTokenTable,
+    /// The frozen `array_prim_kinds` (`newarr` element token -> [`PrimKind`] code).
+    array_prim_kinds: SortedTokenTable,
     /// The frozen `enum_widths` (enum handle -> underlying byte width).
     enum_widths: SortedTokenTable,
     /// The frozen `delegate_invokes` (delegate `Invoke` token -> parameter count).
@@ -1573,9 +1574,11 @@ pub fn baked_image_checksum(image: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(image.get(at..at + 8)?.try_into().ok()?))
 }
 
-/// The baked-image format version. v2 added the content checksum (header word 18); v1 had no
-/// checksum and a shorter header, so `from_baked` rejects it (rebake).
-const BAKED_IMAGE_VERSION: u32 = 2;
+/// The baked-image format version. v3 repurposed the `newarr` element table's payload from a
+/// byte width to a [`PrimKind`] code (packed primitive arrays) -- a v2 image's widths would
+/// misdecode as kinds, so `from_baked` rejects it (rebake). v2 added the content checksum
+/// (header word 18); v1 had no checksum and a shorter header.
+const BAKED_IMAGE_VERSION: u32 = 3;
 
 /// Packs a by-name index key: the member/type handle in the high 40 bits, the name id in the low
 /// 24. `None` if either exceeds its field (the entry then stays in the builder map).
@@ -1689,7 +1692,7 @@ impl FrozenTables {
         pair(out, self.field_slots.offset, self.field_slots.entries);
         pair(out, self.field_types.offset, self.field_types.entries);
         pair(out, self.static_fields.offset, self.static_fields.entries);
-        pair(out, self.array_element_sizes.offset, self.array_element_sizes.entries);
+        pair(out, self.array_prim_kinds.offset, self.array_prim_kinds.entries);
         pair(out, self.enum_widths.offset, self.enum_widths.entries);
         pair(out, self.delegate_invokes.offset, self.delegate_invokes.entries);
         pair(out, self.md_array_ctors.offset, self.md_array_ctors.entries);
@@ -1781,7 +1784,7 @@ impl FrozenTables {
         sorted!(field_slots, SortedTokenTable);
         sorted!(field_types, SortedTokenTable);
         sorted!(static_fields, SortedTokenTable);
-        sorted!(array_element_sizes, SortedTokenTable);
+        sorted!(array_prim_kinds, SortedTokenTable);
         sorted!(enum_widths, SortedTokenTable);
         sorted!(delegate_invokes, SortedTokenTable);
         sorted!(md_array_ctors, SortedTokenTable);
@@ -2718,11 +2721,11 @@ impl Module {
         frozen.static_fields = drain(arena, frozen.static_fields, &mut self.static_fields, |slot| {
             slot as u32
         });
-        frozen.array_element_sizes = drain(
+        frozen.array_prim_kinds = drain(
             arena,
-            frozen.array_element_sizes,
-            &mut self.array_element_sizes,
-            u32::from,
+            frozen.array_prim_kinds,
+            &mut self.array_prim_kinds,
+            |kind| u32::from(kind.code()),
         );
         frozen.enum_widths = drain(arena, frozen.enum_widths, &mut self.enum_widths, u32::from);
         frozen.delegate_invokes = drain(
@@ -3867,7 +3870,7 @@ impl Module {
             + self.field_slots.len()
             + self.field_types.len()
             + self.array_defaults.len()
-            + self.array_element_sizes.len()
+            + self.array_prim_kinds.len()
             + self.method_slots.len()
             + self.static_fields.len()
             + self.type_tokens.len()
@@ -3938,7 +3941,7 @@ impl Module {
             ("field_slots", self.field_slots.len()),
             ("field_types", self.field_types.len()),
             ("array_defaults", self.array_defaults.len()),
-            ("array_element_sizes", self.array_element_sizes.len()),
+            ("array_prim_kinds", self.array_prim_kinds.len()),
             ("method_slots", self.method_slots.len()),
             ("static_fields", self.static_fields.len()),
             ("type_tokens", self.type_tokens.len()),
@@ -4176,26 +4179,26 @@ impl Module {
             .or_else(|| self.array_defaults.get(&key).cloned())
     }
 
-    /// Binds a `newarr` element-type token in assembly `asm` to the element type's byte width
-    /// (`Byte` = 1, `Int16`/`Char` = 2, `Int32` = 4, `Int64`/`Double` = 8) -- the size
-    /// `System.Buffer` measures the array's byte image in. Only sized primitive element types are
-    /// bound; a reference / value-type element array is left unbound.
-    pub fn bind_array_element_size(&mut self, asm: u8, token: Token, size: u8) {
-        self.array_element_sizes.insert(asm_key(asm, token.0), size);
+    /// Binds a `newarr` element-type token in assembly `asm` to the element type's primitive
+    /// kind ([`PrimKind`]: `Byte`/`Boolean` = `U1`, `SByte` = `I1`, `Int16` = `I2`,
+    /// `UInt16`/`Char` = `U2`, ...). Only sized primitive element types are bound; a
+    /// reference / value-type element array is left unbound (its elements stay boxed).
+    pub fn bind_array_prim_kind(&mut self, asm: u8, token: Token, kind: PrimKind) {
+        self.array_prim_kinds.insert(asm_key(asm, token.0), kind);
     }
 
-    /// The element type's byte width of a `newarr` element-type token in assembly `asm`, or `0`
-    /// when none was bound (a reference / value-type element array). `newarr` stamps this onto the
-    /// array so `System.Buffer.BlockCopy` / `ByteLength` can size it.
+    /// The element type's primitive kind of a `newarr` element-type token in assembly `asm`,
+    /// or `None` when none was bound (a reference / value-type element array). `newarr` packs
+    /// the array's element storage at this kind, which also sizes it for `System.Buffer`.
     #[must_use]
-    pub fn array_element_size(&self, asm: u8, token: Token) -> u8 {
+    pub fn array_prim_kind(&self, asm: u8, token: Token) -> Option<PrimKind> {
         let key = asm_key(asm, token.0);
         self.frozen
-            .array_element_sizes
+            .array_prim_kinds
             .get(&self.arena, key)
-            .map(|size| size as u8)
-            .or_else(|| self.array_element_sizes.get(&key).copied())
-            .unwrap_or(0)
+            .and_then(|code| u8::try_from(code).ok())
+            .or_else(|| self.array_prim_kinds.get(&key).map(|kind| kind.code()))
+            .and_then(PrimKind::from_code)
     }
 
     /// Sets `type_id`'s virtual method table (slot -> implementation).
@@ -5682,6 +5685,25 @@ mod tests {
         {
             Box::leak(bytes)
         }
+    }
+
+    #[test]
+    fn array_prim_kinds_survive_the_freeze() {
+        let mut module = Module::new();
+        let byte_elem = Token(0x0100_0009);
+        let long_elem = Token(0x0100_000A);
+        module.bind_array_prim_kind(0, byte_elem, PrimKind::U1);
+        module.bind_array_prim_kind(0, long_elem, PrimKind::I8);
+        assert_eq!(module.array_prim_kind(0, byte_elem), Some(PrimKind::U1));
+
+        module.freeze();
+
+        let census: BTreeMap<&str, usize> = module.table_census().into_iter().collect();
+        assert_eq!(census["array_prim_kinds"], 0, "freeze drains the builder map");
+        assert_eq!(module.array_prim_kind(0, byte_elem), Some(PrimKind::U1));
+        assert_eq!(module.array_prim_kind(0, long_elem), Some(PrimKind::I8));
+        assert_eq!(module.array_prim_kind(0, Token(0x0100_0001)), None);
+        assert_eq!(module.array_prim_kind(1, byte_elem), None, "unknown assembly");
     }
 
     #[test]

@@ -342,34 +342,11 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(stack_peek),
     #[cfg(feature = "NETMFv4_4")]
     entry!(stack_pop),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_append_char),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_append_int),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_append_string),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_get_capacity),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_get_char),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_get_length),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_insert),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_remove),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_replace_char),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_set_char),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_set_length),
-    #[cfg(feature = "NETMFv4_4")]
-    entry!(string_builder_to_string),
     entry!(string_concat),
     entry!(string_concat3),
     entry!(string_concat_object2),
     entry!(string_concat_object3),
+    entry!(string_create_from_chars),
     #[cfg(feature = "NETMFv4_4")]
     entry!(string_contains),
     #[cfg(feature = "NETMFv4_4")]

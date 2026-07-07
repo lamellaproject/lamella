@@ -55,7 +55,8 @@ use lamella_cil_runtime::intrinsics::{
     initialize_array, get_custom_attributes, string_concat, string_concat_object2,
     string_concat_object3, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
-    string_not_equals, string_substring, string_substring_len, type_from_handle, type_get_name,
+    string_create_from_chars, string_not_equals, string_substring, string_substring_len,
+    type_from_handle, type_get_name,
     thread_start, thread_join, thread_yield, thread_sleep, monitor_enter, monitor_exit,
     monitor_try_enter, monitor_wait, monitor_pulse, monitor_pulse_all,
     socket_connect_start, socket_connect_poll, socket_listen, socket_accept,
@@ -95,10 +96,6 @@ use lamella_cil_runtime::intrinsics::{
     list_set_item, map_add, map_contains, map_get_count, map_get_item, map_remove, map_set_item,
     math_abs_int32, math_abs_int64, math_max_int32, math_max_int64, math_min_int32, math_min_int64,
     math_sign_int32, math_sign_int64, queue_dequeue, queue_peek, stack_peek, stack_pop,
-    string_builder_append_char, string_builder_append_int, string_builder_append_string,
-    string_builder_get_capacity, string_builder_get_char, string_builder_get_length,
-    string_builder_insert, string_builder_remove, string_builder_replace_char,
-    string_builder_set_char, string_builder_set_length, string_builder_to_string,
     string_contains, string_ends_with,
     string_index_of_char, string_index_of_string, string_insert, string_join,
     string_last_index_of_char, string_pad_left, string_pad_right, string_remove,
@@ -137,7 +134,8 @@ use lamella_cil_runtime::module::{
     MethodParam, ReflectField, ReflectMethod, ReflectType, param_attr_key,
 };
 use lamella_cil_runtime::{
-    IntrinsicFn, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget, TypeId, Value,
+    IntrinsicFn, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget, PrimKind, TypeId,
+    Value,
 };
 
 const TYPE_REF: u8 = 0x01;
@@ -966,7 +964,6 @@ fn load_assembly<'pe>(
     let mut box_tokens = BTreeSet::new();
     let mut generic_call_tokens = BTreeSet::new();
     let mut value_type_method_rows: BTreeSet<u32> = BTreeSet::new();
-    let mut string_builder_ctor_rows: BTreeMap<u32, u16> = BTreeMap::new();
     let mut list_ctor_rows: BTreeMap<u32, u16> = BTreeMap::new();
     let mut sizeof_tokens: BTreeSet<Token> = BTreeSet::new();
     let mut value_type_tokens: Vec<Token> = Vec::new();
@@ -1091,9 +1088,7 @@ fn load_assembly<'pe>(
             if name == ".ctor" {
                 if let Some(name_parts) = type_name {
                     let count = u16::try_from(params.len()).unwrap_or(0);
-                    if same_assembly_string_builder_ctor(name_parts.namespace, name_parts.name) {
-                        string_builder_ctor_rows.insert(method_row, count);
-                    } else if same_assembly_list_ctor(name_parts.namespace, name_parts.name) {
+                    if same_assembly_list_ctor(name_parts.namespace, name_parts.name) {
                         list_ctor_rows.insert(method_row, count);
                     }
                 }
@@ -1300,7 +1295,6 @@ fn load_assembly<'pe>(
         module,
         asm,
         &newobj_tokens,
-        &string_builder_ctor_rows,
         &list_ctor_rows,
     );
     bind_field_rva_data(assembly, module, asm, &ldtoken_field_tokens);
@@ -1467,15 +1461,6 @@ fn bind_bcl_calls(
             else {
                 continue;
             };
-            if let Some(params) = string_builder_ctor(
-                parent_type.namespace,
-                parent_type.name,
-                method_name,
-                signature.as_ref(),
-            ) {
-                module.mark_string_builder_ctor(asm, *token, params);
-                continue;
-            }
             if resolve_external {
                 let key = name_key(
                     assembly,
@@ -1568,45 +1553,6 @@ fn bind_generic_calls(
             module.bind_token(asm, *token, id);
         }
     }
-}
-
-/// The parameter count of a `System.Text.StringBuilder` constructor, if this member is one,
-/// so `newobj` can allocate a builder. Always `None` without the NETMFv4_4-profile surface that defines it.
-#[cfg(feature = "NETMFv4_4")]
-fn string_builder_ctor(
-    namespace: &str,
-    type_name: &str,
-    method: &str,
-    signature: Option<&MethodSig>,
-) -> Option<u16> {
-    if namespace == "System.Text" && type_name == "StringBuilder" && method == ".ctor" {
-        Some(u16::try_from(signature.map_or(0, |sig| sig.parameters.len())).unwrap_or(0))
-    } else {
-        None
-    }
-}
-
-#[cfg(not(feature = "NETMFv4_4"))]
-fn string_builder_ctor(
-    _namespace: &str,
-    _type_name: &str,
-    _method: &str,
-    _signature: Option<&MethodSig>,
-) -> Option<u16> {
-    None
-}
-
-/// Whether a type declared in THIS assembly is `System.Text.StringBuilder`, so a same-assembly
-/// (corlib-internal) `newobj` of its `.ctor` allocates a builder. Mirrors the type recognition in
-/// [`string_builder_ctor`]; the caller supplies the `.ctor` arity. `false` without the surface.
-#[cfg(feature = "NETMFv4_4")]
-fn same_assembly_string_builder_ctor(namespace: &str, type_name: &str) -> bool {
-    namespace == "System.Text" && type_name == "StringBuilder"
-}
-
-#[cfg(not(feature = "NETMFv4_4"))]
-fn same_assembly_string_builder_ctor(_namespace: &str, _type_name: &str) -> bool {
-    false
 }
 
 /// The parameter count of a `System.Collections.ArrayList` constructor, if this member is one,
@@ -1883,6 +1829,10 @@ fn bcl_intrinsic(
         ("String", "op_Inequality") => string_not_equals_overload(signature),
         ("String", "IsNullOrEmpty") => string_is_null_or_empty_overload(signature),
         ("String", "Substring") => string_substring_overload(signature),
+        ("String", "CreateFromChars") => match parameters_of(signature) {
+            [SigType::SzArray(_), SigType::I4, SigType::I4] => Some(intrinsic!(string_create_from_chars)),
+            _ => None,
+        },
         ("Object", ".ctor") => object_ctor_overload(signature),
         ("Object", "ReferenceEquals") => match parameters_of(signature) {
             [SigType::Object, SigType::Object] => Some(intrinsic!(object_reference_equals)),
@@ -2009,6 +1959,9 @@ fn bcl_intrinsic(
             _ => None,
         },
         ("Int32", "ToString") => to_string_overload(intrinsic!(int32_to_string), signature),
+        ("Byte" | "SByte" | "Int16" | "UInt16", "ToString") => {
+            to_string_overload(intrinsic!(int32_to_string), signature)
+        }
         ("Boolean", "ToString") => to_string_overload(intrinsic!(boolean_to_string), signature),
         ("Char", "ToString") => to_string_overload(intrinsic!(char_to_string), signature),
         ("Int64", "ToString") => to_string_overload(intrinsic!(int64_to_string), signature),
@@ -2144,10 +2097,10 @@ fn default_field_value(signature: Option<SigType>) -> Value {
     }
 }
 
-/// Binds each `newarr` element-type token to its elements' zero value, and -- for a primitive
-/// element type `System.Buffer` accepts -- the element type's byte width, so an array stamps its
-/// `Buffer` size at allocation (a `byte[]` and an `int[]` are otherwise indistinguishable, both
-/// storing `Value::Int32`).
+/// Binds each `newarr` element-type token to its elements' zero value, and -- for a sized
+/// primitive element type -- the element type's [`PrimKind`], so `newarr` packs the array's
+/// element storage at the true byte width (and `System.Buffer` can size its byte image; a
+/// `byte[]` and an `int[]` are otherwise indistinguishable on the stack).
 fn bind_array_defaults(
     assembly: &Assembly,
     module: &mut Module,
@@ -2157,11 +2110,11 @@ fn bind_array_defaults(
 ) {
     for token in tokens {
         module.bind_array_default(asm, *token, array_element_default(assembly, *token));
-        if let Some(size) = assembly
+        if let Some(kind) = assembly
             .type_token_name(*token)
-            .and_then(|name| buffer_element_size(name.namespace, name.name))
+            .and_then(|name| array_prim_kind_of(name.namespace, name.name))
         {
-            module.bind_array_element_size(asm, *token, size);
+            module.bind_array_prim_kind(asm, *token, kind);
         }
         if module.type_id_of(asm, *token).is_none() {
             if let Some(name) = assembly.type_token_name(*token) {
@@ -2210,21 +2163,27 @@ fn box_primitive_kind(namespace: &str, name: &str) -> Option<BoxedPrimitive> {
     }
 }
 
-/// The byte width of a primitive element type `System.Buffer.BlockCopy` / `ByteLength` accept --
-/// the .NET "primitive of fixed size" set (the integer types, `Char`, `Boolean`, `Single`,
-/// `Double`). `None` for anything else, including `IntPtr`/`UIntPtr` (whose size is not fixed and
-/// which `System.Buffer` rejects), references, and value types -- so a `Buffer` call over such an
-/// array raises `ArgumentException`. Mirrors `array_element_default`'s widening (so the byte width
-/// agrees with the `Value` kind the element stores).
-fn buffer_element_size(namespace: &str, name: &str) -> Option<u8> {
+/// The [`PrimKind`] of a sized primitive element type -- the .NET "primitive of fixed size"
+/// set (the integer types, `Char`, `Boolean`, `Single`, `Double`), which `newarr` packs and
+/// `System.Buffer.BlockCopy` / `ByteLength` accept. `None` for anything else, including
+/// `IntPtr`/`UIntPtr` (whose size is not fixed and which `System.Buffer` rejects), references,
+/// and value types -- such an array keeps boxed element storage, and a `Buffer` call over it
+/// raises `ArgumentException`. The kind's read canonicalization mirrors
+/// `array_element_default`'s widening (a `Byte` element reads back as the zero-extended
+/// `Int32` its stack value is).
+fn array_prim_kind_of(namespace: &str, name: &str) -> Option<PrimKind> {
     if namespace != "System" {
         return None;
     }
     Some(match name {
-        "Boolean" | "SByte" | "Byte" => 1,
-        "Int16" | "UInt16" | "Char" => 2,
-        "Int32" | "UInt32" | "Single" => 4,
-        "Int64" | "UInt64" | "Double" => 8,
+        "Boolean" | "Byte" => PrimKind::U1,
+        "SByte" => PrimKind::I1,
+        "Int16" => PrimKind::I2,
+        "UInt16" | "Char" => PrimKind::U2,
+        "Int32" | "UInt32" => PrimKind::I4,
+        "Single" => PrimKind::F4,
+        "Int64" | "UInt64" => PrimKind::I8,
+        "Double" => PrimKind::F8,
         _ => return None,
     })
 }
@@ -2261,26 +2220,23 @@ fn mark_value_type_ctors(
     }
 }
 
-/// Marks a same-assembly (`MethodDef`) `newobj` of a `System.Text.StringBuilder` /
-/// `System.Collections` list `.ctor` declared in this assembly, so a corlib-INTERNAL
-/// `new StringBuilder()` allocates a builder/list at construction. `bind_bcl_calls` already
-/// covers the cross-assembly (`MemberRef`) form for a program's `newobj`; this is the
-/// same-assembly analog (modelled on [`mark_value_type_ctors`]). The per-row arity was
-/// captured as the type's methods were walked.
+/// Marks a same-assembly (`MethodDef`) `newobj` of a `System.Collections` list `.ctor` declared in
+/// this assembly, so a corlib-INTERNAL `new ArrayList()` allocates a native list at construction.
+/// `bind_bcl_calls` already covers the cross-assembly (`MemberRef`) form for a program's `newobj`;
+/// this is the same-assembly analog (modelled on [`mark_value_type_ctors`]). The per-row arity was
+/// captured as the type's methods were walked. (StringBuilder is fully managed now, so it is no
+/// longer marked here -- its ctor runs the managed body.)
 fn mark_same_assembly_ctors(
     module: &mut Module,
     asm: u8,
     newobj_tokens: &BTreeSet<Token>,
-    string_builder_ctor_rows: &BTreeMap<u32, u16>,
     list_ctor_rows: &BTreeMap<u32, u16>,
 ) {
     for token in newobj_tokens {
         if token.table() != METHOD_DEF {
             continue;
         }
-        if let Some(&params) = string_builder_ctor_rows.get(&token.row()) {
-            module.mark_string_builder_ctor(asm, *token, params);
-        } else if let Some(&params) = list_ctor_rows.get(&token.row()) {
+        if let Some(&params) = list_ctor_rows.get(&token.row()) {
             module.mark_list_ctor(asm, *token, params);
         }
     }
@@ -3886,63 +3842,16 @@ mod extended {
         }
     }
 
-    /// `System.Text.StringBuilder` instance methods (NMF v4.4). The `.ctor` is handled at
-    /// `newobj` (see `string_builder_ctor`); these are the instance calls.
+    /// `System.Text` intrinsic hook. `System.Text.StringBuilder` is now ordinary managed C# over a
+    /// `char[] _chars` buffer -- materialized through the one `String.CreateFromChars` seam -- so no
+    /// StringBuilder instance method binds to an intrinsic here (the `Encoding` family is managed
+    /// too). Kept as the `System.Text` dispatch hook (`bcl_intrinsic` routes the namespace here).
     pub(super) fn text_intrinsic(
-        type_name: &str,
-        method: &str,
-        signature: Option<&MethodSig>,
+        _type_name: &str,
+        _method: &str,
+        _signature: Option<&MethodSig>,
     ) -> Option<(IntrinsicFn, u32)> {
-        match (type_name, method) {
-            ("StringBuilder", "Append") => string_builder_append_overload(signature),
-            ("StringBuilder", "ToString") => match parameters_of(signature) {
-                [] => Some(intrinsic!(string_builder_to_string)),
-                _ => None,
-            },
-            ("StringBuilder", "get_Length") => match parameters_of(signature) {
-                [] => Some(intrinsic!(string_builder_get_length)),
-                _ => None,
-            },
-            ("StringBuilder", "SetLengthCore") => match parameters_of(signature) {
-                [SigType::I4] => Some(intrinsic!(string_builder_set_length)),
-                _ => None,
-            },
-            ("StringBuilder", "get_Capacity") => match parameters_of(signature) {
-                [] => Some(intrinsic!(string_builder_get_capacity)),
-                _ => None,
-            },
-            ("StringBuilder", "get_Chars") => match parameters_of(signature) {
-                [SigType::I4] => Some(intrinsic!(string_builder_get_char)),
-                _ => None,
-            },
-            ("StringBuilder", "SetCharsCore") => match parameters_of(signature) {
-                [SigType::I4, SigType::Char] => Some(intrinsic!(string_builder_set_char)),
-                _ => None,
-            },
-            ("StringBuilder", "InsertCore") => match parameters_of(signature) {
-                [SigType::I4, SigType::String] => Some(intrinsic!(string_builder_insert)),
-                _ => None,
-            },
-            ("StringBuilder", "RemoveCore") => match parameters_of(signature) {
-                [SigType::I4, SigType::I4] => Some(intrinsic!(string_builder_remove)),
-                _ => None,
-            },
-            ("StringBuilder", "Replace") => match parameters_of(signature) {
-                [SigType::Char, SigType::Char] => Some(intrinsic!(string_builder_replace_char)),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// A `StringBuilder.Append` overload by argument type (string / char / int).
-    fn string_builder_append_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
-        match parameters_of(signature) {
-            [SigType::String] => Some(intrinsic!(string_builder_append_string)),
-            [SigType::Char] => Some(intrinsic!(string_builder_append_char)),
-            [SigType::I4] => Some(intrinsic!(string_builder_append_int)),
-            _ => None,
-        }
+        None
     }
 
     /// The `get_Count` / `Contains` / `Clear` methods shared by `Stack` and `Queue` (both

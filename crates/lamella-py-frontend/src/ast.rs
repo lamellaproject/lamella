@@ -20,6 +20,8 @@ pub enum BinOp {
     TrueDiv,
     /// `**` -- exponentiation, right-associative (a non-negative integer exponent gives an integer).
     Pow,
+    /// `@` -- matrix multiplication (`__matmul__`); no builtin numeric type implements it.
+    MatMul,
     /// `%`
     Mod,
     /// `&`
@@ -231,7 +233,7 @@ pub enum Expr {
     /// A generator expression `(element for target in iterable [if cond])`. Materialized EAGERLY
     /// (compiled as a list comprehension) in this increment -- indistinguishable from a lazy
     /// generator when consumed immediately (`sum(x for x in xs)`, the common case); true lazy
-    /// evaluation is a follow-on.
+    /// evaluation is unsupported.
     GeneratorExp {
         /// The element expression, evaluated per innermost item.
         element: Box<Expr>,
@@ -316,7 +318,7 @@ pub enum AssignTarget {
         attr: String,
     },
     /// `(a, b)` or `[a, b]` -- a nested tuple/list target; its element sequence is unpacked
-    /// recursively. (A starred target `*x` inside a nested tuple is a follow-on.)
+    /// recursively. (A starred target `*x` inside a nested tuple is unsupported.)
     Tuple(Vec<AssignTarget>),
 }
 
@@ -392,8 +394,12 @@ pub enum Stmt {
     /// An expression evaluated for its effect; its value is discarded.
     Expr(Expr),
     /// `del target, ...` -- unbind each target. A bare name is supported (it unbinds the local);
-    /// subscript / attribute targets (`del xs[i]`, `del o.x`) are a follow-on (need interp ops).
+    /// subscript / attribute targets (`del xs[i]`, `del o.x`) are unsupported (need interp ops).
     Delete(Vec<Expr>),
+    /// `nonlocal name, ...` -- declare that these names bind to the nearest enclosing FUNCTION's
+    /// variables (a shared cell), so an assignment in this function writes through rather than
+    /// creating a new local. Each name must be bound in some enclosing function scope.
+    Nonlocal(Vec<String>),
     /// An `if`/`elif`/`else`. Each `elif` is desugared by the parser into a
     /// nested `If` in the preceding clause's `orelse`.
     If {
@@ -494,6 +500,19 @@ pub enum Stmt {
         /// The decorated statement -- a [`Stmt::FuncDef`] or [`Stmt::ClassDef`].
         inner: Box<Stmt>,
     },
+    /// `import module [as alias], ...` -- import one or more modules, binding each to its `as`
+    /// alias or the module name. Simple (undotted) module names only in this subset.
+    Import {
+        /// Each `(module_name, bound_name)`.
+        modules: Vec<(String, String)>,
+    },
+    /// `from module import name [as alias], ...` -- bind members off a module.
+    ImportFrom {
+        /// The module imported from (a simple name).
+        module: String,
+        /// Each `(member_name, bound_name)`.
+        names: Vec<(String, String)>,
+    },
     /// `break` -- exit the innermost enclosing loop.
     Break,
     /// `continue` -- skip to the next iteration of the innermost enclosing loop.
@@ -539,6 +558,9 @@ pub struct ParamDef {
     /// Whether this parameter is keyword-only -- it follows a bare `*` in the list, so it binds
     /// only by name, never positionally.
     pub keyword_only: bool,
+    /// Whether this parameter is positional-only -- it precedes a `/` in the list, so it binds
+    /// only by position, never by name.
+    pub positional_only: bool,
     /// Whether this is the `*args` parameter -- it collects surplus positional arguments into a
     /// tuple. At most one per parameter list; the params after it are keyword-only.
     pub is_vararg: bool,

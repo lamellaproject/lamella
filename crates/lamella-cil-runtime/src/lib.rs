@@ -29,6 +29,6 @@ pub use module::{
     IntrinsicFn, Method, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget, TypeId,
     baked_image_checksum,
 };
-pub use object::{Heap, Object, ObjectRef};
+pub use object::{ArrayStorage, Heap, Object, ObjectRef, PrimKind};
 pub use trap::Trap;
 pub use value::Value;

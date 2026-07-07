@@ -138,6 +138,17 @@ pub fn parse_submission(source: &str) -> ParsedSubmission {
     }
 }
 
+/// The source spelling of `kind`, for a diagnostic that names an offending token (e.g. CS1519).
+fn token_spelling(kind: &TokenKind) -> Box<str> {
+    match kind {
+        TokenKind::Identifier(name) => name.clone(),
+        TokenKind::Keyword(keyword) => keyword.as_str().into(),
+        TokenKind::Punctuator(punctuator) => punctuator.as_str().into(),
+        TokenKind::IntegerLiteral { value, .. } => alloc::format!("{value}").into(),
+        _ => "?".into(),
+    }
+}
+
 /// A recursive-descent parser over a filtered token stream.
 struct Parser {
     /// The significant tokens, trivia removed, always ending in `EndOfFile`.
@@ -1306,6 +1317,14 @@ impl Parser {
     fn parse_modifiers(&mut self) -> Vec<Modifier> {
         let mut modifiers = Vec::new();
         while let Some(modifier) = self.current_keyword().and_then(modifier_of) {
+            if modifiers.contains(&modifier) {
+                let span = self.current().span;
+                let keyword = token_spelling(&self.current().kind);
+                self.report(
+                    DiagnosticKind::DuplicateModifier { modifier: keyword },
+                    span,
+                );
+            }
             modifiers.push(modifier);
             self.bump();
         }
@@ -1463,9 +1482,37 @@ impl Parser {
                 span: Span::new(start, end),
             };
         }
-        let at = self.current().span.start;
-        self.report(DiagnosticKind::IdentifierExpected, Span::empty_at(at));
+        let span = self.current().span;
+        let token = token_spelling(&self.current().kind);
+        self.report(
+            DiagnosticKind::InvalidTokenInMemberDeclaration { token },
+            span,
+        );
+        self.recover_to_member_boundary();
         Member::Error
+    }
+
+    /// After an invalid token in a member declaration, skips to the next member boundary so the
+    /// enclosing type-body loop resynchronizes: a `;` ends the bad member (consumed), a `}` ends
+    /// the type body (left for the caller to close), and the end of file stops the scan. It also
+    /// stops at an identifier -- a token that can begin the next member (a field or method type) --
+    /// so a valid member after the junk is re-parsed, and a further stray token there is reported
+    /// on its own (csc reports each invalid token, not just the first).
+    fn recover_to_member_boundary(&mut self) {
+        loop {
+            if matches!(
+                self.current().kind,
+                TokenKind::EndOfFile | TokenKind::Identifier(_)
+            ) || self.current_punctuator() == Some(Punctuator::CloseBrace)
+            {
+                return;
+            }
+            let ends_member = self.current_punctuator() == Some(Punctuator::Semicolon);
+            self.bump();
+            if ends_member {
+                return;
+            }
+        }
     }
 
     /// Parses an accessor body `{ get/set accessors }` (17.6.2, 17.8.2), returning
@@ -2357,10 +2404,28 @@ impl Parser {
             if self.eat(Punctuator::Comma) {
                 continue;
             }
+            if self.current_punctuator() == Some(close) {
+                break;
+            }
             if self.position == before {
                 break;
             }
-            break;
+            if matches!(
+                self.current().kind,
+                TokenKind::EndOfFile
+                    | TokenKind::Punctuator(
+                        Punctuator::CloseParen
+                            | Punctuator::CloseBrace
+                            | Punctuator::CloseBracket
+                            | Punctuator::Semicolon
+                    )
+            ) {
+                break;
+            }
+            self.report(
+                DiagnosticKind::TokenExpected { expected: "," },
+                Span::empty_at(self.current().span.start),
+            );
         }
         let end = self.expect(close, missing);
         (arguments, end)
@@ -3299,6 +3364,14 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_comma_in_an_argument_list_is_one_cs1003() {
+        assert_eq!(codes("f(a b)"), vec![1003]);
+        assert_eq!(codes("f(a b c)"), vec![1003, 1003]);
+        assert_eq!(codes("a[i j]"), vec![1003]);
+        assert_eq!(codes("f(a"), vec![1026]);
+    }
+
+    #[test]
     fn a_member_access_without_a_name_is_cs1001() {
         assert_eq!(codes("a."), vec![1001]);
     }
@@ -4036,6 +4109,25 @@ mod tests {
             .iter()
             .map(Diagnostic::code)
             .collect()
+    }
+
+    #[test]
+    fn an_invalid_token_in_a_member_declaration_is_cs1519() {
+        assert_eq!(unit_codes("class C { public static void }"), vec![1519]);
+        assert_eq!(unit_codes("class C { int 5x; }"), vec![1519, 1519]);
+        assert_eq!(unit_codes("class C { int 5x; int y; }"), vec![1519, 1519]);
+    }
+
+    #[test]
+    fn a_duplicate_modifier_is_cs1004() {
+        assert_eq!(unit_codes("class C { public public int x; }"), vec![1004]);
+        assert_eq!(unit_codes("class C { static static int x; }"), vec![1004]);
+        assert_eq!(unit_codes("public public class C {}"), vec![1004]);
+        assert_eq!(unit_codes("class C { public static int x; }"), vec![]);
+        assert_eq!(
+            unit_codes("class C { public public public int x; }"),
+            vec![1004, 1004]
+        );
     }
 
     #[test]

@@ -38,6 +38,12 @@ const DORMANT_TO_SWD_ALERT: [u8; 16] = [
 /// master-type debug + HPROT data + DbgStatus + size-word + single-increment.
 const CSW_WORD: u32 = 0x2300_0052;
 
+/// MEM-AP CSW for sub-word accesses: [`CSW_WORD`]'s master/HPROT shape with Size = 8- or 16-bit
+/// and auto-increment off. Sub-word DRW data rides the byte lane of its address (ADIv5 B2.2.2):
+/// a byte at address A occupies DRW bits `[8*(A&3) +: 8]`, a halfword `[8*(A&2) +: 16]`.
+const CSW_BYTE: u32 = 0x2300_0040;
+const CSW_HALF: u32 = 0x2300_0041;
+
 const DHCSR: u32 = 0xe000_edf0;
 const DCRSR: u32 = 0xe000_edf4;
 const DCRDR: u32 = 0xe000_edf8;
@@ -53,6 +59,8 @@ const DCRSR_WRITE: u32 = 1 << 16;
 
 const AIRCR: u32 = 0xe000_ed0c;
 const AIRCR_SYSRESETREQ: u32 = 0x05fa_0004;
+const DEMCR: u32 = 0xe000_edfc;
+const VC_CORERESET: u32 = 1 << 0;
 
 const FP_CTRL: u32 = 0xe000_2000;
 const FP_COMP0: u32 = 0xe000_2008;
@@ -193,6 +201,17 @@ impl<T: Transport> Dap<T> {
         Ok(reply)
     }
 
+    /// Reads a `DAP_Info` string from the probe itself (no target involved): `id` 0x01 vendor,
+    /// 0x02 product, 0x03 serial, 0x04 CMSIS-DAP protocol version, 0x09 firmware version on
+    /// probes that report one. Empty when the probe does not populate the id.
+    pub fn info_string(&mut self, id: u8) -> Result<String, DapError> {
+        let reply = self.command(&proto::info(id))?;
+        let len = reply.get(1).copied().unwrap_or(0) as usize;
+        let bytes = reply.get(2..2 + len).unwrap_or(&[]);
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+    }
+
     /// Connects to the target over SWD: select the port, set the clock, then send the
     /// line-reset and JTAG-to-SWD switch sequence (ADIv5).
     pub fn connect_swd(&mut self) -> Result<(), DapError> {
@@ -215,7 +234,9 @@ impl<T: Transport> Dap<T> {
     /// recognizes them); the bit stream is least-significant-bit-first, matching every other SWD sequence.
     /// This wakes a SINGLE debug port; a part that puts several targets on ONE SWD bus additionally needs a
     /// DP `TARGETSEL` write to pick one (multi-drop), and an ADIv6 DP addresses its APs by address rather
-    /// than the ADIv5 `APSEL` field.
+    /// than the ADIv5 `APSEL` field -- both are unsupported here
+    /// (their `TARGETSEL` no-acknowledge write and the ADIv6 `SELECT` encoding cannot be confirmed against a
+    /// mock alone, and shipping unverified wire protocol would be worse than a clear seam).
     pub fn connect_swd_from_dormant(&mut self) -> Result<(), DapError> {
         self.command(&proto::connect(Port::Swd))?;
         self.command(&proto::swj_clock(1_000_000))?;
@@ -327,6 +348,48 @@ impl<T: Transport> Dap<T> {
         self.write_ap(0xc, value)
     }
 
+    /// Reads one byte from target memory -- a true 8-bit bus access, which registers with
+    /// byte-access semantics require (e.g. the SAMD21 GCLK's ID-indexed read windows, where a
+    /// 32-bit access would clobber neighboring registers). Switches the MEM-AP CSW to byte size
+    /// for the access and restores the 32-bit CSW afterward, even on failure.
+    pub fn read_byte(&mut self, address: u32) -> Result<u8, DapError> {
+        self.write_ap(0x0, CSW_BYTE)?;
+        let lanes = self.write_ap(0x4, address).and_then(|()| self.read_ap(0xc));
+        self.write_ap(0x0, CSW_WORD)?;
+        Ok((lanes? >> (8 * (address & 3))) as u8)
+    }
+
+    /// Writes one byte to target memory (8-bit bus access, byte-lane placed). See
+    /// [`read_byte`](Self::read_byte).
+    pub fn write_byte(&mut self, address: u32, value: u8) -> Result<(), DapError> {
+        self.write_ap(0x0, CSW_BYTE)?;
+        let put = self
+            .write_ap(0x4, address)
+            .and_then(|()| self.write_ap(0xc, u32::from(value) << (8 * (address & 3))));
+        self.write_ap(0x0, CSW_WORD)?;
+        put
+    }
+
+    /// Reads a halfword from target memory (16-bit bus access, byte-lane shifted). See
+    /// [`read_byte`](Self::read_byte).
+    pub fn read_halfword(&mut self, address: u32) -> Result<u16, DapError> {
+        self.write_ap(0x0, CSW_HALF)?;
+        let lanes = self.write_ap(0x4, address).and_then(|()| self.read_ap(0xc));
+        self.write_ap(0x0, CSW_WORD)?;
+        Ok((lanes? >> (8 * (address & 2))) as u16)
+    }
+
+    /// Writes a halfword to target memory (16-bit bus access) -- e.g. a 16-bit peripheral data
+    /// register a 32-bit write would overshoot. See [`read_byte`](Self::read_byte).
+    pub fn write_halfword(&mut self, address: u32, value: u16) -> Result<(), DapError> {
+        self.write_ap(0x0, CSW_HALF)?;
+        let put = self
+            .write_ap(0x4, address)
+            .and_then(|()| self.write_ap(0xc, u32::from(value) << (8 * (address & 2))));
+        self.write_ap(0x0, CSW_WORD)?;
+        put
+    }
+
     /// Halts the processor core.
     pub fn halt(&mut self) -> Result<(), DapError> {
         self.write_word(DHCSR, DBGKEY | C_DEBUGEN | C_HALT)
@@ -392,6 +455,53 @@ impl<T: Transport> Dap<T> {
     pub fn reset_and_run(&mut self) -> Result<(), DapError> {
         let _ = self.write_word(AIRCR, AIRCR_SYSRESETREQ);
         self.resume()
+    }
+
+    /// Arms halting debug and the reset VECTOR CATCH (`DEMCR.VC_CORERESET`, Armv6-M ARM
+    /// DDI0419 C1.6 debug support): the next core reset -- from any source -- halts at the
+    /// reset vector before the first instruction runs. Disarm with
+    /// [`Dap::disarm_reset_catch`] once caught, or later resets keep halting.
+    pub fn arm_reset_catch(&mut self) -> Result<(), DapError> {
+        self.write_word(DHCSR, DBGKEY | C_DEBUGEN)?;
+        self.write_word(DEMCR, VC_CORERESET)
+    }
+
+    /// Disarms the reset vector catch, so subsequent resets boot freely.
+    pub fn disarm_reset_catch(&mut self) -> Result<(), DapError> {
+        self.write_word(DEMCR, 0)
+    }
+
+    /// Waits (a bounded poll) for the core to report halted.
+    pub fn wait_halted(&mut self) -> Result<(), DapError> {
+        self.poll_dhcsr(S_HALT, "core halt")
+    }
+
+    /// Resets the core and CATCHES it halted at the reset vector, before the first
+    /// instruction runs -- the attach for a target whose RUNNING firmware defeats a plain
+    /// halt request, e.g. an armed watchdog resetting straight through one. The catch is
+    /// disarmed again before returning, so a later [`Dap::reset_and_run`] boots freely.
+    ///
+    /// The arm happens under the probe's `nRESET` when the line works (the core is held --
+    /// nothing runs, so nothing can race the arm-and-release); a probe with no reset line
+    /// wired falls through to racing arm+`SYSRESETREQ` rounds. A family whose debug unit
+    /// parks the core after an external reset needs its device-specific release instead
+    /// (the SAM D21's cold-plugging reset extension lives in `lamella-cmsis-dap-sam`).
+    pub fn reset_and_halt(&mut self) -> Result<(), DapError> {
+        let _ = self.set_reset(true);
+        let armed_held = self.arm_reset_catch().is_ok();
+        let _ = self.set_reset(false);
+        if armed_held && self.poll_dhcsr(S_HALT, "reset catch").is_ok() {
+            return self.disarm_reset_catch();
+        }
+        for _ in 0..8 {
+            if self.arm_reset_catch().is_ok() {
+                let _ = self.write_word(AIRCR, AIRCR_SYSRESETREQ);
+                if self.poll_dhcsr(S_HALT, "reset catch").is_ok() {
+                    return self.disarm_reset_catch();
+                }
+            }
+        }
+        Err(DapError::Timeout("reset catch"))
     }
 
     /// Drives the target reset line (`nRESET`) via `DAP_SWJ_Pins`: `assert = true` holds the core in

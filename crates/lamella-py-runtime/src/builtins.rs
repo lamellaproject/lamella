@@ -9,7 +9,9 @@ use lamella_py_bytecode::{BinOp, CmpOp, CodeObject};
 
 use crate::bigint::BigInt;
 use crate::interp::{binary, bigint_pow, call_value, iterator_for, py_next_value};
-use crate::object::{InlineCache, ObjectModel, LAZY_ENUMERATE, LAZY_FILTER, LAZY_MAP, LAZY_ZIP};
+use crate::object::{
+    InlineCache, ObjectModel, LAZY_CALLABLE, LAZY_ENUMERATE, LAZY_FILTER, LAZY_MAP, LAZY_ZIP,
+};
 use crate::trap::Trap;
 use crate::value::Value;
 
@@ -140,6 +142,12 @@ pub enum Builtin {
     IntFromBytes = 55,
     /// `bytes.fromhex(str)` -- reached via the `bytes` type (not a global name).
     BytesFromhex = 56,
+    /// `property(fget[, fset[, fdel]])` -- a computed-attribute descriptor.
+    Property = 57,
+    /// `ascii(obj)` -- like repr(), but escape every non-ASCII character.
+    Ascii = 58,
+    /// `str.maketrans(x, y[, z])` -- reached via the `str` type (not a global name).
+    StrMaketrans = 59,
 }
 
 impl Builtin {
@@ -205,6 +213,9 @@ impl Builtin {
             54 => Some(Builtin::Format),
             55 => Some(Builtin::IntFromBytes),
             56 => Some(Builtin::BytesFromhex),
+            57 => Some(Builtin::Property),
+            58 => Some(Builtin::Ascii),
+            59 => Some(Builtin::StrMaketrans),
             _ => None,
         }
     }
@@ -277,6 +288,9 @@ impl Builtin {
             Builtin::Format => "format",
             Builtin::IntFromBytes => "from_bytes",
             Builtin::BytesFromhex => "fromhex",
+            Builtin::Property => "property",
+            Builtin::Ascii => "ascii",
+            Builtin::StrMaketrans => "maketrans",
         }
     }
 
@@ -311,7 +325,7 @@ impl Builtin {
 /// `type(x)`: the type object of `x` -- a built-in value's type is its constructor built-in (so
 /// `type(5) is int`), a class instance's type is its class object. `None` for a value whose type
 /// has no representation yet (e.g. `None`, a function) -> the caller raises.
-fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
+pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
     if model.is_instance(value) {
         return Some(model.instance_class(value));
     }
@@ -333,6 +347,8 @@ fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
         Builtin::Bytearray
     } else if model.is_memoryview(value) {
         Builtin::Memoryview
+    } else if model.is_property(value) {
+        Builtin::Property
     } else if model.is_list(value) {
         Builtin::List
     } else if model.is_tuple(value) {
@@ -396,6 +412,8 @@ pub fn builtin_id(name: &str) -> Option<u32> {
         "staticmethod" => Builtin::Staticmethod,
         "classmethod" => Builtin::Classmethod,
         "memoryview" => Builtin::Memoryview,
+        "property" => Builtin::Property,
+        "ascii" => Builtin::Ascii,
         "format" => Builtin::Format,
         "iter" => Builtin::Iter,
         "set" => Builtin::Set,
@@ -438,6 +456,9 @@ pub fn call_builtin(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
+    if id >= crate::stdlib::STDLIB_BASE {
+        return crate::stdlib::call_stdlib(id, args, model);
+    }
     match Builtin::from_id(id).ok_or(Trap::Malformed)? {
         Builtin::Abs => {
             if args.len() != 1 {
@@ -535,6 +556,15 @@ pub fn call_builtin(
                 _ => return Err(Trap::TypeError),
             };
             let elements = collect_iterable(model, &[iterable], functions, depth)?;
+            let all_numeric = model.as_f64(start).is_some()
+                && elements.iter().all(|&e| model.as_f64(e).is_some());
+            let any_float =
+                model.is_float(start) || elements.iter().any(|&e| model.is_float(e));
+            if all_numeric && any_float {
+                let start = model.as_f64(start).unwrap_or(0.0);
+                let total = neumaier_sum(start, elements.iter().map(|&e| model.as_f64(e).unwrap_or(0.0)));
+                return model.new_float(total);
+            }
             let mut acc = start;
             for element in elements {
                 acc = binary(BinOp::Add, acc, element, model)?;
@@ -559,6 +589,41 @@ pub fn call_builtin(
             }
             let rendered = repr_arg(args[0], functions, model, depth)?;
             model.new_str(&rendered)
+        }
+        Builtin::Ascii => {
+            if args.len() != 1 {
+                return Err(Trap::TypeError);
+            }
+            let rendered = repr_arg(args[0], functions, model, depth)?;
+            model.new_str(&ascii_escape(&rendered))
+        }
+        Builtin::StrMaketrans => {
+            let chars = |model: &ObjectModel, v: Value| {
+                model.str_value(v).map(|s| s.chars().collect::<alloc::vec::Vec<char>>())
+            };
+            let (from, to, drop) = match args {
+                [x, y] => (chars(model, *x), chars(model, *y), None),
+                [x, y, z] => (chars(model, *x), chars(model, *y), Some(chars(model, *z))),
+                _ => return Err(Trap::TypeError),
+            };
+            let from = from.ok_or(Trap::TypeError)?;
+            let to = to.ok_or(Trap::TypeError)?;
+            if from.len() != to.len() {
+                return Err(Trap::ValueError);
+            }
+            let mut entries = alloc::vec::Vec::new();
+            for (a, b) in from.iter().zip(to.iter()) {
+                let key = Value::fixnum(*a as i32).ok_or(Trap::Overflow)?;
+                let val = Value::fixnum(*b as i32).ok_or(Trap::Overflow)?;
+                entries.push((key, val));
+            }
+            if let Some(drop) = drop {
+                for c in drop.ok_or(Trap::TypeError)? {
+                    let key = Value::fixnum(c as i32).ok_or(Trap::Overflow)?;
+                    entries.push((key, Value::NONE));
+                }
+            }
+            model.new_dict(entries)
         }
         Builtin::Int => match args {
             [] => Value::fixnum(0).ok_or(Trap::Overflow),
@@ -595,6 +660,18 @@ pub fn call_builtin(
                 } else {
                     Err(Trap::TypeError)
                 }
+            }
+            [x, base] => {
+                let base = base.as_int().ok_or(Trap::TypeError)?;
+                if base != 0 && !(2..=36).contains(&base) {
+                    return Err(model
+                        .with_message(Trap::ValueError, "int() base must be >= 2 and <= 36, or 0"));
+                }
+                if !model.is_str(*x) {
+                    return Err(Trap::TypeError);
+                }
+                let raw = model.str_value(*x).map(String::from).unwrap_or_default();
+                parse_int_radix(&raw, base, *x, model)
             }
             _ => Err(Trap::TypeError),
         },
@@ -651,15 +728,18 @@ pub fn call_builtin(
             }
             _ => Err(Trap::TypeError),
         },
-        Builtin::Iter => {
-            if args.len() != 1 {
-                return Err(Trap::TypeError);
+        Builtin::Iter => match args {
+            [iterable] => iterator_for(*iterable, functions, model, depth),
+            [callable, sentinel] => {
+                let sources = model.new_tuple(alloc::vec![*sentinel])?;
+                model.new_lazy_iter(LAZY_CALLABLE, *callable, sources)
             }
-            iterator_for(args[0], functions, model, depth)
-        }
+            _ => Err(Trap::TypeError),
+        },
         Builtin::Set => {
             let elems = collect_iterable(model, args, functions, depth)?;
-            model.new_set(elems)
+            let deduped = crate::interp::dedup_elems(elems, functions, model, depth)?;
+            model.new_set(deduped)
         }
         Builtin::Map => {
             if args.len() < 2 {
@@ -716,7 +796,7 @@ pub fn call_builtin(
                         let parts = model.unpack_sequence(pair, 2)?;
                         kv.push((parts[0], parts[1]));
                     }
-                    model.new_dict(kv)
+                    model.new_dict_dyn(kv, functions, depth)
                 }
             }
             _ => Err(Trap::TypeError),
@@ -818,7 +898,8 @@ pub fn call_builtin(
         Builtin::Oct => format_radix(model, args, "0o", 8),
         Builtin::Frozenset => {
             let elems = collect_iterable(model, args, functions, depth)?;
-            model.new_frozenset(elems)
+            let deduped = crate::interp::dedup_elems(elems, functions, model, depth)?;
+            model.new_frozenset(deduped)
         }
         Builtin::Callable => {
             if args.len() != 1 {
@@ -966,6 +1047,16 @@ pub fn call_builtin(
             }
             model.new_bytes(bytes)
         }
+        Builtin::Property => {
+            let (fget, fset, fdel) = match args {
+                [] => (Value::NONE, Value::NONE, Value::NONE),
+                [g] => (*g, Value::NONE, Value::NONE),
+                [g, s] => (*g, *s, Value::NONE),
+                [g, s, d] => (*g, *s, *d),
+                _ => return Err(Trap::TypeError),
+            };
+            model.new_property(fget, fset, fdel)
+        }
         Builtin::Type => {
             let [value] = args else {
                 return Err(Trap::TypeError);
@@ -1047,7 +1138,7 @@ pub fn call_builtin(
                 [it, v] => (*it, *v),
                 _ => return Err(Trap::TypeError),
             };
-            model.new_dict_fromkeys(iterable, value)
+            model.new_dict_fromkeys(iterable, value, functions, depth)
         }
     }
 }
@@ -1168,8 +1259,38 @@ pub fn call_builtin_kw(
         Builtin::Min => min_max_kw(posargs, kwargs, Ordering::Less, functions, model, depth),
         Builtin::Max => min_max_kw(posargs, kwargs, Ordering::Greater, functions, model, depth),
         Builtin::Print => print_kw(posargs, kwargs, functions, model, depth),
+        Builtin::Enumerate => enumerate_kw(posargs, kwargs, functions, model, depth),
+        _ if kwargs.is_empty() => call_builtin(id, posargs, functions, model, depth),
         _ => Err(Trap::TypeError),
     }
+}
+
+/// `enumerate(iterable, start=0)`: accepts `start` as a keyword. A `start` given both positionally
+/// and by keyword, or any other keyword, is a `TypeError`.
+fn enumerate_kw(
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let iterable = *posargs.first().ok_or(Trap::TypeError)?;
+    if posargs.len() > 2 {
+        return Err(Trap::TypeError);
+    }
+    let mut start = posargs.get(1).copied();
+    for &(name, value) in kwargs {
+        if name == "start" && start.is_none() {
+            start = Some(value);
+        } else {
+            return Err(Trap::TypeError);
+        }
+    }
+    let mut call_args = alloc::vec![iterable];
+    if let Some(start) = start {
+        call_args.push(start);
+    }
+    call_builtin(Builtin::Enumerate.id(), &call_args, functions, model, depth)
 }
 
 /// `print(*args, sep=' ', end='\n')`: the args rendered with str() and joined by `sep`, then `end`.
@@ -1416,6 +1537,24 @@ fn repr_arg(
     Ok(model.repr(value))
 }
 
+/// Escapes every non-ASCII code point of `s` as `\xNN` / `\uNNNN` / `\UNNNNNNNN` (Python's `ascii()`).
+fn ascii_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        let cp = c as u32;
+        if cp < 0x80 {
+            out.push(c);
+        } else if cp <= 0xff {
+            out.push_str(&alloc::format!("\\x{cp:02x}"));
+        } else if cp <= 0xffff {
+            out.push_str(&alloc::format!("\\u{cp:04x}"));
+        } else {
+            out.push_str(&alloc::format!("\\U{cp:08x}"));
+        }
+    }
+    out
+}
+
 /// Sorts the collected elements into a new list: int elements numerically, str lexicographically;
 /// a mixed or otherwise unorderable set is a `TypeError`.
 /// `a < b`, honoring a user class's `__lt__` (via the reflected comparison protocol), else the
@@ -1586,6 +1725,75 @@ fn parse_python_float(s: &str) -> Option<f64> {
 /// Removes Python's numeric `_` separators, which must sit BETWEEN two digits (`1_000` is valid,
 /// `_1`/`1_`/`1__0`/`1_.0` are not). `None` for a misplaced underscore; the original string when
 /// there is none.
+/// Neumaier compensated summation (an improved Kahan): tracks the lost low-order bits in `c` so a
+/// large-then-small run (`[1e20, 1, -1e20]`) keeps the small term. Backs `sum()` over floats.
+fn neumaier_sum(start: f64, values: impl Iterator<Item = f64>) -> f64 {
+    let mut sum = start;
+    let mut compensation = 0.0;
+    for x in values {
+        let t = sum + x;
+        if sum.abs() >= x.abs() {
+            compensation += (sum - t) + x;
+        } else {
+            compensation += (x - t) + sum;
+        }
+        sum = t;
+    }
+    sum + compensation
+}
+
+/// `int(str, base)`: parse `raw` in `base` (2..=36, or 0 to auto-detect from a `0x`/`0o`/`0b`
+/// prefix), allowing a leading sign, the matching prefix, and `_` digit separators. `original` is
+/// the source string (for the error message).
+fn parse_int_radix(
+    raw: &str,
+    base: i64,
+    original: Value,
+    model: &mut ObjectModel,
+) -> Result<Value, Trap> {
+    let trimmed = raw.trim();
+    let (negative, body) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    let lowered = body.to_ascii_lowercase();
+    let (base, body) = if base == 0 {
+        if lowered.starts_with("0x") {
+            (16, &body[2..])
+        } else if lowered.starts_with("0o") {
+            (8, &body[2..])
+        } else if lowered.starts_with("0b") {
+            (2, &body[2..])
+        } else {
+            (10, body)
+        }
+    } else {
+        let prefix = match base {
+            16 => "0x",
+            8 => "0o",
+            2 => "0b",
+            _ => "",
+        };
+        if !prefix.is_empty() && lowered.starts_with(prefix) {
+            (base, &body[2..])
+        } else {
+            (base, body)
+        }
+    };
+    let parsed = strip_underscores(body)
+        .and_then(|cleaned| BigInt::from_str_radix(&cleaned, base as u32, negative));
+    match parsed {
+        Some(big) => model.new_bigint(big),
+        None => {
+            let message = alloc::format!(
+                "invalid literal for int() with base {base}: {}",
+                model.repr(original)
+            );
+            Err(model.with_message(Trap::ValueError, &message))
+        }
+    }
+}
+
 fn strip_underscores(s: &str) -> Option<String> {
     if !s.contains('_') {
         return Some(String::from(s));

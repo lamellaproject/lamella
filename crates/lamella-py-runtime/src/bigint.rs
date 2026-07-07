@@ -325,6 +325,20 @@ impl BigInt {
         }
         Some(normalized(negative, mag))
     }
+
+    /// Parses `digits` (no sign, no base prefix, no separators) in `radix` (2..=36) with the given
+    /// sign. `None` on an empty string or an out-of-range digit. Backs `int(str, base)`.
+    pub fn from_str_radix(digits: &str, radix: u32, negative: bool) -> Option<BigInt> {
+        if digits.is_empty() {
+            return None;
+        }
+        let mut mag: Vec<u32> = Vec::new();
+        for ch in digits.chars() {
+            let digit = ch.to_digit(radix)?;
+            mag = mag_add_small(&mag_mul_small(&mag, radix), digit);
+        }
+        Some(normalized(negative, mag))
+    }
 }
 
 /// Trims trailing-zero limbs, and forces a zero magnitude to a non-negative sign (one form per value).

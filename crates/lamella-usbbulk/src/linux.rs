@@ -20,11 +20,14 @@ struct UsbdevfsBulktransfer {
     data: *mut libc::c_void,
 }
 
-/// A discovered v2 probe: its usbfs node, ids, and the vendor interface's number + bulk endpoints.
+/// A discovered v2 probe: its usbfs node, ids, the device's serial/product strings (when sysfs reports
+/// them), and the vendor interface's number + bulk endpoints.
 struct Found {
     node: String,
     vid: u16,
     pid: u16,
+    serial: Option<String>,
+    product: Option<String>,
     interface: u8,
     ep_in: u8,
     ep_out: u8,
@@ -39,6 +42,11 @@ fn read_hex8(path: &Path) -> Option<u8> {
 fn read_dec(path: &Path) -> Option<u8> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
 }
+/// A sysfs string attribute (`serial`, `product`), trimmed; `None` if absent or empty.
+fn read_string(path: &Path) -> Option<String> {
+    let value = fs::read_to_string(path).ok()?.trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
 
 /// Find this interface's bulk IN + OUT endpoint addresses from its `ep_XX` sysfs subdirectories.
 fn bulk_endpoints(iface_dir: &Path) -> (u8, u8) {
@@ -52,8 +60,10 @@ fn bulk_endpoints(iface_dir: &Path) -> (u8, u8) {
             let attr = read_hex8(&ep.path().join("bmAttributes")).unwrap_or(0);
             if attr & 0x03 == 0x02 {
                 if addr & 0x80 != 0 {
-                    ep_in = addr;
-                } else {
+                    if ep_in == 0 || addr < ep_in {
+                        ep_in = addr;
+                    }
+                } else if ep_out == 0 || addr < ep_out {
                     ep_out = addr;
                 }
             }
@@ -85,6 +95,8 @@ fn scan() -> Vec<Found> {
         else {
             continue;
         };
+        let serial = read_string(&dir.join("serial"));
+        let product = read_string(&dir.join("product"));
         let Ok(ifaces) = fs::read_dir(&dir) else {
             continue;
         };
@@ -102,6 +114,8 @@ fn scan() -> Vec<Found> {
                     node: format!("/dev/bus/usb/{busnum:03}/{devnum:03}"),
                     vid,
                     pid,
+                    serial: serial.clone(),
+                    product: product.clone(),
                     interface: read_hex8(&iface.path().join("bInterfaceNumber")).unwrap_or(0),
                     ep_in,
                     ep_out,
@@ -119,8 +133,8 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
         .map(|f| DeviceInfo {
             vendor_id: f.vid,
             product_id: f.pid,
-            serial_number: None,
-            product: None,
+            serial_number: f.serial,
+            product: f.product,
         })
         .collect())
 }

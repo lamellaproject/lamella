@@ -44,6 +44,15 @@ pub type PInvokeHostFn = fn(&crate::module::PInvokeTarget, &mut [PInvokeArg]) ->
 #[derive(Debug, Default)]
 pub struct Vm {
     heap: Heap,
+    /// Recycled activation-frame shells and argument buffers ([`FramePool`]): on a
+    /// bump-allocator device tier a dropped `Vec`'s storage never comes back, so without
+    /// recycling EVERY managed call costs permanent arena (~200-300 B measured). Owned by
+    /// the `Vm` so every session and green thread shares one pool.
+    frame_pool: FramePool,
+    /// The console-output bound ([`Vm::set_output_cap`]): `None` = unbounded (host).
+    output_cap: Option<usize>,
+    /// Whether the cap clipped a write since last taken ([`Vm::take_output_clipped`]).
+    output_clipped: bool,
     output: Vec<u16>,
     /// The DEBUG channel -- the bytes `System.Diagnostics.Debug`'s `DefaultTraceListener`
     /// emits, kept separate from `output` (the Console). Conceptually the developer's debug
@@ -421,6 +430,15 @@ impl Vm {
         self.net_backend.as_deref_mut()
     }
 
+    /// The heap and the networking seam together, split-borrowed -- a bulk socket intrinsic
+    /// crosses the seam straight to/from a packed array's bytes, which needs a view into the
+    /// heap live while the backend runs.
+    pub fn heap_and_net(
+        &mut self,
+    ) -> (&mut Heap, Option<&mut (dyn crate::net::NetBackend + 'static)>) {
+        (&mut self.heap, self.net_backend.as_deref_mut())
+    }
+
     /// Sets the host TLS crypto seam ([`crate::tls::TlsBackend`]). The embedder provides it (the host
     /// with rustls / mbedTLS; a device with mbedTLS); without it, the TLS intrinsics report failure.
     pub fn set_tls_backend(&mut self, backend: alloc::boxed::Box<dyn crate::tls::TlsBackend>) {
@@ -529,9 +547,38 @@ impl Vm {
         }
     }
 
-    /// Appends UTF-16 code units to the console output.
+    /// Appends UTF-16 code units to the console output, clipping at the configured cap
+    /// ([`Vm::set_output_cap`]) -- the units past it are dropped and
+    /// [`Vm::output_clipped`] reports that it happened.
     pub fn write(&mut self, chars: &[u16]) {
-        self.output.extend_from_slice(chars);
+        let take = match self.output_cap {
+            Some(cap) => cap.saturating_sub(self.output.len()).min(chars.len()),
+            None => chars.len(),
+        };
+        if take < chars.len() {
+            self.output_clipped = true;
+        }
+        self.output.extend_from_slice(&chars[..take]);
+    }
+
+    /// Bounds the console output buffer at `cap` UTF-16 units (`None` = unbounded, the
+    /// host default). On a bump-allocator device tier an unbounded console is a leak an
+    /// output-happy program feeds forever; a capped one is a fixed-cost diagnostic window
+    /// (the embedder reads [`Vm::output_clipped`] to note the loss).
+    pub fn set_output_cap(&mut self, cap: Option<usize>) {
+        self.output_cap = cap;
+    }
+
+    /// Whether a [`Vm::write`] was clipped by the output cap since the last
+    /// [`Vm::take_output_clipped`].
+    #[must_use]
+    pub fn output_clipped(&self) -> bool {
+        self.output_clipped
+    }
+
+    /// Reads and clears the clipped flag (an embedder notes the truncation once per run).
+    pub fn take_output_clipped(&mut self) -> bool {
+        core::mem::take(&mut self.output_clipped)
     }
 
     /// The console output so far, as UTF-16 code units.
@@ -733,6 +780,89 @@ struct Frame {
     /// variable arguments begin in `args` and each one's type handle. `arglist` reads it to build a
     /// `TypedReference` per variable argument; `None` for the common non-vararg method.
     varargs: Option<VarargFrame>,
+}
+
+/// Recycled [`Frame`] shells and `Vec<Value>` buffers, so the steady-state cost of a
+/// managed call is ZERO heap allocations: a returning frame's stack/locals/args buffers
+/// (cleared, capacities kept) serve the next call instead of being dropped -- which on a
+/// bump-allocator tier means leaked. Buffers grow to the program's high-water shape and
+/// stay there; the pools cap so a pathological depth spike cannot hoard on a host.
+///
+/// Retired state is CLEARED (`len == 0` everywhere), so a pooled shell holds no object
+/// references -- the collector, which roots only the live call stacks, never needs to see
+/// the pool.
+#[derive(Default)]
+struct FramePool {
+    /// Retired frame shells, ready to revive.
+    shells: Vec<Frame>,
+    /// Spare `Vec<Value>` buffers (call arguments in flight become frame `args`; the
+    /// displaced buffer comes back here).
+    values: Vec<Vec<Value>>,
+}
+
+impl FramePool {
+    /// Pool caps: a shell per plausible call-stack slot, and a few argument buffers in
+    /// flight. Past the cap a retiree is dropped -- correct on a host (the allocator
+    /// frees), and on a bump tier the pool never exceeds the program's real peak anyway.
+    const SHELLS_CAP: usize = 128;
+    const VALUES_CAP: usize = 16;
+
+    /// A cleared `Vec<Value>` buffer (a recycled one when available).
+    fn take_values(&mut self) -> Vec<Value> {
+        self.values.pop().unwrap_or_default()
+    }
+
+    /// Returns a `Vec<Value>` buffer to the pool (cleared here; capacity kept).
+    fn give_values(&mut self, mut buffer: Vec<Value>) {
+        if self.values.len() < Self::VALUES_CAP {
+            buffer.clear();
+            self.values.push(buffer);
+        }
+    }
+
+    /// A frame for `method` taking ownership of `args` -- a revived shell when one is
+    /// pooled (its displaced `args` buffer comes back to the pool), else a fresh frame.
+    fn revive(&mut self, method: MethodId, args: Vec<Value>) -> Frame {
+        match self.shells.pop() {
+            Some(mut frame) => {
+                frame.method = method;
+                frame.ip = 0;
+                self.give_values(core::mem::replace(&mut frame.args, args));
+                frame
+            }
+            None => Frame::new(method, args),
+        }
+    }
+
+    /// Retires a finished frame: clear every buffer (keeping capacities) and every
+    /// in-flight marker, then shelve it for the next call.
+    fn retire(&mut self, mut frame: Frame) {
+        if self.shells.len() >= Self::SHELLS_CAP {
+            return;
+        }
+        frame.stack.clear();
+        frame.locals.clear();
+        frame.args.clear();
+        frame.buffers.clear();
+        frame.new_object = None;
+        frame.new_value = None;
+        frame.current_exception = None;
+        frame.pending = None;
+        frame.pending_filter = None;
+        frame.multicast = None;
+        frame.pending_constraint = None;
+        frame.varargs = None;
+        self.shells.push(frame);
+    }
+}
+
+impl core::fmt::Debug for FramePool {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FramePool")
+            .field("shells", &self.shells.len())
+            .field("values", &self.values.len())
+            .finish()
+    }
 }
 
 /// A vararg method frame's variadic region (set from the call site's [`crate::module::VarargSite`]).
@@ -1399,7 +1529,7 @@ impl Session {
     /// Returns [`Trap::NoSuchMethod`] if `entry` is not a managed method.
     pub fn new(module: &Module, entry: MethodId, args: Vec<Value>) -> Result<Session, Trap> {
         Ok(Session {
-            frames: alloc::vec![new_frame(module, entry, args)?],
+            frames: alloc::vec![new_frame_cold(module, entry, args)?],
             breakpoints: BTreeMap::new(),
             result: None,
             #[cfg(feature = "exceptions")]
@@ -1874,16 +2004,18 @@ impl Session {
         match flow {
             Flow::Next => Ok(Status::Running),
             Flow::Return(value) => {
-                let returned = frames.pop();
-                if let Some((rest, params)) = returned.as_ref().and_then(|f| f.multicast.as_ref()) {
+                let mut returned = frames.pop();
+                if let Some((rest, params)) = returned.as_mut().and_then(|f| f.multicast.take()) {
                     if let Some(((target, method), remaining)) = rest.split_first() {
-                        let call_args = delegate_call_args(target, params);
-                        let (method, remaining, params) =
-                            (*method, remaining.to_vec(), params.clone());
+                        let call_args = delegate_call_args(target, &params);
+                        let (method, remaining) = (*method, remaining.to_vec());
+                        if let Some(finished) = returned {
+                            vm.frame_pool.retire(finished);
+                        }
                         if frames.len() >= MAX_CALL_DEPTH {
                             return Err(Trap::CallStackOverflow);
                         }
-                        let mut next = new_frame(module, method, call_args)?;
+                        let mut next = new_frame(vm, module, method, call_args)?;
                         next.multicast = Some((remaining, params));
                         frames.push(next);
                         push_pending_cctor(frames, module, vm, method)?;
@@ -1891,7 +2023,10 @@ impl Session {
                     }
                 }
                 let returned_object = returned.as_ref().and_then(|frame| frame.new_object);
-                let returned_value_location = returned.and_then(|frame| frame.new_value);
+                let returned_value_location = returned.as_mut().and_then(|frame| frame.new_value.take());
+                if let Some(finished) = returned {
+                    vm.frame_pool.retire(finished);
+                }
                 let returned_struct = returned_value_location
                     .map(|location| read_byref(frames, vm, location));
                 match frames.last_mut() {
@@ -1912,9 +2047,10 @@ impl Session {
                 }
             }
             Flow::Jmp(target) => {
-                let args = frames.last().ok_or(Trap::StackUnderflow)?.args.clone();
-                frames.pop();
-                let frame = new_frame(module, target, args)?;
+                let mut replaced = frames.pop().ok_or(Trap::StackUnderflow)?;
+                let args = core::mem::take(&mut replaced.args);
+                vm.frame_pool.retire(replaced);
+                let frame = new_frame(vm, module, target, args)?;
                 frames.push(frame);
                 push_pending_cctor(frames, module, vm, target)?;
                 Ok(Status::Running)
@@ -1924,18 +2060,20 @@ impl Session {
                     if frames.len() >= MAX_CALL_DEPTH {
                         return Err(Trap::CallStackOverflow);
                     }
-                    frames.push(new_frame(module, method, args)?);
+                    let frame = new_frame(vm, module, method, args)?;
+                    frames.push(frame);
                     push_pending_cctor(frames, module, vm, method)?;
                     Ok(Status::Running)
                 }
                 Some(MethodKind::Intrinsic(func)) => {
                     run_pending_cctor_nested(module, vm, method)?;
-                    let args = if is_compare_exchange(module, method) {
-                        args
-                    } else {
-                        deref_byref_args(frames, vm, args)
-                    };
-                    match func(vm, module, &args) {
+                    let mut args = args;
+                    if !is_compare_exchange(module, method) {
+                        deref_byref_args_in_place(frames, vm, &mut args);
+                    }
+                    let outcome = func(vm, module, &args);
+                    vm.frame_pool.give_values(args);
+                    match outcome {
                         Ok(result) => {
                             if let Some(value) = result {
                                 frames
@@ -1969,7 +2107,7 @@ impl Session {
                 if frames.len() >= MAX_CALL_DEPTH {
                     return Err(Trap::CallStackOverflow);
                 }
-                let mut frame = new_frame(module, method, args)?;
+                let mut frame = new_frame(vm, module, method, args)?;
                 frame.varargs = Some(VarargFrame {
                     start: vararg_start,
                     types: var_types,
@@ -1983,20 +2121,26 @@ impl Session {
                     if frames.len() >= MAX_CALL_DEPTH {
                         return Err(Trap::CallStackOverflow);
                     }
-                    let mut full_args = Vec::with_capacity(args.len() + 1);
+                    let mut args = args;
+                    let mut full_args = vm.frame_pool.take_values();
                     full_args.push(Value::Object(object));
-                    full_args.extend(args);
-                    let mut frame = new_frame(module, ctor, full_args)?;
+                    full_args.append(&mut args);
+                    vm.frame_pool.give_values(args);
+                    let mut frame = new_frame(vm, module, ctor, full_args)?;
                     frame.new_object = Some(object);
                     frames.push(frame);
                     push_pending_cctor(frames, module, vm, ctor)?;
                     Ok(Status::Running)
                 }
                 Some(MethodKind::Intrinsic(func)) => {
-                    let mut full_args = Vec::with_capacity(args.len() + 1);
+                    let mut args = args;
+                    let mut full_args = vm.frame_pool.take_values();
                     full_args.push(Value::Object(object));
-                    full_args.extend(args);
-                    func(vm, module, &full_args)?;
+                    full_args.append(&mut args);
+                    vm.frame_pool.give_values(args);
+                    let outcome = func(vm, module, &full_args);
+                    vm.frame_pool.give_values(full_args);
+                    outcome?;
                     frames
                         .last_mut()
                         .ok_or(Trap::CallStackOverflow)?
@@ -2015,16 +2159,19 @@ impl Session {
                     if frames.len() >= MAX_CALL_DEPTH {
                         return Err(Trap::CallStackOverflow);
                     }
-                    let mut full_args = Vec::with_capacity(args.len() + 1);
+                    let mut args = args;
+                    let mut full_args = vm.frame_pool.take_values();
                     full_args.push(Value::ByRef(location.clone()));
-                    full_args.extend(args);
-                    let mut frame = new_frame(module, ctor, full_args)?;
+                    full_args.append(&mut args);
+                    vm.frame_pool.give_values(args);
+                    let mut frame = new_frame(vm, module, ctor, full_args)?;
                     frame.new_value = Some(location);
                     frames.push(frame);
                     push_pending_cctor(frames, module, vm, ctor)?;
                     Ok(Status::Running)
                 }
                 Some(MethodKind::Intrinsic(_)) => {
+                    vm.frame_pool.give_values(args);
                     let value = read_byref(frames, vm, location);
                     frames
                         .last_mut()
@@ -2042,7 +2189,8 @@ impl Session {
                 if frames.len() >= MAX_CALL_DEPTH {
                     return Err(Trap::CallStackOverflow);
                 }
-                frames.push(new_frame(module, cctor, Vec::new())?);
+                let frame = new_frame(vm, module, cctor, Vec::new())?;
+                frames.push(frame);
                 Ok(Status::Running)
             }
             Flow::Throw(exception) => {
@@ -2178,7 +2326,7 @@ impl Session {
                 if frames.len() >= MAX_CALL_DEPTH {
                     return Err(Trap::CallStackOverflow);
                 }
-                let mut frame = new_frame(module, method, call_args)?;
+                let mut frame = new_frame(vm, module, method, call_args)?;
                 frame.multicast = Some((invocations, params));
                 frames.push(frame);
                 Ok(Status::Running)
@@ -2328,13 +2476,12 @@ fn read_field_at(frames: &[Frame], vm: &Vm, location: Location, slot: u32) -> Va
 /// Dereferences any managed-pointer argument to the value it points at, so an intrinsic
 /// (which works on values -- e.g. `Int32.ToString` on `&int`) sees the value, not the
 /// pointer.
-fn deref_byref_args(frames: &[Frame], vm: &Vm, args: Vec<Value>) -> Vec<Value> {
-    args.into_iter()
-        .map(|arg| match arg {
-            Value::ByRef(location) => read_byref(frames, vm, location),
-            other => other,
-        })
-        .collect()
+fn deref_byref_args_in_place(frames: &[Frame], vm: &Vm, args: &mut [Value]) {
+    for arg in args.iter_mut() {
+        if let Value::ByRef(location) = arg {
+            *arg = read_byref(frames, vm, location.clone());
+        }
+    }
 }
 
 /// Normalizes the value `stind.i1` / `stind.i2` stores through a byref to a VALUE slot (a local /
@@ -2569,7 +2716,8 @@ fn push_pending_cctor(
     if frames.len() >= MAX_CALL_DEPTH {
         return Err(Trap::CallStackOverflow);
     }
-    frames.push(new_frame(module, cctor, Vec::new())?);
+    let frame = new_frame(vm, module, cctor, Vec::new())?;
+    frames.push(frame);
     Ok(())
 }
 
@@ -2587,11 +2735,33 @@ fn run_pending_cctor_nested(module: &Module, vm: &mut Vm, method: MethodId) -> R
     Ok(())
 }
 
-fn new_frame(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
+fn new_frame(vm: &mut Vm, module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
+    match module.method_kind(id) {
+        Some(MethodKind::Managed) => Ok(vm.frame_pool.revive(id, args)),
+        _ => Err(Trap::NoSuchMethod(id)),
+    }
+}
+
+/// [`new_frame`] without a [`Vm`] (no pool): the session/thread ENTRY frame, one per
+/// program start -- the per-call recycling happens in `advance`, which always has the `Vm`.
+fn new_frame_cold(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
     match module.method_kind(id) {
         Some(MethodKind::Managed) => Ok(Frame::new(id, args)),
         _ => Err(Trap::NoSuchMethod(id)),
     }
+}
+
+/// [`Frame::take_args`] into a POOLED buffer: the top `count` stack values move (in
+/// declaration order) into a recycled `Vec`, so a warm call site allocates nothing.
+fn take_args_pooled(frame: &mut Frame, vm: &mut Vm, count: u16) -> Result<Vec<Value>, Trap> {
+    let split = frame
+        .stack
+        .len()
+        .checked_sub(count as usize)
+        .ok_or(Trap::StackUnderflow)?;
+    let mut args = vm.frame_pool.take_values();
+    args.extend(frame.stack.drain(split..));
+    Ok(args)
 }
 
 /// The CIL of a managed method -- looked up per advance now that a frame no longer
@@ -2751,7 +2921,7 @@ fn catchable_fault(trap: &Trap, vm: &mut Vm) -> Option<ObjectRef> {
 fn raise(
     frames: &mut Vec<Frame>,
     module: &Module,
-    vm: &Vm,
+    vm: &mut Vm,
     exception: ObjectRef,
 ) -> Result<Status, Trap> {
     let Some(frame) = frames.last() else {
@@ -2769,7 +2939,7 @@ fn raise(
 fn raise_from(
     frames: &mut Vec<Frame>,
     module: &Module,
-    vm: &Vm,
+    vm: &mut Vm,
     exception: ObjectRef,
     from: usize,
     fault_ip: usize,
@@ -2837,7 +3007,7 @@ fn raise_from(
 fn begin_finallys(
     frames: &mut Vec<Frame>,
     module: &Module,
-    vm: &Vm,
+    vm: &mut Vm,
     mut finallys: Vec<usize>,
     then: AfterFinally,
 ) -> Result<Status, Trap> {
@@ -2857,7 +3027,7 @@ fn begin_finallys(
 fn complete_finally(
     frames: &mut Vec<Frame>,
     module: &Module,
-    vm: &Vm,
+    vm: &mut Vm,
     then: AfterFinally,
 ) -> Result<Status, Trap> {
     match then {
@@ -2874,7 +3044,9 @@ fn complete_finally(
             Ok(Status::Running)
         }
         AfterFinally::Unwind(exception) => {
-            frames.pop();
+            if let Some(unwound) = frames.pop() {
+                vm.frame_pool.retire(unwound);
+            }
             raise(frames, module, vm, exception)
         }
     }
@@ -3229,7 +3401,7 @@ fn step(
                 let total = site.total_args;
                 let vararg_start = site.vararg_start;
                 let var_types = site.var_types.clone();
-                let args = frame.take_args(total)?;
+                let args = take_args_pooled(frame, vm, total)?;
                 return Ok(Flow::CallVararg {
                     method,
                     args,
@@ -3240,7 +3412,7 @@ fn step(
             let arg_count = module
                 .method_arg_count(method)
                 .ok_or(Trap::NoSuchMethod(method))?;
-            let args = frame.take_args(arg_count)?;
+            let args = take_args_pooled(frame, vm, arg_count)?;
             return Ok(Flow::Call { method, args });
         }
 
@@ -3248,7 +3420,7 @@ fn step(
             let module = module.ok_or(Trap::Unsupported(Opcode::Callvirt))?;
             let token = token_operand(instruction)?;
             if let Some(param_count) = module.delegate_invoke(asm, token) {
-                let args = frame.take_args(param_count + 1)?;
+                let args = take_args_pooled(frame, vm, param_count + 1)?;
                 let delegate = object_ref(
                     args.first().ok_or(Trap::StackUnderflow)?.clone(),
                     Opcode::Callvirt,
@@ -3259,6 +3431,7 @@ fn step(
                     .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?
                     .to_vec();
                 let params = args.get(1..).unwrap_or_default().to_vec();
+                vm.frame_pool.give_values(args);
                 return match invocations.split_first() {
                     Some(((target, method), [])) => Ok(Flow::Call {
                         method: *method,
@@ -3282,7 +3455,7 @@ fn step(
                         .ok_or(Trap::NoSuchMethod(method))?
                 }
             };
-            let mut args = frame.take_args(arg_count)?;
+            let mut args = take_args_pooled(frame, vm, arg_count)?;
             let sig_key = target_info.map(|(key, _)| key);
             let constraint = frame.pending_constraint.take();
             let runtime_type = match constraint {
@@ -3346,7 +3519,7 @@ fn step(
             let arg_count = module
                 .method_arg_count(pointer)
                 .ok_or(Trap::NoSuchMethod(pointer))?;
-            let args = frame.take_args(arg_count)?;
+            let args = take_args_pooled(frame, vm, arg_count)?;
             return Ok(Flow::Call {
                 method: pointer,
                 args,
@@ -3398,7 +3571,7 @@ fn step(
                 return Ok(Flow::Next);
             }
             if let Some(rank) = module.md_array_ctor_rank(asm, token) {
-                let lengths = frame.take_args(rank)?;
+                let lengths = take_args_pooled(frame, vm, rank)?;
                 let dims: Vec<i32> = lengths
                     .iter()
                     .map(|value| match value {
@@ -3407,13 +3580,14 @@ fn step(
                         _ => 0,
                     })
                     .collect();
+                vm.frame_pool.give_values(lengths);
                 let array = vm.heap_mut().alloc_md_array(dims);
                 frame.stack.push(Value::Object(array));
                 return Ok(Flow::Next);
             }
             if let Some(params) = module.string_builder_ctor_params(asm, token) {
                 const DEFAULT_CAPACITY: usize = 16;
-                let args = frame.take_args(params)?;
+                let args = take_args_pooled(frame, vm, params)?;
                 let (initial, capacity) = match args.first() {
                     Some(&Value::Object(reference)) => {
                         let units = vm
@@ -3433,12 +3607,18 @@ fn step(
                     }
                     _ => (Vec::new(), DEFAULT_CAPACITY),
                 };
+                vm.frame_pool.give_values(args);
                 let builder = vm.heap_mut().alloc_string_builder(initial, capacity);
                 frame.stack.push(Value::Object(builder));
                 return Ok(Flow::Next);
             }
             if let Some(params) = module.list_ctor_params(asm, token) {
-                frame.take_args(params)?;
+                let split = frame
+                    .stack
+                    .len()
+                    .checked_sub(params as usize)
+                    .ok_or(Trap::StackUnderflow)?;
+                frame.stack.truncate(split);
                 let list = vm.heap_mut().alloc_array(Vec::new());
                 frame.stack.push(Value::Object(list));
                 return Ok(Flow::Next);
@@ -3461,7 +3641,7 @@ fn step(
                 .method_arg_count(ctor)
                 .ok_or(Trap::NoSuchMethod(ctor))?
                 .saturating_sub(1);
-            let args = frame.take_args(param_count)?;
+            let args = take_args_pooled(frame, vm, param_count)?;
             if module.is_value_type_ctor(asm, token) {
                 let zero = Value::Struct(defaults.into_boxed_slice());
                 let temporary = vm.heap_mut().alloc_boxed(asm_key(asm, token.0), zero);
@@ -3771,22 +3951,26 @@ fn step(
         Opcode::Newarr => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Newarr))?;
             let token = token_operand(instruction)?;
-            let default = match module.array_default(asm, token) {
-                Some(default) => default,
-                None => module
-                    .type_id_of(asm, token)
-                    .and_then(|type_id| module.type_field_defaults(type_id))
-                    .map_or(Value::Null, |fields| {
-                        Value::Struct(fields.into_boxed_slice())
-                    }),
-            };
-            let element_size = module.array_element_size(asm, token);
             let length = array_length(frame.pop()?)?;
-            let object = vm.heap_mut().alloc_array_sized(
-                alloc::vec![default; length],
-                element_size,
-                asm_key(asm, token.0),
-            );
+            let element_type = asm_key(asm, token.0);
+            let object = match module.array_prim_kind(asm, token) {
+                Some(kind) if kind.packable() => {
+                    vm.heap_mut().alloc_packed_array(kind, length, element_type)
+                }
+                _ => {
+                    let default = match module.array_default(asm, token) {
+                        Some(default) => default,
+                        None => module
+                            .type_id_of(asm, token)
+                            .and_then(|type_id| module.type_field_defaults(type_id))
+                            .map_or(Value::Null, |fields| {
+                                Value::Struct(fields.into_boxed_slice())
+                            }),
+                    };
+                    vm.heap_mut()
+                        .alloc_typed_array(alloc::vec![default; length], element_type)
+                }
+            };
             frame.stack.push(Value::Object(object));
         }
 
@@ -6090,6 +6274,79 @@ mod tests {
         assert_eq!(
             super::run(&module, &mut Vm::new(), main, Vec::new()),
             Ok(Some(Value::Int32(63)))
+        );
+    }
+
+    #[test]
+    fn packed_byte_array_matches_boxed_element_semantics() {
+        let elem = Token(0x0100_0005);
+        let mut module = Module::new();
+        module.bind_array_default(0, elem, Value::Int32(0));
+        module.bind_array_prim_kind(0, elem, crate::object::PrimKind::U1);
+
+        let main = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::new(Opcode::Newarr, Operand::Token(elem)),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(511)),
+                Instruction::simple(Opcode::StelemI1),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(200)),
+                Instruction::simple(Opcode::StelemI1),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::LdelemU1),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::LdelemU1),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Ret),
+            ]),
+            0,
+        );
+
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Int32(455)))
+        );
+    }
+
+    #[test]
+    fn pinned_byte_pointer_walk_steps_by_the_true_element_width() {
+        let elem = Token(0x0100_0005);
+        let mut module = Module::new();
+        module.bind_array_default(0, elem, Value::Int32(0));
+        module.bind_array_prim_kind(0, elem, crate::object::PrimKind::U1);
+
+        let main = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::simple(Opcode::LdcI44),
+                Instruction::new(Opcode::Newarr, Operand::Token(elem)),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(42)),
+                Instruction::simple(Opcode::StelemI1),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::new(Opcode::Ldelema, Operand::Token(elem)),
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::LdindU1),
+                Instruction::simple(Opcode::Ret),
+            ]),
+            0,
+        );
+
+        assert_eq!(
+            super::run(&module, &mut Vm::new(), main, Vec::new()),
+            Ok(Some(Value::Int32(42)))
         );
     }
 

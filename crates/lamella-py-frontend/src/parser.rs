@@ -24,6 +24,8 @@ fn aug_assign_op(tok: &Tok) -> Option<BinOp> {
         Tok::PlusEq => BinOp::Add,
         Tok::MinusEq => BinOp::Sub,
         Tok::StarEq => BinOp::Mul,
+        Tok::DoubleStarEq => BinOp::Pow,
+        Tok::SlashEq => BinOp::TrueDiv,
         Tok::SlashSlashEq => BinOp::FloorDiv,
         Tok::PercentEq => BinOp::Mod,
         Tok::AmperEq => BinOp::BitAnd,
@@ -31,6 +33,7 @@ fn aug_assign_op(tok: &Tok) -> Option<BinOp> {
         Tok::CaretEq => BinOp::BitXor,
         Tok::LtLtEq => BinOp::LShift,
         Tok::GtGtEq => BinOp::RShift,
+        Tok::AtEq => BinOp::MatMul,
         _ => return None,
     })
 }
@@ -52,7 +55,7 @@ impl core::fmt::Display for ParseError {
 
 /// Parse a token stream (ending in [`Tok::Eof`]) into a module AST.
 pub fn parse(tokens: Vec<Token>) -> Result<ModuleAst, ParseError> {
-    let mut parser = Parser { tokens, pos: 0, temp_seq: 0 };
+    let mut parser = Parser { tokens, pos: 0, temp_seq: 0, line_ended: true };
     parser.parse_module()
 }
 
@@ -62,6 +65,9 @@ struct Parser {
     /// A monotonic counter for synthetic temp names (e.g. a `match` subject), so nested desugarings
     /// never collide.
     temp_seq: usize,
+    /// Whether the most recent simple statement ended the line (a real newline) rather than a `;`
+    /// separator. An inline suite (`if c: a; b`) reads simple statements until the line ends.
+    line_ended: bool,
 }
 
 /// A `case` pattern in the supported match subset. Structural (sequence / class / mapping) patterns
@@ -76,6 +82,33 @@ enum MatchPattern {
     Value(Expr),
     /// `p1 | p2 | ...` of value patterns -- matches when the subject equals any alternative.
     Or(Vec<Expr>),
+    /// `(p0, p1, ...)` / `[p0, ...]` -- a fixed-length sequence pattern: matches a list/tuple of the
+    /// same length whose elements match the sub-patterns (each a capture / wildcard / value).
+    Sequence(Vec<MatchPattern>),
+}
+
+/// `type(subj) is list or type(subj) is tuple` -- the "is a matchable sequence" test for a sequence
+/// pattern. Exact `list`/`tuple` only (so `str`/`dict`/other are correctly excluded); a subclass or a
+/// registered `Sequence` is a documented narrowing of CPython's Sequence-ABC rule.
+fn subject_is_sequence(subj: &str) -> Expr {
+    let type_is = |ty: &str| Expr::Compare {
+        op: CmpOp::Is,
+        lhs: Box::new(call1("type", Expr::Name(String::from(subj)))),
+        rhs: Box::new(Expr::Name(String::from(ty))),
+    };
+    Expr::BoolBinary {
+        op: BoolOp::Or,
+        lhs: Box::new(type_is("list")),
+        rhs: Box::new(type_is("tuple")),
+    }
+}
+
+/// `subj[i]` -- an element of the subject temp.
+fn subject_index(subj: &str, i: usize) -> Expr {
+    Expr::Subscript {
+        value: Box::new(Expr::Name(String::from(subj))),
+        index: Box::new(Expr::Int(i as i64)),
+    }
 }
 
 /// One `case pattern [if guard]: body` clause.
@@ -156,6 +189,46 @@ fn build_case_tree(cases: &[MatchCase], subj: &str) -> Vec<Stmt> {
                 orelse: rest,
             }]
         }
+        MatchPattern::Sequence(elems) => {
+            let mut cond = Expr::BoolBinary {
+                op: BoolOp::And,
+                lhs: Box::new(subject_is_sequence(subj)),
+                rhs: Box::new(Expr::Compare {
+                    op: CmpOp::Eq,
+                    lhs: Box::new(call1("len", Expr::Name(String::from(subj)))),
+                    rhs: Box::new(Expr::Int(elems.len() as i64)),
+                }),
+            };
+            for (i, elem) in elems.iter().enumerate() {
+                if let MatchPattern::Value(v) = elem {
+                    cond = Expr::BoolBinary {
+                        op: BoolOp::And,
+                        lhs: Box::new(cond),
+                        rhs: Box::new(Expr::Compare {
+                            op: CmpOp::Eq,
+                            lhs: Box::new(subject_index(subj, i)),
+                            rhs: Box::new(v.clone()),
+                        }),
+                    };
+                }
+            }
+            let mut stmts: Vec<Stmt> = Vec::new();
+            for (i, elem) in elems.iter().enumerate() {
+                if let MatchPattern::Capture(name) = elem {
+                    stmts.push(Stmt::Assign(Assign {
+                        target: name.clone(),
+                        annotation: None,
+                        value: Some(subject_index(subj, i)),
+                    }));
+                }
+            }
+            stmts.extend(guard_body(body, &first.guard, &rest));
+            vec![Stmt::If {
+                test: cond,
+                body: stmts,
+                orelse: rest,
+            }]
+        }
     }
 }
 
@@ -184,6 +257,13 @@ fn build_list_display(elems: Vec<DisplayElem>) -> Expr {
 /// unioned with `|` around each `set(star)`. With no stars this is a plain `Expr::Set`.
 fn build_set_display(elems: Vec<DisplayElem>) -> Expr {
     build_spread_display(elems, Expr::Set, |e| call1("set", e), BinOp::BitOr)
+}
+
+/// Build a tuple display, desugaring any `*` spread: runs of plain elements become `(..)` tuple
+/// literals, concatenated with `+` around each `tuple(star)`. With no stars this is a plain
+/// `Expr::Tuple`, so an ordinary `1, 2` / `(1, 2)` is unchanged.
+fn build_tuple_display(elems: Vec<DisplayElem>) -> Expr {
+    build_spread_display(elems, Expr::Tuple, |e| call1("tuple", e), BinOp::Add)
 }
 
 fn build_spread_display(
@@ -298,8 +378,18 @@ impl Parser {
         }
     }
 
+    /// End a simple statement: a `;` separates it from the next simple statement on the same line
+    /// (`a; b`), otherwise a real newline ends the line. Records which happened in `line_ended` so an
+    /// inline suite knows when to stop.
     fn expect_newline(&mut self) -> Result<(), ParseError> {
-        self.expect(&Tok::Newline, "end of line")
+        if self.eat(&Tok::Semicolon) {
+            self.line_ended = self.eat(&Tok::Newline);
+            Ok(())
+        } else {
+            self.expect(&Tok::Newline, "end of line")?;
+            self.line_ended = true;
+            Ok(())
+        }
     }
 
 
@@ -321,9 +411,66 @@ impl Parser {
             Tok::KwWith => self.parse_with(),
             Tok::KwClass => self.parse_classdef(),
             Tok::At => self.parse_decorated(),
+            Tok::Reserved(s) if s == "import" => self.parse_import(),
+            Tok::Reserved(s) if s == "from" => self.parse_from_import(),
             Tok::Name(n) if n == "match" && self.looks_like_match() => self.parse_match(),
             _ => self.parse_small_stmt(),
         }
+    }
+
+    /// `import module [as alias] (, module [as alias])*` -- simple (undotted) module names.
+    fn parse_import(&mut self) -> Result<Stmt, ParseError> {
+        self.advance();
+        let mut modules = Vec::new();
+        loop {
+            let module = self.expect_name()?;
+            if self.at(&Tok::Dot) {
+                return Err(self.error("dotted module names (import a.b) are not supported in this subset"));
+            }
+            let bound = if self.eat(&Tok::KwAs) {
+                self.expect_name()?
+            } else {
+                module.clone()
+            };
+            modules.push((module, bound));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect_newline()?;
+        Ok(Stmt::Import { modules })
+    }
+
+    /// `from module import name [as alias] (, name [as alias])*`. `from m import *` and dotted module
+    /// names are out of this subset.
+    fn parse_from_import(&mut self) -> Result<Stmt, ParseError> {
+        self.advance();
+        let module = self.expect_name()?;
+        if self.at(&Tok::Dot) {
+            return Err(self.error("dotted module names (from a.b import ...) are not supported in this subset"));
+        }
+        if !matches!(self.peek(), Tok::Reserved(s) if s == "import") {
+            return Err(self.error("expected 'import' after the module name in a `from` import"));
+        }
+        self.advance();
+        if self.at(&Tok::Star) {
+            return Err(self.error("`from module import *` is not supported in this subset"));
+        }
+        let mut names = Vec::new();
+        loop {
+            let name = self.expect_name()?;
+            let bound = if self.eat(&Tok::KwAs) {
+                self.expect_name()?
+            } else {
+                name.clone()
+            };
+            names.push((name, bound));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect_newline()?;
+        Ok(Stmt::ImportFrom { module, names })
     }
 
     /// Disambiguate the soft keyword `match`: it starts a match statement only when the next token
@@ -438,8 +585,24 @@ impl Parser {
                     Ok(MatchPattern::Capture(name))
                 }
             }
-            Tok::LParen | Tok::LBracket | Tok::LBrace => Err(self.error(
-                "sequence / mapping / group patterns are out of the match subset (use literal, \
+            Tok::LBracket => {
+                self.advance();
+                let (elems, _) = self.parse_pattern_sequence(&Tok::RBracket)?;
+                self.expect(&Tok::RBracket, "']' closing the sequence pattern")?;
+                Ok(MatchPattern::Sequence(elems))
+            }
+            Tok::LParen => {
+                self.advance();
+                let (elems, trailing_comma) = self.parse_pattern_sequence(&Tok::RParen)?;
+                self.expect(&Tok::RParen, "')' closing the pattern")?;
+                if elems.len() == 1 && !trailing_comma {
+                    Ok(elems.into_iter().next().expect("one grouped pattern"))
+                } else {
+                    Ok(MatchPattern::Sequence(elems))
+                }
+            }
+            Tok::LBrace => Err(self.error(
+                "mapping patterns `{...}` are out of the match subset (use sequence, literal, \
                  capture, wildcard, value, or `|` patterns)",
             )),
             _ => {
@@ -456,6 +619,42 @@ impl Parser {
                 Ok(MatchPattern::Value(value))
             }
         }
+    }
+
+    /// The comma-separated closed patterns of a sequence pattern, up to `terminator`. Returns the
+    /// patterns and whether a trailing comma closed the list (to tell a 1-group `(p)` from a
+    /// 1-sequence `(p,)`). `*` star patterns, nested sequence patterns, and `|` inside a sequence are
+    /// out of the subset; each element is a capture / wildcard / value / dotted value.
+    fn parse_pattern_sequence(
+        &mut self,
+        terminator: &Tok,
+    ) -> Result<(Vec<MatchPattern>, bool), ParseError> {
+        let mut elems = Vec::new();
+        if self.at(terminator) {
+            return Ok((elems, false));
+        }
+        let mut trailing_comma = false;
+        loop {
+            if self.at(&Tok::Star) {
+                return Err(self.error("a `*` (star) pattern in a sequence is out of the match subset"));
+            }
+            let elem = self.parse_closed_pattern()?;
+            if matches!(elem, MatchPattern::Sequence(_)) {
+                return Err(self.error("a nested sequence pattern is out of the match subset"));
+            }
+            if self.at(&Tok::Pipe) {
+                return Err(self.error("an `|` (or) pattern inside a sequence is out of the match subset"));
+            }
+            elems.push(elem);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+            if self.at(terminator) {
+                trailing_comma = true;
+                break;
+            }
+        }
+        Ok((elems, trailing_comma))
     }
 
     /// The `Expr` an alternative of an OR pattern compares against; a capture / wildcard is not
@@ -512,9 +711,23 @@ impl Parser {
             Ok(Stmt::Pass)
         } else if self.at(&Tok::KwRaise) {
             self.parse_raise()
+        } else if matches!(self.peek(), Tok::Reserved(s) if s == "nonlocal") {
+            self.parse_nonlocal()
         } else {
             self.parse_assign_or_expr()
         }
+    }
+
+    /// `nonlocal name (, name)*` -- a declaration; it binds the listed names to an enclosing
+    /// function's cells (the compiler validates each has such a binding). Emits no code itself.
+    fn parse_nonlocal(&mut self) -> Result<Stmt, ParseError> {
+        self.advance();
+        let mut names = vec![self.expect_name()?];
+        while self.eat(&Tok::Comma) {
+            names.push(self.expect_name()?);
+        }
+        self.expect_newline()?;
+        Ok(Stmt::Nonlocal(names))
     }
 
     fn parse_raise(&mut self) -> Result<Stmt, ParseError> {
@@ -538,7 +751,7 @@ impl Parser {
     }
 
     /// `del target (, target)* NEWLINE` -- unbind each target. A bare name is supported; a subscript
-    /// or attribute target is a follow-on (compiled as an error until the interp del ops land).
+    /// or attribute target is unsupported (compiled as an error).
     /// The parser is at another `=` after `first = second` -- a CHAINED assignment
     /// `first = second = ... = value`. Collect the remaining targets and the final value into a
     /// MultiAssign; each target may be a name, a subscript, or an attribute.
@@ -547,7 +760,7 @@ impl Parser {
         let value;
         loop {
             self.advance();
-            let next = self.parse_expr()?;
+            let next = self.parse_rhs_value()?;
             if self.at(&Tok::Assign) {
                 target_exprs.push(next);
             } else {
@@ -564,8 +777,8 @@ impl Parser {
     }
 
     /// `assert test [, msg] NEWLINE` -- desugars to `if not test: raise AssertionError[(msg)]`,
-    /// reusing the existing If + Not + Raise. (@python-runtime: needs AssertionError as a built-in
-    /// exception -- flagged as a co-design; the desugar is inert until then.)
+    /// reusing the existing If + Not + Raise. (The runtime must provide `AssertionError` as a
+    /// built-in exception for the raised call to resolve; the desugar is inert until it does.)
     fn parse_assert(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwAssert, "'assert'")?;
         let test = self.parse_expr()?;
@@ -610,7 +823,7 @@ impl Parser {
         let value = if self.at(&Tok::Newline) {
             None
         } else {
-            Some(self.parse_expr()?)
+            Some(self.parse_rhs_value()?)
         };
         self.expect_newline()?;
         Ok(Stmt::Return(value))
@@ -625,17 +838,7 @@ impl Parser {
         if self.at(&Tok::Star) {
             self.advance();
             let first = self.parse_expr()?;
-            let mut targets = vec![self.assign_target(first, target_line)?];
-            let mut star = Some(0);
-            self.parse_remaining_targets(&mut targets, &mut star, target_line)?;
-            self.expect(&Tok::Assign, "'=' in the starred assignment")?;
-            let value = self.parse_rhs_value()?;
-            self.expect_newline()?;
-            return Ok(Stmt::TupleAssign {
-                targets,
-                star,
-                value,
-            });
+            return self.finish_tuple_or_expr_stmt(vec![DisplayElem::Star(first)], target_line);
         }
         let expr = self.parse_expr()?;
         if let Some(op) = aug_assign_op(self.peek()) {
@@ -745,7 +948,7 @@ impl Parser {
             }
             Tok::Assign => {
                 self.advance();
-                let value = self.parse_expr()?;
+                let value = self.parse_rhs_value()?;
                 if self.at(&Tok::Assign) {
                     return self.finish_chain(expr, value, target_line);
                 }
@@ -757,20 +960,7 @@ impl Parser {
                     value: Some(value),
                 }))
             }
-            Tok::Comma => {
-                let mut targets = vec![self.assign_target(expr, target_line)?];
-                let mut star = None;
-                self.parse_remaining_targets(&mut targets, &mut star, target_line)?;
-                self.expect(&Tok::Assign, "'=' in the tuple-unpacking assignment")?;
-                let value = self.parse_rhs_value()?;
-                self.expect_newline()?;
-                if star.is_none() && targets.len() < 2 {
-                    return Err(
-                        self.error("a tuple-unpacking assignment needs two or more targets")
-                    );
-                }
-                Ok(Stmt::TupleAssign { targets, star, value })
-            }
+            Tok::Comma => self.finish_tuple_or_expr_stmt(vec![DisplayElem::Plain(expr)], target_line),
             _ => {
                 self.expect_newline()?;
                 Ok(Stmt::Expr(expr))
@@ -778,46 +968,80 @@ impl Parser {
         }
     }
 
-    /// The right-hand side of an assignment: a single expression, or a bare tuple
-    /// `1, 2, 3` (the latter becomes a tuple display so `a, b = 1, 2` unpacks).
+    /// A value position -- an assignment RHS or a `return` value: a single expression, or an
+    /// unparenthesized expression list `1, 2, 3`, which becomes a tuple display (so `a, b = 1, 2`
+    /// unpacks and `return a, b` returns `(a, b)`). A lone trailing comma makes a 1-tuple (`a,`).
+    /// A `*` spread is allowed in the list (`1, *rest, 2`) and desugars like a starred tuple
+    /// display; a bare `*x` with no comma is a syntax error.
     fn parse_rhs_value(&mut self) -> Result<Expr, ParseError> {
-        let first = self.parse_expr()?;
+        let first = self.parse_display_elem()?;
         if !self.at(&Tok::Comma) {
-            return Ok(first);
+            return match first {
+                DisplayElem::Plain(e) => Ok(e),
+                DisplayElem::Star(_) => Err(self.error("can't use a starred expression here")),
+            };
         }
         let mut elems = vec![first];
         while self.eat(&Tok::Comma) {
             if self.at(&Tok::Newline) || self.at(&Tok::Eof) {
                 break;
             }
-            elems.push(self.parse_expr()?);
+            elems.push(self.parse_display_elem()?);
         }
-        Ok(Expr::Tuple(elems))
+        Ok(build_tuple_display(elems))
     }
 
-    /// Parse the rest of an assignment target list after the first target (the leading comma
-    /// not yet consumed), allowing one starred target `*name` and recording its index in
-    /// `star`.
-    fn parse_remaining_targets(
+    /// Finish a top-level comma list once its leading element is collected: either a
+    /// tuple-unpacking assignment (`a, b = v` / `*a, b = v` -- an `=` follows, so the elements are
+    /// targets, with at most one starred target) or a bare-tuple expression statement (`a, b` /
+    /// `1, 2` / `a,` / `a, *rest` -- a newline follows, so the elements build a tuple, where a `*`
+    /// is a spread and any number are allowed). The leading `,` is not yet consumed; the loop takes
+    /// the rest (with an optional trailing comma). A lone starred `*b` (no comma) is not a statement.
+    fn finish_tuple_or_expr_stmt(
         &mut self,
-        targets: &mut Vec<AssignTarget>,
-        star: &mut Option<usize>,
+        mut elems: Vec<DisplayElem>,
         line: u32,
-    ) -> Result<(), ParseError> {
+    ) -> Result<Stmt, ParseError> {
+        let mut saw_comma = false;
         while self.eat(&Tok::Comma) {
-            if self.at(&Tok::Assign) {
+            saw_comma = true;
+            if matches!(
+                self.peek(),
+                Tok::Assign | Tok::Newline | Tok::Semicolon | Tok::Eof
+            ) {
                 break;
             }
-            if self.eat(&Tok::Star) {
-                if star.is_some() {
-                    return Err(self.error("only one starred target is allowed"));
-                }
-                *star = Some(targets.len());
-            }
-            let t = self.parse_expr()?;
-            targets.push(self.assign_target(t, line)?);
+            elems.push(self.parse_display_elem()?);
         }
-        Ok(())
+        if self.eat(&Tok::Assign) {
+            let mut star = None;
+            let mut targets = Vec::with_capacity(elems.len());
+            for (i, e) in elems.into_iter().enumerate() {
+                let inner = match e {
+                    DisplayElem::Plain(x) => x,
+                    DisplayElem::Star(x) => {
+                        if star.is_some() {
+                            return Err(self.error("only one starred target is allowed"));
+                        }
+                        star = Some(i);
+                        x
+                    }
+                };
+                targets.push(self.assign_target(inner, line)?);
+            }
+            let value = self.parse_rhs_value()?;
+            self.expect_newline()?;
+            if star.is_none() && targets.len() < 2 {
+                return Err(self.error("a tuple-unpacking assignment needs two or more targets"));
+            }
+            Ok(Stmt::TupleAssign { targets, star, value })
+        } else {
+            if !saw_comma && matches!(elems.as_slice(), [DisplayElem::Star(_)]) {
+                return Err(self.error("can't use a starred expression here"));
+            }
+            self.expect_newline()?;
+            Ok(Stmt::Expr(build_tuple_display(elems)))
+        }
     }
 
     /// Require an assignment target to be a bare name (attribute, subscript, and
@@ -901,52 +1125,60 @@ impl Parser {
 
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwFor, "'for'")?;
-        let mut targets = vec![self.expect_name()?];
+        let line = self.current_line();
+        let mut targets = vec![self.for_target(line)?];
         while self.eat(&Tok::Comma) {
             if self.at(&Tok::KwIn) {
                 break;
             }
-            targets.push(self.expect_name()?);
+            targets.push(self.for_target(line)?);
         }
         self.expect(&Tok::KwIn, "'in'")?;
-        let iter = self.parse_expr()?;
+        let iter = self.parse_rhs_value()?;
         self.expect(&Tok::Colon, "':'")?;
         let mut body = self.parse_suite()?;
         let orelse = self.parse_loop_else()?;
-        if targets.len() > 1 {
-            let tmp = String::from(".unpack");
-            let mut new_body = Vec::with_capacity(body.len() + 1);
-            new_body.push(Stmt::TupleAssign {
-                targets: targets.into_iter().map(AssignTarget::Name).collect(),
-                star: None,
-                value: Expr::Name(tmp.clone()),
-            });
-            new_body.append(&mut body);
-            return Ok(Stmt::ForIter {
-                target: tmp,
-                iterable: iter,
-                body: new_body,
-                orelse,
-            });
+
+        if let [AssignTarget::Name(name)] = targets.as_slice() {
+            let target = name.clone();
+            if is_range_call(&iter) {
+                let (start, stop, step) = self.range_bounds(iter)?;
+                return Ok(Stmt::For { target, start, stop, step, body, orelse });
+            }
+            return Ok(Stmt::ForIter { target, iterable: iter, body, orelse });
         }
-        let target = targets.into_iter().next().unwrap();
-        if is_range_call(&iter) {
-            let (start, stop, step) = self.range_bounds(iter)?;
-            Ok(Stmt::For {
-                target,
-                start,
-                stop,
-                step,
-                body,
-                orelse,
-            })
-        } else {
-            Ok(Stmt::ForIter {
-                target,
-                iterable: iter,
-                body,
-                orelse,
-            })
+
+        let unpack_targets = match targets.as_slice() {
+            [AssignTarget::Tuple(inner)] => inner.clone(),
+            _ => targets,
+        };
+        let tmp = String::from(".unpack");
+        let mut new_body = Vec::with_capacity(body.len() + 1);
+        new_body.push(Stmt::TupleAssign {
+            targets: unpack_targets,
+            star: None,
+            value: Expr::Name(tmp.clone()),
+        });
+        new_body.append(&mut body);
+        Ok(Stmt::ForIter {
+            target: tmp,
+            iterable: iter,
+            body: new_body,
+            orelse,
+        })
+    }
+
+    /// A single `for`-loop target: a name or a (possibly nested) parenthesized/bracketed tuple of
+    /// targets. Parsed as a primary (an atom plus `.`/`[]` trailers) so the loop's `in` keyword --
+    /// a comparison operator to `parse_expr` -- is not consumed.
+    fn for_target(&mut self, line: u32) -> Result<AssignTarget, ParseError> {
+        let expr = self.parse_trailer()?;
+        let target = self.assign_target(expr, line)?;
+        match target {
+            AssignTarget::Name(_) | AssignTarget::Tuple(_) => Ok(target),
+            AssignTarget::Subscript { .. } | AssignTarget::Attribute { .. } => {
+                Err(self.error("a for-loop target must be a name or a tuple of names"))
+            }
         }
     }
 
@@ -1095,27 +1327,79 @@ impl Parser {
     }
 
     /// `with context ["as" name] ":" suite` -- a single context manager. Multiple managers in
-    /// one `with` (`with a, b:`) are a follow-on.
+    /// one `with` (`with a, b:`) are unsupported.
     fn parse_with(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwWith, "'with'")?;
+        let items = if self.at(&Tok::LParen) {
+            let saved = self.pos;
+            match self.try_parenthesized_with_items() {
+                Some(items) => items,
+                None => {
+                    self.pos = saved;
+                    self.parse_with_items()?
+                }
+            }
+        } else {
+            self.parse_with_items()?
+        };
+        self.expect(&Tok::Colon, "':'")?;
+        let body = self.parse_suite()?;
+        let mut current = body;
+        for (context, optional_name) in items.into_iter().rev() {
+            current = vec![Stmt::With {
+                context,
+                optional_name,
+                body: current,
+            }];
+        }
+        Ok(current
+            .into_iter()
+            .next()
+            .expect("at least one context manager was parsed"))
+    }
+
+    /// One `with` item: a context-manager expression and an optional `as name` target.
+    fn parse_with_item(&mut self) -> Result<(Expr, Option<String>), ParseError> {
         let context = self.parse_expr()?;
         let optional_name = if self.eat(&Tok::KwAs) {
             Some(self.expect_name()?)
         } else {
             None
         };
-        if self.at(&Tok::Comma) {
-            return Err(
-                self.error("multiple context managers in one `with` are not yet supported")
-            );
+        Ok((context, optional_name))
+    }
+
+    /// A comma-separated list of `with` items (the unparenthesized form).
+    fn parse_with_items(&mut self) -> Result<Vec<(Expr, Option<String>)>, ParseError> {
+        let mut items = vec![self.parse_with_item()?];
+        while self.eat(&Tok::Comma) {
+            items.push(self.parse_with_item()?);
         }
-        self.expect(&Tok::Colon, "':'")?;
-        let body = self.parse_suite()?;
-        Ok(Stmt::With {
-            context,
-            optional_name,
-            body,
-        })
+        Ok(items)
+    }
+
+    /// Try to parse a PEP 617 parenthesized `with` item list `( item (, item)* ,? )` that is
+    /// immediately followed by `:`. Returns `None` (leaving the cursor wherever it got to -- the
+    /// caller restores it) when the shape does not match, e.g. `with (a or b) as x:` where the `)`
+    /// is followed by `as`, so `(a or b)` is a parenthesized expression rather than an item list.
+    fn try_parenthesized_with_items(&mut self) -> Option<Vec<(Expr, Option<String>)>> {
+        self.eat(&Tok::LParen);
+        let mut items = Vec::new();
+        loop {
+            items.push(self.parse_with_item().ok()?);
+            if self.eat(&Tok::Comma) {
+                if self.at(&Tok::RParen) {
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
+        if self.eat(&Tok::RParen) && self.at(&Tok::Colon) {
+            Some(items)
+        } else {
+            None
+        }
     }
 
     /// An optional `else:` suite on a `while`/`for` (run when the loop exits without
@@ -1141,7 +1425,11 @@ impl Parser {
             self.expect(&Tok::Dedent, "a dedent ending the block")?;
             Ok(body)
         } else {
-            Ok(vec![self.parse_small_stmt()?])
+            let mut stmts = vec![self.parse_small_stmt()?];
+            while !self.line_ended {
+                stmts.push(self.parse_small_stmt()?);
+            }
+            Ok(stmts)
         }
     }
 
@@ -1169,23 +1457,56 @@ impl Parser {
     /// `parameter ("," parameter)* [","]`, where `parameter: identifier [":"
     /// expression] ["=" expression]`. A parameter without a default may not follow one
     /// with a default (a SyntaxError in Python). A bare `*` marks the following parameters
-    /// keyword-only; `*args` collects surplus positionals. `**kwargs`, positional-only `/`, and
-    /// keyword-only defaults are out of the subset and rejected explicitly.
+    /// keyword-only; `*args` collects surplus positionals; `**kwargs` collects surplus keywords; and
+    /// a `/` marks the preceding parameters positional-only.
+    /// Def parameters, in parentheses, with optional annotations.
     fn parse_params(&mut self) -> Result<Vec<ParamDef>, ParseError> {
+        self.parse_param_list(&Tok::RParen, true)
+    }
+
+    /// Parse a comma-separated parameter list up to `terminator` (`)` for a def, `:` for a lambda),
+    /// handling `/` (positional-only marker), `*args`, a bare `*` that introduces keyword-only
+    /// params, `**kwargs`, and defaults. Annotations (`name: type`) are parsed only when
+    /// `allow_annotations`; a lambda forbids them because its `:` ends the parameter list.
+    fn parse_param_list(
+        &mut self,
+        terminator: &Tok,
+        allow_annotations: bool,
+    ) -> Result<Vec<ParamDef>, ParseError> {
         let mut params = Vec::new();
-        if self.at(&Tok::RParen) {
+        if self.at(terminator) {
             return Ok(params);
         }
         let mut seen_default = false;
         let mut after_star = false;
         loop {
-            if self.at(&Tok::DoubleSlash) {
-                return Err(self
-                    .error("positional-only parameters (`/`) are not supported in this subset"));
+            if self.eat(&Tok::Slash) {
+                if params.is_empty() {
+                    return Err(self.error("at least one parameter must precede `/`"));
+                }
+                if after_star {
+                    return Err(self.error("`/` must appear before `*` in a parameter list"));
+                }
+                if params.iter().any(|p| p.positional_only) {
+                    return Err(self.error("only one `/` is allowed in a parameter list"));
+                }
+                for p in &mut params {
+                    p.positional_only = true;
+                }
+                if self.eat(&Tok::Comma) {
+                    if self.at(terminator) {
+                        break;
+                    }
+                    continue;
+                }
+                if self.at(terminator) {
+                    break;
+                }
+                return Err(self.error("expected ',' or the end of the parameter list after '/'"));
             }
             if self.eat(&Tok::DoubleStar) {
                 let name = self.expect_name()?;
-                let annotation = if self.eat(&Tok::Colon) {
+                let annotation = if allow_annotations && self.eat(&Tok::Colon) {
                     Some(self.parse_expr()?)
                 } else {
                     None
@@ -1195,11 +1516,12 @@ impl Parser {
                     annotation,
                     default: None,
                     keyword_only: false,
+                    positional_only: false,
                     is_vararg: false,
                     is_varkwarg: true,
                 });
                 self.eat(&Tok::Comma);
-                if !self.at(&Tok::RParen) {
+                if !self.at(terminator) {
                     return Err(self.error("`**kwargs` must be the last parameter"));
                 }
                 break;
@@ -1212,7 +1534,7 @@ impl Parser {
                 seen_default = false;
                 if let Tok::Name(_) = self.peek() {
                     let name = self.expect_name()?;
-                    let annotation = if self.eat(&Tok::Colon) {
+                    let annotation = if allow_annotations && self.eat(&Tok::Colon) {
                         Some(self.parse_expr()?)
                     } else {
                         None
@@ -1222,11 +1544,12 @@ impl Parser {
                         annotation,
                         default: None,
                         keyword_only: false,
+                        positional_only: false,
                         is_vararg: true,
                         is_varkwarg: false,
                     });
                     if self.eat(&Tok::Comma) {
-                        if self.at(&Tok::RParen) {
+                        if self.at(terminator) {
                             break;
                         }
                         continue;
@@ -1239,18 +1562,15 @@ impl Parser {
                 continue;
             }
             let name = self.expect_name()?;
-            let annotation = if self.eat(&Tok::Colon) {
+            let annotation = if allow_annotations && self.eat(&Tok::Colon) {
                 Some(self.parse_expr()?)
             } else {
                 None
             };
             let default = if self.eat(&Tok::Assign) {
-                if after_star {
-                    return Err(
-                        self.error("keyword-only parameter defaults are not yet supported")
-                    );
+                if !after_star {
+                    seen_default = true;
                 }
-                seen_default = true;
                 Some(self.parse_expr()?)
             } else {
                 if seen_default && !after_star {
@@ -1265,11 +1585,12 @@ impl Parser {
                 annotation,
                 default,
                 keyword_only: after_star,
+                positional_only: false,
                 is_vararg: false,
                 is_varkwarg: false,
             });
             if self.eat(&Tok::Comma) {
-                if self.at(&Tok::RParen) {
+                if self.at(terminator) {
                     break;
                 }
                 continue;
@@ -1285,50 +1606,11 @@ impl Parser {
         Ok(params)
     }
 
-    /// Lambda parameters: `identifier ["=" expression]`, comma-separated, terminated by the
-    /// `:` (not `)`). No annotations -- Python forbids them on a lambda. A non-default
-    /// parameter may not follow a default one; `*args`/`**kwargs` are out of the subset.
+    /// Lambda parameters: the full parameter grammar (`*args`, a bare `*` + keyword-only params,
+    /// `**kwargs`, `/`, defaults) but WITHOUT annotations -- a lambda's `:` ends the parameter list,
+    /// so `name: type` is unavailable -- and terminated by that `:` rather than `)`.
     fn parse_lambda_params(&mut self) -> Result<Vec<ParamDef>, ParseError> {
-        let mut params = Vec::new();
-        if self.at(&Tok::Colon) {
-            return Ok(params);
-        }
-        let mut seen_default = false;
-        loop {
-            if self.at(&Tok::Star) || self.at(&Tok::DoubleSlash) {
-                return Err(self.error(
-                    "variadic and positional-only parameters are not supported in this subset",
-                ));
-            }
-            let name = self.expect_name()?;
-            let default = if self.eat(&Tok::Assign) {
-                seen_default = true;
-                Some(self.parse_expr()?)
-            } else {
-                if seen_default {
-                    return Err(
-                        self.error("a non-default parameter cannot follow a default parameter")
-                    );
-                }
-                None
-            };
-            params.push(ParamDef {
-                name,
-                annotation: None,
-                default,
-                keyword_only: false,
-                is_vararg: false,
-                is_varkwarg: false,
-            });
-            if self.eat(&Tok::Comma) {
-                if self.at(&Tok::Colon) {
-                    break;
-                }
-                continue;
-            }
-            break;
-        }
-        Ok(params)
+        self.parse_param_list(&Tok::Colon, false)
     }
 
 
@@ -1354,9 +1636,10 @@ impl Parser {
         Ok(expr)
     }
 
-    /// `yield_expr: "yield" [expression]`. A bare `yield` yields `None`; `yield e` yields `e`. A
-    /// `yield` anywhere in a function body makes it a generator. (`yield from` is not yet in the
-    /// subset.) Emission is gated in the compiler until the generator machinery lands.
+    /// `yield_expr: "yield" [expression_list]`. A bare `yield` yields `None`; `yield e` yields `e`;
+    /// and `yield a, b` yields the tuple `(a, b)` (an expression list, like a bare value position),
+    /// with a `*` spread allowed after the first element. A `yield` anywhere in a function body makes
+    /// it a generator. (`yield from` is not yet in the subset.)
     fn parse_yield(&mut self) -> Result<Expr, ParseError> {
         self.expect(&Tok::KwYield, "'yield'")?;
         if matches!(self.peek(), Tok::Reserved(s) if s == "from") {
@@ -1372,12 +1655,29 @@ impl Parser {
                 | Tok::Colon
                 | Tok::Eof
         );
-        let value = if bare {
-            None
-        } else {
-            Some(Box::new(self.parse_expr()?))
-        };
-        Ok(Expr::Yield(value))
+        if bare {
+            return Ok(Expr::Yield(None));
+        }
+        let first = self.parse_expr()?;
+        if !self.at(&Tok::Comma) {
+            return Ok(Expr::Yield(Some(Box::new(first))));
+        }
+        let mut elems = vec![DisplayElem::Plain(first)];
+        while self.eat(&Tok::Comma) {
+            if matches!(
+                self.peek(),
+                Tok::Newline
+                    | Tok::RParen
+                    | Tok::RBracket
+                    | Tok::RBrace
+                    | Tok::Colon
+                    | Tok::Eof
+            ) {
+                break;
+            }
+            elems.push(self.parse_display_elem()?);
+        }
+        Ok(Expr::Yield(Some(Box::new(build_tuple_display(elems)))))
     }
 
     /// `lambda_expr: "lambda" [param_list] ":" expression`. The body is a single
@@ -1636,6 +1936,7 @@ impl Parser {
                 Tok::DoubleSlash => BinOp::FloorDiv,
                 Tok::Percent => BinOp::Mod,
                 Tok::Slash => BinOp::TrueDiv,
+                Tok::At => BinOp::MatMul,
                 _ => break,
             };
             self.advance();
@@ -1719,7 +2020,19 @@ impl Parser {
                 }
                 Tok::LBracket => {
                     self.advance();
-                    let index = self.parse_slice_or_index()?;
+                    let first = self.parse_slice_or_index()?;
+                    let index = if self.at(&Tok::Comma) {
+                        let mut items = vec![first];
+                        while self.eat(&Tok::Comma) {
+                            if self.at(&Tok::RBracket) {
+                                break;
+                            }
+                            items.push(self.parse_slice_or_index()?);
+                        }
+                        Expr::Tuple(items)
+                    } else {
+                        first
+                    };
                     self.expect(&Tok::RBracket, "']' closing the subscript")?;
                     expr = Expr::Subscript {
                         value: Box::new(expr),
@@ -1773,7 +2086,8 @@ impl Parser {
                     text,
                     conversion,
                     spec,
-                } => self.fstring_field(&text, conversion, spec.as_deref())?,
+                    debug,
+                } => self.fstring_field(&text, conversion, spec.as_deref(), debug.as_deref())?,
             };
             acc = Some(match acc {
                 None => piece,
@@ -1787,14 +2101,17 @@ impl Parser {
         Ok(acc.unwrap_or(Expr::Str(String::new())))
     }
 
-    /// Desugar one `{expr[!conv][:spec]}` field. The expression is parsed; a `!r`/`!s` conversion
+    /// Desugar one `{expr[=][!conv][:spec]}` field. The expression is parsed; a `!r`/`!s` conversion
     /// wraps it in `repr`/`str` (yielding a string); a `:spec` wraps it in `"{:spec}".format(value)`,
     /// which reaches the interpreter's format mini-language. With neither, the field is `str(value)`.
+    /// For a `{expr=}` self-documenting field, `debug` is the literal prefix (e.g. `x=`) prepended
+    /// to the value, and the default rendering (no conversion, no spec) is `repr`, not `str`.
     fn fstring_field(
         &self,
         text: &str,
         conversion: Option<char>,
         spec: Option<&str>,
+        debug: Option<&str>,
     ) -> Result<Expr, ParseError> {
         let mut node = self.parse_embedded_expr(text)?;
         if let Some(conv) = conversion {
@@ -1812,50 +2129,130 @@ impl Parser {
                 keywords: Vec::new(),
             };
         }
-        if let Some(spec) = spec {
-            let template = format!("{{:{spec}}}");
-            Ok(Expr::Call {
+        let value = if let Some(spec) = spec {
+            let template = match self.fstring_spec_expr(spec)? {
+                None => Expr::Str(format!("{{:{spec}}}")),
+                Some(spec_expr) => Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(Expr::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(Expr::Str(String::from("{:"))),
+                        rhs: Box::new(spec_expr),
+                    }),
+                    rhs: Box::new(Expr::Str(String::from("}"))),
+                },
+            };
+            Expr::Call {
                 func: Box::new(Expr::Attribute {
-                    value: Box::new(Expr::Str(template)),
+                    value: Box::new(template),
                     attr: String::from("format"),
                 }),
                 args: vec![node],
                 keywords: Vec::new(),
-            })
+            }
         } else if conversion.is_some() {
-            Ok(node)
+            node
         } else {
-            Ok(Expr::Call {
-                func: Box::new(Expr::Name(String::from("str"))),
+            let func = if debug.is_some() { "repr" } else { "str" };
+            Expr::Call {
+                func: Box::new(Expr::Name(String::from(func))),
                 args: vec![node],
                 keywords: Vec::new(),
-            })
+            }
+        };
+        match debug {
+            Some(prefix) => Ok(Expr::Binary {
+                op: BinOp::Add,
+                lhs: Box::new(Expr::Str(String::from(prefix))),
+                rhs: Box::new(value),
+            }),
+            None => Ok(value),
         }
     }
 
-    /// Re-lex and parse a replacement field's raw source as one expression.
+    /// If a format spec itself contains nested `{expr}` replacement fields (`f"{x:{w}}"`,
+    /// `f"{x:.{p}f}"`), build the spec as a runtime string: literal chunks and `str(expr)` for each
+    /// nested field, concatenated left to right. Returns `None` for a plain spec with no nested
+    /// field (the caller then uses a compile-time template). A nested field is a plain expression
+    /// (its own conversion/spec is out of the subset); `{{`/`}}` are literal braces.
+    fn fstring_spec_expr(&self, spec: &str) -> Result<Option<Expr>, ParseError> {
+        if !spec.contains('{') {
+            return Ok(None);
+        }
+        let chars: Vec<char> = spec.chars().collect();
+        let mut parts: Vec<Expr> = Vec::new();
+        let mut literal = String::new();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '{' if chars.get(i + 1) == Some(&'{') => {
+                    literal.push('{');
+                    i += 2;
+                }
+                '}' if chars.get(i + 1) == Some(&'}') => {
+                    literal.push('}');
+                    i += 2;
+                }
+                '{' => {
+                    if !literal.is_empty() {
+                        parts.push(Expr::Str(core::mem::take(&mut literal)));
+                    }
+                    i += 1;
+                    let start = i;
+                    let mut depth = 0i32;
+                    while i < chars.len() && !(chars[i] == '}' && depth == 0) {
+                        match chars[i] {
+                            '(' | '[' | '{' => depth += 1,
+                            ')' | ']' | '}' => depth -= 1,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    if i >= chars.len() {
+                        return Err(self.error("unterminated nested field in an f-string format spec"));
+                    }
+                    let src: String = chars[start..i].iter().collect();
+                    i += 1;
+                    let expr = self.parse_embedded_expr(&src)?;
+                    parts.push(Expr::Call {
+                        func: Box::new(Expr::Name(String::from("str"))),
+                        args: vec![expr],
+                        keywords: Vec::new(),
+                    });
+                }
+                c => {
+                    literal.push(c);
+                    i += 1;
+                }
+            }
+        }
+        if !literal.is_empty() {
+            parts.push(Expr::Str(literal));
+        }
+        Ok(Some(
+            parts
+                .into_iter()
+                .reduce(|a, b| Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(a),
+                    rhs: Box::new(b),
+                })
+                .unwrap_or_else(|| Expr::Str(String::new())),
+        ))
+    }
+
+    /// Re-lex and parse a replacement field's raw source as one expression. Surrounding
+    /// whitespace is insignificant and trimmed, so `{ x }` and `{x = }` (whose captured source
+    /// carries the spaces) re-lex without the leading run being read as indentation.
     fn parse_embedded_expr(&self, raw: &str) -> Result<Expr, ParseError> {
-        let tokens = crate::lexer::tokenize(raw)
+        let tokens = crate::lexer::tokenize(raw.trim())
             .map_err(|e| self.error(format!("in f-string expression: {}", e.message)))?;
-        let mut sub = Parser { tokens, pos: 0, temp_seq: 0 };
+        let mut sub = Parser { tokens, pos: 0, temp_seq: 0, line_ended: true };
         let expr = sub.parse_expr()?;
         if !matches!(sub.peek(), Tok::Newline | Tok::Eof) {
             return Err(self.error("unexpected trailing tokens in an f-string expression"));
         }
         Ok(expr)
-    }
-
-    /// Comma-separated expressions up to (not including) `end`, with an optional trailing
-    /// comma. Used for list and tuple displays.
-    fn parse_expr_list(&mut self, end: &Tok) -> Result<Vec<Expr>, ParseError> {
-        let mut items = Vec::new();
-        while !self.at(end) {
-            items.push(self.parse_expr()?);
-            if !self.eat(&Tok::Comma) {
-                break;
-            }
-        }
-        Ok(items)
     }
 
     /// A comma-separated target list `a` or `a, b, c` (a trailing comma before `in` is ok).
@@ -2153,6 +2550,10 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Bytes(data))
             }
+            Tok::Ellipsis => {
+                self.advance();
+                Ok(Expr::Name(String::from("Ellipsis")))
+            }
             Tok::Str(value) => {
                 self.advance();
                 let mut joined = value;
@@ -2217,22 +2618,37 @@ impl Parser {
                     self.advance();
                     return Ok(Expr::Tuple(Vec::new()));
                 }
-                let first = self.parse_expr()?;
-                if self.at(&Tok::KwFor) {
+                let first = self.parse_display_elem()?;
+                if matches!(first, DisplayElem::Plain(_)) && self.at(&Tok::KwFor) {
+                    let DisplayElem::Plain(element) = first else {
+                        unreachable!("guarded to a plain element")
+                    };
                     let clauses = self.parse_comp_clauses()?;
                     self.expect(&Tok::RParen, "')' closing the generator expression")?;
                     Ok(Expr::GeneratorExp {
-                        element: Box::new(first),
+                        element: Box::new(element),
                         clauses,
                     })
                 } else if self.eat(&Tok::Comma) {
-                    let mut items = vec![first];
-                    items.extend(self.parse_expr_list(&Tok::RParen)?);
+                    let mut elems = vec![first];
+                    while !self.at(&Tok::RParen) {
+                        elems.push(self.parse_display_elem()?);
+                        if !self.eat(&Tok::Comma) {
+                            break;
+                        }
+                    }
                     self.expect(&Tok::RParen, "')'")?;
-                    Ok(Expr::Tuple(items))
+                    Ok(build_tuple_display(elems))
                 } else {
-                    self.expect(&Tok::RParen, "')'")?;
-                    Ok(first)
+                    match first {
+                        DisplayElem::Plain(e) => {
+                            self.expect(&Tok::RParen, "')'")?;
+                            Ok(e)
+                        }
+                        DisplayElem::Star(_) => {
+                            Err(self.error("can't use a starred expression here"))
+                        }
+                    }
                 }
             }
             Tok::LBrace => self.parse_dict(),
@@ -2267,6 +2683,88 @@ mod tests {
                 attr: "x".into(),
             })]
         );
+    }
+
+    #[test]
+    fn return_of_a_bare_tuple() {
+        let module = parse_ok("def f():\n    return a, b\n");
+        let Stmt::FuncDef(f) = &module.body[0] else { panic!("a def") };
+        assert_eq!(
+            f.body,
+            vec![Stmt::Return(Some(Expr::Tuple(vec![
+                Expr::Name("a".into()),
+                Expr::Name("b".into()),
+            ])))]
+        );
+    }
+
+    #[test]
+    fn assign_a_bare_tuple_value() {
+        let module = parse_ok("x = a, b\ns = 7,\n");
+        assert_eq!(
+            module.body[0],
+            Stmt::Assign(Assign {
+                target: "x".into(),
+                annotation: None,
+                value: Some(Expr::Tuple(vec![Expr::Name("a".into()), Expr::Name("b".into())])),
+            })
+        );
+        assert_eq!(
+            module.body[1],
+            Stmt::Assign(Assign {
+                target: "s".into(),
+                annotation: None,
+                value: Some(Expr::Tuple(vec![Expr::Int(7)])),
+            })
+        );
+    }
+
+    #[test]
+    fn chained_assign_with_a_bare_tuple_value() {
+        let module = parse_ok("a = b = 1, 2\n");
+        let Stmt::MultiAssign { targets, value } = &module.body[0] else {
+            panic!("a multi-assign")
+        };
+        assert_eq!(targets.len(), 2);
+        assert_eq!(*value, Expr::Tuple(vec![Expr::Int(1), Expr::Int(2)]));
+    }
+
+    #[test]
+    fn for_over_a_bare_tuple_iterable() {
+        let module = parse_ok("for x in 1, 2, 3:\n    pass\n");
+        let Stmt::ForIter { target, iterable, .. } = &module.body[0] else {
+            panic!("a general for-iter")
+        };
+        assert_eq!(target, "x");
+        assert_eq!(*iterable, Expr::Tuple(vec![Expr::Int(1), Expr::Int(2), Expr::Int(3)]));
+    }
+
+    #[test]
+    fn semicolon_separated_simple_statements() {
+        let module = parse_ok("a = 1; b = 2; print(a)\n");
+        assert_eq!(module.body.len(), 3);
+        assert!(matches!(&module.body[0], Stmt::Assign(a) if a.target == "a"));
+        assert!(matches!(&module.body[1], Stmt::Assign(a) if a.target == "b"));
+        assert!(matches!(&module.body[2], Stmt::Expr(_)));
+    }
+
+    #[test]
+    fn inline_suite_holds_all_semicolon_statements() {
+        let module = parse_ok("if x: a = 1; b = 2\nc = 3\n");
+        let Stmt::If { body, .. } = &module.body[0] else { panic!("an if") };
+        assert_eq!(body.len(), 2, "both inline statements are in the if body");
+        assert_eq!(module.body.len(), 2, "the if, then `c = 3` -- b did not leak out");
+    }
+
+    #[test]
+    fn for_with_a_nested_tuple_target() {
+        let module = parse_ok("for i, (a, b) in items:\n    pass\n");
+        let Stmt::ForIter { target, body, .. } = &module.body[0] else { panic!("a for-iter") };
+        assert_eq!(target, ".unpack");
+        let Stmt::TupleAssign { targets, .. } = &body[0] else { panic!("an unpack at body start") };
+        assert_eq!(targets.len(), 2);
+        assert!(matches!(&targets[0], AssignTarget::Name(n) if n == "i"));
+        assert!(matches!(&targets[1], AssignTarget::Tuple(inner) if inner.len() == 2));
     }
 
     #[test]
@@ -2313,8 +2811,10 @@ mod tests {
             ("x += 1\n", BinOp::Add),
             ("x -= 1\n", BinOp::Sub),
             ("x *= 1\n", BinOp::Mul),
+            ("x /= 1\n", BinOp::TrueDiv),
             ("x //= 1\n", BinOp::FloorDiv),
             ("x %= 1\n", BinOp::Mod),
+            ("x **= 1\n", BinOp::Pow),
             ("x &= 1\n", BinOp::BitAnd),
             ("x |= 1\n", BinOp::BitOr),
             ("x ^= 1\n", BinOp::BitXor),
@@ -2438,6 +2938,59 @@ mod tests {
     }
 
     #[test]
+    fn fstring_debug_field_desugars_with_prefix_and_repr() {
+        let m = parse_ok("f\"{x=}\"\n");
+        let Stmt::Expr(Expr::Binary { op: BinOp::Add, lhs, rhs }) = &m.body[0] else {
+            panic!("expected a prefix + value concatenation");
+        };
+        assert!(matches!(&**lhs, Expr::Str(s) if s == "x="));
+        let Expr::Call { func, args, .. } = &**rhs else {
+            panic!("expected repr(x)");
+        };
+        assert!(matches!(&**func, Expr::Name(n) if n == "repr"));
+        assert!(matches!(&args[0], Expr::Name(n) if n == "x"));
+        let spaced = parse_ok("f\"{ x = }\"\n");
+        let Stmt::Expr(Expr::Binary { lhs, .. }) = &spaced.body[0] else {
+            panic!("expected a prefix + value concatenation");
+        };
+        assert!(matches!(&**lhs, Expr::Str(s) if s == " x = "));
+        let spec = parse_ok("f\"{x=:d}\"\n");
+        let Stmt::Expr(Expr::Binary { rhs, .. }) = &spec.body[0] else {
+            panic!("expected a prefix + value concatenation");
+        };
+        assert!(matches!(&**rhs, Expr::Call { func, .. }
+            if matches!(&**func, Expr::Attribute { attr, .. } if attr == "format")));
+        let cmp = parse_ok("f\"{a == b}\"\n");
+        let Stmt::Expr(Expr::Call { func, args, .. }) = &cmp.body[0] else {
+            panic!("expected str(a == b)");
+        };
+        assert!(matches!(&**func, Expr::Name(n) if n == "str"));
+        assert!(matches!(&args[0], Expr::Compare { .. }));
+    }
+
+    #[test]
+    fn fstring_nested_spec_builds_a_dynamic_template() {
+        let m = parse_ok("f\"{x:{w}}\"\n");
+        let Stmt::Expr(Expr::Call { func, args, .. }) = &m.body[0] else {
+            panic!("expected a .format(...) call");
+        };
+        let Expr::Attribute { value, attr } = &**func else {
+            panic!("expected an attribute call");
+        };
+        assert_eq!(attr, "format");
+        assert!(matches!(&**value, Expr::Binary { op: BinOp::Add, .. }));
+        assert!(matches!(&args[0], Expr::Name(n) if n == "x"));
+        let plain = parse_ok("f\"{x:.2f}\"\n");
+        let Stmt::Expr(Expr::Call { func, .. }) = &plain.body[0] else {
+            panic!("expected a .format(...) call");
+        };
+        let Expr::Attribute { value, .. } = &**func else {
+            panic!("expected an attribute call");
+        };
+        assert!(matches!(&**value, Expr::Str(s) if s == "{:.2f}"));
+    }
+
+    #[test]
     fn tuple_and_dict_displays_parse() {
         assert!(matches!(parse_ok("(a, b)\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 2));
         assert!(matches!(parse_ok("(a,)\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 1));
@@ -2447,6 +3000,70 @@ mod tests {
         assert!(matches!(parse_ok("{}\n").body[0], Stmt::Expr(Expr::Dict(ref p)) if p.is_empty()));
         assert!(matches!(parse_ok("{1, 2}\n").body[0], Stmt::Expr(Expr::Set(_))));
         assert!(matches!(parse_ok("{}\n").body[0], Stmt::Expr(Expr::Dict(_))));
+    }
+
+    #[test]
+    fn star_in_tuple_display_desugars_to_concat() {
+        assert!(matches!(
+            parse_ok("x = 1, *b, 2\n").body[0],
+            Stmt::Assign(Assign { value: Some(Expr::Binary { op: BinOp::Add, .. }), .. })
+        ));
+        assert!(matches!(
+            parse_ok("(1, *b, 2)\n").body[0],
+            Stmt::Expr(Expr::Binary { op: BinOp::Add, .. })
+        ));
+        assert!(matches!(parse_ok("(*b,)\n").body[0], Stmt::Expr(Expr::Call { .. })));
+        assert!(matches!(
+            parse_ok("x = *b,\n").body[0],
+            Stmt::Assign(Assign { value: Some(Expr::Call { .. }), .. })
+        ));
+        assert!(matches!(parse_ok("(1, 2)\n").body[0], Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 2));
+        assert!(matches!(parse_ok("y = 1, 2, 3\n").body[0],
+            Stmt::Assign(Assign { value: Some(Expr::Tuple(ref v)), .. }) if v.len() == 3));
+        assert!(parse_src("z = *b\n").is_err());
+        assert!(parse_src("(*b)\n").is_err());
+    }
+
+    #[test]
+    fn bare_tuple_expression_statement() {
+        assert!(matches!(
+            parse_ok("a, b\n").body[0],
+            Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 2
+        ));
+        assert!(matches!(
+            parse_ok("1, 2, 3\n").body[0],
+            Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 3
+        ));
+        assert!(matches!(
+            parse_ok("a,\n").body[0],
+            Stmt::Expr(Expr::Tuple(ref v)) if v.len() == 1
+        ));
+        assert!(matches!(parse_ok("a, *b\n").body[0], Stmt::Expr(Expr::Binary { .. })));
+        assert!(matches!(parse_ok("*b, a\n").body[0], Stmt::Expr(Expr::Binary { .. })));
+        assert!(matches!(parse_ok("a, b = p\n").body[0], Stmt::TupleAssign { .. }));
+        assert!(matches!(parse_ok("*a, b = p\n").body[0], Stmt::TupleAssign { .. }));
+        assert!(parse_src("*b\n").is_err());
+    }
+
+    #[test]
+    fn matmul_operator_parses_as_infix_binary() {
+        assert!(matches!(
+            parse_ok("a @ b\n").body[0],
+            Stmt::Expr(Expr::Binary { op: BinOp::MatMul, .. })
+        ));
+        let Stmt::Expr(Expr::Binary { op: BinOp::Add, lhs, .. }) = &parse_ok("a @ b + c\n").body[0]
+        else {
+            panic!("expected (a @ b) + c");
+        };
+        assert!(matches!(&**lhs, Expr::Binary { op: BinOp::MatMul, .. }));
+        assert!(matches!(
+            parse_ok("a @= b\n").body[0],
+            Stmt::Assign(Assign { value: Some(Expr::Binary { op: BinOp::MatMul, .. }), .. })
+        ));
+        assert!(matches!(
+            parse_ok("@d\ndef f():\n    pass\n").body[0],
+            Stmt::Decorated { .. }
+        ));
     }
 
     #[test]
@@ -2676,6 +3293,29 @@ mod tests {
     }
 
     #[test]
+    fn sequence_patterns_parse_and_gate_the_subset() {
+        for src in [
+            "match p:\n    case (x, y):\n        pass\n",
+            "match p:\n    case [a, b, c]:\n        pass\n",
+            "match p:\n    case (0, y):\n        pass\n",
+            "match p:\n    case (_, second, _):\n        pass\n",
+            "match p:\n    case ():\n        pass\n",
+            "match p:\n    case (x):\n        pass\n",
+            "match p:\n    case (x,):\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+        for src in [
+            "match p:\n    case (a, *rest):\n        pass\n",
+            "match p:\n    case {1: x}:\n        pass\n",
+            "match p:\n    case ((a, b), c):\n        pass\n",
+            "match p:\n    case (a | b, c):\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_err(), "should reject: {src:?}");
+        }
+    }
+
+    #[test]
     fn star_displays_desugar_but_plain_displays_do_not() {
         let value = |src: &str| -> Option<Expr> {
             match &parse_ok(src).body[0] {
@@ -2865,6 +3505,31 @@ mod tests {
     }
 
     #[test]
+    fn comma_subscript_is_a_tuple_index() {
+        let module = parse_ok("d[1, 2]\n");
+        let Stmt::Expr(Expr::Subscript { index, .. }) = &module.body[0] else {
+            panic!("expected a subscript");
+        };
+        let Expr::Tuple(items) = &**index else { panic!("a tuple index") };
+        assert_eq!(items.len(), 2);
+        let one = parse_ok("d[1,]\n");
+        let Stmt::Expr(Expr::Subscript { index, .. }) = &one.body[0] else {
+            panic!("expected a subscript");
+        };
+        assert!(matches!(&**index, Expr::Tuple(items) if items.len() == 1));
+    }
+
+    #[test]
+    fn ellipsis_parses_to_the_ellipsis_name() {
+        assert_eq!(
+            parse_ok("...\n").body[0],
+            Stmt::Expr(Expr::Name("Ellipsis".into()))
+        );
+        assert!(parse_src("def f():\n    ...\n").is_ok());
+        assert!(parse_src("x = [..., 1]\n").is_ok());
+    }
+
+    #[test]
     fn adjacent_string_literals_concatenate() {
         assert_eq!(parse_ok("\"ab\" \"cd\"\n").body[0], Stmt::Expr(Expr::Str("abcd".into())));
         assert!(matches!(
@@ -3013,8 +3678,32 @@ else:
         assert!(parse_src("xs[1:2] += p\n").is_err());
         assert!(parse_src("1 = x\n").is_err());
         assert!(parse_src("def f(a=1, b): return a\n").is_err());
-        assert!(parse_src("import os\n").is_err());
+        assert!(parse_src("import a.b\n").is_err());
+        assert!(parse_src("from m import *\n").is_err());
         assert!(parse_src("global x\n").is_err());
+    }
+
+    #[test]
+    fn import_statements_parse() {
+        assert!(matches!(
+            &parse_ok("import math\n").body[0],
+            Stmt::Import { modules } if modules == &[("math".into(), "math".into())]
+        ));
+        assert!(matches!(
+            &parse_ok("import math as m\n").body[0],
+            Stmt::Import { modules } if modules == &[("math".into(), "m".into())]
+        ));
+        assert!(matches!(
+            &parse_ok("from math import sqrt\n").body[0],
+            Stmt::ImportFrom { module, names }
+                if module == "math" && names == &[("sqrt".into(), "sqrt".into())]
+        ));
+        assert!(matches!(
+            &parse_ok("from math import pi, sqrt as s\n").body[0],
+            Stmt::ImportFrom { module, names }
+                if module == "math"
+                    && names == &[("pi".into(), "pi".into()), ("sqrt".into(), "s".into())]
+        ));
     }
 
     #[test]
@@ -3170,6 +3859,34 @@ else:
     }
 
     #[test]
+    fn yield_of_a_bare_tuple() {
+        let m = parse_ok("def g():\n    yield a, b\n");
+        let Stmt::FuncDef(func) = &m.body[0] else {
+            panic!("expected a function");
+        };
+        let Stmt::Expr(Expr::Yield(Some(v))) = &func.body[0] else {
+            panic!("expected a yield expression");
+        };
+        assert!(matches!(&**v, Expr::Tuple(elems) if elems.len() == 2));
+        let one = parse_ok("def g():\n    yield a,\n");
+        let Stmt::FuncDef(func) = &one.body[0] else {
+            panic!("expected a function");
+        };
+        let Stmt::Expr(Expr::Yield(Some(v))) = &func.body[0] else {
+            panic!("expected a yield expression");
+        };
+        assert!(matches!(&**v, Expr::Tuple(elems) if elems.len() == 1));
+        let spread = parse_ok("def g():\n    yield a, *b\n");
+        let Stmt::FuncDef(func) = &spread.body[0] else {
+            panic!("expected a function");
+        };
+        assert!(matches!(
+            func.body[0],
+            Stmt::Expr(Expr::Yield(Some(ref v))) if matches!(**v, Expr::Binary { .. })
+        ));
+    }
+
+    #[test]
     fn yield_from_is_rejected() {
         assert!(parse_src("def g():\n    yield from xs\n").is_err());
     }
@@ -3186,10 +3903,35 @@ else:
     }
 
     #[test]
-    fn positional_only_and_kwonly_defaults_are_gated() {
-        assert!(parse_src("def f(a, *, b=1):\n    return b\n").is_err());
+    fn kwonly_defaults_parse_and_a_dangling_star_is_gated() {
+        let module = parse_ok("def f(a, *, b=1):\n    return b\n");
+        let Stmt::FuncDef(f) = &module.body[0] else { panic!("a def") };
+        let b = f.params.iter().find(|p| p.name == "b").expect("param b");
+        assert!(b.keyword_only && b.default.is_some(), "b is keyword-only with a default");
         assert!(parse_src("def f(a, *):\n    return a\n").is_err());
-        assert!(parse_src("def f(a, b, /, c):\n    return c\n").is_err());
+    }
+
+    #[test]
+    fn lambda_takes_the_full_parameter_grammar() {
+        let module = parse_ok("f = lambda a, b=1, *args, c, d=4, **kw: a\n");
+        let Stmt::Assign(assign) = &module.body[0] else { panic!("an assignment") };
+        let Some(Expr::Lambda { params, .. }) = &assign.value else { panic!("a lambda value") };
+        assert!(params.iter().any(|p| p.is_vararg && p.name == "args"));
+        assert!(params.iter().any(|p| p.is_varkwarg && p.name == "kw"));
+        assert!(params.iter().any(|p| p.keyword_only && p.name == "c" && p.default.is_none()));
+        assert!(params.iter().any(|p| p.keyword_only && p.name == "d" && p.default.is_some()));
+        assert!(parse_src("f = lambda a, b, /, c: a\n").is_ok());
+    }
+
+    #[test]
+    fn positional_only_marker_sets_the_flag() {
+        let module = parse_ok("def f(a, b, /, c):\n    return a\n");
+        let Stmt::FuncDef(f) = &module.body[0] else { panic!("a def") };
+        assert_eq!(f.params.len(), 3);
+        assert!(f.params[0].positional_only && f.params[1].positional_only);
+        assert!(!f.params[2].positional_only);
+        assert!(parse_src("def f(/, a):\n    return a\n").is_err());
+        assert!(parse_src("def f(a, *, b, /):\n    return b\n").is_err());
     }
 
     #[test]
@@ -3267,7 +4009,25 @@ else:
     }
 
     #[test]
-    fn multiple_context_managers_are_gated() {
-        assert!(parse_src("with a() as x, b() as y:\n    pass\n").is_err());
+    fn parenthesized_with_items_parse() {
+        assert!(parse_src("with (a() as x, b() as y):\n    pass\n").is_ok());
+        assert!(parse_src("with (a(), b()):\n    pass\n").is_ok());
+        assert!(parse_src("with (a() as x,):\n    pass\n").is_ok());
+        let m = parse_ok("with (a() as x, b() as y):\n    pass\n");
+        let Stmt::With { optional_name, body, .. } = &m.body[0] else { panic!("a with") };
+        assert_eq!(optional_name.as_deref(), Some("x"));
+        assert!(matches!(&body[0], Stmt::With { .. }), "the second manager nests inside");
+        assert!(parse_src("with (a or b) as x:\n    pass\n").is_ok());
+        assert!(parse_src("with (a() if c else b()) as x:\n    pass\n").is_ok());
+    }
+
+    #[test]
+    fn multiple_context_managers_nest() {
+        let module = parse_ok("with a() as x, b() as y:\n    pass\n");
+        let Stmt::With { optional_name, body, .. } = &module.body[0] else { panic!("a with") };
+        assert_eq!(optional_name.as_deref(), Some("x"));
+        assert_eq!(body.len(), 1, "the inner with is the outer's whole body");
+        let Stmt::With { optional_name: inner, .. } = &body[0] else { panic!("a nested with") };
+        assert_eq!(inner.as_deref(), Some("y"));
     }
 }

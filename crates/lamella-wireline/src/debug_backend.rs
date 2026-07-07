@@ -2,9 +2,11 @@
 //! the wireline debug channel -- VS Code (via lamella-dap) debugs code running ON A DEVICE
 //! with zero adapter changes.
 
-use crate::{SerialTransport, hello_blocking};
+use crate::{SerialTransport, deploy_chunked_blocking, hello_blocking};
+#[cfg(feature = "usb")]
+use crate::{UsbTransport, parse_usb_target};
 use lamella_debug_backend::{
-    DebugBackend, Disassembled, Frame, Register, Scope, Stop, Variable,
+    DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
 };
 use lamella_runner::RunResult;
 use lamella_runner::debug::{self, reason};
@@ -21,9 +23,128 @@ fn unpack(address: u64) -> (u32, u32) {
     ((address >> 32) as u32, address as u32)
 }
 
+/// The carrier a [`WirelineBackend`] drives: a serial port (USB-CDC / UART / a debug-probe VCP), or --
+/// with the `usb` feature -- a board's native driverless-WinUSB device. A LOCAL enum (not `Box<dyn>`) so it
+/// implements the foreign `Transport` trait, and the blocking deploy/hello drivers take it directly.
+pub enum WireTransport {
+    Serial(SerialTransport),
+    #[cfg(feature = "usb")]
+    Usb(UsbTransport),
+}
+
+impl Transport for WireTransport {
+    fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
+        match self {
+            WireTransport::Serial(t) => t.send(msg_type, seq, payload),
+            #[cfg(feature = "usb")]
+            WireTransport::Usb(t) => t.send(msg_type, seq, payload),
+        }
+    }
+    fn poll(&mut self) -> Result<Option<WireFrame>, TransportError> {
+        match self {
+            WireTransport::Serial(t) => t.poll(),
+            #[cfg(feature = "usb")]
+            WireTransport::Usb(t) => t.poll(),
+        }
+    }
+}
+
+/// A pre-built source map for the DEPLOYED image (`lamella_srcmap`'s JSON, keyed by the SAME method_id the wire
+/// reports), loaded alongside the `.lmli` so a wireline session is SOURCE-LEVEL. `points` are `(il_offset, line,
+/// column)` ascending by offset -- the wire reports the CIL offset directly, so no index conversion is needed.
+struct MethodSrc {
+    document: String,
+    /// The method's qualified display name (`Type.Method`), for stack frames. Empty if the map predates names.
+    name: String,
+    points: Vec<(u32, u32, u32)>,
+}
+
+pub struct SrcMap {
+    methods: std::collections::HashMap<u32, MethodSrc>,
+}
+
+impl SrcMap {
+    /// Parse `lamella_srcmap`'s JSON: `{ methods: { "<id>": { document, points: [{o,l,c}] } } }`.
+    pub fn parse(json: &[u8]) -> Option<Self> {
+        #[derive(serde::Deserialize)]
+        struct RawPoint { o: u32, l: u32, #[serde(default)] c: u32 }
+        #[derive(serde::Deserialize)]
+        struct RawMethod { document: String, #[serde(default)] name: String, points: Vec<RawPoint> }
+        #[derive(serde::Deserialize)]
+        struct Raw { methods: std::collections::HashMap<String, RawMethod> }
+        let raw: Raw = serde_json::from_slice(json).ok()?;
+        let mut methods = std::collections::HashMap::new();
+        for (id, m) in raw.methods {
+            let Ok(id) = id.parse::<u32>() else { continue };
+            let mut points: Vec<(u32, u32, u32)> = m.points.into_iter().map(|p| (p.o, p.l, p.c)).collect();
+            points.sort_by_key(|point| point.0);
+            methods.insert(id, MethodSrc { document: m.document, name: m.name, points });
+        }
+        (!methods.is_empty()).then_some(Self { methods })
+    }
+
+    /// The `(file, line, column)` of the last sequence point at or before `offset` in `method`.
+    fn location(&self, method: u32, offset: u32) -> Option<(&str, u32, u32)> {
+        let method = self.methods.get(&method)?;
+        let point = method
+            .points
+            .iter()
+            .rev()
+            .find(|(o, _, _)| *o <= offset)
+            .or_else(|| method.points.first())?;
+        Some((&method.document, point.1, point.2))
+    }
+
+    /// The qualified display name (`Type.Method`) recorded for `method`, if the map carries one (non-empty).
+    fn name_of(&self, method: u32) -> Option<&str> {
+        self.methods
+            .get(&method)
+            .map(|source| source.name.as_str())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// Resolve a source `(document, line)` to a `(method_id, il_offset)` breakpoint -- the nearest sequence point at
+    /// or after `line` (matched by full path, else file basename).
+    fn resolve(&self, document: &str, line: u32) -> Option<(u32, u32)> {
+        let basename: fn(&str) -> &str = |path| path.rsplit(['/', '\\']).next().unwrap_or(path);
+        let target = basename(document);
+        let mut best: Option<(u32, u32, u32)> = None;
+        for (&method, source) in &self.methods {
+            if source.document != document && basename(&source.document) != target {
+                continue;
+            }
+            for &(offset, l, _) in &source.points {
+                if l >= line && best.map_or(true, |(_, _, distance)| l - line < distance) {
+                    best = Some((method, offset, l - line));
+                }
+            }
+        }
+        best.map(|(method, offset, _)| (method, offset))
+    }
+
+    /// Is `offset` exactly a sequence point in `method` (a source-statement boundary)?
+    fn is_sequence_point(&self, method: u32, offset: u32) -> bool {
+        self.methods
+            .get(&method)
+            .map_or(false, |source| source.points.iter().any(|&(o, _, _)| o == offset))
+    }
+
+    /// Every sequence-point offset in `method` (the temp-breakpoint set for a source step-over into a call).
+    fn points_of(&self, method: u32) -> Vec<u32> {
+        self.methods
+            .get(&method)
+            .map_or(Vec::new(), |source| source.points.iter().map(|&(o, _, _)| o).collect())
+    }
+}
+
 /// A [`DebugBackend`] driving a wireline target's on-device interpreter session.
 pub struct WirelineBackend {
-    transport: SerialTransport,
+    transport: WireTransport,
+    /// The deployed image's source map, if present -- makes the session source-level; `None` => IL-level.
+    srcmap: Option<SrcMap>,
+    /// The user's current breakpoint addresses (from set_breakpoints) -- kept armed alongside the temp breakpoints
+    /// run_to_return() uses, so a source step-over never drops a user breakpoint.
+    user_bps: Vec<u64>,
     image: Vec<u8>,
     timeout: Duration,
     seq: u16,
@@ -50,7 +171,50 @@ impl WirelineBackend {
         image: Vec<u8>,
         timeout: Duration,
     ) -> Result<Self, TransportError> {
-        let mut transport = SerialTransport::open(port, baud)?;
+        Self::from_transport(WireTransport::Serial(SerialTransport::open(port, baud)?), image, timeout)
+    }
+
+    /// Open a NATIVE-USB (driverless WinUSB) wireline target by `vid`/`pid` + an optional serial
+    /// substring (the picker key: an RP2350 reports its 16-hex chip id, the F427 `F427-0001`).
+    ///
+    /// # Errors
+    /// As [`Self::open`], with a carrier error if no matching USB device is present.
+    #[cfg(feature = "usb")]
+    pub fn open_usb(
+        vid: u16,
+        pid: u16,
+        serial: Option<&str>,
+        image: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        Self::from_transport(WireTransport::Usb(UsbTransport::open_matching(vid, pid, serial)?), image, timeout)
+    }
+
+    /// Open by a TARGET STRING: `usb` / `usb:<serial>` / `usb:<vid>:<pid>[:<serial>]` selects the native-USB
+    /// carrier (when the `usb` feature is on); anything else is a serial port name.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    pub fn open_target(
+        target: &str,
+        baud: u32,
+        image: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        #[cfg(feature = "usb")]
+        if target == "usb" || target.starts_with("usb:") {
+            let (vid, pid, serial) = parse_usb_target(target);
+            return Self::open_usb(vid, pid, serial.as_deref(), image, timeout);
+        }
+        Self::open(target, baud, image, timeout)
+    }
+
+    /// HELLO `transport`, require the debug caps, and build the backend around it.
+    fn from_transport(
+        mut transport: WireTransport,
+        image: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Self, TransportError> {
         let caps = Capabilities(
             Capabilities::DEBUG_BASIC
                 | Capabilities::BREAKPOINTS
@@ -74,7 +238,19 @@ impl WirelineBackend {
             frames: Vec::new(),
             exit_code: 0,
             pending_output: None,
+            srcmap: None,
+            user_bps: Vec::new(),
         })
+    }
+
+    /// Attach a pre-built source map (`lamella_srcmap` JSON, e.g. `<image>.srcmap.json`) so the session is
+    /// source-level. `None` or unparseable JSON leaves it IL-level.
+    #[must_use]
+    pub fn with_srcmap(mut self, json: Option<Vec<u8>>) -> Self {
+        if let Some(bytes) = json {
+            self.srcmap = SrcMap::parse(&bytes);
+        }
+        self
     }
 
     fn next_seq(&mut self) -> u16 {
@@ -159,6 +335,22 @@ impl WirelineBackend {
             ));
         }
     }
+
+    /// Send the breakpoint set (each address = packed method_id|offset) to the target. DBG_BREAK REPLACES all
+    /// breakpoints, so callers pass the FULL set they want armed.
+    fn send_breakpoints(&mut self, addresses: &[u64]) {
+        let mut payload = Vec::with_capacity(2 + addresses.len() * 8);
+        payload.extend_from_slice(&(addresses.len() as u16).to_le_bytes());
+        for &address in addresses {
+            let (method, offset) = unpack(address);
+            payload.extend_from_slice(&method.to_le_bytes());
+            payload.extend_from_slice(&offset.to_le_bytes());
+        }
+        let seq = self.next_seq();
+        if self.transport.send(debug::DBG_BREAK, seq, &payload).is_ok() {
+            self.await_type(debug::DBG_ACK);
+        }
+    }
 }
 
 impl DebugBackend for WirelineBackend {
@@ -173,7 +365,14 @@ impl DebugBackend for WirelineBackend {
         self.running = false;
         self.exit_code = 0;
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_IMAGE, seq, &self.image).is_err() {
+        if !matches!(
+            deploy_chunked_blocking(&mut self.transport, seq, &self.image, 8 * 1024, self.timeout),
+            Ok(true)
+        ) {
+            return false;
+        }
+        let seq = self.next_seq();
+        if self.transport.send(debug::DBG_ATTACH, seq, &[]).is_err() {
             return false;
         }
         let Some(stop) = self.await_type(debug::EVT_STOPPED) else {
@@ -207,8 +406,22 @@ impl DebugBackend for WirelineBackend {
     }
 
     fn pause(&mut self) -> bool {
+        if !self.session_live || !self.running {
+            return true;
+        }
         let seq = self.next_seq();
-        self.transport.send(debug::DBG_PAUSE, seq, &[]).is_ok()
+        if self.transport.send(debug::DBG_PAUSE, seq, &[]).is_err() {
+            return false;
+        }
+        match self.await_type(debug::EVT_STOPPED) {
+            Some(frame) => {
+                self.on_stopped(&frame);
+            }
+            None => {
+                self.running = false;
+            }
+        }
+        true
     }
 
     fn step(&mut self) -> Stop {
@@ -234,17 +447,65 @@ impl DebugBackend for WirelineBackend {
     }
 
     fn set_breakpoints(&mut self, addresses: &[u64]) {
-        let mut payload = Vec::with_capacity(2 + addresses.len() * 8);
-        payload.extend_from_slice(&(addresses.len() as u16).to_le_bytes());
-        for &address in addresses {
-            let (method, offset) = unpack(address);
-            payload.extend_from_slice(&method.to_le_bytes());
-            payload.extend_from_slice(&offset.to_le_bytes());
+        self.user_bps = addresses.to_vec();
+        if self.session_live && self.running {
+            self.pause();
+            self.send_breakpoints(addresses);
+            let seq = self.next_seq();
+            if self.transport.send(debug::DBG_RESUME, seq, &[]).is_ok() {
+                self.running = true;
+            }
+        } else {
+            self.send_breakpoints(addresses);
         }
+    }
+
+    fn run_to_return(&mut self) -> Stop {
+        if !self.session_live {
+            return Stop::Done;
+        }
+        let Some(&(caller, _)) = self.frames.get(1) else {
+            return self.step();
+        };
+        let temps: Vec<u64> = match self.srcmap.as_ref() {
+            Some(srcmap) => srcmap.points_of(caller).into_iter().map(|offset| pack(caller, offset)).collect(),
+            None => Vec::new(),
+        };
+        if temps.is_empty() {
+            return self.step();
+        }
+        let mut armed = self.user_bps.clone();
+        armed.extend_from_slice(&temps);
+        self.send_breakpoints(&armed);
         let seq = self.next_seq();
-        if self.transport.send(debug::DBG_BREAK, seq, &payload).is_ok() {
-            self.await_type(debug::DBG_ACK);
+        if self.transport.send(debug::DBG_RESUME, seq, &[]).is_err() {
+            return Stop::Fault("the wire dropped".to_string());
         }
+        self.running = true;
+        let stop = match self.await_type(debug::EVT_STOPPED) {
+            Some(frame) => self.on_stopped(&frame),
+            None => Stop::Fault("run-to-return timed out".to_string()),
+        };
+        let restore = self.user_bps.clone();
+        self.send_breakpoints(&restore);
+        match stop {
+            Stop::Breakpoint => {
+                let at = self.frames.first().map(|&(method, offset)| pack(method, offset));
+                if at.map_or(false, |address| self.user_bps.contains(&address)) {
+                    Stop::Breakpoint
+                } else {
+                    Stop::Step
+                }
+            }
+            other => other,
+        }
+    }
+
+    fn step_out(&mut self) -> Option<Stop> {
+        if self.frames.len() < 2 {
+            return None;
+        }
+        Some(self.run_to_return())
     }
 
     fn stack(&self) -> Vec<Frame> {
@@ -252,7 +513,11 @@ impl DebugBackend for WirelineBackend {
             .iter()
             .map(|&(method, offset)| Frame {
                 address: pack(method, offset),
-                name: format!("method {method}"),
+                name: self
+                    .srcmap
+                    .as_ref()
+                    .and_then(|srcmap| srcmap.name_of(method))
+                    .map_or_else(|| format!("method {method}"), String::from),
                 line: offset + 1,
             })
             .collect()
@@ -260,6 +525,40 @@ impl DebugBackend for WirelineBackend {
 
     fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
         Vec::new()
+    }
+
+    fn has_source(&self) -> bool {
+        self.srcmap.is_some()
+    }
+
+    /// Is the current (innermost) stop exactly at a source-statement boundary? `source_step()` single-steps until
+    /// this is true, so without it a source step-over would never terminate.
+    fn at_source_boundary(&self) -> bool {
+        let Some(&(method, offset)) = self.frames.first() else {
+            return false;
+        };
+        self.srcmap
+            .as_ref()
+            .map_or(false, |srcmap| srcmap.is_sequence_point(method, offset))
+    }
+
+    /// Resolve a frame's opaque address `(method_id, il_offset)` to a source line via the deployed image's map.
+    fn source_location(&self, address: u64) -> Option<SourceLocation> {
+        let (method, offset) = unpack(address);
+        let (file, line, column) = self.srcmap.as_ref()?.location(method, offset)?;
+        Some(SourceLocation {
+            file: file.to_string(),
+            line,
+            column,
+            end_line: line,
+            end_column: column,
+        })
+    }
+
+    /// Map a source `(document, line)` breakpoint to the `(method_id, il_offset)` address DBG_BREAK wants.
+    fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
+        let (method, offset) = self.srcmap.as_ref()?.resolve(document, line)?;
+        Some(pack(method, offset))
     }
 
     fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
@@ -276,5 +575,34 @@ impl DebugBackend for WirelineBackend {
 
     fn take_output(&mut self) -> Option<String> {
         self.pending_output.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SrcMap;
+
+    #[test]
+    fn srcmap_carries_qualified_method_names() {
+        let json = br#"{ "methods": {
+            "1154": { "document": "blink-rp2350.cs", "name": "BlinkRp2350.Main",
+                      "points": [{ "o": 0, "l": 113, "c": 5 }] },
+            "1147": { "document": "blink-rp2350.cs", "name": "Rp2350GpioDriver.SetPinMode",
+                      "points": [{ "o": 0, "l": 65, "c": 5 }] }
+        }, "entryPoint": 1154, "error": null }"#;
+        let map = SrcMap::parse(json).expect("parse");
+        assert_eq!(map.name_of(1154), Some("BlinkRp2350.Main"));
+        assert_eq!(map.name_of(1147), Some("Rp2350GpioDriver.SetPinMode"));
+        assert_eq!(map.name_of(9999), None);
+    }
+
+    #[test]
+    fn nameless_srcmap_still_parses() {
+        let json = br#"{ "methods": {
+            "42": { "document": "a.cs", "points": [{ "o": 0, "l": 1, "c": 1 }] }
+        }, "entryPoint": null, "error": null }"#;
+        let map = SrcMap::parse(json).expect("parse");
+        assert_eq!(map.name_of(42), None);
+        assert!(map.location(42, 0).is_some());
     }
 }

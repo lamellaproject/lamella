@@ -15,4 +15,5 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 
 [dev-dependencies]
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }
+# Real-probe HID access for the examples.
 lamella-usbhid = { path = "../lamella-usbhid" }
