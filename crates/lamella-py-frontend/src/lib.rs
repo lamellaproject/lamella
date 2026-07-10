@@ -68,6 +68,61 @@ pub fn compile_str(
     Ok(module)
 }
 
+/// Compile a multi-file Python program into a [`bytecode::Bundle`]: the `entry` module plus,
+/// transitively, the managed `.py` modules its imports resolve to. `resolve(name)` returns a module's
+/// source by name, or `None` for a name that stays a native / built-in module (not bundled -- e.g.
+/// `math`). The import graph is walked breadth-first with a seen-set, so a module reached by several
+/// paths (a diamond) or an import cycle compiles once and terminates.
+pub fn compile_bundle(
+    entry_name: &str,
+    entry_source: &str,
+    resolve: &dyn Fn(&str) -> Option<alloc::string::String>,
+) -> Result<bytecode::Bundle, FrontendError> {
+    use alloc::collections::{BTreeSet, VecDeque};
+    use alloc::string::String;
+    use alloc::vec::Vec;
+
+    let entry_ast = parser::parse(lexer::tokenize(entry_source)?)?;
+    let entry = compile::compile_module(entry_name, &entry_ast)?;
+
+    let mut modules: Vec<bytecode::Module> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut queue: VecDeque<String> = top_level_imports(&entry_ast).into_iter().collect();
+    while let Some(name) = queue.pop_front() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(source) = resolve(&name) else {
+            continue;
+        };
+        let ast = parser::parse(lexer::tokenize(&source)?)?;
+        for imported in top_level_imports(&ast) {
+            if !seen.contains(&imported) {
+                queue.push_back(imported);
+            }
+        }
+        modules.push(compile::compile_module(&name, &ast)?);
+    }
+    Ok(bytecode::Bundle { entry, modules })
+}
+
+/// The module names a module imports at top level (`import m [, n]` and `from m import ...`).
+fn top_level_imports(module: &ast::ModuleAst) -> alloc::vec::Vec<alloc::string::String> {
+    let mut names = alloc::vec::Vec::new();
+    for stmt in &module.body {
+        match stmt {
+            ast::Stmt::Import { modules } => {
+                for (module_name, _alias) in modules {
+                    names.push(module_name.clone());
+                }
+            }
+            ast::Stmt::ImportFrom { module, .. } => names.push(module.clone()),
+            _ => {}
+        }
+    }
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +183,46 @@ print(fib(10))
         let err = compile_str("m", "a = )\n").unwrap_err();
         let _: String = alloc::format!("{err}");
         assert!(matches!(err, FrontendError::Parse(_)));
+    }
+
+    #[test]
+    fn compile_bundle_walks_the_import_graph() {
+        let resolve = |name: &str| -> Option<String> {
+            match name {
+                "helpers" => Some(String::from(
+                    "MAX = 10\nimport math\ndef double(x):\n    return x * 2\n",
+                )),
+                "config" => Some(String::from("NAME = \"cfg\"\n")),
+                _ => None,
+            }
+        };
+        let bundle = compile_bundle(
+            "__main__",
+            "import helpers\nfrom config import NAME\nimport math\n",
+            &resolve,
+        )
+        .expect("compiles");
+        assert_eq!(bundle.entry.name, "__main__");
+        assert_eq!(bundle.modules.len(), 2);
+        let names: alloc::vec::Vec<&str> = bundle.modules.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"helpers") && names.contains(&"config"));
+        assert!(!names.contains(&"math"), "a native module is not bundled");
+        let bytes = bundle.encode(FeatureFlags::FIRST_LIGHT);
+        let (decoded, _) = bytecode::Bundle::decode(&bytes).expect("decodes");
+        assert_eq!(decoded, bundle);
+    }
+
+    #[test]
+    fn compile_bundle_dedups_a_diamond_and_a_cycle() {
+        let resolve = |name: &str| -> Option<String> {
+            match name {
+                "a" => Some(String::from("import shared\nX = 1\n")),
+                "b" => Some(String::from("import shared\nY = 2\n")),
+                "shared" => Some(String::from("import a\nZ = 3\n")),
+                _ => None,
+            }
+        };
+        let bundle = compile_bundle("__main__", "import a\nimport b\n", &resolve).expect("compiles");
+        assert_eq!(bundle.modules.len(), 3);
     }
 }

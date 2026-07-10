@@ -1660,6 +1660,24 @@ impl Binder {
                     }
                 }
                 if !operand.ty.is_error() && !ty.is_error() {
+                    if matches!(ty, TypeSymbol::Special(SpecialType::Decimal))
+                        != matches!(operand.ty, TypeSymbol::Special(SpecialType::Decimal))
+                    {
+                        if let Some(method) = self
+                            .user_conversion(&operand.ty, &ty, "op_Implicit")
+                            .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Explicit"))
+                        {
+                            let argument = self.convert(operand, &method.parameters[0].clone());
+                            return BoundExpr {
+                                ty,
+                                kind: BoundExprKind::Call {
+                                    callee: Box::new(error_expr()),
+                                    arguments: alloc::vec![argument],
+                                    method: Some(method),
+                                },
+                            };
+                        }
+                    }
                     if let Some(method) = self
                         .user_conversion(&operand.ty, &ty, "op_Explicit")
                         .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Implicit"))
@@ -3028,7 +3046,10 @@ impl Binder {
                 return error_expr();
             }
         }
-        let receiver_kind = receiver_category(&receiver);
+        let receiver_kind = match receiver_category(&receiver) {
+            Receiver::ImplicitThis => Receiver::Instance,
+            other => other,
+        };
         match self.resolve_member(&receiver.ty, name) {
             MemberResolution::Field(field) => {
                 self.check_accessible(&field.declaring_type, field.accessibility, name, span);
@@ -4446,6 +4467,101 @@ impl Binder {
                 .get_by_symbol(&ty)
                 .and_then(|info| info.base.clone());
         }
+    }
+
+    /// Reports `CS0529` if `interface_ty`'s base-interface hierarchy is circular (interface
+    /// I : J, J : I). The graph walk is bounded by a visited set, and emitting the error skips
+    /// emission -- where the interface flattening for the metadata would otherwise loop forever.
+    pub(crate) fn check_interface_cycle(
+        &mut self,
+        interface_ty: &TypeSymbol,
+        declaration: &lamella_syntax::ast::TypeDecl,
+    ) {
+        let Some(bases) = self
+            .model
+            .get_by_symbol(interface_ty)
+            .map(|info| info.bases.clone())
+        else {
+            return;
+        };
+        for base in &bases {
+            if self.type_reaches(base, interface_ty, false) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::CircularInterface {
+                        type_name: declaration.name.clone(),
+                        base: base.to_string().into(),
+                    },
+                    declaration.span,
+                ));
+                return;
+            }
+        }
+    }
+
+    /// Reports `CS0523` if a value-type field of struct `struct_ty` cycles back through
+    /// value-type fields to the struct itself (`struct S { S f; }`) -- an infinitely-sized
+    /// layout. The walk is bounded by a visited set; emitting the error skips emission, where
+    /// the struct-layout computation would otherwise loop forever.
+    pub(crate) fn check_struct_layout_cycle(
+        &mut self,
+        struct_ty: &TypeSymbol,
+        declaration: &lamella_syntax::ast::TypeDecl,
+    ) {
+        let Some(fields) = self.model.get_by_symbol(struct_ty).map(|info| {
+            info.fields
+                .iter()
+                .filter(|field| !field.is_static)
+                .map(|field| (field.name.clone(), field.ty.clone()))
+                .collect::<Vec<_>>()
+        }) else {
+            return;
+        };
+        for (name, ty) in &fields {
+            if self.type_reaches(ty, struct_ty, true) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::StructLayoutCycle {
+                        member: alloc::format!("{}.{}", declaration.name, name).into(),
+                        type_name: ty.to_string().into(),
+                    },
+                    declaration.span,
+                ));
+                return;
+            }
+        }
+    }
+
+    /// Whether following `start`'s bases -- or, when `by_value`, its non-static value-type fields
+    /// -- transitively reaches `target`. A bounded graph walk (visited set), used to detect an
+    /// interface-hierarchy or struct-layout cycle without looping on it.
+    fn type_reaches(&self, start: &TypeSymbol, target: &TypeSymbol, by_value: bool) -> bool {
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut stack: Vec<TypeSymbol> = alloc::vec![start.clone()];
+        while let Some(current) = stack.pop() {
+            if &current == target {
+                return true;
+            }
+            if visited.contains(&current) {
+                continue;
+            }
+            visited.push(current.clone());
+            let Some(info) = self.model.get_by_symbol(&current) else {
+                continue;
+            };
+            if by_value {
+                if info.kind == TypeKind::Struct {
+                    for field in &info.fields {
+                        if !field.is_static {
+                            stack.push(field.ty.clone());
+                        }
+                    }
+                }
+            } else {
+                for base in &info.bases {
+                    stack.push(base.clone());
+                }
+            }
+        }
+        false
     }
 
     /// Every method named `name` on `ty` or any of its base classes -- the method

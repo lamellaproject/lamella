@@ -3646,7 +3646,6 @@ impl Module {
                         !cfg!(feature = "typed-references")
                     }
                     Opcode::Arglist => !cfg!(feature = "varargs"),
-                    Opcode::Localloc => true,
                     _ => false,
                 };
                 if unsupported {

@@ -1,12 +1,13 @@
 //! The dynamic object model and its intrinsics.
 
+use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use core::cmp::Ordering;
 
 use lamella_gc::{Heap, Ref, TypeDesc};
-use lamella_py_bytecode::{BinOp, CmpOp, CodeObject};
+use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Module, UnaryOp};
 
 use crate::bigint::BigInt;
 use crate::builtins::Builtin;
@@ -1126,6 +1127,29 @@ pub struct ObjectModel {
     /// a repeated `import` returns the same object and a module body runs at most once. A GC root
     /// (with `globals`), keeping every imported module and its members reachable.
     modules: Vec<(String, Value)>,
+    /// The managed-module registry: the Python-authored modules bundled with the program, resolved by
+    /// `name` when an `import` misses the cache and the native/host modules. Immutable for a run
+    /// (installed once by the host via [`ObjectModel::set_managed_modules`]); a first import CLONES the
+    /// matched `Module` out to run its body (once, then cached in `modules`), which sidesteps the
+    /// borrow of running a body against `&mut self` and costs a single clone per module. Not a GC root
+    /// (it holds bytecode, not heap Values).
+    managed_modules: Vec<Module>,
+    /// Each managed module's function table as a shared `Rc`, indexed by `module_id - 1` (module 0 is
+    /// the entry, whose functions are threaded, not stored here). A CROSS-module call clones the `Rc`
+    /// (cheap) to run the callee against its OWN function table, disjoint from the `&mut self` borrow.
+    /// Built once by [`ObjectModel::set_managed_modules`] alongside the registry.
+    managed_functions: Vec<Rc<[CodeObject]>>,
+    /// Each managed module's live GLOBAL namespace (name -> value), indexed by `module_id - 1`. A
+    /// managed module's top-level bindings and its functions' `LoadGlobal`s resolve here (via
+    /// [`ObjectModel::current_module_global`]), NOT the entry's `globals`, so a function defined in
+    /// module M resolves its globals against M even when called from another module. Module 0 (entry)
+    /// uses `globals`. A GC root (with `globals`), keeping every managed module's bindings reachable.
+    managed_globals: Vec<Vec<(String, Value)>>,
+    /// The module whose functions + globals the RUNNING code resolves against (0 = entry, k = managed
+    /// module k). [`crate::interp`]'s `run_frames` sets it on entry to a drive and restores it on exit,
+    /// so a cross-module call runs the callee in the callee's module context; `LoadGlobal` /
+    /// `StoreFast` (module body) / `MakeFunction` read it. Not a GC root (a plain id).
+    current_module: u16,
     /// Per-function attribute dicts (`f.tag = ...`): a function value's `bits()` -> its `__dict__`.
     /// A function value has no `__dict__` slot, so its user attributes live here, keyed by `bits()` so
     /// a bare `function_ref` (stable per def) and each PyFunction instance (distinct per closure) map
@@ -1204,6 +1228,9 @@ pub struct ObjectModel {
     mmio_write_fn: Option<fn(u32, u32)>,
     /// The volatile MMIO read seam (device: `lamella_mmio::read32`; host: the sim).
     mmio_read_fn: Option<fn(u32) -> u32>,
+    /// The target board whose register map the gpio layer drives (named pins, drive/direction/clock
+    /// registers). Default = STM32F4; the deployment sets it via [`ObjectModel::set_board`].
+    board: crate::gpio::Board,
     /// The host-only simulated register file (the default MMIO target when no seam is installed),
     /// so a driver runs and its register writes are verifiable OFF-device.
     #[cfg(not(target_os = "none"))]
@@ -1294,9 +1321,9 @@ impl ObjectModel {
         });
         let class_type_id = descs.len() as u32;
         descs.push(TypeDesc {
-            payload_size: 12,
+            payload_size: 16,
             ref_offsets: Vec::new(),
-            tagged_offsets: (0..3).map(|i| i * 4).collect(),
+            tagged_offsets: (0..4).map(|i| i * 4).collect(),
         });
         let instance_type_id = descs.len() as u32;
         descs.push(TypeDesc {
@@ -1390,13 +1417,13 @@ impl ObjectModel {
         });
         let py_function_type_id = descs.len() as u32;
         descs.push(TypeDesc {
-            payload_size: 16,
+            payload_size: 20,
             ref_offsets: Vec::new(),
             tagged_offsets: (1..4).map(|i| i * 4).collect(),
         });
         let generator_type_id = descs.len() as u32;
         descs.push(TypeDesc {
-            payload_size: 4,
+            payload_size: 8,
             ref_offsets: Vec::new(),
             tagged_offsets: Vec::new(),
         });
@@ -1503,6 +1530,10 @@ impl ObjectModel {
             pending_exception: None,
             globals: Vec::new(),
             modules: Vec::new(),
+            managed_modules: Vec::new(),
+            managed_functions: Vec::new(),
+            managed_globals: Vec::new(),
+            current_module: 0,
             function_dicts: Vec::new(),
             stdout: String::new(),
             gpio_type_id,
@@ -1528,6 +1559,7 @@ impl ObjectModel {
             gpio_reserved: Vec::new(),
             mmio_write_fn: None,
             mmio_read_fn: None,
+            board: crate::gpio::Board::default(),
             #[cfg(not(target_os = "none"))]
             mmio_sim: alloc::collections::BTreeMap::new(),
             #[cfg(not(target_os = "none"))]
@@ -2139,9 +2171,11 @@ impl ObjectModel {
             if self.is_slice(index) {
                 return self.str_getitem_slice(container, index);
             }
+            let Some(i) = index.as_int() else {
+                return Err(self.index_type_error(container, index));
+            };
             let resolved = {
                 let s = self.str_value(container).ok_or(Trap::TypeError)?;
-                let i = index.as_int().ok_or(Trap::TypeError)?;
                 let len = s.chars().count() as i64;
                 let at = if i < 0 { i + len } else { i };
                 if at < 0 || at >= len {
@@ -2160,10 +2194,12 @@ impl ObjectModel {
             if self.is_slice(index) {
                 return self.seq_getitem_slice(container, index);
             }
+            let Some(i) = index.as_int() else {
+                return Err(self.index_type_error(container, index));
+            };
             let (resolved, is_tuple) = {
                 let elems = self.seq_value(container).ok_or(Trap::TypeError)?;
                 let len = elems.len() as i64;
-                let i = index.as_int().ok_or(Trap::TypeError)?;
                 let at = if i < 0 { i + len } else { i };
                 let resolved = if at < 0 || at >= len { None } else { Some(elems[at as usize]) };
                 (resolved, self.is_tuple(container))
@@ -2216,14 +2252,17 @@ impl ObjectModel {
                 let (sub_start, sub_stop) = adjust_slice(start_v, stop_v, sub_step, len)?;
                 return self.new_range(start + sub_start * step, start + sub_stop * step, step * sub_step);
             }
-            let i = index.as_int().ok_or(Trap::TypeError)?;
+            let Some(i) = index.as_int() else {
+                return Err(self.index_type_error(container, index));
+            };
             let at = if i < 0 { i + len } else { i };
             if at < 0 || at >= len {
                 return Err(self.with_message(Trap::IndexError, "range object index out of range"));
             }
             return Value::fixnum((start + at * step) as i32).ok_or(Trap::Overflow);
         }
-        Err(Trap::TypeError)
+        let message = alloc::format!("'{}' object is not subscriptable", self.type_name_of(container));
+        Err(self.with_message(Trap::TypeError, &message))
     }
 
     /// `str` slicing -- `container[slice]`. Reads the slice's `[start, stop, step]` and
@@ -3127,8 +3166,13 @@ impl ObjectModel {
             }
         }
         if self.is_class(value) {
-            let name = self.str_value(self.read_slot(value, 0)).unwrap_or("?");
-            return alloc::format!("<class '__main__.{name}'>");
+            let name = String::from(self.str_value(self.read_slot(value, 0)).unwrap_or("?"));
+            let namespace = self.read_slot(value, 2);
+            let module = self.dict_get_str(namespace, "__module__").and_then(|m| self.str_value(m));
+            return match module {
+                Some(m) if m != "builtins" => alloc::format!("<class '{m}.{name}'>"),
+                _ => alloc::format!("<class '{name}'>"),
+            };
         }
         if self.is_instance(value) {
             let name = self.instance_class_name(value).unwrap_or("object");
@@ -3500,23 +3544,169 @@ impl ObjectModel {
     /// Imports the module `name`, returning its module object: a cached `sys.modules` entry if it
     /// was imported before (so `import` is idempotent and a module body runs at most once), else a
     /// native stdlib module built on demand and cached, else a `ModuleNotFoundError`. Backs
-    /// [`crate::interp`]'s `ImportName` op. (Managed Python-authored modules -- running a compiled
-    /// module body in a fresh namespace -- are the next layer; this resolves the native modules.)
+    /// [`crate::interp`]'s `ImportName` op for NATIVE-only resolution -- the interpreter-aware
+    /// resolver ([`crate::interp`]'s `resolve_import`) tries this first (native wins) and falls
+    /// through to a managed Python-authored module when it returns `None`.
     pub fn import_module(&mut self, name: &str) -> Result<Value, Trap> {
+        match self.import_builtin_module(name) {
+            Some(result) => result,
+            None => Err(self.module_not_found(name)),
+        }
+    }
+
+    /// Resolves a BUILT-IN import: a cached `sys.modules` entry, a host-provided module bound as a
+    /// global, or a native stdlib module built on demand (and cached). Returns `None` when `name`
+    /// matches none of these, so the interpreter-aware resolver can fall through to a managed module
+    /// (a Python-authored one, whose body it runs). Split from [`ObjectModel::import_module`] because
+    /// running a managed body is interpreter-level (it needs the driver), which the model cannot do.
+    pub(crate) fn import_builtin_module(&mut self, name: &str) -> Option<Result<Value, Trap>> {
         if let Some((_, module)) = self.modules.iter().find(|(n, _)| n == name) {
-            return Ok(*module);
+            return Some(Ok(*module));
         }
         if let Some(module) = self.get_global(name).filter(|&g| self.is_module_object(g)) {
             self.modules.push((String::from(name), module));
-            return Ok(module);
+            return Some(Ok(module));
         }
         if let Some(result) = crate::stdlib::build_module(name, self) {
-            let module = result?;
-            self.modules.push((String::from(name), module));
-            return Ok(module);
+            return Some(result.inspect(|&module| {
+                self.modules.push((String::from(name), module));
+            }));
         }
+        None
+    }
+
+    /// The `ModuleNotFoundError` for an unresolved import `name` ("No module named '...'").
+    pub(crate) fn module_not_found(&mut self, name: &str) -> Trap {
         let message = alloc::format!("No module named '{name}'");
-        Err(self.raise_named_exception("ModuleNotFoundError", &message))
+        self.raise_named_exception("ModuleNotFoundError", &message)
+    }
+
+    /// Installs the managed-module registry -- the Python-authored modules bundled with the program,
+    /// resolved by `name` on an `import` that misses the native/host modules. Set once by the host
+    /// before running the entry module (a single-file program installs an empty registry, the
+    /// default). Also builds each module's function-table `Rc` (for cross-module calls) and sizes its
+    /// global namespace. Module ids are the registry position + 1 (module 0 is the entry).
+    pub fn set_managed_modules(&mut self, modules: Vec<Module>) {
+        self.managed_functions = modules
+            .iter()
+            .map(|m| Rc::from(m.functions.clone().into_boxed_slice()))
+            .collect();
+        self.managed_globals = modules.iter().map(|_| Vec::new()).collect();
+        self.managed_modules = modules;
+    }
+
+    /// The module id (registry position + 1) of the managed module named `name`, or `None`. Module 0
+    /// is the entry, so managed ids start at 1.
+    #[must_use]
+    pub(crate) fn managed_module_id(&self, name: &str) -> Option<u16> {
+        self.managed_modules
+            .iter()
+            .position(|m| m.name == name)
+            .map(|i| (i + 1) as u16)
+    }
+
+    /// A CLONE of managed module `module_id`'s top-level body code, or `None`. Cloned so its body runs
+    /// against `&mut self` without a borrow into the registry (once, on the module's first import).
+    #[must_use]
+    pub(crate) fn managed_module_body(&self, module_id: u16) -> Option<CodeObject> {
+        self.managed_modules.get((module_id.checked_sub(1)?) as usize).map(|m| m.body.clone())
+    }
+
+    /// A shared clone of managed module `module_id`'s function table (`module_id >= 1`), or `None` for
+    /// the entry module (0, whose functions are threaded) or an out-of-range id. A cross-module call
+    /// clones this `Rc` (cheap) to run the callee against its own table, disjoint from `&mut self`.
+    #[must_use]
+    pub(crate) fn managed_functions_rc(&self, module_id: u16) -> Option<Rc<[CodeObject]>> {
+        self.managed_functions.get((module_id.checked_sub(1)?) as usize).cloned()
+    }
+
+    /// The module whose functions + globals running code resolves against (0 = entry). Read by
+    /// `LoadGlobal` / the module body's `StoreFast` / `MakeFunction` / the call dispatch.
+    #[must_use]
+    pub(crate) fn current_module(&self) -> u16 {
+        self.current_module
+    }
+
+    /// Sets the current module id, returning the previous one. `run_frames` sets it on entry to a drive
+    /// and restores it on exit, so a cross-module call runs in the callee's module context.
+    pub(crate) fn set_current_module(&mut self, module_id: u16) -> u16 {
+        core::mem::replace(&mut self.current_module, module_id)
+    }
+
+    /// The value bound to `name` in the CURRENT module's global namespace (entry -> `globals`, a managed
+    /// module -> its `managed_globals` slot), or `None`. The module-aware `get_global`.
+    #[must_use]
+    pub(crate) fn current_module_global(&self, name: &str) -> Option<Value> {
+        match self.current_module {
+            0 => self.get_global(name),
+            k => self
+                .managed_globals
+                .get((k - 1) as usize)?
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| *v),
+        }
+    }
+
+    /// Binds (or rebinds) `name` in the CURRENT module's global namespace -- the module-aware
+    /// `set_global`, used by a module body's top-level `StoreFast`.
+    pub(crate) fn set_current_module_global(&mut self, name: &str, value: Value) {
+        match self.current_module {
+            0 => self.set_global(name, value),
+            k => {
+                if let Some(slot) = self.managed_globals.get_mut((k - 1) as usize) {
+                    match slot.iter_mut().find(|(n, _)| n == name) {
+                        Some(entry) => entry.1 = value,
+                        None => slot.push((String::from(name), value)),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A clone of managed module `module_id`'s populated global namespace pairs -- the source for its
+    /// namespace dict, built once after its body runs. Empty for the entry or an out-of-range id.
+    #[must_use]
+    pub(crate) fn managed_module_globals(&self, module_id: u16) -> Vec<(String, Value)> {
+        module_id
+            .checked_sub(1)
+            .and_then(|i| self.managed_globals.get(i as usize))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Records `module` under `name` in the import cache (`sys.modules`). A managed module is cached
+    /// here BEFORE its body runs, so a circular import sees the in-progress module and terminates.
+    pub(crate) fn cache_module(&mut self, name: &str, module: Value) {
+        self.modules.push((String::from(name), module));
+    }
+
+    /// Removes `name` from the import cache -- used when a managed module's body raises during import,
+    /// so a later import retries the body (CPython drops a failed import from `sys.modules`).
+    pub(crate) fn uncache_module(&mut self, name: &str) {
+        self.modules.retain(|(n, _)| n != name);
+    }
+
+    /// Builds a module namespace dict from a managed module body's populated globals -- each name is
+    /// interned as a `str` key (so `dict_get_str` / attribute access resolve it) mapping to its value.
+    pub(crate) fn namespace_from_globals(
+        &mut self,
+        globals: Vec<(String, Value)>,
+    ) -> Result<Value, Trap> {
+        let mut pairs = Vec::with_capacity(globals.len());
+        for (name, value) in globals {
+            let key = self.new_str(&name)?;
+            pairs.push((key, value));
+        }
+        self.new_dict(pairs)
+    }
+
+    /// Replaces module object `module`'s namespace dict (slot 0) -- used once, after a managed body
+    /// finishes, to swap its cached-empty namespace for the populated one. The precondition is that
+    /// `module` is a module object.
+    pub(crate) fn set_module_namespace(&mut self, module: Value, namespace: Value) {
+        let reference = module.as_ref().expect("a module object");
+        self.heap.write_u32(reference.0, namespace.bits());
     }
 
     /// Reads member `name` off an imported `module` -- `from module import name`. The member is
@@ -3876,12 +4066,78 @@ impl ObjectModel {
 
     /// Allocates a class object `[name, base, namespace]` (`Op::BuildClass`). `base` is a
     /// class or `None`; `namespace` is the class body's dict (methods + class attributes).
-    pub fn new_class(&mut self, name: Value, base: Value, namespace: Value) -> Result<Value, Trap> {
+    pub fn new_class(&mut self, name: Value, bases: Value, namespace: Value) -> Result<Value, Trap> {
+        let base_list: Vec<Value> = if self.is_tuple(bases) {
+            self.seq_value(bases).cloned().unwrap_or_default()
+        } else if self.is_class(bases) {
+            alloc::vec![bases]
+        } else {
+            Vec::new()
+        };
+        for &b in &base_list {
+            if !self.is_class(b) {
+                return Err(Trap::TypeError);
+            }
+        }
         let reference = self.alloc_object(self.class_type_id).ok_or(Trap::OutOfMemory)?;
+        let class = Value::from_ref(reference);
         self.heap.write_u32(reference.0, name.bits());
-        self.heap.write_u32(reference.0 + 4, base.bits());
+        self.heap.write_u32(reference.0 + 4, Value::NONE.bits());
         self.heap.write_u32(reference.0 + 8, namespace.bits());
-        Ok(Value::from_ref(reference))
+        self.heap.write_u32(reference.0 + 12, Value::NONE.bits());
+        let bases_tuple = self.new_tuple(base_list.clone())?;
+        self.heap.write_u32(reference.0 + 4, bases_tuple.bits());
+        let mro_vec = self.c3_linearize(class, &base_list)?;
+        let mro_tuple = self.new_tuple(mro_vec)?;
+        self.heap.write_u32(reference.0 + 12, mro_tuple.bits());
+        Ok(class)
+    }
+
+    /// The C3 linearization of a class whose direct bases are `bases` -- the method resolution order
+    /// `[class, ...ancestors...]`. C3 merges the parents' MROs plus the parents list, preserving each
+    /// parent's local precedence and the monotonicity that makes cooperative multiple inheritance sound.
+    /// An inconsistent hierarchy (no order satisfies every parent) is a `TypeError`, like CPython. Single
+    /// inheritance and no-base fall out as the n=1 / n=0 cases (no special path). There is no modeled
+    /// `object` root, so a baseless class linearizes to just `[class]`.
+    fn c3_linearize(&self, class: Value, bases: &[Value]) -> Result<Vec<Value>, Trap> {
+        let mut seqs: Vec<Vec<Value>> = bases.iter().map(|&b| self.class_mro_vec(b)).collect();
+        if !bases.is_empty() {
+            seqs.push(bases.to_vec());
+        }
+        let mut result = alloc::vec![class];
+        loop {
+            seqs.retain(|s| !s.is_empty());
+            if seqs.is_empty() {
+                break;
+            }
+            let head = seqs
+                .iter()
+                .map(|s| s[0])
+                .find(|&h| !seqs.iter().any(|t| t[1..].contains(&h)))
+                .ok_or(Trap::TypeError)?;
+            result.push(head);
+            for s in &mut seqs {
+                s.retain(|&c| c != head);
+            }
+        }
+        Ok(result)
+    }
+
+    /// A class's `__mro__` as a `Vec` (the linearized lookup order, starting with the class itself), or
+    /// `[class]` for a class whose MRO slot is unset (defensive -- every class built by `new_class` has
+    /// one). Empty for a non-class value.
+    #[must_use]
+    fn class_mro_vec(&self, class: Value) -> Vec<Value> {
+        if !self.is_class(class) {
+            return Vec::new();
+        }
+        let mro = self.read_slot(class, 3);
+        let vec = self.seq_value(mro).cloned().unwrap_or_default();
+        if vec.is_empty() {
+            alloc::vec![class]
+        } else {
+            vec
+        }
     }
 
     /// Allocates an instance of `class` with a fresh empty `__dict__` (the first half of
@@ -3917,14 +4173,16 @@ impl ObjectModel {
         Ok(Value::from_ref(reference))
     }
 
-    /// Allocates a `PyFunction` -- a DEFAULTED function `[func_index, defaults, kwdefaults]`. Only a
-    /// `def` (or lambda) carrying default args needs this; a plain function stays a `function_ref`
-    /// immediate. `defaults` is a tuple (or `None`); `kwdefaults` a dict (or `None`).
+    /// Allocates a `PyFunction` -- a DEFAULTED function `[func_index, defaults, kwdefaults, .., home]`.
+    /// Only a `def` (or lambda) carrying default args needs this; a plain function stays a `function_ref`
+    /// immediate. `defaults` is a tuple (or `None`); `kwdefaults` a dict (or `None`); `home` is the home
+    /// module id (0 = entry) a cross-module call resolves the function against.
     pub fn new_py_function(
         &mut self,
         func_index: u32,
         defaults: Value,
         kwdefaults: Value,
+        home: u16,
     ) -> Result<Value, Trap> {
         let reference = self
             .heap
@@ -3934,6 +4192,7 @@ impl ObjectModel {
         self.heap.write_u32(reference.0 + 4, defaults.bits());
         self.heap.write_u32(reference.0 + 8, kwdefaults.bits());
         self.heap.write_u32(reference.0 + 12, Value::NONE.bits());
+        self.heap.write_u32(reference.0 + 16, u32::from(home));
         Ok(Value::from_ref(reference))
     }
 
@@ -3946,8 +4205,9 @@ impl ObjectModel {
         defaults: Value,
         kwdefaults: Value,
         cells: Value,
+        home: u16,
     ) -> Result<Value, Trap> {
-        let function = self.new_py_function(func_index, defaults, kwdefaults)?;
+        let function = self.new_py_function(func_index, defaults, kwdefaults, home)?;
         let reference = function.as_ref().ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0 + 12, cells.bits());
         Ok(function)
@@ -3979,6 +4239,26 @@ impl ObjectModel {
         self.heap.read_u32(reference.0)
     }
 
+    /// The HOME module id a `PyFunction` carries (0 = entry).
+    #[must_use]
+    pub fn py_function_home(&self, func: Value) -> u16 {
+        func.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + 16) as u16)
+    }
+
+    /// The home module id of any callable function VALUE -- a bare `function_ref`'s packed home, a
+    /// `PyFunction`'s home field, else 0 (the entry). The single funnel the call dispatch reads to
+    /// route a cross-module call to the callee's module.
+    #[must_use]
+    pub(crate) fn function_home(&self, func: Value) -> u16 {
+        if let Some(home) = func.function_home_module() {
+            home
+        } else if self.is_py_function(func) {
+            self.py_function_home(func)
+        } else {
+            0
+        }
+    }
+
     /// The positional DEFAULTS of a `PyFunction` as a vector (the defaults tuple's elements, or
     /// empty if it has none). They align to the trailing positional parameters at bind time.
     #[must_use]
@@ -4001,13 +4281,21 @@ impl ObjectModel {
 
     /// Allocates a generator object owning `frame` (its fresh, not-yet-run activation, with args
     /// already bound to locals), returning the heap value. The body does not run until the first
-    /// resume; the frame lives in the `generators` arena and the heap object holds its index.
-    pub fn new_generator(&mut self, frame: Frame) -> Result<Value, Trap> {
+    /// resume; the frame lives in the `generators` arena and the heap object holds its index +
+    /// `home_module` (the module whose functions + globals a resume runs the body against).
+    pub fn new_generator(&mut self, frame: Frame, home_module: u16) -> Result<Value, Trap> {
         let index = self.generators.len() as u32;
         self.generators.push(Some(frame));
         let reference = self.alloc_object(self.generator_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
+        self.heap.write_u32(reference.0 + 4, u32::from(home_module));
         Ok(Value::from_ref(reference))
+    }
+
+    /// The home module id a generator carries (the module a resume runs its body against; 0 = entry).
+    #[must_use]
+    pub(crate) fn generator_module(&self, generator: Value) -> u16 {
+        generator.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + 4) as u16)
     }
 
     /// Takes a recycled frame from the pool (its Vec buffers ready to reuse), or `None` if empty.
@@ -4122,8 +4410,22 @@ impl ObjectModel {
     pub fn py_getattr_super(&mut self, super_obj: Value, name: &str) -> Result<Value, Trap> {
         let class = self.read_slot(super_obj, 0);
         let receiver = self.read_slot(super_obj, 1);
-        let base = self.read_slot(class, 1);
-        let found = match self.find_in_class(base, name) {
+        let instance_type = if self.is_instance(receiver) {
+            self.read_slot(receiver, 0)
+        } else {
+            class
+        };
+        let mro = self.class_mro_vec(instance_type);
+        let start = mro.iter().position(|&c| c == class).map_or(mro.len(), |i| i + 1);
+        let mut found = None;
+        for &c in &mro[start..] {
+            let namespace = self.read_slot(c, 2);
+            if let Some(f) = self.dict_lookup_str(namespace, name) {
+                found = Some(f);
+                break;
+            }
+        }
+        let found = match found {
             Some(found) => found,
             None => {
                 if name == "__init__" && self.is_exception_value(receiver) {
@@ -4148,15 +4450,14 @@ impl ObjectModel {
             .map(|(_, v)| *v)
     }
 
-    /// Resolves `name` in `class`'s namespace, then up the base chain; `None` if unbound.
+    /// Resolves `name` in `class`'s namespace, then along its MRO (the C3 linearization); `None` if
+    /// unbound. The MRO walk replaces the single base chain, so multiple inheritance resolves correctly.
     fn find_in_class(&self, class: Value, name: &str) -> Option<Value> {
-        let mut current = class;
-        while self.is_class(current) {
-            let namespace = self.read_slot(current, 2);
+        for c in self.class_mro_vec(class) {
+            let namespace = self.read_slot(c, 2);
             if let Some(found) = self.dict_lookup_str(namespace, name) {
                 return Some(found);
             }
-            current = self.read_slot(current, 1);
         }
         None
     }
@@ -4349,35 +4650,23 @@ impl ObjectModel {
         self.is_instance_of(exc, target)
     }
 
-    /// Whether `value` is a class instance whose class is `class` or one of its bases (the class's
-    /// base chain). Backs `MatchExc`/`except E` and the `isinstance` built-in for user classes.
+    /// Whether `value` is a class instance whose class is `class` or one of its ancestors (anywhere on
+    /// the class's MRO). Backs `MatchExc`/`except E` and the `isinstance` built-in for user classes.
     #[must_use]
     pub fn is_instance_of(&self, value: Value, class: Value) -> bool {
         if !self.is_instance(value) {
             return false;
         }
-        let mut current = self.read_slot(value, 0);
-        while self.is_class(current) {
-            if current == class {
-                return true;
-            }
-            current = self.read_slot(current, 1);
-        }
-        false
+        let ty = self.read_slot(value, 0);
+        self.is_subclass_of(ty, class)
     }
 
-    /// Whether user class `cls` derives from user class `target` (walking `cls`'s base chain, which
-    /// includes `cls` itself). Backs `issubclass`.
+    /// Whether user class `cls` derives from user class `target` -- `target` anywhere on `cls`'s MRO
+    /// (which includes `cls` itself). Backs `issubclass`. The MRO membership test covers multiple
+    /// inheritance, where a single base chain would miss a second base.
     #[must_use]
     pub fn is_subclass_of(&self, cls: Value, target: Value) -> bool {
-        let mut current = cls;
-        while self.is_class(current) {
-            if current == target {
-                return true;
-            }
-            current = self.read_slot(current, 1);
-        }
-        false
+        self.class_mro_vec(cls).contains(&target)
     }
 
     /// Maps a raised interpreter [`Trap`] to a fresh instance of the matching built-in
@@ -4462,6 +4751,181 @@ impl ObjectModel {
             }
             Err(trap) => trap,
         }
+    }
+
+    /// The Python type name of `value` -- `type(value).__name__`: `int` / `str` / `list` / `NoneType`
+    /// / a user class's own name / ... -- for a diagnostic like a `TypeError` message. Degrades to
+    /// `type` for a class object and `object` for the few values whose metatype is not modeled (a
+    /// function, a module), which are rare as a failing operand.
+    pub(crate) fn type_name_of(&self, value: Value) -> String {
+        if value == Value::NONE {
+            return String::from("NoneType");
+        }
+        if let Some(class) = crate::builtins::type_of(value, self) {
+            if let Some(builtin) = class.as_builtin_id().and_then(crate::builtins::Builtin::from_id) {
+                return String::from(builtin.python_name());
+            }
+            if let Some(name) = self.str_value(self.read_slot(class, 0)) {
+                return String::from(name);
+            }
+        }
+        if self.is_class(value) {
+            return String::from("type");
+        }
+        String::from("object")
+    }
+
+    /// The `__name__` of a class VALUE itself (`int` / a user class's name slot) -- for a diagnostic
+    /// like a match class-pattern arity error. Unlike [`Self::type_name_of`] (which names a value's
+    /// TYPE), this names the class object passed in. Empty for a non-class.
+    pub(crate) fn class_display_name(&self, class: Value) -> String {
+        if let Some(builtin) = class.as_builtin_id().and_then(crate::builtins::Builtin::from_id) {
+            return String::from(builtin.python_name());
+        }
+        self.str_value(self.read_slot(class, 0)).map(String::from).unwrap_or_default()
+    }
+
+    /// The display name of module `id`: the entry module (0) is `__main__` (as under `python x.py`),
+    /// a managed module its registered name. Used to stamp a class's `__module__`.
+    #[must_use]
+    fn module_display_name(&self, id: u16) -> String {
+        match id {
+            0 => String::from("__main__"),
+            k => self
+                .managed_modules
+                .get((k - 1) as usize)
+                .map_or_else(String::new, |m| m.name.clone()),
+        }
+    }
+
+    /// Stamps class `class` with its defining module as `__module__` in its namespace (CPython's own
+    /// mechanism), so `Cls.__module__` reads it and `repr(Cls)` qualifies as `module.Name`. Called at
+    /// class creation with the current module id.
+    pub(crate) fn set_class_module(&mut self, class: Value, module_id: u16) -> Result<(), Trap> {
+        let name = self.module_display_name(module_id);
+        let namespace = self.read_slot(class, 2);
+        let key = self.new_str("__module__")?;
+        let value = self.new_str(&name)?;
+        self.py_setitem(namespace, key, value)
+    }
+
+    /// The `TypeError` for indexing a sequence with a non-int, non-slice index -- CPython 3.14's
+    /// per-container message: `string indices must be integers, not 'X'` for a str; `KIND indices must
+    /// be integers or slices, not X` for a list/tuple/range. Attached as a trap arg (like the sibling
+    /// IndexError), at the per-container index site in [`Self::py_getitem`].
+    fn index_type_error(&mut self, container: Value, index: Value) -> Trap {
+        let index_type = self.type_name_of(index);
+        let message = if self.is_str(container) {
+            alloc::format!("string indices must be integers, not '{index_type}'")
+        } else {
+            let kind = if self.is_tuple(container) {
+                "tuple"
+            } else if self.is_range(container) {
+                "range"
+            } else {
+                "list"
+            };
+            alloc::format!("{kind} indices must be integers or slices, not {index_type}")
+        };
+        self.with_message(Trap::TypeError, &message)
+    }
+
+    /// The `TypeError` for a binary operator with no applicable operation on `lhs`/`rhs` -- a raised
+    /// exception whose message matches CPython 3.14. The default is `unsupported operand type(s) for
+    /// OP: 'L' and 'R'` (with `** or pow()` naming `**`); the sequence cases are special: `+` on a
+    /// str/list/tuple reports `can only concatenate L (not "R") to L`, and `*` of a sequence by a
+    /// non-int reports `can't multiply sequence by non-int of type 'X'`. Called at the `Op::Binary`
+    /// chokepoint on a bare `Trap::TypeError`, so it never overrides a message a user dunder raised
+    /// (that arrives as `Trap::Raised`, carrying its own exception).
+    pub(crate) fn binop_type_error(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Trap {
+        let lt = self.type_name_of(lhs);
+        let rt = self.type_name_of(rhs);
+        let lhs_seq = self.is_str(lhs) || self.is_list(lhs) || self.is_tuple(lhs);
+        let rhs_seq = self.is_str(rhs) || self.is_list(rhs) || self.is_tuple(rhs);
+        let message = match op {
+            BinOp::Add if lhs_seq => alloc::format!("can only concatenate {lt} (not \"{rt}\") to {lt}"),
+            BinOp::Mul if lhs_seq => alloc::format!("can't multiply sequence by non-int of type '{rt}'"),
+            BinOp::Mul if rhs_seq => alloc::format!("can't multiply sequence by non-int of type '{lt}'"),
+            _ => {
+                let sym = match op {
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::FloorDiv => "//",
+                    BinOp::Mod => "%",
+                    BinOp::BitAnd => "&",
+                    BinOp::BitOr => "|",
+                    BinOp::BitXor => "^",
+                    BinOp::LShift => "<<",
+                    BinOp::RShift => ">>",
+                    BinOp::TrueDiv => "/",
+                    BinOp::Pow => "** or pow()",
+                    BinOp::MatMul => "@",
+                };
+                alloc::format!("unsupported operand type(s) for {sym}: '{lt}' and '{rt}'")
+            }
+        };
+        self.raise_named_exception("TypeError", &message)
+    }
+
+    /// The `TypeError` for an ORDERING comparison (`< <= > >=`) between values that do not support it
+    /// -- a raised exception matching CPython 3.14's `'OP' not supported between instances of 'L' and
+    /// 'R'`. Only ordering comparisons reach here: `==`/`!=` fall back to identity (never a TypeError)
+    /// and `is`/`is not` are handled before the dispatch. Called on a bare `Trap::TypeError`, so a user
+    /// comparison dunder that itself raised (`Trap::Raised`) keeps its own message.
+    pub(crate) fn compare_type_error(&mut self, op: CmpOp, lhs: Value, rhs: Value) -> Trap {
+        let lt = self.type_name_of(lhs);
+        let rt = self.type_name_of(rhs);
+        let sym = match op {
+            CmpOp::Lt => "<",
+            CmpOp::Le => "<=",
+            CmpOp::Gt => ">",
+            CmpOp::Ge => ">=",
+            CmpOp::Eq => "==",
+            CmpOp::Ne => "!=",
+            CmpOp::Is | CmpOp::IsNot => "is",
+        };
+        let message = alloc::format!("'{sym}' not supported between instances of '{lt}' and '{rt}'");
+        self.raise_named_exception("TypeError", &message)
+    }
+
+    /// The `TypeError` for `len(x)` on a value with no length -- CPython 3.14's `object of type 'X' has
+    /// no len()`. Raised at the `len` built-in on a bare `Trap::TypeError` from [`Self::py_len`].
+    pub(crate) fn len_type_error(&mut self, value: Value) -> Trap {
+        let name = self.type_name_of(value);
+        self.raise_named_exception("TypeError", &alloc::format!("object of type '{name}' has no len()"))
+    }
+
+    /// The `TypeError` for using `value` where a runtime operation requires it to be `what` (`callable`
+    /// / `iterable` / `subscriptable` / ...) -- CPython 3.14's `'X' object is not WHAT`. Raised at the
+    /// operation's source (e.g. calling a non-callable, iterating a non-iterable) on the type decision.
+    pub(crate) fn object_is_not(&mut self, value: Value, what: &str) -> Trap {
+        let name = self.type_name_of(value);
+        self.raise_named_exception("TypeError", &alloc::format!("'{name}' object is not {what}"))
+    }
+
+    /// The `TypeError` for a unary operator (`- + ~`) with no applicable operand -- CPython's `bad
+    /// operand type for unary OP: 'X'`. (`not` never errors, so it does not reach here.)
+    pub(crate) fn unary_type_error(&mut self, op: UnaryOp, value: Value) -> Trap {
+        let name = self.type_name_of(value);
+        let sym = match op {
+            UnaryOp::Neg => "-",
+            UnaryOp::Pos => "+",
+            UnaryOp::Invert => "~",
+        };
+        self.raise_named_exception("TypeError", &alloc::format!("bad operand type for unary {sym}: '{name}'"))
+    }
+
+    /// The `AttributeError` for `value.name` where `name` is not an attribute of `value` -- CPython
+    /// 3.14's `'X' object has no attribute 'NAME'`. Raised at the attribute-access site on a bare
+    /// `Trap::AttributeError` (an attribute miss), so it does not disturb `getattr`'s own contract
+    /// (`hasattr` / `getattr(o, n, default)` still catch the bare trap and never see this message).
+    pub(crate) fn attribute_error(&mut self, value: Value, name: &str) -> Trap {
+        let type_name = self.type_name_of(value);
+        self.raise_named_exception(
+            "AttributeError",
+            &alloc::format!("'{type_name}' object has no attribute '{name}'"),
+        )
     }
 
     /// Whether the currently pending exception is an instance of the named class -- consumed by the
@@ -4899,7 +5363,7 @@ impl ObjectModel {
             return self.new_bound_method(obj, method_id);
         }
         if type_id == self.board_type_id {
-            let pin = crate::gpio::board_pin_id(name).ok_or(Trap::AttributeError)?;
+            let pin = self.board.pin_id(name).ok_or(Trap::AttributeError)?;
             return Value::fixnum(pin as i32).ok_or(Trap::Overflow);
         }
         if type_id == self.pin_type_id {
@@ -4943,6 +5407,12 @@ impl ObjectModel {
             if name == "__name__" {
                 return Ok(self.read_slot(obj, 0));
             }
+            if name == "__module__" {
+                return match self.find_in_class(obj, "__module__") {
+                    Some(module) => Ok(module),
+                    None => self.new_str("builtins"),
+                };
+            }
             let found = self.find_in_class(obj, name).ok_or(Trap::AttributeError)?;
             return self.bind_class_member(found, obj, obj);
         }
@@ -4985,6 +5455,13 @@ impl ObjectModel {
     pub fn set_mmio(&mut self, write: fn(u32, u32), read: fn(u32) -> u32) {
         self.mmio_write_fn = Some(write);
         self.mmio_read_fn = Some(read);
+    }
+
+    /// Selects the target board whose register map the gpio layer drives (`board.LED` resolution + the
+    /// drive/direction/clock registers). Set once by the deployment before running; Orthogonal to the
+    /// MMIO seam (which is host-sim vs on-device).
+    pub fn set_board(&mut self, board: crate::gpio::Board) {
+        self.board = board;
     }
 
     /// A volatile 32-bit register write: through the installed seam on device, else into the host
@@ -5116,21 +5593,39 @@ impl ObjectModel {
         Ok(Value::from_ref(reference))
     }
 
-    /// Opens `pin` in the given direction: claims it (fail-loud), configures the port through the
-    /// board driver (clock ungate + the pin's MODER direction), and returns a `Pin`. Shared by the
-    /// clean `gpio` API and its shims.
+    /// Replays one board setup [`RegOp`](crate::gpio::RegOp) over the MMIO seam: an outright write (an
+    /// atomic set/clear alias, a function-select, a pad config), or a read-modify-write (a clock-enable
+    /// bit, a two-bit direction field).
+    fn apply_reg_op(&mut self, op: crate::gpio::RegOp) {
+        use crate::gpio::RegOp;
+        match op {
+            RegOp::Write { reg, value } => self.mmio_write(reg, value),
+            RegOp::SetBits { reg, set_mask } => {
+                let value = self.mmio_read(reg) | set_mask;
+                self.mmio_write(reg, value);
+            }
+            RegOp::ClearAndSet { reg, clear_mask, set_value } => {
+                let value = (self.mmio_read(reg) & !clear_mask) | set_value;
+                self.mmio_write(reg, value);
+            }
+        }
+    }
+
+    /// Opens `pin` in the given direction: claims it (fail-loud), brings the port up and sets the
+    /// pin's direction by replaying the selected board's ordered setup ops (clock ungate / peripheral
+    /// un-reset, pad, function-select, direction), and returns a `Pin`. Shared by the clean `gpio` API
+    /// and its shims.
     fn open_pin(&mut self, pin: u32, output: bool) -> Result<Value, Trap> {
-        use crate::gpio::*;
-        if pin > MAX_PIN {
+        use crate::gpio::{PIN_MODE_INPUT, PIN_MODE_OUTPUT};
+        let board = self.board;
+        if pin > board.max_pin() {
             return Err(Trap::ValueError);
         }
         self.claim_pin(pin)?;
-        let enabled = self.mmio_read(CLOCK_ENABLE_REG) | CLOCK_ENABLE_BIT;
-        self.mmio_write(CLOCK_ENABLE_REG, enabled);
-        let (clear_mask, set_value) = moder_bits(pin, output);
-        let moder = (self.mmio_read(MODER_REG) & !clear_mask) | set_value;
-        self.mmio_write(MODER_REG, moder);
-        let regs = pin_regs(pin);
+        for op in board.open_ops(pin, output) {
+            self.apply_reg_op(op);
+        }
+        let regs = board.pin_regs(pin);
         let mode = if output { PIN_MODE_OUTPUT } else { PIN_MODE_INPUT };
         self.new_pin(mode, &regs)
     }
@@ -5263,15 +5758,17 @@ impl ObjectModel {
         self.read_slot(dio, 0)
     }
 
-    /// Reconfigures a `Pin`'s direction in place (rewrites the MODER field + the mode word); the
-    /// port clock is already ungated at open.
+    /// Reconfigures a `Pin`'s direction in place (replays the board's direction ops + rewrites the
+    /// mode word); the one-time port bring-up (clock / un-reset, pad, function-select) already ran at
+    /// open.
     fn set_pin_direction(&mut self, pin: Value, output: bool) -> Result<(), Trap> {
-        use crate::gpio::*;
+        use crate::gpio::{PIN_MODE_INPUT, PIN_MODE_OUTPUT, PIN_W_ID, PIN_W_MODE};
+        let board = self.board;
         let reference = pin.as_ref().ok_or(Trap::TypeError)?;
         let pin_id = self.heap.read_u32(reference.0 + PIN_W_ID * 4);
-        let (clear_mask, set_value) = moder_bits(pin_id, output);
-        let moder = (self.mmio_read(MODER_REG) & !clear_mask) | set_value;
-        self.mmio_write(MODER_REG, moder);
+        for op in board.direction_ops(pin_id, output) {
+            self.apply_reg_op(op);
+        }
         let mode = if output { PIN_MODE_OUTPUT } else { PIN_MODE_INPUT };
         self.heap.write_u32(reference.0 + PIN_W_MODE * 4, mode);
         Ok(())
@@ -8043,12 +8540,12 @@ mod tests {
     #[test]
     fn closure_carries_captured_cells() {
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
-        let plain = model.new_py_function(0, Value::NONE, Value::NONE).unwrap();
+        let plain = model.new_py_function(0, Value::NONE, Value::NONE, 0).unwrap();
         assert!(model.py_function_cells(plain).is_empty());
         let c1 = model.new_cell(Value::fixnum(1).unwrap()).unwrap();
         let c2 = model.new_cell(Value::fixnum(2).unwrap()).unwrap();
         let cells = model.new_tuple(alloc::vec![c1, c2]).unwrap();
-        let closure = model.new_closure(0, Value::NONE, Value::NONE, cells).unwrap();
+        let closure = model.new_closure(0, Value::NONE, Value::NONE, cells, 0).unwrap();
         let captured = model.py_function_cells(closure);
         assert_eq!(captured.len(), 2);
         assert_eq!(model.cell_get(captured[0]).unwrap().as_fixnum(), Some(1));
@@ -8223,7 +8720,7 @@ mod tests {
         let name = model.new_str("C").unwrap();
         let key_m = model.new_str("m").unwrap();
         let defaults = model.new_tuple(alloc::vec![n(1)]).unwrap();
-        let m = model.new_py_function(0, defaults, Value::NONE).unwrap();
+        let m = model.new_py_function(0, defaults, Value::NONE, 0).unwrap();
         let ns = model.new_dict(alloc::vec![(key_m, m)]).unwrap();
         let class = model.new_class(name, Value::NONE, ns).unwrap();
         let obj = model.new_object(class).unwrap();
@@ -8231,6 +8728,93 @@ mod tests {
         assert!(model.is_py_bound(bound));
         assert_eq!(model.bound_self(bound), obj);
         assert!(model.is_py_function(model.bound_func(bound)));
+    }
+
+    /// Builds a class named `name` with direct `bases` (a tuple, a single class, or `None`) and the
+    /// given namespace members. Used by the multiple-inheritance tests.
+    fn class_with(model: &mut ObjectModel, name: &str, bases: Value, members: &[(&str, Value)]) -> Value {
+        let name_v = model.new_str(name).unwrap();
+        let mut pairs = Vec::new();
+        for (k, v) in members {
+            let key = model.new_str(k).unwrap();
+            pairs.push((key, *v));
+        }
+        let ns = model.new_dict(pairs).unwrap();
+        model.new_class(name_v, bases, ns).unwrap()
+    }
+
+    #[test]
+    fn multiple_inheritance_resolves_via_the_c3_mro() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let a = class_with(&mut model, "A", Value::NONE, &[("a", n(1)), ("shared", n(10))]);
+        let ba = model.new_tuple(alloc::vec![a]).unwrap();
+        let b = class_with(&mut model, "B", ba, &[("shared", n(20))]);
+        let ca = model.new_tuple(alloc::vec![a]).unwrap();
+        let c = class_with(&mut model, "C", ca, &[("c", n(3)), ("shared", n(30))]);
+        let bc = model.new_tuple(alloc::vec![b, c]).unwrap();
+        let d = class_with(&mut model, "D", bc, &[]);
+        assert_eq!(model.class_mro_vec(d), alloc::vec![d, b, c, a]);
+        let obj = model.new_object(d).unwrap();
+        assert_eq!(model.py_getattr_instance(obj, "shared").unwrap().as_fixnum(), Some(20));
+        assert_eq!(model.py_getattr_instance(obj, "a").unwrap().as_fixnum(), Some(1));
+        assert_eq!(model.py_getattr_instance(obj, "c").unwrap().as_fixnum(), Some(3));
+        for base in [a, b, c, d] {
+            assert!(model.is_instance_of(obj, base));
+            assert!(model.is_subclass_of(d, base));
+        }
+        assert!(!model.is_subclass_of(b, c));
+        let unrelated = class_with(&mut model, "Z", Value::NONE, &[]);
+        assert!(!model.is_instance_of(obj, unrelated));
+    }
+
+    #[test]
+    fn super_resolves_the_next_class_in_the_instance_mro() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let n = |v: i32| Value::fixnum(v).unwrap();
+        let a = class_with(&mut model, "A", Value::NONE, &[("who", n(1))]);
+        let ta = model.new_tuple(alloc::vec![a]).unwrap();
+        let b = class_with(&mut model, "B", ta, &[("who", n(2))]);
+        let ta2 = model.new_tuple(alloc::vec![a]).unwrap();
+        let c = class_with(&mut model, "C", ta2, &[("who", n(3))]);
+        let bc = model.new_tuple(alloc::vec![b, c]).unwrap();
+        let d = class_with(&mut model, "D", bc, &[]);
+        let obj = model.new_object(d).unwrap();
+        let super_b = model.new_super(b, obj).unwrap();
+        assert_eq!(model.py_getattr_super(super_b, "who").unwrap().as_fixnum(), Some(3));
+        let super_c = model.new_super(c, obj).unwrap();
+        assert_eq!(model.py_getattr_super(super_c, "who").unwrap().as_fixnum(), Some(1));
+        let super_a = model.new_super(a, obj).unwrap();
+        assert_eq!(model.py_getattr_super(super_a, "who"), Err(Trap::AttributeError));
+    }
+
+    #[test]
+    fn an_inconsistent_hierarchy_is_a_type_error() {
+        let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
+        let a = class_with(&mut model, "A", Value::NONE, &[]);
+        let b = class_with(&mut model, "B", Value::NONE, &[]);
+        let ab = model.new_tuple(alloc::vec![a, b]).unwrap();
+        let x = class_with(&mut model, "X", ab, &[]);
+        let ba = model.new_tuple(alloc::vec![b, a]).unwrap();
+        let y = class_with(&mut model, "Y", ba, &[]);
+        let xy = model.new_tuple(alloc::vec![x, y]).unwrap();
+        let name = model.new_str("Z").unwrap();
+        let ns = model.new_dict(Vec::new()).unwrap();
+        assert_eq!(model.new_class(name, xy, ns), Err(Trap::TypeError));
+    }
+
+    #[test]
+    fn single_inheritance_and_no_base_linearize_trivially() {
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let a = class_with(&mut model, "A", Value::NONE, &[]);
+        let ta = model.new_tuple(alloc::vec![a]).unwrap();
+        let b = class_with(&mut model, "B", ta, &[]);
+        let tb = model.new_tuple(alloc::vec![b]).unwrap();
+        let c = class_with(&mut model, "C", tb, &[]);
+        assert_eq!(model.class_mro_vec(a), alloc::vec![a]);
+        assert_eq!(model.class_mro_vec(c), alloc::vec![c, b, a]);
+        let d = class_with(&mut model, "D", a, &[]);
+        assert_eq!(model.class_mro_vec(d), alloc::vec![d, a]);
     }
 
     #[test]

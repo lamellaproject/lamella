@@ -148,6 +148,18 @@ pub enum Builtin {
     Ascii = 58,
     /// `str.maketrans(x, y[, z])` -- reached via the `str` type (not a global name).
     StrMaketrans = 59,
+    /// `__match_class__(subject, cls, count)` -- the runtime half of a POSITIONAL class pattern
+    /// (`case Cls(p0, ...)`): a compiler-internal helper (not user Python) the match desugar calls to
+    /// extract the positional values to bind. Returns a `count`-tuple of the extracted values, or
+    /// `None` on a non-match; raises TypeError on an arity mismatch. Follows CPython's `__match_args__`
+    /// + builtin self-match rules.
+    MatchClassPositional = 60,
+    /// `type(None)` -- the type object of the `None` singleton (CPython's `NoneType`). Not a builtin
+    /// NAME (unreachable as a bare `NoneType`); reached only via `type(None)`.
+    NoneType = 61,
+    /// `type(...)` -- the type object of the `Ellipsis` singleton (CPython's `ellipsis`). Not a
+    /// builtin NAME; reached only via `type(...)`.
+    EllipsisType = 62,
 }
 
 impl Builtin {
@@ -216,6 +228,9 @@ impl Builtin {
             57 => Some(Builtin::Property),
             58 => Some(Builtin::Ascii),
             59 => Some(Builtin::StrMaketrans),
+            60 => Some(Builtin::MatchClassPositional),
+            61 => Some(Builtin::NoneType),
+            62 => Some(Builtin::EllipsisType),
             _ => None,
         }
     }
@@ -291,6 +306,9 @@ impl Builtin {
             Builtin::Property => "property",
             Builtin::Ascii => "ascii",
             Builtin::StrMaketrans => "maketrans",
+            Builtin::MatchClassPositional => "__match_class__",
+            Builtin::NoneType => "NoneType",
+            Builtin::EllipsisType => "ellipsis",
         }
     }
 
@@ -318,6 +336,8 @@ impl Builtin {
                 | Builtin::Frozenset
                 | Builtin::Range
                 | Builtin::Type
+                | Builtin::NoneType
+                | Builtin::EllipsisType
         )
     }
 }
@@ -326,6 +346,12 @@ impl Builtin {
 /// `type(5) is int`), a class instance's type is its class object. `None` for a value whose type
 /// has no representation yet (e.g. `None`, a function) -> the caller raises.
 pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
+    if value == Value::NONE {
+        return Some(Value::builtin_ref(Builtin::NoneType.id()));
+    }
+    if value.is_ellipsis() {
+        return Some(Value::builtin_ref(Builtin::EllipsisType.id()));
+    }
     if model.is_instance(value) {
         return Some(model.instance_class(value));
     }
@@ -443,9 +469,32 @@ pub fn builtin_id(name: &str) -> Option<u32> {
         "setattr" => Builtin::Setattr,
         "delattr" => Builtin::Delattr,
         "hash" => Builtin::Hash,
+        "__match_class__" => Builtin::MatchClassPositional,
         _ => return None,
     };
     Some(builtin.id())
+}
+
+/// Whether `cls` is one of CPython's `Py_TPFLAGS_MATCH_SELF` builtin types -- those for which a single
+/// positional class-pattern sub-pattern binds the subject ITSELF (they carry no `__match_args__`):
+/// int, float, bool, str, bytes, bytearray, list, tuple, dict, set, frozenset.
+fn is_self_match_type(cls: Value) -> bool {
+    matches!(
+        cls.as_builtin_id().and_then(Builtin::from_id),
+        Some(
+            Builtin::Int
+                | Builtin::Float
+                | Builtin::Bool
+                | Builtin::Str
+                | Builtin::Bytes
+                | Builtin::Bytearray
+                | Builtin::List
+                | Builtin::Tuple
+                | Builtin::Dict
+                | Builtin::Set
+                | Builtin::Frozenset
+        )
+    )
 }
 
 /// Calls built-in `id` with `args` (Python 3.14.6 "Built-in Functions").
@@ -486,7 +535,10 @@ pub fn call_builtin(
             if let Some(len_method) = model.find_dunder(args[0], "__len__") {
                 return call_value(len_method, &[], functions, model, depth);
             }
-            model.py_len(args[0])
+            match model.py_len(args[0]) {
+                Err(Trap::TypeError) => Err(model.len_type_error(args[0])),
+                other => other,
+            }
         }
         Builtin::Str => {
             if args.len() != 1 {
@@ -875,13 +927,24 @@ pub fn call_builtin(
                 let base = model.as_bigint(*base).ok_or(Trap::TypeError)?;
                 let exponent = exp.as_int().ok_or(Trap::TypeError)?;
                 let modulus = model.as_bigint(*modulus).ok_or(Trap::TypeError)?;
-                if exponent < 0 || modulus.is_zero() {
+                if modulus.is_zero() {
                     return Err(Trap::ValueError);
                 }
+                let (base, magnitude) = if exponent < 0 {
+                    let inverse = base.mod_inverse(&modulus).ok_or_else(|| {
+                        model.raise_named_exception(
+                            "ValueError",
+                            "base is not invertible for the given modulus",
+                        )
+                    })?;
+                    (inverse, exponent.unsigned_abs())
+                } else {
+                    (base, exponent as u64)
+                };
                 let reduce = |x: &BigInt| x.divmod(&modulus).map(|(_, r)| r).ok_or(Trap::ValueError);
                 let mut acc = reduce(&BigInt::from_i128(1))?;
                 let mut base_mod = reduce(&base)?;
-                let mut bits = exponent as u64;
+                let mut bits = magnitude;
                 while bits > 0 {
                     if bits & 1 == 1 {
                         acc = reduce(&acc.mul(&base_mod))?;
@@ -976,6 +1039,58 @@ pub fn call_builtin(
             };
             Ok(Value::from_bool(issubclass_of(*cls, *classinfo, model)?))
         }
+        Builtin::MatchClassPositional => {
+            let [subject, cls, count] = args else {
+                return Err(Trap::TypeError);
+            };
+            let (subject, cls) = (*subject, *cls);
+            let count =
+                usize::try_from(count.as_int().ok_or(Trap::TypeError)?).map_err(|_| Trap::TypeError)?;
+            if !isinstance_of(subject, cls, model)? {
+                return Ok(Value::NONE);
+            }
+            let self_match = is_self_match_type(cls);
+            let match_args = if self_match {
+                None
+            } else {
+                let mut cache = InlineCache::empty();
+                match model.getattr(cls, "__match_args__", &mut cache) {
+                    Ok(ma) => model.seq_value(ma).cloned(),
+                    Err(Trap::AttributeError) => None,
+                    Err(other) => return Err(other),
+                }
+            };
+            let accepted = if self_match { 1 } else { match_args.as_ref().map_or(0, Vec::len) };
+            if count > accepted {
+                let name = model.class_display_name(cls);
+                let noun = if accepted == 1 { "sub-pattern" } else { "sub-patterns" };
+                let message =
+                    alloc::format!("{name}() accepts {accepted} positional {noun} ({count} given)");
+                return Err(model.raise_named_exception("TypeError", &message));
+            }
+            let mut values = Vec::with_capacity(count);
+            if self_match {
+                if count == 1 {
+                    values.push(subject);
+                }
+            } else if let Some(names) = match_args {
+                let mut cache = InlineCache::empty();
+                for name_val in names.iter().take(count) {
+                    let Some(attr) = model.str_value(*name_val).map(String::from) else {
+                        return Err(model.raise_named_exception(
+                            "TypeError",
+                            "__match_args__ elements must be strings",
+                        ));
+                    };
+                    match model.getattr(subject, &attr, &mut cache) {
+                        Ok(v) => values.push(v),
+                        Err(Trap::AttributeError) => return Ok(Value::NONE),
+                        Err(other) => return Err(other),
+                    }
+                }
+            }
+            model.new_tuple(values)
+        }
         Builtin::Slice => {
             let (start, stop, step) = match args {
                 [stop] => (Value::NONE, *stop, Value::NONE),
@@ -1063,6 +1178,14 @@ pub fn call_builtin(
             };
             type_of(*value, model).ok_or(Trap::Unsupported)
         }
+        Builtin::NoneType => match args {
+            [] => Ok(Value::NONE),
+            _ => Err(Trap::TypeError),
+        },
+        Builtin::EllipsisType => match args {
+            [] => Ok(Value::ELLIPSIS),
+            _ => Err(Trap::TypeError),
+        },
         Builtin::Getattr => {
             let (obj, name, default) = match args {
                 [obj, name] => (*obj, *name, None),
@@ -1073,7 +1196,10 @@ pub fn call_builtin(
             let mut cache = InlineCache::empty();
             match model.getattr(obj, &attr, &mut cache) {
                 Ok(value) => Ok(value),
-                Err(Trap::AttributeError) => default.ok_or(Trap::AttributeError),
+                Err(Trap::AttributeError) => match default {
+                    Some(fallback) => Ok(fallback),
+                    None => Err(model.attribute_error(obj, &attr)),
+                },
                 Err(other) => Err(other),
             }
         }
@@ -2031,6 +2157,29 @@ mod tests {
     }
 
     #[test]
+    fn match_class_positional_self_match_arity_and_nonmatch() {
+        let mut model = ObjectModel::new(Vec::new(), 8192);
+        let mc = Builtin::MatchClassPositional.id();
+        let int_ty = Value::builtin_ref(Builtin::Int.id());
+        let five = Value::fixnum(5).unwrap();
+        let text = model.new_str("hi").unwrap();
+        let (zero, one, two) =
+            (Value::fixnum(0).unwrap(), Value::fixnum(1).unwrap(), Value::fixnum(2).unwrap());
+        let bound = call_builtin(mc, &[five, int_ty, one], &[], &mut model, 0).unwrap();
+        assert_eq!(model.seq_value(bound).cloned(), Some(alloc::vec![five]));
+        let none_bound = call_builtin(mc, &[five, int_ty, zero], &[], &mut model, 0).unwrap();
+        assert_eq!(model.seq_value(none_bound).map(alloc::vec::Vec::len), Some(0));
+        assert_eq!(call_builtin(mc, &[five, int_ty, two], &[], &mut model, 0), Err(Trap::Raised));
+        let exc = model.take_pending_exception().unwrap();
+        assert!(
+            model.repr(exc).contains("int() accepts 1 positional sub-pattern (2 given)"),
+            "got: {}",
+            model.repr(exc)
+        );
+        assert_eq!(call_builtin(mc, &[text, int_ty, one], &[], &mut model, 0), Ok(Value::NONE));
+    }
+
+    #[test]
     fn type_of_maps_values_to_their_constructor_type() {
         let mut model = ObjectModel::new(Vec::new(), 4096);
         let int_ty = Value::builtin_ref(Builtin::Int.id());
@@ -2039,9 +2188,13 @@ mod tests {
         let text = model.new_str("x").unwrap();
         assert_eq!(type_of(text, &model), Some(Value::builtin_ref(Builtin::Str.id())));
         assert_eq!(type_of(Value::fixnum(1).unwrap(), &model), Some(int_ty));
-        assert_eq!(type_of(Value::NONE, &model), None);
+        assert_eq!(type_of(Value::NONE, &model), Some(Value::builtin_ref(Builtin::NoneType.id())));
+        assert_eq!(type_of(Value::ELLIPSIS, &model), Some(Value::builtin_ref(Builtin::EllipsisType.id())));
         assert_eq!(Builtin::Int.python_name(), "int");
         assert_eq!(Builtin::Abs.python_name(), "abs");
+        assert_eq!(Builtin::NoneType.python_name(), "NoneType");
+        assert_eq!(Builtin::EllipsisType.python_name(), "ellipsis");
         assert!(Builtin::Int.is_type() && !Builtin::Abs.is_type());
+        assert!(Builtin::NoneType.is_type() && Builtin::EllipsisType.is_type());
     }
 }

@@ -254,6 +254,15 @@ impl<T: Transport> Dap<T> {
         self.read_dp(0x0)
     }
 
+    /// Writes `DAPABORT` to the DP ABORT register, aborting a stalled AP transaction. An AP
+    /// transaction interrupted by a target reset mid-transfer survives even a line reset and
+    /// leaves the DP answering WAIT to everything -- including the post-connect `DPIDR` read.
+    /// The ABORT register is the architected way out (the DP accepts it while stalled); call
+    /// this when a fresh connect sees a persistent WAIT, then retry.
+    pub fn abort_stalled_transaction(&mut self) -> Result<(), DapError> {
+        self.write_dp(0x0, 0x1)
+    }
+
     /// Powers up the debug and system domains and configures the MEM-AP for 32-bit
     /// access. Call once after connecting, before any memory access.
     pub fn init_mem(&mut self) -> Result<(), DapError> {

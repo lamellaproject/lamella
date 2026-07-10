@@ -222,6 +222,13 @@ impl Vm {
         &mut self.heap
     }
 
+    /// Sets the HARD live-object budget (`None` = unbounded, the host default). A device on a
+    /// fixed heap sets it below the real capacity so an exhausting program raises a catchable
+    /// `OutOfMemoryException` instead of failing the allocator hard. See [`Heap::at_budget`].
+    pub fn set_object_budget(&mut self, budget: Option<usize>) {
+        self.heap.set_object_budget(budget);
+    }
+
     /// Reserves the next green-thread id (`Thread.Start`). Ids start at 1; thread 0 is main.
     pub fn alloc_thread_id(&mut self) -> u32 {
         if self.next_thread_id == 0 {
@@ -990,6 +997,35 @@ enum Flow {
         /// The source location to read.
         src: Location,
     },
+    /// A cross-frame `ldind` through a localloc pointer: read `width` bytes (per `opcode`,
+    /// little-endian) from localloc `buffer` of the frame at `owner`, which is NOT the current
+    /// frame (a `stackalloc` buffer passed to a callee and dereferenced there). Byte-width access
+    /// needs the owning frame's stack, so -- like [`LoadObj`] for the heap -- it defers to the
+    /// frames-aware handler.
+    LoadStack {
+        /// The owning frame's index in the call stack.
+        owner: usize,
+        /// Which of that frame's localloc buffers.
+        buffer: usize,
+        /// The byte offset within it.
+        offset: u32,
+        /// The triggering `ldind` (its width + sign/zero extension).
+        opcode: Opcode,
+    },
+    /// A cross-frame `stind` through a localloc pointer: write `value` at `width` (per `opcode`)
+    /// into localloc `buffer` of the frame at `owner`, which is NOT the current frame.
+    StoreStack {
+        /// The owning frame's index in the call stack.
+        owner: usize,
+        /// Which of that frame's localloc buffers.
+        buffer: usize,
+        /// The byte offset within it.
+        offset: u32,
+        /// The triggering `stind` (its width + narrowing).
+        opcode: Opcode,
+        /// The value to store.
+        value: Value,
+    },
     /// A multicast delegate's `Invoke`: call each `(target, method)` in turn (each with
     /// `params`); the delegate's result is the last one's.
     InvokeMulticast {
@@ -1073,6 +1109,9 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
             Flow::LoadObj { .. } => return Err(Trap::Unsupported(Opcode::Ldobj)),
             Flow::StoreObj { .. } => return Err(Trap::Unsupported(Opcode::Stobj)),
             Flow::CopyObj { .. } => return Err(Trap::Unsupported(Opcode::Cpobj)),
+            Flow::LoadStack { opcode, .. } | Flow::StoreStack { opcode, .. } => {
+                return Err(Trap::Unsupported(opcode));
+            }
             Flow::InvokeMulticast { .. } => return Err(Trap::Unsupported(Opcode::Callvirt)),
         }
     }
@@ -1958,7 +1997,7 @@ impl Session {
                 if forced {
                     vm.request_collect();
                 }
-            } else if forced || vm.heap().should_collect() {
+            } else if forced || vm.heap().should_collect() || vm.heap().at_budget() {
                 if vm.live_thread_count() <= 1 {
                     self.collect_garbage(module, vm);
                 } else {
@@ -2312,6 +2351,41 @@ impl Session {
             Flow::CopyObj { dest, src } => {
                 let value = read_byref(frames, vm, src);
                 write_location_value(frames, vm, dest, value)?;
+                Ok(Status::Running)
+            }
+            Flow::LoadStack {
+                owner,
+                buffer,
+                offset,
+                opcode,
+            } => {
+                let width = indirect_width(opcode).ok_or(Trap::TypeMismatch(opcode))?;
+                let raw = frames
+                    .get(owner)
+                    .and_then(|frame| frame.read_stack(buffer, offset, width))
+                    .ok_or(Trap::NullReference)?;
+                let value = stack_loaded_value(opcode, raw)?;
+                frames
+                    .get_mut(current)
+                    .ok_or(Trap::StackUnderflow)?
+                    .stack
+                    .push(value);
+                Ok(Status::Running)
+            }
+            Flow::StoreStack {
+                owner,
+                buffer,
+                offset,
+                opcode,
+                value,
+            } => {
+                let frame = frames.get_mut(owner).ok_or(Trap::NullReference)?;
+                let location = Location::Stack {
+                    frame: owner,
+                    buffer,
+                    offset,
+                };
+                store_stack_indirect(frame, owner, opcode, location, value)?;
                 Ok(Status::Running)
             }
             Flow::InvokeMulticast {
@@ -2830,6 +2904,12 @@ fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str]
         "System.Exception",
         "System.Object",
     ];
+    const OUT_OF_MEMORY: &[&str] = &[
+        "System.OutOfMemoryException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
     const INDEX_OOB: &[&str] = &[
         "System.IndexOutOfRangeException",
         "System.SystemException",
@@ -2889,6 +2969,7 @@ fn fault_exception(trap: &Trap) -> Option<(&'static str, &'static [&'static str]
             SYNC_LOCK,
         ),
         Trap::Overflow => ("Arithmetic operation resulted in an overflow.", OVERFLOW),
+        Trap::OutOfMemory => ("Insufficient memory to continue the execution of the program.", OUT_OF_MEMORY),
         _ => return None,
     };
     Some((text, chain))
@@ -3155,6 +3236,27 @@ fn catch_matches(
     }
 }
 
+/// The out-of-memory guard an allocation opcode (`newobj`, `newarr`, `box`) runs before it
+/// grows the heap: with a hard object budget configured (an embedder on a fixed heap sets
+/// one below the real capacity), refuse the allocation once the live object count has reached
+/// it, returning `Trap::OutOfMemory`. The caller (`advance`) turns that trap into a CATCHABLE
+/// `OutOfMemoryException` via [`catchable_fault`], so `catch (OutOfMemoryException)` runs and a
+/// handler that drops references lets the next collection recover -- exactly the allocation
+/// site .NET throws OOM at, not an instruction-boundary poll (which would re-throw before the
+/// handler's own first instruction could run). The safepoint at the top of `advance` has
+/// already collected on this pressure (its GC condition includes `at_budget`), so this reads
+/// the POST-collection count and fires only when a collection could not free the room. The
+/// exception object itself allocates through [`Heap::alloc`] directly, using the headroom the
+/// budget deliberately leaves below capacity. Unbounded by default (`object_budget = None`),
+/// so a host that sets no budget never pays for the check.
+#[inline]
+fn check_alloc_budget(vm: &Vm) -> Result<(), Trap> {
+    if vm.heap().at_budget() {
+        return Err(Trap::OutOfMemory);
+    }
+    Ok(())
+}
+
 fn step(
     frame: &mut Frame,
     frame_index: usize,
@@ -3167,6 +3269,7 @@ fn step(
     let asm = module.map_or(0, |module| module.method_asm(frame.method));
     match opcode {
         Opcode::Nop => {}
+        Opcode::Break => {}
         Opcode::Pop => {
             frame.pop()?;
         }
@@ -3561,6 +3664,7 @@ fn step(
         }
 
         Opcode::Newobj => {
+            check_alloc_budget(vm)?;
             let module = module.ok_or(Trap::Unsupported(Opcode::Newobj))?;
             let token = token_operand(instruction)?;
             if module.is_delegate_ctor(asm, token) {
@@ -3828,7 +3932,12 @@ fn step(
             }) => {
                 let width = indirect_width(opcode).ok_or(Trap::TypeMismatch(opcode))?;
                 if owner != frame_index {
-                    return Err(Trap::Unsupported(opcode));
+                    return Ok(Flow::LoadStack {
+                        owner,
+                        buffer,
+                        offset,
+                        opcode,
+                    });
                 }
                 let raw = frame
                     .read_stack(buffer, offset, width)
@@ -3842,7 +3951,25 @@ fn step(
         Opcode::StindI1 | Opcode::StindI2 => {
             let value = frame.pop()?;
             match frame.pop()? {
-                Value::ByRef(location @ Location::Stack { .. }) => {
+                Value::ByRef(Location::Stack {
+                    frame: owner,
+                    buffer,
+                    offset,
+                }) => {
+                    if owner != frame_index {
+                        return Ok(Flow::StoreStack {
+                            owner,
+                            buffer,
+                            offset,
+                            opcode,
+                            value,
+                        });
+                    }
+                    let location = Location::Stack {
+                        frame: owner,
+                        buffer,
+                        offset,
+                    };
                     store_stack_indirect(frame, frame_index, opcode, location, value)?;
                 }
                 Value::ByRef(location) => {
@@ -3861,7 +3988,25 @@ fn step(
         | Opcode::StindRef => {
             let value = frame.pop()?;
             match frame.pop()? {
-                Value::ByRef(location @ Location::Stack { .. }) => {
+                Value::ByRef(Location::Stack {
+                    frame: owner,
+                    buffer,
+                    offset,
+                }) => {
+                    if owner != frame_index {
+                        return Ok(Flow::StoreStack {
+                            owner,
+                            buffer,
+                            offset,
+                            opcode,
+                            value,
+                        });
+                    }
+                    let location = Location::Stack {
+                        frame: owner,
+                        buffer,
+                        offset,
+                    };
                     store_stack_indirect(frame, frame_index, opcode, location, value)?;
                 }
                 Value::ByRef(location) => return Ok(Flow::StoreObj { location, value }),
@@ -3931,6 +4076,7 @@ fn step(
         }
 
         Opcode::Box => {
+            check_alloc_budget(vm)?;
             let token = token_operand(instruction)?;
             let value = frame.pop()?;
             let reference = vm.heap_mut().alloc_boxed(asm_key(asm, token.0), value);
@@ -3949,6 +4095,7 @@ fn step(
         }
 
         Opcode::Newarr => {
+            check_alloc_budget(vm)?;
             let module = module.ok_or(Trap::Unsupported(Opcode::Newarr))?;
             let token = token_operand(instruction)?;
             let length = array_length(frame.pop()?)?;
@@ -4170,6 +4317,18 @@ fn step(
                 }) if owner == frame_index => {
                     frame.fill_stack(buffer, offset, value, size)?;
                 }
+                Value::ByRef(Location::Element {
+                    array,
+                    index,
+                    byte_offset,
+                }) => {
+                    let start = index + byte_offset as usize;
+                    let slice = vm
+                        .heap_mut()
+                        .array_u8_slice_mut(array, start, size)
+                        .ok_or(Trap::Unsupported(Opcode::Initblk))?;
+                    slice.iter_mut().for_each(|byte| *byte = value);
+                }
                 Value::Null => return Err(Trap::NullReference),
                 _ => return Err(Trap::Unsupported(Opcode::Initblk)),
             }
@@ -4191,6 +4350,29 @@ fn step(
                     }),
                 ) if dest_owner == frame_index && src_owner == frame_index => {
                     frame.copy_stack(dest_buffer, dest_offset, src_buffer, src_offset, size)?;
+                }
+                (
+                    Value::ByRef(Location::Element {
+                        array: dest_array,
+                        index: dest_index,
+                        byte_offset: dest_bo,
+                    }),
+                    Value::ByRef(Location::Element {
+                        array: src_array,
+                        index: src_index,
+                        byte_offset: src_bo,
+                    }),
+                ) => {
+                    let temp = vm
+                        .heap()
+                        .array_u8_slice(src_array, src_index + src_bo as usize, size)
+                        .ok_or(Trap::Unsupported(Opcode::Cpblk))?
+                        .to_vec();
+                    let dest = vm
+                        .heap_mut()
+                        .array_u8_slice_mut(dest_array, dest_index + dest_bo as usize, size)
+                        .ok_or(Trap::Unsupported(Opcode::Cpblk))?;
+                    dest.copy_from_slice(&temp);
                 }
                 (Value::Null, _) | (_, Value::Null) => return Err(Trap::NullReference),
                 _ => return Err(Trap::Unsupported(Opcode::Cpblk)),
@@ -5640,6 +5822,35 @@ mod tests {
     }
 
     #[test]
+    fn break_opcode_is_a_nop() {
+        let result = run(vec![
+            Instruction::simple(Opcode::LdcI45),
+            Instruction::simple(Opcode::Break),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(result, Ok(Some(Value::Int32(5))));
+    }
+
+    #[cfg(feature = "float")]
+    #[test]
+    fn conv_ovf_from_nan_and_infinity_overflows() {
+        for value in [
+            Value::Float(f64::NAN),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Single(f32::NAN),
+            Value::Single(f32::INFINITY),
+        ] {
+            assert_eq!(convert_checked(Opcode::ConvOvfI4, value.clone()), Err(Trap::Overflow));
+            assert_eq!(convert_checked(Opcode::ConvOvfU8, value), Err(Trap::Overflow));
+        }
+        assert_eq!(
+            convert_checked(Opcode::ConvOvfI4, Value::Float(42.0)),
+            Ok(Value::Int32(42))
+        );
+    }
+
+    #[test]
     fn integer_divide_by_zero_traps() {
         let result = run(vec![
             Instruction::simple(Opcode::LdcI41),
@@ -5648,6 +5859,72 @@ mod tests {
             Instruction::simple(Opcode::Ret),
         ]);
         assert_eq!(result, Err(Trap::DivideByZero));
+    }
+
+    #[test]
+    fn allocation_budget_guard_traps_out_of_memory_at_the_ceiling() {
+        let mut vm = Vm::new();
+        assert_eq!(check_alloc_budget(&vm), Ok(()));
+        vm.set_object_budget(Some(2));
+        assert_eq!(check_alloc_budget(&vm), Ok(()));
+        vm.heap_mut().alloc_string(&[b'a' as u16]);
+        assert_eq!(check_alloc_budget(&vm), Ok(()));
+        vm.heap_mut().alloc_string(&[b'b' as u16]);
+        assert_eq!(check_alloc_budget(&vm), Err(Trap::OutOfMemory));
+    }
+
+    #[test]
+    fn out_of_memory_fault_names_the_out_of_memory_exception_hierarchy() {
+        let (message, chain) =
+            fault_exception(&Trap::OutOfMemory).expect("OutOfMemory is a catchable fault");
+        assert_eq!(
+            message,
+            "Insufficient memory to continue the execution of the program."
+        );
+        assert_eq!(chain.first(), Some(&"System.OutOfMemoryException"));
+        assert_eq!(chain.last(), Some(&"System.Object"));
+        assert!(chain.contains(&"System.SystemException"));
+        assert!(chain.contains(&"System.Exception"));
+    }
+
+    #[cfg(feature = "exceptions")]
+    #[test]
+    fn allocation_over_budget_raises_a_catchable_out_of_memory_exception() {
+        use lamella_cil::{EhClause, EhKind, InstructionRange};
+        let elem = Token(0x0100_0001);
+        let mut module = Module::new();
+        module.bind_array_default(0, elem, Value::Int32(0));
+        let mut code = Vec::new();
+        for _ in 0..4 {
+            code.push(Instruction::simple(Opcode::LdcI41));
+            code.push(Instruction::new(Opcode::Newarr, Operand::Token(elem)));
+        }
+        let handler_start = code.len() as u32;
+        code.push(Instruction::simple(Opcode::Pop));
+        code.push(Instruction::new(Opcode::LdcI4S, Operand::Int8(42)));
+        code.push(Instruction::simple(Opcode::Ret));
+        let handler_end = code.len() as u32;
+        let mut body = method(code);
+        body.handlers = alloc::vec![EhClause {
+            try_range: InstructionRange {
+                start: 0,
+                end: handler_start,
+            },
+            handler_range: InstructionRange {
+                start: handler_start,
+                end: handler_end,
+            },
+            kind: EhKind::Catch(Token(0x0100_00FF)),
+        }]
+        .into_boxed_slice();
+        let main = module.add_method_image(0, body, 0);
+
+        let mut vm = Vm::new();
+        vm.set_object_budget(Some(3));
+        assert_eq!(
+            super::run(&module, &mut vm, main, Vec::new()),
+            Ok(Some(Value::Int32(42)))
+        );
     }
 
     #[test]

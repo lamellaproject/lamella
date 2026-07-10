@@ -11,6 +11,7 @@
 extern crate alloc;
 
 pub mod boot;
+pub mod flash;
 pub mod hif;
 pub mod net;
 pub mod socket;

@@ -143,6 +143,25 @@ pub mod deploy {
     /// Host -> target: boot the deployed image NOW -- a clean self-reset into the boot-run path, so
     /// deploy->run needs no debug probe. No reply and no payload (the target resets).
     pub const DEPLOY_RUN: u8 = 0x29;
+    /// Host -> target: begin a WINC1500 module-firmware write. Payload =
+    /// `offset(u32 LE) | total(u32 LE)`: the firmware initializes the module into its flash
+    /// download mode and erases the module-flash span `[offset, offset + total)`. Answered by
+    /// [`WINC_FW_RESULT`] (the erase of a full ~332 KB image takes seconds -- hosts wait
+    /// generously). A target without a WINC module answers `ok = 0`.
+    pub const WINC_FW_START: u8 = 0x2a;
+    /// Host -> target: one chunk of the module-firmware image. Payload =
+    /// `offset(u32 LE, absolute module-flash address) | chunk bytes`; the firmware programs the
+    /// chunk into the erased span and verifies it by read-back. Answered by [`WINC_FW_RESULT`]
+    /// per chunk, so the STREAM never needs the whole image in the target's RAM -- a 32 KB part
+    /// updates a 332 KB module image.
+    pub const WINC_FW_CHUNK: u8 = 0x2b;
+    /// Host -> target: the module-firmware write is complete (no payload). The firmware runs its
+    /// final sanity read and parks the module for a clean reboot into the new firmware. Answered
+    /// by [`WINC_FW_RESULT`].
+    pub const WINC_FW_END: u8 = 0x2c;
+    /// Target -> host: `ok(u8)` -- 1 if the begin/program/finish step succeeded, 0 on any module
+    /// wire fault, verify mismatch, or a target without a module flasher.
+    pub const WINC_FW_RESULT: u8 = 0x2d;
 }
 
 /// Re-exported for a deploy host: read a baked image's content checksum from its header, to compare
@@ -173,6 +192,28 @@ pub trait FlashSink {
         let _ = (offset, chunk, total);
         false
     }
+}
+
+/// A WINC1500 WiFi module's OWN firmware store, reachable from the firmware over the module's
+/// SPI: the target side of the `WINC_FW_*` streaming update (the module image is far larger
+/// than a small part's RAM, so the host chunks it and the firmware programs each chunk as it
+/// arrives). The generic runner drives the protocol against this seam; a WiFi board implements
+/// it over its hardware SPI, and a board without a module passes none (the runner then answers
+/// every `WINC_FW_*` request `ok = 0`).
+#[cfg(feature = "baked-image")]
+pub trait WincFlasher {
+    /// Brings the module into its flash download mode from scratch (a fresh power-up sequence,
+    /// so it works whether or not the module's firmware was booted) and erases the module-flash
+    /// span `[offset, offset + total)`. Returns whether the module answered sanely and the
+    /// erase completed.
+    fn begin(&mut self, offset: usize, total: usize) -> bool;
+    /// Programs `data` at the absolute module-flash `offset` (within the span `begin` erased)
+    /// and verifies it by read-back. Returns whether the readback matched.
+    fn program(&mut self, offset: usize, data: &[u8]) -> bool;
+    /// Finishes the update: a final module-flash read proves the wire stayed sane, then the
+    /// module is parked (powered down) so the next board reset boots it fresh into the new
+    /// firmware.
+    fn finish(&mut self) -> bool;
 }
 
 /// How a [`run_deployed`] app run ended.
@@ -799,11 +840,13 @@ pub fn serve_one_deploy(
     transport: &mut impl Transport,
     flash: &mut impl FlashSink,
 ) -> Result<Served, TransportError> {
-    serve_one_deploy_with(transport, flash, &mut |_vm| {})
+    serve_one_deploy_with(transport, flash, &mut |_vm| {}, None)
 }
 
 /// [`serve_one_deploy`] with the firmware's [`Vm`]-configure hook (see
-/// [`run_image_with`]): every evaluation the serve runs gets the board seams installed.
+/// [`run_image_with`]) -- every evaluation the serve runs gets the board seams installed --
+/// and, on a WiFi board, its [`WincFlasher`] so a host can stream a module-firmware update
+/// over the wire (`None` answers every `WINC_FW_*` request `ok = 0`).
 ///
 /// # Errors
 /// Propagates a [`TransportError`] from the carrier.
@@ -812,6 +855,7 @@ pub fn serve_one_deploy_with(
     transport: &mut impl Transport,
     flash: &mut impl FlashSink,
     configure: &mut dyn FnMut(&mut Vm),
+    mut winc: Option<&mut dyn WincFlasher>,
 ) -> Result<Served, TransportError> {
     let Some(frame) = transport.poll()? else {
         return Ok(Served::Nothing);
@@ -835,6 +879,39 @@ pub fn serve_one_deploy_with(
                 false
             };
             transport.send(deploy::DEPLOY_RESULT, frame.seq, &[u8::from(ok)])?;
+        }
+        deploy::WINC_FW_START => {
+            let payload = &frame.payload;
+            let ok = match (payload.len() >= 8, winc.as_deref_mut()) {
+                (true, Some(flasher)) => {
+                    let offset =
+                        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                    let total =
+                        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+                    flasher.begin(offset, total)
+                }
+                _ => false,
+            };
+            transport.send(deploy::WINC_FW_RESULT, frame.seq, &[u8::from(ok)])?;
+        }
+        deploy::WINC_FW_CHUNK => {
+            let payload = &frame.payload;
+            let ok = match (payload.len() >= 4, winc.as_deref_mut()) {
+                (true, Some(flasher)) => {
+                    let offset =
+                        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+                    flasher.program(offset, &payload[4..])
+                }
+                _ => false,
+            };
+            transport.send(deploy::WINC_FW_RESULT, frame.seq, &[u8::from(ok)])?;
+        }
+        deploy::WINC_FW_END => {
+            let ok = match winc.as_deref_mut() {
+                Some(flasher) => flasher.finish(),
+                None => false,
+            };
+            transport.send(deploy::WINC_FW_RESULT, frame.seq, &[u8::from(ok)])?;
         }
         deploy::DEPLOY_STATUS => {
             let (present, checksum) = match baked_image_checksum(flash.image_slice()) {
@@ -1512,5 +1589,108 @@ mod tests {
             seq += 1;
         }
         assert_eq!(sink.data, image, "the reassembled image matches the original");
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[derive(Default)]
+    struct MockWincFlasher {
+        begun: Option<(usize, usize)>,
+        data: Vec<u8>,
+        finished: bool,
+    }
+
+    #[cfg(feature = "baked-image")]
+    impl WincFlasher for MockWincFlasher {
+        fn begin(&mut self, offset: usize, total: usize) -> bool {
+            self.begun = Some((offset, total));
+            self.data = vec![0xff; offset + total];
+            true
+        }
+        fn program(&mut self, offset: usize, data: &[u8]) -> bool {
+            if offset + data.len() > self.data.len() {
+                return false;
+            }
+            self.data[offset..offset + data.len()].copy_from_slice(data);
+            true
+        }
+        fn finish(&mut self) -> bool {
+            self.finished = true;
+            true
+        }
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn winc_firmware_streams_through_the_flasher_hook() {
+        use lamella_wire::MemTransport;
+
+        let firmware: Vec<u8> = (0..5000u32).map(|i| (i % 241) as u8).collect();
+        let base = 4096usize;
+        let chunk_len = 1024usize;
+        let mut sink = MockFlash::default();
+        let mut flasher = MockWincFlasher::default();
+
+        let mut exchange = |msg_type: u8, seq: u16, payload: &[u8], flasher: &mut MockWincFlasher| {
+            let mut driver = MemTransport::new();
+            let mut runner = MemTransport::new();
+            driver.send(msg_type, seq, payload).unwrap();
+            runner.feed(&driver.take_sent());
+            assert_eq!(
+                serve_one_deploy_with(
+                    &mut runner,
+                    &mut sink,
+                    &mut |_vm| {},
+                    Some(flasher as &mut dyn WincFlasher),
+                )
+                .unwrap(),
+                Served::Handled,
+            );
+            driver.feed(&runner.take_sent());
+            let ack = driver.poll().unwrap().expect("a WINC_FW_RESULT ack");
+            assert_eq!(ack.msg_type, deploy::WINC_FW_RESULT);
+            assert_eq!(ack.payload, vec![1], "the step succeeded");
+        };
+
+        let mut start = Vec::new();
+        start.extend_from_slice(&(base as u32).to_le_bytes());
+        start.extend_from_slice(&(firmware.len() as u32).to_le_bytes());
+        exchange(deploy::WINC_FW_START, 1, &start, &mut flasher);
+        assert_eq!(flasher.begun, Some((base, firmware.len())));
+
+        let mut offset = 0;
+        let mut seq = 2u16;
+        while offset < firmware.len() {
+            let end = (offset + chunk_len).min(firmware.len());
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&((base + offset) as u32).to_le_bytes());
+            payload.extend_from_slice(&firmware[offset..end]);
+            exchange(deploy::WINC_FW_CHUNK, seq, &payload, &mut flasher);
+            offset = end;
+            seq += 1;
+        }
+        exchange(deploy::WINC_FW_END, seq, &[], &mut flasher);
+
+        assert!(flasher.finished, "END reached finish");
+        assert_eq!(&flasher.data[base..], &firmware[..], "the programmed image matches");
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_target_without_a_winc_flasher_answers_not_ok() {
+        use lamella_wire::MemTransport;
+
+        let mut sink = MockFlash::default();
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        driver.send(deploy::WINC_FW_START, 1, &[0, 0, 0, 0, 16, 0, 0, 0]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert_eq!(
+            serve_one_deploy_with(&mut runner, &mut sink, &mut |_vm| {}, None).unwrap(),
+            Served::Handled,
+        );
+        driver.feed(&runner.take_sent());
+        let ack = driver.poll().unwrap().expect("a WINC_FW_RESULT ack");
+        assert_eq!(ack.msg_type, deploy::WINC_FW_RESULT);
+        assert_eq!(ack.payload, vec![0], "no flasher answers not-ok");
     }
 }

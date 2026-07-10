@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.DivideByZeroException
 namespace System
 {
-    public class DivideByZeroException : SystemException
+    public class DivideByZeroException : ArithmeticException
     {
         public DivideByZeroException() : base() { }
         public DivideByZeroException(string message) : base(message) { }

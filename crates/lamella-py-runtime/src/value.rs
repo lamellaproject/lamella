@@ -144,12 +144,24 @@ impl Value {
         }
     }
 
-    /// A reference to module function `index` -- the callable `LoadGlobal` pushes and
-    /// `Call` consumes. The index occupies bits 5..; it is an immediate, not a managed
-    /// pointer, since a function lives in the bytecode rather than the GC heap.
+    /// A reference to function `index` of the ENTRY module (module 0) -- the callable
+    /// [`Op::LoadGlobal`] pushes and [`Op::Call`] consumes. Shorthand for
+    /// [`Value::function_ref_in_module`] with home module 0; an immediate, not a managed pointer,
+    /// since a function lives in the bytecode rather than the GC heap.
     #[must_use]
     pub const fn function_ref(index: u32) -> Value {
-        Value((index << 5) | FUNCTION_REF_TAG)
+        Value::function_ref_in_module(0, index)
+    }
+
+    /// A reference to function `index` of module `home` (a managed .py module registry id -- entry = 0,
+    /// managed modules 1..). The local index occupies bits 5..21 (up to 65536 functions per module) and
+    /// the home module id bits 21..32 (up to 2048 modules), so a function VALUE self-describes which
+    /// module's function table + globals a cross-module call must resolve it against, while intra-module
+    /// resolution stays a bare index. The low 5 tag bits are unchanged, so it remains a GC-skipped
+    /// immediate exactly like [`Value::function_ref`].
+    #[must_use]
+    pub const fn function_ref_in_module(home: u16, index: u32) -> Value {
+        Value(((home as u32 & 0x7FF) << 21) | ((index & 0xFFFF) << 5) | FUNCTION_REF_TAG)
     }
 
     /// Whether this is a module-function reference.
@@ -158,11 +170,22 @@ impl Value {
         self.0 & CALLABLE_TAG_MASK == FUNCTION_REF_TAG
     }
 
-    /// The module-function index if this is a function reference, else `None`.
+    /// The LOCAL function index (within its home module) if this is a function reference, else `None`.
     #[must_use]
     pub const fn as_function_index(self) -> Option<u32> {
         if self.is_function_ref() {
-            Some(self.0 >> 5)
+            Some((self.0 >> 5) & 0xFFFF)
+        } else {
+            None
+        }
+    }
+
+    /// The HOME module id (which module's function table + globals this ref resolves against) if this
+    /// is a function reference, else `None`. 0 is the entry module.
+    #[must_use]
+    pub const fn function_home_module(self) -> Option<u16> {
+        if self.is_function_ref() {
+            Some((self.0 >> 21) as u16 & 0x7FF)
         } else {
             None
         }
@@ -394,6 +417,22 @@ mod tests {
         assert_eq!(Value::NONE.as_int(), None);
         assert_eq!(Value::from_ref(Ref(8)).as_int(), None);
         assert_eq!(Value::UNBOUND.as_int(), None);
+    }
+
+    #[test]
+    fn function_refs_carry_a_home_module_id() {
+        assert_eq!(Value::function_ref(7).function_home_module(), Some(0));
+        for &home in &[0u16, 1, 2, 42, 2047] {
+            for &index in &[0u32, 1, 500, 65535] {
+                let f = Value::function_ref_in_module(home, index);
+                assert!(f.is_function_ref());
+                assert_eq!(f.as_function_index(), Some(index), "index {index} home {home}");
+                assert_eq!(f.function_home_module(), Some(home), "index {index} home {home}");
+                assert!(!f.is_fixnum() && !f.is_pointer() && f.as_ref().is_none() && !f.is_none());
+            }
+        }
+        assert_eq!(Value::NONE.function_home_module(), None);
+        assert_eq!(Value::builtin_ref(3).function_home_module(), None);
     }
 
     #[test]

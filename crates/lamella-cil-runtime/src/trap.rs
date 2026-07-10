@@ -58,6 +58,10 @@ pub enum Trap {
     NoSuchMethod(u32),
     /// The call stack grew past the interpreter's depth limit (runaway recursion).
     CallStackOverflow,
+    /// The managed heap reached its configured budget and a collection could not free enough
+    /// (the `OutOfMemoryException` site) -- raised before the underlying allocator would fail
+    /// hard, so it is catchable like the other runtime faults.
+    OutOfMemory,
     /// An exception propagated out of the entry method with no matching handler.
     UnhandledException,
 }
@@ -98,6 +102,7 @@ impl fmt::Display for Trap {
             }
             Trap::NoSuchMethod(id) => write!(f, "method id {id} does not exist"),
             Trap::CallStackOverflow => f.write_str("call stack overflow"),
+            Trap::OutOfMemory => f.write_str("out of memory"),
             Trap::UnhandledException => f.write_str("unhandled exception"),
         }
     }

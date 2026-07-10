@@ -2,19 +2,20 @@
 
 use crate::bind::{bind_type, parameter_symbol};
 use crate::bound::Binder;
-use crate::declaration::collect_into;
+use crate::declaration::{accessibility_of, collect_into};
 use crate::diagnostic::{Diagnostic, DiagnosticKind, SignaturePosition};
 use crate::reference::load_assembly;
 use crate::special::SpecialType;
-use crate::symbols::{Accessibility, Model};
+use crate::symbols::{Accessibility, Model, TypeInfo};
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_metadata::Assembly;
 use lamella_syntax::ast::{
-    CompilationUnit, Member, Modifier, NamespaceMember, Parameter, ParameterModifier, QualifiedName,
-    TypeDecl, TypeKind, TypeRefKind, UsingDirective, UsingKind,
+    CompilationUnit, ConversionDirection, DelegateDecl, Member, Modifier, NamespaceMember,
+    OverloadableOperator, Parameter, ParameterModifier, QualifiedName, TypeDecl, TypeKind,
+    TypeRefKind, UsingDirective, UsingKind,
 };
 use lamella_syntax::span::Span;
 
@@ -187,10 +188,51 @@ fn bind_namespace_body(
                 bind_namespace_body(binder, &declaration.usings, &declaration.members, &inner);
             }
             NamespaceMember::Type(declaration) => bind_type_bodies(binder, namespace, declaration),
-            NamespaceMember::Enum(_) | NamespaceMember::Delegate(_) => {}
+            NamespaceMember::Delegate(declaration) => {
+                check_delegate_accessibility(binder, namespace, declaration);
+            }
+            NamespaceMember::Enum(_) => {}
         }
     }
     binder.restore_import_scope(scope);
+}
+
+/// CS0058 / CS0059: a delegate's return type and parameter types must each be at least as
+/// accessible as the delegate itself (10.5.4). The delegate's effective accessibility comes from
+/// its declared modifiers (a top-level delegate defaults to `internal`); an unresolved, reference,
+/// or predefined signature type never fires, so this never false-flags a valid program.
+fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaration: &DelegateDecl) {
+    let delegate = named_symbol(namespace, &declaration.name);
+    let delegate_mask = {
+        let model = binder.model();
+        model
+            .get_by_symbol(&delegate)
+            .map_or(ACCESS_FULL, |info| effective_info_mask(model, info))
+    };
+    let return_ty = binder.canonicalize(&bind_type(&declaration.return_type));
+    if exposes_less_accessible(effective_type_mask(binder.model(), &return_ty), delegate_mask) {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::InconsistentAccessibility {
+                position: SignaturePosition::DelegateReturnType,
+                type_name: return_ty.to_string().into(),
+                member: declaration.name.clone(),
+            },
+            declaration.span,
+        ));
+    }
+    for parameter in &declaration.parameters {
+        let param_ty = binder.canonicalize(&bind_type(&parameter.ty));
+        if exposes_less_accessible(effective_type_mask(binder.model(), &param_ty), delegate_mask) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::InconsistentAccessibility {
+                    position: SignaturePosition::DelegateParameterType,
+                    type_name: param_ty.to_string().into(),
+                    member: declaration.name.clone(),
+                },
+                declaration.span,
+            ));
+        }
+    }
 }
 
 fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
@@ -456,16 +498,19 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         };
         check_params_usage(binder, parameters);
     }
-    let container_public = binder.model().get_by_symbol(&enclosing).is_some_and(|info| {
-        info.accessibility == Accessibility::Public && info.enclosing.is_none()
-    });
-    if container_public && declaration.kind == TypeKind::Class {
+    let container_mask = {
+        let model = binder.model();
+        model
+            .get_by_symbol(&enclosing)
+            .map_or(ACCESS_FULL, |info| effective_info_mask(model, info))
+    };
+    if declaration.kind == TypeKind::Class {
         if let Some(base) = binder
             .model()
             .get_by_symbol(&enclosing)
             .and_then(|info| info.base.clone())
         {
-            if !is_public_own(binder.model(), &base) {
+            if exposes_less_accessible(effective_type_mask(binder.model(), &base), container_mask) {
                 binder.report(Diagnostic::new(
                     DiagnosticKind::InconsistentAccessibility {
                         position: SignaturePosition::BaseClass,
@@ -477,110 +522,293 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             }
         }
     }
-    if container_public {
-        for member in &declaration.members {
-            match member {
-                Member::Method {
-                    modifiers,
-                    return_type,
-                    name,
-                    parameters,
-                    span,
-                    ..
-                } if modifiers.iter().any(|m| matches!(m, Modifier::Public)) => {
-                    let signature = method_signature(&declaration.name, name, parameters);
-                    let return_ty = binder.canonicalize(&bind_type(return_type));
-                    if !is_public_own(binder.model(), &return_ty) {
+    if declaration.kind == TypeKind::Interface {
+        let bases = binder
+            .model()
+            .get_by_symbol(&enclosing)
+            .map(|info| info.bases.clone())
+            .unwrap_or_default();
+        for base in &bases {
+            if exposes_less_accessible(effective_type_mask(binder.model(), base), container_mask) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::InconsistentAccessibility {
+                        position: SignaturePosition::BaseInterface,
+                        type_name: base.to_string().into(),
+                        member: declaration.name.clone(),
+                    },
+                    declaration.span,
+                ));
+            }
+        }
+    }
+    for member in &declaration.members {
+        let member_modifiers = match member {
+            Member::Method { modifiers, .. }
+            | Member::Constructor { modifiers, .. }
+            | Member::Field { modifiers, .. }
+            | Member::Property { modifiers, .. }
+            | Member::Event { modifiers, .. }
+            | Member::EventField { modifiers, .. }
+            | Member::Indexer { modifiers, .. }
+            | Member::Operator { modifiers, .. }
+            | Member::ConversionOperator { modifiers, .. } => modifiers.as_slice(),
+            _ => continue,
+        };
+        let member_access = if declaration.kind == TypeKind::Interface {
+            Accessibility::Public
+        } else {
+            accessibility_of(member_modifiers)
+        };
+        let member_mask = access_mask(member_access) & container_mask;
+        if member_mask == 0 {
+            continue;
+        }
+        match member {
+            Member::Method {
+                return_type,
+                name,
+                parameters,
+                span,
+                ..
+            } => {
+                let signature = method_signature(&declaration.name, name, parameters);
+                let return_ty = binder.canonicalize(&bind_type(return_type));
+                if exposes_less_accessible(effective_type_mask(binder.model(), &return_ty), member_mask)
+                {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::InconsistentAccessibility {
+                            position: SignaturePosition::ReturnType,
+                            type_name: return_ty.to_string().into(),
+                            member: signature.clone(),
+                        },
+                        *span,
+                    ));
+                }
+                for parameter in parameters {
+                    let param_ty = binder.canonicalize(&bind_type(&parameter.ty));
+                    if exposes_less_accessible(effective_type_mask(binder.model(), &param_ty), member_mask)
+                    {
                         binder.report(Diagnostic::new(
                             DiagnosticKind::InconsistentAccessibility {
-                                position: SignaturePosition::ReturnType,
-                                type_name: return_ty.to_string().into(),
+                                position: SignaturePosition::ParameterType,
+                                type_name: param_ty.to_string().into(),
                                 member: signature.clone(),
                             },
                             *span,
                         ));
                     }
-                    for parameter in parameters {
-                        let param_ty = binder.canonicalize(&bind_type(&parameter.ty));
-                        if !is_public_own(binder.model(), &param_ty) {
-                            binder.report(Diagnostic::new(
-                                DiagnosticKind::InconsistentAccessibility {
-                                    position: SignaturePosition::ParameterType,
-                                    type_name: param_ty.to_string().into(),
-                                    member: signature.clone(),
-                                },
-                                *span,
-                            ));
-                        }
-                    }
                 }
-                Member::Constructor {
-                    modifiers,
-                    name,
-                    parameters,
-                    span,
-                    ..
-                } if modifiers.iter().any(|m| matches!(m, Modifier::Public)) => {
-                    let signature = method_signature(&declaration.name, name, parameters);
-                    for parameter in parameters {
-                        let param_ty = binder.canonicalize(&bind_type(&parameter.ty));
-                        if !is_public_own(binder.model(), &param_ty) {
-                            binder.report(Diagnostic::new(
-                                DiagnosticKind::InconsistentAccessibility {
-                                    position: SignaturePosition::ParameterType,
-                                    type_name: param_ty.to_string().into(),
-                                    member: signature.clone(),
-                                },
-                                *span,
-                            ));
-                        }
-                    }
-                }
-                Member::Field {
-                    modifiers,
-                    ty,
-                    declarators,
-                    ..
-                } if modifiers.iter().any(|m| matches!(m, Modifier::Public)) => {
-                    let field_ty = binder.canonicalize(&bind_type(ty));
-                    if !is_public_own(binder.model(), &field_ty) {
-                        for declarator in declarators {
-                            binder.report(Diagnostic::new(
-                                DiagnosticKind::InconsistentAccessibility {
-                                    position: SignaturePosition::FieldType,
-                                    type_name: field_ty.to_string().into(),
-                                    member: alloc::format!(
-                                        "{}.{}",
-                                        declaration.name, declarator.name
-                                    )
-                                    .into(),
-                                },
-                                declarator.span,
-                            ));
-                        }
-                    }
-                }
-                Member::Property {
-                    modifiers,
-                    ty,
-                    name,
-                    span,
-                    ..
-                } if modifiers.iter().any(|m| matches!(m, Modifier::Public)) => {
-                    let property_ty = binder.canonicalize(&bind_type(ty));
-                    if !is_public_own(binder.model(), &property_ty) {
+            }
+            Member::Constructor {
+                name,
+                parameters,
+                span,
+                ..
+            } => {
+                let signature = method_signature(&declaration.name, name, parameters);
+                for parameter in parameters {
+                    let param_ty = binder.canonicalize(&bind_type(&parameter.ty));
+                    if exposes_less_accessible(effective_type_mask(binder.model(), &param_ty), member_mask)
+                    {
                         binder.report(Diagnostic::new(
                             DiagnosticKind::InconsistentAccessibility {
-                                position: SignaturePosition::PropertyType,
-                                type_name: property_ty.to_string().into(),
-                                member: alloc::format!("{}.{}", declaration.name, name).into(),
+                                position: SignaturePosition::ParameterType,
+                                type_name: param_ty.to_string().into(),
+                                member: signature.clone(),
                             },
                             *span,
                         ));
                     }
                 }
-                _ => {}
             }
+            Member::Field {
+                ty, declarators, ..
+            } => {
+                let field_ty = binder.canonicalize(&bind_type(ty));
+                if exposes_less_accessible(effective_type_mask(binder.model(), &field_ty), member_mask)
+                {
+                    for declarator in declarators {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::InconsistentAccessibility {
+                                position: SignaturePosition::FieldType,
+                                type_name: field_ty.to_string().into(),
+                                member: alloc::format!("{}.{}", declaration.name, declarator.name)
+                                    .into(),
+                            },
+                            declarator.span,
+                        ));
+                    }
+                }
+            }
+            Member::Property {
+                ty, name, span, ..
+            } => {
+                let property_ty = binder.canonicalize(&bind_type(ty));
+                if exposes_less_accessible(effective_type_mask(binder.model(), &property_ty), member_mask)
+                {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::InconsistentAccessibility {
+                            position: SignaturePosition::PropertyType,
+                            type_name: property_ty.to_string().into(),
+                            member: alloc::format!("{}.{}", declaration.name, name).into(),
+                        },
+                        *span,
+                    ));
+                }
+            }
+            Member::Event {
+                ty, name, span, ..
+            } => {
+                let event_ty = binder.canonicalize(&bind_type(ty));
+                if exposes_less_accessible(effective_type_mask(binder.model(), &event_ty), member_mask)
+                {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::InconsistentAccessibility {
+                            position: SignaturePosition::EventType,
+                            type_name: event_ty.to_string().into(),
+                            member: alloc::format!("{}.{}", declaration.name, name).into(),
+                        },
+                        *span,
+                    ));
+                }
+            }
+            Member::EventField {
+                ty, declarators, ..
+            } => {
+                let event_ty = binder.canonicalize(&bind_type(ty));
+                if exposes_less_accessible(effective_type_mask(binder.model(), &event_ty), member_mask)
+                {
+                    for declarator in declarators {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::InconsistentAccessibility {
+                                position: SignaturePosition::EventType,
+                                type_name: event_ty.to_string().into(),
+                                member: alloc::format!("{}.{}", declaration.name, declarator.name)
+                                    .into(),
+                            },
+                            declarator.span,
+                        ));
+                    }
+                }
+            }
+            Member::Indexer {
+                ty, parameters, span, ..
+            } => {
+                let signature =
+                    alloc::format!("{}.this[{}]", declaration.name, parameter_type_list(parameters));
+                let element_ty = binder.canonicalize(&bind_type(ty));
+                if exposes_less_accessible(effective_type_mask(binder.model(), &element_ty), member_mask)
+                {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::InconsistentAccessibility {
+                            position: SignaturePosition::IndexerType,
+                            type_name: element_ty.to_string().into(),
+                            member: signature.clone().into(),
+                        },
+                        *span,
+                    ));
+                }
+                for parameter in parameters {
+                    let param_ty = binder.canonicalize(&bind_type(&parameter.ty));
+                    if exposes_less_accessible(effective_type_mask(binder.model(), &param_ty), member_mask)
+                    {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::InconsistentAccessibility {
+                                position: SignaturePosition::IndexerParameterType,
+                                type_name: param_ty.to_string().into(),
+                                member: signature.clone().into(),
+                            },
+                            *span,
+                        ));
+                    }
+                }
+            }
+            Member::Operator {
+                return_type,
+                operator,
+                parameters,
+                span,
+                ..
+            } => {
+                let signature = alloc::format!(
+                    "{}.operator {}({})",
+                    declaration.name,
+                    operator_source_symbol(*operator),
+                    parameter_type_list(parameters)
+                );
+                let return_ty = binder.canonicalize(&bind_type(return_type));
+                if exposes_less_accessible(effective_type_mask(binder.model(), &return_ty), member_mask)
+                {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::InconsistentAccessibility {
+                            position: SignaturePosition::OperatorReturnType,
+                            type_name: return_ty.to_string().into(),
+                            member: signature.clone().into(),
+                        },
+                        *span,
+                    ));
+                }
+                for parameter in parameters {
+                    let param_ty = binder.canonicalize(&bind_type(&parameter.ty));
+                    if exposes_less_accessible(effective_type_mask(binder.model(), &param_ty), member_mask)
+                    {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::InconsistentAccessibility {
+                                position: SignaturePosition::OperatorParameterType,
+                                type_name: param_ty.to_string().into(),
+                                member: signature.clone().into(),
+                            },
+                            *span,
+                        ));
+                    }
+                }
+            }
+            Member::ConversionOperator {
+                direction,
+                target,
+                parameters,
+                span,
+                ..
+            } => {
+                let target_ty = binder.canonicalize(&bind_type(target));
+                let keyword = match direction {
+                    ConversionDirection::Implicit => "implicit",
+                    ConversionDirection::Explicit => "explicit",
+                };
+                let signature = alloc::format!(
+                    "{}.{} operator {}({})",
+                    declaration.name,
+                    keyword,
+                    target_ty,
+                    parameter_type_list(parameters)
+                );
+                if exposes_less_accessible(effective_type_mask(binder.model(), &target_ty), member_mask)
+                {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::InconsistentAccessibility {
+                            position: SignaturePosition::OperatorReturnType,
+                            type_name: target_ty.to_string().into(),
+                            member: signature.clone().into(),
+                        },
+                        *span,
+                    ));
+                }
+                for parameter in parameters {
+                    let param_ty = binder.canonicalize(&bind_type(&parameter.ty));
+                    if exposes_less_accessible(effective_type_mask(binder.model(), &param_ty), member_mask)
+                    {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::InconsistentAccessibility {
+                                position: SignaturePosition::OperatorParameterType,
+                                type_name: param_ty.to_string().into(),
+                                member: signature.clone().into(),
+                            },
+                            *span,
+                        ));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     for member in &declaration.members {
@@ -858,6 +1086,11 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         }
     }
     binder.check_base_cycle(&enclosing, declaration);
+    match declaration.kind {
+        TypeKind::Interface => binder.check_interface_cycle(&enclosing, declaration),
+        TypeKind::Struct => binder.check_struct_layout_cycle(&enclosing, declaration),
+        _ => {}
+    }
     binder.check_interface_implementations(&enclosing, declaration);
     binder.check_overrides_have_base(&enclosing, declaration);
     binder.check_abstract_implementations(&enclosing, declaration);
@@ -1011,6 +1244,50 @@ pub(crate) fn method_signature(type_name: &str, method: &str, parameters: &[Para
     signature.into()
 }
 
+/// The comma-separated parameter-type list for an indexer/operator signature message (the `int` in
+/// `C.this[int]`, the `C, int` in `C.operator +(C, int)`). Uses `parameter_symbol`, so a nested
+/// type is under-qualified exactly like a CS0051 method signature.
+fn parameter_type_list(parameters: &[Parameter]) -> String {
+    let mut list = String::new();
+    for (index, parameter) in parameters.iter().enumerate() {
+        if index > 0 {
+            list.push_str(", ");
+        }
+        list.push_str(&alloc::format!("{}", parameter_symbol(parameter)));
+    }
+    list
+}
+
+/// The SOURCE symbol of a user-defined operator (`+`, `==`, `true`, ...) for a CS0056/CS0057
+/// signature message (`C.operator +(C, int)`), distinct from its `op_*` metadata name.
+fn operator_source_symbol(operator: OverloadableOperator) -> &'static str {
+    use OverloadableOperator as O;
+    match operator {
+        O::Plus => "+",
+        O::Minus => "-",
+        O::LogicalNot => "!",
+        O::BitwiseNot => "~",
+        O::Increment => "++",
+        O::Decrement => "--",
+        O::True => "true",
+        O::False => "false",
+        O::Multiply => "*",
+        O::Divide => "/",
+        O::Remainder => "%",
+        O::BitwiseAnd => "&",
+        O::BitwiseOr => "|",
+        O::ExclusiveOr => "^",
+        O::LeftShift => "<<",
+        O::RightShift => ">>",
+        O::Equality => "==",
+        O::Inequality => "!=",
+        O::GreaterThan => ">",
+        O::LessThan => "<",
+        O::GreaterThanOrEqual => ">=",
+        O::LessThanOrEqual => "<=",
+    }
+}
+
 fn named_symbol(namespace: &str, name: &str) -> TypeSymbol {
     let mut parts: Vec<Box<str>> = Vec::new();
     if !namespace.is_empty() {
@@ -1055,20 +1332,68 @@ fn default_value_string(model: &Model, ty: &TypeSymbol) -> Box<str> {
     value.into()
 }
 
-/// Whether a type is `public` by its own declared accessibility -- a conservative
-/// under-approximation of effective accessibility (10.5.4): a primitive, a reference or synthetic
-/// type (which default to public), an unresolved type, and an error are treated as public, and a
-/// non-public element makes an array, pointer, or byref non-public.
-fn is_public_own(model: &Model, ty: &TypeSymbol) -> bool {
+/// The accessibility DOMAIN (10.5.3) as a bitmask of the outer contexts a type or member reaches
+/// (the declaring type itself always reaches it, so it needs no bit): bit 0 = a derived type in
+/// this assembly, bit 1 = a derived type in another assembly, bit 2 = a non-derived type in this
+/// assembly, bit 3 = a non-derived type in another assembly. Intersection -- down a nesting chain,
+/// and to combine a member with its container -- is `&`; "at least as accessible" is bucket-superset
+/// (`a & b == b`). This encodes the `protected`/`internal` incomparability exactly: their masks
+/// (`0b0011`, `0b0101`) share only the derived-in-this-assembly bit, so neither covers the other.
+const ACCESS_FULL: u8 = 0b1111;
+
+/// The accessibility domain mask of a single declared accessibility.
+fn access_mask(accessibility: Accessibility) -> u8 {
+    match accessibility {
+        Accessibility::Public => ACCESS_FULL,
+        Accessibility::ProtectedInternal => 0b0111,
+        Accessibility::Protected => 0b0011,
+        Accessibility::Internal => 0b0101,
+        Accessibility::Private => 0b0000,
+    }
+}
+
+/// Whether a signature type (`exposed`) is NOT at least as accessible as the member exposing it
+/// (`member`) -- its domain misses a context the member reaches, so the member could hand a consumer
+/// a type it cannot name and the accessibility-consistency diagnostic fires (10.5.4).
+fn exposes_less_accessible(exposed: u8, member: u8) -> bool {
+    exposed & member != member
+}
+
+/// The effective accessibility (domain mask) of a type: its own declared accessibility intersected
+/// down its nesting chain. A predefined, unresolved, reference, or error type is treated as fully
+/// public (a safe under-report -- it never makes a signature look less accessible than it is); an
+/// array, pointer, or byref is as accessible as its element.
+fn effective_type_mask(model: &Model, ty: &TypeSymbol) -> u8 {
     match ty {
-        TypeSymbol::Special(_) | TypeSymbol::Error => true,
+        TypeSymbol::Special(_) | TypeSymbol::Error => ACCESS_FULL,
         TypeSymbol::Array { element, .. }
         | TypeSymbol::Pointer(element)
-        | TypeSymbol::ByRef(element) => is_public_own(model, element),
+        | TypeSymbol::ByRef(element) => effective_type_mask(model, element),
         TypeSymbol::Named(_) => model
             .get_by_symbol(ty)
-            .map_or(true, |info| info.accessibility == Accessibility::Public),
+            .map_or(ACCESS_FULL, |info| effective_info_mask(model, info)),
     }
+}
+
+/// The effective accessibility of a resolved type: its own accessibility intersected with its
+/// enclosing type's effective accessibility, walking the nesting chain outward.
+fn effective_info_mask(model: &Model, info: &TypeInfo) -> u8 {
+    let own = access_mask(info.accessibility);
+    match &info.enclosing {
+        None => own,
+        Some(enclosing) => own & enclosing_mask(model, enclosing),
+    }
+}
+
+/// The effective accessibility of the type named by a nested type's `enclosing` full name (e.g.
+/// `"N.Outer"`), found by splitting off the last name segment. An unresolved enclosing name imposes
+/// no restriction (a safe under-report).
+fn enclosing_mask(model: &Model, enclosing: &str) -> u8 {
+    let info = match enclosing.rfind('.') {
+        Some(dot) => model.get(&enclosing[..dot], &enclosing[dot + 1..]),
+        None => model.get("", enclosing),
+    };
+    info.map_or(ACCESS_FULL, |info| effective_info_mask(model, info))
 }
 
 fn type_is_resolvable(model: &Model, ty: &TypeSymbol) -> bool {
@@ -1298,6 +1623,170 @@ mod tests {
         assert_eq!(sorted_codes("public class C { public int Get() { return 0; } }"), []);
         assert_eq!(
             sorted_codes("public class C { private class Priv {} private Priv Get() { return null; } }"),
+            []
+        );
+    }
+
+    #[test]
+    fn inconsistent_accessibility_lattice() {
+        assert_eq!(
+            sorted_codes("public class C { protected class P {} internal void M(P x) {} }"),
+            [51]
+        );
+        assert_eq!(
+            sorted_codes("public class C { internal class I {} protected void M(I x) {} }"),
+            [51]
+        );
+        assert_eq!(
+            sorted_codes("public class C { internal class I {} protected internal void M(I x) {} }"),
+            [51]
+        );
+        assert_eq!(
+            sorted_codes("public class C { internal class I {} internal void M(I x) {} }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("public class C { protected class P {} protected void M(P x) {} }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("public class C { internal class I {} private void M(I x) {} }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "public class Outer { private class S {} public class Pub { public void M(S x) {} } }"
+            ),
+            [51]
+        );
+        assert_eq!(
+            sorted_codes("internal class T { private class H {} public void M(H x) {} }"),
+            [51]
+        );
+        assert_eq!(
+            sorted_codes("internal class T { public class Pub {} public Pub M() { return null; } }"),
+            []
+        );
+    }
+
+    #[test]
+    fn top_level_type_defaults_to_internal_accessibility() {
+        assert_eq!(
+            sorted_codes("class Plain {} public class C { public Plain M() { return null; } }"),
+            [50]
+        );
+        assert_eq!(
+            sorted_codes("class Plain {} internal class D { public Plain M() { return null; } }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("internal delegate void H(); public class C { public H f; }"),
+            [52]
+        );
+        assert_eq!(
+            sorted_codes("internal enum E { A } public class C { public E f; }"),
+            [52]
+        );
+        assert_eq!(
+            sorted_codes("public delegate void H(); public class C { public H f; }"),
+            []
+        );
+    }
+
+    #[test]
+    fn circular_type_dependencies_are_detected_not_looped() {
+        assert_eq!(sorted_codes("class A : B {} class B : A {}"), [146, 146]);
+        assert_eq!(sorted_codes("interface I : J {} interface J : I {}"), [529, 529]);
+        assert_eq!(sorted_codes("struct S { public S f; }"), [523]);
+        assert_eq!(
+            sorted_codes("struct A { public B b; } struct B { public A a; }"),
+            [523, 523]
+        );
+        assert_eq!(
+            sorted_codes("interface I : J {} interface J {} class C : I {}"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("struct Inner {} struct Outer { public Inner x; }"),
+            []
+        );
+        assert_eq!(sorted_codes("struct S { public static S s; }"), []);
+    }
+
+    #[test]
+    fn static_member_through_explicit_this_is_cs0176() {
+        assert_eq!(
+            sorted_codes("class C { static int P { get { return 0; } } int M() { return this.P; } }"),
+            [176]
+        );
+        assert_eq!(
+            sorted_codes("class C { int P { get { return 0; } } int M() { return this.P; } }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("class C { static int P { get { return 0; } } int M() { return P; } }"),
+            []
+        );
+    }
+
+    #[test]
+    fn inconsistent_accessibility_indexer_operator() {
+        assert_eq!(
+            sorted_codes("public class C { private class Sec {} public Sec this[int i] { get { return null; } } }"),
+            [54]
+        );
+        assert_eq!(
+            sorted_codes("public class C { private class Sec {} public int this[Sec s] { get { return 0; } } }"),
+            [55]
+        );
+        assert_eq!(
+            sorted_codes("public class C { private class Sec {} public static Sec operator +(C a, int b) { return null; } }"),
+            [56]
+        );
+        assert_eq!(
+            sorted_codes("public class C { private class Sec {} public static C operator +(C a, Sec b) { return null; } }"),
+            [57]
+        );
+        assert_eq!(
+            sorted_codes("public class C { private class Sec {} public static implicit operator Sec(C c) { return null; } }"),
+            [56]
+        );
+        assert_eq!(
+            sorted_codes("public class C { public class Pub {} public Pub this[int i] { get { return null; } } }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("public class C { public static C operator +(C a, C b) { return null; } }"),
+            []
+        );
+    }
+
+    #[test]
+    fn inconsistent_accessibility_delegate_event_interface() {
+        assert_eq!(sorted_codes("internal class S {} public delegate S D();"), [58]);
+        assert_eq!(
+            sorted_codes("internal class S {} public delegate void D(S x);"),
+            [59]
+        );
+        assert_eq!(sorted_codes("internal class S {} internal delegate S D();"), []);
+        assert_eq!(
+            sorted_codes("internal delegate void H(); public class C { public event H E; }"),
+            [7025]
+        );
+        assert_eq!(
+            sorted_codes("internal interface I {} public interface J : I {}"),
+            [61]
+        );
+        assert_eq!(
+            sorted_codes("public interface I {} public interface J : I {}"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("internal class Sec {} public interface I { void M(Sec s); }"),
+            [51]
+        );
+        assert_eq!(
+            sorted_codes("internal class Sec {} internal interface I { void M(Sec s); }"),
             []
         );
     }

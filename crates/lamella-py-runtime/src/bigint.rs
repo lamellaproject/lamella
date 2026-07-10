@@ -184,6 +184,38 @@ impl BigInt {
         }
     }
 
+    /// The modular inverse of `self` mod `modulus` -- the value `x` with `self * x` congruent to `1`
+    /// mod `modulus`, normalized to the modulus's floor-mod range ([0, m) for m > 0, (m, 0] for m < 0).
+    /// `None` when `self` is not invertible (gcd(self, modulus) != 1) or `modulus` is 0. Backs
+    /// `pow(a, -k, m)` (Python 3.8+). Iterative extended Euclidean, tracking the Bezout coefficient of
+    /// the initial dividend alongside the gcd descent.
+    #[must_use]
+    pub fn mod_inverse(&self, modulus: &BigInt) -> Option<BigInt> {
+        if modulus.is_zero() {
+            return None;
+        }
+        let m_abs = modulus.abs();
+        let (_, reduced) = self.divmod(&m_abs)?;
+        let mut old_r = reduced;
+        let mut r = m_abs;
+        let mut old_s = BigInt::from_i128(1);
+        let mut s = BigInt::zero();
+        while !r.is_zero() {
+            let (q, _) = old_r.divmod(&r)?;
+            let next_r = old_r.sub(&q.mul(&r));
+            let next_s = old_s.sub(&q.mul(&s));
+            old_r = r;
+            r = next_r;
+            old_s = s;
+            s = next_s;
+        }
+        if old_r.to_i128() != Some(1) {
+            return None;
+        }
+        let (_, inverse) = old_s.divmod(modulus)?;
+        Some(inverse)
+    }
+
     /// `self << bits` (multiply by `2^bits`); the sign is unchanged.
     #[must_use]
     pub fn shl(&self, bits: u64) -> BigInt {
@@ -586,6 +618,29 @@ mod tests {
         }
         let over = BigInt::from_i128(i128::MAX).add(&BigInt::from_i128(1));
         assert_eq!(over.to_i128(), None);
+    }
+
+    #[test]
+    fn mod_inverse_matches_known_values() {
+        let inv = |a: i128, m: i128| {
+            BigInt::from_i128(a).mod_inverse(&BigInt::from_i128(m)).and_then(|x| x.to_i128())
+        };
+        assert_eq!(inv(3, 7), Some(5));
+        assert_eq!(inv(3, 11), Some(4));
+        assert_eq!(inv(10, 17), Some(12));
+        assert_eq!(inv(7, 13), Some(2));
+        assert_eq!(inv(1, 5), Some(1));
+        assert_eq!(inv(5, 1), Some(0));
+        assert_eq!(inv(3, -7), Some(-2));
+        assert_eq!(inv(4, 8), None);
+        assert_eq!(inv(0, 5), None);
+        assert_eq!(inv(6, 9), None);
+        assert_eq!(inv(5, 0), None);
+        let m = big("1000000007");
+        let a = BigInt::from_i128(65537);
+        let inverse = a.mod_inverse(&m).unwrap();
+        let (_, product) = a.mul(&inverse).divmod(&m).unwrap();
+        assert_eq!(product.to_i128(), Some(1));
     }
 
     #[test]

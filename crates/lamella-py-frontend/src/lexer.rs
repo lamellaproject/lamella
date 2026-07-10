@@ -270,6 +270,14 @@ struct Lexer {
     tokens: Vec<Token>,
 }
 
+/// The kind of a (possibly prefixed) string literal -- a plain string, a `bytes`, or an f-string.
+#[derive(Clone, Copy)]
+enum StrKind {
+    Str,
+    Bytes,
+    FString,
+}
+
 impl Lexer {
     fn run(&mut self) -> Result<(), LexError> {
         loop {
@@ -292,6 +300,17 @@ impl Lexer {
 
     fn peek3(&self) -> Option<char> {
         self.chars.get(self.pos + 2).copied()
+    }
+
+    fn nth(&self, k: usize) -> Option<char> {
+        self.chars.get(self.pos + k).copied()
+    }
+
+    /// At the closing delimiter of a string literal -- one `quote` for a single-line literal, three
+    /// for a triple-quoted one.
+    fn at_str_close(&self, quote: char, triple: bool) -> bool {
+        self.peek() == Some(quote)
+            && (!triple || (self.peek2() == Some(quote) && self.peek3() == Some(quote)))
     }
 
     fn push(&mut self, kind: Tok) {
@@ -442,171 +461,188 @@ impl Lexer {
             || (c == '.' && matches!(self.peek2(), Some(d) if d.is_ascii_digit()))
         {
             self.lex_number()
-        } else if (c == 'f' || c == 'F') && matches!(self.peek2(), Some('\'' | '"')) {
-            self.lex_fstring()
-        } else if (c == 'r' || c == 'R') && matches!(self.peek2(), Some('\'' | '"')) {
-            self.lex_raw_string()
-        } else if (c == 'b' || c == 'B') && matches!(self.peek2(), Some('\'' | '"')) {
-            self.lex_bytes()
+        } else if let Some((prefix_len, raw, kind, triple)) = self.string_literal_start() {
+            self.pos += prefix_len;
+            match kind {
+                StrKind::Str => self.lex_string(raw, triple),
+                StrKind::Bytes => self.lex_bytes(raw, triple),
+                StrKind::FString => self.lex_fstring(raw, triple),
+            }
         } else if c == '_' || c.is_ascii_alphabetic() {
             self.lex_name();
             Ok(())
-        } else if c == '\'' || c == '"' {
-            if self.peek2() == Some(c) && self.peek3() == Some(c) {
-                self.lex_long_string(c)
-            } else {
-                self.lex_string()
-            }
         } else {
             self.lex_operator()
         }
     }
 
-    /// Lex a triple-quoted string (Language Reference 2.4.1): `'''...'''` or
-    /// `"""..."""`. Unlike a short string it may span lines (a literal newline becomes a
-    /// `\n` in the value); the same escape sequences apply, and a single or double quote
-    /// inside is an ordinary character. It closes at the next three matching quotes.
-    fn lex_long_string(&mut self, quote: char) -> Result<(), LexError> {
-        self.pos += 3;
-        let mut value = String::new();
-        loop {
-            match self.peek() {
-                None => return Err(self.err("unterminated triple-quoted string literal")),
-                Some(c)
-                    if c == quote
-                        && self.peek2() == Some(quote)
-                        && self.peek3() == Some(quote) =>
-                {
-                    self.pos += 3;
-                    self.push(Tok::Str(value));
-                    return Ok(());
-                }
-                Some('\\') => {
-                    self.pos += 1;
-                    self.lex_string_escape(&mut value)?;
-                }
-                Some('\n') => {
-                    value.push('\n');
-                    self.pos += 1;
-                    self.line += 1;
-                }
-                Some('\r') => {
-                    value.push('\n');
-                    self.pos += 1;
-                    if self.peek() == Some('\n') {
-                        self.pos += 1;
-                    }
-                    self.line += 1;
-                }
-                Some(c) => {
-                    value.push(c);
-                    self.pos += 1;
-                }
-            }
-        }
+    /// Recognize the start of a string literal: an optional prefix -- `r`/`b`/`f`/`u` (single) or
+    /// `rb`/`br`/`rf`/`fr` (raw bytes / raw f-string, either order, any case) -- then a quote, single
+    /// or triple. Returns `(prefix_len, raw, kind, triple)`, or `None` when the cursor is not at a
+    /// string (an ordinary name or an operator). A doubled / `bf` / `uu` letter combination is not a
+    /// prefix.
+    fn string_literal_start(&self) -> Option<(usize, bool, StrKind, bool)> {
+        let c1 = self.peek()?;
+        let (prefix_len, raw, kind) = if matches!(c1, '\'' | '"') {
+            (0, false, StrKind::Str)
+        } else if matches!(self.peek2(), Some('\'' | '"')) {
+            let (raw, kind) = match c1 {
+                'r' | 'R' => (true, StrKind::Str),
+                'b' | 'B' => (false, StrKind::Bytes),
+                'f' | 'F' => (false, StrKind::FString),
+                'u' | 'U' => (false, StrKind::Str),
+                _ => return None,
+            };
+            (1, raw, kind)
+        } else if matches!(self.peek3(), Some('\'' | '"')) {
+            let mut pair = [c1.to_ascii_lowercase(), self.peek2()?.to_ascii_lowercase()];
+            pair.sort_unstable();
+            let kind = match pair {
+                ['b', 'r'] => StrKind::Bytes,
+                ['f', 'r'] => StrKind::FString,
+                _ => return None,
+            };
+            (2, true, kind)
+        } else {
+            return None;
+        };
+        let quote = self.nth(prefix_len)?;
+        let triple =
+            self.nth(prefix_len + 1) == Some(quote) && self.nth(prefix_len + 2) == Some(quote);
+        Some((prefix_len, raw, kind, triple))
     }
 
-    /// Lex a short string literal (Language Reference 2.4.1): `'...'` or `"..."` on one
-    /// logical line, with the 2.4.1 escape sequences resolved. A `\`-newline continues
-    /// the line; an UNescaped newline or end-of-input before the close is an error; an
-    /// unrecognized escape keeps its backslash, exactly as CPython does (`'\d'` is `\d`).
-    /// Triple-quoted and prefixed (`r`/`b`/`f`/`u`) strings are outside this subset.
-    fn lex_string(&mut self) -> Result<(), LexError> {
+    /// Lex a string literal, the prefix (if any) already consumed and the cursor at the opening
+    /// quote. Handles all four shapes: single-line (`"..."`) or triple-quoted (`"""..."""`, which may
+    /// span lines -- a source newline becomes a single `\n`), and normal (2.4.1 escapes resolved; an
+    /// unrecognized escape keeps its backslash, as CPython does: `'\d'` is `\d`) or `raw` (every
+    /// backslash literal -- `r"a\tb"` is the four characters `a\tb` -- with a backslash keeping the
+    /// next character, even a quote, from ending the literal). A single-line literal may not contain
+    /// an unescaped newline.
+    fn lex_string(&mut self, raw: bool, triple: bool) -> Result<(), LexError> {
         let quote = self.peek().expect("lex_string called at a quote");
-        self.pos += 1;
+        self.pos += if triple { 3 } else { 1 };
         let mut value = String::new();
         loop {
-            match self.peek() {
-                None | Some('\n') | Some('\r') => {
-                    return Err(self.err("unterminated string literal"));
-                }
-                Some(c) if c == quote => {
-                    self.pos += 1;
-                    self.push(Tok::Str(value));
-                    return Ok(());
-                }
-                Some('\\') => {
-                    self.pos += 1;
-                    self.lex_string_escape(&mut value)?;
-                }
-                Some(c) => {
-                    value.push(c);
-                    self.pos += 1;
-                }
+            if self.at_str_close(quote, triple) {
+                self.pos += if triple { 3 } else { 1 };
+                self.push(Tok::Str(value));
+                return Ok(());
             }
-        }
-    }
-
-    /// Resolve one escape sequence (the leading backslash already consumed) into `out`.
-    /// Lex a raw string `r"..."` / `r'...'`: like [`Self::lex_string`] but backslashes are LITERAL
-    /// (no escapes) -- `r"a\tb"` is the four characters `a\tb`. A backslash still keeps the next
-    /// character from being special, so an escaped quote does not close the string (both the
-    /// backslash and the quote are kept), matching CPython's raw-string tokenizing.
-    fn lex_raw_string(&mut self) -> Result<(), LexError> {
-        self.pos += 1;
-        let quote = self.peek().expect("lex_raw_string called before the quote");
-        self.pos += 1;
-        let mut value = String::new();
-        loop {
             match self.peek() {
-                None | Some('\n') | Some('\r') => {
-                    return Err(self.err("unterminated string literal"));
-                }
-                Some(c) if c == quote => {
-                    self.pos += 1;
-                    self.push(Tok::Str(value));
-                    return Ok(());
-                }
-                Some('\\') => {
+                None => return Err(self.err("unterminated string literal")),
+                Some('\n' | '\r') if !triple => return Err(self.err("unterminated string literal")),
+                Some('\\') if raw => {
                     value.push('\\');
                     self.pos += 1;
                     match self.peek() {
-                        None | Some('\n') | Some('\r') => {
-                            return Err(self.err("unterminated string literal"));
+                        None => return Err(self.err("unterminated string literal")),
+                        Some('\n' | '\r') if !triple => {
+                            return Err(self.err("unterminated string literal"))
                         }
-                        Some(c) => {
-                            value.push(c);
-                            self.pos += 1;
-                        }
+                        Some(_) => self.push_string_char(&mut value),
                     }
                 }
-                Some(c) => {
-                    value.push(c);
+                Some('\\') => {
                     self.pos += 1;
+                    self.lex_string_escape(&mut value)?;
                 }
+                Some(_) => self.push_string_char(&mut value),
             }
         }
     }
 
-    /// Lex a single-line bytes literal `b"..."` / `b'...'` (the `b`/`B` not yet consumed): ASCII
-    /// source with the usual escapes, each contributing a BYTE (`\xhh` is one byte, not a code point).
-    /// Non-ASCII source characters are rejected (bytes literals are ASCII source). Produces `Tok::Bytes`.
-    fn lex_bytes(&mut self) -> Result<(), LexError> {
-        self.pos += 1;
+    /// Append the source character at the cursor to `value`, advancing; a source line ending (`\n`,
+    /// `\r`, or `\r\n`) becomes a single `\n` and bumps the line count. Reached only where a newline
+    /// is permitted (triple-quoted content, or an ordinary non-newline character).
+    fn push_string_char(&mut self, value: &mut String) {
+        match self.peek() {
+            Some('\r') => {
+                value.push('\n');
+                self.pos += 1;
+                if self.peek() == Some('\n') {
+                    self.pos += 1;
+                }
+                self.line += 1;
+            }
+            Some('\n') => {
+                value.push('\n');
+                self.pos += 1;
+                self.line += 1;
+            }
+            Some(c) => {
+                value.push(c);
+                self.pos += 1;
+            }
+            None => {}
+        }
+    }
+
+    /// Lex a bytes literal `b"..."` / `rb"..."` / `b"""..."""`, the prefix already consumed. ASCII
+    /// source, each source unit contributing a BYTE; a triple-quoted bytes literal may span lines (a
+    /// source newline is one `\n` byte). Normally the usual escapes are resolved (`\xhh` is one byte,
+    /// `\ooo` an octal byte); a `raw` bytes literal keeps every backslash LITERAL (and a backslash
+    /// keeps the next char from ending the literal). Non-ASCII source is rejected. Produces
+    /// `Tok::Bytes`.
+    fn lex_bytes(&mut self, raw: bool, triple: bool) -> Result<(), LexError> {
         let quote = self.peek().expect("lex_bytes called at a quote");
-        self.pos += 1;
+        self.pos += if triple { 3 } else { 1 };
         let mut out: Vec<u8> = Vec::new();
         loop {
+            if self.at_str_close(quote, triple) {
+                self.pos += if triple { 3 } else { 1 };
+                self.push(Tok::Bytes(out));
+                return Ok(());
+            }
             match self.peek() {
-                None | Some('\n' | '\r') => return Err(self.err("unterminated bytes literal")),
-                Some(c) if c == quote => {
+                None => return Err(self.err("unterminated bytes literal")),
+                Some('\n' | '\r') if !triple => return Err(self.err("unterminated bytes literal")),
+                Some('\\') if raw => {
+                    out.push(b'\\');
                     self.pos += 1;
-                    self.push(Tok::Bytes(out));
-                    return Ok(());
+                    match self.peek() {
+                        None => return Err(self.err("unterminated bytes literal")),
+                        Some('\n' | '\r') if !triple => {
+                            return Err(self.err("unterminated bytes literal"))
+                        }
+                        Some(_) => self.push_bytes_char(&mut out)?,
+                    }
                 }
                 Some('\\') => {
                     self.pos += 1;
                     self.lex_bytes_escape(&mut out)?;
                 }
-                Some(c) if c.is_ascii() => {
-                    out.push(c as u8);
-                    self.pos += 1;
-                }
-                Some(_) => {
-                    return Err(self.err("a bytes literal may contain only ASCII characters"));
-                }
+                Some(_) => self.push_bytes_char(&mut out)?,
             }
         }
+    }
+
+    /// Append the source character at the cursor to `out` as a byte, advancing; a source line ending
+    /// (`\n`, `\r`, or `\r\n`) becomes one `\n` byte and bumps the line count. Non-ASCII source is
+    /// rejected. Reached only where a newline is permitted (triple-quoted content or plain content).
+    fn push_bytes_char(&mut self, out: &mut Vec<u8>) -> Result<(), LexError> {
+        match self.peek() {
+            Some('\r') => {
+                out.push(b'\n');
+                self.pos += 1;
+                if self.peek() == Some('\n') {
+                    self.pos += 1;
+                }
+                self.line += 1;
+            }
+            Some('\n') => {
+                out.push(b'\n');
+                self.pos += 1;
+                self.line += 1;
+            }
+            Some(c) if c.is_ascii() => {
+                out.push(c as u8);
+                self.pos += 1;
+            }
+            Some(_) => return Err(self.err("a bytes literal may contain only ASCII characters")),
+            None => {}
+        }
+        Ok(())
     }
 
     /// One escape inside a bytes literal (the `\` already consumed): the same set as a string, but
@@ -669,6 +705,7 @@ impl Lexer {
         Ok(())
     }
 
+    /// Resolve one escape sequence (the leading backslash already consumed) into `out`.
     fn lex_string_escape(&mut self, out: &mut String) -> Result<(), LexError> {
         let c = match self.peek() {
             Some(c) => c,
@@ -739,28 +776,29 @@ impl Lexer {
         Ok(())
     }
 
-    /// Lex a single-line f-string `f"..."` / `f'...'` (the `f`/`F` not yet consumed):
-    /// literal text (escapes resolved, `{{`/`}}` -> `{`/`}`) interspersed with
-    /// `{expr[=][!conversion][:spec]}` replacement fields. The expression source is captured
-    /// for the parser; a `=` self-documenting marker, a `!r`/`!s` conversion, and a `:spec` are
-    /// split off here. Raw/triple-quoted f-strings are out of subset.
-    fn lex_fstring(&mut self) -> Result<(), LexError> {
-        self.pos += 1;
+    /// Lex an f-string `f"..."` / `rf"..."` / `f"""..."""`, the prefix already consumed: literal text
+    /// (escapes resolved, `{{`/`}}` -> `{`/`}`) interspersed with `{expr[=][!conversion][:spec]}`
+    /// replacement fields. The expression source is captured for the parser; a `=` self-documenting
+    /// marker, a `!r`/`!s` conversion, and a `:spec` are split off here. A triple-quoted f-string's
+    /// literal text may span lines (a field expression may not); in a `raw` f-string the literal-text
+    /// backslashes are LITERAL (a `{`/`}` still delimits a field).
+    fn lex_fstring(&mut self, raw: bool, triple: bool) -> Result<(), LexError> {
         let quote = self.peek().expect("lex_fstring called at a quote");
-        self.pos += 1;
+        self.pos += if triple { 3 } else { 1 };
         let mut parts = Vec::new();
         let mut literal = String::new();
         loop {
-            match self.peek() {
-                None | Some('\n') | Some('\r') => return Err(self.err("unterminated f-string")),
-                Some(c) if c == quote => {
-                    self.pos += 1;
-                    if !literal.is_empty() {
-                        parts.push(FStringPart::Literal(literal));
-                    }
-                    self.push(Tok::FString(parts));
-                    return Ok(());
+            if self.at_str_close(quote, triple) {
+                self.pos += if triple { 3 } else { 1 };
+                if !literal.is_empty() {
+                    parts.push(FStringPart::Literal(literal));
                 }
+                self.push(Tok::FString(parts));
+                return Ok(());
+            }
+            match self.peek() {
+                None => return Err(self.err("unterminated f-string")),
+                Some('\n' | '\r') if !triple => return Err(self.err("unterminated f-string")),
                 Some('{') if self.peek2() == Some('{') => {
                     literal.push('{');
                     self.pos += 2;
@@ -785,14 +823,21 @@ impl Lexer {
                 Some('}') => {
                     return Err(self.err("single '}' in an f-string (double it as '}}' for a literal)"));
                 }
+                Some('\\') if raw => {
+                    literal.push('\\');
+                    self.pos += 1;
+                    match self.peek() {
+                        Some('{' | '}') => {}
+                        None => return Err(self.err("unterminated f-string")),
+                        Some('\n' | '\r') if !triple => return Err(self.err("unterminated f-string")),
+                        Some(_) => self.push_string_char(&mut literal),
+                    }
+                }
                 Some('\\') => {
                     self.pos += 1;
                     self.lex_string_escape(&mut literal)?;
                 }
-                Some(c) => {
-                    literal.push(c);
-                    self.pos += 1;
-                }
+                Some(_) => self.push_string_char(&mut literal),
             }
         }
     }
@@ -1307,6 +1352,52 @@ mod tests {
         assert_eq!(kinds("r\"a\\tb\"\n")[0], Tok::Str("a\\tb".into()));
         assert_eq!(kinds("r\"x\\\"y\"\n")[0], Tok::Str("x\\\"y".into()));
         assert_eq!(kinds("R'\\d+'\n")[0], Tok::Str("\\d+".into()));
+    }
+
+    #[test]
+    fn combined_and_extra_string_prefixes_lex() {
+        let raw_x41 = vec![b'\\', b'x', b'4', b'1'];
+        assert_eq!(kinds("rb\"\\x41\"\n")[0], Tok::Bytes(raw_x41.clone()));
+        assert_eq!(kinds("br\"\\x41\"\n")[0], Tok::Bytes(raw_x41.clone()));
+        assert_eq!(kinds("Rb\"\\x41\"\n")[0], Tok::Bytes(raw_x41.clone()));
+        assert_eq!(kinds("bR\"\\x41\"\n")[0], Tok::Bytes(raw_x41));
+        assert_eq!(
+            kinds("rf\"\\d{1}\"\n")[0],
+            Tok::FString(vec![
+                FStringPart::Literal("\\d".into()),
+                FStringPart::Expr {
+                    text: "1".into(),
+                    conversion: None,
+                    spec: None,
+                    debug: None,
+                },
+            ])
+        );
+        assert_eq!(kinds("u'x'\n")[0], Tok::Str("x".into()));
+        assert_eq!(kinds("U'y'\n")[0], Tok::Str("y".into()));
+        assert_eq!(kinds("bb\"x\"\n")[0], Tok::Name("bb".into()));
+    }
+
+    #[test]
+    fn triple_quoted_strings_lex_across_prefixes() {
+        assert_eq!(kinds("\"\"\"a\nb\"\"\"\n")[0], Tok::Str("a\nb".into()));
+        assert_eq!(kinds("r\"\"\"a\\nb\"\"\"\n")[0], Tok::Str("a\\nb".into()));
+        assert_eq!(kinds("b\"\"\"hi\"\"\"\n")[0], Tok::Bytes(vec![b'h', b'i']));
+        assert_eq!(kinds("rb\"\"\"\\x\"\"\"\n")[0], Tok::Bytes(vec![b'\\', b'x']));
+        assert_eq!(
+            kinds("f\"\"\"a{1}\"\"\"\n")[0],
+            Tok::FString(vec![
+                FStringPart::Literal("a".into()),
+                FStringPart::Expr {
+                    text: "1".into(),
+                    conversion: None,
+                    spec: None,
+                    debug: None,
+                },
+            ])
+        );
+        assert_eq!(kinds("\"\"\"\"\"\"\n")[0], Tok::Str(String::new()));
+        assert_eq!(kinds("\"\"\"a\"b\"\"\"\n")[0], Tok::Str("a\"b".into()));
     }
 
     #[test]

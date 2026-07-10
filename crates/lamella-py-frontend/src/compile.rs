@@ -46,7 +46,7 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
                 }
             }
             Stmt::ClassDef { name, body, .. } => {
-                compile_class_method_bodies(name, body, &mut functions)?;
+                compile_class_method_bodies(name, body, &mut functions, &[])?;
                 top_level.push(stmt);
             }
             Stmt::Decorated { inner, .. } => {
@@ -57,7 +57,7 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
                         functions.extend(lambdas);
                     }
                     Stmt::ClassDef { name, body, .. } => {
-                        compile_class_method_bodies(name, body, &mut functions)?;
+                        compile_class_method_bodies(name, body, &mut functions, &[])?;
                     }
                     _ => {}
                 }
@@ -133,6 +133,7 @@ fn compile_method(
     qualified: &str,
     class_name: &str,
     method: &FuncDef,
+    enclosing: &[BTreeSet<String>],
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let body: Vec<&Stmt> = method.body.iter().collect();
     compile_code_object(
@@ -142,7 +143,7 @@ fn compile_method(
         &method.ret,
         &body,
         Some(class_name),
-        &[],
+        enclosing,
     )
 }
 
@@ -154,6 +155,7 @@ fn compile_class_method_bodies(
     class_name: &str,
     body: &[Stmt],
     functions: &mut Vec<bc::CodeObject>,
+    enclosing: &[BTreeSet<String>],
 ) -> Result<(), CompileError> {
     let names = method_qualified_names(class_name, body);
     for (i, member) in body.iter().enumerate() {
@@ -167,7 +169,7 @@ fn compile_class_method_bodies(
         };
         if let Some(method) = method {
             let qualified = names[i].as_ref().expect("a method has a qualified name");
-            let (co, lambdas) = compile_method(qualified, class_name, method)?;
+            let (co, lambdas) = compile_method(qualified, class_name, method, enclosing)?;
             functions.push(co);
             functions.extend(lambdas);
         }
@@ -175,24 +177,10 @@ fn compile_class_method_bodies(
     Ok(())
 }
 
-/// Whether a nested class would need to CAPTURE an enclosing function local -- in its body (a
-/// statement-level read, which goes through the class namespace `LoadName` and cannot reach a fast
-/// local) or in a method (which would need the class-body emitter to load the cell into the method's
-/// closure). A self-contained nested class (reading only globals, built-ins, and its own names) is
-/// compiled; one that captures an enclosing local is rejected. Returns the first offending name,
-/// if any.
-fn class_captures_enclosing_local(
-    body: &[Stmt],
-    base: &Option<Expr>,
-    child_scopes: &[BTreeSet<String>],
-) -> Option<String> {
-    let mut u = Uses::default();
-    for member in body {
-        walk_stmt_uses(member, &mut u);
-    }
-    if let Some(b) = base {
-        walk_expr_uses(b, &mut u);
-    }
+/// The names a class body binds: member assignment targets + method names (bare or decorated). A
+/// read of one of these inside the body is a class-local, resolved namespace-first (`LoadName`) so it
+/// reads the class attribute rather than a shadowed enclosing/module name.
+fn class_body_bound_names(body: &[Stmt]) -> BTreeSet<String> {
     let mut bound = BTreeSet::new();
     for member in body {
         if let Stmt::Assign(a) = member {
@@ -201,10 +189,7 @@ fn class_captures_enclosing_local(
             bound.insert(String::from(method));
         }
     }
-    u.direct
-        .into_iter()
-        .chain(u.child_free)
-        .find(|name| !bound.contains(name) && child_scopes.iter().any(|s| s.contains(name)))
+    bound
 }
 
 /// Resolve an annotation expression to a static type: a bare `int` is the typed
@@ -297,6 +282,7 @@ fn compile_code_object(
         finallys: Vec::new(),
         handler_depth: 0,
         in_class_body: false,
+        class_body_bound: BTreeSet::new(),
         current_class: current_class.map(String::from),
         name: String::from(name),
         hoisted: Vec::new(),
@@ -987,8 +973,8 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
             walk_expr_uses(context, u);
             walk_body_uses(body, u);
         }
-        Stmt::ClassDef { base, body, .. } => {
-            if let Some(b) = base {
+        Stmt::ClassDef { bases, body, .. } => {
+            for b in bases {
                 walk_expr_uses(b, u);
             }
             walk_body_uses(body, u);
@@ -1410,6 +1396,11 @@ struct Compiler {
     /// so a bare-name read emits `LoadName` (namespace -> global -> built-in) instead of
     /// `LoadGlobal` -- letting a member read a name the body bound earlier.
     in_class_body: bool,
+    /// The names bound in the class body currently being emitted (member assignments + method
+    /// names); empty outside a class body. A read of one of these resolves namespace-first
+    /// (`LoadName`), NOT as an enclosing function local/cell -- so a class attribute that shadows an
+    /// enclosing or module name reads the class attribute, matching CPython's class scope.
+    class_body_bound: BTreeSet<String>,
     /// The enclosing class name, so `super()` in a method resolves to its base.
     current_class: Option<String>,
     /// This code object's own name, used to prefix hoisted-lambda names for uniqueness.
@@ -1460,12 +1451,17 @@ impl Compiler {
             .map(|i| (self.cellvars.len() + i) as u32)
     }
 
-    /// Emit a read of `name`: a cell/free variable through `LoadDeref`, a plain local through
-    /// `LoadFast`; otherwise a `LoadGlobal`, or -- directly in a class body -- a `LoadName`, which
-    /// resolves the class namespace first (so a member can read a name the body bound earlier), then
-    /// falls back to global -> built-in. A nested def/lambda inside the body compiles in its own
-    /// scope (not `in_class_body`), so its reads stay Global/Fast/Deref, matching CPython.
+    /// Emit a read of `name`: a class-local (a name bound in the enclosing class body) through
+    /// `LoadName` (namespace -> global -> built-in); else a cell/free variable through `LoadDeref`, a
+    /// plain local through `LoadFast`, a module global through `LoadGlobal`, or -- for a NON-class-local
+    /// name read directly in a class body -- `LoadName`. A nested def/lambda inside the body compiles
+    /// in its own scope (not `in_class_body`), so its reads stay Global/Fast/Deref, matching CPython.
     fn emit_load_name(&mut self, name: &str) {
+        if self.in_class_body && self.class_body_bound.contains(name) {
+            let idx = self.name_index(name);
+            self.asm.emit(bc::Op::LoadName(idx));
+            return;
+        }
         if let Some(deref) = self.deref_slot(name) {
             self.asm.emit(bc::Op::LoadDeref(deref));
         } else if let Some(slot) = self.local_slot(name) {
@@ -1590,7 +1586,7 @@ impl Compiler {
                 value,
                 op,
             } => self.compile_setattr(obj, attr, value, *op),
-            Stmt::ClassDef { name, base, body } => self.compile_classdef(name, base, body),
+            Stmt::ClassDef { name, bases, body } => self.compile_classdef(name, bases, body),
             Stmt::Expr(expr) => {
                 self.compile_expr(expr)?;
                 self.asm.emit(bc::Op::PopTop);
@@ -2082,39 +2078,44 @@ impl Compiler {
     fn compile_classdef(
         &mut self,
         name: &str,
-        base: &Option<Expr>,
+        bases: &[Expr],
         body: &[Stmt],
     ) -> Result<(), CompileError> {
         let class_qual = if self.scope == Scope::Module {
             String::from(name)
         } else {
-            if class_captures_enclosing_local(body, base, &self.child_scopes).is_some() {
-                return Err(error(
-                    "a nested class capturing an enclosing function local is not yet supported",
-                ));
-            }
             let qualified = format!("{}.{}", self.name, name);
-            compile_class_method_bodies(&qualified, body, &mut self.hoisted)?;
+            let enclosing = self.child_scopes.clone();
+            compile_class_method_bodies(&qualified, body, &mut self.hoisted, &enclosing)?;
             qualified
         };
         let name_const = self.const_index(bc::Const::Str(String::from(name)));
         self.asm.emit(bc::Op::LoadConst(name_const));
-        match base {
-            Some(b) => self.compile_expr(b)?,
-            None => {
+        match bases {
+            [] => {
                 let none = self.const_index(bc::Const::None);
                 self.asm.emit(bc::Op::LoadConst(none));
+            }
+            [single] => self.compile_expr(single)?,
+            many => {
+                for b in many {
+                    self.compile_expr(b)?;
+                }
+                self.asm.emit(bc::Op::BuildTuple(many.len() as u32));
             }
         }
         self.asm.emit(bc::Op::SetupClassNamespace);
         self.in_class_body = true;
+        self.class_body_bound = class_body_bound_names(body);
         let names = method_qualified_names(&class_qual, body);
         for (i, member) in body.iter().enumerate() {
             match member {
                 Stmt::FuncDef(method) => {
                     let qualified = names[i].as_ref().expect("a method has a qualified name");
+                    let freevars = self.method_freevars(qualified);
                     let f = self.name_index(qualified);
-                    let flags = self.emit_param_defaults(&method.params)?;
+                    let mut flags = self.emit_param_defaults(&method.params)?;
+                    flags |= self.emit_captured_cells(&freevars);
                     self.asm.emit(bc::Op::MakeFunction { func: f, flags });
                     self.emit_store_member(&method.name);
                 }
@@ -2127,8 +2128,10 @@ impl Compiler {
                         self.compile_expr(decorator)?;
                     }
                     let qualified = names[i].as_ref().expect("a method has a qualified name");
+                    let freevars = self.method_freevars(qualified);
                     let f = self.name_index(qualified);
-                    let flags = self.emit_param_defaults(&method.params)?;
+                    let mut flags = self.emit_param_defaults(&method.params)?;
+                    flags |= self.emit_captured_cells(&freevars);
                     self.asm.emit(bc::Op::MakeFunction { func: f, flags });
                     for _ in decorators {
                         self.asm.emit(bc::Op::Call(1));
@@ -2145,6 +2148,7 @@ impl Compiler {
             }
         }
         self.in_class_body = false;
+        self.class_body_bound = BTreeSet::new();
         self.asm.emit(bc::Op::BuildClass);
         self.emit_store_name(name);
         Ok(())
@@ -2155,6 +2159,18 @@ impl Compiler {
     fn emit_store_member(&mut self, simple_name: &str) {
         let idx = self.name_index(simple_name);
         self.asm.emit(bc::Op::StoreName(idx));
+    }
+
+    /// The freevars of an already-compiled class method (hoisted under its qualified name) -- the
+    /// enclosing-function locals it captures, loaded as cells at its `MakeFunction`. Empty for a
+    /// top-level class (its methods compiled without an enclosing scope) or a method that captures
+    /// nothing.
+    fn method_freevars(&self, qualified: &str) -> Vec<String> {
+        self.hoisted
+            .iter()
+            .find(|c| c.name == qualified)
+            .map(|c| c.freevars.clone())
+            .unwrap_or_default()
     }
 
     /// `for target in <iterable>:` over a general iterable -- the iterator protocol. The
@@ -3205,6 +3221,56 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_class_method_capturing_a_param_is_a_closure() {
+        let src = "def make_adder(n):\n    class Adder:\n        def add(self, x):\n            \
+                   return x + n\n    return Adder()\n";
+        let module = compile_src(src).unwrap();
+        let outer = func(&module, "make_adder");
+        assert_eq!(outer.cellvars, [String::from("n")]);
+        assert!(outer.freevars.is_empty());
+        assert!(outer.ops.iter().any(|op| matches!(op, Op::LoadClosure(0))));
+        assert!(outer
+            .ops
+            .iter()
+            .any(|op| matches!(op, Op::MakeFunction { flags, .. } if flags & 0x04 != 0)));
+        let method = func(&module, "make_adder.Adder.add");
+        assert!(method.cellvars.is_empty());
+        assert_eq!(method.freevars, [String::from("n")]);
+        assert_eq!(
+            &method.ops[..4],
+            &[Op::LoadFast(1), Op::LoadDeref(0), Op::Binary(BinOp::Add), Op::Return]
+        );
+    }
+
+    #[test]
+    fn a_top_level_class_method_reads_a_global_not_a_cell() {
+        let module = compile_src("G = 10\nclass C:\n    def m(self):\n        return G\n").unwrap();
+        let m = func(&module, "C.m");
+        assert!(m.cellvars.is_empty());
+        assert!(m.freevars.is_empty());
+        assert!(m.ops.iter().any(|op| matches!(op, Op::LoadGlobal(_))));
+        assert!(!m.ops.iter().any(|op| matches!(op, Op::LoadDeref(_))));
+    }
+
+    #[test]
+    fn a_nested_class_body_reads_an_enclosing_local_directly() {
+        let m = compile_src("def f(n):\n    class A:\n        x = n\n    return A\n").unwrap();
+        let f = func(&m, "f");
+        assert!(f.cellvars.is_empty());
+        assert!(f.ops.iter().any(|op| matches!(op, Op::LoadFast(0))));
+    }
+
+    #[test]
+    fn a_class_attribute_shadowing_an_outer_name_resolves_namespace_first() {
+        let m = compile_src("G = 99\nclass A:\n    G = 5\n    x = G\n").unwrap();
+        let g_idx = m.body.names.iter().position(|n| n == "G").map(|i| i as u32);
+        assert!(
+            m.body.ops.iter().any(|op| matches!(op, Op::LoadName(i) if Some(*i) == g_idx)),
+            "the shadowing class attribute reads namespace-first (LoadName), not LoadFast"
+        );
+    }
+
+    #[test]
     fn a_freevar_bubbles_through_an_intermediate_closure() {
         let src = "def repeat(times):\n    def deco(fn):\n        def wrapper(x):\n            \
                    return fn(x) + times\n        return wrapper\n    return deco\n";
@@ -3360,6 +3426,20 @@ mod tests {
     }
 
     #[test]
+    fn multiple_bases_emit_a_bases_tuple() {
+        let m = compile_src("class A: pass\nclass B: pass\nclass C(A, B):\n    pass\n").unwrap();
+        assert!(
+            m.body.ops.iter().any(|op| matches!(op, Op::BuildTuple(2))),
+            "the two bases build a 2-tuple"
+        );
+        let m2 = compile_src("class A: pass\nclass B(A):\n    pass\n").unwrap();
+        assert!(
+            !m2.body.ops.iter().any(|op| matches!(op, Op::BuildTuple(_))),
+            "a single base does not build a bases tuple"
+        );
+    }
+
+    #[test]
     fn nested_classes_hoist_scope_qualified_methods() {
         let m = compile_src(
             "def make():\n    class Local:\n        def hi(self):\n            return 1\n    return Local()\n",
@@ -3379,7 +3459,7 @@ mod tests {
         assert!(compile_src(
             "def f(n):\n    class C:\n        def g(self):\n            return n\n    return C()\n"
         )
-        .is_err());
+        .is_ok());
     }
 
     #[test]

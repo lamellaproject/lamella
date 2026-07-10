@@ -299,6 +299,22 @@ impl Model {
         }
     }
 
+    /// Promotes every non-public, non-nested, this-assembly type to `internal` -- the default
+    /// accessibility of a top-level type (10.2.3). Collection derives accessibility from modifiers,
+    /// which defaults to `private` (right for a nested member, wrong for a top-level type), so this
+    /// corrects the default once every type's `enclosing` is known. Reference (external) types keep
+    /// their metadata accessibility, and an explicitly `public` type is left alone.
+    pub fn default_toplevel_types_to_internal(&mut self) {
+        for info in self.types.values_mut() {
+            if !info.is_external
+                && info.enclosing.is_none()
+                && info.accessibility != Accessibility::Public
+            {
+                info.accessibility = Accessibility::Internal;
+            }
+        }
+    }
+
     /// Resolves a written base to the symbol of a model type of `kind`: by exact match,
     /// else (for an unqualified base such as a `using`-imported `Exception` or
     /// `IEnumerator`) by a unique simple-name match across namespaces. `None` if no such

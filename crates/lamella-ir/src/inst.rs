@@ -718,6 +718,46 @@ pub enum Inst {
         /// The size in bytes of one element.
         element_size: u32,
     },
+    /// Allocates a rank-N (N >= 3) rectangular array -- the CLI's `int[,,...]::.ctor`. The layout is
+    /// `[dim0][dim1]...[dim(N-1)][elements]`: N u32 dimension words, then the elements row-major, so the
+    /// size is `4*N + (dim0*dim1*...*dim(N-1))*element_size`. `dims` holds the N dimension lengths in
+    /// order. The result is the array `ObjectRef` (the header base). Rank 1 is [`AllocArray`], rank 2 is
+    /// [`AllocArray2D`] (this generalizes it; a rank-N Horner index folds to their forms at N=1/2).
+    AllocArrayMD {
+        /// The array type's identity, for the emitted TypeDesc.
+        handle: TypeHandle,
+        /// The N dimension lengths, in order (`dims[0]` is the outermost / slowest-varying).
+        dims: alloc::boxed::Box<[ValueId]>,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
+    /// Loads element `(indices[0], ..., indices[N-1])` of a rank-N `array` -- the CLI's `int[,,...]::Get`.
+    /// Row-major: the element sits at `array + 4*N + flat*element_size` where the flat index is the Horner
+    /// fold `((...(i0*dim1 + i1)*dim2 + i2)...)*dim(N-1) + i(N-1)` (each `dim_k` read from `[array+4*k]`),
+    /// with a per-dimension bounds check (`indices[k] < dim_k`). A sub-word element is sign-/zero-extended
+    /// per `signed`.
+    ArrayMDLoad {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The N indices, in order.
+        indices: alloc::boxed::Box<[ValueId]>,
+        /// The size in bytes of one element.
+        element_size: u32,
+        /// Whether a sub-word element is sign-extended (signed) or zero-extended (unsigned).
+        signed: bool,
+    },
+    /// Stores `value` into element `(indices[0], ..., indices[N-1])` of a rank-N `array` -- the CLI's
+    /// `int[,,...]::Set`. A side effect; the instruction's result is a placeholder callers ignore.
+    ArrayMDStore {
+        /// The array `ObjectRef`.
+        array: ValueId,
+        /// The N indices, in order.
+        indices: alloc::boxed::Box<[ValueId]>,
+        /// The value to store (its width comes from its type).
+        value: ValueId,
+        /// The size in bytes of one element.
+        element_size: u32,
+    },
     /// Loads a static field -- the CLI's `ldsfld`. `offset` is the field's byte offset within the
     /// module's static storage region (the target adds its static base). Static fields holding an
     /// `ObjectRef` are GC roots the collector must scan; only scalar statics are lowered so far.

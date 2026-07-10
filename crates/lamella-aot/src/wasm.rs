@@ -319,6 +319,9 @@ fn uses_memory(funcs: &[Function]) -> bool {
                     | Inst::AllocArray2D { .. }
                     | Inst::Array2DLoad { .. }
                     | Inst::Array2DStore { .. }
+                    | Inst::AllocArrayMD { .. }
+                    | Inst::ArrayMDLoad { .. }
+                    | Inst::ArrayMDStore { .. }
                     | Inst::StaticLoad { .. }
                     | Inst::StaticStore { .. }
                     | Inst::StringLiteral { .. }
@@ -1459,26 +1462,57 @@ fn lower_inst(
                 Some(t) => BlockType::Value(valtype(t)?),
                 None => BlockType::Empty,
             };
+            let arg_locals: Vec<u32> = args.iter().map(|&a| local(a)).collect();
+            let del = body.add_local(ValType::I32);
+            let index = body.add_local(ValType::I32);
+            let last = match result_ty {
+                Some(t) => Some(body.add_local(valtype(t)?)),
+                None => None,
+            };
+            body.i32_const(0);
+            body.local_set(index);
             body.local_get(local(*delegate));
+            body.i32_load(MemArg::new(4, 8));
+            body.if_(BlockType::Empty);
+            body.block(BlockType::Empty);
+            body.loop_(BlockType::Empty);
+            body.local_get(index);
+            body.local_get(local(*delegate));
+            body.i32_load(MemArg::new(4, 8));
             body.i32_load(MemArg::new(4, 0));
-            body.if_(bt);
+            body.i32_ge_u();
+            body.br_if(1);
             body.local_get(local(*delegate));
+            body.i32_load(MemArg::new(4, 8));
+            body.i32_const(4);
+            body.i32_add();
+            body.local_get(index);
+            body.i32_const(4);
+            body.i32_mul();
+            body.i32_add();
             body.i32_load(MemArg::new(4, 0));
-            for &arg in args.iter() {
-                body.local_get(local(arg));
+            body.local_set(del);
+            emit_delegate_dispatch(body, del, &arg_locals, bt, with_idx, without_idx);
+            if let Some(l) = last {
+                body.local_set(l);
             }
-            body.local_get(local(*delegate));
-            body.i32_load(MemArg::new(4, 4));
-            body.call_indirect(with_idx, 0);
-            body.else_();
-            for &arg in args.iter() {
-                body.local_get(local(arg));
-            }
-            body.local_get(local(*delegate));
-            body.i32_load(MemArg::new(4, 4));
-            body.call_indirect(without_idx, 0);
+            body.local_get(index);
+            body.i32_const(1);
+            body.i32_add();
+            body.local_set(index);
+            body.br(0);
             body.end();
-            if result_ty.is_some() {
+            body.end();
+            body.else_();
+            body.local_get(local(*delegate));
+            body.local_set(del);
+            emit_delegate_dispatch(body, del, &arg_locals, bt, with_idx, without_idx);
+            if let Some(l) = last {
+                body.local_set(l);
+            }
+            body.end();
+            if let Some(l) = last {
+                body.local_get(l);
                 body.local_set(local(result));
             }
         }
@@ -1539,6 +1573,54 @@ fn lower_inst(
             body.i32_add();
             body.local_set(local(result));
         }
+        Inst::AllocArrayMD {
+            dims,
+            element_size,
+            ..
+        } => {
+            body.local_get(local(dims[0]));
+            for d in &dims[1..] {
+                body.local_get(local(*d));
+                body.i32_mul();
+            }
+            body.i32_const(*element_size as i32);
+            body.i32_mul();
+            body.i32_const(4 * dims.len() as i32);
+            body.i32_add();
+            body.i32_const(7);
+            body.i32_add();
+            body.i32_const(!7);
+            body.i32_and();
+            body.global_get(HEAP_POINTER);
+            body.local_tee(local(result));
+            body.i32_add();
+            body.global_set(HEAP_POINTER);
+            for (k, d) in dims.iter().enumerate() {
+                body.local_get(local(result));
+                body.local_get(local(*d));
+                body.i32_store(MemArg::new(4, (4 * k) as u32));
+            }
+        }
+        Inst::ArrayMDLoad {
+            array,
+            indices,
+            element_size,
+            signed,
+        } => {
+            emit_md_element_address(body, local, *array, indices, *element_size);
+            emit_array_load(body, *element_size, *signed, value_types[result.index()])?;
+            body.local_set(local(result));
+        }
+        Inst::ArrayMDStore {
+            array,
+            indices,
+            value,
+            element_size,
+        } => {
+            emit_md_element_address(body, local, *array, indices, *element_size);
+            body.local_get(local(*value));
+            emit_array_store(body, *element_size, value_types[value.index()])?;
+        }
         _ => return Err(LowerError::Unsupported),
     }
     Ok(())
@@ -1581,6 +1663,77 @@ fn emit_2d_element_address(
     body.i32_const(element_size as i32);
     body.i32_mul();
     body.i32_add();
+}
+
+/// Leaves the address of rank-N element `(indices[0..N])` on the stack: bounds-check each index against
+/// its dimension word `[array + 4*k]` (unsigned; `unreachable` on failure), then compute `array + 4*N +
+/// flat*element_size` where the flat index is the Horner fold `((..(i0*dim1 + i1)*dim2 + i2)..) +
+/// i(N-1)`. The stack-machine form nests naturally: each step multiplies the running flat by the next
+/// dimension and adds the next index. Generalizes `emit_2d_element_address` from 2 dimensions to N.
+fn emit_md_element_address(
+    body: &mut Func,
+    local: &impl Fn(ValueId) -> u32,
+    array: ValueId,
+    indices: &[ValueId],
+    element_size: u32,
+) {
+    let n = indices.len();
+    for (k, &idx) in indices.iter().enumerate() {
+        body.local_get(local(idx));
+        body.local_get(local(array));
+        body.i32_load(MemArg::new(4, (4 * k) as u32));
+        body.i32_ge_u();
+        body.if_(BlockType::Empty);
+        body.unreachable();
+        body.end();
+    }
+    body.local_get(local(array));
+    body.i32_const(4 * n as i32);
+    body.i32_add();
+    body.local_get(local(indices[0]));
+    for (k, &idx) in indices.iter().enumerate().skip(1) {
+        body.local_get(local(array));
+        body.i32_load(MemArg::new(4, (4 * k) as u32));
+        body.i32_mul();
+        body.local_get(local(idx));
+        body.i32_add();
+    }
+    body.i32_const(element_size as i32);
+    body.i32_mul();
+    body.i32_add();
+}
+
+/// Emits the dispatch of ONE delegate held in `del` (a linear-memory address): read `_target@0` -- a
+/// non-null target is the instance receiver (pushed as arg0 ahead of the explicit args), a null target
+/// is a static method -- then `call_indirect` the `_methodPtr@4` funcref table index against the matching
+/// signature. Shared by the single-cast and multicast (per-element) paths of `InvokeDelegate`.
+fn emit_delegate_dispatch(
+    body: &mut Func,
+    del: u32,
+    arg_locals: &[u32],
+    bt: BlockType,
+    with_idx: u32,
+    without_idx: u32,
+) {
+    body.local_get(del);
+    body.i32_load(MemArg::new(4, 0));
+    body.if_(bt);
+    body.local_get(del);
+    body.i32_load(MemArg::new(4, 0));
+    for &a in arg_locals {
+        body.local_get(a);
+    }
+    body.local_get(del);
+    body.i32_load(MemArg::new(4, 4));
+    body.call_indirect(with_idx, 0);
+    body.else_();
+    for &a in arg_locals {
+        body.local_get(a);
+    }
+    body.local_get(del);
+    body.i32_load(MemArg::new(4, 4));
+    body.call_indirect(without_idx, 0);
+    body.end();
 }
 
 /// Whether `value`'s local holds a linear-memory address that a field access can dereference: a heap
@@ -3071,5 +3224,76 @@ mod tests {
         let bytes = lower(&array_2d()).expect("a 2-D array lowers to WASM");
         assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
         assert!(uses_memory(&[array_2d()]));
+    }
+
+    /// A rank-3 rectangular array `int[2,3,4]`: `a[1,2,3] = 42; return a[1,2,3]`. Exercises
+    /// `AllocArrayMD` + `ArrayMDStore`/`ArrayMDLoad` (the Horner flat index 1*3*4 + 2*4 + 3 = 23).
+    fn array_3d() -> Function {
+        let i32t = MirType::I32;
+        let n = ValueId;
+        let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+        Function {
+            params: Vec::new(),
+            ret: Some(i32t),
+            value_types: alloc::vec![
+                i32t,
+                i32t,
+                i32t,
+                MirType::ObjectRef,
+                i32t,
+                i32t,
+                i32t,
+                i32t,
+                i32t,
+                i32t,
+            ],
+            entry: BlockId(0),
+            blocks: alloc::vec![BasicBlock {
+                params: Vec::new(),
+                insts: alloc::vec![
+                    (n(0), c(2)),
+                    (n(1), c(3)),
+                    (n(2), c(4)),
+                    (
+                        n(3),
+                        Inst::AllocArrayMD {
+                            handle: lamella_ir::TypeHandle(1),
+                            dims: alloc::vec![n(0), n(1), n(2)].into_boxed_slice(),
+                            element_size: 4,
+                        },
+                    ),
+                    (n(4), c(1)),
+                    (n(5), c(2)),
+                    (n(6), c(3)),
+                    (n(7), c(42)),
+                    (
+                        n(8),
+                        Inst::ArrayMDStore {
+                            array: n(3),
+                            indices: alloc::vec![n(4), n(5), n(6)].into_boxed_slice(),
+                            value: n(7),
+                            element_size: 4,
+                        },
+                    ),
+                    (
+                        n(9),
+                        Inst::ArrayMDLoad {
+                            array: n(3),
+                            indices: alloc::vec![n(4), n(5), n(6)].into_boxed_slice(),
+                            element_size: 4,
+                            signed: false,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(n(9)))),
+            }],
+        }
+    }
+
+    #[test]
+    fn lowers_a_3d_array() {
+        let bytes = lower(&array_3d()).expect("a 3-D array lowers to WASM");
+        assert_eq!(&bytes[0..4], &[0x00, 0x61, 0x73, 0x6D]);
+        assert!(uses_memory(&[array_3d()]));
     }
 }

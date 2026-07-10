@@ -16,11 +16,21 @@ use lamella_ir::{
 /// resolver shifts them), so a throw/dispatch and an `ldsfld`/`stsfld` never alias.
 const G_EXCEPTION_TAG_OFFSET: u32 = 0;
 
-/// A single-cast delegate's field offsets within its heap object: `object _target` (a GC ref) first,
-/// then `IntPtr _methodPtr` (the `ldftn` code address). The object pointer is the payload start, so
-/// these are absolute offsets. The layout matches the managed `System.Delegate` the runtime defines.
-const DELEGATE_TARGET_OFFSET: u32 = 0;
+/// A delegate's field offsets within its heap object: `object _target` (a GC ref) first, then
+/// `IntPtr _methodPtr` (the `ldftn` code address), then `Delegate[] _invocationList` (a GC ref, null for
+/// single-cast; the multicast chain otherwise). The object pointer is the payload start, so these are
+/// absolute offsets. Every delegate instance carries all three (a C# delegate type derives from
+/// `MulticastDelegate`), so the object is `DELEGATE_SIZE` bytes -- the layout matches the managed
+/// `System.Delegate`/`MulticastDelegate` the corlib defines, and the `InvokeDelegate` lowering reads
+/// `_invocationList` at `[obj+8]` to choose single-cast vs multicast dispatch.
+pub(crate) const DELEGATE_TARGET_OFFSET: u32 = 0;
 const DELEGATE_METHODPTR_OFFSET: u32 = 4;
+pub(crate) const DELEGATE_INVOCATION_LIST_OFFSET: u32 = 8;
+/// The heap size of every delegate instance: `_target` + `_methodPtr` + `_invocationList`, three words.
+/// (The metadata layout of a program's delegate type reports 0 own fields -- they are all inherited from
+/// the corlib's `Delegate`/`MulticastDelegate`, which a single-assembly layout pass does not resolve --
+/// so the AOT sets the size here from the fixed delegate layout.)
+pub(crate) const DELEGATE_SIZE: u32 = 12;
 
 /// Why a method body could not be lowered to MIR.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +219,15 @@ pub trait CallResolver {
         None
     }
 
+    /// The rank-N (N>=3) rectangular-array operation a `newobj`/`call` operand names -- the
+    /// `int[,,]::.ctor`/`Get`/`Set` pseudo-method on an array TypeSpec of rank >= 3, or `None`. The 2-D
+    /// forms go through [`array_2d_op`]; this recognizes rank >= 3 the same way (decoding the operand's
+    /// MemberRef parent as an array signature), the rank driving how many indices/dimensions to pop.
+    /// Defaults to `None`.
+    fn array_md_op(&self, _operand: &Operand) -> Option<ArrayMDOp> {
+        None
+    }
+
     /// The byte offset of a static field (an `ldsfld`/`stsfld` operand token) within the module's
     /// static storage region. Defaults to `None`.
     fn static_field_offset(&self, _operand: &Operand) -> Option<u32> {
@@ -347,6 +366,41 @@ pub enum Array2DOp {
     Set {
         /// The size in bytes of one element.
         element_size: u32,
+    },
+}
+
+/// A rank-N (N>=3) rectangular-array pseudo-method a `newobj`/`call` names (`int[,,]::.ctor`/`Get`/`Set`
+/// on an array TypeSpec of rank >= 3). Generalizes [`Array2DOp`] to N dimensions -- the `rank` drives how
+/// many indices/dimensions the lowering pops -- emitting the matching rank-N MIR primitive.
+pub enum ArrayMDOp {
+    /// `newobj int[,,]::.ctor(dim0, ..., dim(N-1))` -- allocate; carries the array identity, element
+    /// size, and rank (the dimension count to pop).
+    New {
+        /// The array type's identity, for the emitted TypeDesc.
+        handle: TypeHandle,
+        /// The size in bytes of one element.
+        element_size: u32,
+        /// The array's rank -- the number of dimension arguments.
+        rank: usize,
+    },
+    /// `call int[,,]::Get(i0, ..., i(N-1))` -- load; carries the element width/signedness, the loaded
+    /// type, and the rank (the index count to pop).
+    Get {
+        /// The size in bytes of one element.
+        element_size: u32,
+        /// Whether a sub-word element is sign-extended (signed) or zero-extended.
+        signed: bool,
+        /// The MIR type of the loaded element (the `Get` result).
+        element_type: MirType,
+        /// The array's rank -- the number of index arguments.
+        rank: usize,
+    },
+    /// `call int[,,]::Set(i0, ..., i(N-1), value)` -- store (the value's width comes from its type).
+    Set {
+        /// The size in bytes of one element.
+        element_size: u32,
+        /// The array's rank -- the number of index arguments (before the value).
+        rank: usize,
     },
 }
 
@@ -1930,6 +1984,54 @@ fn apply_value_op(
                 }
                 _ => {}
             }
+            match resolver.array_md_op(&inst.operand) {
+                Some(ArrayMDOp::Get {
+                    element_size,
+                    signed,
+                    element_type,
+                    rank,
+                }) => {
+                    let mut indices = Vec::with_capacity(rank);
+                    for _ in 0..rank {
+                        indices.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+                    }
+                    indices.reverse();
+                    let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, element_type);
+                    insts.push((
+                        result,
+                        Inst::ArrayMDLoad {
+                            array,
+                            indices: indices.into_boxed_slice(),
+                            element_size,
+                            signed,
+                        },
+                    ));
+                    stack.push(result);
+                    return Ok(());
+                }
+                Some(ArrayMDOp::Set { element_size, rank }) => {
+                    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let mut indices = Vec::with_capacity(rank);
+                    for _ in 0..rank {
+                        indices.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+                    }
+                    indices.reverse();
+                    let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((
+                        result,
+                        Inst::ArrayMDStore {
+                            array,
+                            indices: indices.into_boxed_slice(),
+                            value,
+                            element_size,
+                        },
+                    ));
+                    return Ok(());
+                }
+                _ => {}
+            }
             let info = resolver
                 .resolve(&inst.operand)
                 .ok_or(CilError::UnresolvedCall)?;
@@ -2626,6 +2728,15 @@ fn apply_value_op(
                     };
                 store(insts, value_types, DELEGATE_TARGET_OFFSET, target);
                 store(insts, value_types, DELEGATE_METHODPTR_OFFSET, method_ptr);
+                let null_list = new_value(value_types, MirType::ObjectRef);
+                insts.push((
+                    null_list,
+                    Inst::ConstInt {
+                        ty: MirType::ObjectRef,
+                        value: 0,
+                    },
+                ));
+                store(insts, value_types, DELEGATE_INVOCATION_LIST_OFFSET, null_list);
                 stack.push(obj);
                 return Ok(());
             }
@@ -2643,6 +2754,29 @@ fn apply_value_op(
                         handle,
                         dim0,
                         dim1,
+                        element_size,
+                    },
+                ));
+                stack.push(array);
+                return Ok(());
+            }
+            if let Some(ArrayMDOp::New {
+                handle,
+                element_size,
+                rank,
+            }) = resolver.array_md_op(&inst.operand)
+            {
+                let mut dims = Vec::with_capacity(rank);
+                for _ in 0..rank {
+                    dims.push(stack.pop().ok_or(CilError::StackUnderflow)?);
+                }
+                dims.reverse();
+                let array = new_value(value_types, MirType::ObjectRef);
+                insts.push((
+                    array,
+                    Inst::AllocArrayMD {
+                        handle,
+                        dims: dims.into_boxed_slice(),
                         element_size,
                     },
                 ));

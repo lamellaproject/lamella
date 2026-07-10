@@ -612,6 +612,7 @@ fn rd_cstr(bytes: &[u8], o: usize) -> Result<&str, ElfError> {
     core::str::from_utf8(&rest[..end]).map_err(|_| ElfError::Truncated)
 }
 
+const SH_NAME: usize = 0;
 const SH_TYPE: usize = 4;
 const SH_FLAGS: usize = 8;
 const SH_OFFSET: usize = 16;
@@ -644,6 +645,10 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     let e_shoff = rd_u32(bytes, 32)? as usize;
     let e_shnum = rd_u16(bytes, 48)? as usize;
     let sh = |i: usize, field: usize| rd_u32(bytes, e_shoff + i * 40 + field);
+    let shstrtab_off = sh(rd_u16(bytes, 50)? as usize, SH_OFFSET)? as usize;
+    let sec_name = |i: usize| rd_cstr(bytes, shstrtab_off + sh(i, SH_NAME)? as usize);
+    let is_unwind_metadata =
+        |name: &str| name.starts_with(".eh_frame") || name.starts_with(".ARM.ex");
 
     let mut symtab_i = None;
     let mut section_base: Vec<Option<u32>> = Vec::new();
@@ -656,7 +661,10 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             symtab_i = Some(i);
         }
         let flags = sh(i, SH_FLAGS)?;
-        let merge = sh(i, SH_TYPE)? == 1 && flags & SHF_ALLOC != 0 && flags & SHF_WRITE == 0;
+        let merge = sh(i, SH_TYPE)? == 1
+            && flags & SHF_ALLOC != 0
+            && flags & SHF_WRITE == 0
+            && !is_unwind_metadata(sec_name(i)?);
         if !merge {
             continue;
         }

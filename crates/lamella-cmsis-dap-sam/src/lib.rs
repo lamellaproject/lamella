@@ -25,9 +25,35 @@ pub trait Samd21Debug {
     /// plain vector catch): catch armed under held `nRESET`, then the cold-plugging
     /// extension released INTO the catch.
     fn samd21_reset_halt(&mut self) -> Result<(), DapError>;
+
+    /// PARKS the SAM D21 so it executes nothing, without needing the vector catch at all:
+    /// a probe `nRESET` pulse lands the core in the DSU cold-plugging reset extension
+    /// (CRSTEXT holds it; the debug AHB stays live) -- exactly the stopped-core guarantee
+    /// flash programming and pin takeover need, and deterministic where the catch is not
+    /// (`DEMCR` does not reliably survive this part's external reset). Falls back to a
+    /// plain halt for a probe with no reset line wired. The core stays parked/halted until
+    /// a reset (`Dap::reset_and_run`) or a CRSTEXT release boots it.
+    fn samd21_park(&mut self) -> Result<(), DapError>;
 }
 
 impl<T: Transport> Samd21Debug for Dap<T> {
+    fn samd21_park(&mut self) -> Result<(), DapError> {
+        for _ in 0..4 {
+            let _ = self.set_reset(true);
+            let _ = self.set_reset(false);
+            for _ in 0..64 {
+                if self.read_byte(DSU_STATUSA).map(|s| s & DSU_CRSTEXT != 0).unwrap_or(false) {
+                    return Ok(());
+                }
+            }
+            let _ = self.halt();
+            if self.is_halted().unwrap_or(false) {
+                return Ok(());
+            }
+        }
+        Err(DapError::Timeout("park"))
+    }
+
     fn samd21_reset_halt(&mut self) -> Result<(), DapError> {
         let _ = self.set_reset(true);
         self.arm_reset_catch()?;

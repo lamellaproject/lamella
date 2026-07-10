@@ -394,6 +394,11 @@ pub struct Heap {
     /// [`Heap::should_collect`]); adapts after each collection.
     #[cfg(feature = "gc")]
     gc_threshold: usize,
+    /// A HARD ceiling on the live object count (`None` = unbounded, the host default). An
+    /// embedder on a fixed heap sets it BELOW the real capacity (leaving headroom to allocate
+    /// the OutOfMemoryException itself); when a collection cannot bring the count under it, the
+    /// VES raises a catchable `Trap::OutOfMemory` rather than letting the allocator fail hard.
+    object_budget: Option<usize>,
     /// Parallel to `objects`: whether each object is registered for finalization (its
     /// type has a `Finalize` and it has not been finalized or suppressed). The collector
     /// promotes an unreachable registered object to the f-reachable set instead of
@@ -409,6 +414,7 @@ impl Default for Heap {
             objects: Vec::new(),
             intern: BTreeMap::new(),
             gc_threshold: INITIAL_GC_THRESHOLD,
+            object_budget: None,
             #[cfg(feature = "finalizers")]
             finalize_registered: Vec::new(),
         }
@@ -420,6 +426,21 @@ impl Heap {
     #[must_use]
     pub fn new() -> Heap {
         Heap::default()
+    }
+
+    /// Sets the HARD live-object budget (`None` = unbounded). See [`Heap::object_budget`].
+    pub fn set_object_budget(&mut self, budget: Option<usize>) {
+        self.object_budget = budget;
+    }
+
+    /// Whether the live object count has reached the configured budget (always false when
+    /// unbounded). The VES tests this AFTER a collection to decide a catchable out-of-memory:
+    /// a mark-compact collection shrinks `objects` to the survivors, so a post-GC reading is
+    /// the live count.
+    #[must_use]
+    pub fn at_budget(&self) -> bool {
+        self.object_budget
+            .is_some_and(|budget| self.objects.len() >= budget)
     }
 
     /// Allocates `object` and returns a reference to it. With the `gc` feature an
@@ -1620,6 +1641,22 @@ mod tests {
             heap.as_string(b).as_deref(),
             Some(&[b'y' as u16, b'o' as u16][..])
         );
+    }
+
+    #[test]
+    fn object_budget_reports_at_and_over_the_ceiling() {
+        let mut heap = Heap::new();
+        assert!(!heap.at_budget());
+        heap.alloc_string(&[b'a' as u16]);
+        assert!(!heap.at_budget());
+        heap.set_object_budget(Some(2));
+        assert!(!heap.at_budget());
+        heap.alloc_string(&[b'b' as u16]);
+        assert!(heap.at_budget());
+        heap.alloc_string(&[b'c' as u16]);
+        assert!(heap.at_budget());
+        heap.set_object_budget(None);
+        assert!(!heap.at_budget());
     }
 
     #[test]

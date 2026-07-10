@@ -15,8 +15,9 @@ pub mod trap;
 pub mod value;
 
 pub use builtins::Builtin;
-pub use interp::{run, run_module, Frame};
-pub use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Const, Op};
+pub use gpio::Board;
+pub use interp::{run, run_bundle, run_module, Frame};
+pub use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, Module, Op};
 pub use object::{InlineCache, ObjectModel, PyType};
 pub use trap::Trap;
 pub use value::Value;

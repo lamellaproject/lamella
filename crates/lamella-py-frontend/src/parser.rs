@@ -80,35 +80,131 @@ enum MatchPattern {
     Capture(String),
     /// a literal or dotted value (`1`, `"a"`, `None`, `Color.RED`) -- matches when subject == value.
     Value(Expr),
-    /// `p1 | p2 | ...` of value patterns -- matches when the subject equals any alternative.
-    Or(Vec<Expr>),
-    /// `(p0, p1, ...)` / `[p0, ...]` -- a fixed-length sequence pattern: matches a list/tuple of the
-    /// same length whose elements match the sub-patterns (each a capture / wildcard / value).
-    Sequence(Vec<MatchPattern>),
+    /// `p1 | p2 | ...` -- matches when any alternative sub-pattern matches. The alternatives are
+    /// non-binding (values, bare classes, non-capturing sequences, wildcards), so the whole pattern
+    /// binds nothing; a binding alternative (a capture inside an `|`) is out of the subset.
+    Or(Vec<MatchPattern>),
+    /// `(p0, p1, ...)` / `[p0, ...]` -- a sequence pattern: matches a list/tuple whose elements match
+    /// the sub-patterns (each a capture / wildcard / value / nested sequence / class). With
+    /// `star = None` the length is fixed; with `star = Some(i)`, `elems[i]` is a `*name` (or `*_`)
+    /// that binds the SLICE of surplus items and the length becomes a lower bound -- so `[x, *rest, y]`
+    /// matches any 2+-element sequence.
+    Sequence { elems: Vec<MatchPattern>, star: Option<usize> },
+    /// `Cls(p0, ..., attr=subpat, ...)` / `Cls()` -- a class pattern. Positional sub-patterns match
+    /// the values `__match_class__(subject, cls, k)` extracts (each `p_i` against element `i` of the
+    /// returned tuple -- from the class's `__match_args__`, or the whole subject for a self-match
+    /// builtin like `int`); keyword sub-patterns match the named attributes (`isinstance` + `hasattr`,
+    /// a missing attribute a non-match per CPython's swallowed `AttributeError`). `temp` names the
+    /// walrus temp that holds the `__match_class__` result; it is present iff there are positional
+    /// sub-patterns.
+    Class {
+        cls: Expr,
+        positional: Vec<MatchPattern>,
+        keywords: Vec<(String, MatchPattern)>,
+        temp: Option<String>,
+    },
+    /// `pattern as name` -- matches when `pattern` matches, and additionally binds `name` to the
+    /// subject (the whole value matched at this level). `as _` is rejected (a wildcard target).
+    As {
+        pattern: Box<MatchPattern>,
+        name: String,
+    },
+    /// `{key: subpat, ..., **rest}` -- a mapping pattern: matches a `dict` (subset match -- extra keys
+    /// are ignored) that CONTAINS each `key` (an evaluated literal / value expression), whose value
+    /// matches the sub-pattern. A missing key is a non-match. `**rest` captures the remaining items as
+    /// a new dict. `items` are the `(key, sub-pattern)` pairs in order.
+    Mapping {
+        items: Vec<(Expr, MatchPattern)>,
+        rest: Option<String>,
+    },
 }
 
-/// `type(subj) is list or type(subj) is tuple` -- the "is a matchable sequence" test for a sequence
-/// pattern. Exact `list`/`tuple` only (so `str`/`dict`/other are correctly excluded); a subclass or a
-/// registered `Sequence` is a documented narrowing of CPython's Sequence-ABC rule.
-fn subject_is_sequence(subj: &str) -> Expr {
-    let type_is = |ty: &str| Expr::Compare {
-        op: CmpOp::Is,
-        lhs: Box::new(call1("type", Expr::Name(String::from(subj)))),
-        rhs: Box::new(Expr::Name(String::from(ty))),
-    };
+/// `lhs and rhs` -- a short-circuiting conjunction (used to chain a pattern's tests).
+fn bool_and(lhs: Expr, rhs: Expr) -> Expr {
+    Expr::BoolBinary {
+        op: BoolOp::And,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
+}
+
+/// `lhs or rhs` -- a short-circuiting disjunction.
+fn bool_or(lhs: Expr, rhs: Expr) -> Expr {
     Expr::BoolBinary {
         op: BoolOp::Or,
-        lhs: Box::new(type_is("list")),
-        rhs: Box::new(type_is("tuple")),
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
     }
 }
 
-/// `subj[i]` -- an element of the subject temp.
-fn subject_index(subj: &str, i: usize) -> Expr {
+/// `type(subject) is list or type(subject) is tuple` -- the "is a matchable sequence" test for a
+/// sequence pattern. Exact `list`/`tuple` only (so `str`/`dict`/other are correctly excluded); a
+/// subclass or a registered `Sequence` is a documented narrowing of CPython's Sequence-ABC rule.
+fn is_sequence(subject: &Expr) -> Expr {
+    let type_is = |ty: &str| Expr::Compare {
+        op: CmpOp::Is,
+        lhs: Box::new(call1("type", subject.clone())),
+        rhs: Box::new(Expr::Name(String::from(ty))),
+    };
+    bool_or(type_is("list"), type_is("tuple"))
+}
+
+/// `subject[i]` -- an element of the subject by position.
+fn index_at(subject: &Expr, i: usize) -> Expr {
     Expr::Subscript {
-        value: Box::new(Expr::Name(String::from(subj))),
+        value: Box::new(subject.clone()),
         index: Box::new(Expr::Int(i as i64)),
     }
+}
+
+/// `subject[-k]` -- a from-the-end element access, for a sequence element AFTER a `*` star pattern.
+fn neg_index_at(subject: &Expr, k: usize) -> Expr {
+    Expr::Subscript {
+        value: Box::new(subject.clone()),
+        index: Box::new(Expr::Int(-(k as i64))),
+    }
+}
+
+/// `subject[lower:upper]` -- the surplus slice a `*` star pattern binds. `upper` is `None` for an
+/// open end (`subject[lower:]`, no elements after the star) or a negative literal
+/// (`subject[lower:-post]`).
+fn slice_from(subject: &Expr, lower: usize, upper: Option<i64>) -> Expr {
+    Expr::Subscript {
+        value: Box::new(subject.clone()),
+        index: Box::new(Expr::Slice {
+            lower: Some(Box::new(Expr::Int(lower as i64))),
+            upper: upper.map(|u| Box::new(Expr::Int(u))),
+            step: None,
+        }),
+    }
+}
+
+/// The subject access for the sequence-pattern element at `elems` index `i`: a positive index
+/// before the `*` star (or when there is none), a negative (from-the-end) index after it.
+fn seq_elem(subject: &Expr, i: usize, elems_len: usize, star: Option<usize>) -> Expr {
+    match star {
+        Some(s) if i > s => neg_index_at(subject, elems_len - i),
+        _ => index_at(subject, i),
+    }
+}
+
+/// `subject.attr` -- an attribute of the subject, for a class-pattern keyword sub-pattern.
+fn attr_of(subject: &Expr, attr: &str) -> Expr {
+    Expr::Attribute {
+        value: Box::new(subject.clone()),
+        attr: String::from(attr),
+    }
+}
+
+/// `isinstance(subject, cls)` -- a class pattern's type test.
+fn isinstance_of(subject: &Expr, cls: &Expr) -> Expr {
+    call2("isinstance", subject.clone(), cls.clone())
+}
+
+/// `hasattr(subject, "attr")` -- guards a class keyword sub-pattern so a missing attribute is a
+/// non-match (CPython swallows the `AttributeError`), not an error, and gates the attribute read.
+fn has_attr(subject: &Expr, attr: &str) -> Expr {
+    call2("hasattr", subject.clone(), Expr::Str(String::from(attr)))
 }
 
 /// One `case pattern [if guard]: body` clause.
@@ -119,26 +215,44 @@ struct MatchCase {
 }
 
 /// `subject == value`.
-fn subject_eq(subj: &str, value: Expr) -> Expr {
+fn eq(subject: &Expr, value: Expr) -> Expr {
     Expr::Compare {
         op: CmpOp::Eq,
-        lhs: Box::new(Expr::Name(String::from(subj))),
+        lhs: Box::new(subject.clone()),
         rhs: Box::new(value),
     }
 }
 
-/// `subject == v0 or subject == v1 or ...` for an OR pattern.
-fn subject_in(subj: &str, values: &[Expr]) -> Expr {
-    let mut iter = values.iter();
-    let mut cond = subject_eq(subj, iter.next().expect("an OR pattern has alternatives").clone());
-    for v in iter {
-        cond = Expr::BoolBinary {
-            op: BoolOp::Or,
-            lhs: Box::new(cond),
-            rhs: Box::new(subject_eq(subj, v.clone())),
-        };
+/// Combine two alternative tests with `or` for an OR pattern. `None` means "always matches" (a
+/// wildcard alternative), which makes the whole OR always match.
+fn or_tests(acc: Option<Expr>, next: Option<Expr>) -> Option<Expr> {
+    match (acc, next) {
+        (None, _) | (_, None) => None,
+        (Some(a), Some(b)) => Some(bool_or(a, b)),
     }
-    cond
+}
+
+/// Whether a pattern binds any name (a capture / as-pattern, or a structural pattern containing one).
+/// An OR pattern's alternatives must not bind (CPython requires every alternative to bind the same
+/// names; this subset supports only non-binding alternatives).
+fn pattern_binds(pattern: &MatchPattern) -> bool {
+    match pattern {
+        MatchPattern::Wildcard | MatchPattern::Value(_) => false,
+        MatchPattern::Capture(_) | MatchPattern::As { .. } => true,
+        MatchPattern::Or(alts) => alts.iter().any(pattern_binds),
+        MatchPattern::Sequence { elems, .. } => elems.iter().any(pattern_binds),
+        MatchPattern::Class {
+            positional,
+            keywords,
+            ..
+        } => {
+            positional.iter().any(pattern_binds)
+                || keywords.iter().any(|(_, p)| pattern_binds(p))
+        }
+        MatchPattern::Mapping { items, rest } => {
+            rest.is_some() || items.iter().any(|(_, p)| pattern_binds(p))
+        }
+    }
 }
 
 /// The success body of a case, gated by its guard: `if guard: body else: rest` when there is a
@@ -154,6 +268,224 @@ fn guard_body(body: Vec<Stmt>, guard: &Option<Expr>, rest: &[Stmt]) -> Vec<Stmt>
     }
 }
 
+/// Match `pattern` against the value `subject`, returning the boolean test (`None` when the pattern
+/// matches unconditionally -- a wildcard or a capture) and the bindings to run once the pattern has
+/// matched. Structural patterns recurse against sub-subjects (`subject[i]`, `subject.attr`); each
+/// test is an `and`-chain that short-circuits, so a length / `isinstance` / `hasattr` guard always
+/// precedes the sub-subject access it protects. `subject` may be evaluated more than once, so the
+/// caller passes a cheap, re-evaluable expression (a temp name, or an index / attribute access) --
+/// a documented narrowing for a side-effecting `__getitem__` / `__getattribute__` (CPython evaluates
+/// each sub-access once).
+fn match_pattern(pattern: &MatchPattern, subject: &Expr) -> (Option<Expr>, Vec<Stmt>) {
+    match pattern {
+        MatchPattern::Wildcard => (None, Vec::new()),
+        MatchPattern::Capture(name) => (
+            None,
+            vec![Stmt::Assign(Assign {
+                target: name.clone(),
+                annotation: None,
+                value: Some(subject.clone()),
+            })],
+        ),
+        MatchPattern::Value(value) => (Some(eq(subject, value.clone())), Vec::new()),
+        MatchPattern::Or(alts) => {
+            let mut iter = alts.iter();
+            let (mut test, _) =
+                match_pattern(iter.next().expect("an OR pattern has alternatives"), subject);
+            for alt in iter {
+                let (t, _) = match_pattern(alt, subject);
+                test = or_tests(test, t);
+            }
+            (test, Vec::new())
+        }
+        MatchPattern::Sequence { elems, star } => match_sequence(subject, elems, *star),
+        MatchPattern::Class {
+            cls,
+            positional,
+            keywords,
+            temp,
+        } => match_class(subject, cls, positional, keywords, temp),
+        MatchPattern::As { pattern, name } => {
+            let (test, mut binds) = match_pattern(pattern, subject);
+            binds.push(Stmt::Assign(Assign {
+                target: name.clone(),
+                annotation: None,
+                value: Some(subject.clone()),
+            }));
+            (test, binds)
+        }
+        MatchPattern::Mapping { items, rest } => match_mapping(subject, items, rest),
+    }
+}
+
+/// The synthetic key/value targets of the `**rest` dict comprehension. Dotted, so they cannot collide
+/// with a user identifier, and comprehension-scoped, so reuse across nested mapping patterns is safe.
+const MAP_REST_KEY: &str = ".mapkey";
+const MAP_REST_VAL: &str = ".mapval";
+
+/// The test + bindings for a mapping pattern against `subject` (see [`match_pattern`]): the subject is
+/// a `dict` that contains each key (`isinstance` + `key in subject`, so a missing key is a non-match
+/// and the membership gates the `subject[key]` read), whose value matches the sub-pattern. `**rest`
+/// binds the remaining items as a new dict.
+fn match_mapping(
+    subject: &Expr,
+    items: &[(Expr, MatchPattern)],
+    rest: &Option<String>,
+) -> (Option<Expr>, Vec<Stmt>) {
+    let mut test = call2("isinstance", subject.clone(), Expr::Name(String::from("dict")));
+    let mut binds: Vec<Stmt> = Vec::new();
+    for (key, subpat) in items {
+        test = bool_and(
+            test,
+            Expr::Compare {
+                op: CmpOp::In,
+                lhs: Box::new(key.clone()),
+                rhs: Box::new(subject.clone()),
+            },
+        );
+        let access = Expr::Subscript {
+            value: Box::new(subject.clone()),
+            index: Box::new(key.clone()),
+        };
+        let (sub_test, sub_binds) = match_pattern(subpat, &access);
+        if let Some(t) = sub_test {
+            test = bool_and(test, t);
+        }
+        binds.extend(sub_binds);
+    }
+    if let Some(name) = rest {
+        let items_call = Expr::Call {
+            func: Box::new(attr_of(subject, "items")),
+            args: Vec::new(),
+            keywords: Vec::new(),
+        };
+        let conditions = if items.is_empty() {
+            Vec::new()
+        } else {
+            vec![Expr::Compare {
+                op: CmpOp::NotIn,
+                lhs: Box::new(Expr::Name(String::from(MAP_REST_KEY))),
+                rhs: Box::new(Expr::Tuple(items.iter().map(|(k, _)| k.clone()).collect())),
+            }]
+        };
+        let comp = Expr::DictComp {
+            key: Box::new(Expr::Name(String::from(MAP_REST_KEY))),
+            value: Box::new(Expr::Name(String::from(MAP_REST_VAL))),
+            clauses: vec![CompClause {
+                targets: vec![String::from(MAP_REST_KEY), String::from(MAP_REST_VAL)],
+                iterable: items_call,
+                conditions,
+            }],
+        };
+        binds.push(Stmt::Assign(Assign {
+            target: name.clone(),
+            annotation: None,
+            value: Some(comp),
+        }));
+    }
+    (Some(test), binds)
+}
+
+/// The test + bindings for a sequence pattern against `subject` (see [`match_pattern`]): the subject
+/// is a `list`/`tuple` of the right length whose elements match the sub-patterns.
+fn match_sequence(
+    subject: &Expr,
+    elems: &[MatchPattern],
+    star: Option<usize>,
+) -> (Option<Expr>, Vec<Stmt>) {
+    let elems_len = elems.len();
+    let fixed = elems_len - usize::from(star.is_some());
+    let len_op = if star.is_some() { CmpOp::Ge } else { CmpOp::Eq };
+    let mut test = bool_and(
+        is_sequence(subject),
+        Expr::Compare {
+            op: len_op,
+            lhs: Box::new(call1("len", subject.clone())),
+            rhs: Box::new(Expr::Int(fixed as i64)),
+        },
+    );
+    let mut binds: Vec<Stmt> = Vec::new();
+    for (i, elem) in elems.iter().enumerate() {
+        if star == Some(i) {
+            if let MatchPattern::Capture(name) = elem {
+                let post = elems_len - i - 1;
+                let value = slice_from(subject, i, (post > 0).then(|| -(post as i64)));
+                binds.push(Stmt::Assign(Assign {
+                    target: name.clone(),
+                    annotation: None,
+                    value: Some(value),
+                }));
+            }
+        } else {
+            let (sub_test, sub_binds) = match_pattern(elem, &seq_elem(subject, i, elems_len, star));
+            if let Some(t) = sub_test {
+                test = bool_and(test, t);
+            }
+            binds.extend(sub_binds);
+        }
+    }
+    (Some(test), binds)
+}
+
+/// The test + bindings for a class pattern against `subject` (see [`match_pattern`]). Keyword
+/// sub-patterns match the named attributes of the subject, each behind a `hasattr` guard so a missing
+/// attribute is a non-match (matching CPython's swallowed `AttributeError`). Positional sub-patterns
+/// match the tuple `__match_class__(subject, cls, k)` extracts -- a runtime helper that performs the
+/// `isinstance` test, honours the class's `__match_args__` (and the self-match rule for builtins like
+/// `int`), and returns `None` for a non-match -- each `p_i` against element `i`.
+fn match_class(
+    subject: &Expr,
+    cls: &Expr,
+    positional: &[MatchPattern],
+    keywords: &[(String, MatchPattern)],
+    temp: &Option<String>,
+) -> (Option<Expr>, Vec<Stmt>) {
+    let mut binds: Vec<Stmt> = Vec::new();
+    let mut test = if positional.is_empty() {
+        isinstance_of(subject, cls)
+    } else {
+        let t = temp
+            .as_ref()
+            .expect("a positional class pattern carries a walrus temp");
+        let extract = Expr::Call {
+            func: Box::new(Expr::Name(String::from("__match_class__"))),
+            args: vec![
+                subject.clone(),
+                cls.clone(),
+                Expr::Int(positional.len() as i64),
+            ],
+            keywords: Vec::new(),
+        };
+        let bound = Expr::Walrus {
+            target: t.clone(),
+            value: Box::new(extract),
+        };
+        let mut cond = Expr::Compare {
+            op: CmpOp::IsNot,
+            lhs: Box::new(bound),
+            rhs: Box::new(Expr::None),
+        };
+        let extracted = Expr::Name(t.clone());
+        for (i, subpat) in positional.iter().enumerate() {
+            let (sub_test, sub_binds) = match_pattern(subpat, &index_at(&extracted, i));
+            if let Some(x) = sub_test {
+                cond = bool_and(cond, x);
+            }
+            binds.extend(sub_binds);
+        }
+        cond
+    };
+    for (attr, subpat) in keywords {
+        test = bool_and(test, has_attr(subject, attr));
+        let (sub_test, sub_binds) = match_pattern(subpat, &attr_of(subject, attr));
+        if let Some(t) = sub_test {
+            test = bool_and(test, t);
+        }
+        binds.extend(sub_binds);
+    }
+    (Some(test), binds)
+}
+
 /// The nested-if statement list for `cases`, over the subject temp `subj`. Each case tests its
 /// pattern (and guard); on failure control falls through to the remaining cases (the `orelse`).
 fn build_case_tree(cases: &[MatchCase], subj: &str) -> Vec<Stmt> {
@@ -161,74 +493,16 @@ fn build_case_tree(cases: &[MatchCase], subj: &str) -> Vec<Stmt> {
         return Vec::new();
     };
     let rest = build_case_tree(rest_cases, subj);
-    let body = first.body.clone();
-    match &first.pattern {
-        MatchPattern::Wildcard => guard_body(body, &first.guard, &rest),
-        MatchPattern::Capture(name) => {
-            let mut out = vec![Stmt::Assign(Assign {
-                target: name.clone(),
-                annotation: None,
-                value: Some(Expr::Name(String::from(subj))),
-            })];
-            out.extend(guard_body(body, &first.guard, &rest));
-            out
-        }
-        MatchPattern::Value(value) => {
-            let inner = guard_body(body, &first.guard, &rest);
-            vec![Stmt::If {
-                test: subject_eq(subj, value.clone()),
-                body: inner,
-                orelse: rest,
-            }]
-        }
-        MatchPattern::Or(values) => {
-            let inner = guard_body(body, &first.guard, &rest);
-            vec![Stmt::If {
-                test: subject_in(subj, values),
-                body: inner,
-                orelse: rest,
-            }]
-        }
-        MatchPattern::Sequence(elems) => {
-            let mut cond = Expr::BoolBinary {
-                op: BoolOp::And,
-                lhs: Box::new(subject_is_sequence(subj)),
-                rhs: Box::new(Expr::Compare {
-                    op: CmpOp::Eq,
-                    lhs: Box::new(call1("len", Expr::Name(String::from(subj)))),
-                    rhs: Box::new(Expr::Int(elems.len() as i64)),
-                }),
-            };
-            for (i, elem) in elems.iter().enumerate() {
-                if let MatchPattern::Value(v) = elem {
-                    cond = Expr::BoolBinary {
-                        op: BoolOp::And,
-                        lhs: Box::new(cond),
-                        rhs: Box::new(Expr::Compare {
-                            op: CmpOp::Eq,
-                            lhs: Box::new(subject_index(subj, i)),
-                            rhs: Box::new(v.clone()),
-                        }),
-                    };
-                }
-            }
-            let mut stmts: Vec<Stmt> = Vec::new();
-            for (i, elem) in elems.iter().enumerate() {
-                if let MatchPattern::Capture(name) = elem {
-                    stmts.push(Stmt::Assign(Assign {
-                        target: name.clone(),
-                        annotation: None,
-                        value: Some(subject_index(subj, i)),
-                    }));
-                }
-            }
-            stmts.extend(guard_body(body, &first.guard, &rest));
-            vec![Stmt::If {
-                test: cond,
-                body: stmts,
-                orelse: rest,
-            }]
-        }
+    let (test, binds) = match_pattern(&first.pattern, &Expr::Name(String::from(subj)));
+    let mut success = binds;
+    success.extend(guard_body(first.body.clone(), &first.guard, &rest));
+    match test {
+        None => success,
+        Some(t) => vec![Stmt::If {
+            test: t,
+            body: success,
+            orelse: rest,
+        }],
     }
 }
 
@@ -243,6 +517,15 @@ fn call1(func: &str, arg: Expr) -> Expr {
     Expr::Call {
         func: Box::new(Expr::Name(String::from(func))),
         args: vec![arg],
+        keywords: Vec::new(),
+    }
+}
+
+/// `func(a, b)` -- a two-argument call by name (`isinstance(x, C)`, `hasattr(x, "n")`).
+fn call2(func: &str, a: Expr, b: Expr) -> Expr {
+    Expr::Call {
+        func: Box::new(Expr::Name(String::from(func))),
+        args: vec![a, b],
         keywords: Vec::new(),
     }
 }
@@ -473,20 +756,39 @@ impl Parser {
         Ok(Stmt::ImportFrom { module, names })
     }
 
-    /// Disambiguate the soft keyword `match`: it starts a match statement only when the next token
-    /// begins a subject expression (a name or a literal). Anything else -- an operator, `=`, `.`,
-    /// `(`, `[`, `:`, newline -- means `match` is a plain name (`match = 5`, `match(x)`, `match + 1`).
-    /// A subject that begins with `(` / `[` is not distinguishable here; name it first.
+    /// Disambiguate the soft keyword `match`: it begins a match statement when the line has the shape
+    /// `match <subject> : NEWLINE INDENT case ...`. A read-only scan finds the subject-ending `:` at
+    /// bracket depth 0, then checks that an indented `case` clause follows -- so a subject beginning
+    /// with `[` / `(` / `{` / `-` / `True` (which a single-token peek cannot tell apart from a
+    /// subscript / call / operator on a variable named `match`) is recognized, while `match(x)`,
+    /// `match[i] = 5`, `match = 5`, and `match: int = 5` stay plain expressions / assignments.
     fn looks_like_match(&self) -> bool {
-        matches!(
-            self.peek2(),
-            Tok::Name(_)
-                | Tok::Int(_)
-                | Tok::Float(_)
-                | Tok::Imaginary(_)
-                | Tok::BigInt(_)
-                | Tok::Str(_)
-        )
+        let kind = |i: usize| self.tokens.get(i).map(|t| &t.kind);
+        let mut i = self.pos + 1;
+        let mut depth: i32 = 0;
+        let colon = loop {
+            match kind(i) {
+                Some(Tok::LParen | Tok::LBracket | Tok::LBrace) => depth += 1,
+                Some(Tok::RParen | Tok::RBracket | Tok::RBrace) => depth -= 1,
+                Some(Tok::Colon) if depth == 0 => break i,
+                Some(Tok::Newline) if depth <= 0 => return false,
+                Some(Tok::Eof) | None => return false,
+                _ => {}
+            }
+            i += 1;
+        };
+        let mut j = colon + 1;
+        while matches!(kind(j), Some(Tok::Newline)) {
+            j += 1;
+        }
+        if !matches!(kind(j), Some(Tok::Indent)) {
+            return false;
+        }
+        j += 1;
+        while matches!(kind(j), Some(Tok::Newline)) {
+            j += 1;
+        }
+        matches!(kind(j), Some(Tok::Name(n)) if n == "case")
     }
 
     /// A fresh synthetic local name (dotted, so it cannot collide with a user identifier).
@@ -548,19 +850,44 @@ impl Parser {
         })
     }
 
-    /// One case pattern (the supported subset): a wildcard `_`, a capture name, a literal/value, or
-    /// an OR `a | b | ...` of literal/value alternatives. Sequence / class / mapping patterns are out.
+    /// One case pattern: an OR pattern (`a | b | ...`) or a single closed pattern, optionally
+    /// followed by `as name` to also capture the matched value (`[1, 2] as pair`). `as` binds looser
+    /// than `|`, so `a | b as c` is `(a | b) as c`.
     fn parse_pattern(&mut self) -> Result<MatchPattern, ParseError> {
+        let pattern = self.parse_or_pattern()?;
+        if self.eat(&Tok::KwAs) {
+            let name = self.expect_name()?;
+            if name == "_" {
+                return Err(self.error("cannot use '_' as the capture target of an `as` pattern"));
+            }
+            return Ok(MatchPattern::As {
+                pattern: Box::new(pattern),
+                name,
+            });
+        }
+        Ok(pattern)
+    }
+
+    /// An OR pattern `a | b | ...` of closed patterns, or a single closed pattern when there is no
+    /// `|`. Every alternative must be non-binding (a value, a bare class, a non-capturing sequence, or
+    /// a wildcard) -- CPython requires the alternatives to bind the same names, and this subset
+    /// supports only the non-binding case; a capture inside an `|` is rejected.
+    fn parse_or_pattern(&mut self) -> Result<MatchPattern, ParseError> {
         let first = self.parse_closed_pattern()?;
         if !self.at(&Tok::Pipe) {
             return Ok(first);
         }
-        let mut values = vec![self.pattern_value(first)?];
+        let mut alts = vec![first];
         while self.eat(&Tok::Pipe) {
-            let alt = self.parse_closed_pattern()?;
-            values.push(self.pattern_value(alt)?);
+            alts.push(self.parse_closed_pattern()?);
         }
-        Ok(MatchPattern::Or(values))
+        if alts.iter().any(pattern_binds) {
+            return Err(self.error(
+                "an `|` (or) pattern's alternatives must not bind names (a capture / `as` inside \
+                 `a | b` is out of the match subset)",
+            ));
+        }
+        Ok(MatchPattern::Or(alts))
     }
 
     fn parse_closed_pattern(&mut self) -> Result<MatchPattern, ParseError> {
@@ -571,15 +898,19 @@ impl Parser {
             }
             Tok::Name(_) => {
                 let name = self.expect_name()?;
-                if self.at(&Tok::Dot) {
-                    let mut expr = Expr::Name(name);
-                    while self.eat(&Tok::Dot) {
-                        let attr = self.expect_name()?;
-                        expr = Expr::Attribute {
-                            value: Box::new(expr),
-                            attr,
-                        };
-                    }
+                let mut expr = Expr::Name(name.clone());
+                let mut dotted = false;
+                while self.eat(&Tok::Dot) {
+                    dotted = true;
+                    let attr = self.expect_name()?;
+                    expr = Expr::Attribute {
+                        value: Box::new(expr),
+                        attr,
+                    };
+                }
+                if self.at(&Tok::LParen) {
+                    self.parse_class_pattern(expr)
+                } else if dotted {
                     Ok(MatchPattern::Value(expr))
                 } else {
                     Ok(MatchPattern::Capture(name))
@@ -587,24 +918,21 @@ impl Parser {
             }
             Tok::LBracket => {
                 self.advance();
-                let (elems, _) = self.parse_pattern_sequence(&Tok::RBracket)?;
+                let (elems, star, _) = self.parse_pattern_sequence(&Tok::RBracket)?;
                 self.expect(&Tok::RBracket, "']' closing the sequence pattern")?;
-                Ok(MatchPattern::Sequence(elems))
+                Ok(MatchPattern::Sequence { elems, star })
             }
             Tok::LParen => {
                 self.advance();
-                let (elems, trailing_comma) = self.parse_pattern_sequence(&Tok::RParen)?;
+                let (elems, star, trailing_comma) = self.parse_pattern_sequence(&Tok::RParen)?;
                 self.expect(&Tok::RParen, "')' closing the pattern")?;
-                if elems.len() == 1 && !trailing_comma {
+                if elems.len() == 1 && !trailing_comma && star.is_none() {
                     Ok(elems.into_iter().next().expect("one grouped pattern"))
                 } else {
-                    Ok(MatchPattern::Sequence(elems))
+                    Ok(MatchPattern::Sequence { elems, star })
                 }
             }
-            Tok::LBrace => Err(self.error(
-                "mapping patterns `{...}` are out of the match subset (use sequence, literal, \
-                 capture, wildcard, value, or `|` patterns)",
-            )),
+            Tok::LBrace => self.parse_mapping_pattern(),
             _ => {
                 let negate = self.eat(&Tok::Minus);
                 let lit = self.parse_atom()?;
@@ -621,31 +949,128 @@ impl Parser {
         }
     }
 
-    /// The comma-separated closed patterns of a sequence pattern, up to `terminator`. Returns the
-    /// patterns and whether a trailing comma closed the list (to tell a 1-group `(p)` from a
-    /// 1-sequence `(p,)`). `*` star patterns, nested sequence patterns, and `|` inside a sequence are
-    /// out of the subset; each element is a capture / wildcard / value / dotted value.
+    /// A class pattern `Cls(...)` / `pkg.Cls(...)`: the class reference `cls` has been parsed and the
+    /// parser is positioned at the `(`. Each argument is a keyword sub-pattern `attr=pattern`; the
+    /// subject matches when it is an `isinstance` of `cls` and every named attribute matches its
+    /// sub-pattern. Positional sub-patterns (`Cls(a, b)`) need the class's `__match_args__` -- a
+    /// runtime facility not yet available -- so they are rejected here with a precise message.
+    fn parse_class_pattern(&mut self, cls: Expr) -> Result<MatchPattern, ParseError> {
+        self.expect(&Tok::LParen, "'(' opening the class pattern")?;
+        let mut positional: Vec<MatchPattern> = Vec::new();
+        let mut keywords: Vec<(String, MatchPattern)> = Vec::new();
+        if !self.at(&Tok::RParen) {
+            loop {
+                if matches!(self.peek(), Tok::Name(_)) && matches!(self.peek2(), Tok::Assign) {
+                    let attr = self.expect_name()?;
+                    self.expect(&Tok::Assign, "'=' in a keyword class sub-pattern")?;
+                    if keywords.iter().any(|(a, _)| a == &attr) {
+                        return Err(self.error(format!(
+                            "attribute name repeated in class pattern: {attr}"
+                        )));
+                    }
+                    keywords.push((attr, self.parse_pattern()?));
+                } else {
+                    if !keywords.is_empty() {
+                        return Err(self.error(
+                            "a positional sub-pattern cannot follow a keyword sub-pattern in a \
+                             class pattern",
+                        ));
+                    }
+                    positional.push(self.parse_pattern()?);
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+                if self.at(&Tok::RParen) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RParen, "')' closing the class pattern")?;
+        let temp = (!positional.is_empty()).then(|| self.fresh_temp("mc"));
+        Ok(MatchPattern::Class {
+            cls,
+            positional,
+            keywords,
+            temp,
+        })
+    }
+
+    /// A mapping pattern `{key: subpat, ..., **rest}`: `key: sub-pattern` items (each key an evaluated
+    /// literal / value expression) with an optional trailing `**rest` capture. The subject matches a
+    /// `dict` that contains each key (a subset match). A duplicate key or a non-literal key is
+    /// rejected, as is a `**` rest that is not last.
+    fn parse_mapping_pattern(&mut self) -> Result<MatchPattern, ParseError> {
+        self.expect(&Tok::LBrace, "'{' opening the mapping pattern")?;
+        let mut items: Vec<(Expr, MatchPattern)> = Vec::new();
+        let mut rest: Option<String> = None;
+        if !self.at(&Tok::RBrace) {
+            loop {
+                if self.eat(&Tok::DoubleStar) {
+                    let name = self.expect_name()?;
+                    if name == "_" {
+                        return Err(self.error(
+                            "cannot use '_' as the `**` rest target of a mapping pattern",
+                        ));
+                    }
+                    rest = Some(name);
+                    self.eat(&Tok::Comma);
+                    break;
+                }
+                let key = match self.parse_closed_pattern()? {
+                    MatchPattern::Value(e) => e,
+                    _ => {
+                        return Err(self.error(
+                            "a mapping-pattern key must be a literal or a value (a dotted name)",
+                        ))
+                    }
+                };
+                if items.iter().any(|(k, _)| k == &key) {
+                    return Err(self.error("a mapping pattern has a duplicate key"));
+                }
+                self.expect(&Tok::Colon, "':' after a mapping-pattern key")?;
+                items.push((key, self.parse_pattern()?));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+                if self.at(&Tok::RBrace) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Tok::RBrace, "'}' closing the mapping pattern")?;
+        Ok(MatchPattern::Mapping { items, rest })
+    }
+
+    /// The comma-separated patterns of a sequence pattern, up to `terminator`. Returns the patterns,
+    /// the index of a `*name`/`*_` star element (at most one), and whether a trailing comma closed the
+    /// list (to tell a 1-group `(p)` from a 1-sequence `(p,)`). A `|` (or) directly inside a sequence
+    /// is out of the subset; each non-star element is a capture / wildcard / value / nested sequence /
+    /// class pattern (matched recursively).
     fn parse_pattern_sequence(
         &mut self,
         terminator: &Tok,
-    ) -> Result<(Vec<MatchPattern>, bool), ParseError> {
+    ) -> Result<(Vec<MatchPattern>, Option<usize>, bool), ParseError> {
         let mut elems = Vec::new();
+        let mut star = None;
         if self.at(terminator) {
-            return Ok((elems, false));
+            return Ok((elems, star, false));
         }
         let mut trailing_comma = false;
         loop {
-            if self.at(&Tok::Star) {
-                return Err(self.error("a `*` (star) pattern in a sequence is out of the match subset"));
+            if self.eat(&Tok::Star) {
+                if star.is_some() {
+                    return Err(self.error("a sequence pattern allows at most one `*` pattern"));
+                }
+                let elem = self.parse_closed_pattern()?;
+                if !matches!(elem, MatchPattern::Capture(_) | MatchPattern::Wildcard) {
+                    return Err(self.error("a `*` pattern must be `*name` or `*_`"));
+                }
+                star = Some(elems.len());
+                elems.push(elem);
+            } else {
+                elems.push(self.parse_pattern()?);
             }
-            let elem = self.parse_closed_pattern()?;
-            if matches!(elem, MatchPattern::Sequence(_)) {
-                return Err(self.error("a nested sequence pattern is out of the match subset"));
-            }
-            if self.at(&Tok::Pipe) {
-                return Err(self.error("an `|` (or) pattern inside a sequence is out of the match subset"));
-            }
-            elems.push(elem);
             if !self.eat(&Tok::Comma) {
                 break;
             }
@@ -654,19 +1079,7 @@ impl Parser {
                 break;
             }
         }
-        Ok((elems, trailing_comma))
-    }
-
-    /// The `Expr` an alternative of an OR pattern compares against; a capture / wildcard is not
-    /// allowed inside `|`.
-    fn pattern_value(&self, pattern: MatchPattern) -> Result<Expr, ParseError> {
-        match pattern {
-            MatchPattern::Value(e) => Ok(e),
-            _ => Err(self.error(
-                "an OR pattern's alternatives must be literal or value patterns (not captures or \
-                 wildcards)",
-            )),
-        }
+        Ok((elems, star, trailing_comma))
     }
 
     /// `('@' expr NEWLINE)+` then a `def` or `class`. Each decorator names a callable applied to the
@@ -929,17 +1342,15 @@ impl Parser {
                 })
             }
             Tok::Assign if matches!(&expr, Expr::Tuple(_) | Expr::List(_)) => {
+                self.advance();
+                let value = self.parse_rhs_value()?;
+                if self.at(&Tok::Assign) {
+                    return self.finish_chain(expr, value, target_line);
+                }
+                self.expect_newline()?;
                 let AssignTarget::Tuple(targets) = self.assign_target(expr, target_line)? else {
                     unreachable!("a tuple/list expression converts to a Tuple target")
                 };
-                self.advance();
-                let value = self.parse_rhs_value()?;
-                self.expect_newline()?;
-                if targets.len() < 2 {
-                    return Err(
-                        self.error("a tuple-unpacking assignment needs two or more targets")
-                    );
-                }
                 Ok(Stmt::TupleAssign {
                     targets,
                     star: None,
@@ -1015,25 +1426,32 @@ impl Parser {
         }
         if self.eat(&Tok::Assign) {
             let mut star = None;
-            let mut targets = Vec::with_capacity(elems.len());
+            let mut inners: Vec<Expr> = Vec::with_capacity(elems.len());
             for (i, e) in elems.into_iter().enumerate() {
-                let inner = match e {
-                    DisplayElem::Plain(x) => x,
+                match e {
+                    DisplayElem::Plain(x) => inners.push(x),
                     DisplayElem::Star(x) => {
                         if star.is_some() {
                             return Err(self.error("only one starred target is allowed"));
                         }
                         star = Some(i);
-                        x
+                        inners.push(x);
                     }
-                };
-                targets.push(self.assign_target(inner, line)?);
+                }
             }
             let value = self.parse_rhs_value()?;
-            self.expect_newline()?;
-            if star.is_none() && targets.len() < 2 {
-                return Err(self.error("a tuple-unpacking assignment needs two or more targets"));
+            if self.at(&Tok::Assign) {
+                if star.is_some() {
+                    return Err(self
+                        .error("a starred target in a chained assignment is out of the subset"));
+                }
+                return self.finish_chain(Expr::Tuple(inners), value, line);
             }
+            self.expect_newline()?;
+            let targets = inners
+                .into_iter()
+                .map(|e| self.assign_target(e, line))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Stmt::TupleAssign { targets, star, value })
         } else {
             if !saw_comma && matches!(elems.as_slice(), [DisplayElem::Star(_)]) {
@@ -1142,8 +1560,9 @@ impl Parser {
         if let [AssignTarget::Name(name)] = targets.as_slice() {
             let target = name.clone();
             if is_range_call(&iter) {
-                let (start, stop, step) = self.range_bounds(iter)?;
-                return Ok(Stmt::For { target, start, stop, step, body, orelse });
+                if let Ok((start, stop, step)) = self.range_bounds(iter.clone()) {
+                    return Ok(Stmt::For { target, start, stop, step, body, orelse });
+                }
             }
             return Ok(Stmt::ForIter { target, iterable: iter, body, orelse });
         }
@@ -1247,19 +1666,23 @@ impl Parser {
     fn parse_classdef(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwClass, "'class'")?;
         let name = self.expect_name()?;
-        let base = if self.eat(&Tok::LParen) {
-            let b = if self.at(&Tok::RParen) {
-                None
-            } else {
-                Some(self.parse_expr()?)
-            };
-            if self.at(&Tok::Comma) {
-                return Err(self.error("multiple inheritance is out of the subset"));
+        let bases = if self.eat(&Tok::LParen) {
+            let mut bases = Vec::new();
+            while !self.at(&Tok::RParen) {
+                if matches!(self.peek(), Tok::Name(_)) && matches!(self.peek2(), Tok::Assign) {
+                    return Err(
+                        self.error("a keyword class argument (e.g. `metaclass=`) is out of the subset")
+                    );
+                }
+                bases.push(self.parse_expr()?);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
             }
             self.expect(&Tok::RParen, "')' closing the base list")?;
-            b
+            bases
         } else {
-            None
+            Vec::new()
         };
         self.expect(&Tok::Colon, "':' after the class header")?;
         let body = self.parse_suite()?;
@@ -1273,7 +1696,7 @@ impl Parser {
                 ));
             }
         }
-        Ok(Stmt::ClassDef { name, base, body })
+        Ok(Stmt::ClassDef { name, bases, body })
     }
 
     /// Only `range(stop)`, `range(start, stop)`, or `range(start, stop, step)` are
@@ -2546,9 +2969,13 @@ impl Parser {
                 Ok(Expr::BigInt(digits))
             }
             Tok::Bytes(data) => {
-                let data = data.clone();
                 self.advance();
-                Ok(Expr::Bytes(data))
+                let mut joined = data;
+                while let Tok::Bytes(next) = self.peek().clone() {
+                    joined.extend_from_slice(&next);
+                    self.advance();
+                }
+                Ok(Expr::Bytes(joined))
             }
             Tok::Ellipsis => {
                 self.advance();
@@ -2727,6 +3154,29 @@ mod tests {
         };
         assert_eq!(targets.len(), 2);
         assert_eq!(*value, Expr::Tuple(vec![Expr::Int(1), Expr::Int(2)]));
+    }
+
+    #[test]
+    fn chained_assign_with_tuple_targets() {
+        for src in [
+            "x, y = p, q = 1, 2\n",
+            "(x, y) = p, q = 1, 2\n",
+            "[x, y] = p, q = 1, 2\n",
+        ] {
+            let module = parse_ok(src);
+            let Stmt::MultiAssign { targets, value } = &module.body[0] else {
+                panic!("a multi-assign: {src:?}")
+            };
+            assert_eq!(targets.len(), 2, "{src:?}");
+            assert!(matches!(&targets[0], AssignTarget::Tuple(t) if t.len() == 2), "{src:?}");
+            assert!(matches!(&targets[1], AssignTarget::Tuple(t) if t.len() == 2), "{src:?}");
+            assert_eq!(*value, Expr::Tuple(vec![Expr::Int(1), Expr::Int(2)]), "{src:?}");
+        }
+        assert!(matches!(&parse_ok("m = n, o = 1, 2\n").body[0], Stmt::MultiAssign { targets, .. }
+            if matches!(&targets[0], AssignTarget::Name(_)) && matches!(&targets[1], AssignTarget::Tuple(_))));
+        assert!(matches!(&parse_ok("a, b = c = 1, 2\n").body[0], Stmt::MultiAssign { targets, .. }
+            if matches!(&targets[0], AssignTarget::Tuple(_)) && matches!(&targets[1], AssignTarget::Name(_))));
+        assert!(parse_src("*a, b = c, d = 1, 2, 3\n").is_err());
     }
 
     #[test]
@@ -3095,7 +3545,10 @@ mod tests {
             parse_ok("for x in d:\n    pass\n").body[0],
             Stmt::ForIter { .. }
         ));
-        assert!(parse_src("a, = x\n").is_err());
+        assert!(matches!(
+            &parse_ok("a, = x\n").body[0],
+            Stmt::TupleAssign { targets, star: None, .. } if targets.len() == 1
+        ));
     }
 
     #[test]
@@ -3285,11 +3738,17 @@ mod tests {
 
     #[test]
     fn match_statement_desugars_and_disambiguates() {
-        let m = parse_ok("match x:\n    case 1:\n        y = 2\n    case _:\n        y = 3\n");
-        assert!(matches!(&m.body[0], Stmt::If { test: Expr::Bool(true), .. }));
+        let is_match = |src: &str| matches!(&parse_ok(src).body[0], Stmt::If { test: Expr::Bool(true), .. });
+        assert!(is_match("match x:\n    case 1:\n        y = 2\n    case _:\n        y = 3\n"));
+        for subj in ["[1, 2]", "(1, 2)", "{1: 2}", "-5", "True", "None", "x[1:2]"] {
+            let src = format!("match {subj}:\n    case _:\n        y = 1\n");
+            assert!(is_match(&src), "should be a match statement: {src:?}");
+        }
         assert!(matches!(parse_ok("match = 5\n").body[0], Stmt::Assign(_)));
         assert!(matches!(parse_ok("match(x)\n").body[0], Stmt::Expr(_)));
         assert!(matches!(parse_ok("y = match + 1\n").body[0], Stmt::Assign(_)));
+        assert!(!is_match("match[0] = 5\n"));
+        assert!(!is_match("match.attr\n"));
     }
 
     #[test]
@@ -3302,14 +3761,116 @@ mod tests {
             "match p:\n    case ():\n        pass\n",
             "match p:\n    case (x):\n        pass\n",
             "match p:\n    case (x,):\n        pass\n",
+            "match p:\n    case [x, *rest]:\n        pass\n",
+            "match p:\n    case [*init, y]:\n        pass\n",
+            "match p:\n    case [a, *_, b]:\n        pass\n",
+            "match p:\n    case ((a, b), c):\n        pass\n",
+            "match p:\n    case [a, [b, *rest]]:\n        pass\n",
         ] {
             assert!(parse_src(src).is_ok(), "should parse: {src:?}");
         }
         for src in [
-            "match p:\n    case (a, *rest):\n        pass\n",
-            "match p:\n    case {1: x}:\n        pass\n",
-            "match p:\n    case ((a, b), c):\n        pass\n",
+            "match p:\n    case [a, *b, *c]:\n        pass\n",
             "match p:\n    case (a | b, c):\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_err(), "should reject: {src:?}");
+        }
+    }
+
+    #[test]
+    fn class_patterns_parse_and_gate_the_subset() {
+        for src in [
+            "match p:\n    case Point():\n        pass\n",
+            "match p:\n    case int():\n        pass\n",
+            "match p:\n    case Point(a):\n        pass\n",
+            "match p:\n    case Point(0, y):\n        pass\n",
+            "match p:\n    case int(n):\n        pass\n",
+            "match p:\n    case Point(1 | 2, y):\n        pass\n",
+            "match p:\n    case Point(x=0):\n        pass\n",
+            "match p:\n    case Point(x=0, y=yy):\n        pass\n",
+            "match p:\n    case Point(x=px, y=py):\n        pass\n",
+            "match p:\n    case Point(x=1 | 2 | 3):\n        pass\n",
+            "match p:\n    case Point(a, y=2):\n        pass\n",
+            "match p:\n    case Point(x=0, y=0,):\n        pass\n",
+            "match p:\n    case pkg.mod.Cls():\n        pass\n",
+            "match p:\n    case Line(Point(0, 0), end):\n        pass\n",
+            "match p:\n    case Seg(a=Point(x=0), b=Point(y=r)):\n        pass\n",
+            "match p:\n    case [Point(x=0), Point(x=1)]:\n        pass\n",
+            "match p:\n    case Box(items=[a, b]):\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+        for src in [
+            "match p:\n    case Point(x=0, x=1):\n        pass\n",
+            "match p:\n    case Point(x=0, a):\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_err(), "should reject: {src:?}");
+        }
+    }
+
+    #[test]
+    fn as_patterns_capture_the_matched_value() {
+        for src in [
+            "match v:\n    case 0 as z:\n        pass\n",
+            "match v:\n    case [a, b] as pair:\n        pass\n",
+            "match v:\n    case int() as n:\n        pass\n",
+            "match v:\n    case Point(x, y) as pt:\n        pass\n",
+            "match v:\n    case 1 | 2 | 3 as small:\n        pass\n",
+            "match v:\n    case x as whole:\n        pass\n",
+            "match v:\n    case Box(item=[a] as it):\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+        assert!(matches!(
+            &parse_ok("match v:\n    case [a] as p:\n        y = 1\n").body[0],
+            Stmt::If { .. }
+        ));
+        assert!(parse_src("match v:\n    case [x] as _:\n        pass\n").is_err());
+    }
+
+    #[test]
+    fn or_patterns_allow_non_binding_alternatives() {
+        for src in [
+            "match v:\n    case 1 | 2 | 3:\n        pass\n",
+            "match v:\n    case int() | float():\n        pass\n",
+            "match v:\n    case [1] | [2, 3] | []:\n        pass\n",
+            "match v:\n    case Point() | Circle():\n        pass\n",
+            "match v:\n    case 1 | 'a' | None | True:\n        pass\n",
+            "match v:\n    case 1 | _:\n        pass\n",
+            "match v:\n    case [1 | 2, x]:\n        pass\n",
+            "match v:\n    case (0, 0) | [0, 0]:\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+        for src in [
+            "match v:\n    case x | y:\n        pass\n",
+            "match v:\n    case [x] | (x,):\n        pass\n",
+            "match v:\n    case Point(a) | Circle():\n        pass\n",
+            "match v:\n    case 1 | x:\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_err(), "should reject: {src:?}");
+        }
+    }
+
+    #[test]
+    fn mapping_patterns_parse_and_gate_the_subset() {
+        for src in [
+            "match v:\n    case {}:\n        pass\n",
+            "match v:\n    case {\"a\": x}:\n        pass\n",
+            "match v:\n    case {\"a\": 1, \"b\": 2}:\n        pass\n",
+            "match v:\n    case {\"a\": 1 | 2, \"b\": y}:\n        pass\n",
+            "match v:\n    case {\"a\": x, **rest}:\n        pass\n",
+            "match v:\n    case {**rest}:\n        pass\n",
+            "match v:\n    case {\"a\": {\"b\": z}}:\n        pass\n",
+            "match v:\n    case {Color.RED: x}:\n        pass\n",
+            "match v:\n    case {1: a, 2: b,}:\n        pass\n",
+        ] {
+            assert!(parse_src(src).is_ok(), "should parse: {src:?}");
+        }
+        for src in [
+            "match v:\n    case {x: 1}:\n        pass\n",
+            "match v:\n    case {\"a\": 1, \"a\": 2}:\n        pass\n",
+            "match v:\n    case {**_}:\n        pass\n",
         ] {
             assert!(parse_src(src).is_err(), "should reject: {src:?}");
         }
@@ -3415,17 +3976,21 @@ mod tests {
     #[test]
     fn class_def_parses() {
         let m = parse_ok("class C(Base):\n    k = 1\n    def m(self):\n        return self.k\n");
-        let Stmt::ClassDef { name, base, body } = &m.body[0] else {
+        let Stmt::ClassDef { name, bases, body } = &m.body[0] else {
             panic!("expected a class def");
         };
         assert_eq!(name, "C");
-        assert!(base.is_some());
+        assert_eq!(bases.len(), 1);
         assert_eq!(body.len(), 2);
         assert!(matches!(
-            parse_ok("class D:\n    pass\n").body[0],
-            Stmt::ClassDef { base: None, .. }
+            &parse_ok("class D:\n    pass\n").body[0],
+            Stmt::ClassDef { bases, .. } if bases.is_empty()
         ));
-        assert!(parse_src("class E(A, B):\n    pass\n").is_err());
+        assert!(matches!(
+            &parse_ok("class E(A, B, C):\n    pass\n").body[0],
+            Stmt::ClassDef { bases, .. } if bases.len() == 3
+        ));
+        assert!(parse_src("class F(metaclass=M):\n    pass\n").is_err());
         assert!(matches!(parse_ok("obj.x = 5\n").body[0], Stmt::SetAttr { .. }));
     }
 
@@ -3536,6 +4101,11 @@ mod tests {
             parse_ok("\"ab\" + \"cd\"\n").body[0],
             Stmt::Expr(Expr::Binary { .. })
         ));
+        assert_eq!(
+            parse_ok("b\"ab\" b\"cd\"\n").body[0],
+            Stmt::Expr(Expr::Bytes(b"abcd".to_vec()))
+        );
+        assert!(parse_src("b\"a\" \"b\"\n").is_err());
     }
 
     #[test]
@@ -3588,14 +4158,16 @@ mod tests {
     }
 
     #[test]
-    fn range_with_a_step_is_extracted_and_validated() {
+    fn range_with_a_literal_step_is_counted_else_iterates_the_value() {
         let module = parse_ok("for i in range(0, 10, 2):\n    x = i\n");
         let Stmt::For { step, .. } = &module.body[0] else {
-            panic!("expected a for");
+            panic!("expected a counted for");
         };
         assert_eq!(*step, 2);
-        assert!(parse_src("for i in range(0, 10, n):\n    x = i\n").is_err());
-        assert!(parse_src("for i in range(0, 10, 0):\n    x = i\n").is_err());
+        let var_step = parse_ok("for i in range(0, 10, n):\n    x = i\n");
+        assert!(matches!(var_step.body[0], Stmt::ForIter { .. }));
+        let zero_step = parse_ok("for i in range(0, 10, 0):\n    x = i\n");
+        assert!(matches!(zero_step.body[0], Stmt::ForIter { .. }));
     }
 
     #[test]
@@ -3786,7 +4358,7 @@ else:
     fn keyword_argument_errors_match_python() {
         assert!(parse_src("f(x=1, y)\n").is_err());
         assert!(parse_src("f(x=1, x=2)\n").is_err());
-        assert!(parse_src("for i in range(stop=3):\n    pass\n").is_err());
+        assert!(parse_src("for i in range(stop=3):\n    pass\n").is_ok());
     }
 
     #[test]

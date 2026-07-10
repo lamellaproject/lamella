@@ -19,6 +19,9 @@ lamella-metadata = { path = "../lamella-metadata" }
 # a C# GPIO/peripheral driver reaches real registers). Unused on the host (which uses the sim).
 lamella-mmio = { path = "../lamella-mmio" }
 
+# The run-with-corlib reference-runner example and its host-only backend dev-dependencies
+# (net/tls/pinvoke-host) live in the separate lamella-host-tests crate.
+
 [features]
 # Source-level debugger names (forwarded to the loader). Default on; a constrained device build drops it.
 default = ["profile-full", "debug-names"]

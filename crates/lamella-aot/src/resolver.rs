@@ -14,8 +14,8 @@ use lamella_metadata::{
 use lamella_token::Token;
 
 use crate::cil::{
-    Array2DOp, ArrayElement, CallInfo, CallResolver, CallTarget, CilError, Intrinsic, PInvokeCall,
-    ReferenceLayout, lower_method_typed,
+    Array2DOp, ArrayElement, ArrayMDOp, CallInfo, CallResolver, CallTarget, CilError, Intrinsic,
+    PInvokeCall, ReferenceLayout, lower_method_typed,
 };
 
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
@@ -788,14 +788,13 @@ impl CallResolver for MetadataResolver<'_> {
         if !self.is_delegate_type(&type_def) {
             return None;
         }
-        let layout = self
-            .assembly
-            .value_type_layout(type_def.token(), &TargetLayout::ilp32())
-            .ok()?;
         Some(ReferenceLayout {
             handle: TypeHandle(type_def.token().0),
-            size: layout.size,
-            reference_offsets: layout.reference_offsets,
+            size: crate::cil::DELEGATE_SIZE,
+            reference_offsets: alloc::vec![
+                crate::cil::DELEGATE_TARGET_OFFSET,
+                crate::cil::DELEGATE_INVOCATION_LIST_OFFSET,
+            ],
         })
     }
 
@@ -904,6 +903,41 @@ impl CallResolver for MetadataResolver<'_> {
                     .unwrap_or(MirType::I32),
             }),
             "Set" => Some(Array2DOp::Set { element_size }),
+            _ => None,
+        }
+    }
+
+    fn array_md_op(&self, operand: &Operand) -> Option<ArrayMDOp> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        if token.table() != table::MEMBER_REF {
+            return None;
+        }
+        let member = self.assembly.member_ref(token.row())?;
+        let parent = member.parent();
+        let SigType::Array { element, rank } = self.assembly.type_spec_signature(parent)? else {
+            return None;
+        };
+        if rank < 3 {
+            return None;
+        }
+        let rank = rank as usize;
+        let (element_size, signed) = array_element_size(&element);
+        match member.name()? {
+            ".ctor" => Some(ArrayMDOp::New {
+                handle: TypeHandle(parent.0),
+                element_size,
+                rank,
+            }),
+            "Get" => Some(ArrayMDOp::Get {
+                element_size,
+                signed,
+                element_type: mir_type(&element, self.assembly, &TargetLayout::ilp32())
+                    .unwrap_or(MirType::I32),
+                rank,
+            }),
+            "Set" => Some(ArrayMDOp::Set { element_size, rank }),
             _ => None,
         }
     }

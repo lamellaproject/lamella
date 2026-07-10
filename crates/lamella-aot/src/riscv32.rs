@@ -137,6 +137,103 @@ fn soft_int_routine(op: BinOp) -> &'static str {
     }
 }
 
+/// The compiler-rt soft routine for an int64 (two-word) DIV/REM `op`, called `(a0:a1, a2:a3) -> a0:a1`.
+/// There is no inline 64-bit division on either profile, so these route to a call regardless of RV32IM /
+/// RV32E. `None` for a non-div/rem op (int64 mul is handled separately -- inline on RV32IM, `__muldi3`
+/// on RV32E; add/sub/shift/bitwise lower inline via [`emit_i64_binary`]).
+fn int64_soft_routine(op: BinOp) -> Option<&'static str> {
+    match op {
+        BinOp::DivSigned => Some("__divdi3"),
+        BinOp::DivUnsigned => Some("__udivdi3"),
+        BinOp::RemSigned => Some("__moddi3"),
+        BinOp::RemUnsigned => Some("__umoddi3"),
+        _ => None,
+    }
+}
+
+/// Whether `value` is a float (`f32`/`f64`). The RV32IM/RV32E cores have no FPU, so every float op lowers
+/// to a `compiler_builtins`/libgcc soft-float CALL (the compiler-rt names, NOT ARM's `__aeabi_*`); an
+/// `f32` rides one register (a0), an `f64` a register pair (a0:a1), matching the multi-word value ABI.
+fn is_float(value_types: &[MirType], value: ValueId) -> bool {
+    matches!(
+        value_types.get(value.index()),
+        Some(MirType::F32 | MirType::F64)
+    )
+}
+
+/// The compiler-rt soft-float routine for a float ARITHMETIC `Binary`, keyed by the (float) result width;
+/// `None` when the result is not a float (an integer op). `f32` -> `__addsf3`/... called `(a0, a1) -> a0`;
+/// `f64` -> `__adddf3`/... called `(a0:a1, a2:a3) -> a0:a1`. Float `%` has no compiler-rt helper (it is a
+/// library `fmod`), so `Rem` returns `None` and the caller rejects a float remainder as `Unsupported`.
+fn soft_float_arith(op: BinOp, result_ty: Option<&MirType>) -> Option<&'static str> {
+    let is_f64 = matches!(result_ty, Some(MirType::F64));
+    if !is_f64 && !matches!(result_ty, Some(MirType::F32)) {
+        return None;
+    }
+    Some(match (op, is_f64) {
+        (BinOp::Add, true) => "__adddf3",
+        (BinOp::Sub, true) => "__subdf3",
+        (BinOp::Mul, true) => "__muldf3",
+        (BinOp::DivSigned | BinOp::DivUnsigned, true) => "__divdf3",
+        (BinOp::Add, false) => "__addsf3",
+        (BinOp::Sub, false) => "__subsf3",
+        (BinOp::Mul, false) => "__mulsf3",
+        (BinOp::DivSigned | BinOp::DivUnsigned, false) => "__divsf3",
+        _ => return None,
+    })
+}
+
+/// The compiler-rt soft routine for a float CONVERSION the no-FPU core cannot do inline, with the source
+/// and destination WORD counts (for the register-pair marshalling: `f64`/`i64` span a0:a1, the rest a0).
+/// `None` for an integer widen/narrow, which stays inline in [`emit_convert`].
+fn soft_float_convert(kind: ConvKind) -> Option<(&'static str, u32, u32)> {
+    Some(match kind {
+        ConvKind::IntToFloat32 => ("__floatsisf", 1, 1),
+        ConvKind::IntToFloat64 => ("__floatsidf", 1, 2),
+        ConvKind::UIntToFloat64 => ("__floatunsidf", 1, 2),
+        ConvKind::LongToFloat64 => ("__floatdidf", 2, 2),
+        ConvKind::LongToFloat32 => ("__floatdisf", 2, 1),
+        ConvKind::ULongToFloat64 => ("__floatundidf", 2, 2),
+        ConvKind::Float32ToInt => ("__fixsfsi", 1, 1),
+        ConvKind::Float64ToInt => ("__fixdfsi", 2, 1),
+        ConvKind::Float32ToFloat64 => ("__extendsfdf2", 1, 2),
+        ConvKind::Float64ToFloat32 => ("__truncdfsf2", 2, 1),
+        _ => return None,
+    })
+}
+
+/// The compiler-rt comparison routine SUFFIX for a float `Compare`, plus the SIGNED integer test (of the
+/// routine's returned int, against zero) that yields the CLI bool -- reused through [`materialize_compare`]
+/// with `a0` vs `x0`. The routines are ORDERED and return `<0`/`0`/`>0`; the CLI's unordered forms
+/// (`clt.un` etc.) select the opposite-sense routine and read its sign the other way -- e.g. `clt.un`
+/// (a<b OR NaN) = `!(a>=b ordered)` = `__gedf2(...) < 0`. The full name is `__<suffix>df2`/`__<suffix>sf2`.
+fn float_compare_plan(op: CmpOp) -> (&'static str, CmpOp) {
+    match op {
+        CmpOp::Eq => ("eq", CmpOp::Eq),
+        CmpOp::Ne => ("ne", CmpOp::Ne),
+        CmpOp::SignedLt => ("lt", CmpOp::SignedLt),
+        CmpOp::SignedGt => ("gt", CmpOp::SignedGt),
+        CmpOp::SignedLe => ("le", CmpOp::SignedLe),
+        CmpOp::SignedGe => ("ge", CmpOp::SignedGe),
+        CmpOp::UnsignedLt => ("ge", CmpOp::SignedLt),
+        CmpOp::UnsignedGt => ("le", CmpOp::SignedGt),
+        CmpOp::UnsignedLe => ("gt", CmpOp::SignedLe),
+        CmpOp::UnsignedGe => ("lt", CmpOp::SignedGe),
+    }
+}
+
+/// True if `inst` lowers to a soft-float CALL on the FPU-less RISC-V cores -- a float arithmetic `Binary`,
+/// a float `Compare`, or a float `Convert`. Such a function is non-leaf (its `ra` is saved) and takes the
+/// all-spilled path (which hosts the call marshalling), the same as an integer soft-routine call.
+fn inst_is_softfloat_call(inst: &Inst, result: ValueId, value_types: &[MirType]) -> bool {
+    match inst {
+        Inst::Binary { .. } => is_float(value_types, result),
+        Inst::Compare { lhs, .. } => is_float(value_types, *lhs),
+        Inst::Convert { kind, .. } => soft_float_convert(*kind).is_some(),
+        _ => false,
+    }
+}
+
 /// Emits `product = a * b` (low 32 bits). RV32IM uses the hardware `mul`; RV32E has no M-extension, so
 /// it shifts and adds INLINE (no call, so it never clobbers other live registers). The RV32E path
 /// MUTATES `a` (shifted left) and `b` (shifted down to zero), so the caller must not need either after
@@ -233,7 +330,10 @@ fn func_allocates(func: &Function) -> bool {
         b.insts.iter().any(|(_, i)| {
             matches!(
                 i,
-                Inst::Alloc { .. } | Inst::AllocArray { .. } | Inst::AllocArray2D { .. }
+                Inst::Alloc { .. }
+                    | Inst::AllocArray { .. }
+                    | Inst::AllocArray2D { .. }
+                    | Inst::AllocArrayMD { .. }
             )
         })
     })
@@ -596,10 +696,12 @@ fn lower_function(
     let pool = allocatable(profile);
     let value_count = func.value_types.len();
     let allocates = func_allocates(func);
-    let has_value_types = func
-        .value_types
-        .iter()
-        .any(|t| matches!(t, MirType::ValueType { .. } | MirType::I64));
+    let has_value_types = func.value_types.iter().any(|t| {
+        matches!(
+            t,
+            MirType::ValueType { .. } | MirType::I64 | MirType::F32 | MirType::F64
+        )
+    });
     let has_dispatch = func.blocks.iter().any(|b| {
         b.insts.iter().any(|(_, i)| {
             matches!(
@@ -614,6 +716,9 @@ fn lower_function(
                     | Inst::TypeDescAddr { .. }
                     | Inst::CastClassScan { .. }
                     | Inst::CallNative { .. }
+                    | Inst::AllocArrayMD { .. }
+                    | Inst::ArrayMDLoad { .. }
+                    | Inst::ArrayMDStore { .. }
             )
         })
     });
@@ -1061,17 +1166,22 @@ fn lower_function_spilled(
                     | Inst::Alloc { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
+                    | Inst::AllocArrayMD { .. }
                     | Inst::CallIndirect { .. }
                     | Inst::InvokeDelegate { .. }
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
                     | Inst::CallNative { .. }
             ) || matches!(
+                i,
+                Inst::Binary { op, .. }
+                    if int64_soft_routine(*op).is_some() && is_i64(&func.value_types, *r)
+            ) || matches!(
                 (profile, i),
                 (RiscvProfile::Rv32ec, Inst::Binary { op, .. })
                     if (is_soft_int_binop(*op) && !is_i64(&func.value_types, *r))
                         || (matches!(op, BinOp::Mul) && is_i64(&func.value_types, *r))
-            )
+            ) || inst_is_softfloat_call(i, *r, &func.value_types)
         })
     });
     let mut offsets: Vec<i32> = Vec::with_capacity(value_count);
@@ -1082,8 +1192,23 @@ fn lower_function_spilled(
     }
     let ra_off = used;
     let scratch_off = ra_off + has_calls as i32 * 4;
-    let frame =
-        ((used + has_calls as i32 * 4 + saves_scratch as i32 * 4) as usize).div_ceil(16) * 16;
+    let returns_sret = func
+        .ret
+        .as_ref()
+        .is_some_and(|t| t.stack_slot_bytes() / 4 > 2);
+    let sret_off = scratch_off + saves_scratch as i32 * 4;
+    let invokes_delegate = func
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|(_, i)| matches!(i, Inst::InvokeDelegate { .. })));
+    let mc_off = sret_off + returns_sret as i32 * 4;
+    let frame = ((used
+        + has_calls as i32 * 4
+        + saves_scratch as i32 * 4
+        + returns_sret as i32 * 4
+        + invokes_delegate as i32 * 8) as usize)
+        .div_ceil(16)
+        * 16;
     if frame > 2047 {
         return Err(LowerError::TooManyValues);
     }
@@ -1100,9 +1225,33 @@ fn lower_function_spilled(
         enc.sw(spilled_scratch(profile), Reg::SP, scratch_off);
     }
     let entry = &func.blocks[func.entry.index()];
-    for (i, &param) in entry.params.iter().enumerate() {
-        let arg = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
-        enc.sw(arg, Reg::SP, slot(param));
+    let mut arg_index = 0usize;
+    if returns_sret {
+        enc.sw(Reg::A0, Reg::SP, sret_off);
+        arg_index = 1;
+    }
+    for &param in &entry.params {
+        let words = value_words(&func.value_types, param);
+        if words > 2 {
+            if arg_index >= arg_reg_count(profile) {
+                return Err(LowerError::ControlFlowUnsupported);
+            }
+            let ptr = arg_reg(arg_index).ok_or(LowerError::ControlFlowUnsupported)?;
+            for w in 0..slot_words(&func.value_types, param) as i32 {
+                enc.lw(Reg::T0, ptr, w * 4);
+                enc.sw(Reg::T0, Reg::SP, slot(param) + w * 4);
+            }
+            arg_index += 1;
+            continue;
+        }
+        for w in 0..words {
+            if arg_index >= arg_reg_count(profile) {
+                return Err(LowerError::ControlFlowUnsupported);
+            }
+            let arg = arg_reg(arg_index).ok_or(LowerError::ControlFlowUnsupported)?;
+            enc.sw(arg, Reg::SP, slot(param) + w as i32 * 4);
+            arg_index += 1;
+        }
     }
 
     let block_labels: Vec<Label> = (0..func.blocks.len()).map(|_| enc.new_label()).collect();
@@ -1141,12 +1290,26 @@ fn lower_function_spilled(
                 profile,
                 relocs,
                 relocate,
+                mc_off,
             )?;
         }
         match &block.terminator {
             Some(Terminator::Return(value)) => {
                 if let Some(v) = value {
-                    enc.lw(Reg::A0, Reg::SP, slot(*v));
+                    let words = value_words(&func.value_types, *v);
+                    if words > 2 {
+                        enc.lw(Reg::T0, Reg::SP, sret_off);
+                        for w in 0..slot_words(&func.value_types, *v) as i32 {
+                            enc.lw(Reg::T1, Reg::SP, slot(*v) + w * 4);
+                            enc.sw(Reg::T1, Reg::T0, w * 4);
+                        }
+                        enc.mv(Reg::A0, Reg::T0);
+                    } else {
+                        enc.lw(Reg::A0, Reg::SP, slot(*v));
+                        if words >= 2 {
+                            enc.lw(Reg::A1, Reg::SP, slot(*v) + 4);
+                        }
+                    }
                 }
                 if has_calls {
                     enc.lw(Reg::RA, Reg::SP, ra_off);
@@ -1260,6 +1423,7 @@ fn lower_inst_spilled(
     profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
     relocate: bool,
+    mc_off: i32,
 ) -> Result<(), LowerError> {
     let (t0, t1, t2) = (Reg::T0, Reg::T1, Reg::T2);
     let scratch = spilled_scratch(profile);
@@ -1267,7 +1431,7 @@ fn lower_inst_spilled(
         Inst::ConstInt { ty, value } => {
             enc.li(t0, *value as i32);
             enc.sw(t0, Reg::SP, slot(result));
-            if matches!(ty, MirType::I64) {
+            if matches!(ty, MirType::I64 | MirType::F64) {
                 enc.li(t0, (*value >> 32) as i32);
                 enc.sw(t0, Reg::SP, slot(result) + 4);
             }
@@ -1288,7 +1452,14 @@ fn lower_inst_spilled(
         }
         Inst::Binary { op, lhs, rhs } => {
             if is_i64(value_types, result) {
-                if matches!(profile, RiscvProfile::Rv32ec) && matches!(op, BinOp::Mul) {
+                let routine = int64_soft_routine(*op).or_else(|| {
+                    (matches!(profile, RiscvProfile::Rv32ec) && matches!(op, BinOp::Mul))
+                        .then_some("__muldi3")
+                });
+                if let Some(routine) = routine {
+                    if !relocate {
+                        return Err(LowerError::Unsupported);
+                    }
                     let (a2, a3) = (
                         Reg::new(12).unwrap_or(Reg::ZERO),
                         Reg::new(13).unwrap_or(Reg::ZERO),
@@ -1297,12 +1468,39 @@ fn lower_inst_spilled(
                     enc.lw(Reg::A1, Reg::SP, slot(*lhs) + 4);
                     enc.lw(a2, Reg::SP, slot(*rhs));
                     enc.lw(a3, Reg::SP, slot(*rhs) + 4);
-                    let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, "__muldi3");
+                    let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
                     emit_call(enc, func_labels, relocs, relocate, target)?;
                     enc.sw(Reg::A0, Reg::SP, slot(result));
                     enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
                 } else {
                     emit_i64_binary(enc, slot, *op, result, *lhs, *rhs, profile)?;
+                }
+            } else if is_float(value_types, result) {
+                let Some(routine) = soft_float_arith(*op, value_types.get(result.index())) else {
+                    return Err(LowerError::Unsupported);
+                };
+                if !relocate {
+                    return Err(LowerError::Unsupported);
+                }
+                if matches!(value_types.get(result.index()), Some(MirType::F64)) {
+                    let (a2, a3) = (
+                        Reg::new(12).unwrap_or(Reg::ZERO),
+                        Reg::new(13).unwrap_or(Reg::ZERO),
+                    );
+                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
+                    enc.lw(Reg::A1, Reg::SP, slot(*lhs) + 4);
+                    enc.lw(a2, Reg::SP, slot(*rhs));
+                    enc.lw(a3, Reg::SP, slot(*rhs) + 4);
+                    let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
+                    emit_call(enc, func_labels, relocs, relocate, target)?;
+                    enc.sw(Reg::A0, Reg::SP, slot(result));
+                    enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
+                } else {
+                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
+                    enc.lw(Reg::A1, Reg::SP, slot(*rhs));
+                    let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
+                    emit_call(enc, func_labels, relocs, relocate, target)?;
+                    enc.sw(Reg::A0, Reg::SP, slot(result));
                 }
             } else if matches!(profile, RiscvProfile::Rv32ec) && is_soft_int_binop(*op) {
                 enc.lw(Reg::A0, Reg::SP, slot(*lhs));
@@ -1334,6 +1532,30 @@ fn lower_inst_spilled(
         Inst::Compare { op, lhs, rhs } => {
             if is_i64(value_types, *lhs) {
                 emit_i64_compare(enc, slot, *op, result, *lhs, *rhs, profile)?;
+            } else if is_float(value_types, *lhs) {
+                if !relocate {
+                    return Err(LowerError::Unsupported);
+                }
+                let (suffix, result_op) = float_compare_plan(*op);
+                let is_f64 = matches!(value_types.get(lhs.index()), Some(MirType::F64));
+                let name = alloc::format!("__{}{}2", suffix, if is_f64 { "df" } else { "sf" });
+                if is_f64 {
+                    let (a2, a3) = (
+                        Reg::new(12).unwrap_or(Reg::ZERO),
+                        Reg::new(13).unwrap_or(Reg::ZERO),
+                    );
+                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
+                    enc.lw(Reg::A1, Reg::SP, slot(*lhs) + 4);
+                    enc.lw(a2, Reg::SP, slot(*rhs));
+                    enc.lw(a3, Reg::SP, slot(*rhs) + 4);
+                } else {
+                    enc.lw(Reg::A0, Reg::SP, slot(*lhs));
+                    enc.lw(Reg::A1, Reg::SP, slot(*rhs));
+                }
+                let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, &name);
+                emit_call(enc, func_labels, relocs, relocate, target)?;
+                materialize_compare(enc, t0, Reg::A0, Reg::ZERO, result_op);
+                enc.sw(t0, Reg::SP, slot(result));
             } else {
                 enc.lw(t0, Reg::SP, slot(*lhs));
                 enc.lw(t1, Reg::SP, slot(*rhs));
@@ -1342,9 +1564,25 @@ fn lower_inst_spilled(
             }
         }
         Inst::Convert { value, kind } => {
-            enc.lw(t0, Reg::SP, slot(*value));
-            emit_convert(enc, t0, t0, *kind)?;
-            enc.sw(t0, Reg::SP, slot(result));
+            if let Some((routine, src_words, dst_words)) = soft_float_convert(*kind) {
+                if !relocate {
+                    return Err(LowerError::Unsupported);
+                }
+                enc.lw(Reg::A0, Reg::SP, slot(*value));
+                if src_words >= 2 {
+                    enc.lw(Reg::A1, Reg::SP, slot(*value) + 4);
+                }
+                let target = EXTERN_SYMBOL_FLAG | intern_extern(externs, routine);
+                emit_call(enc, func_labels, relocs, relocate, target)?;
+                enc.sw(Reg::A0, Reg::SP, slot(result));
+                if dst_words >= 2 {
+                    enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
+                }
+            } else {
+                enc.lw(t0, Reg::SP, slot(*value));
+                emit_convert(enc, t0, t0, *kind)?;
+                enc.sw(t0, Reg::SP, slot(result));
+            }
         }
         Inst::CopyBlock { dst, src, size } => {
             enc.lw(t0, Reg::SP, slot(*dst));
@@ -1453,6 +1691,93 @@ fn lower_inst_spilled(
                 1 => enc.sb(t0, scratch, 0),
                 2 => enc.sh(t0, scratch, 0),
                 _ => enc.sw(t0, scratch, 0),
+            }
+        }
+        Inst::AllocArrayMD {
+            handle,
+            dims,
+            element_size,
+        } => {
+            if matches!(profile, RiscvProfile::Rv32ec) {
+                return Err(LowerError::Unsupported);
+            }
+            let n = dims.len() as i32;
+            let header = 4 * n;
+            let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
+                Some((_, l)) => *l,
+                None => {
+                    let l = enc.new_label();
+                    type_descs.push(DescEmit {
+                        label: l,
+                        vtable: Vec::new(),
+                        words: alloc::vec![*element_size, 0, 0],
+                        itable: Vec::new(),
+                        base: None,
+                    });
+                    type_desc_labels.push((*handle, l));
+                    l
+                }
+            };
+            enc.lw(t0, Reg::SP, slot(dims[0]));
+            for d in &dims[1..] {
+                enc.lw(t1, Reg::SP, slot(*d));
+                enc.mul(t0, t0, t1);
+            }
+            if element_size.is_power_of_two() {
+                enc.slli(t0, t0, element_size.trailing_zeros());
+            } else {
+                enc.li(t1, *element_size as i32);
+                enc.mul(t0, t0, t1);
+            }
+            enc.addi(Reg::A0, t0, header);
+            enc.la(Reg::A1, desc_label);
+            emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
+            let ok = enc.new_label();
+            enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
+            enc.ebreak();
+            enc.bind_label(ok);
+            for (k, d) in dims.iter().enumerate() {
+                enc.lw(t0, Reg::SP, slot(*d));
+                enc.sw(t0, Reg::A0, 4 * k as i32);
+            }
+            enc.sw(Reg::A0, Reg::SP, slot(result));
+        }
+        Inst::ArrayMDLoad {
+            array,
+            indices,
+            element_size,
+            signed,
+        } => {
+            if matches!(profile, RiscvProfile::Rv32ec) || !matches!(*element_size, 1 | 2 | 4) {
+                return Err(LowerError::Unsupported);
+            }
+            enc.lw(t0, Reg::SP, slot(*array));
+            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size);
+            match (*element_size, *signed) {
+                (1, true) => enc.lb(t0, t1, 0),
+                (1, false) => enc.lbu(t0, t1, 0),
+                (2, true) => enc.lh(t0, t1, 0),
+                (2, false) => enc.lhu(t0, t1, 0),
+                _ => enc.lw(t0, t1, 0),
+            }
+            enc.sw(t0, Reg::SP, slot(result));
+        }
+        Inst::ArrayMDStore {
+            array,
+            indices,
+            value,
+            element_size,
+        } => {
+            if matches!(profile, RiscvProfile::Rv32ec) || !matches!(*element_size, 1 | 2 | 4) {
+                return Err(LowerError::Unsupported);
+            }
+            enc.lw(t0, Reg::SP, slot(*array));
+            emit_md_element_address(enc, t0, t1, t2, scratch, slot, indices, *element_size);
+            enc.lw(t0, Reg::SP, slot(*value));
+            match *element_size {
+                1 => enc.sb(t0, t1, 0),
+                2 => enc.sh(t0, t1, 0),
+                _ => enc.sw(t0, t1, 0),
             }
         }
         Inst::Load {
@@ -1699,28 +2024,19 @@ fn lower_inst_spilled(
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         Inst::Call { callee, args } => {
-            if value_type_words(value_types, result).is_some()
-                || args
-                    .iter()
-                    .any(|&a| value_type_words(value_types, a).is_some())
-            {
-                return Err(LowerError::Unsupported);
-            }
-            for (i, &arg) in args.iter().enumerate() {
-                let target = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.lw(target, Reg::SP, slot(arg));
-            }
+            let first = emit_sret_arg(enc, slot, value_types, result);
+            marshal_call_args(enc, slot, value_types, args, first, profile)?;
             emit_call(enc, func_labels, relocs, relocate, *callee)?;
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            if first == 0 {
+                store_call_result(enc, slot, value_types, result);
+            }
         }
         Inst::CallNative { symbol, args } => {
             if !relocate {
                 return Err(LowerError::Unsupported);
             }
-            for (i, &arg) in args.iter().enumerate() {
-                let target = arg_reg(i).ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.lw(target, Reg::SP, slot(arg));
-            }
+            let first = emit_sret_arg(enc, slot, value_types, result);
+            marshal_call_args(enc, slot, value_types, args, first, profile)?;
             emit_call(
                 enc,
                 func_labels,
@@ -1728,7 +2044,9 @@ fn lower_inst_spilled(
                 relocate,
                 EXTERN_SYMBOL_FLAG | *symbol,
             )?;
-            enc.sw(Reg::A0, Reg::SP, slot(result));
+            if first == 0 {
+                store_call_result(enc, slot, value_types, result);
+            }
         }
         Inst::FuncAddr { func } => {
             let label = *func_labels
@@ -1750,11 +2068,30 @@ fn lower_inst_spilled(
             if args.len() > 7 {
                 return Err(LowerError::ControlFlowUnsupported);
             }
-            enc.lw(t0, Reg::SP, slot(*delegate));
-            enc.lw(scratch, t0, 4);
-            enc.lw(t1, t0, 0);
+            let mloop = enc.new_label();
+            let multi = enc.new_label();
+            let dispatch = enc.new_label();
             let static_call = enc.new_label();
             let do_call = enc.new_label();
+            let mdone = enc.new_label();
+            enc.sw(Reg::ZERO, Reg::SP, mc_off);
+            enc.bind_label(mloop);
+            enc.lw(t0, Reg::SP, slot(*delegate));
+            enc.lw(t1, t0, 8);
+            enc.branch(BranchCond::Ne, t1, Reg::ZERO, multi);
+            enc.lw(t2, Reg::SP, mc_off);
+            enc.branch(BranchCond::Ne, t2, Reg::ZERO, mdone);
+            enc.j(dispatch);
+            enc.bind_label(multi);
+            enc.lw(t2, t1, 0);
+            enc.lw(t0, Reg::SP, mc_off);
+            enc.branch(BranchCond::GeU, t0, t2, mdone);
+            enc.slli(t0, t0, 2);
+            enc.add(t0, t1, t0);
+            enc.lw(t0, t0, 4);
+            enc.bind_label(dispatch);
+            enc.lw(scratch, t0, 4);
+            enc.lw(t1, t0, 0);
             enc.branch(BranchCond::Eq, t1, Reg::ZERO, static_call);
             enc.mv(Reg::A0, t1);
             for (i, &arg) in args.iter().enumerate() {
@@ -1769,6 +2106,13 @@ fn lower_inst_spilled(
             }
             enc.bind_label(do_call);
             enc.jalr(Reg::RA, scratch, 0);
+            enc.sw(Reg::A0, Reg::SP, mc_off + 4);
+            enc.lw(t0, Reg::SP, mc_off);
+            enc.addi(t0, t0, 1);
+            enc.sw(t0, Reg::SP, mc_off);
+            enc.j(mloop);
+            enc.bind_label(mdone);
+            enc.lw(Reg::A0, Reg::SP, mc_off + 4);
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         Inst::CallVirtual {
@@ -2399,6 +2743,86 @@ fn value_type_words(value_types: &[MirType], value: ValueId) -> Option<u32> {
     }
 }
 
+/// The number of 4-byte words a value occupies in the argument/return registers: 2 for an int64 or a
+/// (<=2-word) value type -- a register PAIR -- and 1 for a scalar. A value type wider than 2 words is
+/// passed/returned by reference (its single pointer register), so callers test `> 2` to take that path.
+fn value_words(value_types: &[MirType], value: ValueId) -> u32 {
+    match value_types.get(value.index()) {
+        Some(MirType::I64 | MirType::F64) => 2,
+        Some(MirType::ValueType { size, .. }) => size / 4,
+        _ => 1,
+    }
+}
+
+/// Marshals a call's arguments from their slots into the argument registers, starting at register index
+/// `first` (0 for a static call, 1 when a0 already holds a receiver). Each value takes consecutive
+/// registers per [`value_words`] -- an int64 / small value type spans a pair. Rejects if the arguments
+/// overflow the profile's argument registers (a0-a5 on RV32E, a0-a7 otherwise); stack-passed arguments
+/// are deferred.
+fn marshal_call_args(
+    enc: &mut Encoder,
+    slot: &impl Fn(ValueId) -> i32,
+    value_types: &[MirType],
+    args: &[ValueId],
+    first: usize,
+    profile: RiscvProfile,
+) -> Result<(), LowerError> {
+    let mut reg = first;
+    for &arg in args {
+        let words = value_words(value_types, arg);
+        if words > 2 {
+            if reg >= arg_reg_count(profile) {
+                return Err(LowerError::ControlFlowUnsupported);
+            }
+            let target = arg_reg(reg).ok_or(LowerError::ControlFlowUnsupported)?;
+            enc.addi(target, Reg::SP, slot(arg));
+            reg += 1;
+            continue;
+        }
+        for w in 0..words {
+            if reg >= arg_reg_count(profile) {
+                return Err(LowerError::ControlFlowUnsupported);
+            }
+            let target = arg_reg(reg).ok_or(LowerError::ControlFlowUnsupported)?;
+            enc.lw(target, Reg::SP, slot(arg) + w as i32 * 4);
+            reg += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Stores a call's result from the return registers a0(:a1) into its slot -- a register pair (two words)
+/// for an int64 / small value type, one word otherwise.
+fn store_call_result(
+    enc: &mut Encoder,
+    slot: &impl Fn(ValueId) -> i32,
+    value_types: &[MirType],
+    result: ValueId,
+) {
+    enc.sw(Reg::A0, Reg::SP, slot(result));
+    if value_words(value_types, result) >= 2 {
+        enc.sw(Reg::A1, Reg::SP, slot(result) + 4);
+    }
+}
+
+/// For a call whose result is a value type wider than two words (returned by reference / sret): emits
+/// `a0 = &result` so the callee writes the value into the result slot, and returns 1 so the explicit
+/// arguments marshal from a1. Returns 0 for a register-returned result -- nothing emitted, and the caller
+/// stores the returned a0(:a1) with [`store_call_result`] instead.
+fn emit_sret_arg(
+    enc: &mut Encoder,
+    slot: &impl Fn(ValueId) -> i32,
+    value_types: &[MirType],
+    result: ValueId,
+) -> usize {
+    if value_words(value_types, result) > 2 {
+        enc.addi(Reg::A0, Reg::SP, slot(result));
+        1
+    } else {
+        0
+    }
+}
+
 /// The padded slot word count of `value` (`stack_slot_bytes / 4`) -- the whole value-type slot,
 /// used to zero (`initobj`) or copy (`ldobj`/`stobj`) a struct local including any tail padding.
 fn slot_words(value_types: &[MirType], value: ValueId) -> u32 {
@@ -2484,6 +2908,49 @@ fn emit_2d_element_address(
     }
     enc.add(s, array, s);
     enc.addi(s, s, 8);
+}
+
+/// Emits the rank-N (row-major) element address into `out`, with a per-dimension bounds check (each
+/// `indices[k] < dim_k`, `dim_k` read from `[base + 4*k]`; an out-of-range index traps). The flat index is
+/// the Horner fold `((...(i0*dim1 + i1)*dim2 + i2)...) + i(N-1)`, then `* element_size`, then `+ base +
+/// 4*N` (past the N dimension words). `base` is preserved; `tmp`/`tmp2` are scratch. RV32IM only (uses
+/// `mul`); `base`/`out`/`tmp`/`tmp2` must be four distinct registers.
+#[allow(clippy::too_many_arguments)]
+fn emit_md_element_address(
+    enc: &mut Encoder,
+    base: Reg,
+    out: Reg,
+    tmp: Reg,
+    tmp2: Reg,
+    slot: &impl Fn(ValueId) -> i32,
+    indices: &[ValueId],
+    element_size: u32,
+) {
+    let n = indices.len();
+    enc.lw(out, Reg::SP, slot(indices[0]));
+    enc.lw(tmp, base, 0);
+    let ok = enc.new_label();
+    enc.branch(BranchCond::LtU, out, tmp, ok);
+    enc.ebreak();
+    enc.bind_label(ok);
+    for (k, &idx) in indices.iter().enumerate().skip(1) {
+        enc.lw(tmp, base, 4 * k as i32);
+        enc.mul(out, out, tmp);
+        enc.lw(tmp2, Reg::SP, slot(idx));
+        let okk = enc.new_label();
+        enc.branch(BranchCond::LtU, tmp2, tmp, okk);
+        enc.ebreak();
+        enc.bind_label(okk);
+        enc.add(out, out, tmp2);
+    }
+    if element_size.is_power_of_two() {
+        enc.slli(out, out, element_size.trailing_zeros());
+    } else {
+        enc.li(tmp, element_size as i32);
+        enc.mul(out, out, tmp);
+    }
+    enc.add(out, base, out);
+    enc.addi(out, out, 4 * n as i32);
 }
 
 /// Emits a byte-copy loop (`cpblk`): copies `size` bytes from `src` to `dst`, using `t6` (the array
@@ -2971,9 +3438,129 @@ mod tests {
     }
 
     #[test]
-    fn rejects_float_conversions() {
+    fn the_flat_path_rejects_float_conversion() {
         let func = convert_function(ConvKind::IntToFloat32);
         assert_eq!(lower(&func), Err(LowerError::Unsupported));
+    }
+
+    #[test]
+    fn the_object_path_lowers_float_ops() {
+        let f64t = MirType::F64;
+        let i32t = MirType::I32;
+        let n = ValueId;
+        let f64c = |bits: f64| Inst::ConstInt {
+            ty: f64t,
+            value: bits.to_bits() as i64,
+        };
+        let arith = Function {
+            params: Vec::new(),
+            ret: Some(i32t),
+            value_types: vec![f64t, f64t, f64t, i32t],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (n(0), f64c(6.0)),
+                    (n(1), f64c(7.0)),
+                    (
+                        n(2),
+                        Inst::Binary {
+                            op: BinOp::Mul,
+                            lhs: n(0),
+                            rhs: n(1),
+                        },
+                    ),
+                    (
+                        n(3),
+                        Inst::Convert {
+                            value: n(2),
+                            kind: ConvKind::Float64ToInt,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(n(3)))),
+            }],
+        };
+        let cmp = Function {
+            params: Vec::new(),
+            ret: Some(i32t),
+            value_types: vec![f64t, f64t, i32t],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (n(0), f64c(6.0)),
+                    (n(1), f64c(7.0)),
+                    (
+                        n(2),
+                        Inst::Compare {
+                            op: CmpOp::SignedLt,
+                            lhs: n(0),
+                            rhs: n(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(n(2)))),
+            }],
+        };
+        assert!(
+            lower_object(&[arith], &["f0"], &[], &[]).is_ok(),
+            "float arithmetic + conversion lower on the object path"
+        );
+        assert!(
+            lower_object(&[cmp], &["f0"], &[], &[]).is_ok(),
+            "a float compare lowers on the object path"
+        );
+    }
+
+    #[test]
+    fn lowers_wide_value_types_by_reference_and_sret() {
+        let n = ValueId;
+        let s = MirType::ValueType {
+            handle: TypeHandle(1),
+            size: 12,
+        };
+        let make = Function {
+            params: Vec::new(),
+            ret: Some(s),
+            value_types: vec![s, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (n(0), Inst::InitStruct),
+                    (n(1), Inst::ConstInt { ty: MirType::I32, value: 42 }),
+                    (
+                        n(2),
+                        Inst::FieldStore {
+                            base: n(0),
+                            offset: 0,
+                            value: n(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(n(0)))),
+            }],
+        };
+        let take = Function {
+            params: vec![s],
+            ret: Some(MirType::I32),
+            value_types: vec![s, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![n(0)],
+                insts: vec![(n(1), Inst::FieldLoad { base: n(0), offset: 0 })],
+                terminator: Some(Terminator::Return(Some(n(1)))),
+            }],
+        };
+        assert!(
+            lower_module(&[make]).is_ok(),
+            "a 3-word sret return lowers"
+        );
+        assert!(
+            lower_module(&[take]).is_ok(),
+            "a 3-word by-value parameter lowers"
+        );
     }
 
     #[test]
@@ -3025,7 +3612,7 @@ mod tests {
     }
 
     #[test]
-    fn defers_value_type_call_return() {
+    fn lowers_small_value_type_call_return() {
         let i32t = MirType::I32;
         let point = MirType::ValueType {
             handle: TypeHandle(1),
@@ -3069,7 +3656,10 @@ mod tests {
                 terminator: Some(Terminator::Return(Some(n(1)))),
             }],
         };
-        assert_eq!(lower_module(&[main, make]), Err(LowerError::Unsupported));
+        assert!(
+            lower_module(&[main, make]).is_ok(),
+            "a small value-type call return rides a0:a1"
+        );
     }
 
     #[test]
@@ -3717,7 +4307,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_int64_divide() {
+    fn the_flat_path_rejects_int64_divide() {
         let i64t = MirType::I64;
         let n = ValueId;
         let func = Function {

@@ -36,7 +36,8 @@ impl Diagnostic {
 
 /// A semantic-diagnostic kind, with any detail its message needs.
 /// Which position in a member's signature a type occupies, for the accessibility-consistency
-/// diagnostics CS0050-CS0053.
+/// diagnostics (10.5.4): CS0050-CS0053 (method/field/property), CS0058/CS0059 (delegate),
+/// CS0060/CS0061 (base class/interface), and CS7025 (event).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignaturePosition {
     /// A method's return type (CS0050).
@@ -47,8 +48,24 @@ pub enum SignaturePosition {
     FieldType,
     /// A property's type (CS0053).
     PropertyType,
+    /// An indexer's element type (CS0054).
+    IndexerType,
+    /// An indexer's parameter type (CS0055).
+    IndexerParameterType,
+    /// An operator's return type (CS0056). Also a conversion operator's target type.
+    OperatorReturnType,
+    /// An operator's parameter type (CS0057).
+    OperatorParameterType,
+    /// A delegate's return type (CS0058). Here the "member" is the delegate itself.
+    DelegateReturnType,
+    /// A delegate's parameter type (CS0059). Here the "member" is the delegate itself.
+    DelegateParameterType,
+    /// An event's (delegate) type (CS7025).
+    EventType,
     /// A class's base class (CS0060). Here the "member" is the derived class itself.
     BaseClass,
+    /// An interface's base interface (CS0061). Here the "member" is the derived interface itself.
+    BaseInterface,
 }
 
 impl SignaturePosition {
@@ -59,18 +76,35 @@ impl SignaturePosition {
             SignaturePosition::ParameterType => 51,
             SignaturePosition::FieldType => 52,
             SignaturePosition::PropertyType => 53,
+            SignaturePosition::IndexerType => 54,
+            SignaturePosition::IndexerParameterType => 55,
+            SignaturePosition::OperatorReturnType => 56,
+            SignaturePosition::OperatorParameterType => 57,
+            SignaturePosition::DelegateReturnType => 58,
+            SignaturePosition::DelegateParameterType => 59,
             SignaturePosition::BaseClass => 60,
+            SignaturePosition::BaseInterface => 61,
+            SignaturePosition::EventType => 7025,
         }
     }
 
     /// The phrase naming the position in the message (`return type`, ..., `base class`).
     fn phrase(self) -> &'static str {
         match self {
-            SignaturePosition::ReturnType => "return type",
-            SignaturePosition::ParameterType => "parameter type",
+            SignaturePosition::ReturnType | SignaturePosition::DelegateReturnType => "return type",
+            SignaturePosition::ParameterType | SignaturePosition::DelegateParameterType => {
+                "parameter type"
+            }
             SignaturePosition::FieldType => "field type",
             SignaturePosition::PropertyType => "property type",
+            SignaturePosition::IndexerType => "indexer return type",
+            SignaturePosition::IndexerParameterType | SignaturePosition::OperatorParameterType => {
+                "parameter type"
+            }
+            SignaturePosition::OperatorReturnType => "return type",
+            SignaturePosition::EventType => "event type",
             SignaturePosition::BaseClass => "base class",
+            SignaturePosition::BaseInterface => "base interface",
         }
     }
 
@@ -80,7 +114,17 @@ impl SignaturePosition {
             SignaturePosition::ReturnType | SignaturePosition::ParameterType => "method",
             SignaturePosition::FieldType => "field",
             SignaturePosition::PropertyType => "property",
+            SignaturePosition::IndexerType => "indexer",
+            SignaturePosition::IndexerParameterType => "indexer or property",
+            SignaturePosition::OperatorReturnType | SignaturePosition::OperatorParameterType => {
+                "operator"
+            }
+            SignaturePosition::DelegateReturnType | SignaturePosition::DelegateParameterType => {
+                "delegate"
+            }
+            SignaturePosition::EventType => "event",
             SignaturePosition::BaseClass => "class",
+            SignaturePosition::BaseInterface => "interface",
         }
     }
 }
@@ -361,6 +405,21 @@ pub enum DiagnosticKind {
         /// The type whose base chain is circular.
         type_name: Box<str>,
     },
+    /// `CS0529`: a circular base-interface dependency (interface I : J, J : I).
+    CircularInterface {
+        /// The interface whose base-interface hierarchy is circular.
+        type_name: Box<str>,
+        /// The directly-inherited interface that leads back into the cycle.
+        base: Box<str>,
+    },
+    /// `CS0523`: a struct field whose type cycles back through value-type fields to the struct
+    /// itself (`struct S { S f; }`) -- an infinitely-sized layout.
+    StructLayoutCycle {
+        /// The qualified field name (`S.f`).
+        member: Box<str>,
+        /// The field's type, which cycles back to the enclosing struct.
+        type_name: Box<str>,
+    },
     /// `CS0266`: no implicit conversion exists, but an explicit one (a cast) does.
     ExplicitConversionExists {
         /// The source type.
@@ -540,6 +599,8 @@ impl DiagnosticKind {
             DiagnosticKind::NoMethodToOverride { .. } => 115,
             DiagnosticKind::AbstractMemberNotImplemented { .. } => 534,
             DiagnosticKind::CircularBase { .. } => 146,
+            DiagnosticKind::StructLayoutCycle { .. } => 523,
+            DiagnosticKind::CircularInterface { .. } => 529,
             DiagnosticKind::ExplicitConversionExists { .. } => 266,
             DiagnosticKind::UnusedLocal { .. } => 168,
             DiagnosticKind::UnusedLocalValue { .. } => 219,
@@ -788,6 +849,14 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::CircularBase { type_name } => write!(
                 f,
                 "Circular base class dependency involving '{type_name}'"
+            ),
+            DiagnosticKind::CircularInterface { type_name, base } => write!(
+                f,
+                "Inherited interface '{base}' causes a cycle in the interface hierarchy of '{type_name}'"
+            ),
+            DiagnosticKind::StructLayoutCycle { member, type_name } => write!(
+                f,
+                "Struct member '{member}' of type '{type_name}' causes a cycle in the struct layout"
             ),
             DiagnosticKind::ExplicitConversionExists { from, to } => write!(
                 f,

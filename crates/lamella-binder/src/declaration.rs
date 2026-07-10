@@ -36,6 +36,7 @@ pub fn collect_into(model: &mut Model, unit: &CompilationUnit) {
     for member in &unit.members {
         collect_namespace_member(member, "", model);
     }
+    model.default_toplevel_types_to_internal();
 }
 
 /// Builds a [`TypeTable`] of every type declared in `unit` (the existence-only
@@ -59,6 +60,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
         }
         NamespaceMember::Enum(declaration) => {
             let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Enum);
+            info.accessibility = accessibility_of(&declaration.modifiers);
             let enum_base = named_symbol("System", "Enum");
             info.bases.push(enum_base.clone());
             info.base = Some(enum_base);
@@ -86,6 +88,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
         }
         NamespaceMember::Delegate(declaration) => {
             let mut info = TypeInfo::new(namespace, &declaration.name, TypeKind::Delegate);
+            info.accessibility = accessibility_of(&declaration.modifiers);
             info.methods.push(MethodSymbol {
                 name: "Invoke".into(),
                 return_type: bind_type(&declaration.return_type),
@@ -654,7 +657,7 @@ fn is_abstract_member(modifiers: &[Modifier], kind: TypeKind) -> bool {
 
 /// The accessibility a member's modifiers declare; a class member with none is
 /// `private` (10.5.1).
-fn accessibility_of(modifiers: &[Modifier]) -> Accessibility {
+pub(crate) fn accessibility_of(modifiers: &[Modifier]) -> Accessibility {
     let protected = modifiers.contains(&Modifier::Protected);
     let internal = modifiers.contains(&Modifier::Internal);
     if modifiers.contains(&Modifier::Public) {

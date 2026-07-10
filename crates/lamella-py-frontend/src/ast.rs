@@ -481,13 +481,14 @@ pub enum Stmt {
         /// The `with` body.
         body: Vec<Stmt>,
     },
-    /// A `class Name [(Base)]:` definition. The body holds method definitions (`FuncDef`)
+    /// A `class Name [(Base, ...)]:` definition. The body holds method definitions (`FuncDef`)
     /// and class-attribute assignments (`Assign`).
     ClassDef {
         /// The class name.
         name: String,
-        /// The single base-class expression, if any (`None` inherits `object`).
-        base: Option<Expr>,
+        /// The base-class expressions, in order (empty inherits `object`); more than one is
+        /// multiple inheritance, resolved by the runtime's C3 MRO.
+        bases: Vec<Expr>,
         /// The class body.
         body: Vec<Stmt>,
     },

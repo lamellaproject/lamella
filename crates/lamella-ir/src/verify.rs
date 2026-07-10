@@ -337,6 +337,32 @@ fn check_inst(
             use_value(func, defined, *index1, errors);
             use_value(func, defined, *value, errors);
         }
+        Inst::AllocArrayMD { dims, .. } => {
+            for &d in dims.iter() {
+                use_value(func, defined, d, errors);
+            }
+            if let Some(r) = result_ty {
+                expect(MirType::ObjectRef, r, errors);
+            }
+        }
+        Inst::ArrayMDLoad { array, indices, .. } => {
+            use_value(func, defined, *array, errors);
+            for &i in indices.iter() {
+                use_value(func, defined, i, errors);
+            }
+        }
+        Inst::ArrayMDStore {
+            array,
+            indices,
+            value,
+            ..
+        } => {
+            use_value(func, defined, *array, errors);
+            for &i in indices.iter() {
+                use_value(func, defined, i, errors);
+            }
+            use_value(func, defined, *value, errors);
+        }
         Inst::StaticLoad { .. } => {
         }
         Inst::StaticStore { value, .. } => {

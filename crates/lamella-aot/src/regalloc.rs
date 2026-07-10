@@ -284,6 +284,29 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *index1, ip);
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
+                Inst::AllocArrayMD { dims, .. } => {
+                    for &d in dims.iter() {
+                        mark(&mut lo, &mut hi, &mut defined, d, ip);
+                    }
+                }
+                Inst::ArrayMDLoad { array, indices, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *array, ip);
+                    for &i in indices.iter() {
+                        mark(&mut lo, &mut hi, &mut defined, i, ip);
+                    }
+                }
+                Inst::ArrayMDStore {
+                    array,
+                    indices,
+                    value,
+                    ..
+                } => {
+                    mark(&mut lo, &mut hi, &mut defined, *array, ip);
+                    for &i in indices.iter() {
+                        mark(&mut lo, &mut hi, &mut defined, i, ip);
+                    }
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
                 Inst::StaticLoad { .. } => {}
                 Inst::StaticStore { value, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
@@ -448,6 +471,7 @@ pub(crate) fn is_safepoint(inst: &Inst) -> bool {
             | Inst::Alloc { .. }
             | Inst::AllocArray { .. }
             | Inst::AllocArray2D { .. }
+            | Inst::AllocArrayMD { .. }
             | Inst::PyIntrinsic { .. }
     )
 }
@@ -630,6 +654,21 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*array);
             f(*index0);
             f(*index1);
+            f(*value);
+        }
+        Inst::AllocArrayMD { dims, .. } => dims.iter().for_each(|&d| f(d)),
+        Inst::ArrayMDLoad { array, indices, .. } => {
+            f(*array);
+            indices.iter().for_each(|&i| f(i));
+        }
+        Inst::ArrayMDStore {
+            array,
+            indices,
+            value,
+            ..
+        } => {
+            f(*array);
+            indices.iter().for_each(|&i| f(i));
             f(*value);
         }
         Inst::StaticLoad { .. } => {}

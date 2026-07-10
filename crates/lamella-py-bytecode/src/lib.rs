@@ -904,6 +904,17 @@ fn put_code_object(buf: &mut Vec<u8>, co: &CodeObject) {
     }
 }
 
+/// Write a module's CONTENT (name + functions + body) with no container header -- shared by a bare
+/// [`Module`] and each module inside a [`Bundle`].
+fn put_module_content(buf: &mut Vec<u8>, module: &Module) {
+    put_str(buf, &module.name);
+    put_len(buf, module.functions.len());
+    for f in &module.functions {
+        put_code_object(buf, f);
+    }
+    put_code_object(buf, &module.body);
+}
+
 impl Module {
     /// Serialize this module to the versioned binary container.
     #[must_use]
@@ -912,12 +923,7 @@ impl Module {
         buf.extend_from_slice(&MAGIC);
         put_u16(&mut buf, FORMAT_VERSION);
         put_u16(&mut buf, features.0);
-        put_str(&mut buf, &self.name);
-        put_len(&mut buf, self.functions.len());
-        for f in &self.functions {
-            put_code_object(&mut buf, f);
-        }
-        put_code_object(&mut buf, &self.body);
+        put_module_content(&mut buf, self);
         buf
     }
 
@@ -933,21 +939,60 @@ impl Module {
             return Err(DecodeError::UnsupportedVersion(version));
         }
         let features = FeatureFlags(r.u16()?);
-        let name = r.string()?;
-        let n_functions = r.u32()? as usize;
-        let mut functions = Vec::with_capacity(n_functions);
-        for _ in 0..n_functions {
-            functions.push(r.code_object()?);
+        let module = r.module_content()?;
+        Ok((module, features))
+    }
+}
+
+/// The binary format version of a [`Bundle`] container -- a program's entry module plus its
+/// importable managed (Python-authored) modules. Distinct from [`FORMAT_VERSION`] (a bare single
+/// module) so a reader dispatches on the version: [`FORMAT_VERSION`] -> a `Module`, this -> a `Bundle`.
+pub const BUNDLE_FORMAT_VERSION: u16 = 17;
+
+/// A compiled multi-module program: the `entry` module (run at startup) plus the importable managed
+/// modules an `import` resolves to (by `name`). The Python analog of a corlib bundle.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bundle {
+    /// The program's main module -- run at startup.
+    pub entry: Module,
+    /// The importable managed modules, resolved by their `name`.
+    pub modules: Vec<Module>,
+}
+
+impl Bundle {
+    /// Serialize this bundle to the versioned binary container (magic + [`BUNDLE_FORMAT_VERSION`]).
+    #[must_use]
+    pub fn encode(&self, features: FeatureFlags) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC);
+        put_u16(&mut buf, BUNDLE_FORMAT_VERSION);
+        put_u16(&mut buf, features.0);
+        put_module_content(&mut buf, &self.entry);
+        put_len(&mut buf, self.modules.len());
+        for m in &self.modules {
+            put_module_content(&mut buf, m);
         }
-        let body = r.code_object()?;
-        Ok((
-            Module {
-                name,
-                functions,
-                body,
-            },
-            features,
-        ))
+        buf
+    }
+
+    /// Decode a bundle from the versioned binary container, also returning the declared feature flags.
+    pub fn decode(data: &[u8]) -> Result<(Bundle, FeatureFlags), DecodeError> {
+        let mut r = Reader { data, pos: 0 };
+        if r.bytes(4)? != MAGIC {
+            return Err(DecodeError::BadMagic);
+        }
+        let version = r.u16()?;
+        if version != BUNDLE_FORMAT_VERSION {
+            return Err(DecodeError::UnsupportedVersion(version));
+        }
+        let features = FeatureFlags(r.u16()?);
+        let entry = r.module_content()?;
+        let n_modules = r.u32()? as usize;
+        let mut modules = Vec::with_capacity(n_modules);
+        for _ in 0..n_modules {
+            modules.push(r.module_content()?);
+        }
+        Ok((Bundle { entry, modules }, features))
     }
 }
 
@@ -991,6 +1036,23 @@ impl<'a> Reader<'a> {
         core::str::from_utf8(bytes)
             .map(String::from)
             .map_err(|_| DecodeError::BadUtf8)
+    }
+
+    /// Read a module's CONTENT (name + functions + body) -- the header-less body of a bare module or
+    /// of one module inside a bundle.
+    fn module_content(&mut self) -> Result<Module, DecodeError> {
+        let name = self.string()?;
+        let n_functions = self.u32()? as usize;
+        let mut functions = Vec::with_capacity(n_functions);
+        for _ in 0..n_functions {
+            functions.push(self.code_object()?);
+        }
+        let body = self.code_object()?;
+        Ok(Module {
+            name,
+            functions,
+            body,
+        })
     }
 
     fn py_type(&mut self) -> Result<StaticType, DecodeError> {
@@ -1280,6 +1342,36 @@ mod tests {
         let (decoded, features) = Module::decode(&bytes).expect("decodes");
         assert_eq!(decoded, module);
         assert!(features.contains(FeatureFlags::FIRST_LIGHT));
+    }
+
+    #[test]
+    fn bundle_container_round_trips() {
+        let named = |name: &str| {
+            let mut m = sample_module();
+            m.name = String::from(name);
+            m
+        };
+        let bundle = Bundle {
+            entry: named("__main__"),
+            modules: vec![named("helpers"), named("config")],
+        };
+        let bytes = bundle.encode(FeatureFlags::FIRST_LIGHT);
+        assert_eq!(&bytes[..4], &MAGIC);
+        let (decoded, features) = Bundle::decode(&bytes).expect("decodes");
+        assert_eq!(decoded, bundle);
+        assert_eq!(decoded.modules.len(), 2);
+        assert_eq!(decoded.modules[0].name, "helpers");
+        assert!(features.contains(FeatureFlags::FIRST_LIGHT));
+        assert!(matches!(
+            Module::decode(&bytes),
+            Err(DecodeError::UnsupportedVersion(v)) if v == BUNDLE_FORMAT_VERSION
+        ));
+        let solo = Bundle {
+            entry: named("__main__"),
+            modules: Vec::new(),
+        };
+        let (d2, _) = Bundle::decode(&solo.encode(FeatureFlags::FIRST_LIGHT)).expect("solo decodes");
+        assert!(d2.modules.is_empty());
     }
 
     #[test]

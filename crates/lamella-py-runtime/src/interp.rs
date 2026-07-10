@@ -4,7 +4,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use lamella_gc::Ref;
-use lamella_py_bytecode::{BinOp, CmpOp, CodeObject, Const, ExcEntry, Op, UnaryOp};
+use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, ExcEntry, Op, UnaryOp};
 
 use crate::bigint::BigInt;
 use crate::object::{InlineCache, ObjectModel};
@@ -565,6 +565,60 @@ fn try_binop_dunder(
     Ok(None)
 }
 
+/// The full binary-operator dispatch: a user operator dunder (`__add__`/`__radd__`/...) wins, then the
+/// interp-aware set / dict operators, then `str`/sequence operands, else numeric. Extracted from the
+/// [`Op::Binary`] handler so a bare `Trap::TypeError` (no operation applies to these operand types) can
+/// be turned into a descriptive `TypeError` at the call site, while a dunder that itself raised
+/// (`Trap::Raised`, carrying its own exception) or any other trap propagates unchanged.
+fn dispatch_binary(
+    binop: BinOp,
+    lhs: Value,
+    rhs: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if let Some(value) = try_binop_dunder(binop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else if let Some(value) = try_set_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else if let Some(value) = try_dict_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else if let Some(value) = model.py_binary(binop, lhs, rhs)? {
+        Ok(value)
+    } else {
+        binary(binop, lhs, rhs, model)
+    }
+}
+
+/// The full comparison dispatch for a non-identity comparison: a user comparison dunder
+/// (`__eq__`/`__lt__`/... + reflected) wins, then the interp-aware set/dict `==`, else the built-in
+/// value comparison. Extracted from the [`Op::Compare`] handler so a bare `Trap::TypeError` (an
+/// ordering comparison on values that do not support it) can become a descriptive `TypeError`, while a
+/// dunder that itself raised (`Trap::Raised`) or any other trap propagates unchanged. `is`/`is not` are
+/// object identity and never reach here (the handler resolves them first).
+fn dispatch_compare(
+    cmpop: CmpOp,
+    lhs: Value,
+    rhs: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if let Some(value) = try_compare_dunder(cmpop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else if let Some(value) = try_set_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else if let Some(value) = try_dict_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else {
+        match model.py_compare(cmpop, lhs, rhs)? {
+            Some(value) => Ok(value),
+            None => compare(cmpop, lhs, rhs, model),
+        }
+    }
+}
+
 /// The dunder method name for a unary operator (`__neg__`/`__pos__`/`__invert__`).
 fn unary_dunder_name(op: UnaryOp) -> &'static str {
     match op {
@@ -1070,18 +1124,93 @@ pub fn run(
     args: &[Value],
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
-    run_frames(code, functions, args, &[], model, false, 0)
+    run_frames(code, functions, args, &[], model, false, 0, 0)
 }
 
 /// Runs the module body (the top-level statements). Its local bindings mirror into the module
 /// globals as they happen, so a function reaches a top-level name (a class, a global) by
-/// `LoadGlobal`. Run this before invoking module functions.
+/// `LoadGlobal`. Run this before invoking module functions. This is the ENTRY module (module 0); a
+/// managed module's body runs via `run_managed_module` with its own module id.
 pub fn run_module(
     body: &CodeObject,
     functions: &[CodeObject],
     model: &mut ObjectModel,
 ) -> Result<Value, Trap> {
-    run_frames(body, functions, &[], &[], model, true, 0)
+    run_frames(body, functions, &[], &[], model, true, 0, 0)
+}
+
+/// Runs a compiled multi-module program (a [`Bundle`]): installs the bundle's importable managed
+/// modules as the registry, then runs the entry module as the program (module 0). An `import name`
+/// in ANY module then resolves against these bundled modules (after the native/host modules, per the
+/// sealed-bundle precedence), so `import helpers` / `from helpers import x` / `helpers.fn()` reach
+/// the bundled `helpers` -- with each module's globals and sibling functions bound to its OWN
+/// namespace (a module function's home-module id rides its value, so it resolves globals against
+/// its home even when called from another module), not the importer's.
+///
+/// This is the multi-module analog of [`run_module`]: a single-file program is a bundle with no
+/// managed modules, for which `run_bundle` behaves exactly like `run_module` of its entry. Consumes
+/// the bundle -- its modules move into the registry (no clone) and its entry runs in place.
+pub fn run_bundle(bundle: Bundle, model: &mut ObjectModel) -> Result<Value, Trap> {
+    let Bundle { entry, modules } = bundle;
+    model.set_managed_modules(modules);
+    run_module(&entry.body, &entry.functions, model)
+}
+
+/// Resolves an `import name` the interpreter-aware way, backing [`Op::ImportName`]: a cached / host /
+/// native module FIRST (native wins, the sealed-bundle precedence -- a bundled `math.py` does not
+/// shadow the stdlib `math`), else a MANAGED Python-authored module (run its body once in its own
+/// namespace), else `ModuleNotFoundError`. Interpreter-level, not a plain model method, because a
+/// managed module runs bytecode -- which needs the driver.
+fn resolve_import(name: &str, model: &mut ObjectModel) -> Result<Value, Trap> {
+    if let Some(result) = model.import_builtin_module(name) {
+        return result;
+    }
+    if model.managed_module_id(name).is_some() {
+        return run_managed_module(name, model);
+    }
+    Err(model.module_not_found(name))
+}
+
+/// Runs a MANAGED (Python-authored) module's body ONCE in its own namespace and returns the module
+/// object. Mirrors CPython's import machinery for the subset:
+///
+/// - The module object is cached in `sys.modules` BEFORE its body runs, so a circular import
+///   (`a` imports `b`, `b` imports `a`) sees the in-progress module and terminates rather than
+///   re-running the body forever. During the body the cached module's namespace is empty; it is
+///   filled once the body completes (a re-entrant import mid-cycle thus sees an empty module, which
+///   is enough to break the cycle -- exposing the partial-as-of-that-point state is a later refinement).
+/// - The body runs against the module's OWN function table + global namespace (module id `k`): each
+///   top-level binding populates module `k`'s globals (`managed_globals[k-1]`), not the importer's, so
+///   `import helpers` does not leak `helpers`' names into the importer. That namespace, UNIONed with the
+///   module's top-level `def`s (which live in the function table, not globals), becomes the module's dict
+///   (`from m import x` / `m.x` read it -- constants, classes, and functions alike).
+/// - On a body error the module is un-cached, so a later import retries (CPython drops a failed
+///   import from `sys.modules`).
+///
+/// A module FUNCTION called after import resolves its globals + sibling functions against THIS module
+/// (its home id rides the function value, stamped at `MakeFunction`), so `helpers.compute()` reads
+/// helpers' globals -- the Phase 2 binding.
+fn run_managed_module(name: &str, model: &mut ObjectModel) -> Result<Value, Trap> {
+    let module_id = model.managed_module_id(name).ok_or(Trap::Malformed)?;
+    let body = model.managed_module_body(module_id).ok_or(Trap::Malformed)?;
+    let functions = model.managed_functions_rc(module_id).ok_or(Trap::Malformed)?;
+    let empty = model.new_dict(Vec::new())?;
+    let module_obj = model.new_module(empty)?;
+    model.cache_module(name, module_obj);
+    let result = run_frames(&body, &functions, &[], &[], model, true, 0, module_id);
+    if let Err(trap) = result {
+        model.uncache_module(name);
+        return Err(trap);
+    }
+    let mut pairs = model.managed_module_globals(module_id);
+    for (index, func) in functions.iter().enumerate() {
+        if !func.name.contains('.') && !pairs.iter().any(|(n, _)| *n == func.name) {
+            pairs.push((func.name.clone(), Value::function_ref_in_module(module_id, index as u32)));
+        }
+    }
+    let namespace = model.namespace_from_globals(pairs)?;
+    model.set_module_namespace(module_obj, namespace);
+    Ok(module_obj)
 }
 
 /// One op's control-flow outcome, returned from the per-op block to the [`run_frames`]
@@ -1140,11 +1269,11 @@ fn find_handler(exc_table: &[ExcEntry], ip: u32) -> Option<ExcEntry> {
 /// exception class (so `except IndexError` / `raise ValueError` find the type). `None` if unbound (a
 /// `NameError` at the use site). Shared by `LoadGlobal` and the outer fallback of `LoadName`.
 fn resolve_global(name: &str, functions: &[CodeObject], model: &mut ObjectModel) -> Option<Value> {
-    if let Some(pyfunc) = model.get_global(name).filter(|&g| model.is_py_function(g)) {
+    if let Some(pyfunc) = model.current_module_global(name).filter(|&g| model.is_py_function(g)) {
         Some(pyfunc)
     } else if let Some(index) = functions.iter().position(|f| f.name == *name) {
-        Some(Value::function_ref(index as u32))
-    } else if let Some(global) = model.get_global(name) {
+        Some(Value::function_ref_in_module(model.current_module(), index as u32))
+    } else if let Some(global) = model.current_module_global(name) {
         Some(global)
     } else if let Some(id) = crate::builtins::builtin_id(name) {
         Some(Value::builtin_ref(id))
@@ -1155,7 +1284,14 @@ fn resolve_global(name: &str, functions: &[CodeObject], model: &mut ObjectModel)
     }
 }
 
-fn invoke_function(
+/// Invokes function `index` of module `home` with already-bound `args` -- the cross-module-aware
+/// funnel. A managed module's function runs against its OWN function table (fetched as a shared `Rc`)
+/// with `home` installed as the module context, so its globals + sibling-function refs resolve against
+/// its home module even when called from another module. The entry module (`home == 0`) uses the
+/// threaded `functions` -- correct when the caller is the entry (the common case); a managed module
+/// calling an entry-defined function is a deferred edge case.
+fn invoke_function_value(
+    home: u16,
     index: u32,
     args: &[Value],
     cells: &[Value],
@@ -1163,12 +1299,57 @@ fn invoke_function(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
+    match model.managed_functions_rc(home) {
+        Some(home_funcs) => invoke_function(index, args, cells, &home_funcs, model, depth, home),
+        None => invoke_function(index, args, cells, functions, model, depth, home),
+    }
+}
+
+/// Binds `posargs`/`kwargs` (with any defaults) to a Python function VALUE (`function_ref` or
+/// `PyFunction`) resolved against its HOME module, then invokes it -- the shared cross-module-aware
+/// tail of the binding call arms (a defaulted function, a keyword call, a bound method). The callee's
+/// CODE lives in its home module, so binding + invocation both use the home function table.
+fn call_py_function_value(
+    func: Value,
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let home = model.function_home(func);
+    let (index, defaults, kwdefaults, cells) = if let Some(index) = func.as_function_index() {
+        (index, Vec::new(), Value::NONE, Vec::new())
+    } else {
+        (
+            model.py_function_index(func),
+            model.py_function_defaults(func),
+            model.py_function_kwdefaults(func),
+            model.py_function_cells(func),
+        )
+    };
+    let home_funcs = model.managed_functions_rc(home);
+    let code_funcs: &[CodeObject] = home_funcs.as_deref().unwrap_or(functions);
+    let code = code_funcs.get(index as usize).ok_or(Trap::Malformed)?;
+    let bound = bind_arguments(code, posargs, kwargs, &defaults, kwdefaults, model)?;
+    invoke_function(index, &bound, &cells, code_funcs, model, depth, home)
+}
+
+fn invoke_function(
+    index: u32,
+    args: &[Value],
+    cells: &[Value],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+    module_id: u16,
+) -> Result<Value, Trap> {
     let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
     if code.is_generator {
         let generator = new_frame(code, CodeId::Func(index), args, false, cells, model)?;
-        model.new_generator(generator)
+        model.new_generator(generator, module_id)
     } else {
-        run_frames(code, functions, args, cells, model, false, depth)
+        run_frames(code, functions, args, cells, model, false, depth, module_id)
     }
 }
 
@@ -1183,15 +1364,10 @@ pub(crate) fn call_value(
     depth: usize,
 ) -> Result<Value, Trap> {
     if let Some(index) = callee.as_function_index() {
-        invoke_function(index, args, &[], functions, model, depth)
+        let home = callee.function_home_module().unwrap_or(0);
+        invoke_function_value(home, index, args, &[], functions, model, depth)
     } else if model.is_py_function(callee) {
-        let index = model.py_function_index(callee);
-        let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-        let defaults = model.py_function_defaults(callee);
-        let kwdefaults = model.py_function_kwdefaults(callee);
-        let bound = bind_arguments(code, args, &[], &defaults, kwdefaults, model)?;
-        let cells = model.py_function_cells(callee);
-        invoke_function(index, &bound, &cells, functions, model, depth)
+        call_py_function_value(callee, args, &[], functions, model, depth)
     } else if let Some(id) = callee.as_builtin_id() {
         crate::builtins::call_builtin(id, args, functions, model, depth)
     } else if model.is_str_join(callee) {
@@ -1215,24 +1391,13 @@ pub(crate) fn call_value(
         }
     } else if model.is_py_bound(callee) {
         let func = model.bound_func(callee);
-        let (index, defaults, kwdefaults, cells) = if let Some(index) = func.as_function_index() {
-            (index, Vec::new(), Value::NONE, Vec::new())
-        } else if model.is_py_function(func) {
-            (
-                model.py_function_index(func),
-                model.py_function_defaults(func),
-                model.py_function_kwdefaults(func),
-                model.py_function_cells(func),
-            )
-        } else {
+        if func.as_function_index().is_none() && !model.is_py_function(func) {
             return Err(Trap::TypeError);
-        };
-        let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
+        }
         let mut method_args = Vec::with_capacity(args.len() + 1);
         method_args.push(model.bound_self(callee));
         method_args.extend_from_slice(args);
-        let bound = bind_arguments(code, &method_args, &[], &defaults, kwdefaults, model)?;
-        invoke_function(index, &bound, &cells, functions, model, depth)
+        call_py_function_value(func, &method_args, &[], functions, model, depth)
     } else if model.is_unbound_method(callee) {
         let (receiver, rest) = args.split_first().ok_or(Trap::TypeError)?;
         let name_value = model.unbound_method_name(callee);
@@ -1257,7 +1422,7 @@ pub(crate) fn call_value(
     } else if let Some(call_method) = model.find_dunder(callee, "__call__") {
         call_value(call_method, args, functions, model, depth + 1)
     } else {
-        Err(Trap::TypeError)
+        Err(model.object_is_not(callee, "callable"))
     }
 }
 
@@ -1273,18 +1438,8 @@ fn call_value_kw(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    if let Some(index) = callee.as_function_index() {
-        let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-        let bound = bind_arguments(code, posargs, kwargs, &[], Value::NONE, model)?;
-        invoke_function(index, &bound, &[], functions, model, depth)
-    } else if model.is_py_function(callee) {
-        let index = model.py_function_index(callee);
-        let code = functions.get(index as usize).ok_or(Trap::Malformed)?;
-        let defaults = model.py_function_defaults(callee);
-        let kwdefaults = model.py_function_kwdefaults(callee);
-        let bound = bind_arguments(code, posargs, kwargs, &defaults, kwdefaults, model)?;
-        let cells = model.py_function_cells(callee);
-        invoke_function(index, &bound, &cells, functions, model, depth)
+    if callee.as_function_index().is_some() || model.is_py_function(callee) {
+        call_py_function_value(callee, posargs, kwargs, functions, model, depth)
     } else if model.is_py_bound(callee) {
         let func = model.bound_func(callee);
         let mut all_pos = Vec::with_capacity(posargs.len() + 1);
@@ -1393,7 +1548,7 @@ fn bind_arguments(
 
     if posargs.len() > n_regular {
         let Some(va) = varargs_idx else {
-            return Err(Trap::TypeError);
+            return Err(too_many_positional_error(code, n_regular, defaults.len(), posargs.len(), model));
         };
         for (i, &value) in posargs.iter().take(n_regular).enumerate() {
             slots[i] = Some(value);
@@ -1450,11 +1605,85 @@ fn bind_arguments(
         }
     }
 
+    let kwonly_start = n_regular + code.has_varargs as usize;
+    let mut missing_positional: Vec<&str> = Vec::new();
+    let mut missing_kwonly: Vec<&str> = Vec::new();
+    for (i, slot) in slots.iter().enumerate() {
+        if slot.is_none() {
+            if i < n_regular {
+                missing_positional.push(code.params[i].name.as_str());
+            } else if (kwonly_start..kwonly_start + kwonly).contains(&i) {
+                missing_kwonly.push(code.params[i].name.as_str());
+            }
+        }
+    }
+    if !missing_positional.is_empty() {
+        return Err(missing_args_error(code, &missing_positional, "positional", model));
+    }
+    if !missing_kwonly.is_empty() {
+        return Err(missing_args_error(code, &missing_kwonly, "keyword-only", model));
+    }
     let mut locals = Vec::with_capacity(nparams);
     for slot in slots {
-        locals.push(slot.ok_or(Trap::TypeError)?);
+        locals.push(slot.ok_or(Trap::Malformed)?);
     }
     Ok(locals)
+}
+
+/// Joins parameter names for a "missing arguments" message, Oxford-comma style like CPython:
+/// `'a'`, `'a' and 'b'`, `'a', 'b', and 'c'`.
+fn join_arg_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => alloc::format!("'{only}'"),
+        [first, second] => alloc::format!("'{first}' and '{second}'"),
+        [rest @ .., last] => {
+            let mut joined = String::new();
+            for name in rest {
+                joined.push('\'');
+                joined.push_str(name);
+                joined.push_str("', ");
+            }
+            joined.push_str("and '");
+            joined.push_str(last);
+            joined.push('\'');
+            joined
+        }
+    }
+}
+
+/// The `TypeError` for a call missing required arguments -- CPython's `NAME() missing N required KIND
+/// argument(s): 'a' and 'b'` (`KIND` is `positional` or `keyword-only`; the `()` suffix + qualified
+/// name match CPython, e.g. `Dog.__init__() missing 1 required positional argument: 'breed'`).
+fn missing_args_error(code: &CodeObject, missing: &[&str], kind: &str, model: &mut ObjectModel) -> Trap {
+    let count = missing.len();
+    let plural = if count == 1 { "argument" } else { "arguments" };
+    let names = join_arg_names(missing);
+    let message = alloc::format!("{}() missing {count} required {kind} {plural}: {names}", code.name);
+    model.raise_named_exception("TypeError", &message)
+}
+
+/// The `TypeError` for a call with too many positional arguments -- CPython's `NAME() takes N (or
+/// `from MIN to MAX`) positional argument(s) but G were/was given`. `n_defaults` trailing positional
+/// params have defaults, so the accepted count is the range `[n_regular - n_defaults, n_regular]`.
+fn too_many_positional_error(
+    code: &CodeObject,
+    n_regular: usize,
+    n_defaults: usize,
+    given: usize,
+    model: &mut ObjectModel,
+) -> Trap {
+    let min = n_regular - n_defaults;
+    let takes = if min < n_regular {
+        alloc::format!("from {min} to {n_regular}")
+    } else {
+        alloc::format!("{n_regular}")
+    };
+    let arg_word = if n_regular == 1 && min == n_regular { "argument" } else { "arguments" };
+    let verb = if given == 1 { "was" } else { "were" };
+    let message =
+        alloc::format!("{}() takes {takes} positional {arg_word} but {given} {verb} given", code.name);
+    model.raise_named_exception("TypeError", &message)
 }
 
 /// Resumes generator `gen` by one step: runs its suspended frame through [`drive`] until the next
@@ -1513,8 +1742,11 @@ fn resume_generator(
             };
         }
     };
+    let module_id = model.generator_module(generator);
+    let gen_functions_rc = model.managed_functions_rc(module_id);
+    let gen_functions: &[CodeObject] = gen_functions_rc.as_deref().unwrap_or(functions);
     let entry = match frame.code {
-        CodeId::Func(index) => functions.get(index as usize).ok_or(Trap::Malformed)?,
+        CodeId::Func(index) => gen_functions.get(index as usize).ok_or(Trap::Malformed)?,
         CodeId::Entry => return Err(Trap::Malformed),
     };
     match resume {
@@ -1552,7 +1784,10 @@ fn resume_generator(
     }
     let mut frames: Vec<Frame> = Vec::new();
     frames.push(frame);
-    match drive(&mut frames, entry, functions, model, depth + 1) {
+    let saved_module = model.set_current_module(module_id);
+    let outcome = drive(&mut frames, entry, gen_functions, model, depth + 1);
+    model.set_current_module(saved_module);
+    match outcome {
         Ok(DriveOutcome::Yielded(value)) => {
             let suspended = frames.pop().ok_or(Trap::Malformed)?;
             if close_mode {
@@ -1652,7 +1887,10 @@ pub(crate) fn iterator_for(
             model.new_iter(result)
         }
     } else {
-        model.new_iter(value)
+        match model.new_iter(value) {
+            Err(Trap::TypeError) => Err(model.object_is_not(value, "iterable")),
+            other => other,
+        }
     }
 }
 
@@ -1784,7 +2022,13 @@ fn new_frame(
     model: &mut ObjectModel,
 ) -> Result<Frame, Trap> {
     if args.len() != code.params.len() {
-        return Err(Trap::TypeError);
+        return Err(if args.len() < code.params.len() {
+            let missing: Vec<&str> =
+                code.params[args.len()..].iter().map(|p| p.name.as_str()).collect();
+            missing_args_error(code, &missing, "positional", model)
+        } else {
+            too_many_positional_error(code, code.params.len(), 0, args.len(), model)
+        });
     }
     let mut frame = match model.take_pooled_frame() {
         Some(mut pooled) => {
@@ -1830,6 +2074,7 @@ fn new_frame(
 /// (the fix for the old one-frame-at-a-time root gap). `is_module` marks the entry frame as the
 /// module body (its `StoreFast`s mirror into the globals). The explicit stack is bounded by
 /// [`MAX_CALL_DEPTH`] frames -> `RecursionError`; `depth` bounds the native callback recursion.
+#[allow(clippy::too_many_arguments)]
 fn run_frames(
     entry: &CodeObject,
     functions: &[CodeObject],
@@ -1838,13 +2083,22 @@ fn run_frames(
     model: &mut ObjectModel,
     is_module: bool,
     depth: usize,
+    module_id: u16,
 ) -> Result<Value, Trap> {
     if depth > MAX_CALL_DEPTH {
         return Err(Trap::RecursionError);
     }
+    let saved_module = model.set_current_module(module_id);
     let mut frames: Vec<Frame> = Vec::new();
-    frames.push(new_frame(entry, CodeId::Entry, args, is_module, cells, model)?);
-    match drive(&mut frames, entry, functions, model, depth)? {
+    let outcome = match new_frame(entry, CodeId::Entry, args, is_module, cells, model) {
+        Ok(frame) => {
+            frames.push(frame);
+            drive(&mut frames, entry, functions, model, depth)
+        }
+        Err(trap) => Err(trap),
+    };
+    model.set_current_module(saved_module);
+    match outcome? {
         DriveOutcome::Returned(value) => Ok(value),
         DriveOutcome::Yielded(_) => Err(Trap::Malformed),
     }
@@ -1901,7 +2155,7 @@ fn drive(
                 frame.store_local(idx as usize, value)?;
                 if frame.is_module {
                     let name = code.local_names.get(idx as usize).ok_or(Trap::Malformed)?;
-                    model.set_global(name, value);
+                    model.set_current_module_global(name, value);
                 }
             }
             Op::LoadGlobal(name_idx) => {
@@ -1913,7 +2167,11 @@ fn drive(
                 let receiver = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
                 let slot = frame.caches.get_mut(cache as usize).ok_or(Trap::Malformed)?;
-                let value = model.getattr(receiver, attr, slot)?;
+                let value = match model.getattr(receiver, attr, slot) {
+                    Ok(value) => value,
+                    Err(Trap::AttributeError) => return Err(model.attribute_error(receiver, attr)),
+                    Err(other) => return Err(other),
+                };
                 if model.is_property(value) && model.is_instance(receiver) {
                     let (fget, _, _) = model.property_accessors(value);
                     if fget.is_none() {
@@ -1928,18 +2186,10 @@ fn drive(
             Op::Binary(binop) => {
                 let rhs = frame.pop()?;
                 let lhs = frame.pop()?;
-                let result = if let Some(value) =
-                    try_binop_dunder(binop, lhs, rhs, functions, model, depth)?
-                {
-                    value
-                } else if let Some(value) = try_set_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
-                    value
-                } else if let Some(value) = try_dict_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
-                    value
-                } else if let Some(value) = model.py_binary(binop, lhs, rhs)? {
-                    value
-                } else {
-                    binary(binop, lhs, rhs, model)?
+                let result = match dispatch_binary(binop, lhs, rhs, functions, model, depth) {
+                    Ok(value) => value,
+                    Err(Trap::TypeError) => return Err(model.binop_type_error(binop, lhs, rhs)),
+                    Err(other) => return Err(other),
                 };
                 frame.push(result);
             }
@@ -1948,7 +2198,11 @@ fn drive(
                 let result = if let Some(method) = model.find_dunder(value, unary_dunder_name(unop)) {
                     call_value(method, &[], functions, model, depth + 1)?
                 } else {
-                    unary(unop, value, model)?
+                    match unary(unop, value, model) {
+                        Ok(value) => value,
+                        Err(Trap::TypeError) => return Err(model.unary_type_error(unop, value)),
+                        Err(other) => return Err(other),
+                    }
                 };
                 frame.push(result);
             }
@@ -1958,18 +2212,15 @@ fn drive(
                 let result = if matches!(cmpop, CmpOp::Is | CmpOp::IsNot) {
                     let same = lhs == rhs;
                     Value::from_bool(if matches!(cmpop, CmpOp::IsNot) { !same } else { same })
-                } else if let Some(value) =
-                    try_compare_dunder(cmpop, lhs, rhs, functions, model, depth)?
-                {
-                    value
-                } else if let Some(value) = try_set_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
-                    value
-                } else if let Some(value) = try_dict_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
-                    value
                 } else {
-                    match model.py_compare(cmpop, lhs, rhs)? {
-                        Some(value) => value,
-                        None => compare(cmpop, lhs, rhs, model)?,
+                    match dispatch_compare(cmpop, lhs, rhs, functions, model, depth) {
+                        Ok(value) => value,
+                        Err(Trap::TypeError)
+                            if matches!(cmpop, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge) =>
+                        {
+                            return Err(model.compare_type_error(cmpop, lhs, rhs));
+                        }
+                        Err(other) => return Err(other),
                     }
                 };
                 frame.push(result);
@@ -2075,7 +2326,12 @@ fn drive(
                 }
                 call_args.reverse();
                 let callee = frame.pop()?;
-                if let Some(index) = callee.as_function_index() {
+                if (callee.as_function_index().is_some() || model.is_py_function(callee))
+                    && model.function_home(callee) != model.current_module()
+                {
+                    let result = call_value(callee, &call_args, functions, model, depth + 1)?;
+                    frame.push(result);
+                } else if let Some(index) = callee.as_function_index() {
                     let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
                     let bound = if callee_code.has_varargs
                         || callee_code.has_varkwargs
@@ -2087,7 +2343,7 @@ fn drive(
                     };
                     if callee_code.is_generator {
                         let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &[], model)?;
-                        frame.push(model.new_generator(generator)?);
+                        frame.push(model.new_generator(generator, model.current_module())?);
                     } else {
                         return Ok(Flow::Call { index, args: bound, cells: Vec::new() });
                     }
@@ -2100,7 +2356,7 @@ fn drive(
                     let cells = model.py_function_cells(callee);
                     if callee_code.is_generator {
                         let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &cells, model)?;
-                        frame.push(model.new_generator(generator)?);
+                        frame.push(model.new_generator(generator, model.current_module())?);
                     } else {
                         return Ok(Flow::Call { index, args: bound, cells });
                     }
@@ -2162,8 +2418,9 @@ fn drive(
                     .iter()
                     .position(|f| f.name == *name)
                     .ok_or(Trap::NameError)? as u32;
+                let home = model.current_module();
                 if flags == 0 {
-                    frame.push(Value::function_ref(index));
+                    frame.push(Value::function_ref_in_module(home, index));
                 } else {
                     let cells = if flags & 0x04 != 0 {
                         let ncells =
@@ -2180,8 +2437,8 @@ fn drive(
                     let kwdefaults = if flags & 0x02 != 0 { frame.pop()? } else { Value::NONE };
                     let defaults = if flags & 0x01 != 0 { frame.pop()? } else { Value::NONE };
                     let function = match cells {
-                        Some(cells) => model.new_closure(index, defaults, kwdefaults, cells)?,
-                        None => model.new_py_function(index, defaults, kwdefaults)?,
+                        Some(cells) => model.new_closure(index, defaults, kwdefaults, cells, home)?,
+                        None => model.new_py_function(index, defaults, kwdefaults, home)?,
                     };
                     frame.push(function);
                 }
@@ -2204,12 +2461,18 @@ fn drive(
                 let callee = frame.pop()?;
                 let kwargs: Vec<(&str, Value)> =
                     names.iter().map(|s| s.as_str()).zip(kwvals).collect();
-                if let Some(index) = callee.as_function_index() {
+                if (callee.as_function_index().is_some() || model.is_py_function(callee))
+                    && model.function_home(callee) != model.current_module()
+                {
+                    let result =
+                        call_value_kw(callee, &call_args, &kwargs, functions, model, depth + 1)?;
+                    frame.push(result);
+                } else if let Some(index) = callee.as_function_index() {
                     let callee_code = functions.get(index as usize).ok_or(Trap::Malformed)?;
                     let bound = bind_arguments(callee_code, &call_args, &kwargs, &[], Value::NONE, model)?;
                     if callee_code.is_generator {
                         let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &[], model)?;
-                        frame.push(model.new_generator(generator)?);
+                        frame.push(model.new_generator(generator, model.current_module())?);
                     } else {
                         return Ok(Flow::Call { index, args: bound, cells: Vec::new() });
                     }
@@ -2222,7 +2485,7 @@ fn drive(
                     let cells = model.py_function_cells(callee);
                     if callee_code.is_generator {
                         let generator = new_frame(callee_code, CodeId::Func(index), &bound, false, &cells, model)?;
-                        frame.push(model.new_generator(generator)?);
+                        frame.push(model.new_generator(generator, model.current_module())?);
                     } else {
                         return Ok(Flow::Call { index, args: bound, cells });
                     }
@@ -2310,7 +2573,7 @@ fn drive(
             }
             Op::ImportName(name_idx) => {
                 let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
-                let module = model.import_module(name)?;
+                let module = resolve_import(name, model)?;
                 frame.push(module);
             }
             Op::ImportFrom(name_idx) => {
@@ -2324,9 +2587,11 @@ fn drive(
                     Some(namespace) => namespace,
                     None => frame.pop()?,
                 };
-                let base = frame.pop()?;
+                let bases = frame.pop()?;
                 let name = frame.pop()?;
-                frame.push(model.new_class(name, base, namespace)?);
+                let class = model.new_class(name, bases, namespace)?;
+                model.set_class_module(class, model.current_module())?;
+                frame.push(class);
             }
             Op::SetAttr { name, cache: _ } => {
                 let object = frame.pop()?;
@@ -2455,36 +2720,54 @@ fn drive(
                 if frames.len() >= MAX_CALL_DEPTH {
                     return Err(Trap::RecursionError);
                 }
-                frames.push(new_frame(callee, CodeId::Func(index), &args, false, &cells, model)?);
-            }
-            Err(trap) => {
-                let exception = match model.take_pending_exception() {
-                    Some(exception) => exception,
-                    None => match model.trap_to_exception(trap) {
-                        Some(exception) => exception,
-                        None => return Err(trap),
-                    },
-                };
-                let mut search_ip = faulting_ip;
-                loop {
-                    let top = frames.len() - 1;
-                    let code = resolve_code(frames[top].code, entry, functions);
-                    if let Some(handler) = find_handler(&code.exc_table, search_ip) {
-                        let frame = &mut frames[top];
-                        frame.stack.truncate(handler.depth as usize);
-                        frame.active_exception = Some(exception);
-                        frame.ip = handler.target as usize;
-                        break;
-                    }
-                    frames.pop();
-                    match frames.last() {
-                        Some(caller) => search_ip = (caller.ip as u32).saturating_sub(1),
-                        None => {
-                            model.set_pending_exception(exception);
-                            return Err(trap);
-                        }
-                    }
+                match new_frame(callee, CodeId::Func(index), &args, false, &cells, model) {
+                    Ok(new) => frames.push(new),
+                    Err(trap) => unwind_exception(trap, frames, faulting_ip, entry, functions, model)?,
                 }
+            }
+            Err(trap) => unwind_exception(trap, frames, faulting_ip, entry, functions, model)?,
+        }
+    }
+}
+
+/// Routes an in-flight exception/trap across the frame stack. The faulting frame searches its exception
+/// table at `faulting_ip`; each caller searches at its pending call op (`ip - 1`). The first covering
+/// handler CATCHES (truncate its stack to the handler depth, bind the exception, jump to the handler)
+/// and this returns `Ok(())`. If the stack empties with no handler, the exception escapes -- it stays
+/// pending on the model and this returns `Err(trap)` for the driver's caller. A non-catchable internal
+/// fault (no exception object) also returns `Err(trap)`.
+fn unwind_exception(
+    trap: Trap,
+    frames: &mut Vec<Frame>,
+    faulting_ip: u32,
+    entry: &CodeObject,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+) -> Result<(), Trap> {
+    let exception = match model.take_pending_exception() {
+        Some(exception) => exception,
+        None => match model.trap_to_exception(trap) {
+            Some(exception) => exception,
+            None => return Err(trap),
+        },
+    };
+    let mut search_ip = faulting_ip;
+    loop {
+        let top = frames.len() - 1;
+        let code = resolve_code(frames[top].code, entry, functions);
+        if let Some(handler) = find_handler(&code.exc_table, search_ip) {
+            let frame = &mut frames[top];
+            frame.stack.truncate(handler.depth as usize);
+            frame.active_exception = Some(exception);
+            frame.ip = handler.target as usize;
+            return Ok(());
+        }
+        frames.pop();
+        match frames.last() {
+            Some(caller) => search_ip = (caller.ip as u32).saturating_sub(1),
+            None => {
+                model.set_pending_exception(exception);
+                return Err(trap);
             }
         }
     }
@@ -2494,7 +2777,7 @@ fn drive(
 mod tests {
     use super::*;
     use crate::object::PyType;
-    use lamella_py_bytecode::{Param, StaticType};
+    use lamella_py_bytecode::{Bundle, Module, Param, StaticType};
 
     #[test]
     fn frame_pool_recycles_buffers() {
@@ -2650,11 +2933,13 @@ mod tests {
     fn bind_arguments_rejects_bad_calls() {
         let c = code(2, 2, Vec::new(), Vec::new(), 0, Vec::new());
         let f = |n: i32| Value::fixnum(n).unwrap();
-        let mut m = no_objects();
-        assert_eq!(bind_arguments(&c, &[f(1), f(2), f(3)], &[], &[], Value::NONE, &mut m), Err(Trap::TypeError));
+        let mut m = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(bind_arguments(&c, &[f(1), f(2), f(3)], &[], &[], Value::NONE, &mut m), Err(Trap::Raised));
+        assert_eq!(bind_arguments(&c, &[f(1)], &[], &[], Value::NONE, &mut m), Err(Trap::Raised));
+        let exc = m.take_pending_exception().unwrap();
+        assert_eq!(m.exception_type_name(exc), Some("TypeError"));
         assert_eq!(bind_arguments(&c, &[f(1)], &[("nope", f(2))], &[], Value::NONE, &mut m), Err(Trap::TypeError));
         assert_eq!(bind_arguments(&c, &[f(1)], &[("a0", f(2))], &[], Value::NONE, &mut m), Err(Trap::TypeError));
-        assert_eq!(bind_arguments(&c, &[f(1)], &[], &[], Value::NONE, &mut m), Err(Trap::TypeError));
     }
 
     #[test]
@@ -2680,7 +2965,7 @@ mod tests {
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         let f = |n: i32| Value::fixnum(n).unwrap();
         let defaults = model.new_tuple(vec![f(10)]).unwrap();
-        let pyfunc = model.new_py_function(0, defaults, Value::NONE).unwrap();
+        let pyfunc = model.new_py_function(0, defaults, Value::NONE, 0).unwrap();
         let bound = model.new_py_bound(f(0), pyfunc).unwrap();
         assert_eq!(call_value(bound, &[], &functions, &mut model, 0).unwrap(), f(10));
         assert_eq!(call_value(bound, &[f(5)], &functions, &mut model, 0).unwrap(), f(5));
@@ -2700,7 +2985,9 @@ mod tests {
             bind_arguments(&c, &[f(5)], &[("b", f(9))], &[], kwdefaults, &mut m).unwrap(),
             vec![f(5), f(9)]
         );
-        assert_eq!(bind_arguments(&c, &[f(5)], &[], &[], Value::NONE, &mut m), Err(Trap::TypeError));
+        assert_eq!(bind_arguments(&c, &[f(5)], &[], &[], Value::NONE, &mut m), Err(Trap::Raised));
+        let exc = m.take_pending_exception().unwrap();
+        assert_eq!(m.exception_type_name(exc), Some("TypeError"));
     }
 
     #[test]
@@ -2714,7 +3001,7 @@ mod tests {
         let name = model.new_str("C").unwrap();
         let key_init = model.new_str("__init__").unwrap();
         let defaults = model.new_tuple(vec![f(7)]).unwrap();
-        let init_fn = model.new_py_function(0, defaults, Value::NONE).unwrap();
+        let init_fn = model.new_py_function(0, defaults, Value::NONE, 0).unwrap();
         let ns = model.new_dict(vec![(key_init, init_fn)]).unwrap();
         let class = model.new_class(name, Value::NONE, ns).unwrap();
         let obj = call_value(class, &[], &functions, &mut model, 0).unwrap();
@@ -2940,7 +3227,7 @@ mod tests {
         let functions = [add];
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         let defaults = model.new_tuple(vec![Value::fixnum(10).unwrap()]).unwrap();
-        let pyfunc = model.new_py_function(0, defaults, Value::NONE).unwrap();
+        let pyfunc = model.new_py_function(0, defaults, Value::NONE, 0).unwrap();
         let result = call_value(pyfunc, &[Value::fixnum(5).unwrap()], &functions, &mut model, 1).unwrap();
         assert_eq!(result.as_fixnum(), Some(15));
     }
@@ -3038,6 +3325,34 @@ mod tests {
         let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
         let result = run(&main, core::slice::from_ref(&boom), &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(7));
+    }
+
+    #[test]
+    fn a_call_arity_typeerror_is_caught_at_the_call_site() {
+        use Op::*;
+        let mut needs_two =
+            code(2, 2, vec![Const::None], Vec::new(), 0, vec![LoadConst(0), Return]);
+        needs_two.name = String::from("needs_two");
+        let mut main = code(0, 0, vec![Const::Int(7)], vec![String::from("needs_two")], 0,
+            vec![LoadGlobal(0), Call(0), PopTop, PopExcept, LoadConst(0), Return]);
+        main.exc_table = vec![ExcEntry { start: 0, end: 2, target: 3, depth: 0 }];
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let result = run(&main, core::slice::from_ref(&needs_two), &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(7));
+    }
+
+    #[test]
+    fn an_uncaught_call_arity_error_escapes_as_a_typeerror() {
+        use Op::*;
+        let mut needs_two =
+            code(2, 2, vec![Const::None], Vec::new(), 0, vec![LoadConst(0), Return]);
+        needs_two.name = String::from("needs_two");
+        let main = code(0, 0, Vec::new(), vec![String::from("needs_two")], 0,
+            vec![LoadGlobal(0), Call(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run(&main, core::slice::from_ref(&needs_two), &[], &mut model), Err(Trap::Raised));
+        let exc = model.take_pending_exception().unwrap();
+        assert_eq!(model.exception_type_name(exc), Some("TypeError"));
     }
 
     #[test]
@@ -3762,5 +4077,510 @@ mod tests {
             vec![LoadConst(0), Return]);
         let mut model = ObjectModel::new(Vec::new(), 0);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::OutOfMemory));
+    }
+
+
+    /// A `"<module>"` body with explicit `local_names` (a module body mirrors each top-level
+    /// `StoreFast` into a global by its local name) and `names` pool.
+    fn module_body(
+        local_names: &[&str],
+        consts: Vec<Const>,
+        names: &[&str],
+        cache_count: usize,
+        ops: Vec<Op>,
+    ) -> CodeObject {
+        let name_pool = names.iter().map(|s| String::from(*s)).collect();
+        let mut co = code(local_names.len(), 0, consts, name_pool, cache_count, ops);
+        co.name = String::from("<module>");
+        co.local_names = local_names.iter().map(|s| String::from(*s)).collect();
+        co
+    }
+
+    /// A named member of a module's function table, with `n_args` params and an explicit `names` pool.
+    fn named_fn(name: &str, n_args: usize, n_locals: usize, names: &[&str], ops: Vec<Op>) -> CodeObject {
+        let name_pool = names.iter().map(|s| String::from(*s)).collect();
+        let mut co = code(n_locals, n_args, Vec::new(), name_pool, 0, ops);
+        co.name = String::from(name);
+        co
+    }
+
+    fn managed_module(name: &str, functions: Vec<CodeObject>, body: CodeObject) -> Module {
+        Module { name: String::from(name), functions, body }
+    }
+
+    #[test]
+    fn managed_module_body_runs_in_its_own_namespace() {
+        use Op::*;
+        let m = managed_module(
+            "m",
+            Vec::new(),
+            module_body(&["X"], vec![Const::Int(10), Const::None], &[], 0,
+                vec![LoadConst(0), StoreFast(0), LoadConst(1), Return]),
+        );
+        let entry = module_body(&["m"], Vec::new(), &["m", "X"], 1, vec![
+            ImportName(0),
+            StoreFast(0),
+            LoadFast(0),
+            LoadAttr { name: 1, cache: 0 },
+            Return,
+        ]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        model.set_managed_modules(vec![m]);
+        let result = run_module(&entry, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(10));
+        assert!(model.get_global("X").is_none());
+        assert!(model.is_module_object(model.get_global("m").unwrap()));
+    }
+
+    #[test]
+    fn from_managed_module_import_binds_the_member() {
+        use Op::*;
+        let config = managed_module(
+            "config",
+            Vec::new(),
+            module_body(&["MAX"], vec![Const::Int(99), Const::None], &[], 0,
+                vec![LoadConst(0), StoreFast(0), LoadConst(1), Return]),
+        );
+        let entry = module_body(&["MAX"], Vec::new(), &["config", "MAX"], 0, vec![
+            ImportName(0),
+            ImportFrom(1),
+            StoreFast(0),
+            PopTop,
+            LoadFast(0),
+            Return,
+        ]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        model.set_managed_modules(vec![config]);
+        let result = run_module(&entry, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(99));
+        assert_eq!(model.get_global("MAX").and_then(Value::as_fixnum), Some(99));
+    }
+
+    #[test]
+    fn a_managed_module_function_resolves_module_globals_during_the_body() {
+        use Op::*;
+        let compute = named_fn("compute", 0, 0, &["BASE"], vec![LoadGlobal(0), Return]);
+        let calc = managed_module(
+            "calc",
+            vec![compute],
+            module_body(&["BASE", "RESULT"], vec![Const::Int(5), Const::None], &["compute"], 0, vec![
+                LoadConst(0),
+                StoreFast(0),
+                LoadGlobal(0),
+                Call(0),
+                StoreFast(1),
+                LoadConst(1),
+                Return,
+            ]),
+        );
+        let entry = module_body(&["calc"], Vec::new(), &["calc", "RESULT"], 1, vec![
+            ImportName(0),
+            StoreFast(0),
+            LoadFast(0),
+            LoadAttr { name: 1, cache: 0 },
+            Return,
+        ]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        model.set_managed_modules(vec![calc]);
+        let result = run_module(&entry, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(5));
+    }
+
+    #[test]
+    fn a_native_module_shadows_a_managed_one_of_the_same_name() {
+        use Op::*;
+        let managed_math = managed_module(
+            "math",
+            Vec::new(),
+            module_body(&["pi"], vec![Const::Int(999), Const::None], &[], 0,
+                vec![LoadConst(0), StoreFast(0), LoadConst(1), Return]),
+        );
+        let entry = module_body(&["math"], Vec::new(), &["math", "pi"], 1, vec![
+            ImportName(0),
+            StoreFast(0),
+            LoadFast(0),
+            LoadAttr { name: 1, cache: 0 },
+            Return,
+        ]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        model.set_managed_modules(vec![managed_math]);
+        let pi = run_module(&entry, &[], &mut model).unwrap();
+        let pi = model.float_value(pi).expect("native math.pi is a float");
+        assert!((pi - core::f64::consts::PI).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_circular_managed_import_terminates_via_cache_before_run() {
+        use Op::*;
+        let selfmod = managed_module(
+            "selfmod",
+            Vec::new(),
+            module_body(&["selfmod", "X"], vec![Const::Int(1), Const::None], &["selfmod"], 0, vec![
+                ImportName(0),
+                StoreFast(0),
+                LoadConst(0),
+                StoreFast(1),
+                LoadConst(1),
+                Return,
+            ]),
+        );
+        let entry = module_body(&["selfmod"], Vec::new(), &["selfmod", "X"], 1, vec![
+            ImportName(0),
+            StoreFast(0),
+            LoadFast(0),
+            LoadAttr { name: 1, cache: 0 },
+            Return,
+        ]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        model.set_managed_modules(vec![selfmod]);
+        let result = run_module(&entry, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(1));
+    }
+
+    #[test]
+    fn an_import_of_neither_a_native_nor_a_managed_module_raises() {
+        use Op::*;
+        let entry = module_body(&["x"], vec![Const::None], &["nope"], 0,
+            vec![ImportName(0), StoreFast(0), LoadConst(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        model.set_managed_modules(Vec::new());
+        assert_eq!(run_module(&entry, &[], &mut model), Err(Trap::Raised));
+    }
+
+    #[test]
+    fn a_module_function_resolves_its_module_globals_when_called_after_import() {
+        use Op::*;
+        let compute = named_fn("compute", 0, 0, &["BASE"], vec![LoadGlobal(0), Return]);
+        let helpers = managed_module(
+            "helpers",
+            vec![compute],
+            module_body(&["BASE", "compute"], vec![Const::Int(5), Const::None], &["compute"], 0, vec![
+                LoadConst(0),
+                StoreFast(0),
+                MakeFunction { func: 0, flags: 0 },
+                StoreFast(1),
+                LoadConst(1),
+                Return,
+            ]),
+        );
+        let entry = module_body(
+            &["BASE", "compute"],
+            vec![Const::Int(99)],
+            &["helpers", "compute"],
+            0,
+            vec![
+                LoadConst(0),
+                StoreFast(0),
+                ImportName(0),
+                ImportFrom(1),
+                StoreFast(1),
+                PopTop,
+                LoadFast(1),
+                Call(0),
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        model.set_managed_modules(vec![helpers]);
+        let result = run_module(&entry, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(5));
+        assert_eq!(model.get_global("BASE").and_then(Value::as_fixnum), Some(99));
+    }
+
+    #[test]
+    fn a_cross_module_call_chains_through_each_function_s_home_module() {
+        use Op::*;
+        let get = named_fn("get", 0, 0, &["VAL"], vec![LoadGlobal(0), Return]);
+        let b = managed_module(
+            "b",
+            vec![get],
+            module_body(&["VAL", "get"], vec![Const::Int(7), Const::None], &["get"], 0, vec![
+                LoadConst(0),
+                StoreFast(0),
+                MakeFunction { func: 0, flags: 0 },
+                StoreFast(1),
+                LoadConst(1),
+                Return,
+            ]),
+        );
+        let relay = named_fn("relay", 0, 0, &["get"], vec![LoadGlobal(0), Call(0), Return]);
+        let a = managed_module(
+            "a",
+            vec![relay],
+            module_body(&["get", "relay"], vec![Const::None], &["b", "get", "relay"], 0, vec![
+                ImportName(0),
+                ImportFrom(1),
+                StoreFast(0),
+                PopTop,
+                MakeFunction { func: 2, flags: 0 },
+                StoreFast(1),
+                LoadConst(0),
+                Return,
+            ]),
+        );
+        let entry = module_body(&["relay"], Vec::new(), &["a", "relay"], 0, vec![
+            ImportName(0),
+            ImportFrom(1),
+            StoreFast(0),
+            PopTop,
+            LoadFast(0),
+            Call(0),
+            Return,
+        ]);
+        let mut model = ObjectModel::new(Vec::new(), 128 * 1024);
+        model.set_managed_modules(vec![a, b]);
+        let result = run_module(&entry, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(7));
+    }
+
+
+    #[test]
+    fn run_bundle_installs_the_registry_then_runs_the_entry() {
+        use Op::*;
+        let compute = named_fn("compute", 0, 0, &["BASE"], vec![LoadGlobal(0), Return]);
+        let helpers = managed_module(
+            "helpers",
+            vec![compute],
+            module_body(&["BASE", "compute"], vec![Const::Int(5), Const::None], &["compute"], 0, vec![
+                LoadConst(0),
+                StoreFast(0),
+                MakeFunction { func: 0, flags: 0 },
+                StoreFast(1),
+                LoadConst(1),
+                Return,
+            ]),
+        );
+        let entry_body = module_body(&["BASE", "compute"], vec![Const::Int(99)], &["helpers", "compute"], 0, vec![
+            LoadConst(0),
+            StoreFast(0),
+            ImportName(0),
+            ImportFrom(1),
+            StoreFast(1),
+            PopTop,
+            LoadFast(1),
+            Call(0),
+            Return,
+        ]);
+        let bundle = Bundle {
+            entry: managed_module("__main__", Vec::new(), entry_body),
+            modules: vec![helpers],
+        };
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let result = run_bundle(bundle, &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(5));
+        assert_eq!(model.get_global("BASE").and_then(Value::as_fixnum), Some(99));
+    }
+
+    #[test]
+    fn run_bundle_with_no_modules_is_a_plain_single_file_program() {
+        use Op::*;
+        let entry_body = module_body(&["x"], vec![Const::Int(42)], &[], 0, vec![
+            LoadConst(0),
+            StoreFast(0),
+            LoadFast(0),
+            Return,
+        ]);
+        let bundle = Bundle {
+            entry: managed_module("__main__", Vec::new(), entry_body),
+            modules: Vec::new(),
+        };
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run_bundle(bundle, &mut model).unwrap().as_fixnum(), Some(42));
+    }
+
+    #[test]
+    fn a_binary_op_type_error_raises_with_a_cpython_message() {
+        use Op::*;
+        let code = code(0, 0, vec![Const::Int(1), Const::Str(String::from("a"))], Vec::new(), 0,
+            vec![LoadConst(0), LoadConst(1), Binary(BinOp::Add), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        let exc = model.take_pending_exception().expect("a pending TypeError");
+        let repr = model.repr(exc);
+        assert!(
+            repr.contains("unsupported operand type(s) for +: 'int' and 'str'"),
+            "got: {repr}"
+        );
+    }
+
+    #[test]
+    fn an_ordering_comparison_type_error_raises_with_a_cpython_message() {
+        use Op::*;
+        let code = code(0, 0, vec![Const::Int(1), Const::Str(String::from("a"))], Vec::new(), 0,
+            vec![LoadConst(0), LoadConst(1), Compare(CmpOp::Lt), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        let exc = model.take_pending_exception().expect("a pending TypeError");
+        let repr = model.repr(exc);
+        assert!(
+            repr.contains("'<' not supported between instances of 'int' and 'str'"),
+            "got: {repr}"
+        );
+    }
+
+    #[test]
+    fn len_of_a_value_with_no_length_raises_with_a_cpython_message() {
+        use Op::*;
+        let code = code(0, 0, vec![Const::Int(5)], vec![String::from("len")], 0,
+            vec![LoadGlobal(0), LoadConst(0), Call(1), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        let exc = model.take_pending_exception().expect("a pending TypeError");
+        let repr = model.repr(exc);
+        assert!(repr.contains("object of type 'int' has no len()"), "got: {repr}");
+    }
+
+    #[test]
+    fn calling_a_non_callable_raises_with_a_cpython_message() {
+        use Op::*;
+        let code = code(0, 0, vec![Const::Int(5)], Vec::new(), 0,
+            vec![LoadConst(0), Call(0), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        let exc = model.take_pending_exception().expect("a pending TypeError");
+        let repr = model.repr(exc);
+        assert!(repr.contains("'int' object is not callable"), "got: {repr}");
+    }
+
+    #[test]
+    fn a_unary_op_type_error_raises_with_a_cpython_message() {
+        use Op::*;
+        let code = code(0, 0, vec![Const::Str(String::from("a"))], Vec::new(), 0,
+            vec![LoadConst(0), Unary(UnaryOp::Neg), Return]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        let exc = model.take_pending_exception().expect("a pending TypeError");
+        let repr = model.repr(exc);
+        assert!(repr.contains("bad operand type for unary -: 'str'"), "got: {repr}");
+    }
+
+    #[test]
+    fn a_missing_attribute_raises_attributeerror_with_a_cpython_message() {
+        use Op::*;
+        let code = code(0, 0, vec![Const::Int(5)], vec![String::from("foo")], 1,
+            vec![LoadConst(0), LoadAttr { name: 0, cache: 0 }, Return]);
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::Raised));
+        let exc = model.take_pending_exception().expect("a pending AttributeError");
+        let repr = model.repr(exc);
+        assert!(repr.contains("'int' object has no attribute 'foo'"), "got: {repr}");
+    }
+
+    #[test]
+    fn subscripting_a_non_subscriptable_carries_a_cpython_message() {
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let five = Value::fixnum(5).unwrap();
+        let zero = Value::fixnum(0).unwrap();
+        assert_eq!(model.py_getitem(five, zero), Err(Trap::TypeError));
+        let exc = model.trap_to_exception(Trap::TypeError).expect("a TypeError exception");
+        assert!(
+            model.repr(exc).contains("'int' object is not subscriptable"),
+            "got: {}",
+            model.repr(exc)
+        );
+    }
+
+    #[test]
+    fn a_class_repr_is_qualified_by_its_module() {
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let name = model.new_str("Foo").unwrap();
+        let ns = model.new_dict(Vec::new()).unwrap();
+        let class = model.new_class(name, Value::NONE, ns).unwrap();
+        model.set_class_module(class, 0).unwrap();
+        assert_eq!(model.repr(class), "<class '__main__.Foo'>");
+        let bare_name = model.new_str("Bar").unwrap();
+        let bare_ns = model.new_dict(Vec::new()).unwrap();
+        let bare = model.new_class(bare_name, Value::NONE, bare_ns).unwrap();
+        assert_eq!(model.repr(bare), "<class 'Bar'>");
+    }
+
+    #[test]
+    fn a_bad_index_type_carries_a_cpython_message() {
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let list = model.new_list(alloc::vec![Value::fixnum(1).unwrap()]).unwrap();
+        let key = model.new_str("a").unwrap();
+        assert_eq!(model.py_getitem(list, key), Err(Trap::TypeError));
+        let exc = model.trap_to_exception(Trap::TypeError).expect("a TypeError");
+        assert!(
+            model.repr(exc).contains("list indices must be integers or slices, not str"),
+            "got: {}",
+            model.repr(exc)
+        );
+        let text = model.new_str("abc").unwrap();
+        assert_eq!(model.py_getitem(text, Value::NONE), Err(Trap::TypeError));
+        let exc2 = model.trap_to_exception(Trap::TypeError).expect("a TypeError");
+        assert!(
+            model.repr(exc2).contains("string indices must be integers, not 'NoneType'"),
+            "got: {}",
+            model.repr(exc2)
+        );
+    }
+
+    #[test]
+    fn the_selected_board_drives_the_gpio_register_map() {
+        let board = crate::gpio::Board::Stm32f4;
+        assert_eq!(board.pin_id("LED"), Some(13));
+        assert_eq!(board.pin_id("PC5"), Some(5));
+        assert_eq!(board.pin_id("PC99"), None);
+        let regs = board.pin_regs(13);
+        assert_eq!(regs.set_val, 1 << 13);
+        assert_eq!(regs.clr_val, 1 << (13 + 16));
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        model.set_board(board);
+    }
+
+    #[test]
+    fn a_managed_module_exports_a_plain_top_level_def_for_from_import() {
+        use Op::*;
+        let f = named_fn("f", 0, 0, &["VAL"], vec![LoadGlobal(0), Return]);
+        let m = managed_module(
+            "m",
+            vec![f],
+            module_body(&["VAL"], vec![Const::Int(7), Const::None], &[], 0,
+                vec![LoadConst(0), StoreFast(0), LoadConst(1), Return]),
+        );
+        let entry_body = module_body(&["m", "f"], Vec::new(), &["m", "f"], 0, vec![
+            ImportName(0),
+            StoreFast(0),
+            LoadFast(0),
+            ImportFrom(1),
+            StoreFast(1),
+            PopTop,
+            LoadFast(1),
+            Call(0),
+            Return,
+        ]);
+        let bundle = Bundle {
+            entry: managed_module("__main__", Vec::new(), entry_body),
+            modules: vec![m],
+        };
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run_bundle(bundle, &mut model).unwrap().as_fixnum(), Some(7));
+    }
+
+    #[test]
+    fn a_managed_module_exports_a_plain_top_level_def_for_attribute_access() {
+        use Op::*;
+        let f = named_fn("f", 0, 0, &["VAL"], vec![LoadGlobal(0), Return]);
+        let m = managed_module(
+            "m",
+            vec![f],
+            module_body(&["VAL"], vec![Const::Int(7), Const::None], &[], 0,
+                vec![LoadConst(0), StoreFast(0), LoadConst(1), Return]),
+        );
+        let entry_body = module_body(&["m"], Vec::new(), &["m", "f"], 1, vec![
+            ImportName(0),
+            StoreFast(0),
+            LoadFast(0),
+            LoadAttr { name: 1, cache: 0 },
+            Call(0),
+            Return,
+        ]);
+        let bundle = Bundle {
+            entry: managed_module("__main__", Vec::new(), entry_body),
+            modules: vec![m],
+        };
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        assert_eq!(run_bundle(bundle, &mut model).unwrap().as_fixnum(), Some(7));
     }
 }

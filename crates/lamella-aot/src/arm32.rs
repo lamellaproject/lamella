@@ -218,6 +218,9 @@ fn lower_inst(
         | Inst::AllocArray2D { .. }
         | Inst::Array2DLoad { .. }
         | Inst::Array2DStore { .. }
+        | Inst::AllocArrayMD { .. }
+        | Inst::ArrayMDLoad { .. }
+        | Inst::ArrayMDStore { .. }
         | Inst::StaticLoad { .. }
         | Inst::StaticStore { .. }
         | Inst::LoadTypeDesc { .. }
@@ -1124,6 +1127,7 @@ fn lower_spilled_inst(
         Inst::Alloc { .. }
         | Inst::AllocArray { .. }
         | Inst::AllocArray2D { .. }
+        | Inst::AllocArrayMD { .. }
         | Inst::LoadTypeDesc { .. }
         | Inst::TypeDescAddr { .. } => {
             return Err(LowerError::CallUnsupported);
@@ -1224,6 +1228,48 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             }
         }
+        Inst::ArrayMDLoad {
+            array,
+            indices,
+            element_size,
+            signed,
+        } => {
+            enc.ldr_sp(Reg::R0, slot(*array))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_md_element_address(enc, pool, slot, indices, *element_size)?;
+            if *element_size == 8 {
+                enc.ldr_imm(Reg::R1, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R0, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                emit_sized_load(enc, Reg::R0, Reg::R0, *element_size, *signed)?;
+            }
+        }
+        Inst::ArrayMDStore {
+            array,
+            indices,
+            value,
+            element_size,
+        } => {
+            enc.ldr_sp(Reg::R0, slot(*array))
+                .map_err(|_| LowerError::TooManyValues)?;
+            emit_md_element_address(enc, pool, slot, indices, *element_size)?;
+            if *element_size == 8 {
+                enc.ldr_sp(Reg::R1, slot(*value))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_sp(Reg::R2, slot(*value) + 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R1, Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.str_imm(Reg::R2, Reg::R0, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+            } else {
+                enc.ldr_sp(Reg::R1, slot(*value))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                emit_sized_store(enc, Reg::R1, Reg::R0, *element_size)?;
+            }
+        }
     }
     Ok(None)
 }
@@ -1296,6 +1342,40 @@ fn emit_dim_bounds_check(enc: &mut Encoder, dim_offset: u16) -> Result<(), Lower
     enc.b_cond(Cond::CarryClear, ok);
     enc.udf(0);
     enc.bind_label(ok);
+    Ok(())
+}
+
+/// With `r0` = the array base, computes the address of rank-N element `(indices[0..N])` into `r0`,
+/// bounds-checking each index against its dimension word `[array + 4*k]` (unsigned, so a negative
+/// index -- a huge unsigned value -- traps too; `udf` on failure). The flat index is the Horner fold
+/// `((..(i0*dim1 + i1)*dim2 + i2)..)*dim(N-1) + i(N-1)`; the element sits at `array + 4*N +
+/// flat*element_size`. Clobbers r1, r2, r3. (The N-1 products use `muls` -- ARM has hardware multiply,
+/// unlike RV32E; the rank fits `ldr [rN,#imm5*4]`/`adds #imm8`, i.e. up to 32, the CLI's rank ceiling.)
+fn emit_md_element_address(
+    enc: &mut Encoder,
+    pool: &mut Vec<(Label, u32)>,
+    slot: &impl Fn(ValueId) -> u16,
+    indices: &[ValueId],
+    element_size: u32,
+) -> Result<(), LowerError> {
+    let oops = |_| LowerError::TooManyValues;
+    let n = indices.len();
+    enc.ldr_sp(Reg::R1, slot(indices[0])).map_err(oops)?;
+    emit_dim_bounds_check(enc, 0)?;
+    for (k, &idx) in indices.iter().enumerate().skip(1) {
+        enc.ldr_imm(Reg::R2, Reg::R0, (4 * k) as u16).map_err(oops)?;
+        enc.muls(Reg::R1, Reg::R2).map_err(oops)?;
+        enc.ldr_sp(Reg::R3, slot(idx)).map_err(oops)?;
+        enc.cmp_reg(Reg::R3, Reg::R2).map_err(oops)?;
+        let ok = enc.new_label();
+        enc.b_cond(Cond::CarryClear, ok);
+        enc.udf(0);
+        enc.bind_label(ok);
+        enc.adds(Reg::R1, Reg::R1, Reg::R3).map_err(oops)?;
+    }
+    scale_index(enc, pool, element_size)?;
+    enc.adds(Reg::R0, Reg::R0, Reg::R1).map_err(oops)?;
+    enc.adds_imm8(Reg::R0, (4 * n) as u8).map_err(oops)?;
     Ok(())
 }
 
@@ -1878,6 +1958,7 @@ fn lower_spilled_into(
                     | Inst::Alloc { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
+                    | Inst::AllocArrayMD { .. }
             )
         })
     });
@@ -2321,6 +2402,64 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 continue;
             }
+            if let Inst::AllocArrayMD {
+                handle,
+                dims,
+                element_size,
+            } = inst
+            {
+                let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
+                let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
+                    Some((_, label)) => *label,
+                    None => {
+                        let label = enc.new_label();
+                        type_descs.push((label, alloc::vec![0u32, 0u32, 0u32].into_boxed_slice()));
+                        type_desc_labels.push((*handle, label));
+                        label
+                    }
+                };
+                let n = dims.len();
+                enc.ldr_sp(Reg::R0, slot(dims[0]))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                for d in &dims[1..] {
+                    enc.ldr_sp(Reg::R1, slot(*d))
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.muls(Reg::R0, Reg::R1)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                if *element_size != 1 {
+                    if element_size.is_power_of_two() {
+                        enc.lsls_imm(Reg::R0, Reg::R0, element_size.trailing_zeros() as u8)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    } else {
+                        load_const_word(enc, &mut pool, Reg::R1, *element_size)?;
+                        enc.muls(Reg::R0, Reg::R1)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                    }
+                }
+                enc.adds_imm8(Reg::R0, (4 * n) as u8)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.adr(Reg::R1, desc_label)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                load_const_word(enc, &mut pool, Reg::R2, alloc)?;
+                enc.blx(Reg::R2);
+                record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
+                let ok = enc.new_label();
+                enc.cmp_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.b_cond(Cond::Ne, ok);
+                enc.udf(0);
+                enc.bind_label(ok);
+                for (k, d) in dims.iter().enumerate() {
+                    enc.ldr_sp(Reg::R1, slot(*d))
+                        .map_err(|_| LowerError::TooManyValues)?;
+                    enc.str_imm(Reg::R1, Reg::R0, (4 * k) as u16)
+                        .map_err(|_| LowerError::TooManyValues)?;
+                }
+                enc.str_sp(Reg::R0, slot(*result))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                continue;
+            }
             let call_pc = lower_spilled_inst(
                 enc,
                 &mut pool,
@@ -2610,6 +2749,9 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::AllocArray2D { .. }
                     | Inst::Array2DLoad { .. }
                     | Inst::Array2DStore { .. }
+                    | Inst::AllocArrayMD { .. }
+                    | Inst::ArrayMDLoad { .. }
+                    | Inst::ArrayMDStore { .. }
                     | Inst::StaticLoad { .. }
                     | Inst::StaticStore { .. }
                     | Inst::LoadTypeDesc { .. }
@@ -3661,6 +3803,110 @@ fn aeabi_float_compare(
     Some((alloc::format!("{prefix}{suffix}"), invert))
 }
 
+/// Rewrites a rectangular-array allocation (`AllocArray2D`/`AllocArrayMD`) for the OBJECT path into a
+/// linker-resolved `lamella_gc_alloc` call, appending the resulting instructions to `insts` (fresh
+/// `value_types` entries for each temporary). It allocates `4*N + product(dims)*element_size` bytes (the
+/// `[dim0]..[dim(N-1)]` row-major header before the elements), tags the object with a minimal `[0,0,tag,0]`
+/// descriptor (an array dispatches no virtuals through it), and writes each dimension length into the
+/// header. The 1-D `AllocArray` has its own rewrite above; the monolithic path lowers all of these inline
+/// against a fixed allocator address; the RISC-V object path does the same via `emit_alloc_call`.
+#[allow(clippy::too_many_arguments)]
+fn rewrite_md_alloc(
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    externs: &mut Vec<alloc::string::String>,
+    descriptors: &[TypeMeta],
+    result: ValueId,
+    handle: lamella_ir::TypeHandle,
+    dims: &[ValueId],
+    element_size: u32,
+) {
+    let symbol = intern_extern(externs, "lamella_gc_alloc");
+    let type_tag = descriptors
+        .iter()
+        .find(|m| m.handle == handle)
+        .map_or(0, |m| m.type_tag);
+    let fresh = |value_types: &mut Vec<MirType>| {
+        let v = ValueId(value_types.len() as u32);
+        value_types.push(MirType::I32);
+        v
+    };
+    let mut acc = dims[0];
+    for &d in &dims[1..] {
+        let p = fresh(value_types);
+        insts.push((
+            p,
+            Inst::Binary {
+                op: BinOp::Mul,
+                lhs: acc,
+                rhs: d,
+            },
+        ));
+        acc = p;
+    }
+    let esize = fresh(value_types);
+    insts.push((
+        esize,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from(element_size),
+        },
+    ));
+    let scaled = fresh(value_types);
+    insts.push((
+        scaled,
+        Inst::Binary {
+            op: BinOp::Mul,
+            lhs: acc,
+            rhs: esize,
+        },
+    ));
+    let header = fresh(value_types);
+    insts.push((
+        header,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: 4 * dims.len() as i64,
+        },
+    ));
+    let size = fresh(value_types);
+    insts.push((
+        size,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: scaled,
+            rhs: header,
+        },
+    ));
+    let typedesc = fresh(value_types);
+    insts.push((
+        typedesc,
+        Inst::TypeDescLiteral {
+            handle: handle.0,
+            words: alloc::vec![0, 0, type_tag, 0].into_boxed_slice(),
+            vtable: alloc::vec![].into_boxed_slice(),
+        },
+    ));
+    insts.push((
+        result,
+        Inst::CallNative {
+            symbol,
+            args: alloc::vec![size, typedesc],
+        },
+    ));
+    for (k, &d) in dims.iter().enumerate() {
+        let st = fresh(value_types);
+        insts.push((
+            st,
+            Inst::FieldStore {
+                base: result,
+                offset: (4 * k) as u32,
+                value: d,
+            },
+        ));
+    }
+}
+
 /// Rewrites the ops the object path resolves through the linker into `CallNative`s (interning each
 /// extern name): soft-float `+ - * /` and the comparisons to `__aeabi_*` helpers (against `libgcc.a`),
 /// and a heap allocation to `lamella_gc_alloc`. Float stays a target-independent typed MIR op; a
@@ -3805,6 +4051,43 @@ fn lower_runtime_calls(
                         value: *length,
                     },
                 ));
+                continue;
+            }
+            if let Inst::AllocArray2D {
+                handle,
+                dim0,
+                dim1,
+                element_size,
+            } = &inst
+            {
+                rewrite_md_alloc(
+                    &mut func.value_types,
+                    &mut insts,
+                    externs,
+                    descriptors,
+                    result,
+                    *handle,
+                    &[*dim0, *dim1],
+                    *element_size,
+                );
+                continue;
+            }
+            if let Inst::AllocArrayMD {
+                handle,
+                dims,
+                element_size,
+            } = &inst
+            {
+                rewrite_md_alloc(
+                    &mut func.value_types,
+                    &mut insts,
+                    externs,
+                    descriptors,
+                    result,
+                    *handle,
+                    dims,
+                    *element_size,
+                );
                 continue;
             }
             if let Inst::TypeDescAddr { handle } = &inst {
@@ -7086,6 +7369,80 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "lamella_gc_alloc" && !s.defined),
             "AllocArray lowers to a lamella_gc_alloc call (not the flat-path fixed address)"
+        );
+    }
+
+    #[test]
+    fn lower_object_lowers_alloc_array_md_to_the_runtime_allocator() {
+        let n = ValueId;
+        let i32c = |v: i64| Inst::ConstInt {
+            ty: MirType::I32,
+            value: v,
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (n(0), i32c(2)),
+                    (n(1), i32c(3)),
+                    (n(2), i32c(4)),
+                    (
+                        n(3),
+                        Inst::AllocArrayMD {
+                            handle: lamella_ir::TypeHandle(1),
+                            dims: alloc::vec![n(0), n(1), n(2)].into_boxed_slice(),
+                            element_size: 4,
+                        },
+                    ),
+                    (n(4), i32c(1)),
+                    (n(5), i32c(2)),
+                    (n(6), i32c(3)),
+                    (n(7), i32c(42)),
+                    (
+                        n(8),
+                        Inst::ArrayMDStore {
+                            array: n(3),
+                            indices: alloc::vec![n(4), n(5), n(6)].into_boxed_slice(),
+                            value: n(7),
+                            element_size: 4,
+                        },
+                    ),
+                    (
+                        n(9),
+                        Inst::ArrayMDLoad {
+                            array: n(3),
+                            indices: alloc::vec![n(4), n(5), n(6)].into_boxed_slice(),
+                            element_size: 4,
+                            signed: false,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(n(9)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&main).is_ok());
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "lamella_gc_alloc" && !s.defined),
+            "AllocArrayMD lowers to a lamella_gc_alloc call on the object path"
         );
     }
 

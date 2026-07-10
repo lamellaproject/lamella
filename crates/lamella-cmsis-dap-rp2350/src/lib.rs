@@ -34,6 +34,13 @@ const STAGE_MAX: usize = 320 * 1024;
 const CALL_SP: u32 = 0x2008_0000;
 const CALL_TRAP: u32 = 0x2000_0000;
 
+/// Boot-RAM BOOTLOCK1 = the bootrom's `LOCK_FLASH_OP` (datasheet 5.4.4 + the boot-RAM register
+/// map): read to claim (returns `1 << 1` on success, 0 if already claimed), write to unclaim.
+/// A firmware built with SDK-style bootrom locking claims `LOCK_ENABLE` (BOOTLOCK7), and boot
+/// RAM SURVIVES `SYSRESETREQ` -- so after such a firmware has run once, every `flash_op`
+/// without this lock answers `BOOTROM_ERROR_LOCK_REQUIRED` (-19), debugger included.
+const BOOTLOCK_FLASH_OP: u32 = 0x400e_0810;
+
 const DEMCR: u32 = 0xe000_edfc;
 const DEMCR_TRCENA: u32 = 1 << 24;
 const DEMCR_VC_CORERESET: u32 = 1 << 0;
@@ -46,8 +53,15 @@ const DHCSR_DEBUGEN: u32 = 0xa05f_0001;
 /// is already awake), give the probe a WAIT-retry budget, and select the core-0 MEM-AP.
 pub fn connect<T: Transport>(dap: &mut Dap<T>) -> Result<u32, DapError> {
     dap.connect_swd_from_dormant()?;
-    let idcode = dap.read_idcode()?;
     dap.configure_transfers(0, 64, 0)?;
+    let idcode = match dap.read_idcode() {
+        Ok(idcode) => idcode,
+        Err(DapError::Ack(_)) => {
+            dap.abort_stalled_transaction()?;
+            dap.read_idcode()?
+        }
+        Err(error) => return Err(error),
+    };
     dap.init_mem_select(CORE0_MEM_AP_SELECT)?;
     Ok(idcode)
 }
@@ -139,8 +153,8 @@ pub fn flash_image<T: Transport>(
     image: &[u8],
     mut log: impl FnMut(&str),
 ) -> Result<(), DapError> {
-    if image.is_empty() || image.len() > STAGE_MAX {
-        return Err(DapError::Timeout("image empty or beyond the staging window"));
+    if image.is_empty() {
+        return Err(DapError::Timeout("image empty"));
     }
 
     log("reset-halt into the secure boot context...");
@@ -153,6 +167,11 @@ pub fn flash_image<T: Transport>(
     let flash_op = rom_function(dap, b'F', b'O')?;
     let flash_flush_cache = rom_function(dap, b'F', b'C')?;
 
+    if dap.read_word(BOOTLOCK_FLASH_OP)? == 0 {
+        dap.write_word(BOOTLOCK_FLASH_OP, 0)?;
+        let _ = dap.read_word(BOOTLOCK_FLASH_OP)?;
+    }
+
     let mut words: Vec<u32> = image
         .chunks(4)
         .map(|c| {
@@ -162,8 +181,6 @@ pub fn flash_image<T: Transport>(
         })
         .collect();
     words.resize(image.len().div_ceil(PAGE_BYTES) * (PAGE_BYTES / 4), 0xFFFF_FFFF);
-    log(&format!("staging {} bytes ({} words) at {STAGE_BASE:#010x}...", image.len(), words.len()));
-    dap.write_words(STAGE_BASE, &words)?;
 
     let frame = CallFrame::new(CALL_SP, CALL_TRAP);
     let slow = CallFrame { poll_tries: 100_000, ..frame };
@@ -179,18 +196,32 @@ pub fn flash_image<T: Transport>(
         &slow,
     )?;
     if status != 0 {
+        log(&format!("flash_op erase status = {} ({status:#010x})", status as i32));
         return Err(DapError::Timeout("flash_op erase returned an error status"));
     }
 
-    let program_len = (words.len() * 4) as u32;
-    log(&format!("flash_op PROGRAM {program_len} bytes..."));
-    let status = dap.call_target(
-        u32::from(flash_op),
-        &[CFLASH_SECURE | CFLASH_OP_PROGRAM, XIP_BASE, program_len, STAGE_BASE],
-        &slow,
-    )?;
-    if status != 0 {
-        return Err(DapError::Timeout("flash_op program returned an error status"));
+    let stage_words = STAGE_MAX / 4;
+    for (index, slice) in words.chunks(stage_words).enumerate() {
+        let offset = (index * STAGE_MAX) as u32;
+        log(&format!(
+            "staging {} bytes at {STAGE_BASE:#010x}, flash_op PROGRAM at +{offset:#x}...",
+            slice.len() * 4
+        ));
+        dap.write_words(STAGE_BASE, slice)?;
+        let status = dap.call_target(
+            u32::from(flash_op),
+            &[
+                CFLASH_SECURE | CFLASH_OP_PROGRAM,
+                XIP_BASE + offset,
+                (slice.len() * 4) as u32,
+                STAGE_BASE,
+            ],
+            &slow,
+        )?;
+        if status != 0 {
+            log(&format!("flash_op program status = {} ({status:#010x})", status as i32));
+            return Err(DapError::Timeout("flash_op program returned an error status"));
+        }
     }
 
     dap.call_target(u32::from(flash_flush_cache), &[], &frame)?;
@@ -202,6 +233,7 @@ pub fn flash_image<T: Transport>(
         return Err(DapError::Timeout("flash verify mismatch"));
     }
 
+    dap.write_word(BOOTLOCK_FLASH_OP, 0)?;
     log("flashed + verified; resetting to boot the image.");
     dap.reset_and_run()?;
     Ok(())

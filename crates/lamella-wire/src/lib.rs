@@ -440,6 +440,8 @@ pub mod board_model {
     pub const STM32L476: u16 = 8;
     /// Arduino MKR1000 (SAMD21G18A host MCU + WINC1500).
     pub const MKR1000: u16 = 9;
+    /// Raspberry Pi Pico 2 W (RP2350 + CYW43439 WiFi).
+    pub const PICO2_W: u16 = 10;
 }
 
 /// The target's `HELLO_ACK`: the negotiated version + the target's capabilities, optionally

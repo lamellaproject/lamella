@@ -68,12 +68,15 @@ string-utf8 = []
 # the tiny-target floor) => those three opcodes trap cleanly; they are vanishingly rare in
 # C# 1.0 (low-level reflection / C variadic interop). A capability-profile knob.
 typed-references = []
-# Varargs (the arglist opcode / __arglist): pushes a RuntimeArgumentHandle for the current
-# method's vararg arguments. Off (the default) => arglist traps. SHELL ONLY: the full vararg
-# ecosystem -- the vararg calling convention (extra args beyond the fixed params at a call
-# site) and the System.ArgIterator BCL type that walks the handle via TypedReference -- is a
-# follow-up, so the handle this pushes is a placeholder no ArgIterator yet consumes. Implies
-# typed-references (an ArgIterator iterates the handle as TypedReferences). A capability knob.
+# Varargs (the arglist opcode / __arglist): the full CLI vararg system. Off (the default, the
+# tiny-target floor) => arglist traps. On => the vararg calling convention (a call site passes the
+# variable arguments beyond the fixed params, recorded as the callee frame's variadic region), the
+# arglist opcode builds a RuntimeArgumentHandle (an array of TypedReferences into those arg slots),
+# and the System.ArgIterator BCL type walks it via the arg_iterator_* intrinsics -- a csc-compiled
+# __arglist/ArgIterator program runs end to end (proven by run-with-corlib --features varargs).
+# Implies typed-references (an ArgIterator iterates the handle as TypedReferences). A capability
+# knob. (Note: lcsc does not yet PARSE __arglist -- that is a separate compiler csc-ism; the RUNTIME
+# executes it.)
 varargs = ["typed-references"]
 # The floating-point transcendentals (Math.Sqrt/Sin/Cos/Tan/Pow/Log/Log10/Exp), backed by the
 # `libm` crate. A floating-point knob: off => they bind nothing and libm is not compiled (the

@@ -45,6 +45,9 @@ pub enum SpiError {
     BadState(u8),
     /// No data-packet header (start nibble 4'b1111) arrived within the retry budget.
     NoDataHeader { last: u8 },
+    /// A module-side operation (a flash-controller transfer, a program/erase) never
+    /// reported done within its poll budget.
+    Timeout,
 }
 
 /// CRC7 over `bytes` with polynomial G(x) = x^7 + x^3 + 1 and seed 0x7F (SDG 17.1.1), bitwise --
