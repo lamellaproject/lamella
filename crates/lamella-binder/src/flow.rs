@@ -920,6 +920,50 @@ fn switch_jump_targets(sections: &[BoundSwitchSection]) -> BTreeSet<usize> {
     targets
 }
 
+/// Which `switch` sections are statically reachable when the governing value is a compile-time
+/// constant (clause 12, 15.7): the section the constant selects (its `case`, else the `default`),
+/// plus every section a `goto case`/`goto default` targets. `None` means the value is not a
+/// constant, so every section is reachable. A returned `Some(v)` has one entry per section, in
+/// order; `v[i] == false` marks section `i` unreachable. Definite assignment drops an unreachable
+/// section from its intersection (its assignments cannot count), and debug emission gives it
+/// hidden sequence points (a debugger steps over its dead statements, as csc does) -- both read
+/// this one computation so the two agree on exactly which sections a constant switch can enter.
+#[must_use]
+pub fn switch_section_reachability(
+    expression: &BoundExpr,
+    sections: &[BoundSwitchSection],
+) -> Option<Vec<bool>> {
+    let value = constant_int_value(expression)?;
+    let has_default = sections
+        .iter()
+        .any(|section| section.labels.contains(&BoundSwitchLabel::Default));
+    let entry = sections
+        .iter()
+        .position(|section| {
+            section
+                .labels
+                .iter()
+                .any(|label| matches!(label, BoundSwitchLabel::Case(v) if *v == value))
+        })
+        .or_else(|| {
+            has_default.then(|| {
+                sections
+                    .iter()
+                    .position(|section| section.labels.contains(&BoundSwitchLabel::Default))
+                    .expect("has_default")
+            })
+        });
+    Some(match entry {
+        None => alloc::vec![false; sections.len()],
+        Some(entry) => {
+            let targets = switch_jump_targets(sections);
+            (0..sections.len())
+                .map(|index| index == entry || targets.contains(&index))
+                .collect()
+        }
+    })
+}
+
 /// Reports `CS0165` for every read of a local that is not definitely assigned on
 /// all paths to it (clause 12, Annex A). `parameters` start definitely assigned.
 /// `model` distinguishes a struct (whose field assignment assigns the local) from a
@@ -1128,34 +1172,7 @@ impl Analyzer<'_> {
                 let has_default = sections
                     .iter()
                     .any(|section| section.labels.contains(&BoundSwitchLabel::Default));
-                let reachable: Option<Vec<bool>> = constant_int_value(expression).map(|value| {
-                    let entry = sections
-                        .iter()
-                        .position(|section| {
-                            section.labels.iter().any(
-                                |label| matches!(label, BoundSwitchLabel::Case(v) if *v == value),
-                            )
-                        })
-                        .or_else(|| {
-                            has_default.then(|| {
-                                sections
-                                    .iter()
-                                    .position(|section| {
-                                        section.labels.contains(&BoundSwitchLabel::Default)
-                                    })
-                                    .expect("has_default")
-                            })
-                        });
-                    match entry {
-                        None => alloc::vec![false; sections.len()],
-                        Some(entry) => {
-                            let targets = switch_jump_targets(sections);
-                            (0..sections.len())
-                                .map(|index| index == entry || targets.contains(&index))
-                                .collect()
-                        }
-                    }
-                });
+                let reachable = switch_section_reachability(expression, sections);
                 self.break_frames.push(Vec::new());
                 let mut after = Flow::Exits;
                 for (index, section) in sections.iter().enumerate() {

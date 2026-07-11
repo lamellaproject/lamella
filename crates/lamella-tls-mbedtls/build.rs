@@ -72,7 +72,10 @@ fn main() {
             let mut paths = vec![bin_dir.to_path_buf()];
             paths.extend(std::env::split_paths(&existing));
             let joined = std::env::join_paths(paths).expect("PATH entries join");
-            unsafe { std::env::set_var("PATH", joined) };
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var("PATH", joined)
+            };
         }
         let ar = gcc.with_file_name(
             gcc.file_name()

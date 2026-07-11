@@ -1027,16 +1027,14 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                 let field_ty = binder.canonicalize(&bind_type(ty));
                 let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
                 for declarator in declarators {
-                    let is_candidate = !field_ty.is_void()
+                    let is_candidate = !is_const
+                        && !field_ty.is_void()
                         && declarator.name != declaration.name
                         && binder
                             .model()
                             .get_by_symbol(&enclosing)
                             .and_then(|info| info.find_field(&declarator.name))
-                            .is_some_and(|field| {
-                                field.accessibility == Accessibility::Private
-                                    && field.constant.is_none()
-                            });
+                            .is_some_and(|field| field.accessibility == Accessibility::Private);
                     if is_candidate {
                         let eligible_never_used = !is_const
                             && type_is_resolvable(binder.model(), &field_ty)
@@ -1091,9 +1089,104 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
         TypeKind::Struct => binder.check_struct_layout_cycle(&enclosing, declaration),
         _ => {}
     }
+    check_constant_cycles(binder, declaration);
     binder.check_interface_implementations(&enclosing, declaration);
     binder.check_overrides_have_base(&enclosing, declaration);
     binder.check_abstract_implementations(&enclosing, declaration);
+}
+
+/// CS0110: reports a const field whose value evaluation is circular. The declaration-order fold
+/// (`const_field_literal`) leaves a cyclic const unresolved rather than looping the compiler, so
+/// the cycle is found here from the const-reference graph: each const's initializer contributes an
+/// edge to every same-type const it names, and a const that reaches itself is circular. One
+/// diagnostic is emitted per cycle, at its earliest-declared member (matching csc).
+fn check_constant_cycles(binder: &mut Binder, declaration: &TypeDecl) {
+    use alloc::collections::{BTreeMap, BTreeSet};
+    let mut const_names: BTreeSet<Box<str>> = BTreeSet::new();
+    for member in &declaration.members {
+        if let Member::Field {
+            modifiers,
+            declarators,
+            ..
+        } = member
+        {
+            if modifiers.iter().any(|m| matches!(m, Modifier::Const)) {
+                for declarator in declarators {
+                    const_names.insert(declarator.name.clone());
+                }
+            }
+        }
+    }
+    if const_names.is_empty() {
+        return;
+    }
+    let mut edges: BTreeMap<Box<str>, Vec<Box<str>>> = BTreeMap::new();
+    let mut order: Vec<(Box<str>, Span)> = Vec::new();
+    for member in &declaration.members {
+        if let Member::Field {
+            modifiers,
+            declarators,
+            ..
+        } = member
+        {
+            if !modifiers.iter().any(|m| matches!(m, Modifier::Const)) {
+                continue;
+            }
+            for declarator in declarators {
+                let mut refs = Vec::new();
+                if let Some(init) = &declarator.initializer {
+                    crate::declaration::const_expr_references(init, &mut refs);
+                }
+                refs.retain(|name| const_names.contains(name));
+                edges.insert(declarator.name.clone(), refs);
+                order.push((declarator.name.clone(), declarator.span));
+            }
+        }
+    }
+    fn reaches(
+        from: &str,
+        to: &str,
+        edges: &BTreeMap<Box<str>, Vec<Box<str>>>,
+        visited: &mut BTreeSet<Box<str>>,
+    ) -> bool {
+        let Some(deps) = edges.get(from) else {
+            return false;
+        };
+        for dep in deps {
+            if dep.as_ref() == to {
+                return true;
+            }
+            if visited.insert(dep.clone()) && reaches(dep, to, edges, visited) {
+                return true;
+            }
+        }
+        false
+    }
+    let mut reported: BTreeSet<Box<str>> = BTreeSet::new();
+    for (name, span) in &order {
+        if reported.contains(name) {
+            continue;
+        }
+        let mut seen = BTreeSet::new();
+        if !reaches(name, name, &edges, &mut seen) {
+            continue;
+        }
+        binder.report(Diagnostic::new(
+            DiagnosticKind::CircularConstant {
+                member: alloc::format!("{}.{}", declaration.name, name).into(),
+            },
+            *span,
+        ));
+        for (other, _) in &order {
+            let mut forward = BTreeSet::new();
+            let mut backward = BTreeSet::new();
+            if reaches(name, other, &edges, &mut forward)
+                && reaches(other, name, &edges, &mut backward)
+            {
+                reported.insert(other.clone());
+            }
+        }
+    }
 }
 
 /// The accessor method name (`get_Name` / `set_Name`), for diagnostics.
@@ -1714,6 +1807,28 @@ mod tests {
     }
 
     #[test]
+    fn circular_constants_are_cs0110_once_per_cycle() {
+        assert_eq!(
+            sorted_codes("class C { const int A = B; const int B = A; }"),
+            [110]
+        );
+        assert_eq!(sorted_codes("class C { const int A = A; }"), [110]);
+        assert_eq!(
+            sorted_codes("class C { const int A = B; const int B = D; const int D = A; }"),
+            [110]
+        );
+        assert_eq!(
+            sorted_codes("class C { const int B = A; const int A = 5; }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("class C { const int A = 5; const int B = A + 1; }"),
+            []
+        );
+        assert_eq!(sorted_codes("class C { const int Unused = 7; }"), []);
+    }
+
+    #[test]
     fn static_member_through_explicit_this_is_cs0176() {
         assert_eq!(
             sorted_codes("class C { static int P { get { return 0; } } int M() { return this.P; } }"),
@@ -1726,6 +1841,25 @@ mod tests {
         assert_eq!(
             sorted_codes("class C { static int P { get { return 0; } } int M() { return P; } }"),
             []
+        );
+        assert_eq!(
+            sorted_codes("class C { static int S() { return 0; } int M() { return this.S(); } }"),
+            [176]
+        );
+        assert_eq!(
+            sorted_codes("class C { static int S() { return 0; } int M() { return S(); } }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes("class C { int I() { return 0; } int M() { return this.I(); } }"),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "class B { public static int S() { return 0; } } \
+                 class C : B { int M() { return base.S(); } }"
+            ),
+            [176]
         );
     }
 

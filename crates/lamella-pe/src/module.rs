@@ -1,7 +1,7 @@
 //! Assembling a managed module: the orchestration over heaps, tables, and the PE.
 
 use crate::heap::{BlobHeapBuilder, GuidHeapBuilder, StringHeapBuilder, UserStringHeapBuilder};
-use crate::pdb::{MethodDebug, build_portable_pdb};
+use crate::pdb::{DebugDocument, MethodDebug, build_portable_pdb};
 use crate::pe::{
     CLI_HEADER_SIZE, COMIMAGE_FLAGS_ILONLY, TEXT_RVA, cli_header, write_image_with_debug,
 };
@@ -41,6 +41,16 @@ fn derive_pdb_id(module_name: &str) -> [u8; 20] {
     id
 }
 
+/// A 16-byte RFC 4122 version-4 GUID whose payload is `bytes[..16]` -- the version and
+/// variant nibbles set (at the .NET GUID byte positions) so it is a well-formed GUID, as
+/// csc's deterministic MVID/debug ids are, with the rest content-derived.
+fn guid_from(bytes: &[u8; 16]) -> [u8; 16] {
+    let mut g = *bytes;
+    g[7] = (g[7] & 0x0f) | 0x40;
+    g[8] = (g[8] & 0x3f) | 0x80;
+    g
+}
+
 /// Assembles a single managed module into a PE image.
 pub struct ImageBuilder {
     strings: StringHeapBuilder,
@@ -63,6 +73,9 @@ pub struct ImageBuilder {
     method_debug: Vec<MethodDebug>,
     /// The debug id shared by this image's PDB and its (eventual) debug directory.
     pdb_id: [u8; 20],
+    /// The `#GUID` heap index of the module's MVID, so [`ImageBuilder::set_content_id`]
+    /// can fill it once the content it is derived from is known.
+    mvid: u32,
 }
 
 impl ImageBuilder {
@@ -83,9 +96,11 @@ impl ImageBuilder {
             object_ctor: None,
             method_debug: Vec::new(),
             pdb_id: derive_pdb_id(module_name),
+            mvid: 0,
         };
 
         let mvid = builder.guids.add([0; 16]);
+        builder.mvid = mvid;
         let module = builder.strings.intern(module_name);
         builder.tables.add_row(
             table::MODULE,
@@ -486,6 +501,7 @@ impl ImageBuilder {
             local_signature: 0,
             locals: Vec::new(),
             scope_length: 0,
+            document: 0,
         });
         Token::new(table::METHOD_DEF, row)
     }
@@ -562,6 +578,7 @@ impl ImageBuilder {
             local_signature: 0,
             locals: Vec::new(),
             scope_length: 0,
+            document: 0,
         });
         Token::new(table::METHOD_DEF, row)
     }
@@ -653,11 +670,29 @@ impl ImageBuilder {
         self.pdb_id
     }
 
+    /// Re-derives the module MVID and the 20-byte debug id (the `#Pdb` id + the PE
+    /// CodeView GUID, which stay equal) from a SHA-256 of `content`, so each build is
+    /// uniquely identifiable instead of keyed on the module name (the FNV fallback) with a
+    /// zero MVID -- a debugger then never binds a stale PDB to a rebuilt binary. The MVID
+    /// and the debug GUID take distinct halves of the 32-byte digest. Call before `finish`.
+    pub fn set_content_id(&mut self, content: &[u8]) {
+        let digest = crate::sha256::sha256(content);
+        let (mvid_bytes, id_bytes) = digest.split_at(16);
+        self.guids.set(
+            self.mvid,
+            guid_from(mvid_bytes.try_into().expect("16 bytes")),
+        );
+        self.pdb_id[..16].copy_from_slice(&guid_from(id_bytes.try_into().expect("16 bytes")));
+        self.pdb_id[16..].copy_from_slice(&1u32.to_le_bytes());
+    }
+
     /// Builds the standalone Portable PDB for this image's methods, attributing them
-    /// to `document_path` and recording `entry_point` (0 for a library).
+    /// to their source files in `documents` (each method's `document` indexes this
+    /// list; each document carries its source hash) and recording `entry_point` (0 for
+    /// a library).
     #[must_use]
-    pub fn build_pdb(&self, document_path: &str, entry_point: Token) -> Vec<u8> {
-        build_portable_pdb(document_path, &self.method_debug, entry_point, self.pdb_id)
+    pub fn build_pdb(&self, documents: &[DebugDocument], entry_point: Token) -> Vec<u8> {
+        build_portable_pdb(documents, &self.method_debug, entry_point, self.pdb_id)
     }
 
     /// Serializes the module to a PE image, naming `entry_point` (a `MethodDef`
@@ -753,6 +788,21 @@ mod tests {
     }
 
     #[test]
+    fn content_id_is_deterministic_content_sensitive_and_well_formed() {
+        let id = |content: &[u8]| {
+            let mut builder = ImageBuilder::new("m", "a");
+            builder.set_content_id(content);
+            builder.pdb_id()
+        };
+        assert_eq!(id(b"alpha"), id(b"alpha"));
+        assert_ne!(id(b"alpha"), id(b"beta"));
+        assert_ne!(id(b"alpha"), ImageBuilder::new("m", "a").pdb_id());
+        let guid = id(b"alpha");
+        assert_eq!(guid[7] & 0xf0, 0x40, "version 4");
+        assert_eq!(guid[8] & 0xc0, 0x80, "variant 10xx");
+    }
+
+    #[test]
     fn build_pdb_carries_the_methods_and_shared_id() {
         let mut builder = ImageBuilder::new("test.dll", "test");
         let object = builder.object_type();
@@ -770,14 +820,19 @@ mod tests {
                     start_column: 1,
                     end_line: 1,
                     end_column: 2,
+                    is_hidden: false,
                 }],
                 local_signature: 0,
                 locals: Vec::new(),
                 scope_length: 0,
+                document: 1,
             },
         );
 
-        let pdb = builder.build_pdb("App.cs", main);
+        let pdb = builder.build_pdb(
+            &[crate::pdb::DebugDocument { path: "App.cs", source: "" }],
+            main,
+        );
         assert_eq!(&pdb[0..4], b"BSJB");
         assert!(pdb.windows(20).any(|window| window == builder.pdb_id()));
     }

@@ -14,7 +14,7 @@ namespace System.Net.Security
     class SslStream : Stream
     {
         private const int TlsBufferSize = 16640;
-        private const int PeerCertBufferSize = 8192;
+        private const int PeerCertBufferSize = 2048;
         private int _stack;
         private const int VerifySystemRoots = 0;
         private const int VerifyAcceptAny = 2;

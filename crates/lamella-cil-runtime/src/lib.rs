@@ -7,6 +7,7 @@ extern crate alloc;
 
 #[cfg(feature = "exceptions")]
 pub mod exception;
+pub mod fs;
 pub mod interp;
 #[cfg(feature = "bcl")]
 pub mod intrinsic_registry;
@@ -15,6 +16,7 @@ pub mod memory;
 pub mod module;
 pub mod net;
 pub mod object;
+pub mod reactor;
 pub mod tls;
 pub mod trap;
 pub mod value;
@@ -26,8 +28,8 @@ pub use interp::{
     StopReason, Vm, run, run_method,
 };
 pub use module::{
-    IntrinsicFn, Method, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget, TypeId,
-    baked_image_checksum,
+    CastElem, CastPrim, IntrinsicFn, Method, MethodId, Module, PInvokeParam, PInvokeReturn,
+    PInvokeTarget, TypeId, asm_key, baked_image_checksum,
 };
 pub use object::{ArrayStorage, Heap, Object, ObjectRef, PrimKind};
 pub use trap::Trap;

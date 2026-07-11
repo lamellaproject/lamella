@@ -287,17 +287,19 @@ fn decode_sequence_points(blob: &[u8]) -> Vec<SequencePoint> {
     let mut il_offset = 0u32;
     let mut line = 0u32;
     let mut column = 0u32;
-    let mut first = true;
+    let mut first_record = true;
+    let mut first_position = true;
     while !rest.is_empty() {
         let Ok((delta_il, n)) = read_compressed_u32(rest) else {
             break;
         };
         rest = &rest[n..];
-        il_offset = if first {
+        il_offset = if first_record {
             delta_il
         } else {
             il_offset + delta_il
         };
+        first_record = false;
 
         let Ok((delta_lines, n)) = read_compressed_u32(rest) else {
             break;
@@ -326,11 +328,10 @@ fn decode_sequence_points(blob: &[u8]) -> Vec<SequencePoint> {
                 end_column: 0,
                 is_hidden: true,
             });
-            first = false;
             continue;
         }
 
-        let (start_line, start_column) = if first {
+        let (start_line, start_column) = if first_position {
             let Ok((sl, n)) = read_compressed_u32(rest) else {
                 break;
             };
@@ -353,7 +354,7 @@ fn decode_sequence_points(blob: &[u8]) -> Vec<SequencePoint> {
         };
         line = start_line;
         column = start_column;
-        first = false;
+        first_position = false;
         points.push(SequencePoint {
             il_offset,
             start_line,
@@ -398,5 +399,21 @@ mod tests {
         assert_eq!(points[1].start_line, 4);
         assert_eq!(points[1].start_column, 5);
         assert_eq!(points[1].end_column, 6);
+    }
+
+    #[test]
+    fn decodes_a_hidden_point_without_moving_the_position_base() {
+        let blob = [
+            0x01, 0x00, 0x00, 0x10, 0x05, 0x09, 0x04, 0x00, 0x00, 0x04, 0x00, 0x0B, 0x02, 0x00,
+        ];
+        let points = decode_sequence_points(&blob);
+        assert_eq!(points.len(), 3);
+        assert_eq!((points[0].start_line, points[0].is_hidden), (5, false));
+        assert_eq!((points[1].il_offset, points[1].is_hidden), (4, true));
+        assert!(!points[2].is_hidden);
+        assert_eq!(points[2].il_offset, 8);
+        assert_eq!(points[2].start_line, 6);
+        assert_eq!(points[2].start_column, 9);
+        assert_eq!(points[2].end_column, 20);
     }
 }

@@ -17,8 +17,10 @@ use lamella_syntax::span::Span;
 use lamella_token::Token;
 
 /// A statement's first instruction index paired with its source span -- the raw
-/// material the debug-info writer turns into a source-line mapping.
-pub type SequencePoint = (u32, Span);
+/// material the debug-info writer turns into a source-line mapping. `None` for the
+/// span marks a HIDDEN point: synthesized IL with no source, which a debugger steps
+/// over (a `using`/`lock` disposal, other compiler-generated code).
+pub type SequencePoint = (u32, Option<Span>);
 
 /// A method body's emitted CIL plus what later stages need from it: the local
 /// types (for the local-variable signature) and the sequence points, which the
@@ -59,7 +61,7 @@ struct Epilogue {
 /// Tracks branch labels (backpatched once known) and the sequence points recorded
 /// at statement boundaries during emission.
 #[derive(Default)]
-struct Labels {
+struct Labels<'a> {
     positions: Vec<Option<u32>>,
     pending: Vec<(usize, usize)>,
     loops: Vec<LoopContext>,
@@ -72,6 +74,15 @@ struct Labels {
     /// The enclosing `switch` statements (innermost last), so `goto case`/`goto default`
     /// can branch to a sibling section's label.
     switches: Vec<SwitchContext>,
+    /// True while emitting a synthesized `finally` (a using/lock disposal): its
+    /// statements become hidden sequence points a debugger steps over.
+    hidden_region: bool,
+    /// The UTF-8 source bytes in a debug build, else `None` for a release build. A
+    /// block's `{`/`}` step points emit only when its span starts at a real `{` here,
+    /// which tells a user-written block apart from a compiler desugaring (a `using`/
+    /// `lock`/`foreach` wrapper block carries the whole statement's span, so it starts
+    /// at the keyword, not a brace).
+    source: Option<&'a [u8]>,
 }
 
 /// A `switch` being emitted: each case value's section label (integral and string),
@@ -82,7 +93,7 @@ struct SwitchContext {
     default: Option<usize>,
 }
 
-impl Labels {
+impl Labels<'_> {
     fn label(&mut self) -> usize {
         self.positions.push(None);
         self.positions.len() - 1
@@ -194,6 +205,7 @@ pub fn emit_method(
         body,
         &TypeSymbol::Special(SpecialType::Void),
         None,
+        None,
     )?
     .0)
 }
@@ -204,6 +216,10 @@ pub fn emit_method(
 pub struct ConstructorPrologue {
     /// The target `.ctor` token (a sibling, the base, or System.Object's).
     pub ctor: Token,
+    /// The `: base(...)` / `: this(...)` initializer's span, for a debug build's
+    /// sequence point on it (a breakpoint on the chain call). `None` for an implicit or
+    /// synthesized base call, which carries no source.
+    pub span: Option<Span>,
     /// The bound chain arguments, in order.
     pub arguments: Vec<BoundExpr>,
     /// How many leading statements of the body -- the instance field initializers
@@ -218,7 +234,9 @@ pub struct ConstructorPrologue {
 /// sequence points (for debug info). `tokens` resolves members; `arg_base` is 1 for
 /// an instance method (argument 0 is `this`), else 0; `return_type` is the method's
 /// return type, for the epilogue a `try` needs. `prologue` is the constructor chain
-/// call, if any.
+/// call, if any. `source` is the UTF-8 source bytes in a debug build (else `None`),
+/// which drives the `{`/`}` brace step points a debugger stops on for every real user
+/// block; a release build passes `None` and stays lean.
 pub fn emit_body(
     parameters: &[Box<str>],
     byref_params: &[(Box<str>, TypeSymbol)],
@@ -227,9 +245,10 @@ pub fn emit_body(
     arg_base: u16,
     return_type: &TypeSymbol,
     prologue: Option<&ConstructorPrologue>,
+    source: Option<&[u8]>,
 ) -> Result<EmittedBody, EmitError> {
     let mut frame = Frame::build(parameters, byref_params, body, arg_base);
-    let lowered = lower(&mut frame, tokens, body, return_type, prologue)?;
+    let lowered = lower(&mut frame, tokens, body, return_type, prologue, source)?;
     Ok(EmittedBody {
         code: lowered.0,
         local_types: frame.local_types(),
@@ -250,9 +269,16 @@ fn lower(
     body: &BoundStmt,
     return_type: &TypeSymbol,
     prologue: Option<&ConstructorPrologue>,
+    source: Option<&[u8]>,
 ) -> Result<Lowered, EmitError> {
-    let mut labels = Labels::default();
-    if contains_try(body) {
+    let mut labels = Labels {
+        source,
+        ..Labels::default()
+    };
+    let method_braces = source.is_some_and(|s| s.get(body.span.start as usize) == Some(&b'{'));
+    let reaches_epilogue =
+        method_braces && (completes_normally(body) || contains_return(body));
+    if contains_try(body) || method_braces {
         let return_slot = if matches!(return_type, TypeSymbol::Special(SpecialType::Void)) {
             None
         } else {
@@ -263,6 +289,12 @@ fn lower(
     }
 
     let mut out = Vec::new();
+    let push_open_brace = |labels: &mut Labels<'_>, out: &mut Vec<Instruction>| {
+        if method_braces {
+            labels.points.push((out.len() as u32, Some(open_brace_span(body))));
+            out.push(Instruction::simple(Opcode::Nop));
+        }
+    };
     match prologue {
         Some(prologue) if prologue.leading_body > 0 => {
             if let BoundStmtKind::Block(statements) = &body.kind {
@@ -270,24 +302,34 @@ fn lower(
                 for statement in &statements[..split] {
                     emit_statement(statement, frame, tokens, &mut labels, &mut out)?;
                 }
-                emit_prologue(prologue, frame, tokens, &mut out)?;
+                emit_prologue(prologue, frame, tokens, &mut labels, &mut out)?;
+                push_open_brace(&mut labels, &mut out);
                 for statement in &statements[split..] {
                     emit_statement(statement, frame, tokens, &mut labels, &mut out)?;
                 }
             } else {
-                emit_prologue(prologue, frame, tokens, &mut out)?;
+                emit_prologue(prologue, frame, tokens, &mut labels, &mut out)?;
+                push_open_brace(&mut labels, &mut out);
                 emit_statement(body, frame, tokens, &mut labels, &mut out)?;
             }
         }
         Some(prologue) => {
-            emit_prologue(prologue, frame, tokens, &mut out)?;
-            emit_statement(body, frame, tokens, &mut labels, &mut out)?;
+            emit_prologue(prologue, frame, tokens, &mut labels, &mut out)?;
+            push_open_brace(&mut labels, &mut out);
+            emit_body_statements(body, frame, tokens, &mut labels, &mut out)?;
         }
-        None => emit_statement(body, frame, tokens, &mut labels, &mut out)?,
+        None => {
+            push_open_brace(&mut labels, &mut out);
+            emit_body_statements(body, frame, tokens, &mut labels, &mut out)?;
+        }
     }
 
     if let Some(Epilogue { label, return_slot }) = labels.epilogue {
         labels.place(label, &out);
+        if reaches_epilogue {
+            labels.points.push((out.len() as u32, Some(close_brace_span(body))));
+            out.push(Instruction::simple(Opcode::Nop));
+        }
         if let Some(slot) = return_slot {
             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
         }
@@ -303,20 +345,58 @@ fn lower(
     Ok((out, labels.points, labels.handlers))
 }
 
+/// Emits a method body's statements directly, WITHOUT the block-brace points the
+/// [`emit_statement`] `Block` arm adds: `lower` emits the method's own `{`/`}` around
+/// the prologue and epilogue, so the top-level body block must not be braced a second
+/// time. Its children emit one by one (a lone braceless statement emits as itself), so
+/// only NESTED blocks reach the brace-emitting arm.
+fn emit_body_statements(
+    body: &BoundStmt,
+    frame: &mut Frame,
+    tokens: &Tokens,
+    labels: &mut Labels<'_>,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    if let BoundStmtKind::Block(statements) = &body.kind {
+        for statement in statements {
+            emit_statement(statement, frame, tokens, labels, out)?;
+        }
+    } else {
+        emit_statement(body, frame, tokens, labels, out)?;
+    }
+    Ok(())
+}
+
 /// Emits a constructor's chain call `ldarg.0; <arguments>; call ctor` -- the invocation of
 /// the base or sibling constructor a prologue records (17.11).
 fn emit_prologue(
     prologue: &ConstructorPrologue,
     frame: &Frame,
     tokens: &Tokens,
+    labels: &mut Labels<'_>,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if let Some(span) = prologue.span {
+        labels.points.push((out.len() as u32, Some(span)));
+    }
     out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
     for argument in &prologue.arguments {
         crate::expr::emit_argument(argument, frame, tokens, out)?;
     }
     out.push(Instruction::new(Opcode::Call, Operand::Token(prologue.ctor)));
     Ok(())
+}
+
+/// The single-character span of a block's opening brace `{` -- a block span starts
+/// there (`parse_block`) -- for a debug build's brace sequence point.
+fn open_brace_span(block: &BoundStmt) -> Span {
+    Span::new(block.span.start, block.span.start + 1)
+}
+
+/// The single-character span of a block's closing brace `}` -- a block span ends just
+/// past it -- for a debug build's brace sequence point.
+fn close_brace_span(block: &BoundStmt) -> Span {
+    Span::new(block.span.end.saturating_sub(1), block.span.end)
 }
 
 /// Whether `stmt` contains a `try` anywhere, so the body needs a return epilogue.
@@ -345,21 +425,123 @@ fn contains_try(stmt: &BoundStmt) -> bool {
     }
 }
 
+/// Whether `stmt` contains a `return` anywhere. A method can reach its epilogue ret (and
+/// so its closing brace) by routing a `return` there even when its body never falls
+/// through, so a method that returns somewhere is braced while one that only throws is not.
+fn contains_return(stmt: &BoundStmt) -> bool {
+    use BoundStmtKind as Kind;
+    match &stmt.kind {
+        Kind::Return(_) => true,
+        Kind::Block(statements) => statements.iter().any(contains_return),
+        Kind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => contains_return(then_branch) || else_branch.as_deref().is_some_and(contains_return),
+        Kind::While { body, .. }
+        | Kind::DoWhile { body, .. }
+        | Kind::For { body, .. }
+        | Kind::ForEach { body, .. }
+        | Kind::Lock { body, .. }
+        | Kind::Using { body, .. }
+        | Kind::Fixed { body, .. }
+        | Kind::Labeled { body, .. } => contains_return(body),
+        Kind::Checked(inner) | Kind::Unchecked(inner) => contains_return(inner),
+        Kind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            contains_return(body)
+                || catches.iter().any(|catch| contains_return(&catch.body))
+                || finally.as_deref().is_some_and(contains_return)
+        }
+        Kind::Switch { sections, .. } => sections
+            .iter()
+            .any(|section| section.statements.iter().any(contains_return)),
+        _ => false,
+    }
+}
+
+/// Whether control can fall through the end of `stmt` -- C#'s reachable-end-point
+/// analysis (ECMA-334 8.1). A block's closing-brace step point is emitted only when its
+/// end is reachable this way: a block that ends by transferring control (a `break`,
+/// `continue`, `return`, `throw`, `goto`, an exhaustive `if`, or a `try`/`switch` whose
+/// every path diverts) has an unreachable `}`, which csc -- and so lcsc -- leaves
+/// unbraced. A loop is taken to complete, since its usual shape has a reachable exit (a
+/// never-completing `while (true)` without a `break` is a rare case this does not model,
+/// and at worst brackets a `}` csc omits -- it never drops one csc keeps).
+fn completes_normally(stmt: &BoundStmt) -> bool {
+    use BoundStmtKind as Kind;
+    match &stmt.kind {
+        Kind::Return(_)
+        | Kind::Throw(_)
+        | Kind::Break
+        | Kind::Continue
+        | Kind::Goto(_)
+        | Kind::GotoCase(_)
+        | Kind::GotoCaseString(_)
+        | Kind::GotoDefault => false,
+        Kind::Block(statements) => statements.iter().all(completes_normally),
+        Kind::If {
+            then_branch,
+            else_branch,
+            ..
+        } => else_branch.as_deref().is_none_or(|else_branch| {
+            completes_normally(then_branch) || completes_normally(else_branch)
+        }),
+        Kind::Checked(inner) | Kind::Unchecked(inner) => completes_normally(inner),
+        Kind::Labeled { body, .. }
+        | Kind::Lock { body, .. }
+        | Kind::Using { body, .. }
+        | Kind::Fixed { body, .. } => completes_normally(body),
+        Kind::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            finally.as_deref().is_none_or(completes_normally)
+                && (completes_normally(body)
+                    || catches.iter().any(|catch| completes_normally(&catch.body)))
+        }
+        Kind::Switch { .. } => !always_exits(stmt),
+        _ => true,
+    }
+}
+
 fn emit_statement(
     stmt: &BoundStmt,
     frame: &mut Frame,
     tokens: &Tokens,
-    labels: &mut Labels,
+    labels: &mut Labels<'_>,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     if !matches!(stmt.kind, BoundStmtKind::Block(_) | BoundStmtKind::Empty) {
-        labels.points.push((out.len() as u32, stmt.span));
+        let point = if labels.hidden_region || stmt.span.is_hidden() {
+            None
+        } else {
+            Some(stmt.span)
+        };
+        labels.points.push((out.len() as u32, point));
     }
     match &stmt.kind {
         BoundStmtKind::Empty => {}
         BoundStmtKind::Block(statements) => {
+            let braced = labels
+                .source
+                .is_some_and(|s| s.get(stmt.span.start as usize) == Some(&b'{'));
+            if braced {
+                let point = (!labels.hidden_region).then(|| open_brace_span(stmt));
+                labels.points.push((out.len() as u32, point));
+                out.push(Instruction::simple(Opcode::Nop));
+            }
             for statement in statements {
                 emit_statement(statement, frame, tokens, labels, out)?;
+            }
+            if braced && statements.iter().all(completes_normally) {
+                let point = (!labels.hidden_region).then(|| close_brace_span(stmt));
+                labels.points.push((out.len() as u32, point));
+                out.push(Instruction::simple(Opcode::Nop));
             }
         }
         BoundStmtKind::Local { declarators, .. } => {
@@ -640,11 +822,18 @@ fn emit_statement(
                 break_label: end,
                 is_switch: true,
             });
+            let reachability = lamella_binder::switch_section_reachability(expression, sections);
             for (index, section) in sections.iter().enumerate() {
                 labels.place(section_labels[index], out);
+                let unreachable = reachability
+                    .as_ref()
+                    .is_some_and(|reachable| !reachable[index]);
+                let saved_hidden = labels.hidden_region;
+                labels.hidden_region |= unreachable;
                 for statement in &section.statements {
                     emit_statement(statement, frame, tokens, labels, out)?;
                 }
+                labels.hidden_region = saved_hidden;
             }
             labels.loops.pop();
             labels.switches.pop();
@@ -794,7 +983,7 @@ fn emit_try(
     finally: Option<&BoundStmt>,
     frame: &mut Frame,
     tokens: &Tokens,
-    labels: &mut Labels,
+    labels: &mut Labels<'_>,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     let end = labels.label();
@@ -811,6 +1000,7 @@ fn emit_try(
 
     for catch in catches {
         let handler_start = out.len() as u32;
+        labels.points.push((handler_start, Some(catch.span)));
         match catch.name.as_deref().and_then(|name| frame.slot(name)) {
             Some(Slot::Local(slot)) => {
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
@@ -840,7 +1030,10 @@ fn emit_try(
 
     if let Some(finally) = finally {
         let handler_start = out.len() as u32;
+        let saved_hidden = labels.hidden_region;
+        labels.hidden_region |= finally.span.is_hidden();
         emit_statement(finally, frame, tokens, labels, out)?;
+        labels.hidden_region = saved_hidden;
         out.push(Instruction::simple(Opcode::Endfinally));
         labels.handlers.push(EhClause {
             try_range: InstructionRange {
@@ -866,7 +1059,7 @@ fn emit_if(
     else_branch: Option<&BoundStmt>,
     frame: &mut Frame,
     tokens: &Tokens,
-    labels: &mut Labels,
+    labels: &mut Labels<'_>,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     emit_expression(condition, frame, tokens, out)?;
@@ -901,7 +1094,7 @@ fn emit_for(
     body: &BoundStmt,
     frame: &mut Frame,
     tokens: &Tokens,
-    labels: &mut Labels,
+    labels: &mut Labels<'_>,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     for statement in initializer {
@@ -1560,8 +1753,8 @@ mod tests {
     fn emission_records_a_sequence_point_per_statement() {
         let body = parse_statement("{ int x = 1; return x; }").statement;
         let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
-        let emitted =
-            emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None).expect("should lower");
+        let emitted = emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None, None)
+            .expect("should lower");
 
         let offsets: Vec<u32> = emitted
             .sequence_points
@@ -1569,7 +1762,77 @@ mod tests {
             .map(|(offset, _)| *offset)
             .collect();
         assert_eq!(offsets, [0, 2]);
-        assert!(emitted.sequence_points[0].1.start < emitted.sequence_points[1].1.start);
+        assert!(
+            emitted.sequence_points[0].1.unwrap().start
+                < emitted.sequence_points[1].1.unwrap().start
+        );
+    }
+
+    #[test]
+    fn a_debug_build_brackets_the_method_with_brace_points() {
+        let source = "{ int x = 1; return x; }";
+        let body = parse_statement(source).statement;
+        let block_span = body.span;
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
+        let emitted =
+            emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+                .expect("should lower");
+
+        assert_eq!(emitted.code[0].opcode, Opcode::Nop);
+        let first = emitted.sequence_points.first().expect("an opening point");
+        assert_eq!(first.0, 0);
+        assert_eq!(first.1, Some(Span::new(block_span.start, block_span.start + 1)));
+        let last = emitted.sequence_points.last().expect("a closing point");
+        assert_eq!(last.1, Some(Span::new(block_span.end - 1, block_span.end)));
+        assert_eq!(emitted.code.last().unwrap().opcode, Opcode::Ret);
+    }
+
+    #[test]
+    fn an_always_throwing_method_omits_its_closing_brace() {
+        let source = "{ throw null; }";
+        let body = parse_statement(source).statement;
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
+        let emitted =
+            emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+                .expect("should lower");
+        let braced = |offset: u32| {
+            emitted
+                .sequence_points
+                .iter()
+                .any(|(_, span)| *span == Some(Span::new(offset, offset + 1)))
+        };
+        assert!(braced(0), "method `{{` should be a point");
+        assert!(
+            !braced(source.len() as u32 - 1),
+            "method `}}` must be omitted -- the epilogue ret is unreachable"
+        );
+    }
+
+    #[test]
+    fn nested_block_closes_its_brace_only_when_reachable() {
+        let source = "{ int a = 0; { int reachable = 1; } if (a > 0) { return 2; } return 0; }";
+        let body = parse_statement(source).statement;
+        let bound = Binder::new().bind_method(None, "M", int(), &[], &[], false, &body);
+        let emitted =
+            emit_body(&[], &[], &bound, &Tokens::new(), 0, &int(), None, Some(source.as_bytes()))
+                .expect("should lower");
+        let braced = |offset: u32| {
+            emitted
+                .sequence_points
+                .iter()
+                .any(|(_, span)| *span == Some(Span::new(offset, offset + 1)))
+        };
+        let bare_open = source.find("{ int reachable").unwrap() as u32;
+        let bare_close = source[..source.find(" if").unwrap()].rfind('}').unwrap() as u32;
+        assert!(braced(bare_open), "bare block `{{` should be a point");
+        assert!(braced(bare_close), "bare block `}}` should be a point");
+        let then_open = source.find("{ return").unwrap() as u32;
+        let then_close = source[..source.rfind("return 0").unwrap()].rfind('}').unwrap() as u32;
+        assert!(braced(then_open), "if-then block `{{` should be a point");
+        assert!(
+            !braced(then_close),
+            "if-then block `}}` is unreachable after `return` and must not be a point"
+        );
     }
 
     #[test]

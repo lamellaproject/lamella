@@ -695,3 +695,68 @@ impl<D: Device> NetBackend for SmoltcpNet<D> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// The AOT loopback tier's clock stand-in: every read advances one "millisecond"
+    /// (`lamella-runtime-support-net`'s `counting_now_ms`), so the in-op grace window
+    /// always makes progress in a bounded number of calls.
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+    fn counting_now_ms() -> u64 {
+        TICKS.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The scheduler-less single-thread loopback the AOT QEMU e2e runs
+    /// (`lamella_net_support_init_loopback`): smoltcp's in-memory device at 127.0.0.1/8,
+    /// the counting clock, and the 50 ms in-op grace.
+    fn loopback_net() -> SmoltcpNet<smoltcp::phy::Loopback> {
+        let device = smoltcp::phy::Loopback::new(smoltcp::phy::Medium::Ethernet);
+        let mut config = NetConfig::new(
+            [0x02, 0, 0, 0, 0, 0x01],
+            IpSetup::Static {
+                addr: [127, 0, 0, 1],
+                prefix_len: 8,
+                gateway: None,
+                dns: Vec::new(),
+            },
+        );
+        config.would_block_grace_ms = 50;
+        SmoltcpNet::new(device, config, counting_now_ms, 0x6c61_6d65_6c6c_6100)
+    }
+
+    /// Busy-retries `operation` like the managed poll loops (`Socket.cs` spins on the
+    /// WouldBlock sentinel), bounded so a stack that stops progressing fails the test
+    /// instead of hanging it.
+    fn busy_poll<T>(what: &str, mut operation: impl FnMut() -> NetResult<T>) -> T {
+        for _ in 0..10_000 {
+            match operation() {
+                NetResult::Ready(value) => return value,
+                NetResult::WouldBlock => {}
+                NetResult::Error => panic!("{what}: error"),
+            }
+        }
+        panic!("{what}: still would-block after 10000 retries");
+    }
+
+    /// The whole-managed-Socket QEMU e2e's exact shape, on the host: bind+listen,
+    /// connect, accept, `client.Send({40, 2})` -> `accepted.Receive(buf)` == 42's worth
+    /// of payload. One single-threaded stack; every wait is the seam's own in-op grace.
+    #[test]
+    fn loopback_moves_bytes_from_client_to_accepted_socket() {
+        let mut net = loopback_net();
+        let listener = busy_poll("listen", || net.tcp_listen(&[0, 0, 0, 0], 4242, 2));
+        let client = busy_poll("connect-start", || net.tcp_connect(&[127, 0, 0, 1], 4242));
+        busy_poll("connect", || net.connect_check(client));
+        let accepted = busy_poll("accept", || net.accept(listener));
+
+        let sent = busy_poll("send", || net.send(client, &[40, 2]));
+        assert_eq!(sent, 2, "the client queues the whole payload");
+        let mut buf = [0u8; 8];
+        let received = busy_poll("receive", || net.recv(accepted, &mut buf));
+        assert_eq!(received, 2, "the payload crosses the loopback");
+        assert_eq!(&buf[..2], &[40, 2]);
+    }
+}

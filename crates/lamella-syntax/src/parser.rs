@@ -723,6 +723,8 @@ impl Parser {
     /// Parses one `catch` clause (15.10): an optional `( type name_opt )` then a
     /// block. A bare `catch` is a general catch.
     fn parse_catch_clause(&mut self) -> CatchClause {
+        let start = self.current().span.start;
+        let mut end = self.current().span.end;
         self.bump();
         let (exception_type, name) = if self.eat(Punctuator::OpenParen) {
             let ty = self.parse_type();
@@ -731,7 +733,7 @@ impl Parser {
             } else {
                 None
             };
-            self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+            end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
             (Some(ty), name)
         } else {
             (None, None)
@@ -741,6 +743,7 @@ impl Parser {
             exception_type,
             name,
             body,
+            span: Span::new(start, end),
         }
     }
 
@@ -1376,7 +1379,12 @@ impl Parser {
             && self.next_is(Punctuator::OpenParen)
         {
             let (name, _) = self.expect_identifier();
-            let parameters = self.parse_parameter_list();
+            self.expect(
+                Punctuator::OpenParen,
+                DiagnosticKind::TokenExpected { expected: "(" },
+            );
+            let parameters = self.parse_parameter_sequence(Punctuator::CloseParen);
+            let header_end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
             let initializer = if self.eat(Punctuator::Colon) {
                 Some(self.parse_constructor_initializer())
             } else {
@@ -1390,6 +1398,8 @@ impl Parser {
                 parameters,
                 initializer,
                 body,
+                header_span: Span::new(start, header_end),
+                attributes: Vec::new(),
                 span: Span::new(start, end),
             };
         }
@@ -1807,6 +1817,7 @@ impl Parser {
     /// Parses a constructor initializer (17.10.1), the scanner just past the `:`:
     /// `base ( args )` or `this ( args )`.
     fn parse_constructor_initializer(&mut self) -> ConstructorInitializer {
+        let span = self.current().span;
         let kind = if self.eat_keyword(Keyword::Base) {
             ConstructorInitializerKind::Base
         } else if self.eat_keyword(Keyword::This) {
@@ -1825,7 +1836,11 @@ impl Parser {
         );
         let (arguments, _) =
             self.parse_arguments(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
-        ConstructorInitializer { kind, arguments }
+        ConstructorInitializer {
+            kind,
+            arguments,
+            span,
+        }
     }
 
     /// Parses an indexer given the modifiers and type already parsed (17.8): the

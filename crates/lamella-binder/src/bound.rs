@@ -3187,8 +3187,12 @@ impl Binder {
             }
             _ => None,
         };
+        let explicitly_qualified = matches!(receiver_expr.kind, ExprKind::MemberAccess { .. });
         let receiver_kind = match &callee.kind {
-            BoundExprKind::MethodGroup { receiver, .. } => Some(receiver_category(receiver)),
+            BoundExprKind::MethodGroup { receiver, .. } => Some(match receiver_category(receiver) {
+                Receiver::ImplicitThis if explicitly_qualified => Receiver::Instance,
+                other => other,
+            }),
             _ => None,
         };
         let mut params_method = false;

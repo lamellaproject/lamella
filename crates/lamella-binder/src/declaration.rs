@@ -202,6 +202,31 @@ fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<L
     }
 }
 
+/// Collects the bare `Name` operands a constant-expression references, walking the same forms as
+/// [`fold_const`]. Used to build the const-reference graph for CS0110 circular-constant detection.
+pub(crate) fn const_expr_references(expr: &Expr, out: &mut Vec<Box<str>>) {
+    match &expr.kind {
+        ExprKind::Name(name) => out.push(name.clone()),
+        ExprKind::Parenthesized(inner) => const_expr_references(inner, out),
+        ExprKind::Unary { operand, .. } => const_expr_references(operand, out),
+        ExprKind::Binary { left, right, .. } => {
+            const_expr_references(left, out);
+            const_expr_references(right, out);
+        }
+        ExprKind::Cast { operand, .. } => const_expr_references(operand, out),
+        ExprKind::Conditional {
+            condition,
+            when_true,
+            when_false,
+        } => {
+            const_expr_references(condition, out);
+            const_expr_references(when_true, out);
+            const_expr_references(when_false, out);
+        }
+        _ => {}
+    }
+}
+
 /// Folds a unary operator applied to an already-folded constant operand (14.6).
 pub(crate) fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Option<Literal> {
     match operator {

@@ -1368,6 +1368,7 @@ fn location_refs<F: FnMut(ObjectRef)>(location: &Location, visit: &mut F) {
     match location {
         Location::Field { object, .. } | Location::Boxed { object } => visit(*object),
         Location::Element { array, .. } => visit(*array),
+        Location::StringChar { string, .. } => visit(*string),
         Location::Nested { base, .. } => location_refs(base, visit),
         Location::Local { .. }
         | Location::Arg { .. }
@@ -1422,6 +1423,7 @@ fn remap_location(location: &mut Location, remap: &[Option<u32>]) {
     match location {
         Location::Field { object, .. } | Location::Boxed { object } => remap_ref(object, remap),
         Location::Element { array, .. } => remap_ref(array, remap),
+        Location::StringChar { string, .. } => remap_ref(string, remap),
         Location::Nested { base, .. } => remap_location(base, remap),
         Location::Local { .. }
         | Location::Arg { .. }

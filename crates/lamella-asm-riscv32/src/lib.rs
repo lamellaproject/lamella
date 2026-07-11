@@ -390,7 +390,7 @@ impl Encoder {
             return;
         }
         let upper = ((imm as i64 + 0x800) >> 12) as u32;
-        let lower = imm - ((upper << 12) as i32);
+        let lower = imm.wrapping_sub((upper << 12) as i32);
         self.lui(rd, upper);
         if lower != 0 {
             self.addi(rd, rd, lower);
@@ -504,6 +504,44 @@ mod tests {
         assert_eq!(&bytes[0..4], &0x0280_0293u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &0x0020_0313u32.to_le_bytes());
         assert_eq!(&bytes[8..12], &0x0062_8533u32.to_le_bytes());
+    }
+
+    #[test]
+    fn li_materializes_extreme_constants() {
+        fn decode_li(bytes: &[u8]) -> i32 {
+            let word = |i: usize| u32::from_le_bytes(bytes[i..i + 4].try_into().unwrap());
+            let mut acc = 0i32;
+            let mut i = 0;
+            while i + 4 <= bytes.len() {
+                let w = word(i);
+                match w & 0x7f {
+                    0x37 => acc = (w & 0xFFFF_F000) as i32,
+                    0x13 => acc = acc.wrapping_add((w as i32) >> 20),
+                    other => panic!("unexpected opcode {other:#x} in li sequence"),
+                }
+                i += 4;
+            }
+            acc
+        }
+        for imm in [
+            0,
+            1,
+            -1,
+            2047,
+            -2048,
+            2048,
+            i32::MAX,
+            i32::MIN,
+            0x7FFF_F800u32 as i32,
+            0x1234_5000,
+            0x1234_5678,
+            -0x1234_5678,
+        ] {
+            let mut enc = Encoder::new();
+            enc.li(Reg::A0, imm);
+            let bytes = enc.finish().unwrap().bytes;
+            assert_eq!(decode_li(&bytes), imm, "li({imm:#x}) round-trips");
+        }
     }
 
     #[test]

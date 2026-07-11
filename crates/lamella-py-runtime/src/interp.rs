@@ -1,5 +1,6 @@
 //! The bytecode interpreter.
 
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -7,7 +8,7 @@ use lamella_gc::Ref;
 use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, ExcEntry, Op, UnaryOp};
 
 use crate::bigint::BigInt;
-use crate::object::{InlineCache, ObjectModel};
+use crate::object::{DictViewKind, InlineCache, ObjectModel};
 use crate::trap::Trap;
 use crate::value::{Value, FIXNUM_MAX, FIXNUM_MIN};
 
@@ -51,6 +52,11 @@ pub struct Frame {
     /// sets it, `StoreName`/`LoadName` target it, `BuildClass` consumes it), else `None`. A GC root
     /// while set (traced by [`Frame::trace`]) so building the namespace cannot free it.
     class_namespace: Option<Value>,
+    /// Whether this frame is mid `yield from` delegation (an `Op::YieldFrom` episode). While set, a
+    /// resume of this generator re-runs YieldFrom (its ip was rewound to the op) with the sent value
+    /// on TOS above the sub-iterator; false marks the first entry (send `None`) and each completed
+    /// episode. Reset on reuse. Not a GC root -- the sub it refers to is on the eval stack.
+    yield_from_active: bool,
 }
 
 impl Frame {
@@ -73,6 +79,7 @@ impl Frame {
             active_exception: None,
             derefs: Vec::new(),
             class_namespace: None,
+            yield_from_active: false,
         }
     }
 
@@ -87,6 +94,7 @@ impl Frame {
         self.active_exception = None;
         self.derefs.clear();
         self.class_namespace = None;
+        self.yield_from_active = false;
     }
 
     /// Pushes a value onto the evaluation stack.
@@ -570,7 +578,7 @@ fn try_binop_dunder(
 /// [`Op::Binary`] handler so a bare `Trap::TypeError` (no operation applies to these operand types) can
 /// be turned into a descriptive `TypeError` at the call site, while a dunder that itself raised
 /// (`Trap::Raised`, carrying its own exception) or any other trap propagates unchanged.
-fn dispatch_binary(
+pub(crate) fn dispatch_binary(
     binop: BinOp,
     lhs: Value,
     rhs: Value,
@@ -582,13 +590,139 @@ fn dispatch_binary(
         Ok(value)
     } else if let Some(value) = try_set_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
         Ok(value)
+    } else if let Some(value) = try_counter_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
     } else if let Some(value) = try_dict_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else if let Some(value) = try_view_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
         Ok(value)
     } else if let Some(value) = model.py_binary(binop, lhs, rhs)? {
         Ok(value)
     } else {
         binary(binop, lhs, rhs, model)
     }
+}
+
+/// The dunder method name for an augmented assignment's in-place operator (`__iadd__`/...).
+/// Unlike the plain operator there is no reflected form -- with the method missing, the whole
+/// dispatch falls back to the plain binary protocol.
+fn inplace_binop_dunder_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "__iadd__",
+        BinOp::Sub => "__isub__",
+        BinOp::Mul => "__imul__",
+        BinOp::Mod => "__imod__",
+        BinOp::FloorDiv => "__ifloordiv__",
+        BinOp::BitAnd => "__iand__",
+        BinOp::BitOr => "__ior__",
+        BinOp::BitXor => "__ixor__",
+        BinOp::LShift => "__ilshift__",
+        BinOp::RShift => "__irshift__",
+        BinOp::TrueDiv => "__itruediv__",
+        BinOp::Pow => "__ipow__",
+        BinOp::MatMul => "__imatmul__",
+    }
+}
+
+/// The in-place dispatch for augmented assignment ([`Op::InplaceBinOp`]): a user class's in-place
+/// dunder (`__iadd__`/`__ior__`/...) wins (NotImplemented is not modeled -- a defined method is
+/// used, exactly as [`try_binop_dunder`]); then a built-in MUTABLE left operand applies the
+/// operation in place and the result IS that same object, so aliases observe the mutation:
+/// `list += any-iterable` extends (a generator source too), `list *= int` repeats,
+/// `dict |= dict-or-pairs` updates, `set OP= set|frozenset` rewrites the contents for `| & - ^`,
+/// `bytearray += bytes-like` appends, `bytearray *= int` repeats. Everything else falls back to
+/// [`dispatch_binary`] -- for immutables the plain operator result rebinds, which is CPython's
+/// augmented semantics when no in-place slot applies.
+fn dispatch_inplace_binary(
+    binop: BinOp,
+    lhs: Value,
+    rhs: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if let Some(method) = model.find_dunder(lhs, inplace_binop_dunder_name(binop)) {
+        return call_value(method, &[rhs], functions, model, depth + 1);
+    }
+    if model.is_list(lhs) {
+        match binop {
+            BinOp::Add => {
+                let items = crate::builtins::collect_iterable(model, &[rhs], functions, depth)?;
+                model.list_extend_in_place(lhs, items)?;
+                return Ok(lhs);
+            }
+            BinOp::Mul => {
+                if let Some(count) = rhs.as_int() {
+                    model.list_repeat_in_place(lhs, count)?;
+                    return Ok(lhs);
+                }
+            }
+            _ => {}
+        }
+    }
+    if model.is_counter(lhs)
+        && model.dict_value(rhs).is_some()
+        && matches!(binop, BinOp::Add | BinOp::Sub | BinOp::BitAnd | BinOp::BitOr)
+    {
+        let entries = counter_op_entries(binop, lhs, rhs, functions, model, depth)?;
+        model.dict_replace_entries(lhs, entries)?;
+        return Ok(lhs);
+    }
+    if model.is_dict(lhs) && binop == BinOp::BitOr {
+        let pairs = if let Some(entries) = model.dict_entries(rhs) {
+            entries
+        } else {
+            let items = crate::builtins::collect_iterable(model, &[rhs], functions, depth)?;
+            let mut kv = Vec::with_capacity(items.len());
+            for item in items {
+                let parts = model.unpack_sequence(item, 2)?;
+                kv.push((parts[0], parts[1]));
+            }
+            kv
+        };
+        for (key, value) in pairs {
+            model.py_setitem_dyn(lhs, key, value, functions, depth)?;
+        }
+        return Ok(lhs);
+    }
+    if model.is_set(lhs)
+        && (model.is_set(rhs) || model.is_frozenset(rhs))
+        && matches!(binop, BinOp::BitOr | BinOp::BitAnd | BinOp::Sub | BinOp::BitXor)
+    {
+        let a_elems = model.set_value(lhs).ok_or(Trap::TypeError)?.clone();
+        let b_elems = model.set_value(rhs).ok_or(Trap::TypeError)?.clone();
+        let result = match binop {
+            BinOp::BitOr => union_elems_dyn(&a_elems, &b_elems, functions, model, depth)?,
+            BinOp::BitAnd => filter_elems_dyn(&a_elems, &b_elems, true, functions, model, depth)?,
+            BinOp::Sub => filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?,
+            BinOp::BitXor => {
+                let mut r = filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?;
+                r.extend(filter_elems_dyn(&b_elems, &a_elems, false, functions, model, depth)?);
+                r
+            }
+            _ => unreachable!("guarded by the matches! above"),
+        };
+        model.set_replace_elems(lhs, result)?;
+        return Ok(lhs);
+    }
+    if model.is_bytearray(lhs) {
+        match binop {
+            BinOp::Add => {
+                if let Some(data) = model.bytes_value(rhs).map(<[u8]>::to_vec) {
+                    model.bytearray_extend_in_place(lhs, data)?;
+                    return Ok(lhs);
+                }
+            }
+            BinOp::Mul => {
+                if let Some(count) = rhs.as_int() {
+                    model.bytearray_repeat_in_place(lhs, count)?;
+                    return Ok(lhs);
+                }
+            }
+            _ => {}
+        }
+    }
+    dispatch_binary(binop, lhs, rhs, functions, model, depth)
 }
 
 /// The full comparison dispatch for a non-identity comparison: a user comparison dunder
@@ -607,7 +741,13 @@ fn dispatch_compare(
 ) -> Result<Value, Trap> {
     if let Some(value) = try_compare_dunder(cmpop, lhs, rhs, functions, model, depth)? {
         Ok(value)
+    } else if let Some(value) = try_view_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
     } else if let Some(value) = try_set_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else if let Some(value) = try_odict_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+        Ok(value)
+    } else if let Some(value) = try_deque_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
         Ok(value)
     } else if let Some(value) = try_dict_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
         Ok(value)
@@ -1002,6 +1142,288 @@ fn try_dict_binop_dyn(
     Ok(Some(model.new_dict_dyn(pairs, functions, depth)?))
 }
 
+/// The entries of `lhs OP rhs` for the Counter operators (`+ - & |`): lhs keys in order, then
+/// rhs-only keys; counts combine per the op (sum / difference / min / max) and results <= 0 are
+/// DROPPED (CPython's keep-positive rule -- note `subtract()` the METHOD keeps them, only the
+/// operators strip). Counts must be ints; a non-int is the bare TypeError. Key matching is
+/// interp-aware (`elem_eq`), so a user-`__eq__` key folds correctly.
+fn counter_op_entries(
+    op: BinOp,
+    lhs: Value,
+    rhs: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<(Value, Value)>, Trap> {
+    let a = model.dict_entries(lhs).unwrap_or_default();
+    let b = model.dict_entries(rhs).unwrap_or_default();
+    let mut out: Vec<(Value, i128)> = Vec::new();
+    for &(key, count) in &a {
+        let x = model.as_i128(count).ok_or(Trap::TypeError)?;
+        let mut y = 0i128;
+        for &(other_key, other_count) in &b {
+            if elem_eq(key, other_key, functions, model, depth)? {
+                y = model.as_i128(other_count).ok_or(Trap::TypeError)?;
+                break;
+            }
+        }
+        let n = match op {
+            BinOp::Add => x + y,
+            BinOp::Sub => x - y,
+            BinOp::BitAnd => x.min(y),
+            BinOp::BitOr => x.max(y),
+            _ => return Err(Trap::TypeError),
+        };
+        if n > 0 {
+            out.push((key, n));
+        }
+    }
+    for &(key, count) in &b {
+        let mut in_lhs = false;
+        for &(lhs_key, _) in &a {
+            if elem_eq(key, lhs_key, functions, model, depth)? {
+                in_lhs = true;
+                break;
+            }
+        }
+        if in_lhs {
+            continue;
+        }
+        let y = model.as_i128(count).ok_or(Trap::TypeError)?;
+        let n = match op {
+            BinOp::Add | BinOp::BitOr => y,
+            BinOp::Sub => -y,
+            BinOp::BitAnd => 0,
+            _ => return Err(Trap::TypeError),
+        };
+        if n > 0 {
+            out.push((key, n));
+        }
+    }
+    let mut entries = Vec::with_capacity(out.len());
+    for (key, n) in out {
+        let count = model.int_from_i128(n)?;
+        entries.push((key, count));
+    }
+    Ok(entries)
+}
+
+/// The Counter operators (`c1 + c2`, `- & |`) -- BOTH operands must be Counters (CPython's
+/// isinstance check: `c + dict` is the unsupported-operand TypeError, while `c | dict` falls
+/// through here to the plain dict merge, both matching CPython). The result is a NEW Counter.
+fn try_counter_binop_dyn(
+    op: BinOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if !matches!(op, BinOp::Add | BinOp::Sub | BinOp::BitAnd | BinOp::BitOr)
+        || !model.is_counter(a)
+        || !model.is_counter(b)
+    {
+        return Ok(None);
+    }
+    let entries = counter_op_entries(op, a, b, functions, model, depth)?;
+    Ok(Some(model.new_counter(entries)?))
+}
+
+/// The deque comparisons: two deques compare like lists -- `==`/`!=` elementwise, `< <= > >=`
+/// lexicographic (the first unequal pair decides via the full comparison dispatch; a strict
+/// prefix is less). `None` unless BOTH operands are deques: a deque never equals a list
+/// (CPython), and an ordering against a non-deque is the default TypeError.
+fn try_deque_compare_dyn(
+    op: CmpOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if !model.is_deque(a) || !model.is_deque(b) {
+        return Ok(None);
+    }
+    if matches!(op, CmpOp::Is | CmpOp::IsNot) {
+        return Ok(None);
+    }
+    let a_elems = model.deque_elems(a).cloned().unwrap_or_default();
+    let b_elems = model.deque_elems(b).cloned().unwrap_or_default();
+    let mut split = None;
+    for (i, (&x, &y)) in a_elems.iter().zip(&b_elems).enumerate() {
+        if !elem_eq(x, y, functions, model, depth)? {
+            split = Some(i);
+            break;
+        }
+    }
+    let value = match op {
+        CmpOp::Eq => split.is_none() && a_elems.len() == b_elems.len(),
+        CmpOp::Ne => split.is_some() || a_elems.len() != b_elems.len(),
+        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match split {
+            Some(i) => {
+                let decided = dispatch_compare(op, a_elems[i], b_elems[i], functions, model, depth)?;
+                return Ok(Some(decided));
+            }
+            None => match op {
+                CmpOp::Lt => a_elems.len() < b_elems.len(),
+                CmpOp::Le => a_elems.len() <= b_elems.len(),
+                CmpOp::Gt => a_elems.len() > b_elems.len(),
+                CmpOp::Ge => a_elems.len() >= b_elems.len(),
+                _ => unreachable!("guarded by the outer match arm"),
+            },
+        },
+        CmpOp::Is | CmpOp::IsNot => unreachable!("returned None above"),
+    };
+    Ok(Some(Value::from_bool(value)))
+}
+
+/// The ORDER-SENSITIVE OrderedDict equality: `od1 == od2` compares entries pairwise IN ORDER --
+/// only when BOTH operands are OrderedDicts (CPython); an OrderedDict against a plain dict (or
+/// another subtype) falls through to the order-insensitive dict equality. Orderings stay
+/// TypeErrors via the default machinery.
+fn try_odict_compare_dyn(
+    op: CmpOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if !matches!(op, CmpOp::Eq | CmpOp::Ne) || !model.is_ordereddict(a) || !model.is_ordereddict(b)
+    {
+        return Ok(None);
+    }
+    let a_entries = model.dict_entries(a).unwrap_or_default();
+    let b_entries = model.dict_entries(b).unwrap_or_default();
+    let mut equal = a_entries.len() == b_entries.len();
+    if equal {
+        for (&(a_key, a_value), &(b_key, b_value)) in a_entries.iter().zip(&b_entries) {
+            if !elem_eq(a_key, b_key, functions, model, depth)?
+                || !elem_eq(a_value, b_value, functions, model, depth)?
+            {
+                equal = false;
+                break;
+            }
+        }
+    }
+    Ok(Some(Value::from_bool(if matches!(op, CmpOp::Ne) { !equal } else { equal })))
+}
+
+/// The elements of a SET-LIKE operand for the dict-view operators: a keys/items view materializes
+/// its current projection, a set/frozenset gives its elements. `None` for anything else -- a
+/// VALUES view included, since it has no set protocol.
+fn set_like_elems(value: Value, model: &mut ObjectModel) -> Result<Option<Vec<Value>>, Trap> {
+    match model.dict_view_kind(value) {
+        Some(DictViewKind::Keys | DictViewKind::Items) => model.dict_view_elems(value),
+        Some(DictViewKind::Values) => Ok(None),
+        None => Ok(model.set_value(value).cloned()),
+    }
+}
+
+/// The interp-aware dict-view set operators (`d.keys() | & - ^ other`, view on either side), or
+/// `None` when neither operand is a keys/items view (a VALUES view has no set protocol and falls
+/// through to the plain TypeError). The result is a plain `set`, as CPython's. The other operand
+/// may be ANY iterable (CPython: `d.keys() & "ab"` works; a non-iterable raises its
+/// `'X' object is not iterable`), deduped up front so a repeating iterable behaves as its set.
+fn try_view_binop_dyn(
+    op: BinOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if !matches!(op, BinOp::BitOr | BinOp::BitAnd | BinOp::Sub | BinOp::BitXor) {
+        return Ok(None);
+    }
+    let a_view = matches!(model.dict_view_kind(a), Some(DictViewKind::Keys | DictViewKind::Items));
+    let b_view = matches!(model.dict_view_kind(b), Some(DictViewKind::Keys | DictViewKind::Items));
+    if !a_view && !b_view {
+        return Ok(None);
+    }
+    let a_elems = match set_like_elems(a, model)? {
+        Some(elems) => elems,
+        None => {
+            let items = crate::builtins::collect_iterable(model, &[a], functions, depth)?;
+            dedup_elems(items, functions, model, depth)?
+        }
+    };
+    let b_elems = match set_like_elems(b, model)? {
+        Some(elems) => elems,
+        None => {
+            let items = crate::builtins::collect_iterable(model, &[b], functions, depth)?;
+            dedup_elems(items, functions, model, depth)?
+        }
+    };
+    let result = match op {
+        BinOp::BitOr => union_elems_dyn(&a_elems, &b_elems, functions, model, depth)?,
+        BinOp::BitAnd => filter_elems_dyn(&a_elems, &b_elems, true, functions, model, depth)?,
+        BinOp::Sub => filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?,
+        BinOp::BitXor => {
+            let mut r = filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?;
+            r.extend(filter_elems_dyn(&b_elems, &a_elems, false, functions, model, depth)?);
+            r
+        }
+        _ => unreachable!("guarded by the matches! above"),
+    };
+    Ok(Some(model.new_set(result)?))
+}
+
+/// The interp-aware dict-view comparisons: a keys/items view compares AS A SET with another
+/// keys/items view or a set/frozenset -- `==`/`!=` set equality, `< <= > >=` (proper)
+/// subset/superset. `==`/`!=` against a NON-set-like is not handled here (`None`), falling through
+/// to identity, so `d.keys() == [..]` is False as in CPython; an ORDERING against a non-set-like
+/// is a TypeError (the dispatch chokepoint renders CPython's message). A VALUES view has no set
+/// protocol and is not handled at all (identity `==`, ordering TypeError).
+fn try_view_compare_dyn(
+    op: CmpOp,
+    a: Value,
+    b: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    let a_view = matches!(model.dict_view_kind(a), Some(DictViewKind::Keys | DictViewKind::Items));
+    let b_view = matches!(model.dict_view_kind(b), Some(DictViewKind::Keys | DictViewKind::Items));
+    if !a_view && !b_view {
+        return Ok(None);
+    }
+    let value = match op {
+        CmpOp::Eq | CmpOp::Ne => {
+            let equal = match (set_like_elems(a, model)?, set_like_elems(b, model)?) {
+                (Some(a_elems), Some(b_elems)) => {
+                    a_elems.len() == b_elems.len()
+                        && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
+                }
+                _ => false,
+            };
+            if matches!(op, CmpOp::Ne) { !equal } else { equal }
+        }
+        CmpOp::Le | CmpOp::Ge | CmpOp::Lt | CmpOp::Gt => {
+            let (Some(a_elems), Some(b_elems)) =
+                (set_like_elems(a, model)?, set_like_elems(b, model)?)
+            else {
+                return Err(Trap::TypeError);
+            };
+            match op {
+                CmpOp::Le => subset_dyn(&a_elems, &b_elems, functions, model, depth)?,
+                CmpOp::Ge => subset_dyn(&b_elems, &a_elems, functions, model, depth)?,
+                CmpOp::Lt => {
+                    a_elems.len() < b_elems.len()
+                        && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
+                }
+                CmpOp::Gt => {
+                    b_elems.len() < a_elems.len()
+                        && subset_dyn(&b_elems, &a_elems, functions, model, depth)?
+                }
+                _ => unreachable!("guarded by the outer match arm"),
+            }
+        }
+        CmpOp::Is | CmpOp::IsNot => return Ok(None),
+    };
+    Ok(Some(Value::from_bool(value)))
+}
+
 /// Evaluates a unary `-`/`+`/`~` over an `int`/`bool` operand (Python int semantics:
 /// `+x == x`, `-x`, `~x == -x - 1`); other types are a `TypeError`. The customizable
 /// `__neg__`/`__pos__`/`__invert__` protocol composes with the broader object model.
@@ -1153,7 +1575,9 @@ pub fn run_module(
 pub fn run_bundle(bundle: Bundle, model: &mut ObjectModel) -> Result<Value, Trap> {
     let Bundle { entry, modules } = bundle;
     model.set_managed_modules(modules);
-    run_module(&entry.body, &entry.functions, model)
+    let entry_functions: Rc<[CodeObject]> = Rc::from(entry.functions);
+    model.set_entry_functions(Rc::clone(&entry_functions));
+    run_module(&entry.body, &entry_functions, model)
 }
 
 /// Resolves an `import name` the interpreter-aware way, backing [`Op::ImportName`]: a cached / host /
@@ -1285,11 +1709,12 @@ fn resolve_global(name: &str, functions: &[CodeObject], model: &mut ObjectModel)
 }
 
 /// Invokes function `index` of module `home` with already-bound `args` -- the cross-module-aware
-/// funnel. A managed module's function runs against its OWN function table (fetched as a shared `Rc`)
-/// with `home` installed as the module context, so its globals + sibling-function refs resolve against
-/// its home module even when called from another module. The entry module (`home == 0`) uses the
-/// threaded `functions` -- correct when the caller is the entry (the common case); a managed module
-/// calling an entry-defined function is a deferred edge case.
+/// funnel. A function runs against its HOME module's function table (fetched as a shared `Rc`) with
+/// `home` installed as the module context, so its globals + sibling-function refs resolve against its
+/// home module even when called from another module. This holds for the entry too (`home == 0` -> the
+/// entry `Rc` `run_bundle` installed), so a managed module calling an entry-defined function reaches
+/// the entry's code; the threaded `functions` is only the fallback when no entry `Rc` is set (a
+/// single-file program, where no managed caller exists).
 fn invoke_function_value(
     home: u16,
     index: u32,
@@ -1365,7 +1790,18 @@ pub(crate) fn call_value(
 ) -> Result<Value, Trap> {
     if let Some(index) = callee.as_function_index() {
         let home = callee.function_home_module().unwrap_or(0);
-        invoke_function_value(home, index, args, &[], functions, model, depth)
+        let needs_bind = {
+            let home_funcs = model.managed_functions_rc(home);
+            let code_funcs = home_funcs.as_deref().unwrap_or(functions);
+            code_funcs
+                .get(index as usize)
+                .is_some_and(|c| c.has_varargs || c.has_varkwargs || c.kwonly_count > 0)
+        };
+        if needs_bind {
+            call_py_function_value(callee, args, &[], functions, model, depth)
+        } else {
+            invoke_function_value(home, index, args, &[], functions, model, depth)
+        }
     } else if model.is_py_function(callee) {
         call_py_function_value(callee, args, &[], functions, model, depth)
     } else if let Some(id) = callee.as_builtin_id() {
@@ -1377,6 +1813,11 @@ pub(crate) fn call_value(
         let items = crate::builtins::collect_iterable(model, &[*iterable], functions, depth)?;
         let list = model.new_list(items)?;
         model.call_bound_method(callee, &[list])
+    } else if model.is_str_format_bound(callee) {
+        let receiver = model.bound_receiver(callee);
+        let template = model.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
+        let rendered = model.format_template(&template, args, &[], functions, depth)?;
+        model.new_str(&rendered)
     } else if model.is_bound_method(callee) {
         let receiver = model.bound_receiver(callee);
         let method_id = model.bound_method_id(callee);
@@ -1386,6 +1827,8 @@ pub(crate) fn call_value(
             model.call_set_method_dyn(receiver, method_id, args, functions, depth)
         } else if model.is_dict(receiver) {
             model.call_dict_method_dyn(receiver, method_id, args, functions, depth)
+        } else if model.is_deque(receiver) {
+            model.call_deque_method_dyn(receiver, method_id, args, functions, depth)
         } else {
             model.call_bound_method(callee, args)
         }
@@ -1404,6 +1847,8 @@ pub(crate) fn call_value(
         let name = model.str_value(name_value).ok_or(Trap::TypeError)?.to_string();
         let bound = model.getattr(*receiver, &name, &mut crate::object::InlineCache::empty())?;
         call_value(bound, rest, functions, model, depth)
+    } else if model.is_ntclass(callee) {
+        construct_namedtuple(callee, args, &[], model)
     } else if model.is_class(callee) {
         let instance = model.new_object(callee)?;
         if let Some(init) = model.find_init(callee) {
@@ -1417,6 +1862,8 @@ pub(crate) fn call_value(
         Ok(instance)
     } else if model.is_pin_factory(callee) {
         model.call_pin_factory(args)
+    } else if model.is_uart_shim_factory(callee) {
+        model.call_uart_shim_factory(callee, args, &[])
     } else if model.is_dio_factory(callee) {
         model.call_dio_factory(args)
     } else if let Some(call_method) = model.find_dunder(callee, "__call__") {
@@ -1424,6 +1871,58 @@ pub(crate) fn call_value(
     } else {
         Err(model.object_is_not(callee, "callable"))
     }
+}
+
+/// Binds a namedtuple class's call arguments (positional + keyword) to its fields and allocates
+/// the instance. The arity/keyword errors carry CPython's `Name.__new__()` spellings.
+fn construct_namedtuple(
+    class: Value,
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    model: &mut ObjectModel,
+) -> Result<Value, Trap> {
+    let fields = model.ntclass_fields(class);
+    let name = model.ntclass_name(class);
+    if posargs.len() > fields.len() {
+        let message = alloc::format!(
+            "{name}.__new__() takes {} positional arguments but {} were given",
+            fields.len() + 1,
+            posargs.len() + 1
+        );
+        return Err(model.raise_named_exception("TypeError", &message));
+    }
+    let mut slots: Vec<Option<Value>> = posargs.iter().map(|&v| Some(v)).collect();
+    slots.resize(fields.len(), None);
+    for &(kw_name, value) in kwargs {
+        let Some(at) = fields.iter().position(|f| f == kw_name) else {
+            let message =
+                alloc::format!("{name}.__new__() got an unexpected keyword argument '{kw_name}'");
+            return Err(model.raise_named_exception("TypeError", &message));
+        };
+        if slots[at].is_some() {
+            let message =
+                alloc::format!("{name}.__new__() got multiple values for argument '{kw_name}'");
+            return Err(model.raise_named_exception("TypeError", &message));
+        }
+        slots[at] = Some(value);
+    }
+    let missing: Vec<&str> = fields
+        .iter()
+        .zip(&slots)
+        .filter(|(_, slot)| slot.is_none())
+        .map(|(field, _)| field.as_str())
+        .collect();
+    if !missing.is_empty() {
+        let plural = if missing.len() == 1 { "" } else { "s" };
+        let message = alloc::format!(
+            "{name}.__new__() missing {} required positional argument{plural}: {}",
+            missing.len(),
+            join_arg_names(&missing)
+        );
+        return Err(model.raise_named_exception("TypeError", &message));
+    }
+    let elements = slots.into_iter().flatten().collect();
+    model.new_ntinstance(class, elements)
 }
 
 /// Dispatches a call carrying KEYWORD arguments (`Op::CallKw`). Like [`call_value`] but binds
@@ -1446,6 +1945,8 @@ fn call_value_kw(
         all_pos.push(model.bound_self(callee));
         all_pos.extend_from_slice(posargs);
         call_value_kw(func, &all_pos, kwargs, functions, model, depth)
+    } else if model.is_ntclass(callee) {
+        construct_namedtuple(callee, posargs, kwargs, model)
     } else if model.is_class(callee) {
         let instance = model.new_object(callee)?;
         if let Some(init) = model.find_init(callee) {
@@ -1463,7 +1964,7 @@ fn call_value_kw(
     } else if model.is_str_format_bound(callee) {
         let receiver = model.bound_receiver(callee);
         let template = model.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
-        let rendered = model.format_template(&template, posargs, kwargs)?;
+        let rendered = model.format_template(&template, posargs, kwargs, functions, depth)?;
         model.new_str(&rendered)
     } else if model.is_dict_update_bound(callee) {
         let receiver = model.bound_receiver(callee);
@@ -1479,10 +1980,44 @@ fn call_value_kw(
             model.py_setitem(receiver, key, value)?;
         }
         Ok(Value::NONE)
+    } else if model.is_uart_shim_factory(callee) {
+        model.call_uart_shim_factory(callee, posargs, kwargs)
+    } else if model.is_bound_method(callee)
+        && (model.is_uart(model.bound_receiver(callee))
+            || model.is_uart_port(model.bound_receiver(callee)))
+    {
+        let receiver = model.bound_receiver(callee);
+        let method_id = model.bound_method_id(callee);
+        model.call_uart_bound_kw(receiver, method_id, posargs, kwargs)
     } else if model.is_bound_method(callee) {
+        let receiver = model.bound_receiver(callee);
+        if model.is_ntinstance(receiver) && model.bound_method_id(callee) == crate::object::NT_REPLACE
+        {
+            if !posargs.is_empty() {
+                return Err(Trap::TypeError);
+            }
+            let class = model.ntinstance_class(receiver).ok_or(Trap::TypeError)?;
+            let fields = model.ntclass_fields(class);
+            let mut elements = model.seq_elements(receiver).unwrap_or_default();
+            let mut unexpected = Vec::new();
+            for &(name, value) in kwargs {
+                match fields.iter().position(|f| f == name) {
+                    Some(at) => elements[at] = value,
+                    None => unexpected.push(alloc::format!("'{name}'")),
+                }
+            }
+            if !unexpected.is_empty() {
+                let message =
+                    alloc::format!("Got unexpected field names: [{}]", unexpected.join(", "));
+                return Err(model.raise_named_exception("TypeError", &message));
+            }
+            return model.new_ntinstance(class, elements);
+        }
         Err(Trap::TypeError)
     } else if let Some(id) = callee.as_builtin_id() {
         crate::builtins::call_builtin_kw(id, posargs, kwargs, functions, model, depth)
+    } else if let Some(call_method) = model.find_dunder(callee, "__call__") {
+        call_value_kw(call_method, posargs, kwargs, functions, model, depth + 1)
     } else {
         Err(Trap::TypeError)
     }
@@ -1733,7 +2268,10 @@ fn resume_generator(
         Some(frame) => frame,
         None => {
             return match resume {
-                Resume::Send(_) => Ok(Value::STOP),
+                Resume::Send(_) => {
+                    model.set_generator_return(Value::NONE);
+                    Ok(Value::STOP)
+                }
                 Resume::Throw(exc) => {
                     model.set_pending_exception(exc);
                     Err(Trap::Raised)
@@ -1759,26 +2297,36 @@ fn resume_generator(
                 frame.stack.push(value);
             }
         }
-        Resume::Throw(exc) => match find_handler(&entry.exc_table, frame.ip as u32) {
-            Some(handler) => {
-                frame.stack.truncate(handler.depth as usize);
-                frame.active_exception = Some(exc);
-                frame.ip = handler.target as usize;
+        Resume::Throw(exc) => {
+            if frame.yield_from_active {
+                model.set_yield_from_throw(exc);
+            } else {
+                match find_handler(&entry.exc_table, frame.ip as u32) {
+                    Some(handler) => {
+                        frame.stack.truncate(handler.depth as usize);
+                        frame.active_exception = Some(exc);
+                        frame.ip = handler.target as usize;
+                    }
+                    None => {
+                        model.set_pending_exception(exc);
+                        return Err(Trap::Raised);
+                    }
+                }
             }
-            None => {
-                model.set_pending_exception(exc);
-                return Err(Trap::Raised);
-            }
-        },
+        }
         Resume::Close => {
             let exc = model.new_exception("GeneratorExit")?;
-            match find_handler(&entry.exc_table, frame.ip as u32) {
-                Some(handler) => {
-                    frame.stack.truncate(handler.depth as usize);
-                    frame.active_exception = Some(exc);
-                    frame.ip = handler.target as usize;
+            if frame.yield_from_active {
+                model.set_yield_from_throw(exc);
+            } else {
+                match find_handler(&entry.exc_table, frame.ip as u32) {
+                    Some(handler) => {
+                        frame.stack.truncate(handler.depth as usize);
+                        frame.active_exception = Some(exc);
+                        frame.ip = handler.target as usize;
+                    }
+                    None => return Ok(Value::NONE),
                 }
-                None => return Ok(Value::NONE),
             }
         }
     }
@@ -1798,7 +2346,14 @@ fn resume_generator(
             model.put_generator_frame(generator, suspended);
             Ok(value)
         }
-        Ok(DriveOutcome::Returned(_)) => Ok(if close_mode { Value::NONE } else { Value::STOP }),
+        Ok(DriveOutcome::Returned(returned)) => {
+            if close_mode {
+                Ok(Value::NONE)
+            } else {
+                model.set_generator_return(returned);
+                Ok(Value::STOP)
+            }
+        }
         Err(Trap::Raised) if close_mode => {
             if model.pending_exception_is("GeneratorExit") {
                 model.take_pending_exception();
@@ -1858,9 +2413,143 @@ fn call_generator_method(
 /// `StopIteration` (unlike the for-loop path, which stops silently); any value passes through.
 fn stop_or_value(value: Value, model: &mut ObjectModel) -> Result<Value, Trap> {
     if value.is_stop() {
-        Err(model.raise_named_exception("StopIteration", ""))
+        let returned = model.take_generator_return().unwrap_or(Value::NONE);
+        Err(model.raise_named_exception_with_value("StopIteration", returned))
     } else {
         Ok(value)
+    }
+}
+
+/// One step of a `yield from` delegation ([`advance_yield_from`]): the sub either yielded a value
+/// (re-yield it) or is exhausted (its return value becomes the `yield from` expression's value).
+enum YieldFromStep {
+    Yielded(Value),
+    Returned(Value),
+}
+
+/// How to advance a `yield from` sub-iterator one step: forward a sent value (`send`/`next`) or throw
+/// an exception into it (`gen.throw`/`gen.close` into a delegating generator).
+enum YieldFromAction {
+    Send(Value),
+    Throw(Value),
+}
+
+/// Drives the sub-iterator of a `yield from` by one step. A GENERATOR sub is resumed with the sent
+/// value or the thrown exception (its return value on exhaustion -- its `StopIteration.value` --
+/// becomes the step's `Returned`; a propagated raise returns `Err`). Any other iterable is advanced by
+/// one `next` for a send (a non-None send is a TypeError -- a plain iterator has no `send` -- and its
+/// return value is always `None`); a throw into a plain iterator raises the exception here.
+fn advance_yield_from(
+    sub: Value,
+    action: YieldFromAction,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<YieldFromStep, Trap> {
+    if model.is_generator(sub) {
+        let resume = match action {
+            YieldFromAction::Send(value) => Resume::Send(value),
+            YieldFromAction::Throw(exc) => Resume::Throw(exc),
+        };
+        let value = resume_generator(sub, resume, functions, model, depth + 1)?;
+        if value.is_stop() {
+            Ok(YieldFromStep::Returned(model.take_generator_return().unwrap_or(Value::NONE)))
+        } else {
+            Ok(YieldFromStep::Yielded(value))
+        }
+    } else {
+        match action {
+            YieldFromAction::Send(send_value) => {
+                if send_value != Value::NONE {
+                    return Err(Trap::TypeError);
+                }
+                match py_next_value(sub, functions, model, depth + 1)? {
+                    Some(value) => Ok(YieldFromStep::Yielded(value)),
+                    None => Ok(YieldFromStep::Returned(Value::NONE)),
+                }
+            }
+            YieldFromAction::Throw(exc) => {
+                model.set_pending_exception(exc);
+                Err(Trap::Raised)
+            }
+        }
+    }
+}
+
+/// Attribute lookup with CPython's `__getattr__` fallback: the normal lookup first, and on an
+/// AttributeError miss the type's `__getattr__(name)` hook if it defines one (a proxy / lazy /
+/// computed attribute). A type without the hook re-raises the bare [`Trap::AttributeError`], so
+/// `Op::LoadAttr` still synthesizes the descriptive `'X' object has no attribute 'NAME'` and
+/// `getattr`/`hasattr` still see the bare trap for their default / boolean handling. (`__getattr__`
+/// is looked up on the type, so it never recurses through the instance dict.) Shared by the
+/// `getattr`/`hasattr` builtins; `Op::LoadAttr` inlines the same fallback to keep its property path.
+pub(crate) fn getattr_hooked(
+    receiver: Value,
+    name: &str,
+    slot: &mut InlineCache,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    match model.getattr(receiver, name, slot) {
+        Err(Trap::AttributeError) => match model.find_dunder(receiver, "__getattr__") {
+            Some(hook) => {
+                let name_value = model.new_str(name)?;
+                call_value(hook, &[name_value], functions, model, depth + 1)
+            }
+            None => Err(Trap::AttributeError),
+        },
+        other => other,
+    }
+}
+
+/// CPython's `operator.index`: coerces an object used where an INTEGER index is required (a built-in
+/// sequence subscript) via its `__index__()` -- so a custom integer-like value can index `list` /
+/// `tuple` / `str` / `bytes`. An int already, or a value with no `__index__`, passes through
+/// unchanged (so a slice reaches the slice path and a non-index value reaches the caller's own
+/// error). `__index__` returning a non-int is a TypeError. Callers exempt `dict` (it keys by the
+/// object itself, not an int).
+pub(crate) fn coerce_index(
+    value: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if !model.is_instance(value) {
+        return Ok(value);
+    }
+    let Some(hook) = model.find_dunder(value, "__index__") else {
+        return Ok(value);
+    };
+    let result = call_value(hook, &[], functions, model, depth + 1)?;
+    if model.is_int(result) {
+        Ok(result)
+    } else {
+        Err(Trap::TypeError)
+    }
+}
+
+/// [`coerce_index`] for a subscript key: a plain index is coerced directly; a SLICE has each of its
+/// non-`None` bounds coerced via `__index__` (`lst[Idx(1):Idx(4)]`), rebuilding the slice only when a
+/// bound actually changed so the original slice object keeps its bounds. Any other value (incl. a
+/// slice with plain int/None bounds) passes through untouched.
+fn coerce_subscript(
+    index: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if !model.is_slice(index) {
+        return coerce_index(index, functions, model, depth);
+    }
+    let (start, stop, step) = model.slice_components(index);
+    let new_start = coerce_index(start, functions, model, depth)?;
+    let new_stop = coerce_index(stop, functions, model, depth)?;
+    let new_step = coerce_index(step, functions, model, depth)?;
+    if new_start != start || new_stop != stop || new_step != step {
+        model.new_slice(new_start, new_stop, new_step)
+    } else {
+        Ok(index)
     }
 }
 
@@ -1888,8 +2577,14 @@ pub(crate) fn iterator_for(
         }
     } else {
         match model.new_iter(value) {
+            Ok(iter) => Ok(iter),
+            Err(Trap::TypeError) if model.find_dunder(value, "__getitem__").is_some() => {
+                let sources = model.new_tuple(alloc::vec![value])?;
+                let zero = Value::fixnum(0).ok_or(Trap::Overflow)?;
+                model.new_lazy_iter(crate::object::LAZY_GETITEM, zero, sources)
+            }
             Err(Trap::TypeError) => Err(model.object_is_not(value, "iterable")),
-            other => other,
+            Err(other) => Err(other),
         }
     }
 }
@@ -1992,6 +2687,24 @@ fn lazy_iter_next(
             let sentinel = sources.first().copied().unwrap_or(Value::NONE);
             let result = call_value(callable, &[], functions, model, depth)?;
             Ok((!model.key_eq(result, sentinel)).then_some(result))
+        }
+        crate::object::LAZY_GETITEM => {
+            let target = sources[0];
+            let index = model.lazy_iter_state(iterator);
+            let getitem = model.find_dunder(target, "__getitem__").ok_or(Trap::TypeError)?;
+            match call_value(getitem, &[index], functions, model, depth) {
+                Ok(value) => {
+                    let next = model.new_long(model.as_i128(index).unwrap_or(0) + 1)?;
+                    model.lazy_iter_set_state(iterator, next);
+                    Ok(Some(value))
+                }
+                Err(Trap::IndexError) => Ok(None),
+                Err(Trap::Raised) if model.pending_exception_is("IndexError") => {
+                    model.take_pending_exception();
+                    Ok(None)
+                }
+                Err(other) => Err(other),
+            }
         }
         _ => Err(Trap::TypeError),
     }
@@ -2147,7 +2860,15 @@ fn drive(
                 frame.push(value);
             }
             Op::LoadFast(idx) => {
-                let value = frame.load_local(idx as usize)?;
+                let value = if frame.is_module {
+                    let name = code.local_names.get(idx as usize).ok_or(Trap::Malformed)?;
+                    match model.current_module_global(name) {
+                        Some(value) => value,
+                        None => frame.load_local(idx as usize)?,
+                    }
+                } else {
+                    frame.load_local(idx as usize)?
+                };
                 frame.push(value);
             }
             Op::StoreFast(idx) => {
@@ -2163,24 +2884,37 @@ fn drive(
                 let value = resolve_global(name, functions, model).ok_or(Trap::NameError)?;
                 frame.push(value);
             }
+            Op::StoreGlobal(name_idx) => {
+                let value = frame.pop()?;
+                let name = code.names.get(name_idx as usize).ok_or(Trap::Malformed)?;
+                model.set_current_module_global(name, value);
+            }
             Op::LoadAttr { name, cache } => {
                 let receiver = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
                 let slot = frame.caches.get_mut(cache as usize).ok_or(Trap::Malformed)?;
-                let value = match model.getattr(receiver, attr, slot) {
-                    Ok(value) => value,
-                    Err(Trap::AttributeError) => return Err(model.attribute_error(receiver, attr)),
-                    Err(other) => return Err(other),
-                };
-                if model.is_property(value) && model.is_instance(receiver) {
-                    let (fget, _, _) = model.property_accessors(value);
-                    if fget.is_none() {
-                        return Err(Trap::AttributeError);
+                match model.getattr(receiver, attr, slot) {
+                    Ok(value) => {
+                        if model.is_property(value) && model.is_instance(receiver) {
+                            let (fget, _, _) = model.property_accessors(value);
+                            if fget.is_none() {
+                                return Err(Trap::AttributeError);
+                            }
+                            let result = call_value(fget, &[receiver], functions, model, depth + 1)?;
+                            frame.push(result);
+                        } else {
+                            frame.push(value);
+                        }
                     }
-                    let result = call_value(fget, &[receiver], functions, model, depth + 1)?;
-                    frame.push(result);
-                } else {
-                    frame.push(value);
+                    Err(Trap::AttributeError) => match model.find_dunder(receiver, "__getattr__") {
+                        Some(hook) => {
+                            let name_value = model.new_str(attr)?;
+                            let result = call_value(hook, &[name_value], functions, model, depth + 1)?;
+                            frame.push(result);
+                        }
+                        None => return Err(model.attribute_error(receiver, attr)),
+                    },
+                    Err(other) => return Err(other),
                 }
             }
             Op::Binary(binop) => {
@@ -2189,6 +2923,18 @@ fn drive(
                 let result = match dispatch_binary(binop, lhs, rhs, functions, model, depth) {
                     Ok(value) => value,
                     Err(Trap::TypeError) => return Err(model.binop_type_error(binop, lhs, rhs)),
+                    Err(other) => return Err(other),
+                };
+                frame.push(result);
+            }
+            Op::InplaceBinOp(binop) => {
+                let rhs = frame.pop()?;
+                let lhs = frame.pop()?;
+                let result = match dispatch_inplace_binary(binop, lhs, rhs, functions, model, depth) {
+                    Ok(value) => value,
+                    Err(Trap::TypeError) => {
+                        return Err(model.inplace_binop_type_error(binop, lhs, rhs));
+                    }
                     Err(other) => return Err(other),
                 };
                 frame.push(result);
@@ -2231,6 +2977,11 @@ fn drive(
                 let result = if let Some(method) = model.find_dunder(container, "__getitem__") {
                     call_value(method, &[index], functions, model, depth + 1)?
                 } else {
+                    let index = if model.is_dict(container) {
+                        index
+                    } else {
+                        coerce_subscript(index, functions, model, depth)?
+                    };
                     model.py_getitem_dyn(container, index, functions, depth)?
                 };
                 frame.push(result);
@@ -2277,6 +3028,11 @@ fn drive(
                     let elements = crate::builtins::collect_iterable(model, &[value], functions, depth)?;
                     model.seq_setitem_slice(container, index, elements)?;
                 } else {
+                    let index = if model.is_dict(container) {
+                        index
+                    } else {
+                        coerce_subscript(index, functions, model, depth)?
+                    };
                     model.py_setitem_dyn(container, index, value, functions, depth)?;
                 }
             }
@@ -2289,6 +3045,22 @@ fn drive(
                 } else if model.is_set(container) || model.is_frozenset(container) {
                     let elems = model.set_value(container).ok_or(Trap::TypeError)?.clone();
                     elems_contain(element, &elems, functions, model, depth)?
+                } else if model.is_dict_view(container) {
+                    let elems = model.dict_view_elems(container)?.unwrap_or_default();
+                    elems_contain(element, &elems, functions, model, depth)?
+                } else if model.is_deque(container) {
+                    let elems = model.deque_elems(container).cloned().unwrap_or_default();
+                    elems_contain(element, &elems, functions, model, depth)?
+                } else if model.is_instance(container) {
+                    let iterator = iterator_for(container, functions, model, depth + 1)?;
+                    let mut found = false;
+                    while let Some(item) = py_next_value(iterator, functions, model, depth)? {
+                        if elem_eq(element, item, functions, model, depth)? {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
                 } else {
                     model.py_contains_dyn(container, element, functions, depth)?
                 };
@@ -2373,6 +3145,7 @@ fn drive(
                     let exception = model.raise_value(value)?;
                     let cause = if model.is_class(cause) { model.new_object(cause)? } else { cause };
                     model.py_setattr_instance(exception, "__cause__", cause)?;
+                    model.py_setattr_instance(exception, "__suppress_context__", Value::TRUE)?;
                     exception
                 } else if argc == 1 {
                     let value = frame.pop()?;
@@ -2387,6 +3160,13 @@ fn drive(
                         }
                     }
                 };
+                if argc != 0 {
+                    if let Some(active) = frame.active_exception {
+                        if active != exception {
+                            model.py_setattr_instance(exception, "__context__", active)?;
+                        }
+                    }
+                }
                 model.set_pending_exception(exception);
                 return Err(Trap::Raised);
             }
@@ -2524,7 +3304,8 @@ fn drive(
                     match kind {
                         0 => posargs.push(val),
                         1 => {
-                            let items = model.seq_elements(val).ok_or(Trap::TypeError)?;
+                            let items =
+                                crate::builtins::collect_iterable(model, &[val], functions, depth)?;
                             posargs.extend(items);
                         }
                         2 => {
@@ -2548,6 +3329,32 @@ fn drive(
             }
             Op::Yield => {
                 return Ok(Flow::Yield(frame.pop()?));
+            }
+            Op::YieldFrom => {
+                let action = if let Some(exc) = model.take_yield_from_throw() {
+                    YieldFromAction::Throw(exc)
+                } else if frame.yield_from_active {
+                    YieldFromAction::Send(frame.pop()?)
+                } else {
+                    frame.yield_from_active = true;
+                    YieldFromAction::Send(Value::NONE)
+                };
+                let sub = frame.peek()?;
+                match advance_yield_from(sub, action, functions, model, depth) {
+                    Ok(YieldFromStep::Yielded(value)) => {
+                        frame.ip -= 1;
+                        return Ok(Flow::Yield(value));
+                    }
+                    Ok(YieldFromStep::Returned(result)) => {
+                        frame.pop()?;
+                        frame.push(result);
+                        frame.yield_from_active = false;
+                    }
+                    Err(trap) => {
+                        frame.yield_from_active = false;
+                        return Err(trap);
+                    }
+                }
             }
             Op::SetupClassNamespace => {
                 let namespace = model.new_dict(Vec::new())?;
@@ -2581,6 +3388,10 @@ fn drive(
                 let module = frame.peek()?;
                 let value = model.import_from(module, name)?;
                 frame.push(value);
+            }
+            Op::ImportStar => {
+                let module = frame.pop()?;
+                model.import_star(module)?;
             }
             Op::BuildClass => {
                 let namespace = match frame.class_namespace.take() {
@@ -2621,6 +3432,11 @@ fn drive(
                 if let Some(method) = model.find_dunder(container, "__delitem__") {
                     call_value(method, &[index], functions, model, depth + 1)?;
                 } else {
+                    let index = if model.is_dict(container) {
+                        index
+                    } else {
+                        coerce_subscript(index, functions, model, depth)?
+                    };
                     model.py_delitem_dyn(container, index, functions, depth)?;
                 }
             }
@@ -2635,6 +3451,10 @@ fn drive(
             }
             Op::DeleteFast(idx) => {
                 frame.store_local(idx as usize, Value::UNBOUND)?;
+                if frame.is_module {
+                    let name = code.local_names.get(idx as usize).ok_or(Trap::Malformed)?;
+                    model.delete_current_module_global(name);
+                }
             }
             Op::UnpackSequence(count) => {
                 let value = frame.pop()?;
@@ -3049,6 +3869,17 @@ mod tests {
         let mut model = ObjectModel::new(Vec::new(), 32 * 1024);
         let result = run(&entry, &functions, &[], &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(3));
+    }
+
+    #[test]
+    fn module_body_loadfast_reads_the_module_global() {
+        use Op::*;
+        let mut body = code(1, 0, Vec::new(), Vec::new(), 0, vec![LoadFast(0), Return]);
+        body.local_names = vec![String::from("count")];
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        model.set_global("count", Value::fixnum(42).unwrap());
+        let result = run_module(&body, &[], &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(42));
     }
 
     #[test]
@@ -3517,6 +4348,64 @@ mod tests {
         );
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         assert_eq!(run(&code, &[], &[], &mut model), Err(Trap::ValueError));
+    }
+
+    #[test]
+    fn inplace_binop_extends_a_list_in_place_preserving_identity() {
+        use Op::*;
+        let code = code(
+            2,
+            0,
+            vec![Const::Int(1), Const::Int(2), Const::Int(3)],
+            Vec::new(),
+            0,
+            vec![
+                LoadConst(0),
+                BuildList(1),
+                StoreFast(0),
+                LoadFast(0),
+                StoreFast(1),
+                LoadFast(0),
+                LoadConst(1),
+                LoadConst(2),
+                BuildTuple(2),
+                InplaceBinOp(BinOp::Add),
+                StoreFast(0),
+                LoadFast(0),
+                LoadFast(1),
+                Compare(CmpOp::Is),
+                LoadFast(1),
+                BuildTuple(2),
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        let result = run(&code, &[], &[], &mut model).unwrap();
+        assert_eq!(model.repr(result), "(True, [1, 2, 3])");
+    }
+
+    #[test]
+    fn inplace_binop_falls_back_to_the_plain_op_for_immutables() {
+        use Op::*;
+        let code = code(
+            1,
+            0,
+            vec![Const::Int(5), Const::Int(1)],
+            Vec::new(),
+            0,
+            vec![
+                LoadConst(0),
+                StoreFast(0),
+                LoadFast(0),
+                LoadConst(1),
+                InplaceBinOp(BinOp::Add),
+                StoreFast(0),
+                LoadFast(0),
+                Return,
+            ],
+        );
+        let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
+        assert_eq!(run(&code, &[], &[], &mut model).unwrap().as_fixnum(), Some(6));
     }
 
     #[test]
@@ -4369,6 +5258,43 @@ mod tests {
         let result = run_bundle(bundle, &mut model).unwrap();
         assert_eq!(result.as_fixnum(), Some(5));
         assert_eq!(model.get_global("BASE").and_then(Value::as_fixnum), Some(99));
+    }
+
+    #[test]
+    fn a_managed_module_calling_an_entry_defined_function_resolves_it_against_the_entry() {
+        use Op::*;
+        let cb = named_fn("cb", 0, 0, &["X"], vec![LoadGlobal(0), Return]);
+        let apply = named_fn("apply", 1, 1, &[], vec![LoadFast(0), Call(0), Return]);
+        let m = managed_module(
+            "m",
+            vec![apply],
+            module_body(&["apply"], vec![Const::None], &["apply"], 0, vec![
+                MakeFunction { func: 0, flags: 0 },
+                StoreFast(0),
+                LoadConst(0),
+                Return,
+            ]),
+        );
+        let entry_body = module_body(&["X", "cb", "m"], vec![Const::Int(42)], &["cb", "m", "apply"], 1, vec![
+            LoadConst(0),
+            StoreFast(0),
+            MakeFunction { func: 0, flags: 0 },
+            StoreFast(1),
+            ImportName(1),
+            StoreFast(2),
+            LoadFast(2),
+            LoadAttr { name: 2, cache: 0 },
+            LoadFast(1),
+            Call(1),
+            Return,
+        ]);
+        let bundle = Bundle {
+            entry: managed_module("__main__", vec![cb], entry_body),
+            modules: vec![m],
+        };
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let result = run_bundle(bundle, &mut model).unwrap();
+        assert_eq!(result.as_fixnum(), Some(42));
     }
 
     #[test]

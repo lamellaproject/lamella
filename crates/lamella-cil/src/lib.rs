@@ -16,7 +16,7 @@ pub use body::{
 };
 pub use codec::{
     DecodeError, EncodeError, decode, decode_at, decode_with_offsets, encode, encode_with_offsets,
-    instruction_offsets,
+    instruction_index_of_offset, instruction_offsets,
 };
 pub use instruction::{Instruction, Operand};
 pub use opcode::{Encoding, Opcode, OperandKind};

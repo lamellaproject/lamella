@@ -589,6 +589,22 @@ pub enum Inst {
         /// the roots the emitted TypeDesc lists for the collector to trace and relocate.
         ref_offsets: Box<[u32]>,
     },
+    /// Allocates a garbage-collected object of `payload_size` bytes whose runtime type -- its `obj-4`
+    /// TypeDesc -- is CLONED from `proto`'s header, rather than baked from a static [`TypeHandle`] like
+    /// [`Inst::Alloc`]. The target reads `proto`'s descriptor (`[proto - 4]`), allocates via
+    /// `lamella_gc_alloc(payload_size, that_desc)` (an allocation safepoint), writes that descriptor at the
+    /// new object's `obj-4`, and yields the `ObjectRef`. Because the descriptor is shared with `proto`, the
+    /// GC traces the new object with PROTO's trace map -- so the two MUST be the same shape (a same-type
+    /// clone). The engine of an immutable delegate `Combine`: the concrete delegate type is only known at
+    /// run time (from the `a`/`b` operands), so the new `MulticastDelegate` clones an operand's descriptor
+    /// and a following `castclass` to the concrete delegate type still passes. The payload is NOT zeroed
+    /// (the bump allocator does not zero); the producer must initialize the ref fields before any safepoint.
+    AllocLike {
+        /// The prototype object whose runtime TypeDesc (`obj-4`) the new object clones.
+        proto: ValueId,
+        /// The payload size in bytes of the new object (a delegate is 12; matches `proto`'s size).
+        payload_size: u32,
+    },
     /// Loads the TypeDesc pointer of a heap object -- the word the allocator wrote in the header
     /// just before the payload (`object - 4` per the GC ABI). The runtime type identity of a boxed
     /// value / reference, compared against [`Inst::TypeDescAddr`] for an `unbox.any`/`castclass`

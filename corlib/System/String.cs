@@ -5,6 +5,9 @@ namespace System
     {
         public static readonly string Empty = "";
 
+        [Lamella.Runtime.RuntimeProvided] public unsafe String(char* value) { }
+        [Lamella.Runtime.RuntimeProvided] public unsafe String(char* value, int startIndex, int length) { }
+
         public int Length { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
         [System.Runtime.CompilerServices.IndexerName("Chars")]
         public char this[int index] { [Lamella.Runtime.RuntimeProvided] get { return '\0'; } }
@@ -384,21 +387,39 @@ namespace System
             return this.Substring(0, end + 1);
         }
 
-        public string ToUpper()
-        {
-            System.Text.StringBuilder result = new System.Text.StringBuilder();
-            int n = this.Length;
-            for (int i = 0; i < n; i++) result.Append(Char.ToUpper(this[i]));
-            return result.ToString();
-        }
+        public string ToUpper() { return MapCase(true); }
 
-        public string ToLower()
+        public string ToLower() { return MapCase(false); }
+
+        private string MapCase(bool toUpper)
         {
             System.Text.StringBuilder result = new System.Text.StringBuilder();
             int n = this.Length;
-            for (int i = 0; i < n; i++) result.Append(Char.ToLower(this[i]));
+            for (int i = 0; i < n; i++)
+            {
+                char c = this[i];
+                if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n)
+                {
+                    char d = this[i + 1];
+                    if (d >= 0xDC00 && d <= 0xDFFF)
+                    {
+                        int cp = 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+                        int mapped = toUpper ? CaseMapping.ToUpperCodePoint(cp) : CaseMapping.ToLowerCodePoint(cp);
+                        result.Append((char)(0xD800 + ((mapped - 0x10000) >> 10)));
+                        result.Append((char)(0xDC00 + ((mapped - 0x10000) & 0x3FF)));
+                        i++;
+                        continue;
+                    }
+                }
+                result.Append(toUpper ? CaseMapping.ToUpper(c) : CaseMapping.ToLower(c));
+            }
             return result.ToString();
         }
+#if LAMELLA_SURFACE_STRING_COMPARISON
+        public string ToUpperInvariant() { return MapCase(true); }
+
+        public string ToLowerInvariant() { return MapCase(false); }
+#endif
 
         public string Replace(char oldChar, char newChar)
         {
@@ -503,32 +524,17 @@ namespace System
             return result.ToString();
         }
 
-        private static int CompareOrdinalNormalized(string a, string b)
-        {
-            if ((object)a == null) return (object)b == null ? 0 : -1;
-            if ((object)b == null) return 1;
-            int n = a.Length;
-            int m = b.Length;
-            int limit = n < m ? n : m;
-            for (int i = 0; i < limit; i++)
-            {
-                if (a[i] != b[i]) return a[i] < b[i] ? -1 : 1;
-            }
-            if (n == m) return 0;
-            return n < m ? -1 : 1;
-        }
-
-        public int CompareTo(string strB) { return CompareOrdinalNormalized(this, strB); }
+        public int CompareTo(string strB) { return CompareOrdinal(this, strB); }
 
         public int CompareTo(object obj)
         {
             if ((object)obj == null) return 1;
             string other = obj as string;
             if ((object)other == null) throw new ArgumentException("Object must be of type String.");
-            return CompareOrdinalNormalized(this, other);
+            return CompareOrdinal(this, other);
         }
 
-        public static int Compare(string strA, string strB) { return CompareOrdinalNormalized(strA, strB); }
+        public static int Compare(string strA, string strB) { return CompareOrdinal(strA, strB); }
 
         public static int CompareOrdinal(string strA, string strB)
         {
@@ -546,6 +552,127 @@ namespace System
         }
 
         public bool Equals(string value) { return this == value; }
+
+#if LAMELLA_SURFACE_STRING_COMPARISON
+        private static bool ComparisonFoldsCase(StringComparison comparisonType)
+        {
+            switch (comparisonType)
+            {
+                case StringComparison.CurrentCulture:
+                case StringComparison.InvariantCulture:
+                case StringComparison.Ordinal:
+                    return false;
+                case StringComparison.CurrentCultureIgnoreCase:
+                case StringComparison.InvariantCultureIgnoreCase:
+                case StringComparison.OrdinalIgnoreCase:
+                    return true;
+                default:
+                    throw new ArgumentException("The string comparison type passed in is currently not supported.", "comparisonType");
+            }
+        }
+
+        private static int NextCodePoint(string s, ref int i, int limit)
+        {
+            char c = s[i];
+            i++;
+            if (c >= 0xD800 && c <= 0xDBFF && i < limit)
+            {
+                char d = s[i];
+                if (d >= 0xDC00 && d <= 0xDFFF)
+                {
+                    i++;
+                    return 0x10000 + ((c - 0xD800) << 10) + (d - 0xDC00);
+                }
+            }
+            return c;
+        }
+
+        private static int CompareOrdinalIgnoreCase(string a, string b)
+        {
+            if ((object)a == null) return (object)b == null ? 0 : -1;
+            if ((object)b == null) return 1;
+            int n = a.Length;
+            int m = b.Length;
+            int ia = 0;
+            int ib = 0;
+            while (ia < n && ib < m)
+            {
+                int ca = NextCodePoint(a, ref ia, n);
+                int cb = NextCodePoint(b, ref ib, m);
+                if (ca != cb)
+                {
+                    int fa = CaseMapping.ToUpperCodePoint(ca);
+                    int fb = CaseMapping.ToUpperCodePoint(cb);
+                    if (fa != fb) return fa - fb;
+                }
+            }
+            return n - m;
+        }
+
+        private bool MatchesAtIgnoreCase(string value, int start)
+        {
+            int m = value.Length;
+            int limit = start + m;
+            int iv = 0;
+            int it = start;
+            while (iv < m)
+            {
+                int cv = NextCodePoint(value, ref iv, m);
+                int ct = NextCodePoint(this, ref it, limit);
+                if (cv != ct && CaseMapping.ToUpperCodePoint(cv) != CaseMapping.ToUpperCodePoint(ct)) return false;
+            }
+            return true;
+        }
+
+        public static int Compare(string strA, string strB, StringComparison comparisonType)
+        {
+            if (ComparisonFoldsCase(comparisonType)) return CompareOrdinalIgnoreCase(strA, strB);
+            return CompareOrdinal(strA, strB);
+        }
+
+        public static bool Equals(string a, string b, StringComparison comparisonType)
+        {
+            bool foldsCase = ComparisonFoldsCase(comparisonType);
+            if ((object)a == (object)b) return true;
+            if ((object)a == null || (object)b == null) return false;
+            if (a.Length != b.Length) return false;
+            if (!foldsCase) return a == b;
+            return CompareOrdinalIgnoreCase(a, b) == 0;
+        }
+
+        public bool Equals(string value, StringComparison comparisonType)
+        {
+            return Equals(this, value, comparisonType);
+        }
+
+        public bool StartsWith(string value, StringComparison comparisonType)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            if (!ComparisonFoldsCase(comparisonType)) return StartsWith(value);
+            if (value.Length > this.Length) return false;
+            return MatchesAtIgnoreCase(value, 0);
+        }
+
+        public bool EndsWith(string value, StringComparison comparisonType)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            if (!ComparisonFoldsCase(comparisonType)) return EndsWith(value);
+            if (value.Length > this.Length) return false;
+            return MatchesAtIgnoreCase(value, this.Length - value.Length);
+        }
+
+        public int IndexOf(string value, StringComparison comparisonType)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            if (!ComparisonFoldsCase(comparisonType)) return IndexOf(value);
+            int last = this.Length - value.Length;
+            for (int start = 0; start <= last; start++)
+            {
+                if (MatchesAtIgnoreCase(value, start)) return start;
+            }
+            return -1;
+        }
+#endif
 
         public override bool Equals(object value)
         {

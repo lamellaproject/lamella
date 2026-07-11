@@ -4,9 +4,16 @@
  * - Client only: MBEDTLS_SSL_CLI_C without MBEDTLS_SSL_SRV_C.
  * - Suites: ECDHE-RSA / ECDHE-ECDSA / RSA key exchange over AES-GCM with SHA-256/384,
  *   curves P-256/P-384 -- the modern-server intersection, no CBC legacy.
- * - No wall clock (MBEDTLS_HAVE_TIME undefined): certificate validity WINDOWS are not
- *   checked on device -- chain signatures and hostname still are. A device wall-clock
- *   source is the documented follow-up.
+ * - Wall clock (MBEDTLS_HAVE_TIME_DATE): certificate validity WINDOWS are checked against
+ *   the embedder's clock (lamella_mbedtls_time -> the Rust set_time_source seam), alongside
+ *   the chain signatures and hostname. Without a registered source the clock reads 0 (the
+ *   epoch), which pre-dates every real certificate, so a REQUIRED (pinned/system-root)
+ *   verify FAILS "not yet valid" LOUDLY rather than trusting an unchecked window -- fail
+ *   closed. A device supplies REAL advancing time (a battery-backed RTC, or an SNTP-synced
+ *   clock). It must NOT install a frozen value (a build timestamp, a floor): a stopped clock
+ *   silently ACCEPTS certificates that expire after the frozen instant -- the opposite of
+ *   this fail-closed intent. A clockless board that must speak pinned TLS opts in to a
+ *   skip-with-warning policy at the seam instead (never a quiet success).
  * - No filesystem, no built-in networking, no printf-family dependency beyond what the
  *   modules below need: the library runs as a pure byte transform behind the Rust seam.
  * - Memory: every allocation routes through lamella_mbedtls_calloc/free (provided in
@@ -22,6 +29,11 @@
 void *lamella_mbedtls_calloc(size_t count, size_t size);
 void lamella_mbedtls_free(void *pointer);
 
+/* The wall clock mbedTLS reads for certificate validity windows (Unix seconds; the shim
+ * forwards to the embedder's source over the Rust seam). Declared here because the
+ * MBEDTLS_PLATFORM_TIME_MACRO below resolves to it wherever the library calls time(). */
+long long lamella_mbedtls_time(long long *t);
+
 /* Platform: custom memory, no OS entropy, everything else default-free. */
 #define MBEDTLS_PLATFORM_C
 #define MBEDTLS_PLATFORM_MEMORY
@@ -29,6 +41,18 @@ void lamella_mbedtls_free(void *pointer);
 #define MBEDTLS_PLATFORM_FREE_MACRO lamella_mbedtls_free
 #define MBEDTLS_NO_PLATFORM_ENTROPY
 #define MBEDTLS_ENTROPY_HARDWARE_ALT
+
+/* Wall clock: the embedder's time drives certificate validity-window checks. TIME_MACRO
+ * routes every time() call to our shim; the 64-bit type sidesteps the 2038 wrap; GMTIME_R_ALT
+ * provides a libc-free UTC breakdown (the shim's civil-from-days). */
+#define MBEDTLS_HAVE_TIME
+#define MBEDTLS_HAVE_TIME_DATE
+#define MBEDTLS_PLATFORM_TIME_MACRO lamella_mbedtls_time
+#define MBEDTLS_PLATFORM_TIME_TYPE_MACRO long long
+#define MBEDTLS_PLATFORM_GMTIME_R_ALT
+/* HAVE_TIME also pulls mbedtls_ms_time (DTLS/TLS-1.3 retransmit timers, unused on this TLS
+ * 1.2 client build); freestanding has no platform impl, so the shim provides one. */
+#define MBEDTLS_PLATFORM_MS_TIME_ALT
 
 /* RNG: CTR_DRBG seeded from the hardware entropy hook. */
 #define MBEDTLS_ENTROPY_C

@@ -1,0 +1,18 @@
+{
+  "resources": [
+    {
+      "uri": "lamella://boards",
+      "name": "Supported boards",
+      "description": "The dev-board registry: board_model wire values + curated boards.",
+      "mimeType": "text/markdown",
+      "text": "# Supported dev boards\n\nThe `board_model` wire values a board reports over Lamella Link:\n\n| model | board |\n|--:|---|\n| 0 | custom board |\n| 1 | BBC micro:bit v1 |\n| 2 | Raspberry Pi Pico 2 |\n| 3 | SAM4S Xplained Pro |\n| 4 | SAME54 Xplained Pro |\n| 5 | SAMD21 Xplained Pro |\n| 6 | ATSAMW25 Xplained Pro |\n| 7 | STM32F091 Nucleo-64 |\n| 8 | STM32L476 Nucleo |\n| 9 | Arduino MKR1000 |\n| 10 | Raspberry Pi Pico 2 W |\n| 11 | BBC micro:bit v2 |\n| 12 | Arduino Zero |\n| 13 | Raspberry Pi Pico |\n| 14 | Espressif ESP32-C6 |13, USB `1209:0001`\n- **Espressif ESP32-C6** (`esp32c6`, null) — board_model 14\n\nRun `lamella_identify_device` on a connected board to read its `board_model` + chip IDCODE live.\n"
+    },
+    {
+      "uri": "lamella://samples/hello",
+      "name": "Hello / compute sample",
+      "description": "A minimal host-runnable C# program (Console + a loop).",
+      "mimeType": "text/x-csharp",
+      "text": "class Program {\n    static void Main() {\n        int total = 0;\n        for (int i = 1; i <= 100; i++) total += i;\n        System.Console.WriteLine(\"sum 1..100 = \" + total);\n    }\n}\n"
+    }
+  ]
+}

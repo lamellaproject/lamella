@@ -1089,11 +1089,13 @@ impl Encoder {
             let carried = self.relocs.iter().find(|r| r.at == target).copied();
             let ins = at + 2;
             let pad = (4 - ((ins + 2) & 3)) & 3;
-            let mut island = Vec::with_capacity((6 + pad) as usize);
+            let mut island = Vec::with_capacity(8);
             island.extend_from_slice(&0xE000u16.to_le_bytes());
             island.resize(island.len() + pad as usize, 0);
             island.extend_from_slice(&word);
             let word_site = ins + 2 + pad;
+            let trailing = (4 - (island.len() as u32 & 3)) & 3;
+            island.resize(island.len() + trailing as usize, 0);
             let over = ins + island.len() as u32;
             self.splice_in(ins, &island);
             self.labels[label_id as usize] = Some(word_site);
@@ -1553,6 +1555,33 @@ mod tests {
             &0x1234_5678u32.to_le_bytes(),
             "the load still resolves to its constant after both grew the image"
         );
+    }
+
+    #[test]
+    fn an_island_preserves_word_alignment_of_later_literal_loads() {
+        let mut enc = Encoder::new();
+        let pool_a = enc.new_label();
+        enc.ldr_literal(Reg::R0, pool_a).unwrap();
+        for _ in 0..600 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.pool_word(pool_a, 0xAAAA_AAAA);
+        enc.align_to_word();
+        let pool_b = enc.new_label();
+        enc.ldr_literal(Reg::R1, pool_b).unwrap();
+        enc.align_to_word();
+        enc.pool_word(pool_b, 0xBBBB_BBBB);
+        let out = enc
+            .finish()
+            .expect("region B's word-aligned literal load survives region A's island");
+        let pos = out.label_position(pool_b).expect("pool_b bound") as usize;
+        assert_eq!(
+            &out.bytes[pos..pos + 4],
+            &0xBBBB_BBBBu32.to_le_bytes(),
+            "region B's load still resolves to its constant after the island shifted it"
+        );
+        assert_eq!(pos % 4, 0, "the islanded pool word stays word-aligned");
     }
 
     #[test]

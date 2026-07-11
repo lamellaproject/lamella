@@ -12,7 +12,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use lamella_ir::{
-    BasicBlock, BinOp, BlockId, ConvKind, Function, Inst, MirType, Terminator, TypeHandle, ValueId,
+    BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, TypeHandle,
+    ValueId,
 };
 use lamella_metadata::tables::table;
 use lamella_metadata::{Assembly, SigType, TargetLayout};
@@ -431,7 +432,7 @@ pub fn build_library_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let names = library_symbol_names(&assembly, funcs.len(), &prefix);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let descriptors = MetadataResolver::new(&assembly).type_descriptors();
-    riscv32::lower_object(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerRiscv)
+    riscv32::lower_object_library(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerRiscv)
 }
 
 /// AOT-lowers a whole assembly as a LINKABLE LIBRARY object (a corlib, a helper library): every public
@@ -1229,6 +1230,40 @@ fn lower_assembly_debug<'a>(
                     funcs[*rid as usize] = char_to_string_body();
                     continue;
                 }
+                if (type_name.namespace, type_name.name) == ("System", "Delegate") && params == 2 {
+                    if method.name() == Some("Combine") {
+                        funcs[*rid as usize] = delegate_combine_body();
+                        continue;
+                    }
+                    if method.name() == Some("Remove") {
+                        funcs[*rid as usize] = delegate_remove_body();
+                        continue;
+                    }
+                }
+                if let Some(import) =
+                    net_seam_import(type_name.namespace, type_name.name, method.name())
+                {
+                    if let Some(sig) = &signature {
+                        let param_types: Vec<MirType> =
+                            sig.parameters.iter().map(|p| mir_type(p, assembly)).collect();
+                        funcs[*rid as usize] = runtime_seam_body(
+                            &param_types,
+                            &sig.parameters,
+                            !matches!(sig.return_type, SigType::Void),
+                            net_seam_folds_buffer(method.name()),
+                            import,
+                        );
+                        continue;
+                    }
+                }
+                if net_seam_deferred(type_name.namespace, type_name.name, method.name()) {
+                    if let Some(sig) = &signature {
+                        let param_types: Vec<MirType> =
+                            sig.parameters.iter().map(|p| mir_type(p, assembly)).collect();
+                        funcs[*rid as usize] = net_deferred_body(&param_types, -2);
+                        continue;
+                    }
+                }
             }
         }
         let mut arg_types = Vec::new();
@@ -1291,6 +1326,774 @@ fn method_exports(assembly: &Assembly, has_main: bool) -> Vec<(String, u32)> {
     exports
 }
 
+/// A tiny SSA/CFG builder for the hand-synthesized MULTI-block runtime bodies (`Delegate.Combine`, and
+/// later `Remove`) -- the single-block `synthesize_runtime_reader` style does not scale to loops/branches.
+/// Values are numbered as created; blocks accumulate instructions + a terminator. A value defined in a
+/// block is usable in any later block it dominates (verify is define-once/use-anywhere with no dominance
+/// test, regalloc is liveness-based), so a value is threaded as a block PARAM only where it MERGES with a
+/// different value at a join; elsewhere a dominated block reads it directly.
+struct MirBuilder {
+    value_types: Vec<MirType>,
+    blocks: Vec<BasicBlock>,
+    cur: usize,
+    n_params: usize,
+}
+
+impl MirBuilder {
+    fn new(params: &[MirType]) -> (Self, Vec<ValueId>) {
+        let ids: Vec<ValueId> = (0..params.len()).map(|i| ValueId(i as u32)).collect();
+        let entry = BasicBlock {
+            params: ids.clone(),
+            insts: Vec::new(),
+            terminator: None,
+        };
+        (
+            Self {
+                value_types: params.to_vec(),
+                blocks: vec![entry],
+                cur: 0,
+                n_params: params.len(),
+            },
+            ids,
+        )
+    }
+    /// A fresh value of `ty`.
+    fn val(&mut self, ty: MirType) -> ValueId {
+        self.value_types.push(ty);
+        ValueId((self.value_types.len() - 1) as u32)
+    }
+    /// A new EMPTY block (no params yet); returns its index. Blocks are created up front so branch targets
+    /// resolve, but their PARAMS are created lazily by [`Self::enter`] as blocks are filled in execution
+    /// order -- so a param's ValueId follows (not precedes) the values of the earlier blocks that jump to
+    /// it, keeping ValueIds in definition order the way the rest of the pipeline expects.
+    fn block(&mut self) -> usize {
+        self.blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: Vec::new(),
+            terminator: None,
+        });
+        self.blocks.len() - 1
+    }
+    /// Enter block `b` to fill it, creating its parameters NOW (fresh ValueIds, in execution order); a
+    /// preceding `jump` supplies their values positionally. Returns the parameter values.
+    fn enter(&mut self, b: usize, param_types: &[MirType]) -> Vec<ValueId> {
+        let ids: Vec<ValueId> = param_types.iter().map(|t| self.val(*t)).collect();
+        self.blocks[b].params = ids.clone();
+        self.cur = b;
+        ids
+    }
+    /// Enter a param-less block to fill it.
+    fn at(&mut self, b: usize) {
+        self.cur = b;
+    }
+    /// Append a value-defining instruction of result type `ty`; returns its value.
+    fn emit(&mut self, ty: MirType, inst: Inst) -> ValueId {
+        let v = self.val(ty);
+        self.blocks[self.cur].insts.push((v, inst));
+        v
+    }
+    /// Append a side-effecting instruction (`Store`/`ArrayStore`/`CopyBlock`); its result is an ignored i32.
+    fn side(&mut self, inst: Inst) {
+        let v = self.val(MirType::I32);
+        self.blocks[self.cur].insts.push((v, inst));
+    }
+    fn ret(&mut self, v: ValueId) {
+        self.blocks[self.cur].terminator = Some(Terminator::Return(Some(v)));
+    }
+    fn ret_void(&mut self) {
+        self.blocks[self.cur].terminator = Some(Terminator::Return(None));
+    }
+    fn jump(&mut self, target: usize, args: Vec<ValueId>) {
+        self.blocks[self.cur].terminator = Some(Terminator::Jump {
+            target: BlockId(target as u32),
+            args,
+        });
+    }
+    fn branch(&mut self, cond: ValueId, if_true: usize, if_false: usize) {
+        self.blocks[self.cur].terminator = Some(Terminator::Branch {
+            cond,
+            if_true: BlockId(if_true as u32),
+            true_args: Vec::new(),
+            if_false: BlockId(if_false as u32),
+            false_args: Vec::new(),
+        });
+    }
+    fn finish(self, ret: Option<MirType>) -> Function {
+        Function {
+            params: self.value_types[..self.n_params].to_vec(),
+            ret,
+            value_types: self.value_types,
+            entry: BlockId(0),
+            blocks: self.blocks,
+        }
+    }
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Delegate.Combine(a, b)` -- the immutable multicast
+/// concatenation the AOT builds over the `{_target@0, _methodPtr@4, _invocationList@8}` delegate layout (the
+/// interpreter uses its native rep; both implement the same contract, so parity holds by same-semantics).
+/// `Combine(a, null) == a`, `Combine(null, b) == b`; otherwise a NEW `MulticastDelegate` -- cloning a's
+/// CONCRETE descriptor via [`Inst::AllocLike`] so the caller's `castclass` to the concrete delegate type
+/// still passes -- whose `_invocationList` is the FLATTENED concatenation of a's entries then b's. Each
+/// operand contributes its own `_invocationList` (a `Delegate[count][entries]`) when multicast, or itself
+/// when single-cast; `Invoke` walks the list and returns the last value (the invoke port is already on
+/// every backend).
+///
+/// GC: with the bump allocator no object moves, so the freshly built list + result are stable. When a
+/// precise MOVING collector lands it must trace `Delegate[]` elements (the deferred array-tracing contract);
+/// the list is filled BEFORE the result's `AllocLike` safepoint and the result's ref fields are then set
+/// with no intervening safepoint, so only that array-element tracing is owed. The `list` is a live root at
+/// the `AllocLike` safepoint (used just after) and `a` is the live prototype, so both survive a collection.
+///
+/// Public so a per-target verifier example (`qemu-riscv-combine`, `wasm-combine`) can lower + run the
+/// SAME synthesized body the corlib build substitutes -- proving the target-agnostic MIR end to end.
+pub fn delegate_combine_body() -> Function {
+    const DELEGATE_SIZE: u32 = 12;
+    const INVLIST_OFF: i64 = 8;
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt, objt]);
+    let (a, b) = (params[0], params[1]);
+
+    let ret_b = mb.block();
+    let chk_b = mb.block();
+    let ret_a = mb.block();
+    let body = mb.block();
+    let na_one = mb.block();
+    let na_list = mb.block();
+    let nb_head = mb.block();
+    let nb_one = mb.block();
+    let nb_list = mb.block();
+    let alloc = mb.block();
+    let copy_a1 = mb.block();
+    let copy_am = mb.block();
+    let copy_b = mb.block();
+    let copy_b1 = mb.block();
+    let copy_bm = mb.block();
+    let fin = mb.block();
+
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let refint = |value| Inst::Convert {
+        value,
+        kind: ConvKind::RefToInt,
+    };
+    let add = |lhs, rhs| Inst::Binary {
+        op: BinOp::Add,
+        lhs,
+        rhs,
+    };
+    let load = |address| Inst::Load {
+        address,
+        width: 4,
+        signed: false,
+    };
+    let eq = |lhs, rhs| Inst::Compare {
+        op: CmpOp::Eq,
+        lhs,
+        rhs,
+    };
+
+    mb.at(0);
+    let zero = mb.emit(i32t, c(0));
+    let ai = mb.emit(i32t, refint(a));
+    let a_null = mb.emit(i32t, eq(ai, zero));
+    mb.branch(a_null, ret_b, chk_b);
+    mb.at(ret_b);
+    mb.ret(b);
+
+    mb.at(chk_b);
+    let bi = mb.emit(i32t, refint(b));
+    let b_null = mb.emit(i32t, eq(bi, zero));
+    mb.branch(b_null, ret_a, body);
+    mb.at(ret_a);
+    mb.ret(a);
+
+    mb.at(body);
+    let off8 = mb.emit(i32t, c(INVLIST_OFF));
+    let a8 = mb.emit(i32t, add(ai, off8));
+    let la = mb.emit(objt, load(a8));
+    let b8 = mb.emit(i32t, add(bi, off8));
+    let lb = mb.emit(objt, load(b8));
+    let lai = mb.emit(i32t, refint(la));
+    let la_null = mb.emit(i32t, eq(lai, zero));
+    mb.branch(la_null, na_one, na_list);
+    mb.at(na_one);
+    let one_a = mb.emit(i32t, c(1));
+    mb.jump(nb_head, vec![one_a]);
+    mb.at(na_list);
+    let la_count = mb.emit(i32t, load(lai));
+    mb.jump(nb_head, vec![la_count]);
+
+    let na_in = mb.enter(nb_head, &[i32t])[0];
+    let lbi = mb.emit(i32t, refint(lb));
+    let lb_null = mb.emit(i32t, eq(lbi, zero));
+    mb.branch(lb_null, nb_one, nb_list);
+    mb.at(nb_one);
+    let one_b = mb.emit(i32t, c(1));
+    mb.jump(alloc, vec![na_in, one_b]);
+    mb.at(nb_list);
+    let lb_count = mb.emit(i32t, load(lbi));
+    mb.jump(alloc, vec![na_in, lb_count]);
+
+    let alloc_p = mb.enter(alloc, &[i32t, i32t]);
+    let (na, nb) = (alloc_p[0], alloc_p[1]);
+    let total = mb.emit(i32t, add(na, nb));
+    let list = mb.emit(
+        objt,
+        Inst::AllocArray {
+            handle: TypeHandle(0),
+            length: total,
+            element_size: 4,
+        },
+    );
+    let listi = mb.emit(i32t, refint(list));
+    let four = mb.emit(i32t, c(4));
+    let list_e = mb.emit(i32t, add(listi, four));
+    mb.branch(la_null, copy_a1, copy_am);
+    mb.at(copy_a1);
+    let idx0 = mb.emit(i32t, c(0));
+    mb.side(Inst::ArrayStore {
+        array: list,
+        index: idx0,
+        value: a,
+        element_size: 4,
+    });
+    mb.jump(copy_b, vec![]);
+    mb.at(copy_am);
+    let la_e = mb.emit(i32t, add(lai, four));
+    let na_bytes = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Mul,
+            lhs: na,
+            rhs: four,
+        },
+    );
+    mb.side(Inst::CopyBlock {
+        dst: list_e,
+        src: la_e,
+        size: na_bytes,
+    });
+    mb.jump(copy_b, vec![]);
+
+    mb.at(copy_b);
+    mb.branch(lb_null, copy_b1, copy_bm);
+    mb.at(copy_b1);
+    mb.side(Inst::ArrayStore {
+        array: list,
+        index: na,
+        value: b,
+        element_size: 4,
+    });
+    mb.jump(fin, vec![]);
+    mb.at(copy_bm);
+    let na_off = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Mul,
+            lhs: na,
+            rhs: four,
+        },
+    );
+    let dst_b = mb.emit(i32t, add(list_e, na_off));
+    let lb_e = mb.emit(i32t, add(lbi, four));
+    let nb_bytes = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Mul,
+            lhs: nb,
+            rhs: four,
+        },
+    );
+    mb.side(Inst::CopyBlock {
+        dst: dst_b,
+        src: lb_e,
+        size: nb_bytes,
+    });
+    mb.jump(fin, vec![]);
+
+    mb.at(fin);
+    let result = mb.emit(
+        objt,
+        Inst::AllocLike {
+            proto: a,
+            payload_size: DELEGATE_SIZE,
+        },
+    );
+    let ri = mb.emit(i32t, refint(result));
+    let z = mb.emit(i32t, c(0));
+    mb.side(Inst::Store {
+        address: ri,
+        value: z,
+        width: 4,
+    });
+    let r4 = mb.emit(i32t, add(ri, four));
+    mb.side(Inst::Store {
+        address: r4,
+        value: z,
+        width: 4,
+    });
+    let r8 = mb.emit(i32t, add(ri, off8));
+    let listw = mb.emit(i32t, refint(list));
+    mb.side(Inst::Store {
+        address: r8,
+        value: listw,
+        width: 4,
+    });
+    mb.ret(result);
+
+    mb.finish(Some(objt))
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Delegate.Remove(source, value)` -- the immutable
+/// `a -= b`. Removes the LAST entry of `source`'s invocation list that equals `value` (same `_target@0`
+/// AND `_methodPtr@4`), returning: `source` unchanged if `value` is not found; `null` if the list becomes
+/// empty; the bare remaining single-cast delegate if one entry is left; else a new `MulticastDelegate`
+/// (cloning `source`'s descriptor via [`Inst::AllocLike`]) over the shortened list.
+///
+/// A MULTICAST `value` (`a -= (b + c)`) removes the LAST contiguous SUBSEQUENCE of `source`'s list that
+/// equals `value`'s list -- a nested scan (outer over candidate start positions from the end, inner over
+/// the value list; the `multi_val`/`sub_*` blocks), matching .NET's `MulticastDelegate.RemoveImpl`. Not
+/// found (or a single-cast source that cannot contain a >=2-entry subsequence) returns `source` unchanged.
+///
+/// GC: mirrors [`delegate_combine_body`] -- the only safepoints are the new list's `AllocArray` and the
+/// result's `AllocLike`; the list is filled between them with no intervening alloc, and the result's ref
+/// fields are set before RETURN, so a moving collector owes only the deferred `Delegate[]` element tracing.
+pub fn delegate_remove_body() -> Function {
+    const DELEGATE_SIZE: u32 = 12;
+    const INVLIST_OFF: i64 = 8;
+    let i32t = MirType::I32;
+    let objt = MirType::ObjectRef;
+    let (mut mb, params) = MirBuilder::new(&[objt, objt]);
+    let (source, value) = (params[0], params[1]);
+
+    let ret_null = mb.block();
+    let ret_source = mb.block();
+    let b1 = mb.block();
+    let b2 = mb.block();
+    let b3 = mb.block();
+    let single_src = mb.block();
+    let multi_src = mb.block();
+    let match_hdr = mb.block();
+    let cmp_k = mb.block();
+    let matched = mb.block();
+    let match_next = mb.block();
+    let decide = mb.block();
+    let decide1 = mb.block();
+    let single_remain = mb.block();
+    let rebuild = mb.block();
+    let multi_val = mb.block();
+    let sub_setup = mb.block();
+    let sub_hdr = mb.block();
+    let sub_body = mb.block();
+    let sub_inner = mb.block();
+    let sub_cmp = mb.block();
+    let sub_cont = mb.block();
+    let sub_next = mb.block();
+    let sub_matched = mb.block();
+    let sub_decide1 = mb.block();
+    let sub_single = mb.block();
+    let sub_single_i0 = mb.block();
+    let sub_single_pos = mb.block();
+    let sub_rebuild = mb.block();
+
+    let c = |v: i64| Inst::ConstInt { ty: i32t, value: v };
+    let refint = |value| Inst::Convert { value, kind: ConvKind::RefToInt };
+    let intref = |value| Inst::Convert { value, kind: ConvKind::IntToRef };
+    let add = |lhs, rhs| Inst::Binary { op: BinOp::Add, lhs, rhs };
+    let sub = |lhs, rhs| Inst::Binary { op: BinOp::Sub, lhs, rhs };
+    let mul = |lhs, rhs| Inst::Binary { op: BinOp::Mul, lhs, rhs };
+    let band = |lhs, rhs| Inst::Binary { op: BinOp::And, lhs, rhs };
+    let load = |address| Inst::Load { address, width: 4, signed: false };
+    let eq = |lhs, rhs| Inst::Compare { op: CmpOp::Eq, lhs, rhs };
+    let lt = |lhs, rhs| Inst::Compare { op: CmpOp::SignedLt, lhs, rhs };
+    let lt0 = |lhs, zero| Inst::Compare { op: CmpOp::SignedLt, lhs, rhs: zero };
+
+    mb.at(0);
+    let zero = mb.emit(i32t, c(0));
+    let si = mb.emit(i32t, refint(source));
+    let s_null = mb.emit(i32t, eq(si, zero));
+    mb.branch(s_null, ret_null, b1);
+    mb.at(ret_null);
+    let nz = mb.emit(i32t, c(0));
+    let nref = mb.emit(objt, intref(nz));
+    mb.ret(nref);
+    mb.at(ret_source);
+    mb.ret(source);
+
+    mb.at(b1);
+    let vi = mb.emit(i32t, refint(value));
+    let v_null = mb.emit(i32t, eq(vi, zero));
+    mb.branch(v_null, ret_source, b2);
+
+    mb.at(b2);
+    let off8 = mb.emit(i32t, c(INVLIST_OFF));
+    let v8 = mb.emit(i32t, add(vi, off8));
+    let vl = mb.emit(objt, load(v8));
+    let vli = mb.emit(i32t, refint(vl));
+    let vl_zero = mb.emit(i32t, eq(vli, zero));
+    mb.branch(vl_zero, b3, multi_val);
+
+    mb.at(b3);
+    let four = mb.emit(i32t, c(4));
+    let vt = mb.emit(i32t, load(vi));
+    let vm4 = mb.emit(i32t, add(vi, four));
+    let vm = mb.emit(i32t, load(vm4));
+    let s8 = mb.emit(i32t, add(si, off8));
+    let sl = mb.emit(objt, load(s8));
+    let sli = mb.emit(i32t, refint(sl));
+    let sl_null = mb.emit(i32t, eq(sli, zero));
+    mb.branch(sl_null, single_src, multi_src);
+
+    mb.at(single_src);
+    let st = mb.emit(i32t, load(si));
+    let t_eq = mb.emit(i32t, eq(st, vt));
+    let sm4 = mb.emit(i32t, add(si, four));
+    let sm = mb.emit(i32t, load(sm4));
+    let m_eq = mb.emit(i32t, eq(sm, vm));
+    let s_match = mb.emit(i32t, band(t_eq, m_eq));
+    mb.branch(s_match, ret_null, ret_source);
+
+    mb.at(multi_src);
+    let sn = mb.emit(i32t, load(sli));
+    let se = mb.emit(i32t, add(sli, four));
+    let one = mb.emit(i32t, c(1));
+    let kstart = mb.emit(i32t, sub(sn, one));
+    mb.jump(match_hdr, vec![kstart]);
+
+    let k = mb.enter(match_hdr, &[i32t])[0];
+    let k_neg = mb.emit(i32t, lt0(k, zero));
+    mb.branch(k_neg, ret_source, cmp_k);
+    mb.at(cmp_k);
+    let koff = mb.emit(i32t, mul(k, four));
+    let ek_addr = mb.emit(i32t, add(se, koff));
+    let e = mb.emit(i32t, load(ek_addr));
+    let et = mb.emit(i32t, load(e));
+    let te = mb.emit(i32t, eq(et, vt));
+    let e4 = mb.emit(i32t, add(e, four));
+    let em = mb.emit(i32t, load(e4));
+    let me = mb.emit(i32t, eq(em, vm));
+    let e_match = mb.emit(i32t, band(te, me));
+    mb.branch(e_match, matched, match_next);
+    mb.at(matched);
+    mb.jump(decide, vec![k]);
+    mb.at(match_next);
+    let k1 = mb.emit(i32t, sub(k, one));
+    mb.jump(match_hdr, vec![k1]);
+
+    let found = mb.enter(decide, &[i32t])[0];
+    let new_n = mb.emit(i32t, sub(sn, one));
+    let n_zero = mb.emit(i32t, eq(new_n, zero));
+    mb.branch(n_zero, ret_null, decide1);
+    mb.at(decide1);
+    let n_one = mb.emit(i32t, eq(new_n, one));
+    mb.branch(n_one, single_remain, rebuild);
+
+    mb.at(single_remain);
+    let rem_idx = mb.emit(i32t, sub(one, found));
+    let rem_off = mb.emit(i32t, mul(rem_idx, four));
+    let rem_addr = mb.emit(i32t, add(se, rem_off));
+    let rem_e = mb.emit(i32t, load(rem_addr));
+    let rem_ref = mb.emit(objt, intref(rem_e));
+    mb.ret(rem_ref);
+
+    mb.at(rebuild);
+    let nl = mb.emit(
+        objt,
+        Inst::AllocArray { handle: TypeHandle(0), length: new_n, element_size: 4 },
+    );
+    let nli = mb.emit(i32t, refint(nl));
+    let ne = mb.emit(i32t, add(nli, four));
+    let found4 = mb.emit(i32t, mul(found, four));
+    mb.side(Inst::CopyBlock { dst: ne, src: se, size: found4 });
+    let fp1 = mb.emit(i32t, add(found, one));
+    let fp1_4 = mb.emit(i32t, mul(fp1, four));
+    let src2 = mb.emit(i32t, add(se, fp1_4));
+    let dst2 = mb.emit(i32t, add(ne, found4));
+    let rem_count = mb.emit(i32t, sub(new_n, found));
+    let rem_bytes = mb.emit(i32t, mul(rem_count, four));
+    mb.side(Inst::CopyBlock { dst: dst2, src: src2, size: rem_bytes });
+    let result = mb.emit(
+        objt,
+        Inst::AllocLike { proto: source, payload_size: DELEGATE_SIZE },
+    );
+    let ri = mb.emit(i32t, refint(result));
+    let rz = mb.emit(i32t, c(0));
+    mb.side(Inst::Store { address: ri, value: rz, width: 4 });
+    let r4 = mb.emit(i32t, add(ri, four));
+    mb.side(Inst::Store { address: r4, value: rz, width: 4 });
+    let r8 = mb.emit(i32t, add(ri, off8));
+    let listw = mb.emit(i32t, refint(nl));
+    mb.side(Inst::Store { address: r8, value: listw, width: 4 });
+    mb.ret(result);
+
+    mb.at(multi_val);
+    let s8b = mb.emit(i32t, add(si, off8));
+    let slb = mb.emit(objt, load(s8b));
+    let slib = mb.emit(i32t, refint(slb));
+    let sl_null_b = mb.emit(i32t, eq(slib, zero));
+    mb.branch(sl_null_b, ret_source, sub_setup);
+
+    mb.at(sub_setup);
+    let four2 = mb.emit(i32t, c(4));
+    let snb = mb.emit(i32t, load(slib));
+    let seb = mb.emit(i32t, add(slib, four2));
+    let vnb = mb.emit(i32t, load(vli));
+    let veb = mb.emit(i32t, add(vli, four2));
+    let istart = mb.emit(i32t, sub(snb, vnb));
+    mb.jump(sub_hdr, vec![istart]);
+
+    let i = mb.enter(sub_hdr, &[i32t])[0];
+    let i_neg = mb.emit(i32t, lt0(i, zero));
+    mb.branch(i_neg, ret_source, sub_body);
+    mb.at(sub_body);
+    let j0 = mb.emit(i32t, c(0));
+    mb.jump(sub_inner, vec![i, j0]);
+
+    let inner = mb.enter(sub_inner, &[i32t, i32t]);
+    let (ii, jj) = (inner[0], inner[1]);
+    let j_lt = mb.emit(i32t, lt(jj, vnb));
+    mb.branch(j_lt, sub_cmp, sub_matched);
+    mb.at(sub_cmp);
+    let ij = mb.emit(i32t, add(ii, jj));
+    let ij4 = mb.emit(i32t, mul(ij, four2));
+    let s_ea = mb.emit(i32t, add(seb, ij4));
+    let s_e = mb.emit(i32t, load(s_ea));
+    let vj4 = mb.emit(i32t, mul(jj, four2));
+    let v_ea = mb.emit(i32t, add(veb, vj4));
+    let v_e = mb.emit(i32t, load(v_ea));
+    let s_t = mb.emit(i32t, load(s_e));
+    let v_t = mb.emit(i32t, load(v_e));
+    let t_ok = mb.emit(i32t, eq(s_t, v_t));
+    let s_ma = mb.emit(i32t, add(s_e, four2));
+    let s_m = mb.emit(i32t, load(s_ma));
+    let v_ma = mb.emit(i32t, add(v_e, four2));
+    let v_m = mb.emit(i32t, load(v_ma));
+    let m_ok = mb.emit(i32t, eq(s_m, v_m));
+    let both = mb.emit(i32t, band(t_ok, m_ok));
+    mb.branch(both, sub_cont, sub_next);
+    mb.at(sub_cont);
+    let one3 = mb.emit(i32t, c(1));
+    let jn = mb.emit(i32t, add(jj, one3));
+    mb.jump(sub_inner, vec![ii, jn]);
+    mb.at(sub_next);
+    let one4 = mb.emit(i32t, c(1));
+    let ip = mb.emit(i32t, sub(ii, one4));
+    mb.jump(sub_hdr, vec![ip]);
+
+    mb.at(sub_matched);
+    let new_nb = mb.emit(i32t, sub(snb, vnb));
+    let nb_zero = mb.emit(i32t, eq(new_nb, zero));
+    mb.branch(nb_zero, ret_null, sub_decide1);
+    mb.at(sub_decide1);
+    let one5 = mb.emit(i32t, c(1));
+    let nb_one = mb.emit(i32t, eq(new_nb, one5));
+    mb.branch(nb_one, sub_single, sub_rebuild);
+
+    mb.at(sub_single);
+    let i_is0 = mb.emit(i32t, eq(ii, zero));
+    mb.branch(i_is0, sub_single_i0, sub_single_pos);
+    mb.at(sub_single_i0);
+    let four3 = mb.emit(i32t, c(4));
+    let vn4 = mb.emit(i32t, mul(vnb, four3));
+    let surv0_a = mb.emit(i32t, add(seb, vn4));
+    let surv0 = mb.emit(i32t, load(surv0_a));
+    let surv0_ref = mb.emit(objt, intref(surv0));
+    mb.ret(surv0_ref);
+    mb.at(sub_single_pos);
+    let surv1 = mb.emit(i32t, load(seb));
+    let surv1_ref = mb.emit(objt, intref(surv1));
+    mb.ret(surv1_ref);
+
+    mb.at(sub_rebuild);
+    let nlb = mb.emit(
+        objt,
+        Inst::AllocArray { handle: TypeHandle(0), length: new_nb, element_size: 4 },
+    );
+    let nlib = mb.emit(i32t, refint(nlb));
+    let four4 = mb.emit(i32t, c(4));
+    let neb = mb.emit(i32t, add(nlib, four4));
+    let i4b = mb.emit(i32t, mul(ii, four4));
+    mb.side(Inst::CopyBlock { dst: neb, src: seb, size: i4b });
+    let ivn = mb.emit(i32t, add(ii, vnb));
+    let ivn4 = mb.emit(i32t, mul(ivn, four4));
+    let src2b = mb.emit(i32t, add(seb, ivn4));
+    let dst2b = mb.emit(i32t, add(neb, i4b));
+    let tail_c = mb.emit(i32t, sub(new_nb, ii));
+    let tail_b = mb.emit(i32t, mul(tail_c, four4));
+    mb.side(Inst::CopyBlock { dst: dst2b, src: src2b, size: tail_b });
+    let result2 = mb.emit(
+        objt,
+        Inst::AllocLike { proto: source, payload_size: DELEGATE_SIZE },
+    );
+    let ri2 = mb.emit(i32t, refint(result2));
+    let rz2 = mb.emit(i32t, c(0));
+    mb.side(Inst::Store { address: ri2, value: rz2, width: 4 });
+    let r4b = mb.emit(i32t, add(ri2, four4));
+    mb.side(Inst::Store { address: r4b, value: rz2, width: 4 });
+    let off8b = mb.emit(i32t, c(INVLIST_OFF));
+    let r8b = mb.emit(i32t, add(ri2, off8b));
+    let listw2 = mb.emit(i32t, refint(nlb));
+    mb.side(Inst::Store { address: r8b, value: listw2, width: 4 });
+    mb.ret(result2);
+
+    mb.finish(Some(objt))
+}
+
+/// Maps a `[RuntimeProvided]` `System.Net.Sockets.Socket` / `System.Net.Security.TlsNative` seam static
+/// to the C-ABI extern the AOT links against `lamella-runtime-support-net` (@runtime's no_std staticlib
+/// wrapping the SAME lamella-net-smoltcp + lamella-tls-mbedtls crates the interpreter binds). Returns
+/// `None` for any other method (it keeps its normal lowering). The names are PROVISIONAL, chosen to
+/// mirror the managed method names 1:1 -- the whole table reconciles in one place when @runtime posts the
+/// exact export list with the crate; the marshalling ([`runtime_seam_body`]) is name-independent.
+fn net_seam_import(namespace: &str, type_name: &str, method: Option<&str>) -> Option<&'static str> {
+    Some(match (namespace, type_name, method?) {
+        ("System.Net.Sockets", "Socket", "ConnectStart") => "lamella_net_connect_start",
+        ("System.Net.Sockets", "Socket", "ConnectPoll") => "lamella_net_connect_poll",
+        ("System.Net.Sockets", "Socket", "ListenStart") => "lamella_net_listen_start",
+        ("System.Net.Sockets", "Socket", "AcceptPoll") => "lamella_net_accept_poll",
+        ("System.Net.Sockets", "Socket", "SendPoll") => "lamella_net_send_poll",
+        ("System.Net.Sockets", "Socket", "ReceivePoll") => "lamella_net_recv_poll",
+        ("System.Net.Sockets", "Socket", "LocalPort") => "lamella_net_local_port",
+        ("System.Net.Sockets", "Socket", "CloseSocket") => "lamella_net_close",
+        ("System.Net.Security", "TlsNative", "ClientConfig") => "lamella_tls_client_config",
+        ("System.Net.Security", "TlsNative", "ClientNew") => "lamella_tls_client_new",
+        ("System.Net.Security", "TlsNative", "Process") => "lamella_tls_process",
+        ("System.Net.Security", "TlsNative", "WantsWrite") => "lamella_tls_wants_write",
+        ("System.Net.Security", "TlsNative", "WriteTls") => "lamella_tls_write_tls",
+        ("System.Net.Security", "TlsNative", "ReadTls") => "lamella_tls_read_tls",
+        ("System.Net.Security", "TlsNative", "ReadPlain") => "lamella_tls_read_plain",
+        ("System.Net.Security", "TlsNative", "WritePlain") => "lamella_tls_write_plain",
+        ("System.Net.Security", "TlsNative", "PeerCert") => "lamella_tls_peer_cert",
+        ("System.Net.Security", "TlsNative", "CloseTls") => "lamella_tls_close",
+        ("System.Net.Security", "TlsNative", "DefaultStack") => "lamella_tls_default_stack",
+        _ => return None,
+    })
+}
+
+/// Whether a net/TLS seam's `byte[]` buffer is a SLICE `(byte[] buffer, int offset, int count)` -- the
+/// Send/Receive/Write/Read family, whose native ABI is `(h, buf*, len)` with the offset folded into `buf*`
+/// and `len = count`. The address/config/cert seams pass a WHOLE array instead (`(arr + 4, arr.Length)`),
+/// so they fold nothing. Keyed by method name because a byte[]-then-two-ints signature is ambiguous by
+/// type alone (`ListenStart(addr, port, backlog)` is a whole array followed by two unrelated scalars).
+fn net_seam_folds_buffer(method: Option<&str>) -> bool {
+    matches!(
+        method,
+        Some("SendPoll" | "ReceivePoll" | "WriteTls" | "ReadTls" | "ReadPlain" | "WritePlain")
+    )
+}
+
+/// A DEFERRED net/TLS seam (UDP + server-side TLS) -- @runtime's Phase-A crate exports no extern for it.
+/// It cannot be a link error: `Socket.Bind` STATICALLY references `UdpBind` (its `Dgram` branch, never taken
+/// for a TCP program), so a TCP program would otherwise fail to link over an unreachable path. Instead the
+/// AOT synthesizes it to return the `SockError` (-2) sentinel -- the corlib LINKS, and a program that
+/// actually uses UDP / server TLS throws `SocketException` at runtime (loud), not a wrong value.
+fn net_seam_deferred(namespace: &str, type_name: &str, method: Option<&str>) -> bool {
+    matches!(
+        (namespace, type_name, method),
+        ("System.Net.Sockets", "Socket", Some("UdpBind" | "UdpSendTo" | "UdpReceiveFrom"))
+            | ("System.Net.Security", "TlsNative", Some("ServerConfig" | "ServerNew"))
+    )
+}
+
+/// A single-block body returning the `i32` constant `value` (a deferred seam -> `SockError`). Takes the
+/// managed `param_types` so its ABI signature matches the caller; the arguments are ignored.
+fn net_deferred_body(param_types: &[MirType], value: i64) -> Function {
+    let (mut b, _params) = MirBuilder::new(param_types);
+    let v = b.emit(
+        MirType::I32,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value,
+        },
+    );
+    b.ret(v);
+    b.finish(Some(MirType::I32))
+}
+
+/// A synthesized MIR body for a `System.Net` / `System.Net.Security` `[RuntimeProvided]` seam static (the
+/// socket + TLS primitives). It MARSHALS the managed arguments to the C-ABI that the linked
+/// `lamella-runtime-support-net` exports, calls it, and returns the result. The marshalling mirrors the
+/// runtime's C-ABI (`939f993933`) exactly -- the same shape the interpreter's binding passes:
+/// * a BUFFER SLICE (`fold_buffer`: a `byte[] buffer, int offset, int count` triple, as in Send/Receive/
+///   Write/Read) crosses as ONE (ptr, len) pair with the offset FOLDED IN: `ptr = &buffer[offset]` (the
+///   ObjectRef + 4 + offset) and `len = count`. The offset/count args are consumed, NOT passed separately --
+///   the native `send_poll(h, buf*, len)` sends exactly the `[offset, offset+count)` slice.
+/// * a WHOLE `byte[]` / `string` (an address, a cert buffer, a hostname) crosses as `(ptr = arr + 4, len =
+///   arr.Length)` -- past the 4-byte header, the element/unit count at `arr + 0`.
+/// * a scalar (`int`) passes straight through. (An extra managed arg the native side ignores -- e.g.
+///   `ClientConfig`'s `rootsPem`, absent from `client_config(stack, verify)` -- is harmless: it lands in a
+///   register the callee never reads.)
+/// Only the FIRST array of a `fold_buffer` seam is a slice; every seam has at most one such buffer.
+///
+/// `import` is the extern the object path resolves through the linker: ARM `lower_runtime_calls` and
+/// RISC-V `rewrite_pinvoke` rewrite the emitted `PInvoke` to a `CallNative`, and WASM binds it to a
+/// `lamella_native` host import. Phase A (single-threaded blocking): the seam is an alloc-free leaf call
+/// with no safepoint inside, and the managed busy-poll loop (`while (Poll() == WouldBlock) {}`) re-passes
+/// the buffer each call -- so no GC pin is needed until Phase B.
+///
+/// `param_types` are the managed argument MirTypes (the caller resolves them once through the canonical
+/// [`mir_type`]); `parameters` are the same arguments' `SigType`s, which classify the marshalling.
+pub fn runtime_seam_body(
+    param_types: &[MirType],
+    parameters: &[SigType],
+    returns_value: bool,
+    fold_buffer: bool,
+    import: &str,
+) -> Function {
+    let i32t = MirType::I32;
+    let (mut b, params) = MirBuilder::new(param_types);
+    let mut native_args: Vec<ValueId> = Vec::new();
+    let mut folded = false;
+    let mut index = 0;
+    while index < parameters.len() {
+        let arg = params[index];
+        match &parameters[index] {
+            SigType::SzArray(_) if fold_buffer && !folded => {
+                let offset = params[index + 1];
+                let count = params[index + 2];
+                let addr = b.emit(i32t, Inst::Convert { value: arg, kind: ConvKind::RefToInt });
+                let four = b.emit(i32t, Inst::ConstInt { ty: i32t, value: 4 });
+                let base = b.emit(i32t, Inst::Binary { op: BinOp::Add, lhs: addr, rhs: four });
+                let ptr = b.emit(i32t, Inst::Binary { op: BinOp::Add, lhs: base, rhs: offset });
+                native_args.push(ptr);
+                native_args.push(count);
+                folded = true;
+                index += 3;
+                continue;
+            }
+            SigType::SzArray(_) | SigType::String => {
+                let addr = b.emit(i32t, Inst::Convert { value: arg, kind: ConvKind::RefToInt });
+                let four = b.emit(i32t, Inst::ConstInt { ty: i32t, value: 4 });
+                let ptr = b.emit(i32t, Inst::Binary { op: BinOp::Add, lhs: addr, rhs: four });
+                let len = b.emit(i32t, Inst::Load { address: addr, width: 4, signed: false });
+                native_args.push(ptr);
+                native_args.push(len);
+            }
+            _ => native_args.push(arg),
+        }
+        index += 1;
+    }
+    if returns_value {
+        let result = b.emit(
+            i32t,
+            Inst::PInvoke {
+                import: import.into(),
+                args: native_args,
+            },
+        );
+        b.ret(result);
+        b.finish(Some(i32t))
+    } else {
+        b.side(Inst::PInvoke {
+            import: import.into(),
+            args: native_args,
+        });
+        b.ret_void();
+        b.finish(None)
+    }
+}
+
 #[cfg(all(test, feature = "arm32"))]
 mod tests {
     use super::*;
@@ -1303,6 +2106,118 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} not synthesized"));
             lamella_ir::verify(&f).unwrap_or_else(|e| panic!("{name} verify: {e:?}"));
             crate::arm32::lower(&f).unwrap_or_else(|e| panic!("{name} lower: {e:?}"));
+        }
+    }
+
+    #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+    #[test]
+    fn alloc_like_lowers_on_every_backend() {
+        let f = Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::AllocLike {
+                        proto: ValueId(0),
+                        payload_size: 12,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        lamella_ir::verify(&f).expect("AllocLike verifies");
+        #[cfg(feature = "arm32")]
+        crate::arm32::lower_object(&[f.clone()], &["clone_it"], &[]).expect("arm lowers AllocLike");
+        #[cfg(feature = "riscv32")]
+        crate::riscv32::lower_object(&[f.clone()], &["clone_it"], &[], &[])
+            .expect("riscv lowers AllocLike");
+        #[cfg(feature = "wasm")]
+        crate::wasm::lower(&f).expect("wasm lowers AllocLike");
+    }
+
+    #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+    #[test]
+    fn delegate_combine_body_verifies_and_lowers() {
+        let f = delegate_combine_body();
+        lamella_ir::verify(&f).expect("Combine body verifies");
+        #[cfg(feature = "arm32")]
+        crate::arm32::lower_object(&[f.clone()], &["combine"], &[]).expect("arm lowers Combine");
+        #[cfg(feature = "riscv32")]
+        crate::riscv32::lower_object(&[f.clone()], &["combine"], &[], &[])
+            .expect("riscv lowers Combine");
+        #[cfg(feature = "wasm")]
+        crate::wasm::lower(&f).expect("wasm lowers Combine");
+    }
+
+    #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+    #[test]
+    fn delegate_remove_body_verifies_and_lowers() {
+        let f = delegate_remove_body();
+        lamella_ir::verify(&f).expect("Remove body verifies");
+        #[cfg(feature = "arm32")]
+        crate::arm32::lower_object(&[f.clone()], &["remove"], &[]).expect("arm lowers Remove");
+        #[cfg(feature = "riscv32")]
+        crate::riscv32::lower_object(&[f.clone()], &["remove"], &[], &[])
+            .expect("riscv lowers Remove");
+        #[cfg(feature = "wasm")]
+        crate::wasm::lower(&f).expect("wasm lowers Remove");
+    }
+
+    #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
+    #[test]
+    fn net_seam_bodies_marshal_and_lower() {
+        use alloc::boxed::Box;
+        let obj = MirType::ObjectRef;
+        let i32t = MirType::I32;
+        let bytes = || SigType::SzArray(Box::new(SigType::U1));
+        let ints = || SigType::SzArray(Box::new(SigType::I4));
+        let cases: [(&str, alloc::vec::Vec<MirType>, alloc::vec::Vec<SigType>, bool, bool); 5] = [
+            (
+                "lamella_net_send_poll",
+                vec![i32t, obj, i32t, i32t],
+                vec![SigType::I4, bytes(), SigType::I4, SigType::I4],
+                true,
+                true,
+            ),
+            (
+                "lamella_net_udp_send_to",
+                vec![i32t, obj, i32t, i32t, obj, i32t],
+                vec![SigType::I4, bytes(), SigType::I4, SigType::I4, bytes(), SigType::I4],
+                true,
+                true,
+            ),
+            (
+                "lamella_net_udp_receive_from",
+                vec![i32t, obj, i32t, i32t, obj, obj],
+                vec![SigType::I4, bytes(), SigType::I4, SigType::I4, bytes(), ints()],
+                true,
+                true,
+            ),
+            (
+                "lamella_tls_client_new",
+                vec![i32t, obj],
+                vec![SigType::I4, SigType::String],
+                true,
+                false,
+            ),
+            ("lamella_net_close", vec![i32t], vec![SigType::I4], false, false),
+        ];
+        for (label, param_types, parameters, returns_value, fold_buffer) in &cases {
+            let label = *label;
+            let f = runtime_seam_body(param_types, parameters, *returns_value, *fold_buffer, label);
+            lamella_ir::verify(&f).unwrap_or_else(|e| panic!("{label} verify: {e:?}"));
+            #[cfg(feature = "arm32")]
+            crate::arm32::lower_object(&[f.clone()], &[label], &[])
+                .unwrap_or_else(|e| panic!("{label} arm lower: {e:?}"));
+            #[cfg(feature = "riscv32")]
+            crate::riscv32::lower_object(&[f.clone()], &[label], &[], &[])
+                .unwrap_or_else(|e| panic!("{label} riscv lower: {e:?}"));
+            #[cfg(feature = "wasm")]
+            crate::wasm::lower(&f).unwrap_or_else(|e| panic!("{label} wasm lower: {e:?}"));
         }
     }
 

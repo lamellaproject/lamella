@@ -17,6 +17,13 @@ pub mod riscv {
     pub const R_RISCV_PCREL_HI20: u32 = 23;
     /// `R_RISCV_PCREL_LO12_I` -- the low 12 bits of a PC-relative reference (an I-type).
     pub const R_RISCV_PCREL_LO12_I: u32 = 24;
+    /// `R_RISCV_HI20` -- the high 20 bits of an ABSOLUTE reference (a `lui`), `S + A`. The medlow code
+    /// model's address materialization (e.g. loading a function pointer); needs the link's `text_base`.
+    pub const R_RISCV_HI20: u32 = 26;
+    /// `R_RISCV_LO12_I` -- the low 12 bits of an ABSOLUTE reference in an I-type (`addi`/load), `S + A`.
+    pub const R_RISCV_LO12_I: u32 = 27;
+    /// `R_RISCV_LO12_S` -- the low 12 bits of an ABSOLUTE reference in an S-type (`store`), `S + A`.
+    pub const R_RISCV_LO12_S: u32 = 28;
     /// `R_RISCV_RELAX` -- a linker-relaxation hint paired with a real relocation; nothing to patch.
     pub const R_RISCV_RELAX: u32 = 51;
     /// A lamella-private 32-bit data relocation, `S + A - P` -- the RISC-V twin of
@@ -42,6 +49,17 @@ pub mod arm {
     /// `R_ARM_CALL` -- an A32 (ARM-state) `BL`/`BLX` call: `((S + A) | T) - P`, a 24-bit signed
     /// word-scaled offset in bits[23:0].
     pub const R_ARM_CALL: u32 = 28;
+    /// `R_ARM_THM_JUMP24` -- a Thumb `B.W` (T4) unconditional branch: `(S + A) - P`, the SAME 24-bit
+    /// halfword-scaled offset swizzle as `R_ARM_THM_CALL`; the instruction differs only in the second
+    /// halfword's bit 14 (`B.W` = 0, `BL` = 1). A Rust/GCC thumbv7em tail call becomes one.
+    pub const R_ARM_THM_JUMP24: u32 = 30;
+    /// `R_ARM_THM_MOVW_ABS_NC` -- the LOW 16 bits of `(S + A) | T` written into a Thumb-2 `MOVW`
+    /// (the 16-bit immediate split imm4:i:imm3:imm8). Paired with `MOVT_ABS` to materialize a 32-bit
+    /// absolute address; the thumbv7em toolchain uses this pair instead of a literal pool.
+    pub const R_ARM_THM_MOVW_ABS_NC: u32 = 47;
+    /// `R_ARM_THM_MOVT_ABS` -- the HIGH 16 bits of `S + A` written into a Thumb-2 `MOVT` (same
+    /// imm4:i:imm3:imm8 split). The upper half of the `MOVW`/`MOVT` absolute-address pair.
+    pub const R_ARM_THM_MOVT_ABS: u32 = 48;
     /// A lamella-private 32-bit data relocation, `S + A - P` -- like `R_ARM_REL32` but WITHOUT the
     /// interworking `| T` (Thumb-bit) forcing. It stores a signed, placement-invariant relative offset
     /// into a data word. Its one use is a vtable slot: the value stored is `(method_entry - type_desc)`

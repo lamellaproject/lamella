@@ -12,6 +12,7 @@
  */
 #include <stddef.h>
 #include <string.h>
+#include <time.h> /* struct tm, for the libc-free mbedtls_platform_gmtime_r below */
 
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
@@ -101,6 +102,65 @@ int mbedtls_hardware_poll(void *data, unsigned char *output, size_t len, size_t 
     }
     *olen = len;
     return 0;
+}
+
+/* Provided by src/lib.rs: the embedder's wall clock in Unix seconds, or 0 when no source is
+ * registered (which pre-dates every real certificate -> a REQUIRED verify fails closed). */
+extern long long lamella_tls_time(void);
+
+/* MBEDTLS_PLATFORM_TIME_MACRO: mbedTLS reads the clock here for certificate validity. */
+long long lamella_mbedtls_time(long long *t)
+{
+    long long now = lamella_tls_time();
+    if (t != NULL) {
+        *t = now;
+    }
+    return now;
+}
+
+/* MBEDTLS_PLATFORM_MS_TIME_ALT: a millisecond clock for the DTLS / TLS-1.3 retransmit
+ * timers (unused on this TLS 1.2 client, but HAVE_TIME compiles the reference). Derived
+ * from the same wall clock -- coarse (whole seconds), which is irrelevant while unused. */
+mbedtls_ms_time_t mbedtls_ms_time(void)
+{
+    return (mbedtls_ms_time_t)lamella_tls_time() * 1000;
+}
+
+/* MBEDTLS_PLATFORM_GMTIME_R_ALT: a libc-free UTC breakdown of Unix seconds -- the x509 date
+ * check converts the current time to y/m/d/h/m/s and compares it with the certificate's
+ * notBefore/notAfter. Days->civil is Howard Hinnant's proleptic-Gregorian algorithm (exact,
+ * branch-light, no tables); only the fields the x509 comparison reads are filled. */
+struct tm *mbedtls_platform_gmtime_r(const mbedtls_time_t *tt, struct tm *tm_buf)
+{
+    long long secs = (long long)*tt;
+    long long days = secs / 86400;
+    long long rem = secs % 86400;
+    if (rem < 0) {
+        rem += 86400;
+        days -= 1;
+    }
+    tm_buf->tm_hour = (int)(rem / 3600);
+    tm_buf->tm_min = (int)((rem % 3600) / 60);
+    tm_buf->tm_sec = (int)(rem % 60);
+
+    long long z = days + 719468; /* shift the epoch to 0000-03-01 */
+    long long era = (z >= 0 ? z : z - 146096) / 146097;
+    unsigned doe = (unsigned)(z - era * 146097);                       /* [0, 146096] */
+    unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; /* [0, 399] */
+    long long y = (long long)yoe + era * 400;
+    unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100); /* [0, 365] */
+    unsigned mp = (5 * doy + 2) / 153;                      /* [0, 11] (Mar=0) */
+    unsigned d = doy - (153 * mp + 2) / 5 + 1;              /* [1, 31] */
+    unsigned m = mp < 10 ? mp + 3 : mp - 9;                 /* [1, 12] */
+    y += (m <= 2);
+
+    tm_buf->tm_year = (int)(y - 1900);
+    tm_buf->tm_mon = (int)(m - 1);
+    tm_buf->tm_mday = (int)d;
+    tm_buf->tm_wday = 0; /* the x509 window comparison reads neither wday nor yday */
+    tm_buf->tm_yday = 0;
+    tm_buf->tm_isdst = 0;
+    return tm_buf;
 }
 
 typedef struct lam_tls {

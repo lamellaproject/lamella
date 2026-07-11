@@ -240,9 +240,31 @@ fn compile_code_object(
         local_names = kept_names;
         local_types = kept_types;
     }
+    let mut globals = BTreeSet::new();
+    collect_globals(body, &mut globals);
+    if !globals.is_empty() {
+        for n in &globals {
+            if params.iter().any(|p| &p.name == n) {
+                return Err(error(&format!("name '{n}' is parameter and global")));
+            }
+        }
+        let mut kept_names = Vec::with_capacity(local_names.len());
+        let mut kept_types = Vec::with_capacity(local_types.len());
+        for (name, ty) in local_names.iter().zip(&local_types) {
+            if !globals.contains(name) {
+                kept_names.push(name.clone());
+                kept_types.push(*ty);
+            }
+        }
+        local_names = kept_names;
+        local_types = kept_types;
+    }
     infer_local_types(params, body, &local_names, &mut local_types);
 
-    let bound = bound_names(params, body);
+    let mut bound = bound_names(params, body);
+    for n in &globals {
+        bound.remove(n);
+    }
     let (cellvars, freevars) = if scope == Scope::Module {
         (Vec::new(), Vec::new())
     } else {
@@ -255,6 +277,9 @@ fn compile_code_object(
         free_uses.extend(u.child_free);
         free_uses.extend(nonlocals.iter().cloned());
         for n in &bound {
+            free_uses.remove(n);
+        }
+        for n in &globals {
             free_uses.remove(n);
         }
         let freevars: Vec<String> = free_uses
@@ -277,6 +302,7 @@ fn compile_code_object(
         local_types,
         cellvars: cellvars.clone(),
         freevars: freevars.clone(),
+        globals,
         child_scopes,
         loops: Vec::new(),
         finallys: Vec::new(),
@@ -382,6 +408,7 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
                 add_dynamic_local(bound, names, types);
             }
         }
+        Stmt::ImportStar { .. } => {}
         Stmt::If { body, orelse, .. } => {
             for s in body {
                 collect_locals_stmt(s, names, types);
@@ -482,6 +509,7 @@ fn collect_locals_stmt(stmt: &Stmt, names: &mut Vec<String>, types: &mut Vec<bc:
         | Stmt::Expr(_)
         | Stmt::Delete(_)
         | Stmt::Nonlocal(_)
+        | Stmt::Global(_)
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass
@@ -607,7 +635,9 @@ fn collect_comp_targets_stmt(
         | Stmt::ClassDef { .. }
         | Stmt::Import { .. }
         | Stmt::ImportFrom { .. }
+        | Stmt::ImportStar { .. }
         | Stmt::Nonlocal(_)
+        | Stmt::Global(_)
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass
@@ -632,7 +662,16 @@ fn call_arg_expr(arg: &ast::CallArg) -> &Expr {
 /// clause target unpacks through a temp. Shared by the emitter and the free-variable analysis so
 /// both see the same synthetic scope.
 fn build_genexpr_body(element: &Expr, clauses: &[CompClause]) -> Vec<Stmt> {
-    let mut body = vec![Stmt::Expr(Expr::Yield(Some(Box::new(element.clone()))))];
+    wrap_comp_clauses(
+        vec![Stmt::Expr(Expr::Yield(Some(Box::new(element.clone()))))],
+        clauses,
+    )
+}
+
+/// Wrap `innermost` in a comprehension's nested for/if clause chain (shared by every comprehension
+/// kind's hidden function). The OUTERMOST clause iterates the `.0` parameter -- the eagerly-iter'd
+/// first iterable the call site passes in; inner clauses iterate their own expressions.
+fn wrap_comp_clauses(mut body: Vec<Stmt>, clauses: &[CompClause]) -> Vec<Stmt> {
     for (i, clause) in clauses.iter().enumerate().rev() {
         for cond in clause.conditions.iter().rev() {
             body = vec![Stmt::If {
@@ -676,7 +715,7 @@ fn build_genexpr_body(element: &Expr, clauses: &[CompClause]) -> Vec<Stmt> {
     body
 }
 
-/// The single `.0` parameter of a generator expression's hidden function (the outermost iterable).
+/// The single `.0` parameter of a comprehension's hidden function (the outermost iterable).
 fn genexpr_param() -> ast::ParamDef {
     ast::ParamDef {
         name: String::from(".0"),
@@ -689,6 +728,90 @@ fn genexpr_param() -> ast::ParamDef {
     }
 }
 
+/// The body of a list/set/dict comprehension's hidden function: build an empty accumulator, add each
+/// element as the clause chain runs, and return it. The accumulator name begins with `.`, which no
+/// source identifier can, so it never collides with a loop target or a captured name. An empty
+/// `[]` / set / `{}` display and the `.append`/`.add`/`[k]=v` on that fresh container are all
+/// shadow-proof -- they never touch the `list`/`set`/`dict` builtins (which a user may have rebound).
+fn build_container_comp_body(kind: CompKind, clauses: &[CompClause]) -> Vec<Stmt> {
+    let acc = String::from(".acc");
+    let (init, add): (Expr, Stmt) = match kind {
+        CompKind::List(e) => (
+            Expr::List(Vec::new()),
+            method_call_stmt(&acc, "append", vec![e.clone()]),
+        ),
+        CompKind::Set(e) => (
+            Expr::Set(Vec::new()),
+            method_call_stmt(&acc, "add", vec![e.clone()]),
+        ),
+        CompKind::Dict(k, v) => (
+            Expr::Dict(Vec::new()),
+            Stmt::SetItem {
+                container: Expr::Name(acc.clone()),
+                index: k.clone(),
+                value: v.clone(),
+                op: None,
+            },
+        ),
+    };
+    let mut body = vec![Stmt::Assign(Assign {
+        target: acc.clone(),
+        annotation: None,
+        value: Some(init),
+    })];
+    body.extend(wrap_comp_clauses(vec![add], clauses));
+    body.push(Stmt::Return(Some(Expr::Name(acc))));
+    body
+}
+
+/// A statement `obj.method(args...)` (result discarded) -- the accumulator append/add.
+fn method_call_stmt(obj: &str, method: &str, args: Vec<Expr>) -> Stmt {
+    Stmt::Expr(Expr::Call {
+        func: Box::new(Expr::Attribute {
+            value: Box::new(Expr::Name(String::from(obj))),
+            attr: String::from(method),
+        }),
+        args,
+        keywords: Vec::new(),
+    })
+}
+
+/// Whether a comprehension may compile to its own function scope (so its loop targets do not leak
+/// into the enclosing scope). It may UNLESS a walrus (`:=`) appears in a part that would move into
+/// that scope -- the element/key/value, a condition, or a non-outermost iterable -- because a walrus
+/// must bind in the containing scope (PEP 572), which only the inline form does. (A walrus in the
+/// outermost iterable is evaluated in the enclosing scope either way, so it does not force inline.)
+fn comprehension_hoists(main_exprs: &[&Expr], clauses: &[CompClause]) -> bool {
+    let mut u = Uses::default();
+    for e in main_exprs {
+        walk_expr_uses(e, &mut u);
+    }
+    for (i, c) in clauses.iter().enumerate() {
+        for cond in &c.conditions {
+            walk_expr_uses(cond, &mut u);
+        }
+        if i > 0 {
+            walk_expr_uses(&c.iterable, &mut u);
+        }
+    }
+    !u.has_walrus
+}
+
+/// The free variables of a hoisted comprehension's hidden function -- the names it captures from the
+/// enclosing scope (so they become cells). A genexpr-shaped body over the same element(s) and clauses
+/// has the identical free-variable profile (the accumulator name is bound, and the container ops name
+/// no variables), so this reuses that skeleton; a dict's key and value are combined so both count.
+fn comp_free_uses(main_exprs: &[&Expr], clauses: &[CompClause]) -> BTreeSet<String> {
+    let element = if main_exprs.len() == 1 {
+        main_exprs[0].clone()
+    } else {
+        Expr::Tuple(main_exprs.iter().map(|e| (*e).clone()).collect())
+    };
+    let body = build_genexpr_body(&element, clauses);
+    let refs: Vec<&Stmt> = body.iter().collect();
+    func_free_uses(&[genexpr_param()], &refs)
+}
+
 /// Walk an expression, collecting comprehension loop variables (recursing into nested
 /// comprehensions) as dynamic locals.
 fn collect_comp_targets_expr(
@@ -699,8 +822,14 @@ fn collect_comp_targets_expr(
     match expr {
         Expr::ListComp { element, clauses }
         | Expr::SetComp { element, clauses } => {
-            collect_comp_clauses(clauses, names, types);
-            collect_comp_targets_expr(element, names, types);
+            if comprehension_hoists(&[element], clauses) {
+                if let Some(first) = clauses.first() {
+                    collect_comp_targets_expr(&first.iterable, names, types);
+                }
+            } else {
+                collect_comp_clauses(clauses, names, types);
+                collect_comp_targets_expr(element, names, types);
+            }
         }
         Expr::GeneratorExp { clauses, .. } => {
             if let Some(first) = clauses.first() {
@@ -708,11 +837,18 @@ fn collect_comp_targets_expr(
             }
         }
         Expr::DictComp { key, value, clauses } => {
-            collect_comp_clauses(clauses, names, types);
-            collect_comp_targets_expr(key, names, types);
-            collect_comp_targets_expr(value, names, types);
+            if comprehension_hoists(&[key, value], clauses) {
+                if let Some(first) = clauses.first() {
+                    collect_comp_targets_expr(&first.iterable, names, types);
+                }
+            } else {
+                collect_comp_clauses(clauses, names, types);
+                collect_comp_targets_expr(key, names, types);
+                collect_comp_targets_expr(value, names, types);
+            }
         }
         Expr::Binary { lhs, rhs, .. }
+        | Expr::InplaceBinary { lhs, rhs, .. }
         | Expr::Compare { lhs, rhs, .. }
         | Expr::BoolBinary { lhs, rhs, .. } => {
             collect_comp_targets_expr(lhs, names, types);
@@ -781,6 +917,7 @@ fn collect_comp_targets_expr(
                 collect_comp_targets_expr(v, names, types);
             }
         }
+        Expr::YieldFrom(value) => collect_comp_targets_expr(value, names, types),
     }
 }
 
@@ -793,6 +930,9 @@ struct Uses {
     /// Names that functions nested in this scope need from this scope or an outer one -- a nested
     /// function's free variables, bubbled up so an enclosing scope can satisfy them with a cell.
     child_free: BTreeSet<String>,
+    /// Set when a walrus (`:=`) was seen while walking. Used only to decide whether a comprehension
+    /// can move to its own function scope (a walrus must bind in the containing scope, so it cannot).
+    has_walrus: bool,
 }
 
 /// The user-visible names a function scope binds: its parameters plus every name assigned in its
@@ -851,6 +991,50 @@ fn collect_nonlocals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
         Stmt::With { body, .. } => {
             for s in body {
                 collect_nonlocals_stmt(s, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the names declared `global` anywhere in a function body -- descending into control-flow
+/// blocks but NOT into nested functions (a `global` declaration binds only the function it is in).
+fn collect_globals(body: &[&Stmt], out: &mut BTreeSet<String>) {
+    for stmt in body {
+        collect_globals_stmt(stmt, out);
+    }
+}
+
+fn collect_globals_stmt(stmt: &Stmt, out: &mut BTreeSet<String>) {
+    match stmt {
+        Stmt::Global(names) => {
+            for n in names {
+                out.insert(n.clone());
+            }
+        }
+        Stmt::If { body, orelse, .. } | Stmt::While { body, orelse, .. } => {
+            for s in body.iter().chain(orelse.iter()) {
+                collect_globals_stmt(s, out);
+            }
+        }
+        Stmt::For { body, orelse, .. } | Stmt::ForIter { body, orelse, .. } => {
+            for s in body.iter().chain(orelse.iter()) {
+                collect_globals_stmt(s, out);
+            }
+        }
+        Stmt::Try { body, handlers, orelse, finalbody } => {
+            for s in body.iter().chain(orelse.iter()).chain(finalbody.iter()) {
+                collect_globals_stmt(s, out);
+            }
+            for h in handlers {
+                for s in &h.body {
+                    collect_globals_stmt(s, out);
+                }
+            }
+        }
+        Stmt::With { body, .. } => {
+            for s in body {
+                collect_globals_stmt(s, out);
             }
         }
         _ => {}
@@ -981,7 +1165,9 @@ fn walk_stmt_uses(stmt: &Stmt, u: &mut Uses) {
         }
         Stmt::Import { .. }
         | Stmt::ImportFrom { .. }
+        | Stmt::ImportStar { .. }
         | Stmt::Nonlocal(_)
+        | Stmt::Global(_)
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass => {}
@@ -1036,6 +1222,7 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
         }
         Expr::Attribute { value, .. } => walk_expr_uses(value, u),
         Expr::Binary { lhs, rhs, .. }
+        | Expr::InplaceBinary { lhs, rhs, .. }
         | Expr::BoolBinary { lhs, rhs, .. }
         | Expr::Compare { lhs, rhs, .. } => {
             walk_expr_uses(lhs, u);
@@ -1084,11 +1271,18 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
         }
         Expr::ListComp { element, clauses }
         | Expr::SetComp { element, clauses } => {
-            walk_expr_uses(element, u);
-            for c in clauses {
-                walk_expr_uses(&c.iterable, u);
-                for cond in &c.conditions {
-                    walk_expr_uses(cond, u);
+            if comprehension_hoists(&[element], clauses) {
+                if let Some(first) = clauses.first() {
+                    walk_expr_uses(&first.iterable, u);
+                }
+                u.child_free.extend(comp_free_uses(&[element], clauses));
+            } else {
+                walk_expr_uses(element, u);
+                for c in clauses {
+                    walk_expr_uses(&c.iterable, u);
+                    for cond in &c.conditions {
+                        walk_expr_uses(cond, u);
+                    }
                 }
             }
         }
@@ -1102,21 +1296,32 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
                 .extend(func_free_uses(&[genexpr_param()], &refs));
         }
         Expr::DictComp { key, value, clauses } => {
-            walk_expr_uses(key, u);
-            walk_expr_uses(value, u);
-            for c in clauses {
-                walk_expr_uses(&c.iterable, u);
-                for cond in &c.conditions {
-                    walk_expr_uses(cond, u);
+            if comprehension_hoists(&[key, value], clauses) {
+                if let Some(first) = clauses.first() {
+                    walk_expr_uses(&first.iterable, u);
+                }
+                u.child_free.extend(comp_free_uses(&[key, value], clauses));
+            } else {
+                walk_expr_uses(key, u);
+                walk_expr_uses(value, u);
+                for c in clauses {
+                    walk_expr_uses(&c.iterable, u);
+                    for cond in &c.conditions {
+                        walk_expr_uses(cond, u);
+                    }
                 }
             }
         }
-        Expr::Walrus { value, .. } => walk_expr_uses(value, u),
+        Expr::Walrus { value, .. } => {
+            u.has_walrus = true;
+            walk_expr_uses(value, u);
+        }
         Expr::Yield(value) => {
             if let Some(v) = value {
                 walk_expr_uses(v, u);
             }
         }
+        Expr::YieldFrom(value) => walk_expr_uses(value, u),
     }
 }
 
@@ -1148,19 +1353,33 @@ fn infer_local_types(
     while changed {
         changed = false;
         for i in 0..names.len() {
-            if pinned[i] || types[i] != bc::StaticType::Int {
+            if pinned[i] {
                 continue;
             }
-            let provably_int = !rhss[i].is_empty()
-                && rhss[i]
-                    .iter()
-                    .all(|e| expr_static_type(e, names, types) == bc::StaticType::Int);
-            if !provably_int {
-                types[i] = bc::StaticType::Dynamic;
+            let new_ty = numeric_kind(&rhss[i], names, types);
+            if new_ty != types[i] {
+                types[i] = new_ty;
                 changed = true;
             }
         }
     }
+}
+
+/// The common numeric static type of a local's assignment RHSs (for [`infer_local_types`]): `Int` if
+/// every RHS is provably Int, `Float` if every RHS is provably Float, else `Dynamic` -- no RHS, any
+/// dynamic RHS, or a MIXED int/float local (one MIR slot cannot be both machine widths).
+fn numeric_kind(rhss: &[Expr], names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
+    let mut kind: Option<bc::StaticType> = None;
+    for e in rhss {
+        let t = expr_static_type(e, names, types);
+        match (kind, t) {
+            (_, bc::StaticType::Dynamic) => return bc::StaticType::Dynamic,
+            (None, t) => kind = Some(t),
+            (Some(k), t) if k == t => {}
+            (Some(_), _) => return bc::StaticType::Dynamic,
+        }
+    }
+    kind.unwrap_or(bc::StaticType::Dynamic)
 }
 
 /// Walk a statement, pinning the targets of annotated assignments and collecting each
@@ -1197,13 +1416,47 @@ fn gather_assignments_stmt(
                 }
             }
         }
-        Stmt::TupleAssign { targets, .. } => {
-            for target in targets {
-                let mut bound = Vec::new();
-                target.collect_names(&mut bound);
-                for name in bound {
-                    if let Some(slot) = names.iter().position(|n| n == name) {
-                        pinned[slot] = true;
+        Stmt::TupleAssign { targets, star, value } => {
+            let all_names = star.is_none()
+                && targets
+                    .iter()
+                    .all(|t| matches!(t, ast::AssignTarget::Name(_)));
+            let decomposed: Option<Vec<Expr>> = if !all_names {
+                None
+            } else if let Expr::Tuple(elems) = value {
+                (elems.len() == targets.len()).then(|| elems.clone())
+            } else if let Expr::Call { func, args, keywords } = value {
+                (keywords.is_empty()
+                    && args.len() == 2
+                    && targets.len() == 2
+                    && matches!(&**func, Expr::Name(n) if n == "divmod"))
+                .then(|| {
+                    let binary = |op| Expr::Binary {
+                        op,
+                        lhs: Box::new(args[0].clone()),
+                        rhs: Box::new(args[1].clone()),
+                    };
+                    vec![binary(ast::BinOp::FloorDiv), binary(ast::BinOp::Mod)]
+                })
+            } else {
+                None
+            };
+            if let Some(exprs) = decomposed {
+                for (target, expr) in targets.iter().zip(exprs) {
+                    if let ast::AssignTarget::Name(name) = target {
+                        if let Some(slot) = names.iter().position(|n| n == name) {
+                            rhss[slot].push(expr);
+                        }
+                    }
+                }
+            } else {
+                for target in targets {
+                    let mut bound = Vec::new();
+                    target.collect_names(&mut bound);
+                    for name in bound {
+                        if let Some(slot) = names.iter().position(|n| n == name) {
+                            pinned[slot] = true;
+                        }
                     }
                 }
             }
@@ -1292,10 +1545,12 @@ fn gather_assignments_stmt(
         | Stmt::Expr(_)
         | Stmt::Delete(_)
         | Stmt::Nonlocal(_)
+        | Stmt::Global(_)
         | Stmt::FuncDef(_)
         | Stmt::Decorated { .. }
         | Stmt::Import { .. }
         | Stmt::ImportFrom { .. }
+        | Stmt::ImportStar { .. }
         | Stmt::Break
         | Stmt::Continue
         | Stmt::Pass
@@ -1305,50 +1560,119 @@ fn gather_assignments_stmt(
     }
 }
 
-/// The statically-known type of an expression given the locals settled so far:
-/// an integer/boolean literal, an integer-typed name, or arithmetic/comparison
-/// over integers is `Int`; a call result, attribute, `None`, or string is `Dynamic`.
+/// The statically-known type of an expression given the locals settled so far, MATCHING what the
+/// typed lowering emits: an integer/boolean literal or integer arithmetic is `Int`; a float literal,
+/// `/` (true division, always float), or a `+ - *` with a float operand is `Float` (Python promotes);
+/// a comparison of two numerics is `Int` (a 0/1 bool); a call result, attribute, `None`, or string is
+/// `Dynamic`. Kept in lockstep with `lower.rs` so an inferred slot type always matches the value the
+/// lowering stores into it.
 fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
-    let both_int = |a: &Expr, b: &Expr| {
-        expr_static_type(a, names, types) == bc::StaticType::Int
-            && expr_static_type(b, names, types) == bc::StaticType::Int
-    };
+    use bc::StaticType::{Dynamic, Float, Int};
+    fn numeric(t: bc::StaticType) -> bool {
+        matches!(t, Int | Float)
+    }
     match expr {
-        Expr::Int(_) | Expr::Bool(_) => bc::StaticType::Int,
+        Expr::Int(_) | Expr::Bool(_) => Int,
+        Expr::Float(_) => Float,
         Expr::Name(n) => names
             .iter()
             .position(|x| x == n)
             .map(|i| types[i])
-            .unwrap_or(bc::StaticType::Dynamic),
-        Expr::Binary { lhs, rhs, .. }
-        | Expr::Compare { lhs, rhs, .. }
-        | Expr::BoolBinary { lhs, rhs, .. } => {
-            if both_int(lhs, rhs) {
-                bc::StaticType::Int
-            } else {
-                bc::StaticType::Dynamic
+            .unwrap_or(Dynamic),
+        Expr::Binary { op, lhs, rhs } | Expr::InplaceBinary { op, lhs, rhs } => {
+            let a = expr_static_type(lhs, names, types);
+            let b = expr_static_type(rhs, names, types);
+            if !numeric(a) || !numeric(b) {
+                return Dynamic;
+            }
+            match op {
+                ast::BinOp::Add | ast::BinOp::Sub | ast::BinOp::Mul => {
+                    if a == Int && b == Int { Int } else { Float }
+                }
+                ast::BinOp::TrueDiv => Float,
+                ast::BinOp::FloorDiv
+                | ast::BinOp::Mod
+                | ast::BinOp::BitAnd
+                | ast::BinOp::BitOr
+                | ast::BinOp::BitXor
+                | ast::BinOp::LShift
+                | ast::BinOp::RShift => {
+                    if a == Int && b == Int { Int } else { Dynamic }
+                }
+                ast::BinOp::Pow | ast::BinOp::MatMul => Dynamic,
             }
         }
-        Expr::Unary { operand, .. } => expr_static_type(operand, names, types),
-        Expr::Not { .. } => bc::StaticType::Int,
-        Expr::Conditional { body, orelse, .. } => {
-            if both_int(body, orelse) {
-                bc::StaticType::Int
+        Expr::Compare { lhs, rhs, .. } => {
+            if numeric(expr_static_type(lhs, names, types))
+                && numeric(expr_static_type(rhs, names, types))
+            {
+                Int
             } else {
-                bc::StaticType::Dynamic
+                Dynamic
+            }
+        }
+        Expr::BoolBinary { lhs, rhs, .. } => {
+            if expr_static_type(lhs, names, types) == Int
+                && expr_static_type(rhs, names, types) == Int
+            {
+                Int
+            } else {
+                Dynamic
+            }
+        }
+        Expr::Unary { op, operand } => {
+            let t = expr_static_type(operand, names, types);
+            match op {
+                ast::UnaryOp::Invert => {
+                    if t == Int { Int } else { Dynamic }
+                }
+                ast::UnaryOp::Neg | ast::UnaryOp::Pos => {
+                    if numeric(t) { t } else { Dynamic }
+                }
+            }
+        }
+        Expr::Not { .. } => Int,
+        Expr::Conditional { body, orelse, .. } => {
+            let a = expr_static_type(body, names, types);
+            let b = expr_static_type(orelse, names, types);
+            if a == b && numeric(a) { a } else { Dynamic }
+        }
+        Expr::Call { func, args, keywords }
+            if keywords.is_empty()
+                && args.len() == 1
+                && matches!(&**func, Expr::Name(n) if n == "int" || n == "float")
+                && numeric(expr_static_type(&args[0], names, types)) =>
+        {
+            match &**func {
+                Expr::Name(n) if n == "int" => Int,
+                _ => Float,
             }
         }
         Expr::Call { func, args, keywords }
             if keywords.is_empty()
-                && matches!(&**func, Expr::Name(n) if matches!(n.as_str(),
-                    "abs" | "min" | "max" | "mmio_read8" | "mmio_read16" | "mmio_read32"))
-                && args
-                    .iter()
-                    .all(|a| expr_static_type(a, names, types) == bc::StaticType::Int) =>
+                && args.len() == 1
+                && matches!(&**func, Expr::Name(n) if n == "abs")
+                && numeric(expr_static_type(&args[0], names, types)) =>
         {
-            bc::StaticType::Int
+            expr_static_type(&args[0], names, types)
         }
-        _ => bc::StaticType::Dynamic,
+        Expr::Call { func, args, keywords }
+            if keywords.is_empty()
+                && args.len() == 1
+                && matches!(&**func, Expr::Name(n) if n == "round")
+                && numeric(expr_static_type(&args[0], names, types)) =>
+        {
+            Int
+        }
+        Expr::Call { func, args, keywords }
+            if keywords.is_empty()
+                && matches!(&**func, Expr::Name(n) if matches!(n.as_str(),
+                    "min" | "max" | "mmio_read8" | "mmio_read16" | "mmio_read32"))
+                && args.iter().all(|a| expr_static_type(a, names, types) == Int) =>
+        {
+            Int
+        }
+        _ => Dynamic,
     }
 }
 
@@ -1374,6 +1698,10 @@ struct Compiler {
     /// The names captured from an enclosing function (deref indices continue after `cellvars`).
     /// Reads emit `LoadDeref`; a nested function's def site loads them with `LoadClosure`.
     freevars: Vec<String>,
+    /// The names declared `global` in this scope. A read emits `LoadGlobal` and a write `StoreGlobal`
+    /// (the module namespace), never a local slot or a cell -- these names were excluded from
+    /// `local_names` / `cellvars` / `freevars`.
+    globals: BTreeSet<String>,
     /// The scope chain a nested function of this one sees -- the enclosing FUNCTION scopes' bound
     /// names plus this function's own -- so a nested function can tell a captured free variable
     /// (bound in some entry here) from a global.
@@ -1457,6 +1785,11 @@ impl Compiler {
     /// name read directly in a class body -- `LoadName`. A nested def/lambda inside the body compiles
     /// in its own scope (not `in_class_body`), so its reads stay Global/Fast/Deref, matching CPython.
     fn emit_load_name(&mut self, name: &str) {
+        if self.globals.contains(name) {
+            let idx = self.name_index(name);
+            self.asm.emit(bc::Op::LoadGlobal(idx));
+            return;
+        }
         if self.in_class_body && self.class_body_bound.contains(name) {
             let idx = self.name_index(name);
             self.asm.emit(bc::Op::LoadName(idx));
@@ -1479,6 +1812,11 @@ impl Compiler {
     /// Emit a store to `name`: a cell variable through `StoreDeref`, otherwise `StoreFast` to its
     /// local slot (every bound name has one, from the pre-pass; a module-level store set_globals it).
     fn emit_store_name(&mut self, name: &str) {
+        if self.globals.contains(name) {
+            let idx = self.name_index(name);
+            self.asm.emit(bc::Op::StoreGlobal(idx));
+            return;
+        }
         if let Some(deref) = self.deref_slot(name) {
             self.asm.emit(bc::Op::StoreDeref(deref));
         } else {
@@ -1681,7 +2019,16 @@ impl Compiler {
                 self.asm.emit(bc::Op::PopTop);
                 Ok(())
             }
-            Stmt::Nonlocal(_) => Ok(()),
+            Stmt::ImportStar { module } => {
+                if self.scope != Scope::Module {
+                    return Err(error("import * is only allowed at module level"));
+                }
+                let midx = self.name_index(module);
+                self.asm.emit(bc::Op::ImportName(midx));
+                self.asm.emit(bc::Op::ImportStar);
+                Ok(())
+            }
+            Stmt::Nonlocal(_) | Stmt::Global(_) => Ok(()),
             Stmt::Pass => Ok(()),
         }
     }
@@ -2292,45 +2639,46 @@ impl Compiler {
                 self.asm.emit(bc::Op::BuildSet(elements.len() as u32));
             }
             Expr::ListComp { element, clauses } => {
-                self.compile_comprehension(CompKind::List(element), clauses)?
+                if comprehension_hoists(&[element], clauses) {
+                    let body = build_container_comp_body(CompKind::List(element), clauses);
+                    self.compile_hoisted_comprehension("listcomp", body, &clauses[0].iterable)?;
+                } else {
+                    self.compile_comprehension(CompKind::List(element), clauses)?;
+                }
             }
-            Expr::GeneratorExp { element, clauses } => {
-                let name = format!("{}.<genexpr.{}>", self.name, self.lambda_counter);
-                self.lambda_counter += 1;
-                let gen_body = build_genexpr_body(element, clauses);
-                let params = [genexpr_param()];
-                let body_refs: Vec<&Stmt> = gen_body.iter().collect();
-                let (co, nested) = compile_code_object(
-                    Scope::Function,
-                    &name,
-                    &params,
-                    &None,
-                    &body_refs,
-                    None,
-                    &self.child_scopes,
-                )?;
-                let freevars = co.freevars.clone();
-                self.hoisted.push(co);
-                self.hoisted.extend(nested);
-                let flags = self.emit_captured_cells(&freevars);
-                let idx = self.name_index(&name);
-                self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
-                self.compile_expr(&clauses[0].iterable)?;
-                self.asm.emit(bc::Op::GetIter);
-                self.asm.emit(bc::Op::Call(1));
+            Expr::SetComp { element, clauses } => {
+                if comprehension_hoists(&[element], clauses) {
+                    let body = build_container_comp_body(CompKind::Set(element), clauses);
+                    self.compile_hoisted_comprehension("setcomp", body, &clauses[0].iterable)?;
+                } else {
+                    self.compile_comprehension(CompKind::Set(element), clauses)?;
+                }
             }
             Expr::DictComp {
                 key,
                 value,
                 clauses,
-            } => self.compile_comprehension(CompKind::Dict(key, value), clauses)?,
-            Expr::SetComp { element, clauses } => {
-                self.compile_comprehension(CompKind::Set(element), clauses)?
+            } => {
+                if comprehension_hoists(&[key, value], clauses) {
+                    let body = build_container_comp_body(CompKind::Dict(key, value), clauses);
+                    self.compile_hoisted_comprehension("dictcomp", body, &clauses[0].iterable)?;
+                } else {
+                    self.compile_comprehension(CompKind::Dict(key, value), clauses)?;
+                }
+            }
+            Expr::GeneratorExp { element, clauses } => {
+                let body = build_genexpr_body(element, clauses);
+                self.compile_hoisted_comprehension("genexpr", body, &clauses[0].iterable)?;
             }
             Expr::Binary { op, lhs, rhs } => {
                 self.compile_expr(lhs)?;
                 self.compile_expr(rhs)?;
                 self.asm.emit(bc::Op::Binary(binop_sel(*op)));
+            }
+            Expr::InplaceBinary { op, lhs, rhs } => {
+                self.compile_expr(lhs)?;
+                self.compile_expr(rhs)?;
+                self.asm.emit(bc::Op::InplaceBinOp(binop_sel(*op)));
             }
             Expr::Unary { op, operand } => {
                 self.compile_expr(operand)?;
@@ -2423,6 +2771,12 @@ impl Compiler {
                     }
                 }
                 self.asm.emit(bc::Op::Yield);
+                self.has_yield = true;
+            }
+            Expr::YieldFrom(value) => {
+                self.compile_expr(value)?;
+                self.asm.emit(bc::Op::GetIter);
+                self.asm.emit(bc::Op::YieldFrom);
                 self.has_yield = true;
             }
         }
@@ -2563,9 +2917,45 @@ impl Compiler {
         }
     }
 
-    /// Compile a comprehension: build an empty container in a temp, run the clause chain
-    /// (nested loops, each with its `if` filters), append/insert the element at the innermost
-    /// point, and leave the container on the stack.
+    /// Compile a comprehension as its own function scope: hoist `body` -- which builds and returns
+    /// the container, or (for a genexpr) yields each element -- into a hidden `<tag.N>(.0)` function,
+    /// then at the call site build the (closure) function and call it with the eagerly-iter'd
+    /// outermost iterable. The loop targets are the hidden function's locals, so they never leak into
+    /// this scope. Shared by list/set/dict comprehensions and generator expressions.
+    fn compile_hoisted_comprehension(
+        &mut self,
+        tag: &str,
+        body: Vec<Stmt>,
+        first_iterable: &Expr,
+    ) -> Result<(), CompileError> {
+        let name = format!("{}.<{}.{}>", self.name, tag, self.lambda_counter);
+        self.lambda_counter += 1;
+        let params = [genexpr_param()];
+        let body_refs: Vec<&Stmt> = body.iter().collect();
+        let (co, nested) = compile_code_object(
+            Scope::Function,
+            &name,
+            &params,
+            &None,
+            &body_refs,
+            None,
+            &self.child_scopes,
+        )?;
+        let freevars = co.freevars.clone();
+        self.hoisted.push(co);
+        self.hoisted.extend(nested);
+        let flags = self.emit_captured_cells(&freevars);
+        let idx = self.name_index(&name);
+        self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
+        self.compile_expr(first_iterable)?;
+        self.asm.emit(bc::Op::GetIter);
+        self.asm.emit(bc::Op::Call(1));
+        Ok(())
+    }
+
+    /// Compile a comprehension INLINE (the fallback when it holds a walrus that must leak): build an
+    /// empty container in a temp, run the clause chain (nested loops, each with its `if` filters),
+    /// append/insert the element at the innermost point, and leave the container on the stack.
     fn compile_comprehension(
         &mut self,
         kind: CompKind,
@@ -2760,7 +3150,7 @@ impl Compiler {
         self.asm.emit(bc::Op::StoreFast(i));
         let cn = Expr::Name(format!(".t{c}"));
         let ix = Expr::Name(format!(".t{i}"));
-        let combined = Expr::Binary {
+        let combined = Expr::InplaceBinary {
             op,
             lhs: Box::new(Expr::Subscript {
                 value: Box::new(cn.clone()),
@@ -2792,7 +3182,7 @@ impl Compiler {
         self.compile_expr(obj)?;
         self.asm.emit(bc::Op::StoreFast(o));
         let on = Expr::Name(format!(".t{o}"));
-        let combined = Expr::Binary {
+        let combined = Expr::InplaceBinary {
             op,
             lhs: Box::new(Expr::Attribute {
                 value: Box::new(on.clone()),
@@ -3122,6 +3512,17 @@ mod tests {
     }
 
     #[test]
+    fn yield_from_emits_getiter_then_yieldfrom_and_flags_generator() {
+        let module = compile_src("def g():\n    yield from xs\n").unwrap();
+        let g = func(&module, "g");
+        assert!(g.is_generator, "yield from makes the function a generator");
+        let gi = g.ops.iter().position(|op| matches!(op, Op::GetIter));
+        let yf = g.ops.iter().position(|op| matches!(op, Op::YieldFrom));
+        assert!(gi.is_some() && yf.is_some(), "emits GetIter and YieldFrom");
+        assert!(gi < yf, "GetIter (obtain the sub-iterator) precedes YieldFrom (delegate)");
+    }
+
+    #[test]
     fn genexpr_compiles_to_a_lazy_generator_function() {
         let module = compile_src("g = (x * x for x in xs)\n").unwrap();
         let genfn = module
@@ -3360,6 +3761,29 @@ mod tests {
     }
 
     #[test]
+    fn global_reads_and_writes_the_module_namespace() {
+        let src = "def bump():\n    global count\n    count = count + 1\n    return count\n";
+        let module = compile_src(src).unwrap();
+        let f = func(&module, "bump");
+        assert!(!f.local_names.iter().any(|n| n == "count"), "count is not a local slot");
+        assert!(f.cellvars.is_empty() && f.freevars.is_empty(), "a global is not a cell/free var");
+        assert!(
+            f.ops.iter().any(|op| matches!(op, Op::LoadGlobal(_))),
+            "count is read through the global namespace"
+        );
+        assert!(
+            f.ops.iter().any(|op| matches!(op, Op::StoreGlobal(_))),
+            "count is written through the global namespace"
+        );
+    }
+
+    #[test]
+    fn global_on_a_parameter_is_rejected() {
+        let err = compile_src("def f(a):\n    global a\n    return a\n").unwrap_err();
+        assert!(err.message.contains("parameter and global"), "{}", err.message);
+    }
+
+    #[test]
     fn a_decorated_method_lands_in_the_class_namespace() {
         let src = "def tag(f):\n    return f\nclass C:\n    @tag\n    def m(self):\n        return 1\n";
         let module = compile_src(src).unwrap();
@@ -3485,6 +3909,18 @@ mod tests {
     }
 
     #[test]
+    fn import_star_emits_importname_then_importstar() {
+        let m = compile_src("from math import *\n").unwrap();
+        let ops = &m.body.ops;
+        let ni = ops.iter().position(|op| matches!(op, Op::ImportName(_)));
+        let si = ops.iter().position(|op| matches!(op, Op::ImportStar));
+        assert!(ni.is_some() && si.is_some(), "emits ImportName then ImportStar");
+        assert!(ni < si, "ImportName (push the module) precedes ImportStar (bind its names)");
+        assert!(!ops.iter().any(|op| matches!(op, Op::PopTop)), "ImportStar consumes the module");
+        assert!(compile_src("def f():\n    from math import *\n").is_err(), "rejected in a function");
+    }
+
+    #[test]
     fn keyword_only_defaults_emit_a_kwdefaults_dict() {
         let m = compile_src("def f(a, *, b=1):\n    return b\n").unwrap();
         let ops = &m.body.ops;
@@ -3528,6 +3964,61 @@ mod tests {
             func(&module, "f").local_types,
             vec![StaticType::Int, StaticType::Int]
         );
+    }
+
+    #[test]
+    fn tuple_assignment_targets_infer_int_from_a_tuple_literal() {
+        let module = compile_src("def f() -> int:\n    a, b = 1, 2\n    return a + b\n").unwrap();
+        assert_eq!(
+            func(&module, "f").local_types,
+            vec![StaticType::Int, StaticType::Int]
+        );
+    }
+
+    #[test]
+    fn tuple_assignment_from_a_non_literal_keeps_targets_dynamic() {
+        let module = compile_src("def f(pair) -> int:\n    a, b = pair\n    return 0\n").unwrap();
+        assert_eq!(
+            func(&module, "f").local_types,
+            vec![StaticType::Dynamic, StaticType::Dynamic, StaticType::Dynamic]
+        );
+    }
+
+    #[test]
+    fn unannotated_float_locals_are_inferred() {
+        let module =
+            compile_src("def f() -> int:\n    x = 3.0\n    y = x + 1.0\n    return 0\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "x").unwrap()], StaticType::Float);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "y").unwrap()], StaticType::Float);
+    }
+
+    #[test]
+    fn true_division_and_int_plus_float_infer_float() {
+        let module =
+            compile_src("def f() -> int:\n    h = 7 / 2\n    m = 5 + 1.0\n    return 0\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "h").unwrap()], StaticType::Float);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "m").unwrap()], StaticType::Float);
+    }
+
+    #[test]
+    fn a_mixed_int_and_float_local_is_dynamic() {
+        let module =
+            compile_src("def f() -> int:\n    x = 1\n    x = 2.0\n    return 0\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "x").unwrap()], StaticType::Dynamic);
+    }
+
+    #[test]
+    fn a_float_comparison_result_infers_int() {
+        let module = compile_src(
+            "def f() -> int:\n    a = 2.5\n    b = 1.5\n    flag = a > b\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "a").unwrap()], StaticType::Float);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "flag").unwrap()], StaticType::Int);
     }
 
     #[test]
@@ -3768,20 +4259,38 @@ mod tests {
         let m = compile_src("def f():\n    return {1, 2, 3}\n").unwrap();
         assert!(func(&m, "f").ops.iter().any(|op| matches!(op, Op::BuildSet(3))));
         let c = compile_src("def f(r):\n    return {x for x in r}\n").unwrap();
-        let ops = &func(&c, "f").ops;
-        assert!(ops.iter().any(|op| matches!(op, Op::BuildSet(0))));
-        assert!(ops.iter().any(|op| matches!(op, Op::SetAdd)));
+        let comp = c
+            .functions
+            .iter()
+            .find(|co| co.name.contains("<setcomp."))
+            .expect("a hoisted setcomp function");
+        assert!(comp.ops.iter().any(|op| matches!(op, Op::BuildSet(0))));
+        assert!(comp.ops.iter().any(|op| matches!(op, Op::ForIter(_))));
+        assert!(func(&c, "f").ops.iter().any(|op| matches!(op, Op::Call(1))));
+        assert!(!func(&c, "f").ops.iter().any(|op| matches!(op, Op::BuildSet(_))));
     }
 
     #[test]
-    fn comprehensions_emit_build_and_append() {
+    fn comprehensions_hoist_and_build_in_their_own_function() {
         let m = compile_src("def f(r):\n    return [x * 2 for x in r if x]\n").unwrap();
-        let ops = &func(&m, "f").ops;
-        assert!(ops.iter().any(|op| matches!(op, Op::BuildList(0))));
-        assert!(ops.iter().any(|op| matches!(op, Op::ListAppend)));
-        assert!(ops.iter().any(|op| matches!(op, Op::ForIter(_))));
+        let comp = m
+            .functions
+            .iter()
+            .find(|co| co.name.contains("<listcomp."))
+            .expect("a hoisted listcomp function");
+        assert!(comp.ops.iter().any(|op| matches!(op, Op::BuildList(0))));
+        assert!(comp.ops.iter().any(|op| matches!(op, Op::ForIter(_))));
+        assert!(comp.ops.iter().any(|op| matches!(op, Op::Return)));
+        assert!(func(&m, "f").ops.iter().any(|op| matches!(op, Op::Call(1))));
+        assert!(!func(&m, "f").ops.iter().any(|op| matches!(op, Op::BuildList(0))));
         let d = compile_src("def f(r):\n    return {x: x for x in r}\n").unwrap();
-        assert!(func(&d, "f").ops.iter().any(|op| matches!(op, Op::DictInsert)));
+        let dc = d
+            .functions
+            .iter()
+            .find(|co| co.name.contains("<dictcomp."))
+            .expect("a hoisted dictcomp function");
+        assert!(dc.ops.iter().any(|op| matches!(op, Op::BuildDict(0))));
+        assert!(dc.ops.iter().any(|op| matches!(op, Op::Setitem)));
     }
 
     #[test]
@@ -3789,6 +4298,16 @@ mod tests {
         let m = compile_src("def f(a, b):\n    return [a, b, a]\n").unwrap();
         let f = func(&m, "f");
         assert!(f.ops.iter().any(|op| matches!(op, Op::BuildList(3))));
+    }
+
+    #[test]
+    fn bare_name_augmented_assign_emits_inplace_binop() {
+        let m = compile_src("def f(x):\n    x += 1\n    return x\n").unwrap();
+        let ops = &func(&m, "f").ops;
+        assert!(ops.iter().any(|op| matches!(op, Op::InplaceBinOp(bc::BinOp::Add))));
+        assert!(!ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Add))), "not a plain binary");
+        let p = compile_src("def g(x):\n    return x + 1\n").unwrap();
+        assert!(func(&p, "g").ops.iter().any(|op| matches!(op, Op::Binary(bc::BinOp::Add))));
     }
 
     #[test]

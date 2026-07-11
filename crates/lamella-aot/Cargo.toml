@@ -46,3 +46,4 @@ string-utf8-wtf8 = []
 
 [lints]
 workspace = true
+

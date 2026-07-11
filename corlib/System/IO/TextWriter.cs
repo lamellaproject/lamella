@@ -21,8 +21,19 @@ namespace System.IO
             }
         }
 
+        public virtual void Write(int value)
+        {
+            Write(value.ToString());
+        }
+
         public virtual void WriteLine()
         {
+            Write(NewLine);
+        }
+
+        public virtual void WriteLine(int value)
+        {
+            Write(value);
             Write(NewLine);
         }
 

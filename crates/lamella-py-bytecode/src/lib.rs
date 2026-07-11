@@ -24,7 +24,18 @@ pub const MAGIC: [u8; 4] = *b"LPYC";
 /// Version 16 added the import system: `ImportName` (import a module and push it) and
 /// `ImportFrom` (read a name off the module on top of the stack), so `import m` and
 /// `from m import a` bind their names.
-pub const FORMAT_VERSION: u16 = 16;
+///
+/// Version 18 added `StoreGlobal` (a `global x` assignment inside a function stores to the module
+/// namespace). 17 is [`BUNDLE_FORMAT_VERSION`], so the bare-module version skips it -- the two share
+/// one u16 dispatch space (a reader tells a bare module from a bundle by the version).
+///
+/// Version 19 added `YieldFrom` (`yield from iterable` -- a generator delegates to a sub-iterator).
+///
+/// Version 20 added `ImportStar` (`from m import *` -- bind a module's public names into the current
+/// module namespace).
+///
+/// Version 21 added `InplaceBinOp` (augmented assignment `x OP= y` -- the in-place binary operator).
+pub const FORMAT_VERSION: u16 = 21;
 
 /// The feature-flag bits a module's header carries, declaring which language
 /// surface its bytecode assumes. A reader lacking a required feature rejects the
@@ -200,6 +211,10 @@ impl UnaryOp {
 /// |  45-47 | LoadDeref, StoreDeref, LoadClosure | closures |
 /// |  48-50 | SetupClassNamespace, StoreName, LoadName | class-body namespace |
 /// |  51-52 | ImportName, ImportFrom | imports |
+/// |     53 | StoreGlobal | `global` |
+/// |     54 | YieldFrom | generators |
+/// |     55 | ImportStar | imports |
+/// |     56 | InplaceBinOp | augmented assignment |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     /// Push `consts[idx]`.
@@ -328,6 +343,12 @@ pub enum Op {
     },
     /// Pop the right operand then the left, and push `left <op> right`.
     Binary(BinOp),
+    /// Pop the value then the target, apply the AUGMENTED (in-place) binary operator `op`, and push
+    /// the result -- for `target OP= value`. Distinct from [`Op::Binary`] because CPython augmented
+    /// assignment uses the in-place dunder (`__iadd__`, `__ior__`, ...): the target's in-place method
+    /// if it defines one, else a builtin mutable container's in-place op (a list extends, a dict
+    /// updates, ...) returning the SAME object, else the plain binary op (immutables are unchanged).
+    InplaceBinOp(BinOp),
     /// Pop the right operand then the left, and push the boolean `left <cmp> right`.
     Compare(CmpOp),
     /// Pop the operand and push `<op> operand`.
@@ -360,6 +381,13 @@ pub enum Op {
     /// value the caller injected (`None` under `next`). A `yield` expression -- appears only in a
     /// generator function (one whose [`CodeObject::is_generator`] is set).
     Yield,
+    /// Delegate to the sub-iterator on top of the stack (`yield from`). Drives it to exhaustion:
+    /// each value the sub yields is re-yielded to THIS generator's caller (suspending here), and the
+    /// value the caller injects (via `send`) -- or an exception it throws in -- is forwarded into the
+    /// sub. When the sub is exhausted, its return value (its `StopIteration.value`) is pushed as the
+    /// `yield from` expression's result. Stack: pops the iterator, pushes the result. Appears only in
+    /// a generator function. The operand is produced by a preceding [`Op::GetIter`].
+    YieldFrom,
     /// A call with `*args` / `**kwargs` unpacking. The stack holds `[callee, arg0 .. arg{argc-1}]`;
     /// `consts[kinds]` (a [`Const::ArgKinds`]) tags each of the `argc` values (positional / `*` /
     /// keyword / `**`), and `consts[kwnames]` (a [`Const::KwNames`]) names the keyword-tagged slots
@@ -417,6 +445,16 @@ pub enum Op {
     /// `from m import a, b`; the frontend emits a following store, then one [`Op::PopTop`] after the
     /// last to discard the module.
     ImportFrom(u32),
+    /// Pop the module on top of the stack and bind all of its public names into the CURRENT module's
+    /// namespace (its `__all__` if defined, else every name not starting with `_`) -- `from m import
+    /// *`. Takes no operand (the module carries its own name); the frontend emits it after an
+    /// [`Op::ImportName`], and it consumes that module (no trailing `PopTop`).
+    ImportStar,
+    /// Pop a value and store it into the CURRENT module's globals under `names[idx]` -- the store
+    /// counterpart of [`Op::LoadGlobal`] (CPython's `STORE_GLOBAL`). Emitted for an assignment to a
+    /// name declared `global` inside a function, whose write must reach the module namespace rather
+    /// than a frame local.
+    StoreGlobal(u32),
 }
 
 /// A compile-time constant in a code object's constant pool. Every value the running
@@ -707,6 +745,10 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             buf.push(5);
             buf.push(*b as u8);
         }
+        Op::InplaceBinOp(b) => {
+            buf.push(56);
+            buf.push(*b as u8);
+        }
         Op::Compare(c) => {
             buf.push(6);
             buf.push(*c as u8);
@@ -805,6 +847,8 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
             put_u32(buf, *kwnames);
         }
         Op::Yield => buf.push(41),
+        Op::YieldFrom => buf.push(54),
+        Op::ImportStar => buf.push(55),
         Op::CallEx {
             argc,
             kinds,
@@ -847,6 +891,10 @@ fn put_op(buf: &mut Vec<u8>, op: &Op) {
         }
         Op::ImportFrom(name) => {
             buf.push(52);
+            put_u32(buf, *name);
+        }
+        Op::StoreGlobal(name) => {
+            buf.push(53);
             put_u32(buf, *name);
         }
     }
@@ -1177,6 +1225,13 @@ impl<'a> Reader<'a> {
             50 => Op::LoadName(self.u32()?),
             51 => Op::ImportName(self.u32()?),
             52 => Op::ImportFrom(self.u32()?),
+            53 => Op::StoreGlobal(self.u32()?),
+            54 => Op::YieldFrom,
+            55 => Op::ImportStar,
+            56 => {
+                let b = self.u8()?;
+                Op::InplaceBinOp(BinOp::from_u8(b).ok_or(DecodeError::BadTag("BinOp", b))?)
+            }
             _ => return Err(DecodeError::BadTag("Op", tag)),
         };
         Ok(op)
@@ -1427,6 +1482,10 @@ mod tests {
             Op::LoadName(2),
             Op::ImportName(3),
             Op::ImportFrom(4),
+            Op::StoreGlobal(5),
+            Op::YieldFrom,
+            Op::ImportStar,
+            Op::InplaceBinOp(BinOp::Add),
             Op::Return,
         ];
         let mut buf = Vec::new();

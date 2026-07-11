@@ -112,6 +112,9 @@ namespace System
         public static Decimal operator -(Decimal d) { return Zero - d; }
         public static Decimal operator +(Decimal d) { return d; }
 
+        public static Decimal operator ++(Decimal d) { return d + One; }
+        public static Decimal operator --(Decimal d) { return d - One; }
+
         public static bool operator ==(Decimal d1, Decimal d2) { return Compare(d1, d2) == 0; }
         public static bool operator !=(Decimal d1, Decimal d2) { return Compare(d1, d2) != 0; }
         public static bool operator <(Decimal d1, Decimal d2) { return Compare(d1, d2) < 0; }

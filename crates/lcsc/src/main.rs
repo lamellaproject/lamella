@@ -38,7 +38,7 @@ fn main() -> ExitCode {
 
 /// Parses csc-style options. Bare arguments are the source files (one or more);
 /// `/reference:` (`-r:`) names a reference assembly, `/out:` the output, and
-/// `/debug-` suppresses the PDB (it is emitted by default, single-source only).
+/// `/debug-` suppresses the PDB (it is emitted by default).
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut sources = Vec::new();
     let mut output = None;
@@ -92,7 +92,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
 const USAGE: &str = "usage: lcsc <source.cs>... [/out:<path>] [/reference:<dll>]... [/define:A;B]... \
      [/debug-] [/normalize-identifiers] [/typedref] [/native-interop]\n\
      /define:A;B seeds preprocessor symbols for #if (9.5.3), like csc's /define (repeatable).\n\
-     Several source files compile into one assembly (the PDB is single-source only).\n\
+     Several source files compile into one assembly (each is its own PDB document).\n\
      /normalize-identifiers folds identifiers to NFC per ECMA-334 9.4.2 (off by default, to \
      match csc).\n\
      /typedref enables csc's undocumented __makeref/__refvalue/__reftype operators (off by \
@@ -194,7 +194,14 @@ fn compile(options: &Options) -> Result<bool, String> {
         .zip(&options.sources)
         .map(|(text, path)| (text.as_str(), path.as_str()))
         .collect();
-    let result = compile_sources_with(&sources, module, assembly, &references, options.lex.clone());
+    let result = compile_sources_with(
+        &sources,
+        module,
+        assembly,
+        &references,
+        options.emit_debug,
+        options.lex.clone(),
+    );
     let mut any_error = false;
     for ((text, path), diagnostics) in sources.iter().zip(&result.diagnostics) {
         print_diagnostics(path, text, diagnostics);
@@ -204,6 +211,11 @@ fn compile(options: &Options) -> Result<bool, String> {
         Some(image) => {
             std::fs::write(&output, &image)
                 .map_err(|error| format!("cannot write '{output}': {error}"))?;
+            if let Some(pdb) = result.pdb {
+                let pdb_path = replace_extension(&output, "pdb");
+                std::fs::write(&pdb_path, &pdb)
+                    .map_err(|error| format!("cannot write '{pdb_path}': {error}"))?;
+            }
             Ok(true)
         }
         None => {

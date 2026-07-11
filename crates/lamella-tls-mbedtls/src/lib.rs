@@ -52,6 +52,33 @@ pub fn set_entropy_source(source: fn(&mut [u8]) -> bool) {
     ENTROPY_SOURCE.store(source as *mut (), Ordering::Release);
 }
 
+/// The registered wall-clock source (`None` until the embedder provides one). Stored as a
+/// raw fn pointer so registration works from a bare-metal boot path, like the entropy source.
+static TIME_SOURCE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Registers the wall clock certificate validity WINDOWS are checked against (the current
+/// time in Unix seconds). Without one the clock reads 0 (the epoch): every real certificate
+/// then pre-dates "now", so a REQUIRED (pinned-cert / system-root) verify fails "not yet
+/// valid" LOUDLY rather than trusting an unchecked window -- fail closed. A device points
+/// this at an RTC, an SNTP-synced counter, or a baked build-time floor; the accept-any
+/// bench path (VERIFY_NONE) never consults it. Optional: a client that only uses accept-any
+/// need not register a clock.
+pub fn set_time_source(source: fn() -> u64) {
+    TIME_SOURCE.store(source as *mut (), Ordering::Release);
+}
+
+/// C hook (`csrc/lamella_tls_shim.c` -> `lamella_mbedtls_time`): the current time in Unix
+/// seconds, or 0 when no source is registered.
+#[unsafe(no_mangle)]
+extern "C" fn lamella_tls_time() -> i64 {
+    let source = TIME_SOURCE.load(Ordering::Acquire);
+    if source.is_null() {
+        return 0;
+    }
+    let source: fn() -> u64 = unsafe { core::mem::transmute(source) };
+    source() as i64
+}
+
 /// C hook (`csrc/lamella_tls_shim.c` -> `mbedtls_hardware_poll`): fills `output` from the
 /// registered source; nonzero = failure (no source registered, or the source failed).
 ///
@@ -67,12 +94,75 @@ extern "C" fn lamella_entropy_poll(output: *mut u8, len: usize) -> c_int {
     if source(buffer) { 0 } else { 1 }
 }
 
-/// Bytes of allocation header holding the payload size (16 keeps the payload the same
-/// alignment `Layout` grants the block).
-const ALLOC_HEADER: usize = 16;
 
-/// C hook: `calloc` for mbedTLS, backed by the global allocator with a size header so
-/// [`lamella_mbedtls_free`] can reconstruct the layout. Zeroed per calloc's contract.
+/// The pool size. On a device: one session's record buffers (16 KiB in + 4 KiB out) +
+/// ssl/x509 state + bignum churn peak, with working headroom -- an embedder wanting
+/// concurrent sessions grows this and its RAM budget together. On a HOST the pool is
+/// roomier: the conformance tests run sessions in parallel test threads, and host RAM is
+/// not the scarce resource the pool exists to discipline.
+const POOL_BYTES: usize = if cfg!(target_os = "none") { 32 * 1024 } else { 128 * 1024 };
+
+/// Block granularity and payload alignment: every block size is a multiple of this, and
+/// headers are one unit so payloads stay aligned.
+const ALLOC_UNIT: usize = 16;
+
+#[allow(dead_code)]
+#[repr(align(16))]
+struct Pool([u8; POOL_BYTES]);
+
+static mut POOL: Pool = Pool([0; POOL_BYTES]);
+
+/// A free block's header: its total size (header included) and the next free block by
+/// ascending address (address order is what makes coalescing a neighbor check).
+#[repr(C)]
+struct FreeBlock {
+    size: usize,
+    next: *mut FreeBlock,
+}
+
+/// The free-list head. Null until [`pool_init`] links the whole pool as one block;
+/// `FREE_INIT` marks initialization done even when the list is momentarily empty (fully
+/// allocated).
+static mut FREE_HEAD: *mut FreeBlock = core::ptr::null_mut();
+static mut FREE_INIT: bool = false;
+
+/// The pool's spin guard. A device pumps one session on one thread (uncontended, so this
+/// costs one uncontended CAS per call); the HOST conformance tests run in cargo's
+/// parallel test threads and genuinely contend.
+static POOL_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Runs `body` holding the pool lock.
+fn with_pool<T>(body: impl FnOnce() -> T) -> T {
+    while POOL_LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    let result = body();
+    POOL_LOCK.store(false, Ordering::Release);
+    result
+}
+
+/// Lazily links the whole pool as a single free block.
+///
+/// Safety: single-threaded contract; called only from the allocator entry points.
+unsafe fn pool_init() {
+    unsafe {
+        if *core::ptr::addr_of!(FREE_INIT) {
+            return;
+        }
+        let head = core::ptr::addr_of_mut!(POOL).cast::<FreeBlock>();
+        (*head).size = POOL_BYTES;
+        (*head).next = core::ptr::null_mut();
+        *core::ptr::addr_of_mut!(FREE_HEAD) = head;
+        *core::ptr::addr_of_mut!(FREE_INIT) = true;
+    }
+}
+
+/// C hook: `calloc` for mbedTLS over the pool -- first fit, split when the remainder can
+/// hold a block, zeroed per calloc's contract. An allocated block's header keeps its size
+/// for [`lamella_mbedtls_free`].
 ///
 /// Safety: pure allocator; returns null on overflow or exhaustion (mbedTLS handles null).
 #[unsafe(no_mangle)]
@@ -80,23 +170,46 @@ extern "C" fn lamella_mbedtls_calloc(count: usize, size: usize) -> *mut c_void {
     let Some(payload) = count.checked_mul(size) else {
         return core::ptr::null_mut();
     };
-    let Some(total) = payload.checked_add(ALLOC_HEADER) else {
+    let Some(raw) = payload.checked_add(ALLOC_UNIT) else {
         return core::ptr::null_mut();
     };
-    let Ok(layout) = core::alloc::Layout::from_size_align(total, ALLOC_HEADER) else {
-        return core::ptr::null_mut();
-    };
-    let block = unsafe { alloc::alloc::alloc_zeroed(layout) };
-    if block.is_null() {
-        return core::ptr::null_mut();
-    }
-    unsafe {
-        block.cast::<usize>().write(payload);
-        block.add(ALLOC_HEADER).cast()
-    }
+    let needed = (raw + ALLOC_UNIT - 1) & !(ALLOC_UNIT - 1);
+    with_pool(|| unsafe {
+        pool_init();
+        let mut prev: *mut FreeBlock = core::ptr::null_mut();
+        let mut current = *core::ptr::addr_of!(FREE_HEAD);
+        while !current.is_null() {
+            if (*current).size >= needed {
+                let remainder = (*current).size - needed;
+                let successor = if remainder >= ALLOC_UNIT * 2 {
+                    let tail = current.cast::<u8>().add(needed).cast::<FreeBlock>();
+                    (*tail).size = remainder;
+                    (*tail).next = (*current).next;
+                    (*current).size = needed;
+                    tail
+                } else {
+                    (*current).next
+                };
+                if prev.is_null() {
+                    *core::ptr::addr_of_mut!(FREE_HEAD) = successor;
+                } else {
+                    (*prev).next = successor;
+                }
+                let block = current.cast::<u8>();
+                block.cast::<usize>().write((*current).size);
+                let user = block.add(ALLOC_UNIT);
+                core::ptr::write_bytes(user, 0, payload);
+                return user.cast();
+            }
+            prev = current;
+            current = (*current).next;
+        }
+        core::ptr::null_mut()
+    })
 }
 
-/// C hook: `free` for [`lamella_mbedtls_calloc`] blocks.
+/// C hook: `free` for [`lamella_mbedtls_calloc`] blocks -- inserts by address and
+/// coalesces with adjacent free neighbors, so churn cannot fragment the pool away.
 ///
 /// Safety: `pointer` is null or a payload pointer this module's calloc returned.
 #[unsafe(no_mangle)]
@@ -104,13 +217,31 @@ extern "C" fn lamella_mbedtls_free(pointer: *mut c_void) {
     if pointer.is_null() {
         return;
     }
-    unsafe {
-        let block = pointer.cast::<u8>().sub(ALLOC_HEADER);
-        let payload = block.cast::<usize>().read();
-        let layout =
-            core::alloc::Layout::from_size_align_unchecked(payload + ALLOC_HEADER, ALLOC_HEADER);
-        alloc::alloc::dealloc(block, layout);
-    }
+    with_pool(|| unsafe {
+        let block = pointer.cast::<u8>().sub(ALLOC_UNIT).cast::<FreeBlock>();
+        let size = block.cast::<usize>().read();
+        (*block).size = size;
+        let mut prev: *mut FreeBlock = core::ptr::null_mut();
+        let mut current = *core::ptr::addr_of!(FREE_HEAD);
+        while !current.is_null() && current < block {
+            prev = current;
+            current = (*current).next;
+        }
+        (*block).next = current;
+        if prev.is_null() {
+            *core::ptr::addr_of_mut!(FREE_HEAD) = block;
+        } else {
+            (*prev).next = block;
+        }
+        if !current.is_null() && block.cast::<u8>().add((*block).size) == current.cast::<u8>() {
+            (*block).size += (*current).size;
+            (*block).next = (*current).next;
+        }
+        if !prev.is_null() && prev.cast::<u8>().add((*prev).size) == block.cast::<u8>() {
+            (*prev).size += (*block).size;
+            (*prev).next = (*block).next;
+        }
+    });
 }
 
 /// The ciphertext queues one session shares with mbedTLS's BIO callbacks. Boxed to a

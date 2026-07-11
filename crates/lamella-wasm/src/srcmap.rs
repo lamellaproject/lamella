@@ -107,7 +107,12 @@ fn srcmap_inner(corlib: &'static [u8], library: &'static [u8], app: &'static [u8
         }
         let document = pdb.method_document(rid).unwrap_or_default();
         let name = method_names.get(&rid).cloned().unwrap_or_default();
-        methods.insert(method_id.to_string(), serde_json::json!({ "document": document, "name": name, "points": points }));
+        let locals: Vec<serde_json::Value> = pdb
+            .local_variables(rid)
+            .into_iter()
+            .map(|lv| serde_json::json!({ "index": lv.index, "name": lv.name }))
+            .collect();
+        methods.insert(method_id.to_string(), serde_json::json!({ "document": document, "name": name, "points": points, "locals": locals }));
     }
     let entry_point = pdb
         .entry_point()

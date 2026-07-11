@@ -115,6 +115,41 @@ fn register_arg_count(inst: &Inst) -> usize {
     }
 }
 
+/// The number of argument WORDS a `Call`/`CallNative` must pass on the STACK -- the overflow past the
+/// profile's argument registers (a0-a7 on RV32IM, a0-a5 on RV32E), which [`marshal_call_args`] stores into
+/// the outgoing-args area at the BOTTOM of the caller's spilled frame (`sp+0..`). Mirrors that function's
+/// register packing exactly: a wide (>2-word) value-type argument rides ONE register (its slot ADDRESS, by
+/// reference), an int64/f64/small-struct a register PAIR, a scalar one; and a wide RESULT reserves a0 for
+/// the sret pointer so the explicit arguments start at a1. Returns 0 for a call that fits in registers, or
+/// a non-`Call`/`CallNative` inst -- the dispatch kinds (indirect/virtual/interface/delegate) still cap at
+/// the argument registers (their stack-arg support is a follow-on).
+fn call_stack_words(
+    inst: &Inst,
+    result: ValueId,
+    value_types: &[MirType],
+    profile: RiscvProfile,
+) -> usize {
+    let args = match inst {
+        Inst::Call { args, .. } | Inst::CallNative { args, .. } => args,
+        _ => return 0,
+    };
+    let regs = arg_reg_count(profile);
+    let mut reg = (value_words(value_types, result) > 2) as usize;
+    let mut stack = 0usize;
+    for &arg in args {
+        let words = value_words(value_types, arg);
+        let units = if words > 2 { 1 } else { words as usize };
+        for _ in 0..units {
+            if reg < regs {
+                reg += 1;
+            } else {
+                stack += 1;
+            }
+        }
+    }
+    stack
+}
+
 /// True if `op` is an integer mul/div/rem -- the operations RV32E must lower to a soft-routine CALL,
 /// since it has no M-extension. Add/sub, bitwise, and shifts stay native (base RV32I).
 fn is_soft_int_binop(op: BinOp) -> bool {
@@ -331,6 +366,7 @@ fn func_allocates(func: &Function) -> bool {
             matches!(
                 i,
                 Inst::Alloc { .. }
+                    | Inst::AllocLike { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
                     | Inst::AllocArrayMD { .. }
@@ -439,7 +475,7 @@ fn lower_module_inner(
         Some(addr) => AllocSite::Address(addr),
         None => AllocSite::None,
     };
-    lower_module_to_image(funcs, alloc, descriptors, &mut Vec::new(), profile, false)
+    lower_module_to_image(funcs, alloc, descriptors, &mut Vec::new(), profile, false, false)
         .map(|(bytes, ..)| bytes)
 }
 
@@ -487,6 +523,7 @@ fn lower_module_to_image(
     externs: &mut Vec<alloc::string::String>,
     profile: RiscvProfile,
     relocate: bool,
+    tolerant: bool,
 ) -> Result<LoweredModule, LowerError> {
     let mut program = funcs.to_vec();
     if !relocate {
@@ -495,40 +532,92 @@ fn lower_module_to_image(
         crate::stringgen::lower_int_to_string(&mut program);
     }
     let funcs: &[Function] = &program;
-    for func in funcs {
-        if lamella_ir::verify(func).is_err() {
-            return Err(LowerError::NotWellFormed);
+    if !tolerant {
+        for func in funcs {
+            if lamella_ir::verify(func).is_err() {
+                return Err(LowerError::NotWellFormed);
+            }
         }
     }
     let mut enc = Encoder::new();
     let func_labels: Vec<Label> = (0..funcs.len()).map(|_| enc.new_label()).collect();
     let mut offsets: Vec<u32> = Vec::with_capacity(funcs.len());
     let mut call_relocs: Vec<(u32, u32)> = Vec::new();
+    let mut desc_relocs: Vec<DescReloc> = Vec::new();
     let mut type_descs: TypeDescs = Vec::new();
     let mut type_desc_labels: Vec<(TypeHandle, Label)> = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
         enc.bind_label(func_labels[index]);
         offsets.push(enc.position());
-        lower_function(
-            &mut enc,
-            func,
-            &func_labels,
-            alloc,
-            descriptors,
-            &mut type_descs,
-            &mut type_desc_labels,
-            externs,
-            profile,
-            &mut call_relocs,
-            relocate,
-        )?;
+        if tolerant {
+            let mut scratch = Encoder::new();
+            let scratch_labels: Vec<Label> =
+                (0..funcs.len()).map(|_| scratch.new_label()).collect();
+            scratch.bind_label(scratch_labels[index]);
+            let mut s_descs: TypeDescs = Vec::new();
+            let mut s_desc_labels: Vec<(TypeHandle, Label)> = Vec::new();
+            let mut s_call_relocs: Vec<(u32, u32)> = Vec::new();
+            let mut s_desc_relocs: Vec<DescReloc> = Vec::new();
+            let mut s_externs = externs.clone();
+            let lowered = lamella_ir::verify(func).is_ok()
+                && lower_function(
+                    &mut scratch,
+                    func,
+                    &scratch_labels,
+                    alloc,
+                    descriptors,
+                    &mut s_descs,
+                    &mut s_desc_labels,
+                    &mut s_externs,
+                    profile,
+                    &mut s_call_relocs,
+                    &mut s_desc_relocs,
+                    relocate,
+                )
+                .is_ok();
+            if lowered {
+                lower_function(
+                    &mut enc,
+                    func,
+                    &func_labels,
+                    alloc,
+                    descriptors,
+                    &mut type_descs,
+                    &mut type_desc_labels,
+                    externs,
+                    profile,
+                    &mut call_relocs,
+                    &mut desc_relocs,
+                    relocate,
+                )
+                .expect("a method that lowered in the dry run lowers for real");
+            } else {
+                enc.ret();
+            }
+        } else {
+            lower_function(
+                &mut enc,
+                func,
+                &func_labels,
+                alloc,
+                descriptors,
+                &mut type_descs,
+                &mut type_desc_labels,
+                externs,
+                profile,
+                &mut call_relocs,
+                &mut desc_relocs,
+                relocate,
+            )?;
+        }
     }
-    let (desc_syms, desc_relocs) = emit_descriptors(
+    let desc_syms = emit_descriptors(
         &mut enc,
         &type_descs,
         &type_desc_labels,
         &func_labels,
         relocate,
+        &mut desc_relocs,
     );
     let bytes = enc
         .finish()
@@ -547,12 +636,14 @@ fn lower_module_to_image(
 /// name (plus any the caller passes in `externs`, whose indices lead so a hand-built `CallNative` still
 /// names them) becomes an UNDEFINED symbol. `externs` may be `&[]`; the pass discovers the rest.
 ///
-/// `descriptors` are the per-type vtables/itables (the resolver's `type_descriptors()`), laid IN-IMAGE
-/// after each allocating function's code (addressed PC-relatively via `la`, so position-independent
-/// through the link) -- so a dispatched/cast type's `Alloc` writes its `obj-4` descriptor pointer and
-/// `CallVirtual`/`CallInterface`/`castclass` work over the link, exactly as on the flat path. Pass `&[]`
-/// for a module with no dispatch. (The LINKABLE-symbol descriptor lane -- for `--gc-sections` and
-/// cross-assembly vtables -- is a later brick; these in-image descriptors serve self-contained programs.)
+/// `descriptors` are the per-type vtables/itables (the resolver's `type_descriptors()`). Each type gets
+/// ONE canonical `__lamella_typedesc_<handle>` symbol laid after the function code, its vtable/itable/
+/// base_ptr slots emitted as `R_LAMELLA_REL_DESC` relocations the linker resolves -- so a slot can point
+/// ACROSS the link at an inherited library virtual, and `--gc-sections` keeps/drops each descriptor by
+/// reachability. An `Alloc`/`TypeDescAddr` reaches its descriptor through a per-function REL_DESC pool
+/// word (`emit_desc_words_addr`), not a bare `la`, so the collector follows the Alloc -> descriptor edge.
+/// Thus a dispatched/cast type's `Alloc` writes its `obj-4` descriptor pointer and `CallVirtual`/
+/// `CallInterface`/`castclass` work over the link AND survive a gc re-layout. Pass `&[]` for no dispatch.
 pub fn lower_object(
     funcs: &[Function],
     names: &[&str],
@@ -572,6 +663,33 @@ pub fn lower_object_profile(
     descriptors: &[TypeMeta],
     profile: RiscvProfile,
 ) -> Result<Vec<u8>, LowerError> {
+    lower_object_relocatable(funcs, names, externs, descriptors, profile, false)
+}
+
+/// The RISC-V twin of arm32 [`crate::arm32::lower_object_library`]: lowers a LIBRARY object (corlib) with
+/// per-method dry-run TOLERANCE -- a method that fails to lower is stubbed to a bare `ret` and the build
+/// continues, so one un-lowerable corlib method does not sink the whole library. `--gc-sections` drops an
+/// unreached stub; a program that actually calls one surfaces the gap loudly (its own build stays fatal).
+pub fn lower_object_library(
+    funcs: &[Function],
+    names: &[&str],
+    externs: &[&str],
+    descriptors: &[TypeMeta],
+) -> Result<Vec<u8>, LowerError> {
+    lower_object_relocatable(funcs, names, externs, descriptors, RiscvProfile::Rv32im, true)
+}
+
+/// The shared relocatable-object lowering for [`lower_object_profile`] (a program, `tolerant == false` --
+/// every method must lower) and [`lower_object_library`] (a library, `tolerant == true` -- an un-lowerable
+/// method is stubbed). `tolerant` threads to [`lower_module_to_image`]'s per-method dry-run.
+fn lower_object_relocatable(
+    funcs: &[Function],
+    names: &[&str],
+    externs: &[&str],
+    descriptors: &[TypeMeta],
+    profile: RiscvProfile,
+    tolerant: bool,
+) -> Result<Vec<u8>, LowerError> {
     let mut extern_names: Vec<alloc::string::String> =
         externs.iter().map(|s| (*s).into()).collect();
     let program: Vec<Function> = funcs
@@ -590,6 +708,7 @@ pub fn lower_object_profile(
         &mut extern_names,
         profile,
         true,
+        tolerant,
     )?;
     let mut symbols: Vec<lamella_elf::Symbol> = (0..program.len())
         .map(|i| {
@@ -691,6 +810,7 @@ fn lower_function(
     externs: &mut Vec<alloc::string::String>,
     profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
+    desc_relocs: &mut Vec<DescReloc>,
     relocate: bool,
 ) -> Result<(), LowerError> {
     let pool = allocatable(profile);
@@ -727,11 +847,17 @@ fn lower_function(
             .iter()
             .any(|(_, i)| matches!(i, Inst::StringLiteral { .. }))
     });
+    let has_stack_call = func.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|(r, i)| call_stack_words(i, *r, &func.value_types, profile) > 0)
+    });
     if value_count > pool.len()
         || allocates
         || has_value_types
         || has_dispatch
         || has_string_literal
+        || has_stack_call
     {
         return lower_function_spilled(
             enc,
@@ -744,6 +870,7 @@ fn lower_function(
             externs,
             profile,
             relocs,
+            desc_relocs,
             relocate,
         );
     }
@@ -1144,15 +1271,15 @@ fn lower_function_spilled(
     externs: &mut Vec<alloc::string::String>,
     profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
+    desc_relocs: &mut Vec<DescReloc>,
     relocate: bool,
 ) -> Result<(), LowerError> {
     let max_args = arg_reg_count(profile);
     let arg_overflow = func.blocks[func.entry.index()].params.len() > max_args
-        || func
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .any(|(_, inst)| register_arg_count(inst) > max_args);
+        || func.blocks.iter().flat_map(|b| &b.insts).any(|(_, inst)| {
+            !matches!(inst, Inst::Call { .. } | Inst::CallNative { .. })
+                && register_arg_count(inst) > max_args
+        });
     if arg_overflow {
         return Err(LowerError::ControlFlowUnsupported);
     }
@@ -1164,6 +1291,7 @@ fn lower_function_spilled(
                 i,
                 Inst::Call { .. }
                     | Inst::Alloc { .. }
+                    | Inst::AllocLike { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
                     | Inst::AllocArrayMD { .. }
@@ -1184,8 +1312,16 @@ fn lower_function_spilled(
             ) || inst_is_softfloat_call(i, *r, &func.value_types)
         })
     });
+    let out_args_words = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|(result, inst)| call_stack_words(inst, *result, &func.value_types, profile))
+        .max()
+        .unwrap_or(0);
+    let out_args_bytes = out_args_words as i32 * 4;
     let mut offsets: Vec<i32> = Vec::with_capacity(value_count);
-    let mut used = 0i32;
+    let mut used = out_args_bytes;
     for ty in &func.value_types {
         offsets.push(used);
         used += ty.stack_slot_bytes() as i32;
@@ -1214,6 +1350,7 @@ fn lower_function_spilled(
     }
     let slot = |v: ValueId| offsets[v.index()];
     let mut string_blobs: Vec<(Label, Vec<u16>)> = Vec::new();
+    let mut desc_ptr_pool: Vec<(TypeHandle, Label)> = Vec::new();
 
     if frame > 0 {
         enc.addi(Reg::SP, Reg::SP, -(frame as i32));
@@ -1286,6 +1423,7 @@ fn lower_function_spilled(
                 type_descs,
                 type_desc_labels,
                 &mut string_blobs,
+                &mut desc_ptr_pool,
                 externs,
                 profile,
                 relocs,
@@ -1391,6 +1529,11 @@ fn lower_function_spilled(
         }
         ancestor += 1;
     }
+    for (handle, label) in &desc_ptr_pool {
+        enc.bind_label(*label);
+        desc_relocs.push((enc.position(), DESC_SYMBOL_FLAG | handle.0, 0));
+        enc.emit_word(0);
+    }
     for (label, units) in &string_blobs {
         enc.bind_label(*label);
         enc.emit_word(units.len() as u32);
@@ -1419,6 +1562,7 @@ fn lower_inst_spilled(
     type_descs: &mut TypeDescs,
     type_desc_labels: &mut Vec<(TypeHandle, Label)>,
     string_blobs: &mut Vec<(Label, Vec<u16>)>,
+    desc_ptr_pool: &mut Vec<(TypeHandle, Label)>,
     externs: &mut Vec<alloc::string::String>,
     profile: RiscvProfile,
     relocs: &mut Vec<(u32, u32)>,
@@ -1637,7 +1781,7 @@ fn lower_inst_spilled(
                 enc.mul(t2, t2, t1);
             }
             enc.addi(Reg::A0, t2, 8);
-            enc.la(Reg::A1, desc_label);
+            emit_desc_words_addr(enc, Reg::A1, t0, *handle, desc_label, desc_ptr_pool, relocate);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
@@ -1730,7 +1874,7 @@ fn lower_inst_spilled(
                 enc.mul(t0, t0, t1);
             }
             enc.addi(Reg::A0, t0, header);
-            enc.la(Reg::A1, desc_label);
+            emit_desc_words_addr(enc, Reg::A1, t0, *handle, desc_label, desc_ptr_pool, relocate);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
@@ -1972,17 +2116,35 @@ fn lower_inst_spilled(
                 Reg::A0,
                 (*payload_size + if has_descriptor { 4 } else { 0 }) as i32,
             );
-            enc.la(Reg::A1, desc_label);
+            emit_desc_words_addr(enc, Reg::A1, t0, *handle, desc_label, desc_ptr_pool, relocate);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
             enc.bind_label(ok);
             if has_descriptor {
-                enc.la(t0, desc_label);
+                emit_desc_words_addr(enc, t0, t1, *handle, desc_label, desc_ptr_pool, relocate);
                 enc.sw(t0, Reg::A0, 0);
                 enc.addi(Reg::A0, Reg::A0, 4);
             }
+            enc.sw(Reg::A0, Reg::SP, slot(result));
+        }
+        Inst::AllocLike {
+            proto,
+            payload_size,
+        } => {
+            enc.lw(t0, Reg::SP, slot(*proto));
+            enc.lw(Reg::A1, t0, -4);
+            enc.li(Reg::A0, (*payload_size + 4) as i32);
+            emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
+            let ok = enc.new_label();
+            enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
+            enc.ebreak();
+            enc.bind_label(ok);
+            enc.lw(t0, Reg::SP, slot(*proto));
+            enc.lw(t1, t0, -4);
+            enc.sw(t1, Reg::A0, 0);
+            enc.addi(Reg::A0, Reg::A0, 4);
             enc.sw(Reg::A0, Reg::SP, slot(result));
         }
         Inst::AllocArray {
@@ -2013,7 +2175,7 @@ fn lower_inst_spilled(
                 enc.mul(t0, t0, t1);
             }
             enc.addi(Reg::A0, t0, 4);
-            enc.la(Reg::A1, desc_label);
+            emit_desc_words_addr(enc, Reg::A1, t0, *handle, desc_label, desc_ptr_pool, relocate);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
@@ -2199,7 +2361,7 @@ fn lower_inst_spilled(
                 type_desc_labels,
                 externs,
             );
-            enc.la(t0, desc_label);
+            emit_desc_words_addr(enc, t0, t1, *handle, desc_label, desc_ptr_pool, relocate);
             enc.sw(t0, Reg::SP, slot(result));
         }
         Inst::CastClassScan { args } => {
@@ -2601,9 +2763,9 @@ fn emit_descriptors(
     type_desc_labels: &[(TypeHandle, Label)],
     func_labels: &[Label],
     relocate: bool,
-) -> (Vec<DescSym>, Vec<DescReloc>) {
+    desc_relocs: &mut Vec<DescReloc>,
+) -> Vec<DescSym> {
     let mut desc_syms: Vec<DescSym> = Vec::new();
-    let mut desc_relocs: Vec<DescReloc> = Vec::new();
     for (desc, (handle, _)) in type_descs.iter().zip(type_desc_labels) {
         let vtable_start = enc.position();
         for (k, slot) in desc.vtable.iter().enumerate().rev() {
@@ -2661,7 +2823,46 @@ fn emit_descriptors(
             desc.vtable.len() as u32 * 4,
         ));
     }
-    (desc_syms, desc_relocs)
+    desc_syms
+}
+
+/// Emits `dst = &TypeDesc` (the canonical descriptor's WORDS address -- the value obj-4 holds and
+/// `CallVirtual`/`castclass` compare) for `handle`, choosing a `--gc-sections`-robust reference.
+///
+/// A bare `la dst, <descriptor>` names the module-level descriptor via a PC-relative pair the encoder
+/// resolves IN PLACE -- correct on the flat path and a non-collecting link, but it emits NO relocation,
+/// so `garbage_collect` cannot see the allocating-function -> descriptor edge: it would drop the
+/// descriptor, and the baked `la` would then address whatever re-layout left there. So on the OBJECT
+/// path (`relocate`) the reference is INDIRECT through a per-function pool word: the word holds `words -
+/// word` as an `R_LAMELLA_REL_DESC` (a relocation `garbage_collect` DOES follow to keep the descriptor,
+/// and which the linker re-applies under re-layout), and `la dst,word; lw tmp,0(dst); add dst,dst,tmp`
+/// reconstitutes the absolute words address position-independently. The pool word rides INSIDE this
+/// function's code (deduplicated by handle), so its own local `la` survives re-layout the way a string
+/// literal's does. `tmp` must differ from `dst`; both are caller-scratch at the call sites.
+fn emit_desc_words_addr(
+    enc: &mut Encoder,
+    dst: Reg,
+    tmp: Reg,
+    handle: TypeHandle,
+    desc_label: Label,
+    desc_ptr_pool: &mut Vec<(TypeHandle, Label)>,
+    relocate: bool,
+) {
+    if !relocate {
+        enc.la(dst, desc_label);
+        return;
+    }
+    let word = match desc_ptr_pool.iter().find(|(h, _)| *h == handle) {
+        Some((_, l)) => *l,
+        None => {
+            let l = enc.new_label();
+            desc_ptr_pool.push((handle, l));
+            l
+        }
+    };
+    enc.la(dst, word);
+    enc.lw(tmp, dst, 0);
+    enc.add(dst, dst, tmp);
 }
 
 /// Finds or creates the canonical descriptor label for `handle`, deduplicated so an `Alloc` and a
@@ -2756,9 +2957,11 @@ fn value_words(value_types: &[MirType], value: ValueId) -> u32 {
 
 /// Marshals a call's arguments from their slots into the argument registers, starting at register index
 /// `first` (0 for a static call, 1 when a0 already holds a receiver). Each value takes consecutive
-/// registers per [`value_words`] -- an int64 / small value type spans a pair. Rejects if the arguments
-/// overflow the profile's argument registers (a0-a5 on RV32E, a0-a7 otherwise); stack-passed arguments
-/// are deferred.
+/// registers per [`value_words`] -- an int64 / small value type spans a pair. Arguments PAST the profile's
+/// registers (a0-a7 on RV32IM, a0-a5 on RV32E) spill to the STACK: the caller reserves an outgoing-args
+/// area at the BOTTOM of its spilled frame (`sp+0..`, sized by [`call_stack_words`]), so each overflow word
+/// lands at `sp + 4*k` -- exactly where the callee reads it at `sp + its_frame + 4*k`. Loaded through the
+/// spilled scratch register (the arguments live in memory slots, so no register-source hazard).
 fn marshal_call_args(
     enc: &mut Encoder,
     slot: &impl Fn(ValueId) -> i32,
@@ -2767,25 +2970,34 @@ fn marshal_call_args(
     first: usize,
     profile: RiscvProfile,
 ) -> Result<(), LowerError> {
+    let regs = arg_reg_count(profile);
+    let scratch = spilled_scratch(profile);
     let mut reg = first;
+    let mut stack_word = 0i32;
     for &arg in args {
         let words = value_words(value_types, arg);
         if words > 2 {
-            if reg >= arg_reg_count(profile) {
-                return Err(LowerError::ControlFlowUnsupported);
+            if reg < regs {
+                let target = arg_reg(reg).ok_or(LowerError::ControlFlowUnsupported)?;
+                enc.addi(target, Reg::SP, slot(arg));
+                reg += 1;
+            } else {
+                enc.addi(scratch, Reg::SP, slot(arg));
+                enc.sw(scratch, Reg::SP, stack_word * 4);
+                stack_word += 1;
             }
-            let target = arg_reg(reg).ok_or(LowerError::ControlFlowUnsupported)?;
-            enc.addi(target, Reg::SP, slot(arg));
-            reg += 1;
             continue;
         }
         for w in 0..words {
-            if reg >= arg_reg_count(profile) {
-                return Err(LowerError::ControlFlowUnsupported);
+            if reg < regs {
+                let target = arg_reg(reg).ok_or(LowerError::ControlFlowUnsupported)?;
+                enc.lw(target, Reg::SP, slot(arg) + w as i32 * 4);
+                reg += 1;
+            } else {
+                enc.lw(scratch, Reg::SP, slot(arg) + w as i32 * 4);
+                enc.sw(scratch, Reg::SP, stack_word * 4);
+                stack_word += 1;
             }
-            let target = arg_reg(reg).ok_or(LowerError::ControlFlowUnsupported)?;
-            enc.lw(target, Reg::SP, slot(arg) + w as i32 * 4);
-            reg += 1;
         }
     }
     Ok(())

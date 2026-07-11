@@ -284,6 +284,12 @@ fn check_inst(
                 expect(MirType::ObjectRef, r, errors);
             }
         }
+        Inst::AllocLike { proto, .. } => {
+            use_value(func, defined, *proto, errors);
+            if let Some(r) = result_ty {
+                expect(MirType::ObjectRef, r, errors);
+            }
+        }
         Inst::AllocArray { length, .. } => {
             use_value(func, defined, *length, errors);
             if let Some(r) = result_ty {

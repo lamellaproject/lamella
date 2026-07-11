@@ -14,6 +14,8 @@ lamella-ir = { path = "../lamella-ir" }
 [dev-dependencies]
 lamella-aot = { path = "../lamella-aot" }
 lamella-asm-arm32 = { path = "../lamella-asm-arm32" }
+lamella-elf = { path = "../lamella-elf" }
+lamella-link = { path = "../lamella-link" }
 
 [lints]
 workspace = true

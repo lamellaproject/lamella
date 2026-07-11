@@ -179,6 +179,7 @@ impl Debugger {
             "initialize" => (true, Some(capabilities())),
             "launch" => {
                 let launched = self.launch(request);
+                self.flush_output(&mut events);
                 events.push(("initialized", None));
                 (launched, None)
             }
@@ -919,6 +920,62 @@ mod tests {
                 .map(str::to_owned),
             _ => None,
         })
+    }
+
+    /// A backend that surfaces a one-shot connect banner from `take_output` -- as the WirelineBackend
+    /// does with the board/chip identity it sets on HELLO -- and produces nothing thereafter. Inert
+    /// otherwise. Used to check the adapter drains that banner at `launch`, before the program runs.
+    struct BannerBackend {
+        banner: Option<String>,
+    }
+
+    impl DebugBackend for BannerBackend {
+        fn launch(&mut self) -> bool {
+            true
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) {}
+        fn resolve_source_breakpoint(&self, _document: &str, _line: u32) -> Option<u64> {
+            None
+        }
+        fn stack(&self) -> Vec<Frame> {
+            Vec::new()
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            self.banner.take()
+        }
+    }
+
+    #[test]
+    fn launch_surfaces_the_connect_banner_before_the_program_runs() {
+        let mut dbg = Debugger::with_backend(Box::new(BannerBackend {
+            banner: Some("Lamella Link: SAM E54 Xplained Pro\n".to_string()),
+        }));
+        let out = dbg.handle(&request(1, "launch", None));
+        assert_eq!(
+            output_note(&out).as_deref(),
+            Some("Lamella Link: SAM E54 Xplained Pro\n"),
+        );
     }
 
     #[test]

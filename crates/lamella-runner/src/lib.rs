@@ -463,9 +463,21 @@ fn run_result_of(vm: &Vm, value: &Option<lamella_cil_runtime::Value>) -> RunResu
 }
 
 /// Applies a [`debug::DBG_BREAK`] payload to `session`: replace the whole breakpoint set with
-/// the `(method_id, offset)` pairs it carries (`count(u16 LE)` then `count` x two u32 LE). On
-/// the `in_place` tier the offset is the CIL byte offset, the domain `is_at_breakpoint` checks
-/// the running ip against -- so a breakpoint applied here (even mid-run) fires on the next hit.
+/// the `(method_id, offset)` pairs it carries (`count(u16 LE)` then `count` x two u32 LE).
+///
+/// The `offset` is stored VERBATIM as the breakpoint key, and that is deliberate, not a missing
+/// conversion: a `baked-image` device runs the interpreter `code-in-place`, under which the
+/// executing `frame.ip` is a CIL BYTE offset (interp.rs advances it via `decode_at` -> `next_ip`,
+/// a variable-width byte step), and `is_at_breakpoint` matches `breakpoints.get(&(method,
+/// frame.ip))` -- so the key domain IS byte offsets. The wireline host sends the srcmap's raw
+/// il_offset (a byte offset) precisely because of this (see lamella-wireline debug_backend: "the
+/// wire reports the CIL offset directly, so no index conversion is needed"). Converting the
+/// offset to an instruction INDEX here would store a key the byte-domain ip never equals -- the
+/// breakpoint would silently miss. Index conversion is the HOST interpreter's job (that Session
+/// is `not(code-in-place)`, so its ip IS an index; lamella-dap's interp_backend converts at
+/// source-resolution time). If a `baked-image` build ever pairs with a `not(code-in-place)`
+/// interpreter, THAT variant -- and only it -- would need the byte->index conversion here.
+///
 /// Shared by the halted command loop and the mid-run poll, so setting a breakpoint WHILE the
 /// program runs behaves identically to setting one while it is stopped.
 #[cfg(feature = "baked-image")]

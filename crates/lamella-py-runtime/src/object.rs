@@ -61,6 +61,8 @@ const STR_CASEFOLD: u32 = 40;
 const STR_TRANSLATE: u32 = 41;
 const STR_FORMAT_MAP: u32 = 42;
 const STR_ENCODE: u32 = 43;
+const STR_ISTITLE: u32 = 44;
+const STR_ISPRINTABLE: u32 = 45;
 
 /// The id of the `str` method `name`, or `None` if `str` has no such method.
 /// Renders `n` in `radix` (2/8/10/16) with no sign or prefix; `upper` uppercases the hex digits.
@@ -161,6 +163,8 @@ fn str_method_id(name: &str) -> Option<u32> {
         "expandtabs" => Some(STR_EXPANDTABS),
         "isascii" => Some(STR_ISASCII),
         "isidentifier" => Some(STR_ISIDENTIFIER),
+        "istitle" => Some(STR_ISTITLE),
+        "isprintable" => Some(STR_ISPRINTABLE),
         "format" => Some(STR_FORMAT),
         "rsplit" => Some(STR_RSPLIT),
         "casefold" => Some(STR_CASEFOLD),
@@ -192,6 +196,13 @@ const DICT_SETDEFAULT: u32 = 6;
 const DICT_CLEAR: u32 = 7;
 const DICT_COPY: u32 = 8;
 const DICT_POPITEM: u32 = 9;
+const COUNTER_MOST_COMMON: u32 = 20;
+const COUNTER_ELEMENTS: u32 = 21;
+const COUNTER_TOTAL: u32 = 22;
+const COUNTER_UPDATE: u32 = 23;
+const COUNTER_SUBTRACT: u32 = 24;
+const ODICT_MOVE_TO_END: u32 = 25;
+const ODICT_POPITEM: u32 = 26;
 /// A synthetic method id: a `super().__init__(*args)` that resolves to the built-in
 /// `BaseException.__init__` (sets `self.args`). Reserved (`u32::MAX`) -- never a real per-type id.
 const EXC_INIT: u32 = u32::MAX;
@@ -211,6 +222,17 @@ const SET_POP: u32 = 12;
 const SET_UPDATE: u32 = 13;
 const TUPLE_INDEX: u32 = 0;
 const TUPLE_COUNT: u32 = 1;
+const NT_ASDICT: u32 = 10;
+pub(crate) const NT_REPLACE: u32 = 11;
+
+/// The namedtuple-instance method id for `name`, or `None` (the tuple surface then applies).
+fn nt_method_id(name: &str) -> Option<u32> {
+    match name {
+        "_asdict" => Some(NT_ASDICT),
+        "_replace" => Some(NT_REPLACE),
+        _ => None,
+    }
+}
 
 /// The `list`-method id for `name`, or `None`.
 fn list_method_id(name: &str) -> Option<u32> {
@@ -243,6 +265,58 @@ fn dict_method_id(name: &str) -> Option<u32> {
         "clear" => Some(DICT_CLEAR),
         "copy" => Some(DICT_COPY),
         "popitem" => Some(DICT_POPITEM),
+        _ => None,
+    }
+}
+
+const DEQUE_APPEND: u32 = 0;
+const DEQUE_APPENDLEFT: u32 = 1;
+const DEQUE_POP: u32 = 2;
+const DEQUE_POPLEFT: u32 = 3;
+const DEQUE_EXTEND: u32 = 4;
+const DEQUE_EXTENDLEFT: u32 = 5;
+const DEQUE_ROTATE: u32 = 6;
+const DEQUE_CLEAR: u32 = 7;
+const DEQUE_COUNT: u32 = 8;
+const DEQUE_REMOVE: u32 = 9;
+
+/// The method id for a `collections.deque` method `name`.
+fn deque_method_id(name: &str) -> Option<u32> {
+    match name {
+        "append" => Some(DEQUE_APPEND),
+        "appendleft" => Some(DEQUE_APPENDLEFT),
+        "pop" => Some(DEQUE_POP),
+        "popleft" => Some(DEQUE_POPLEFT),
+        "extend" => Some(DEQUE_EXTEND),
+        "extendleft" => Some(DEQUE_EXTENDLEFT),
+        "rotate" => Some(DEQUE_ROTATE),
+        "clear" => Some(DEQUE_CLEAR),
+        "count" => Some(DEQUE_COUNT),
+        "remove" => Some(DEQUE_REMOVE),
+        _ => None,
+    }
+}
+
+/// The Counter-specific method id for `name` (`most_common`/`elements`/`total`, plus the
+/// count-adding `update`/`subtract` OVERRIDES of the dict surface), or `None` (the inherited dict
+/// method then applies).
+fn counter_method_id(name: &str) -> Option<u32> {
+    match name {
+        "most_common" => Some(COUNTER_MOST_COMMON),
+        "elements" => Some(COUNTER_ELEMENTS),
+        "total" => Some(COUNTER_TOTAL),
+        "update" => Some(COUNTER_UPDATE),
+        "subtract" => Some(COUNTER_SUBTRACT),
+        _ => None,
+    }
+}
+
+/// The OrderedDict-specific method id for `name` (`move_to_end`; `popitem` gains the FIFO flag),
+/// or `None` (the inherited dict method then applies).
+fn odict_method_id(name: &str) -> Option<u32> {
+    match name {
+        "move_to_end" => Some(ODICT_MOVE_TO_END),
+        "popitem" => Some(ODICT_POPITEM),
         _ => None,
     }
 }
@@ -291,12 +365,24 @@ fn complex_method_id(name: &str) -> Option<u32> {
     }
 }
 
+/// Which projection of a dict a view object exposes (`d.keys()` / `d.values()` / `d.items()`) --
+/// derived from the view's type id, since each kind is its own type.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DictViewKind {
+    Keys,
+    Values,
+    Items,
+}
+
 pub(crate) const LAZY_MAP: u32 = 0;
 pub(crate) const LAZY_FILTER: u32 = 1;
 pub(crate) const LAZY_ZIP: u32 = 2;
 pub(crate) const LAZY_ENUMERATE: u32 = 3;
 /// `iter(callable, sentinel)`: state = the callable, the single source element = the sentinel.
 pub(crate) const LAZY_CALLABLE: u32 = 4;
+/// The old-style sequence protocol: iterate an object that has `__getitem__` but no `__iter__` by
+/// `obj[0]`, `obj[1]`, ... until IndexError. state = the current index, the single source = the object.
+pub(crate) const LAZY_GETITEM: u32 = 5;
 
 const BYTES_HEX: u32 = 0;
 const BYTES_DECODE: u32 = 1;
@@ -313,6 +399,31 @@ const BYTES_SPLIT: u32 = 11;
 const BYTES_STRIP: u32 = 12;
 const BYTES_LSTRIP: u32 = 13;
 const BYTES_RSTRIP: u32 = 14;
+const BYTES_ISALPHA: u32 = 15;
+const BYTES_ISDIGIT: u32 = 16;
+const BYTES_ISALNUM: u32 = 17;
+const BYTES_ISSPACE: u32 = 18;
+const BYTES_ISUPPER: u32 = 19;
+const BYTES_ISLOWER: u32 = 20;
+const BYTES_ISTITLE: u32 = 21;
+const BYTES_TITLE: u32 = 22;
+const BYTES_CAPITALIZE: u32 = 23;
+const BYTES_SWAPCASE: u32 = 24;
+const BYTES_REMOVEPREFIX: u32 = 25;
+const BYTES_REMOVESUFFIX: u32 = 26;
+const BYTES_JOIN: u32 = 27;
+const BYTES_RFIND: u32 = 28;
+const BYTES_INDEX: u32 = 29;
+const BYTES_RINDEX: u32 = 30;
+const BYTES_CENTER: u32 = 31;
+const BYTES_LJUST: u32 = 32;
+const BYTES_RJUST: u32 = 33;
+const BYTES_ZFILL: u32 = 34;
+const BYTES_PARTITION: u32 = 35;
+const BYTES_RPARTITION: u32 = 36;
+const BYTES_SPLITLINES: u32 = 37;
+const BYTES_EXPANDTABS: u32 = 38;
+const BYTES_RSPLIT: u32 = 39;
 
 /// The method id for a `bytes`/`bytearray` method `name` (`mutating` allows the bytearray-only ones).
 fn bytes_method_id(name: &str, mutating: bool) -> Option<u32> {
@@ -332,7 +443,171 @@ fn bytes_method_id(name: &str, mutating: bool) -> Option<u32> {
         "rstrip" => Some(BYTES_RSTRIP),
         "append" if mutating => Some(BYTEARRAY_APPEND),
         "extend" if mutating => Some(BYTEARRAY_EXTEND),
+        "isalpha" => Some(BYTES_ISALPHA),
+        "isdigit" => Some(BYTES_ISDIGIT),
+        "isalnum" => Some(BYTES_ISALNUM),
+        "isspace" => Some(BYTES_ISSPACE),
+        "isupper" => Some(BYTES_ISUPPER),
+        "islower" => Some(BYTES_ISLOWER),
+        "istitle" => Some(BYTES_ISTITLE),
+        "title" => Some(BYTES_TITLE),
+        "capitalize" => Some(BYTES_CAPITALIZE),
+        "swapcase" => Some(BYTES_SWAPCASE),
+        "removeprefix" => Some(BYTES_REMOVEPREFIX),
+        "removesuffix" => Some(BYTES_REMOVESUFFIX),
+        "join" => Some(BYTES_JOIN),
+        "rfind" => Some(BYTES_RFIND),
+        "index" => Some(BYTES_INDEX),
+        "rindex" => Some(BYTES_RINDEX),
+        "center" => Some(BYTES_CENTER),
+        "ljust" => Some(BYTES_LJUST),
+        "rjust" => Some(BYTES_RJUST),
+        "zfill" => Some(BYTES_ZFILL),
+        "partition" => Some(BYTES_PARTITION),
+        "rpartition" => Some(BYTES_RPARTITION),
+        "splitlines" => Some(BYTES_SPLITLINES),
+        "expandtabs" => Some(BYTES_EXPANDTABS),
+        "rsplit" => Some(BYTES_RSPLIT),
         _ => None,
+    }
+}
+
+/// Splits `data` on line boundaries (`\n`, `\r`, `\r\n`) for `bytes.splitlines`; `keepends` keeps the
+/// terminator on each line. A final line with no terminator is kept if non-empty.
+fn split_lines_bytes(data: &[u8], keepends: bool) -> Vec<Vec<u8>> {
+    let mut lines = Vec::new();
+    let mut current = Vec::new();
+    let mut i = 0;
+    while i < data.len() {
+        match data[i] {
+            b'\n' => {
+                if keepends {
+                    current.push(b'\n');
+                }
+                lines.push(core::mem::take(&mut current));
+                i += 1;
+            }
+            b'\r' => {
+                let crlf = data.get(i + 1) == Some(&b'\n');
+                if keepends {
+                    current.push(b'\r');
+                    if crlf {
+                        current.push(b'\n');
+                    }
+                }
+                lines.push(core::mem::take(&mut current));
+                i += if crlf { 2 } else { 1 };
+            }
+            other => {
+                current.push(other);
+                i += 1;
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+/// The ASCII case transform for a `bytes`/`bytearray` method: `title` (each word's first letter
+/// upper, rest lower), `capitalize` (first byte upper, the rest lower), `swapcase` (flip each).
+fn bytes_case_transform(method_id: u32, data: &[u8]) -> Vec<u8> {
+    match method_id {
+        BYTES_TITLE => {
+            let mut out = Vec::with_capacity(data.len());
+            let mut previous_is_cased = false;
+            for &b in data {
+                if b.is_ascii_alphabetic() {
+                    out.push(if previous_is_cased {
+                        b.to_ascii_lowercase()
+                    } else {
+                        b.to_ascii_uppercase()
+                    });
+                    previous_is_cased = true;
+                } else {
+                    out.push(b);
+                    previous_is_cased = false;
+                }
+            }
+            out
+        }
+        BYTES_CAPITALIZE => {
+            let mut out: Vec<u8> = data.iter().map(u8::to_ascii_lowercase).collect();
+            if let Some(first) = out.first_mut() {
+                *first = first.to_ascii_uppercase();
+            }
+            out
+        }
+        _ => data
+            .iter()
+            .map(|&b| {
+                if b.is_ascii_uppercase() {
+                    b.to_ascii_lowercase()
+                } else if b.is_ascii_lowercase() {
+                    b.to_ascii_uppercase()
+                } else {
+                    b
+                }
+            })
+            .collect(),
+    }
+}
+
+/// An ASCII `bytes`/`bytearray` predicate (`isalpha`/`isdigit`/`isalnum`/`isspace`/`isupper`/
+/// `islower`/`istitle`), no arguments -> a bool. Bytes predicates test the ASCII range only (unlike
+/// the Unicode-aware `str` versions).
+fn bytes_predicate(method_id: u32, data: &[u8]) -> bool {
+    match method_id {
+        BYTES_ISALPHA => !data.is_empty() && data.iter().all(u8::is_ascii_alphabetic),
+        BYTES_ISDIGIT => !data.is_empty() && data.iter().all(u8::is_ascii_digit),
+        BYTES_ISALNUM => !data.is_empty() && data.iter().all(u8::is_ascii_alphanumeric),
+        BYTES_ISSPACE => {
+            !data.is_empty()
+                && data.iter().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+        }
+        BYTES_ISUPPER => {
+            let mut cased = false;
+            for &b in data {
+                if b.is_ascii_lowercase() {
+                    return false;
+                }
+                cased |= b.is_ascii_uppercase();
+            }
+            cased
+        }
+        BYTES_ISLOWER => {
+            let mut cased = false;
+            for &b in data {
+                if b.is_ascii_uppercase() {
+                    return false;
+                }
+                cased |= b.is_ascii_lowercase();
+            }
+            cased
+        }
+        BYTES_ISTITLE => {
+            let mut cased = false;
+            let mut previous_is_cased = false;
+            for &b in data {
+                if b.is_ascii_uppercase() {
+                    if previous_is_cased {
+                        return false;
+                    }
+                    previous_is_cased = true;
+                    cased = true;
+                } else if b.is_ascii_lowercase() {
+                    if !previous_is_cased {
+                        return false;
+                    }
+                    cased = true;
+                } else {
+                    previous_is_cased = false;
+                }
+            }
+            cased
+        }
+        _ => false,
     }
 }
 
@@ -373,6 +648,7 @@ fn int_method_id(name: &str) -> Option<u32> {
 const FLOAT_IS_INTEGER: u32 = 0;
 const FLOAT_AS_INTEGER_RATIO: u32 = 1;
 const FLOAT_CONJUGATE: u32 = 2;
+const FLOAT_HEX: u32 = 3;
 
 /// The method id for a `float` method `name`.
 fn float_method_id(name: &str) -> Option<u32> {
@@ -380,8 +656,32 @@ fn float_method_id(name: &str) -> Option<u32> {
         "is_integer" => Some(FLOAT_IS_INTEGER),
         "as_integer_ratio" => Some(FLOAT_AS_INTEGER_RATIO),
         "conjugate" => Some(FLOAT_CONJUGATE),
+        "hex" => Some(FLOAT_HEX),
         _ => None,
     }
+}
+
+/// `float.hex()`: CPython's exact hexadecimal rendering of a double -- `[sign] 0xL.MMMMMMMMMMMMMp±E`,
+/// where `L` is the leading bit (1 normal, 0 subnormal/zero), `M` the 52-bit mantissa as 13 hex
+/// digits (trailing zeros KEPT), and `E` the power-of-two exponent (always signed). inf/nan render
+/// as their words. The inverse of [`crate::builtins::parse_hex_float`] (`float.fromhex`).
+fn float_to_hex(value: f64) -> String {
+    if value.is_nan() {
+        return String::from("nan");
+    }
+    if value.is_infinite() {
+        return String::from(if value < 0.0 { "-inf" } else { "inf" });
+    }
+    let bits = value.to_bits();
+    let sign = if bits >> 63 == 1 { "-" } else { "" };
+    let exp_bits = ((bits >> 52) & 0x7ff) as i64;
+    let mantissa = bits & 0x000f_ffff_ffff_ffff;
+    if exp_bits == 0 && mantissa == 0 {
+        return alloc::format!("{sign}0x0.0p+0");
+    }
+    let (lead, exp) = if exp_bits == 0 { (0u64, -1022i64) } else { (1u64, exp_bits - 1023) };
+    let exp_sign = if exp >= 0 { "+" } else { "-" };
+    alloc::format!("{sign}0x{lead}.{mantissa:013x}p{exp_sign}{}", exp.abs())
 }
 
 /// The exact `(numerator, denominator)` of a finite float, as reduced BigInts (the denominator a
@@ -506,6 +806,42 @@ fn str_predicate(method_id: u32, s: &str) -> bool {
                     && s.chars().skip(1).all(|c| is_xid_continue(c as u32))
             }
         },
+        STR_ISTITLE => {
+            let mut cased = false;
+            let mut previous_is_cased = false;
+            for c in s.chars() {
+                let cp = c as u32;
+                if is_uppercase(cp) || is_titlecase(cp) {
+                    if previous_is_cased {
+                        return false;
+                    }
+                    previous_is_cased = true;
+                    cased = true;
+                } else if is_lowercase(cp) {
+                    if !previous_is_cased {
+                        return false;
+                    }
+                    cased = true;
+                } else {
+                    previous_is_cased = false;
+                }
+            }
+            cased
+        }
+        STR_ISPRINTABLE => s.chars().all(|c| {
+            c == ' '
+                || !matches!(
+                    general_category(c as u32),
+                    GeneralCategory::SpaceSeparator
+                        | GeneralCategory::LineSeparator
+                        | GeneralCategory::ParagraphSeparator
+                        | GeneralCategory::Control
+                        | GeneralCategory::Format
+                        | GeneralCategory::Surrogate
+                        | GeneralCategory::PrivateUse
+                        | GeneralCategory::NotAssigned
+                )
+        }),
         _ => false,
     }
 }
@@ -897,6 +1233,120 @@ fn split_whitespace_bytes(data: &[u8]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// `bytes.split(None, maxsplit)` with `maxsplit >= 0`: whitespace split at most `maxsplit` times from
+/// the LEFT, leading whitespace skipped; the remainder keeps its internal + trailing whitespace.
+fn split_whitespace_maxsplit_bytes(data: &[u8], maxsplit: usize) -> Vec<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut i = 0;
+    let n = data.len();
+    while result.len() < maxsplit {
+        while i < n && data[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let start = i;
+        while i < n && !data[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        result.push(data[start..i].to_vec());
+    }
+    while i < n && data[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < n {
+        result.push(data[i..].to_vec());
+    }
+    result
+}
+
+/// `bytes.rsplit(None, maxsplit)` with `maxsplit >= 0`: the whitespace split counting from the RIGHT.
+fn rsplit_whitespace_maxsplit_bytes(data: &[u8], maxsplit: usize) -> Vec<Vec<u8>> {
+    let mut result = Vec::new();
+    let mut i = data.len();
+    while result.len() < maxsplit {
+        while i > 0 && data[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            break;
+        }
+        let end = i;
+        while i > 0 && !data[i - 1].is_ascii_whitespace() {
+            i -= 1;
+        }
+        result.push(data[i..end].to_vec());
+    }
+    while i > 0 && data[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i > 0 {
+        result.push(data[..i].to_vec());
+    }
+    result.reverse();
+    result
+}
+
+/// `str.split(None, maxsplit)` with `maxsplit >= 0`: split on runs of whitespace at most `maxsplit`
+/// times from the LEFT, leading whitespace skipped; after the last cut the remainder keeps its
+/// internal + trailing whitespace verbatim (only its leading whitespace is stripped).
+fn split_whitespace_maxsplit(s: &str, maxsplit: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    let mut result = Vec::new();
+    let mut i = 0;
+    while result.len() < maxsplit {
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let start = i;
+        while i < n && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        result.push(chars[start..i].iter().collect());
+    }
+    while i < n && chars[i].is_whitespace() {
+        i += 1;
+    }
+    if i < n {
+        result.push(chars[i..].iter().collect());
+    }
+    result
+}
+
+/// `str.rsplit(None, maxsplit)` with `maxsplit >= 0`: the whitespace split counting from the RIGHT,
+/// so the leftmost pieces stay joined (the head keeps its leading + internal whitespace verbatim).
+fn rsplit_whitespace_maxsplit(s: &str, maxsplit: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut result = Vec::new();
+    let mut i = chars.len();
+    while result.len() < maxsplit {
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i == 0 {
+            break;
+        }
+        let end = i;
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        result.push(chars[i..end].iter().collect());
+    }
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    if i > 0 {
+        result.push(chars[..i].iter().collect());
+    }
+    result.reverse();
+    result
+}
+
 /// Trims the bytes in `chars` from the chosen ends of `data`.
 fn strip_bytes(data: &[u8], chars: &[u8], left: bool, right: bool) -> Vec<u8> {
     let mut start = 0;
@@ -1139,6 +1589,13 @@ pub struct ObjectModel {
     /// (cheap) to run the callee against its OWN function table, disjoint from the `&mut self` borrow.
     /// Built once by [`ObjectModel::set_managed_modules`] alongside the registry.
     managed_functions: Vec<Rc<[CodeObject]>>,
+    /// The ENTRY module's function table (module 0) as a shared `Rc`, set by [`run_bundle`] before the
+    /// entry runs. The entry's own code threads its `functions` slice, but a MANAGED module calling an
+    /// entry-defined function value (home 0) reaches its code through this `Rc` -- else it would resolve
+    /// the index against the caller's table. `None` for a single-file program (no managed caller exists).
+    ///
+    /// [`run_bundle`]: crate::interp::run_bundle
+    entry_functions: Option<Rc<[CodeObject]>>,
     /// Each managed module's live GLOBAL namespace (name -> value), indexed by `module_id - 1`. A
     /// managed module's top-level bindings and its functions' `LoadGlobal`s resolve here (via
     /// [`ObjectModel::current_module_global`]), NOT the entry's `globals`, so a function defined in
@@ -1164,6 +1621,20 @@ pub struct ObjectModel {
     board_type_id: u32,
     /// The GC type-descriptor id of a `Pin` handle (a GC leaf of raw register words).
     pin_type_id: u32,
+    /// The GC type-descriptor id of the `uart` module singleton (the clean serial API).
+    uart_type_id: u32,
+    /// The GC type-descriptor id of a board UART resource (`board.UART0`): one raw instance word.
+    uart_resource_type_id: u32,
+    /// The GC type-descriptor id of an open `Port` (a GC leaf of raw config/state words).
+    uart_port_type_id: u32,
+    /// The GC type-descriptor id of the `busio` module singleton.
+    busio_type_id: u32,
+    /// The GC type-descriptor id of a shim UART factory (`machine.UART` / `busio.UART`, a
+    /// callable carrying its flavor word).
+    uart_shim_factory_type_id: u32,
+    /// The GC type-descriptor id of a shim UART instance: the wrapped Port (tagged, traced) +
+    /// the constructor-held timeout + the flavor.
+    uart_shim_type_id: u32,
     /// The GC type-descriptor id of the `machine` module singleton.
     machine_type_id: u32,
     /// The GC type-descriptor id of a `machine.Pin` factory (a callable, carrying OUT/IN).
@@ -1200,6 +1671,30 @@ pub struct ObjectModel {
     /// offset@4 (raw), length@8 (raw)]`. A zero-copy 1-D view; reads/writes go straight to the base's
     /// `byte_buffers` slot (a bytearray-backed view is writable, a bytes-backed one read-only).
     memoryview_type_id: u32,
+    /// The GC type-descriptor ids of the three dict views (`d.keys()`/`d.values()`/`d.items()`):
+    /// payload `[dict@0 (tagged, traced)]` -- a live window onto the dict, not a snapshot. Three
+    /// ids so each view is its own type (`dict_keys`/`dict_values`/`dict_items`).
+    dict_keys_type_id: u32,
+    dict_values_type_id: u32,
+    dict_items_type_id: u32,
+    /// The GC type-descriptor id of a `collections.defaultdict` -- a dict SUBTYPE: payload
+    /// `[dicts-arena index@0 (raw, dict-identical), default_factory@4 (tagged)]`. Every dict
+    /// operation accepts it via [`ObjectModel::dict_slot`]; only missing-key subscript, repr, and
+    /// `type()` differ.
+    defaultdict_type_id: u32,
+    /// The GC type-descriptor ids of `collections.Counter` / `collections.OrderedDict` -- dict
+    /// SUBTYPES with dict-identical one-slot payloads (see [`ObjectModel::dict_slot`]); the type id
+    /// alone selects the subtype behaviors.
+    counter_type_id: u32,
+    ordereddict_type_id: u32,
+    /// The GC type-descriptor id of a `collections.deque`: payload `[seqs-arena index@0 (raw),
+    /// maxlen@4 (raw; u32::MAX = unbounded)]`. Its own type over the shared seqs arena.
+    deque_type_id: u32,
+    /// The GC type-descriptor ids of a namedtuple CLASS (`[name@0, fields@4]`, both tagged) and a
+    /// namedtuple INSTANCE (`[seqs-arena index@0 raw, class@4 tagged]` -- a tuple SUBTYPE via
+    /// [`ObjectModel::tuple_slot`]).
+    ntclass_type_id: u32,
+    ntinstance_type_id: u32,
     /// The GC type-descriptor id of a `property`: payload `[fget@0, fset@4, fdel@8]` (each a function
     /// or None). Stored in a class namespace; the interpreter's attribute access calls the accessor.
     property_type_id: u32,
@@ -1218,8 +1713,10 @@ pub struct ObjectModel {
     /// every pooled frame is cleared of Values (holds nothing to trace).
     frame_pool: Vec<Frame>,
     /// App-claimed GPIO pins -- the one-owner-per-pin reservation. A second claim of a held pin
-    /// fails LOUD (a `ValueError` for an already-in-use pin), never a silent register race.
+    /// fails LOUD (an `OSError`, CPython's already-in-use flavor), never a silent register race.
     gpio_claimed: Vec<u32>,
+    /// App-claimed UART instances -- one owner per port, same fail-loud rule as pins.
+    uart_claimed: Vec<u32>,
     /// Firmware-reserved pins (seeded from the target profile): a claim of one fails loud, so an
     /// app-vs-firmware conflict is caught rather than silently colliding.
     gpio_reserved: Vec<u32>,
@@ -1235,6 +1732,13 @@ pub struct ObjectModel {
     /// so a driver runs and its register writes are verifiable OFF-device.
     #[cfg(not(target_os = "none"))]
     mmio_sim: alloc::collections::BTreeMap<u32, u32>,
+    /// The host UART sim's pending RX bytes (a test injects; FIFO reads pop) -- the behavioral
+    /// half the plain register file cannot express.
+    #[cfg(not(target_os = "none"))]
+    uart_sim_rx: alloc::collections::VecDeque<u8>,
+    /// The host UART sim's transmitted bytes (FIFO writes append) -- the TX oracle.
+    #[cfg(not(target_os = "none"))]
+    uart_sim_tx: Vec<u8>,
     /// The host-only ordered log of every MMIO write, so a test can assert the exact drive
     /// sequence (e.g. a blinky's alternating set/reset) that the last-value sim map cannot show.
     #[cfg(not(target_os = "none"))]
@@ -1248,6 +1752,16 @@ pub struct ObjectModel {
     /// takes it as the exception's single arg. Transient: consumed on the immediately following
     /// conversion (a future safe-point collector would trace it as a root while set).
     pending_trap_arg: Option<Value>,
+    /// The value a generator's body returned (`return v`, or `None` when it falls through), carried
+    /// from the exhausting [`crate::interp::resume_generator`] to the `StopIteration` the resumer
+    /// raises (so `StopIteration.value` is `v`). Transient: set at exhaustion and consumed by the
+    /// immediately following resume step, with no safe-point in between.
+    generator_return: Option<Value>,
+    /// An exception thrown INTO a generator suspended in a `yield from` (via `gen.throw`/`gen.close`):
+    /// carried from [`crate::interp::resume_generator`] to the re-run YieldFrom arm, which forwards it
+    /// to the sub-iterator (`sub.throw`). Transient: set then consumed by the immediately re-driven
+    /// YieldFrom op, with no safe-point between.
+    yield_from_throw: Option<Value>,
 }
 
 impl ObjectModel {
@@ -1379,6 +1893,42 @@ impl ObjectModel {
             ref_offsets: Vec::new(),
             tagged_offsets: Vec::new(),
         });
+        let uart_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let uart_resource_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let uart_port_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::uart::PORT_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let busio_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let uart_shim_factory_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let uart_shim_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::uart::SHIM_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0],
+        });
         let machine_type_id = descs.len() as u32;
         descs.push(TypeDesc {
             payload_size: 4,
@@ -1450,6 +2000,60 @@ impl ObjectModel {
             payload_size: 12,
             ref_offsets: Vec::new(),
             tagged_offsets: alloc::vec![0],
+        });
+        let dict_keys_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0],
+        });
+        let dict_values_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0],
+        });
+        let dict_items_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![0],
+        });
+        let defaultdict_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![4],
+        });
+        let counter_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let ordereddict_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let deque_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let ntclass_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: (0..2).map(|i| i * 4).collect(),
+        });
+        let ntinstance_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![4],
         });
         let property_type_id = descs.len() as u32;
         descs.push(TypeDesc {
@@ -1532,6 +2136,7 @@ impl ObjectModel {
             modules: Vec::new(),
             managed_modules: Vec::new(),
             managed_functions: Vec::new(),
+            entry_functions: None,
             managed_globals: Vec::new(),
             current_module: 0,
             function_dicts: Vec::new(),
@@ -1539,6 +2144,12 @@ impl ObjectModel {
             gpio_type_id,
             board_type_id,
             pin_type_id,
+            uart_type_id,
+            uart_resource_type_id,
+            uart_port_type_id,
+            busio_type_id,
+            uart_shim_factory_type_id,
+            uart_shim_type_id,
             machine_type_id,
             pin_factory_type_id,
             digitalio_type_id,
@@ -1551,11 +2162,21 @@ impl ObjectModel {
             lazy_iter_type_id,
             method_wrapper_type_id,
             memoryview_type_id,
+            dict_keys_type_id,
+            dict_values_type_id,
+            dict_items_type_id,
+            defaultdict_type_id,
+            counter_type_id,
+            ordereddict_type_id,
+            deque_type_id,
+            ntclass_type_id,
+            ntinstance_type_id,
             property_type_id,
             unbound_method_type_id,
             generators: Vec::new(),
             frame_pool: Vec::new(),
             gpio_claimed: Vec::new(),
+            uart_claimed: Vec::new(),
             gpio_reserved: Vec::new(),
             mmio_write_fn: None,
             mmio_read_fn: None,
@@ -1563,9 +2184,15 @@ impl ObjectModel {
             #[cfg(not(target_os = "none"))]
             mmio_sim: alloc::collections::BTreeMap::new(),
             #[cfg(not(target_os = "none"))]
+            uart_sim_rx: alloc::collections::VecDeque::new(),
+            #[cfg(not(target_os = "none"))]
+            uart_sim_tx: Vec::new(),
+            #[cfg(not(target_os = "none"))]
             mmio_trace: Vec::new(),
             delay_fn: None,
             pending_trap_arg: None,
+            generator_return: None,
+            yield_from_throw: None,
         }
     }
 
@@ -1631,6 +2258,10 @@ impl ObjectModel {
             range_len(start, stop, step).max(0) as usize
         } else if let Some(elements) = self.set_value(value) {
             elements.len()
+        } else if self.is_dict_view(value) {
+            self.dict_value(self.dict_view_dict(value)).map_or(0, Vec::len)
+        } else if let Some(elems) = self.deque_elems(value) {
+            elems.len()
         } else {
             return Err(Trap::TypeError);
         };
@@ -1693,6 +2324,30 @@ impl ObjectModel {
     #[must_use]
     pub fn is_bytearray(&self, value: Value) -> bool {
         value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.bytearray_type_id)
+    }
+
+    /// Appends `data` to a `bytearray` IN PLACE (`bytearray += bytes-like`). The object's identity
+    /// is unchanged. Rejects a `bytes` receiver (immutable -- its augmented form falls back to the
+    /// plain concatenation, rebinding a new `bytes`).
+    pub(crate) fn bytearray_extend_in_place(&mut self, bytearray: Value, data: Vec<u8>) -> Result<(), Trap> {
+        if !self.is_bytearray(bytearray) {
+            return Err(Trap::TypeError);
+        }
+        let slot = self.byte_buffer_slot(bytearray).ok_or(Trap::TypeError)?;
+        self.byte_buffers[slot].extend(data);
+        Ok(())
+    }
+
+    /// Repeats a `bytearray`'s contents `count` times IN PLACE (`bytearray *= n`; a non-positive
+    /// count clears, matching the plain `bytearray * n`).
+    pub(crate) fn bytearray_repeat_in_place(&mut self, bytearray: Value, count: i64) -> Result<(), Trap> {
+        if !self.is_bytearray(bytearray) {
+            return Err(Trap::TypeError);
+        }
+        let slot = self.byte_buffer_slot(bytearray).ok_or(Trap::TypeError)?;
+        let data = core::mem::take(&mut self.byte_buffers[slot]);
+        self.byte_buffers[slot] = if count > 0 { data.repeat(count as usize) } else { Vec::new() };
+        Ok(())
     }
 
     /// The dynamic binary-op dispatch (`py_binop`) for object operands: `str` (`+` concatenates,
@@ -2048,6 +2703,18 @@ impl ObjectModel {
                 _ => Err(Trap::TypeError),
             };
         }
+        if self.is_slice(lhs) && self.is_slice(rhs) {
+            let (a_start, a_stop, a_step) = self.slice_components(lhs);
+            let (b_start, b_stop, b_step) = self.slice_components(rhs);
+            let equal = self.key_eq(a_start, b_start)
+                && self.key_eq(a_stop, b_stop)
+                && self.key_eq(a_step, b_step);
+            return match op {
+                CmpOp::Eq => Ok(Some(Value::from_bool(equal))),
+                CmpOp::Ne => Ok(Some(Value::from_bool(!equal))),
+                _ => Err(Trap::TypeError),
+            };
+        }
         match (self.str_value(lhs), self.str_value(rhs)) {
             (None, None) => Ok(None),
             (Some(a), Some(b)) => {
@@ -2102,6 +2769,13 @@ impl ObjectModel {
         if let Some(elements) = self.set_value(value) {
             return Ok(Some(!elements.is_empty()));
         }
+        if self.is_dict_view(value) {
+            let entries = self.dict_value(self.dict_view_dict(value));
+            return Ok(Some(entries.is_some_and(|e| !e.is_empty())));
+        }
+        if let Some(elems) = self.deque_elems(value) {
+            return Ok(Some(!elems.is_empty()));
+        }
         if self.is_range(value) {
             let (start, stop, step) = self.range_bounds(value);
             return Ok(Some(range_len(start, stop, step) > 0));
@@ -2126,6 +2800,20 @@ impl ObjectModel {
     /// dispatch later -- the one-source-of-truth path the interpreter and the AOT
     /// `py_getitem` intrinsic both consume.
     pub fn py_getitem(&mut self, container: Value, index: Value) -> Result<Value, Trap> {
+        if self.is_deque(container) {
+            if self.is_slice(index) {
+                let message = "sequence index must be integer, not 'slice'";
+                return Err(self.with_message(Trap::TypeError, message));
+            }
+            let elems = self.deque_elems(container).ok_or(Trap::TypeError)?;
+            let len = elems.len() as i64;
+            let i = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if i < 0 { i + len } else { i };
+            if at < 0 || at >= len {
+                return Err(self.with_message(Trap::IndexError, "deque index out of range"));
+            }
+            return Ok(elems[at as usize]);
+        }
         if self.is_memoryview(container) {
             let (base, offset, length) = self.memoryview_parts(container);
             if self.is_slice(index) {
@@ -2387,6 +3075,16 @@ impl ObjectModel {
             .is_some_and(|reference| self.heap.type_id_of(reference) == self.slice_type_id)
     }
 
+    /// The `(start, stop, step)` bounds of a slice object -- each an int `Value` or `None` (the
+    /// caller has established `is_slice`). Backs `slice.start`/`.stop`/`.step`, its repr, and `==`.
+    pub(crate) fn slice_components(&self, value: Value) -> (Value, Value, Value) {
+        let reference = value.as_ref().expect("a slice");
+        let start = Value::from_bits(self.heap.read_u32(reference.0));
+        let stop = Value::from_bits(self.heap.read_u32(reference.0 + 4));
+        let step = Value::from_bits(self.heap.read_u32(reference.0 + 8));
+        (start, stop, step)
+    }
+
     /// Allocates a `range(start, stop, step)` -- a lazy int sequence (the bounds are fixnums,
     /// so an i32-range; a wider range would overflow, matching the corpus's needs).
     pub fn new_range(&mut self, start: i64, stop: i64, step: i64) -> Result<Value, Trap> {
@@ -2431,10 +3129,28 @@ impl ObjectModel {
         (self.heap.type_id_of(reference) == type_id).then(|| self.heap.read_u32(reference.0) as usize)
     }
 
-    /// The `seqs`-arena index if `value` is a `list` or `tuple`.
+    /// The `seqs`-arena index if `value` is a `tuple` OR a tuple SUBTYPE (a namedtuple instance)
+    /// -- both keep the arena index at payload offset 0, so every tuple operation that routes
+    /// through here treats an instance as the tuple it is.
+    fn tuple_slot(&self, value: Value) -> Option<usize> {
+        self.container_slot(value, self.tuple_type_id)
+            .or_else(|| self.container_slot(value, self.ntinstance_type_id))
+    }
+
+    /// The `seqs`-arena index if `value` is a `list` or `tuple` (incl. a tuple subtype).
     fn seq_slot(&self, value: Value) -> Option<usize> {
-        self.container_slot(value, self.list_type_id)
-            .or_else(|| self.container_slot(value, self.tuple_type_id))
+        self.container_slot(value, self.list_type_id).or_else(|| self.tuple_slot(value))
+    }
+
+    /// The `dicts`-arena index if `value` is a `dict` OR a dict SUBTYPE (`defaultdict`) -- both
+    /// keep the arena index at payload offset 0, so every dict operation that routes through here
+    /// treats a subtype as the dict it is; only the subtype-specific behaviors (missing-key
+    /// subscript, repr, `type()`) branch on the concrete type id.
+    fn dict_slot(&self, value: Value) -> Option<usize> {
+        self.container_slot(value, self.dict_type_id)
+            .or_else(|| self.container_slot(value, self.defaultdict_type_id))
+            .or_else(|| self.container_slot(value, self.counter_type_id))
+            .or_else(|| self.container_slot(value, self.ordereddict_type_id))
     }
 
     /// The elements if `value` is a `list` or `tuple`.
@@ -2442,10 +3158,9 @@ impl ObjectModel {
         self.seq_slot(value).and_then(|i| self.seqs.get(i))
     }
 
-    /// The key/value pairs if `value` is a `dict`.
+    /// The key/value pairs if `value` is a `dict` (or a dict subtype).
     pub(crate) fn dict_value(&self, value: Value) -> Option<&Vec<(Value, Value)>> {
-        self.container_slot(value, self.dict_type_id)
-            .and_then(|i| self.dicts.get(i))
+        self.dict_slot(value).and_then(|i| self.dicts.get(i))
     }
 
     /// The value bound to the string key `name` in `dict`, or `None` if `dict` is not a dict or has
@@ -2465,22 +3180,475 @@ impl ObjectModel {
         self.dict_value(value).cloned()
     }
 
+    /// Allocates a `collections.defaultdict` over `pairs` (duplicate keys collapsing like a dict
+    /// display) with `factory` as its `default_factory` (`Value::NONE` = no factory). A dict
+    /// SUBTYPE: the arena index sits at offset 0 exactly like a dict, so every dict operation
+    /// accepts it via [`ObjectModel::dict_slot`]; a missing-key subscript calls the factory.
+    pub(crate) fn new_defaultdict(
+        &mut self,
+        factory: Value,
+        pairs: Vec<(Value, Value)>,
+    ) -> Result<Value, Trap> {
+        let mut entries: Vec<(Value, Value)> = Vec::new();
+        for (key, value) in pairs {
+            match entries.iter().position(|(k, _)| self.key_eq(*k, key)) {
+                Some(slot) => entries[slot].1 = value,
+                None => entries.push((key, value)),
+            }
+        }
+        let index = self.dicts.len() as u32;
+        self.dicts.push(entries);
+        let reference = self.alloc_object(self.defaultdict_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, index);
+        self.heap.write_u32(reference.0 + 4, factory.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a `collections.defaultdict`.
+    #[must_use]
+    pub fn is_defaultdict(&self, value: Value) -> bool {
+        self.container_slot(value, self.defaultdict_type_id).is_some()
+    }
+
+    /// Allocates a `collections.Counter` over `entries` (already deduped/counted by the caller --
+    /// the constructor and the operator arms fold counts before allocating).
+    pub(crate) fn new_counter(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, Trap> {
+        let index = self.dicts.len() as u32;
+        self.dicts.push(entries);
+        let reference = self.alloc_object(self.counter_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, index);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a `collections.Counter`.
+    #[must_use]
+    pub fn is_counter(&self, value: Value) -> bool {
+        self.container_slot(value, self.counter_type_id).is_some()
+    }
+
+    /// A Counter's entries in DISPLAY order: count-descending, STABLE (ties keep insertion order)
+    /// -- CPython's most_common ordering, shared by the repr. Entries with a non-int count keep
+    /// pure insertion order (CPython's repr falls back the same way when counts don't sort).
+    pub(crate) fn counter_display_entries(&self, entries: Vec<(Value, Value)>) -> Vec<(Value, Value)> {
+        let mut counts = Vec::with_capacity(entries.len());
+        for (_, v) in &entries {
+            match self.as_i128(*v) {
+                Some(n) => counts.push(n),
+                None => return entries,
+            }
+        }
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by_key(|&i| core::cmp::Reverse(counts[i]));
+        order.into_iter().map(|i| entries[i]).collect()
+    }
+
+    /// Allocates a `collections.OrderedDict` over `pairs` (duplicate keys collapsing like a dict
+    /// display: last value wins, the key keeps its first position).
+    pub(crate) fn new_ordereddict(&mut self, pairs: Vec<(Value, Value)>) -> Result<Value, Trap> {
+        let mut entries: Vec<(Value, Value)> = Vec::new();
+        for (key, value) in pairs {
+            match entries.iter().position(|(k, _)| self.key_eq(*k, key)) {
+                Some(slot) => entries[slot].1 = value,
+                None => entries.push((key, value)),
+            }
+        }
+        let index = self.dicts.len() as u32;
+        self.dicts.push(entries);
+        let reference = self.alloc_object(self.ordereddict_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, index);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a `collections.OrderedDict`.
+    #[must_use]
+    pub fn is_ordereddict(&self, value: Value) -> bool {
+        self.container_slot(value, self.ordereddict_type_id).is_some()
+    }
+
+    /// Allocates a `collections.deque` over `elements`, keeping only the LAST `maxlen` of them
+    /// when bounded (CPython's constructor rule).
+    pub(crate) fn new_deque(
+        &mut self,
+        mut elements: Vec<Value>,
+        maxlen: Option<usize>,
+    ) -> Result<Value, Trap> {
+        if let Some(m) = maxlen {
+            if elements.len() > m {
+                elements.drain(..elements.len() - m);
+            }
+        }
+        let index = self.seqs.len() as u32;
+        self.seqs.push(elements);
+        let reference = self.alloc_object(self.deque_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, index);
+        self.heap.write_u32(reference.0 + 4, maxlen.map_or(u32::MAX, |m| m as u32));
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a `collections.deque`.
+    #[must_use]
+    pub fn is_deque(&self, value: Value) -> bool {
+        self.container_slot(value, self.deque_type_id).is_some()
+    }
+
+    /// The `seqs`-arena slot of a deque.
+    fn deque_slot(&self, value: Value) -> Option<usize> {
+        self.container_slot(value, self.deque_type_id)
+    }
+
+    /// A deque's elements (`None` if `value` is not a deque).
+    pub(crate) fn deque_elems(&self, value: Value) -> Option<&Vec<Value>> {
+        self.deque_slot(value).and_then(|i| self.seqs.get(i))
+    }
+
+    /// A deque's maxlen (`None` = unbounded); the outer `None` means `value` is not a deque.
+    pub(crate) fn deque_maxlen(&self, value: Value) -> Option<Option<usize>> {
+        let reference = value.as_ref()?;
+        if self.heap.type_id_of(reference) != self.deque_type_id {
+            return None;
+        }
+        let raw = self.heap.read_u32(reference.0 + 4);
+        Some(if raw == u32::MAX { None } else { Some(raw as usize) })
+    }
+
+    /// Pushes onto a deque's BACK, evicting from the FRONT past `maxlen` (a zero maxlen keeps it
+    /// empty, as CPython does).
+    fn deque_push_back(&mut self, slot: usize, maxlen: Option<usize>, item: Value) {
+        self.seqs[slot].push(item);
+        if let Some(m) = maxlen {
+            while self.seqs[slot].len() > m {
+                self.seqs[slot].remove(0);
+            }
+        }
+    }
+
+    /// Pushes onto a deque's FRONT, evicting from the BACK past `maxlen`.
+    fn deque_push_front(&mut self, slot: usize, maxlen: Option<usize>, item: Value) {
+        self.seqs[slot].insert(0, item);
+        if let Some(m) = maxlen {
+            while self.seqs[slot].len() > m {
+                self.seqs[slot].pop();
+            }
+        }
+    }
+
+    /// Allocates a namedtuple CLASS (`namedtuple(name, fields)` -- the factory's result): the
+    /// class name plus the field-name tuple, both interned as values.
+    pub(crate) fn new_ntclass(&mut self, name: &str, fields: &[String]) -> Result<Value, Trap> {
+        let name_value = self.new_str(name)?;
+        let mut field_values = Vec::with_capacity(fields.len());
+        for field in fields {
+            field_values.push(self.new_str(field)?);
+        }
+        let fields_tuple = self.new_tuple(field_values)?;
+        let reference = self.alloc_object(self.ntclass_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, name_value.bits());
+        self.heap.write_u32(reference.0 + 4, fields_tuple.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a namedtuple CLASS.
+    #[must_use]
+    pub fn is_ntclass(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.ntclass_type_id)
+    }
+
+    /// A namedtuple class's name (empty for a non-ntclass).
+    pub(crate) fn ntclass_name(&self, class: Value) -> String {
+        if !self.is_ntclass(class) {
+            return String::new();
+        }
+        self.str_value(self.read_slot(class, 0)).map(String::from).unwrap_or_default()
+    }
+
+    /// A namedtuple class's field names, in declaration order (empty for a non-ntclass).
+    pub(crate) fn ntclass_fields(&self, class: Value) -> Vec<String> {
+        if !self.is_ntclass(class) {
+            return Vec::new();
+        }
+        let fields_tuple = self.read_slot(class, 1);
+        self.seq_value(fields_tuple)
+            .map(|elems| {
+                elems
+                    .iter()
+                    .map(|&f| self.str_value(f).map(String::from).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The `_fields` tuple of a namedtuple class (the stored tuple itself).
+    pub(crate) fn ntclass_fields_tuple(&self, class: Value) -> Value {
+        if !self.is_ntclass(class) {
+            return Value::NONE;
+        }
+        self.read_slot(class, 1)
+    }
+
+    /// Allocates a namedtuple INSTANCE of `class` over `elements` (already bound to the fields by
+    /// the caller). A tuple subtype: the elements live in the seqs arena at offset 0.
+    pub(crate) fn new_ntinstance(&mut self, class: Value, elements: Vec<Value>) -> Result<Value, Trap> {
+        let index = self.seqs.len() as u32;
+        self.seqs.push(elements);
+        let reference = self.alloc_object(self.ntinstance_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, index);
+        self.heap.write_u32(reference.0 + 4, class.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The namedtuple class of `value` if it is a namedtuple INSTANCE (`None` otherwise).
+    pub(crate) fn ntinstance_class(&self, value: Value) -> Option<Value> {
+        value
+            .as_ref()
+            .filter(|r| self.heap.type_id_of(*r) == self.ntinstance_type_id)
+            .map(|r| Value::from_bits(self.heap.read_u32(r.0 + 4)))
+    }
+
+    /// Whether `value` is a namedtuple INSTANCE.
+    #[must_use]
+    pub fn is_ntinstance(&self, value: Value) -> bool {
+        self.ntinstance_class(value).is_some()
+    }
+
+    /// The namedtuple-instance method dispatch: `_asdict` here, everything else (index/count)
+    /// delegated to the tuple methods the instance inherits. `_replace` takes KEYWORDS and is
+    /// handled in the interpreter's keyword-call path instead.
+    pub(crate) fn call_nt_method(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        match method_id {
+            NT_ASDICT => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let class = self.ntinstance_class(receiver).ok_or(Trap::TypeError)?;
+                let fields = self.ntclass_fields(class);
+                let elements = self.seq_value(receiver).cloned().unwrap_or_default();
+                let mut pairs = Vec::with_capacity(fields.len());
+                for (field, element) in fields.iter().zip(elements) {
+                    let key = self.new_str(field)?;
+                    pairs.push((key, element));
+                }
+                self.new_dict(pairs)
+            }
+            NT_REPLACE => Err(Trap::TypeError),
+            _ => self.call_tuple_method(receiver, method_id, args),
+        }
+    }
+
+    /// The interp-aware `collections.deque` method dispatch. `count`/`remove` match elements by
+    /// `elem_eq` (a user `__eq__` participates) and `extend`/`extendleft` collect any iterable (a
+    /// generator source works), which is why the whole dispatch takes the interpreter context.
+    pub(crate) fn call_deque_method_dyn(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        args: &[Value],
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<Value, Trap> {
+        let slot = self.deque_slot(receiver).ok_or(Trap::TypeError)?;
+        let maxlen = self.deque_maxlen(receiver).unwrap_or(None);
+        match method_id {
+            DEQUE_APPEND | DEQUE_APPENDLEFT => {
+                let [item] = args else {
+                    return Err(Trap::TypeError);
+                };
+                if method_id == DEQUE_APPEND {
+                    self.deque_push_back(slot, maxlen, *item);
+                } else {
+                    self.deque_push_front(slot, maxlen, *item);
+                }
+                Ok(Value::NONE)
+            }
+            DEQUE_POP | DEQUE_POPLEFT => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                if self.seqs[slot].is_empty() {
+                    return Err(self.with_message(Trap::IndexError, "pop from an empty deque"));
+                }
+                Ok(if method_id == DEQUE_POP {
+                    self.seqs[slot].pop().unwrap_or(Value::NONE)
+                } else {
+                    self.seqs[slot].remove(0)
+                })
+            }
+            DEQUE_EXTEND | DEQUE_EXTENDLEFT => {
+                let [iterable] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let items = crate::builtins::collect_iterable(self, &[*iterable], functions, depth)?;
+                for item in items {
+                    if method_id == DEQUE_EXTEND {
+                        self.deque_push_back(slot, maxlen, item);
+                    } else {
+                        self.deque_push_front(slot, maxlen, item);
+                    }
+                }
+                Ok(Value::NONE)
+            }
+            DEQUE_ROTATE => {
+                let n = match args {
+                    [] => 1i64,
+                    [n] => n.as_int().ok_or(Trap::TypeError)?,
+                    _ => return Err(Trap::TypeError),
+                };
+                let len = self.seqs[slot].len();
+                if len > 0 {
+                    let k = n.rem_euclid(len as i64) as usize;
+                    self.seqs[slot].rotate_right(k);
+                }
+                Ok(Value::NONE)
+            }
+            DEQUE_CLEAR => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                self.seqs[slot].clear();
+                Ok(Value::NONE)
+            }
+            DEQUE_COUNT => {
+                let [element] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let elems = self.seqs[slot].clone();
+                let mut n = 0i64;
+                for e in elems {
+                    if crate::interp::elem_eq(*element, e, functions, self, depth)? {
+                        n += 1;
+                    }
+                }
+                self.int_from_i128(i128::from(n))
+            }
+            DEQUE_REMOVE => {
+                let [element] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let elems = self.seqs[slot].clone();
+                for (at, e) in elems.into_iter().enumerate() {
+                    if crate::interp::elem_eq(*element, e, functions, self, depth)? {
+                        self.seqs[slot].remove(at);
+                        return Ok(Value::NONE);
+                    }
+                }
+                let message = "deque.remove(x): x not in deque";
+                Err(self.with_message(Trap::ValueError, message))
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Replaces a dict's (or dict subtype's) entries wholesale -- the in-place Counter operators
+    /// compute the result entries, then swap them in, preserving the object's identity.
+    pub(crate) fn dict_replace_entries(
+        &mut self,
+        dict: Value,
+        entries: Vec<(Value, Value)>,
+    ) -> Result<(), Trap> {
+        let index = self.dict_slot(dict).ok_or(Trap::TypeError)?;
+        self.dicts[index] = entries;
+        Ok(())
+    }
+
+    /// An int `Value` from an `i128` count: a fixnum when it fits, else a long. The Counter
+    /// arithmetic's result constructor.
+    pub(crate) fn int_from_i128(&mut self, n: i128) -> Result<Value, Trap> {
+        if let Some(v) = i32::try_from(n).ok().and_then(Value::fixnum) {
+            return Ok(v);
+        }
+        self.new_long(n)
+    }
+
+    /// A defaultdict's `default_factory` (`Value::NONE` for none); `None` if `value` is not a
+    /// defaultdict.
+    pub(crate) fn defaultdict_factory(&self, value: Value) -> Option<Value> {
+        value
+            .as_ref()
+            .filter(|r| self.heap.type_id_of(*r) == self.defaultdict_type_id)
+            .map(|r| Value::from_bits(self.heap.read_u32(r.0 + 4)))
+    }
+
+    /// Allocates a dict VIEW over `dict` (`d.keys()`/`d.values()`/`d.items()`): a one-slot object
+    /// holding the dict itself. Live, not a snapshot -- every read goes through to the dict's
+    /// current entries, so mutations after the view was taken are visible.
+    pub(crate) fn new_dict_view(&mut self, dict: Value, kind: DictViewKind) -> Result<Value, Trap> {
+        let type_id = match kind {
+            DictViewKind::Keys => self.dict_keys_type_id,
+            DictViewKind::Values => self.dict_values_type_id,
+            DictViewKind::Items => self.dict_items_type_id,
+        };
+        let reference = self.alloc_object(type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, dict.bits());
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The view kind if `value` is a dict view, `None` otherwise.
+    pub(crate) fn dict_view_kind(&self, value: Value) -> Option<DictViewKind> {
+        let reference = value.as_ref()?;
+        let type_id = self.heap.type_id_of(reference);
+        if type_id == self.dict_keys_type_id {
+            Some(DictViewKind::Keys)
+        } else if type_id == self.dict_values_type_id {
+            Some(DictViewKind::Values)
+        } else if type_id == self.dict_items_type_id {
+            Some(DictViewKind::Items)
+        } else {
+            None
+        }
+    }
+
+    /// Whether `value` is any of the three dict views.
+    pub(crate) fn is_dict_view(&self, value: Value) -> bool {
+        self.dict_view_kind(value).is_some()
+    }
+
+    /// The dict a view wraps. `None` (never a valid dict) if `view` is not a view.
+    pub(crate) fn dict_view_dict(&self, view: Value) -> Value {
+        view.as_ref()
+            .map_or(Value::NONE, |r| Value::from_bits(self.heap.read_u32(r.0)))
+    }
+
+    /// Materializes a view's CURRENT elements: the dict's keys / values / `(key, value)` tuples
+    /// (the items kind allocates one tuple per entry). `None` if `value` is not a view.
+    pub(crate) fn dict_view_elems(&mut self, value: Value) -> Result<Option<Vec<Value>>, Trap> {
+        let Some(kind) = self.dict_view_kind(value) else {
+            return Ok(None);
+        };
+        let entries = self.dict_value(self.dict_view_dict(value)).cloned().unwrap_or_default();
+        let elems = match kind {
+            DictViewKind::Keys => entries.iter().map(|(k, _)| *k).collect(),
+            DictViewKind::Values => entries.iter().map(|(_, v)| *v).collect(),
+            DictViewKind::Items => {
+                let mut items = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    items.push(self.new_tuple(alloc::vec![key, value])?);
+                }
+                items
+            }
+        };
+        Ok(Some(elems))
+    }
+
     /// Whether `value` is a `list`.
     #[must_use]
     pub fn is_list(&self, value: Value) -> bool {
         self.container_slot(value, self.list_type_id).is_some()
     }
 
-    /// Whether `value` is a `tuple`.
+    /// Whether `value` is a `tuple` (a namedtuple instance included -- it IS one).
     #[must_use]
     pub fn is_tuple(&self, value: Value) -> bool {
-        self.container_slot(value, self.tuple_type_id).is_some()
+        self.tuple_slot(value).is_some()
     }
 
     /// Whether `value` is a `dict`.
     #[must_use]
     pub fn is_dict(&self, value: Value) -> bool {
-        self.container_slot(value, self.dict_type_id).is_some()
+        self.dict_slot(value).is_some()
     }
 
     /// Allocates a `list` over `elements` (a mutable sequence). The elements live in the
@@ -2491,6 +3659,28 @@ impl ObjectModel {
         let reference = self.alloc_object(self.list_type_id).ok_or(Trap::OutOfMemory)?;
         self.heap.write_u32(reference.0, index);
         Ok(Value::from_ref(reference))
+    }
+
+    /// Extends a `list` with `items` IN PLACE (`list += iterable` -- the interpreter collects the
+    /// iterable interp-aware first, so a generator source works). The list object's identity is
+    /// unchanged, so every alias observes the growth.
+    pub(crate) fn list_extend_in_place(&mut self, list: Value, items: Vec<Value>) -> Result<(), Trap> {
+        let index = self.container_slot(list, self.list_type_id).ok_or(Trap::TypeError)?;
+        self.seqs[index].extend(items);
+        Ok(())
+    }
+
+    /// Repeats a `list`'s contents `count` times IN PLACE (`list *= n`; a non-positive count
+    /// clears, matching the plain `list * n`). The list object's identity is unchanged.
+    pub(crate) fn list_repeat_in_place(&mut self, list: Value, count: i64) -> Result<(), Trap> {
+        let index = self.container_slot(list, self.list_type_id).ok_or(Trap::TypeError)?;
+        let base = core::mem::take(&mut self.seqs[index]);
+        let mut elements = Vec::new();
+        for _ in 0..count.max(0) {
+            elements.extend_from_slice(&base);
+        }
+        self.seqs[index] = elements;
+        Ok(())
     }
 
     /// Allocates a `tuple` over `elements` (an immutable sequence).
@@ -2557,7 +3747,7 @@ impl ObjectModel {
         functions: &[CodeObject],
         depth: usize,
     ) -> Result<Option<usize>, Trap> {
-        let i = self.container_slot(dict, self.dict_type_id).ok_or(Trap::TypeError)?;
+        let i = self.dict_slot(dict).ok_or(Trap::TypeError)?;
         self.require_hashable(key)?;
         if !self.is_instance(key) {
             let mut saw_instance_key = false;
@@ -2645,6 +3835,16 @@ impl ObjectModel {
         if !self.sets[index].iter().any(|e| self.key_eq(*e, value)) {
             self.sets[index].push(value);
         }
+        Ok(())
+    }
+
+    /// Replaces a MUTABLE set's contents wholesale -- the in-place set operators (`set |= s`,
+    /// `&=`, `-=`, `^=`) compute the result elements interp-aware, then swap them in, preserving
+    /// the set object's identity for aliases. A frozenset is rejected (its augmented form falls
+    /// back to the plain operator, rebinding a new frozenset).
+    pub(crate) fn set_replace_elems(&mut self, set: Value, elems: Vec<Value>) -> Result<(), Trap> {
+        let index = self.container_slot(set, self.set_type_id).ok_or(Trap::TypeError)?;
+        self.sets[index] = elems;
         Ok(())
     }
 
@@ -2758,6 +3958,16 @@ impl ObjectModel {
     /// from the end, `IndexError` out of range); a `dict` inserts or updates `index` as the
     /// key. A `tuple`/`str`/other is not assignable (`TypeError`).
     pub fn py_setitem(&mut self, container: Value, index: Value, value: Value) -> Result<(), Trap> {
+        if let Some(slot) = self.deque_slot(container) {
+            let len = self.seqs[slot].len() as i64;
+            let i = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if i < 0 { i + len } else { i };
+            if at < 0 || at >= len {
+                return Err(self.with_message(Trap::IndexError, "deque index out of range"));
+            }
+            self.seqs[slot][at as usize] = value;
+            return Ok(());
+        }
         if self.is_memoryview(container) {
             if self.memoryview_is_readonly(container) {
                 return Err(Trap::TypeError);
@@ -2801,7 +4011,7 @@ impl ObjectModel {
             self.seqs[i][at as usize] = value;
             return Ok(());
         }
-        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+        if let Some(i) = self.dict_slot(container) {
             match self.dicts[i].iter().position(|(k, _)| self.key_eq(*k, index)) {
                 Some(slot) => self.dicts[i][slot].1 = value,
                 None => self.dicts[i].push((index, value)),
@@ -2867,6 +4077,16 @@ impl ObjectModel {
     /// a `dict` removes `index` as a key (`KeyError` if absent). A `tuple`/`str`/other is a
     /// `TypeError`. An instance's `__delitem__` is dispatched by the interpreter before this.
     pub fn py_delitem(&mut self, container: Value, index: Value) -> Result<(), Trap> {
+        if let Some(slot) = self.deque_slot(container) {
+            let len = self.seqs[slot].len() as i64;
+            let i = index.as_int().ok_or(Trap::TypeError)?;
+            let at = if i < 0 { i + len } else { i };
+            if at < 0 || at >= len {
+                return Err(self.with_message(Trap::IndexError, "deque index out of range"));
+            }
+            self.seqs[slot].remove(at as usize);
+            return Ok(());
+        }
         if let Some(i) = self.container_slot(container, self.list_type_id) {
             if self.is_slice(index) {
                 return self.seq_delitem_slice(container, index);
@@ -2880,7 +4100,7 @@ impl ObjectModel {
             self.seqs[i].remove(at as usize);
             return Ok(());
         }
-        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+        if let Some(i) = self.dict_slot(container) {
             return match self.dicts[i].iter().position(|(k, _)| self.key_eq(*k, index)) {
                 Some(slot) => {
                     self.dicts[i].remove(slot);
@@ -2990,10 +4210,22 @@ impl ObjectModel {
         functions: &[CodeObject],
         depth: usize,
     ) -> Result<Value, Trap> {
-        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+        if let Some(i) = self.dict_slot(container) {
             return match self.dict_find_dyn(container, index, functions, depth)? {
                 Some(slot) if slot < self.dicts[i].len() => Ok(self.dicts[i][slot].1),
                 _ => {
+                    if let Some(factory) = self.defaultdict_factory(container) {
+                        if factory != Value::NONE {
+                            let value =
+                                crate::interp::call_value(factory, &[], functions, self, depth + 1)?;
+                            let slot = self.dict_slot(container).ok_or(Trap::TypeError)?;
+                            self.dicts[slot].push((index, value));
+                            return Ok(value);
+                        }
+                    }
+                    if self.is_counter(container) {
+                        return Value::fixnum(0).ok_or(Trap::Overflow);
+                    }
                     self.set_trap_arg(index);
                     Err(Trap::KeyError)
                 }
@@ -3013,7 +4245,7 @@ impl ObjectModel {
         functions: &[CodeObject],
         depth: usize,
     ) -> Result<(), Trap> {
-        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+        if let Some(i) = self.dict_slot(container) {
             match self.dict_find_dyn(container, index, functions, depth)? {
                 Some(slot) if slot < self.dicts[i].len() => self.dicts[i][slot].1 = value,
                 _ => self.dicts[i].push((index, value)),
@@ -3033,7 +4265,7 @@ impl ObjectModel {
         functions: &[CodeObject],
         depth: usize,
     ) -> Result<(), Trap> {
-        if let Some(i) = self.container_slot(container, self.dict_type_id) {
+        if let Some(i) = self.dict_slot(container) {
             return match self.dict_find_dyn(container, index, functions, depth)? {
                 Some(slot) if slot < self.dicts[i].len() => {
                     self.dicts[i].remove(slot);
@@ -3111,6 +4343,24 @@ impl ObjectModel {
                 alloc::format!("range({start}, {stop}, {step})")
             };
         }
+        if self.is_slice(value) {
+            let (start, stop, step) = self.slice_components(value);
+            return alloc::format!("slice({}, {}, {})", self.repr(start), self.repr(stop), self.repr(step));
+        }
+        if let Some(class) = self.ntinstance_class(value) {
+            let fields = self.ntclass_fields(class);
+            let elems = self.seq_value(value).cloned().unwrap_or_default();
+            let inner = fields
+                .iter()
+                .zip(&elems)
+                .map(|(f, &e)| alloc::format!("{f}={}", self.repr(e)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return alloc::format!("{}({inner})", self.ntclass_name(class));
+        }
+        if self.is_ntclass(value) {
+            return alloc::format!("<class '__main__.{}'>", self.ntclass_name(value));
+        }
         if let Some(elems) = self.seq_value(value) {
             let is_tuple = self.is_tuple(value);
             let len = elems.len();
@@ -3145,12 +4395,63 @@ impl ObjectModel {
                 alloc::format!("{{{inner}}}")
             };
         }
+        if let Some(elems) = self.deque_elems(value) {
+            let inner = elems.iter().map(|&e| self.repr(e)).collect::<Vec<_>>().join(", ");
+            return match self.deque_maxlen(value).unwrap_or(None) {
+                Some(m) => alloc::format!("deque([{inner}], maxlen={m})"),
+                None => alloc::format!("deque([{inner}])"),
+            };
+        }
+        if let Some(kind) = self.dict_view_kind(value) {
+            let entries = self.dict_value(self.dict_view_dict(value)).cloned().unwrap_or_default();
+            let (name, inner) = match kind {
+                DictViewKind::Keys => (
+                    "dict_keys",
+                    entries.iter().map(|&(k, _)| self.repr(k)).collect::<Vec<_>>().join(", "),
+                ),
+                DictViewKind::Values => (
+                    "dict_values",
+                    entries.iter().map(|&(_, v)| self.repr(v)).collect::<Vec<_>>().join(", "),
+                ),
+                DictViewKind::Items => (
+                    "dict_items",
+                    entries
+                        .iter()
+                        .map(|&(k, v)| alloc::format!("({}, {})", self.repr(k), self.repr(v)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            };
+            return alloc::format!("{name}([{inner}])");
+        }
         if let Some(entries) = self.dict_value(value) {
+            if self.is_counter(value) {
+                if entries.is_empty() {
+                    return String::from("Counter()");
+                }
+                let entries = self.counter_display_entries(entries.clone());
+                let inner = entries
+                    .iter()
+                    .map(|(k, v)| alloc::format!("{}: {}", self.repr(*k), self.repr(*v)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return alloc::format!("Counter({{{inner}}})");
+            }
             let inner = entries
                 .iter()
                 .map(|(k, v)| alloc::format!("{}: {}", self.repr(*k), self.repr(*v)))
                 .collect::<Vec<_>>()
                 .join(", ");
+            if let Some(factory) = self.defaultdict_factory(value) {
+                return alloc::format!("defaultdict({}, {{{inner}}})", self.repr(factory));
+            }
+            if self.is_ordereddict(value) {
+                return if inner.is_empty() {
+                    String::from("OrderedDict()")
+                } else {
+                    alloc::format!("OrderedDict({{{inner}}})")
+                };
+            }
             return alloc::format!("{{{inner}}}");
         }
         if let Some(id) = value.as_builtin_id() {
@@ -3162,7 +4463,12 @@ impl ObjectModel {
                 };
             }
             if let Some(name) = crate::stdlib::stdlib_name(id) {
-                return alloc::format!("<built-in function {name}>");
+                return if crate::stdlib::stdlib_is_type(id) {
+                    let module = crate::stdlib::stdlib_module_of(id).unwrap_or("builtins");
+                    alloc::format!("<class '{module}.{name}'>")
+                } else {
+                    alloc::format!("<built-in function {name}>")
+                };
             }
         }
         if self.is_class(value) {
@@ -3612,12 +4918,24 @@ impl ObjectModel {
         self.managed_modules.get((module_id.checked_sub(1)?) as usize).map(|m| m.body.clone())
     }
 
-    /// A shared clone of managed module `module_id`'s function table (`module_id >= 1`), or `None` for
-    /// the entry module (0, whose functions are threaded) or an out-of-range id. A cross-module call
-    /// clones this `Rc` (cheap) to run the callee against its own table, disjoint from `&mut self`.
+    /// A shared clone of module `module_id`'s function table, or `None` for an out-of-range id (or the
+    /// entry when no bundle installed one). Module 0 is the ENTRY (its `Rc`, set by `run_bundle`), so a
+    /// managed module calling an entry-defined function reaches the entry's code, not the caller's;
+    /// `module_id >= 1` is a managed module. A cross-module call clones this `Rc` (cheap) to run the
+    /// callee against its own table, disjoint from the `&mut self` borrow.
     #[must_use]
     pub(crate) fn managed_functions_rc(&self, module_id: u16) -> Option<Rc<[CodeObject]>> {
-        self.managed_functions.get((module_id.checked_sub(1)?) as usize).cloned()
+        match module_id {
+            0 => self.entry_functions.clone(),
+            k => self.managed_functions.get((k - 1) as usize).cloned(),
+        }
+    }
+
+    /// Installs the ENTRY module's function table (module 0) as a shared `Rc`, so a managed module
+    /// calling an entry-defined function value resolves its code against the entry. Set by `run_bundle`
+    /// before the entry runs.
+    pub(crate) fn set_entry_functions(&mut self, functions: Rc<[CodeObject]>) {
+        self.entry_functions = Some(functions);
     }
 
     /// The module whose functions + globals running code resolves against (0 = entry). Read by
@@ -3662,6 +4980,59 @@ impl ObjectModel {
                 }
             }
         }
+    }
+
+    /// Removes `name` from the CURRENT module's global namespace (a module-level `del name`), the
+    /// counterpart of [`Self::set_current_module_global`]. Returns whether it was bound.
+    pub(crate) fn delete_current_module_global(&mut self, name: &str) -> bool {
+        let slot = match self.current_module {
+            0 => &mut self.globals,
+            k => match self.managed_globals.get_mut((k - 1) as usize) {
+                Some(slot) => slot,
+                None => return false,
+            },
+        };
+        let before = slot.len();
+        slot.retain(|(n, _)| n != name);
+        slot.len() != before
+    }
+
+    /// `from m import *`: binds `module`'s public names into the CURRENT module's globals. The
+    /// exported set is the module's `__all__` (a list/tuple of names) if defined, else every top-level
+    /// name not starting with `_`, per CPython. Each bound via [`Self::set_current_module_global`].
+    pub(crate) fn import_star(&mut self, module: Value) -> Result<(), Trap> {
+        let namespace = self.module_namespace(module);
+        let bindings: Vec<(String, Value)> = match self.dict_get_str(namespace, "__all__") {
+            Some(all) => {
+                let names = self.seq_value(all).ok_or(Trap::TypeError)?.clone();
+                let mut out = Vec::with_capacity(names.len());
+                for name_value in names {
+                    let name = String::from(self.str_value(name_value).ok_or(Trap::TypeError)?);
+                    if let Some(value) = self.dict_get_str(namespace, &name) {
+                        out.push((name, value));
+                    }
+                }
+                out
+            }
+            None => {
+                let entries = self.dict_value(namespace).cloned().unwrap_or_default();
+                entries
+                    .into_iter()
+                    .filter_map(|(key, value)| {
+                        let name = self.str_value(key)?;
+                        if name.starts_with('_') {
+                            None
+                        } else {
+                            Some((String::from(name), value))
+                        }
+                    })
+                    .collect()
+            }
+        };
+        for (name, value) in bindings {
+            self.set_current_module_global(&name, value);
+        }
+        Ok(())
     }
 
     /// A clone of managed module `module_id`'s populated global namespace pairs -- the source for its
@@ -3974,7 +5345,9 @@ impl ObjectModel {
             || self.seq_value(iterable).is_some()
             || self.dict_value(iterable).is_some()
             || self.is_range(iterable)
-            || self.set_value(iterable).is_some();
+            || self.set_value(iterable).is_some()
+            || self.is_dict_view(iterable)
+            || self.is_deque(iterable);
         if !iterable_ok {
             return Err(Trap::TypeError);
         }
@@ -4053,6 +5426,27 @@ impl ObjectModel {
             self.heap.write_u32(reference.0 + 4, (pos + 1) as u32);
             let mut buf = [0u8; 4];
             return Ok(Some(self.new_str(ch.encode_utf8(&mut buf))?));
+        }
+        if let Some(elems) = self.deque_elems(container) {
+            let Some(&element) = elems.get(pos) else {
+                return Ok(None);
+            };
+            self.heap.write_u32(reference.0 + 4, (pos + 1) as u32);
+            return Ok(Some(element));
+        }
+        if let Some(kind) = self.dict_view_kind(container) {
+            let dict = self.dict_view_dict(container);
+            let Some(&(key, value)) =
+                self.dict_value(dict).and_then(|entries| entries.get(pos))
+            else {
+                return Ok(None);
+            };
+            self.heap.write_u32(reference.0 + 4, (pos + 1) as u32);
+            return match kind {
+                DictViewKind::Keys => Ok(Some(key)),
+                DictViewKind::Values => Ok(Some(value)),
+                DictViewKind::Items => Ok(Some(self.new_tuple(alloc::vec![key, value])?)),
+            };
         }
         Err(Trap::TypeError)
     }
@@ -4478,14 +5872,71 @@ impl ObjectModel {
         if matches!(name, "__cause__" | "__context__") && self.is_exception_value(instance) {
             return Ok(Value::NONE);
         }
+        if name == "__suppress_context__" && self.is_exception_value(instance) {
+            return Ok(Value::FALSE);
+        }
+        if name == "value"
+            && self
+                .exc_class_lookup("StopIteration")
+                .is_some_and(|class| self.is_instance_of(instance, class))
+        {
+            let value = self
+                .instance_attr(instance, "args")
+                .and_then(|args| self.seq_value(args))
+                .and_then(|elements| elements.first().copied())
+                .unwrap_or(Value::NONE);
+            return Ok(value);
+        }
         Err(Trap::AttributeError)
     }
 
     /// `instance.name = value` (`Op::SetAttr`): stores into the instance `__dict__`.
     pub fn py_setattr_instance(&mut self, instance: Value, name: &str, value: Value) -> Result<(), Trap> {
+        let mro = self.class_mro_vec(self.instance_class(instance));
+        if !mro.is_empty() {
+            let mut slots = Vec::new();
+            let mut restricted = true;
+            for class in &mro {
+                match self.class_own_slots(*class) {
+                    Some(names) => slots.extend(names),
+                    None => {
+                        restricted = false;
+                        break;
+                    }
+                }
+            }
+            if restricted && !slots.iter().any(|s| s == name) {
+                let class_name = String::from(self.instance_class_name(instance).unwrap_or(""));
+                let message = alloc::format!(
+                    "'{class_name}' object has no attribute '{name}' and no __dict__ for setting new attributes"
+                );
+                return Err(self.with_message(Trap::AttributeError, &message));
+            }
+        }
         let key = self.new_str(name)?;
         let dict = self.read_slot(instance, 1);
         self.py_setitem(dict, key, value)
+    }
+
+    /// The restrictive `__slots__` names a class declares in its OWN namespace (a single str, or a
+    /// tuple/list of str), or `None` when the class declares no `__slots__` OR lists `__dict__` (both
+    /// mean instances keep a `__dict__`, so nothing is restricted). Read per-class (not the base chain)
+    /// so the caller can require EVERY class in the MRO to be slotted before it enforces.
+    fn class_own_slots(&self, class: Value) -> Option<Vec<String>> {
+        let namespace = self.read_slot(class, 2);
+        let declared = self.dict_lookup_str(namespace, "__slots__")?;
+        let mut names = Vec::new();
+        if let Some(single) = self.str_value(declared) {
+            names.push(String::from(single));
+        } else if let Some(elements) = self.seq_value(declared).cloned() {
+            for element in elements {
+                names.push(String::from(self.str_value(element)?));
+            }
+        }
+        if names.iter().any(|n| n == "__dict__") {
+            return None;
+        }
+        Some(names)
     }
 
     /// `C.name = value` (`Op::SetAttr` on a class object): stores into the class's OWN namespace dict
@@ -4605,6 +6056,8 @@ impl ObjectModel {
             ("StopIteration", "Exception"),
             ("ImportError", "Exception"),
             ("ModuleNotFoundError", "ImportError"),
+            ("OSError", "Exception"),
+            ("TimeoutError", "OSError"),
             ("GeneratorExit", "BaseException"),
         ];
         for &(name, base_name) in HIERARCHY {
@@ -4753,6 +6206,46 @@ impl ObjectModel {
         }
     }
 
+    /// Raises the named exception carrying a single VALUE argument (not a string message) -- e.g. a
+    /// generator's `return v` surfaces as `StopIteration(v)`, whose `.value` reads `v`. A `None` value
+    /// raises the bare form (`args == ()`, so `.value` is `None`), matching CPython.
+    pub(crate) fn raise_named_exception_with_value(&mut self, name: &str, value: Value) -> Trap {
+        match self.new_exception(name) {
+            Ok(exc) => {
+                if value != Value::NONE {
+                    let _ = self.init_default_args(exc, &[value]);
+                }
+                self.set_pending_exception(exc);
+                Trap::Raised
+            }
+            Err(trap) => trap,
+        }
+    }
+
+    /// Stashes the value a generator's body returned, for the resumer to read as the raised
+    /// `StopIteration.value` ([`ObjectModel::take_generator_return`]). See the field's doc.
+    pub(crate) fn set_generator_return(&mut self, value: Value) {
+        self.generator_return = Some(value);
+    }
+
+    /// Takes the stashed generator return value (leaving `None`), or `None` if none was set (a
+    /// re-exhausted generator raises a bare `StopIteration`, value `None`).
+    pub(crate) fn take_generator_return(&mut self) -> Option<Value> {
+        self.generator_return.take()
+    }
+
+    /// Stashes an exception thrown into a generator suspended in a `yield from`, for the re-run
+    /// YieldFrom arm to forward into the sub-iterator ([`ObjectModel::take_yield_from_throw`]).
+    pub(crate) fn set_yield_from_throw(&mut self, exc: Value) {
+        self.yield_from_throw = Some(exc);
+    }
+
+    /// Takes the stashed `yield from` throw (leaving `None`): `Some` marks a throw/close resume of a
+    /// delegating generator, `None` an ordinary send/next resume.
+    pub(crate) fn take_yield_from_throw(&mut self) -> Option<Value> {
+        self.yield_from_throw.take()
+    }
+
     /// The Python type name of `value` -- `type(value).__name__`: `int` / `str` / `list` / `NoneType`
     /// / a user class's own name / ... -- for a diagnostic like a `TypeError` message. Degrades to
     /// `type` for a class object and `object` for the few values whose metatype is not modeled (a
@@ -4764,6 +6257,9 @@ impl ObjectModel {
         if let Some(class) = crate::builtins::type_of(value, self) {
             if let Some(builtin) = class.as_builtin_id().and_then(crate::builtins::Builtin::from_id) {
                 return String::from(builtin.python_name());
+            }
+            if let Some(name) = class.as_builtin_id().and_then(crate::stdlib::stdlib_name) {
+                return String::from(name);
             }
             if let Some(name) = self.str_value(self.read_slot(class, 0)) {
                 return String::from(name);
@@ -4833,19 +6329,50 @@ impl ObjectModel {
     /// The `TypeError` for a binary operator with no applicable operation on `lhs`/`rhs` -- a raised
     /// exception whose message matches CPython 3.14. The default is `unsupported operand type(s) for
     /// OP: 'L' and 'R'` (with `** or pow()` naming `**`); the sequence cases are special: `+` on a
-    /// str/list/tuple reports `can only concatenate L (not "R") to L`, and `*` of a sequence by a
-    /// non-int reports `can't multiply sequence by non-int of type 'X'`. Called at the `Op::Binary`
-    /// chokepoint on a bare `Trap::TypeError`, so it never overrides a message a user dunder raised
-    /// (that arrives as `Trap::Raised`, carrying its own exception).
+    /// str/list/tuple reports `can only concatenate L (not "R") to L`, `+` on a bytes/bytearray
+    /// reports `can't concat R to L`, and `*` of a sequence (incl. bytes) by a non-int reports
+    /// `can't multiply sequence by non-int of type 'X'`. Called at the `Op::Binary` chokepoint on a
+    /// bare `Trap::TypeError`, so it never overrides a message a user dunder raised (that arrives
+    /// as `Trap::Raised`, carrying its own exception).
     pub(crate) fn binop_type_error(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Trap {
+        let message = self.binop_type_error_message(op, lhs, rhs, false);
+        self.raise_named_exception("TypeError", &message)
+    }
+
+    /// The `TypeError` for an augmented assignment ([`Op::InplaceBinOp`]) with no applicable
+    /// operation: identical to [`ObjectModel::binop_type_error`] except the default spelling names
+    /// the AUGMENTED operator (`unsupported operand type(s) for -=: ...`, and `**=` where the plain
+    /// form says `** or pow()`) -- CPython renders the `=` there, while the concatenate/multiply
+    /// sequence messages keep the plain-op text.
+    pub(crate) fn inplace_binop_type_error(&mut self, op: BinOp, lhs: Value, rhs: Value) -> Trap {
+        let message = self.binop_type_error_message(op, lhs, rhs, true);
+        self.raise_named_exception("TypeError", &message)
+    }
+
+    /// The message body shared by [`ObjectModel::binop_type_error`] (plain spelling) and
+    /// [`ObjectModel::inplace_binop_type_error`] (augmented spelling).
+    fn binop_type_error_message(
+        &mut self,
+        op: BinOp,
+        lhs: Value,
+        rhs: Value,
+        augmented: bool,
+    ) -> alloc::string::String {
         let lt = self.type_name_of(lhs);
         let rt = self.type_name_of(rhs);
         let lhs_seq = self.is_str(lhs) || self.is_list(lhs) || self.is_tuple(lhs);
         let rhs_seq = self.is_str(rhs) || self.is_list(rhs) || self.is_tuple(rhs);
-        let message = match op {
+        let lhs_bytes = self.bytes_value(lhs).is_some();
+        let rhs_bytes = self.bytes_value(rhs).is_some();
+        match op {
             BinOp::Add if lhs_seq => alloc::format!("can only concatenate {lt} (not \"{rt}\") to {lt}"),
-            BinOp::Mul if lhs_seq => alloc::format!("can't multiply sequence by non-int of type '{rt}'"),
-            BinOp::Mul if rhs_seq => alloc::format!("can't multiply sequence by non-int of type '{lt}'"),
+            BinOp::Add if lhs_bytes => alloc::format!("can't concat {rt} to {lt}"),
+            BinOp::Mul if lhs_seq || lhs_bytes => {
+                alloc::format!("can't multiply sequence by non-int of type '{rt}'")
+            }
+            BinOp::Mul if rhs_seq || rhs_bytes => {
+                alloc::format!("can't multiply sequence by non-int of type '{lt}'")
+            }
             _ => {
                 let sym = match op {
                     BinOp::Add => "+",
@@ -4859,13 +6386,14 @@ impl ObjectModel {
                     BinOp::LShift => "<<",
                     BinOp::RShift => ">>",
                     BinOp::TrueDiv => "/",
+                    BinOp::Pow if augmented => "**",
                     BinOp::Pow => "** or pow()",
                     BinOp::MatMul => "@",
                 };
-                alloc::format!("unsupported operand type(s) for {sym}: '{lt}' and '{rt}'")
+                let eq = if augmented { "=" } else { "" };
+                alloc::format!("unsupported operand type(s) for {sym}{eq}: '{lt}' and '{rt}'")
             }
-        };
-        self.raise_named_exception("TypeError", &message)
+        }
     }
 
     /// The `TypeError` for an ORDERING comparison (`< <= > >=`) between values that do not support it
@@ -4921,11 +6449,31 @@ impl ObjectModel {
     /// `Trap::AttributeError` (an attribute miss), so it does not disturb `getattr`'s own contract
     /// (`hasattr` / `getattr(o, n, default)` still catch the bare trap and never see this message).
     pub(crate) fn attribute_error(&mut self, value: Value, name: &str) -> Trap {
-        let type_name = self.type_name_of(value);
+        let type_name = self.tp_name_of(value);
         self.raise_named_exception(
             "AttributeError",
             &alloc::format!("'{type_name}' object has no attribute '{name}'"),
         )
+    }
+
+    /// The type name as CPython's `tp_name` spells it in hash/attribute error messages: the
+    /// C-implemented collections types carry their DOTTED name (`collections.deque`), everything
+    /// else (including the pure-Python `Counter`) the plain [`ObjectModel::type_name_of`]. Only
+    /// those message sites use this; `type(x).__name__` and the operator messages stay undotted,
+    /// exactly as CPython behaves.
+    pub(crate) fn tp_name_of(&self, value: Value) -> String {
+        if let Some(id) =
+            crate::stdlib::stdlib_type_of(value, self).and_then(|class| class.as_builtin_id())
+        {
+            if crate::stdlib::stdlib_tp_name_dotted(id) {
+                if let (Some(module), Some(name)) =
+                    (crate::stdlib::stdlib_module_of(id), crate::stdlib::stdlib_name(id))
+                {
+                    return alloc::format!("{module}.{name}");
+                }
+            }
+        }
+        self.type_name_of(value)
     }
 
     /// Whether the currently pending exception is an instance of the named class -- consumed by the
@@ -5245,6 +6793,9 @@ impl ObjectModel {
             if id == Builtin::Bytes.id() && name == "fromhex" {
                 return Ok(Value::builtin_ref(Builtin::BytesFromhex.id()));
             }
+            if id == Builtin::Float.id() && name == "fromhex" {
+                return Ok(Value::builtin_ref(Builtin::FloatFromhex.id()));
+            }
             if id == Builtin::Str.id() && name == "maketrans" {
                 return Ok(Value::builtin_ref(Builtin::StrMaketrans.id()));
             }
@@ -5257,10 +6808,27 @@ impl ObjectModel {
             return Err(Trap::AttributeError);
         }
         if self.is_int(obj) {
+            match name {
+                "numerator" | "real" => {
+                    return Ok(match obj {
+                        Value::TRUE => Value::fixnum(1).ok_or(Trap::Overflow)?,
+                        Value::FALSE => Value::fixnum(0).ok_or(Trap::Overflow)?,
+                        _ => obj,
+                    });
+                }
+                "denominator" => return Value::fixnum(1).ok_or(Trap::Overflow),
+                "imag" => return Value::fixnum(0).ok_or(Trap::Overflow),
+                _ => {}
+            }
             let method_id = int_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
         if self.is_float(obj) {
+            match name {
+                "real" => return Ok(obj),
+                "imag" => return self.new_float(0.0),
+                _ => {}
+            }
             let method_id = float_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
@@ -5299,6 +6867,25 @@ impl ObjectModel {
                 }
             };
         }
+        if type_id == self.slice_type_id {
+            let (start, stop, step) = self.slice_components(obj);
+            return match name {
+                "start" => Ok(start),
+                "stop" => Ok(stop),
+                "step" => Ok(step),
+                _ => Err(Trap::AttributeError),
+            };
+        }
+        if type_id == self.range_type_id {
+            let (start, stop, step) = self.range_bounds(obj);
+            let as_int = |n: i64| Value::fixnum(i32::try_from(n).unwrap_or(0)).ok_or(Trap::Overflow);
+            return match name {
+                "start" => as_int(start),
+                "stop" => as_int(stop),
+                "step" => as_int(step),
+                _ => Err(Trap::AttributeError),
+            };
+        }
         if type_id == self.property_type_id {
             let (fget, fset, fdel) = self.property_accessors(obj);
             return match name {
@@ -5318,6 +6905,59 @@ impl ObjectModel {
         if type_id == self.dict_type_id {
             let method_id = dict_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.defaultdict_type_id {
+            if name == "default_factory" {
+                return Ok(self.defaultdict_factory(obj).unwrap_or(Value::NONE));
+            }
+            let method_id = dict_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.counter_type_id {
+            let method_id = counter_method_id(name)
+                .or_else(|| dict_method_id(name))
+                .ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.ordereddict_type_id {
+            let method_id = odict_method_id(name)
+                .or_else(|| dict_method_id(name))
+                .ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.deque_type_id {
+            if name == "maxlen" {
+                return match self.deque_maxlen(obj).unwrap_or(None) {
+                    Some(m) => Value::fixnum(m as i32).ok_or(Trap::Overflow),
+                    None => Ok(Value::NONE),
+                };
+            }
+            let method_id = deque_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.ntinstance_type_id {
+            let class = self.ntinstance_class(obj).unwrap_or(Value::NONE);
+            if name == "_fields" {
+                return Ok(self.ntclass_fields_tuple(class));
+            }
+            let fields = self.ntclass_fields(class);
+            if let Some(at) = fields.iter().position(|f| f == name) {
+                let elems = self.seq_value(obj).ok_or(Trap::AttributeError)?;
+                return elems.get(at).copied().ok_or(Trap::AttributeError);
+            }
+            let method_id = nt_method_id(name)
+                .or_else(|| tuple_method_id(name))
+                .ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.ntclass_type_id {
+            if name == "_fields" {
+                return Ok(self.ntclass_fields_tuple(obj));
+            }
+            if name == "__name__" {
+                return Ok(self.read_slot(obj, 0));
+            }
+            return Err(Trap::AttributeError);
         }
         if type_id == self.set_type_id {
             let method_id = set_method_id(name).ok_or(Trap::AttributeError)?;
@@ -5363,14 +7003,82 @@ impl ObjectModel {
             return self.new_bound_method(obj, method_id);
         }
         if type_id == self.board_type_id {
-            let pin = self.board.pin_id(name).ok_or(Trap::AttributeError)?;
-            return Value::fixnum(pin as i32).ok_or(Trap::Overflow);
+            if let Some(pin) = self.board.pin_id(name) {
+                return Value::fixnum(pin as i32).ok_or(Trap::Overflow);
+            }
+            if let Some(instance) = self.board.uart_instance(name) {
+                return self.new_uart_resource(instance);
+            }
+            if let Some((tx, rx)) = self.board.uart_default_pins(0) {
+                match name {
+                    "TX" => return Value::fixnum(tx as i32).ok_or(Trap::Overflow),
+                    "RX" => return Value::fixnum(rx as i32).ok_or(Trap::Overflow),
+                    _ => {}
+                }
+            }
+            return Err(Trap::AttributeError);
         }
         if type_id == self.pin_type_id {
             let method_id = crate::gpio::pin_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
+        if type_id == self.uart_type_id {
+            let method_id = crate::uart::uart_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.uart_port_type_id {
+            use crate::uart::{PORT_W_BAUDRATE, PORT_W_DATA_BITS, PORT_W_PARITY, PORT_W_STOP_BITS};
+            match name {
+                "baudrate" => {
+                    let value = self.port_word(obj, PORT_W_BAUDRATE);
+                    return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+                }
+                "data_bits" => {
+                    let value = self.port_word(obj, PORT_W_DATA_BITS);
+                    return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+                }
+                "stop_bits" => {
+                    let value = self.port_word(obj, PORT_W_STOP_BITS);
+                    return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+                }
+                "parity" => {
+                    let code = self.port_word(obj, PORT_W_PARITY);
+                    return self.new_str(crate::uart::parity_name(code));
+                }
+                _ => {}
+            }
+            let method_id = crate::uart::port_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.busio_type_id {
+            if name == "UART" {
+                return self.uart_shim_factory_singleton(crate::uart::SHIM_FLAVOR_BUSIO);
+            }
+            return Err(Trap::AttributeError);
+        }
+        if type_id == self.uart_shim_type_id {
+            let flavor = self.shim_word(obj, crate::uart::SHIM_W_FLAVOR);
+            let port = self.shim_port(obj);
+            match name {
+                "in_waiting" if flavor == crate::uart::SHIM_FLAVOR_BUSIO => {
+                    let (_instance, facts) = self.port_require_open(port)?;
+                    let count = self.uart_rx_count(&facts);
+                    return Value::fixnum(count as i32).ok_or(Trap::Overflow);
+                }
+                "baudrate" if flavor == crate::uart::SHIM_FLAVOR_BUSIO => {
+                    let value = self.port_word(port, crate::uart::PORT_W_BAUDRATE);
+                    return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+                }
+                _ => {}
+            }
+            let method_id = crate::uart::uart_shim_method_id(flavor, name)
+                .ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
         if type_id == self.machine_type_id {
+            if name == "UART" {
+                return self.uart_shim_factory_singleton(crate::uart::SHIM_FLAVOR_MACHINE);
+            }
             if name == "Pin" {
                 return self.pin_factory_singleton();
             }
@@ -5465,7 +7173,8 @@ impl ObjectModel {
     }
 
     /// A volatile 32-bit register write: through the installed seam on device, else into the host
-    /// simulated register file (and the ordered write trace).
+    /// simulated register file (and the ordered write trace). The sim additionally MODELS the
+    /// selected board's UART FIFO: a write to it captures the TX byte (the byte in bits 7..0).
     pub fn mmio_write(&mut self, address: u32, value: u32) {
         if let Some(write) = self.mmio_write_fn {
             write(address, value);
@@ -5473,24 +7182,811 @@ impl ObjectModel {
         }
         #[cfg(not(target_os = "none"))]
         {
+            if let Some(facts) = self.board.uart_facts(0) {
+                if address == facts.fifo {
+                    self.uart_sim_tx.push((value & 0xFF) as u8);
+                }
+            }
             self.mmio_sim.insert(address, value);
             self.mmio_trace.push((address, value));
         }
     }
 
     /// A volatile 32-bit register read: through the installed seam on device, else from the host
-    /// simulated register file (0 for a register never written).
-    #[must_use]
-    pub fn mmio_read(&self, address: u32) -> u32 {
+    /// simulated register file (0 for a register never written). The sim MODELS the selected
+    /// board's UART where a plain last-value file cannot: the status register's RX count reflects
+    /// the injected bytes (TX always reads drained), a FIFO read POPS one RX byte, and the
+    /// config-latch register self-clears instantly -- so the driver's real poll loops terminate.
+    pub fn mmio_read(&mut self, address: u32) -> u32 {
         if let Some(read) = self.mmio_read_fn {
             return read(address);
         }
         #[cfg(not(target_os = "none"))]
         {
+            if let Some(facts) = self.board.uart_facts(0) {
+                match facts.status {
+                    crate::uart::UartStatus::Counts { status, rx_shift, rx_mask, tx_shift, tx_mask }
+                        if address == status =>
+                    {
+                        let rx = (self.uart_sim_rx.len() as u32).min(facts.fifo_depth);
+                        let tx = 0u32;
+                        return ((rx & rx_mask) << rx_shift) | ((tx & tx_mask) << tx_shift);
+                    }
+                    crate::uart::UartStatus::Flags { flags, rx_empty_mask } if address == flags => {
+                        return if self.uart_sim_rx.is_empty() { rx_empty_mask } else { 0 };
+                    }
+                    _ => {}
+                }
+                if address == facts.fifo {
+                    return u32::from(self.uart_sim_rx.pop_front().unwrap_or(0));
+                }
+                if facts.self_clear_reg != 0 && address == facts.self_clear_reg {
+                    return 0;
+                }
+                for &(reg, value) in facts.sim_ready {
+                    if address == reg {
+                        return value;
+                    }
+                }
+            }
             self.mmio_sim.get(&address).copied().unwrap_or(0)
         }
         #[cfg(target_os = "none")]
         0
+    }
+
+    /// Queues RX bytes into the host UART sim (the test-side peer writing to us).
+    #[cfg(not(target_os = "none"))]
+    pub fn uart_sim_inject_rx(&mut self, data: &[u8]) {
+        self.uart_sim_rx.extend(data.iter().copied());
+    }
+
+    /// The bytes the program has transmitted through the host UART sim -- the TX oracle.
+    #[cfg(not(target_os = "none"))]
+    #[must_use]
+    pub fn uart_sim_tx(&self) -> &[u8] {
+        &self.uart_sim_tx
+    }
+
+
+    /// The `uart` module singleton. Bind it as the global `uart` so a program reaches
+    /// `uart.open(...)`.
+    pub fn uart_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.uart_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is the `uart` singleton.
+    #[must_use]
+    pub fn is_uart(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.uart_type_id)
+    }
+
+    /// Whether `value` is an open-or-closed `Port`.
+    #[must_use]
+    pub fn is_uart_port(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.uart_port_type_id)
+    }
+
+    /// Allocates a board UART resource handle (`board.UART0`) carrying its instance number.
+    fn new_uart_resource(&mut self, instance: u32) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.uart_resource_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, instance);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The instance number if `value` is a board UART resource.
+    fn uart_resource_instance(&self, value: Value) -> Option<u32> {
+        value
+            .as_ref()
+            .filter(|r| self.heap.type_id_of(*r) == self.uart_resource_type_id)
+            .map(|r| self.heap.read_u32(r.0))
+    }
+
+    /// Allocates an OPEN `Port` over `instance` with the validated `config` echoed into its
+    /// read-only property words.
+    fn new_port(&mut self, instance: u32, config: &crate::uart::UartConfig) -> Result<Value, Trap> {
+        use crate::uart::*;
+        let reference = self.alloc_object(self.uart_port_type_id).ok_or(Trap::OutOfMemory)?;
+        let base = reference.0;
+        self.heap.write_u32(base + PORT_W_INSTANCE * 4, instance);
+        self.heap.write_u32(base + PORT_W_OPEN * 4, 1);
+        self.heap.write_u32(base + PORT_W_BAUDRATE * 4, config.baudrate);
+        self.heap.write_u32(base + PORT_W_DATA_BITS * 4, config.data_bits);
+        self.heap.write_u32(base + PORT_W_PARITY * 4, config.parity);
+        self.heap.write_u32(base + PORT_W_STOP_BITS * 4, config.stop_bits);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// One raw word of a `Port`'s payload.
+    pub(crate) fn port_word(&self, port: Value, word: u32) -> u32 {
+        port.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + word * 4))
+    }
+
+    fn port_set_word(&mut self, port: Value, word: u32, value: u32) {
+        if let Some(r) = port.as_ref() {
+            self.heap.write_u32(r.0 + word * 4, value);
+        }
+    }
+
+    /// Replays one driver-sequence step over the MMIO seam. The polls are the driver's REAL
+    /// loops: on device they spin on the hardware bit; on the host sim the modeled registers
+    /// (self-clearing latch, drained TX count) satisfy them immediately.
+    fn apply_uart_op(&mut self, op: crate::uart::UartOp) {
+        use crate::uart::UartOp;
+        match op {
+            UartOp::Write { reg, value } => self.mmio_write(reg, value),
+            UartOp::PollEq { reg, mask, want } => while self.mmio_read(reg) & mask != want {},
+            UartOp::PollBelow { reg, mask, below } => while self.mmio_read(reg) & mask >= below {},
+        }
+    }
+
+    /// The bytes known to be immediately readable: the exact count on a counted-status chip,
+    /// 0 or 1 on a flag-style chip (all the silicon can say there) -- `any()`'s contract.
+    fn uart_rx_count(&mut self, facts: &crate::uart::UartFacts) -> u32 {
+        match facts.status {
+            crate::uart::UartStatus::Counts { status, rx_shift, rx_mask, .. } => {
+                (self.mmio_read(status) >> rx_shift) & rx_mask
+            }
+            crate::uart::UartStatus::Flags { flags, rx_empty_mask } => {
+                u32::from(self.mmio_read(flags) & rx_empty_mask == 0)
+            }
+        }
+    }
+
+    /// Parses a `timeout_ms` argument: `None` = block, `0` = never block, `n` = a deadline of
+    /// `n` integer milliseconds (times are integer ms so the surface is identical on a no-float
+    /// profile; the tri-state is CPython's settimeout semantics in that unit).
+    fn parse_timeout_ms(&mut self, value: Value) -> Result<crate::uart::UartTimeout, Trap> {
+        use crate::uart::UartTimeout;
+        if value.is_none() {
+            return Ok(UartTimeout::Blocking);
+        }
+        let Some(ms) = value.as_int() else {
+            return Err(self.with_message(Trap::TypeError, "timeout_ms must be an int or None"));
+        };
+        if ms < 0 {
+            return Err(self.with_message(Trap::ValueError, "timeout_ms must be >= 0"));
+        }
+        if ms == 0 {
+            return Ok(UartTimeout::Poll);
+        }
+        Ok(UartTimeout::DeadlineMs(u32::try_from(ms).unwrap_or(u32::MAX)))
+    }
+
+    /// Waits (per `timeout`) until at least one RX byte is buffered; `false` = timed out with
+    /// none. On the host sim there is no concurrent producer, so a finite deadline with no data
+    /// is an immediate expiry (observably equivalent), and a would-block-forever read fails
+    /// LOUD rather than hanging the harness. On device, blocking spins the status register; a
+    /// finite deadline needs the tick seam the threading arc brings, so until then it is
+    /// rejected loudly there.
+    fn uart_wait_rx(
+        &mut self,
+        facts: &crate::uart::UartFacts,
+        timeout: crate::uart::UartTimeout,
+    ) -> Result<bool, Trap> {
+        use crate::uart::UartTimeout;
+        if self.uart_rx_count(facts) > 0 {
+            return Ok(true);
+        }
+        let on_device = self.mmio_read_fn.is_some();
+        match timeout {
+            UartTimeout::Poll => Ok(false),
+            UartTimeout::Blocking => {
+                if !on_device {
+                    let message = "uart read would block forever (no rx data on the host sim)";
+                    return Err(self.raise_named_exception("RuntimeError", message));
+                }
+                loop {
+                    if self.uart_rx_count(facts) > 0 {
+                        return Ok(true);
+                    }
+                }
+            }
+            UartTimeout::DeadlineMs(ms) => {
+                if !on_device {
+                    return Ok(false);
+                }
+                let message = alloc::format!(
+                    "a finite timeout_ms ({ms} ms) needs a tick source (not wired on-device yet); use timeout_ms=None or 0"
+                );
+                Err(self.with_message(Trap::Unsupported, &message))
+            }
+        }
+    }
+
+    /// Pops up to `max` more RX bytes (all buffered when `None`) into `out`.
+    fn uart_pop_available(
+        &mut self,
+        facts: &crate::uart::UartFacts,
+        max: Option<usize>,
+        out: &mut alloc::vec::Vec<u8>,
+    ) {
+        let mut taken = 0usize;
+        loop {
+            if let Some(m) = max {
+                if taken >= m {
+                    return;
+                }
+            }
+            if self.uart_rx_count(facts) == 0 {
+                return;
+            }
+            out.push((self.mmio_read(facts.fifo) & 0xFF) as u8);
+            taken += 1;
+        }
+    }
+
+    /// The instance + facts of an OPEN port (`ValueError` after `close`, CPython's file text).
+    fn port_require_open(&mut self, port: Value) -> Result<(u32, crate::uart::UartFacts), Trap> {
+        use crate::uart::{PORT_W_INSTANCE, PORT_W_OPEN};
+        if self.port_word(port, PORT_W_OPEN) == 0 {
+            return Err(self.with_message(Trap::ValueError, "I/O operation on closed port"));
+        }
+        let instance = self.port_word(port, PORT_W_INSTANCE);
+        let facts = self.board.uart_facts(instance).ok_or(Trap::Malformed)?;
+        Ok((instance, facts))
+    }
+
+    /// `uart.open(resource, **config)`: validates the line config, CLAIMS the instance (one
+    /// owner per port; a second open raises `OSError: UART0 in use`), replays the board's
+    /// bring-up sequence, and returns the `Port`.
+    fn uart_open(&mut self, posargs: &[Value], kwargs: &[(&str, Value)]) -> Result<Value, Trap> {
+        use crate::uart::{parity_code, UartConfig};
+        let [resource] = posargs else {
+            let message = "open() takes exactly one positional argument (the board UART resource)";
+            return Err(self.with_message(Trap::TypeError, message));
+        };
+        let Some(instance) = self.uart_resource_instance(*resource) else {
+            let message = "open() expects a board UART resource (e.g. board.UART0)";
+            return Err(self.with_message(Trap::TypeError, message));
+        };
+        let mut config = UartConfig::default();
+        for &(name, value) in kwargs {
+            match name {
+                "baudrate" => {
+                    let baud = value.as_int().unwrap_or(0);
+                    if baud <= 0 || baud > i64::from(u32::MAX) {
+                        let message = "baudrate must be a positive integer";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                    config.baudrate = baud as u32;
+                }
+                "data_bits" => match value.as_int() {
+                    Some(bits @ 5..=8) => config.data_bits = bits as u32,
+                    Some(9) => {
+                        let message = "data_bits=9 is not supported";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                    _ => {
+                        let message = "data_bits must be 5, 6, 7 or 8";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                },
+                "parity" => {
+                    let Some(code) = self.str_value(value).and_then(parity_code) else {
+                        let message = "parity must be 'none', 'even' or 'odd'";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    };
+                    config.parity = code;
+                }
+                "stop_bits" => match value.as_int() {
+                    Some(stop @ 1..=2) => config.stop_bits = stop as u32,
+                    _ => {
+                        let message = "stop_bits must be 1 or 2";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                },
+                other => {
+                    let message =
+                        alloc::format!("open() got an unexpected keyword argument '{other}'");
+                    return Err(self.raise_named_exception("TypeError", &message));
+                }
+            }
+        }
+        if self.uart_claimed.contains(&instance) {
+            let message = alloc::format!("UART{instance} in use");
+            return Err(self.raise_named_exception("OSError", &message));
+        }
+        let ops = match self.board.uart_open_ops(instance, &config) {
+            None => {
+                let message = "uart is not supported on this board yet";
+                return Err(self.with_message(Trap::Unsupported, message));
+            }
+            Some(Err(crate::uart::UartConfigError::BaudOutOfRange)) => {
+                let message = "baudrate out of range for this uart";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
+            Some(Err(crate::uart::UartConfigError::ParityNotTabled)) => {
+                let message = "parity is not in this chip's table yet (parity='none' only)";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
+            Some(Ok(ops)) => ops,
+        };
+        self.uart_claimed.push(instance);
+        for op in ops {
+            self.apply_uart_op(op);
+        }
+        self.new_port(instance, &config)
+    }
+
+    /// Dispatches a `uart` module method, positional form.
+    pub(crate) fn call_uart_method(
+        &mut self,
+        _uart: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        match method_id {
+            crate::uart::UART_OPEN => self.uart_open(args, &[]),
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a keyword call on the `uart` module or a `Port` (the `Op::CallKw` path):
+    /// `uart.open(baudrate=...)`, `port.read(timeout_ms=...)`.
+    pub(crate) fn call_uart_bound_kw(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        posargs: &[Value],
+        kwargs: &[(&str, Value)],
+    ) -> Result<Value, Trap> {
+        use crate::uart::*;
+        if self.is_uart(receiver) {
+            return match method_id {
+                UART_OPEN => self.uart_open(posargs, kwargs),
+                _ => Err(Trap::AttributeError),
+            };
+        }
+        let mut timeout_value = Value::NONE;
+        for &(name, value) in kwargs {
+            let reads = matches!(
+                method_id,
+                PORT_READ | PORT_READ_EXACTLY | PORT_READINTO | PORT_READLINE
+            );
+            if name == "timeout_ms" && reads {
+                timeout_value = value;
+            } else {
+                let message =
+                    alloc::format!("this method got an unexpected keyword argument '{name}'");
+                return Err(self.raise_named_exception("TypeError", &message));
+            }
+        }
+        self.port_dispatch(receiver, method_id, posargs, timeout_value)
+    }
+
+    /// Dispatches a `Port` method, positional form (`timeout_ms` defaults to blocking).
+    pub(crate) fn call_port_method(
+        &mut self,
+        port: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        self.port_dispatch(port, method_id, args, Value::NONE)
+    }
+
+    /// The one `Port` dispatch both call forms funnel through.
+    fn port_dispatch(
+        &mut self,
+        port: Value,
+        method_id: u32,
+        args: &[Value],
+        timeout_value: Value,
+    ) -> Result<Value, Trap> {
+        use crate::uart::*;
+        match method_id {
+            PORT_ANY => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let (_instance, facts) = self.port_require_open(port)?;
+                let count = self.uart_rx_count(&facts);
+                Value::fixnum(count as i32).ok_or(Trap::Overflow)
+            }
+            PORT_READ => {
+                let max = match args {
+                    [] => None,
+                    [n] if n.is_none() => None,
+                    [n] => match n.as_int() {
+                        Some(n) if n >= 0 => Some(n as usize),
+                        _ => {
+                            let message = "read size must be an int >= 0 or None";
+                            return Err(self.with_message(Trap::ValueError, message));
+                        }
+                    },
+                    _ => return Err(Trap::TypeError),
+                };
+                let timeout = self.parse_timeout_ms(timeout_value)?;
+                let (_instance, facts) = self.port_require_open(port)?;
+                let mut out = alloc::vec::Vec::new();
+                if max != Some(0) && self.uart_wait_rx(&facts, timeout)? {
+                    self.uart_pop_available(&facts, max, &mut out);
+                }
+                self.new_bytes(out)
+            }
+            PORT_READ_EXACTLY => {
+                let [n] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let Some(n) = n.as_int().filter(|&n| n >= 0) else {
+                    let message = "read_exactly size must be an int >= 0";
+                    return Err(self.with_message(Trap::ValueError, message));
+                };
+                let n = n as usize;
+                let timeout = self.parse_timeout_ms(timeout_value)?;
+                let (_instance, facts) = self.port_require_open(port)?;
+                let mut out = alloc::vec::Vec::with_capacity(n);
+                while out.len() < n {
+                    if !self.uart_wait_rx(&facts, timeout)? {
+                        let message =
+                            alloc::format!("read_exactly: got {} of {} bytes", out.len(), n);
+                        return Err(self.raise_named_exception("TimeoutError", &message));
+                    }
+                    let remaining = n - out.len();
+                    self.uart_pop_available(&facts, Some(remaining), &mut out);
+                }
+                self.new_bytes(out)
+            }
+            PORT_READINTO => {
+                let [buf] = args else {
+                    return Err(Trap::TypeError);
+                };
+                if !self.is_bytearray(*buf) {
+                    let message = "readinto() argument must be a bytearray";
+                    return Err(self.with_message(Trap::TypeError, message));
+                }
+                let capacity = self.bytes_value(*buf).map_or(0, <[u8]>::len);
+                let timeout = self.parse_timeout_ms(timeout_value)?;
+                let (_instance, facts) = self.port_require_open(port)?;
+                let mut out = alloc::vec::Vec::new();
+                if capacity > 0 && self.uart_wait_rx(&facts, timeout)? {
+                    self.uart_pop_available(&facts, Some(capacity), &mut out);
+                }
+                if let Some(slot) = self.byte_buffer_slot(*buf) {
+                    for (at, &byte) in out.iter().enumerate() {
+                        self.byte_buffers[slot][at] = byte;
+                    }
+                }
+                Value::fixnum(out.len() as i32).ok_or(Trap::Overflow)
+            }
+            PORT_READLINE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let timeout = self.parse_timeout_ms(timeout_value)?;
+                let (_instance, facts) = self.port_require_open(port)?;
+                let mut out = alloc::vec::Vec::new();
+                loop {
+                    if !self.uart_wait_rx(&facts, timeout)? {
+                        break;
+                    }
+                    let byte = (self.mmio_read(facts.fifo) & 0xFF) as u8;
+                    out.push(byte);
+                    if byte == b'\n' {
+                        break;
+                    }
+                }
+                self.new_bytes(out)
+            }
+            PORT_WRITE => {
+                let [data] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let Some(data) = self.bytes_value(*data).map(<[u8]>::to_vec) else {
+                    let message = alloc::format!(
+                        "a bytes-like object is required, not '{}'",
+                        self.type_name_of(*data)
+                    );
+                    return Err(self.raise_named_exception("TypeError", &message));
+                };
+                let (instance, _facts) = self.port_require_open(port)?;
+                let board = self.board;
+                for &byte in &data {
+                    for op in board.uart_tx_byte_ops(instance, byte) {
+                        self.apply_uart_op(op);
+                    }
+                }
+                Value::fixnum(data.len() as i32).ok_or(Trap::Overflow)
+            }
+            PORT_FLUSH => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let (instance, _facts) = self.port_require_open(port)?;
+                let board = self.board;
+                for op in board.uart_flush_ops(instance) {
+                    self.apply_uart_op(op);
+                }
+                Ok(Value::NONE)
+            }
+            PORT_DISCARD_INPUT => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let (_instance, facts) = self.port_require_open(port)?;
+                while self.uart_rx_count(&facts) > 0 {
+                    self.mmio_read(facts.fifo);
+                }
+                Ok(Value::NONE)
+            }
+            PORT_CLOSE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                self.port_close(port);
+                Ok(Value::NONE)
+            }
+            PORT_ENTER => Ok(port),
+            PORT_EXIT => {
+                self.port_close(port);
+                Ok(Value::NONE)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Closes a port: releases the instance claim and marks it closed (idempotent, like a
+    /// CPython file's close).
+    fn port_close(&mut self, port: Value) {
+        use crate::uart::{PORT_W_INSTANCE, PORT_W_OPEN};
+        if self.port_word(port, PORT_W_OPEN) == 0 {
+            return;
+        }
+        let instance = self.port_word(port, PORT_W_INSTANCE);
+        self.uart_claimed.retain(|&claimed| claimed != instance);
+        self.port_set_word(port, PORT_W_OPEN, 0);
+    }
+
+
+    /// The `busio` module singleton.
+    pub fn busio_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.busio_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// A shim UART factory carrying its flavor (`machine.UART` / `busio.UART`).
+    fn uart_shim_factory_singleton(&mut self, flavor: u32) -> Result<Value, Trap> {
+        let reference =
+            self.alloc_object(self.uart_shim_factory_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, flavor);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is a shim UART factory.
+    #[must_use]
+    pub fn is_uart_shim_factory(&self, value: Value) -> bool {
+        value
+            .as_ref()
+            .is_some_and(|r| self.heap.type_id_of(r) == self.uart_shim_factory_type_id)
+    }
+
+    /// Whether `value` is a shim UART instance.
+    #[must_use]
+    pub fn is_uart_shim(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.uart_shim_type_id)
+    }
+
+    fn shim_word(&self, shim: Value, word: u32) -> u32 {
+        shim.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + word * 4))
+    }
+
+    /// The standard Port a shim instance wraps.
+    fn shim_port(&self, shim: Value) -> Value {
+        Value::from_bits(self.shim_word(shim, crate::uart::SHIM_W_PORT))
+    }
+
+    /// A shim's tx=/rx= pin arguments must MATCH the table-fixed pins -- the table wires the
+    /// pins, so a differing override fails loud rather than silently transmitting elsewhere.
+    fn shim_check_pin(&mut self, given: Value, expected: u32, which: &str) -> Result<(), Trap> {
+        if given.is_none() {
+            return Ok(());
+        }
+        if given.as_int() == Some(i64::from(expected)) {
+            return Ok(());
+        }
+        let message = alloc::format!(
+            "{which} is fixed to pin {expected} by this board's table (pass board.{}, or omit it)",
+            if which == "tx" { "TX" } else { "RX" }
+        );
+        Err(self.with_message(Trap::ValueError, &message))
+    }
+
+    /// Constructs a shim UART: translates the shim's constructor surface onto the clean
+    /// `uart.open`, holding the shim-only state (the implicit timeout) on the shim.
+    pub(crate) fn call_uart_shim_factory(
+        &mut self,
+        factory: Value,
+        posargs: &[Value],
+        kwargs: &[(&str, Value)],
+    ) -> Result<Value, Trap> {
+        use crate::uart::*;
+        let flavor = factory.as_ref().map_or(0, |r| self.heap.read_u32(r.0));
+        let mut config = UartConfig::default();
+        let mut timeout_ms: u32 = if flavor == SHIM_FLAVOR_MACHINE { 0 } else { 1000 };
+        let mut instance: u32 = 0;
+        let mut tx_arg = Value::NONE;
+        let mut rx_arg = Value::NONE;
+        if flavor == SHIM_FLAVOR_MACHINE {
+            match posargs {
+                [id] => {
+                    instance = id.as_int().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| {
+                        self.with_message(Trap::ValueError, "UART id must be a small int")
+                    })?;
+                }
+                _ => {
+                    let message = "UART(id, ...) takes the port id as its one positional argument";
+                    return Err(self.with_message(Trap::TypeError, message));
+                }
+            }
+            config.baudrate = 9600;
+        } else {
+            match posargs {
+                [] => {}
+                [tx] => tx_arg = *tx,
+                [tx, rx] => {
+                    tx_arg = *tx;
+                    rx_arg = *rx;
+                }
+                _ => return Err(Trap::TypeError),
+            }
+            config.baudrate = 9600;
+        }
+        for &(name, value) in kwargs {
+            match name {
+                "baudrate" => {
+                    let baud = value.as_int().unwrap_or(0);
+                    if baud <= 0 || baud > i64::from(u32::MAX) {
+                        let message = "baudrate must be a positive integer";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                    config.baudrate = baud as u32;
+                }
+                "bits" => match value.as_int() {
+                    Some(bits @ 5..=8) => config.data_bits = bits as u32,
+                    _ => {
+                        let message = "bits must be 5, 6, 7 or 8";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                },
+                "parity" => {
+                    config.parity = if value.is_none() {
+                        PARITY_NONE
+                    } else if flavor == SHIM_FLAVOR_MACHINE && value.as_int() == Some(0) {
+                        PARITY_EVEN
+                    } else if flavor == SHIM_FLAVOR_MACHINE && value.as_int() == Some(1) {
+                        PARITY_ODD
+                    } else {
+                        let message = if flavor == SHIM_FLAVOR_MACHINE {
+                            "parity must be None, 0 (even) or 1 (odd)"
+                        } else {
+                            "the busio Parity enum is not modeled yet (parity=None only)"
+                        };
+                        return Err(self.with_message(Trap::ValueError, message));
+                    };
+                }
+                "stop" => match value.as_int() {
+                    Some(stop @ 1..=2) => config.stop_bits = stop as u32,
+                    _ => {
+                        let message = "stop must be 1 or 2";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                },
+                "timeout" => {
+                    timeout_ms = if flavor == SHIM_FLAVOR_MACHINE {
+                        value.as_int().and_then(|n| u32::try_from(n).ok()).ok_or_else(|| {
+                            self.with_message(Trap::ValueError, "timeout must be an int (ms)")
+                        })?
+                    } else {
+                        let seconds = self
+                            .float_value(value)
+                            .or_else(|| value.as_int().map(|n| n as f64))
+                            .filter(|&t| t >= 0.0)
+                            .ok_or_else(|| {
+                                self.with_message(
+                                    Trap::ValueError,
+                                    "timeout must be a non-negative number of seconds",
+                                )
+                            })?;
+                        (seconds * 1000.0) as u32
+                    };
+                }
+                "timeout_char" => {
+                    if value.as_int().is_none() {
+                        let message = "timeout_char must be an int (ms)";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                }
+                "receiver_buffer_size" => {
+                    if value.as_int().is_none() {
+                        return Err(Trap::TypeError);
+                    }
+                }
+                "tx" => tx_arg = value,
+                "rx" => rx_arg = value,
+                other => {
+                    let message =
+                        alloc::format!("UART() got an unexpected keyword argument '{other}'");
+                    return Err(self.raise_named_exception("TypeError", &message));
+                }
+            }
+        }
+        let Some((tx_pin, rx_pin)) = self.board.uart_default_pins(instance) else {
+            let message = "no UART with that id on this board";
+            return Err(self.with_message(Trap::ValueError, message));
+        };
+        self.shim_check_pin(tx_arg, tx_pin, "tx")?;
+        self.shim_check_pin(rx_arg, rx_pin, "rx")?;
+        let resource = self.new_uart_resource(instance)?;
+        let baud = Value::fixnum(config.baudrate as i32).ok_or(Trap::Overflow)?;
+        let bits = Value::fixnum(config.data_bits as i32).ok_or(Trap::Overflow)?;
+        let stop = Value::fixnum(config.stop_bits as i32).ok_or(Trap::Overflow)?;
+        let parity = self.new_str(crate::uart::parity_name(config.parity))?;
+        let pairs = [
+            ("baudrate", baud),
+            ("data_bits", bits),
+            ("parity", parity),
+            ("stop_bits", stop),
+        ];
+        let port = self.uart_open(&[resource], &pairs)?;
+        let reference = self.alloc_object(self.uart_shim_type_id).ok_or(Trap::OutOfMemory)?;
+        let base = reference.0;
+        self.heap.write_u32(base + SHIM_W_PORT * 4, port.bits());
+        self.heap.write_u32(base + SHIM_W_TIMEOUT_MS * 4, timeout_ms);
+        self.heap.write_u32(base + SHIM_W_FLAVOR * 4, flavor);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Dispatches a shim UART method: each translates onto the standard Port dispatch with the
+    /// shim's held timeout, then re-wraps the result in the shim's convention (`None`
+    /// where the standard returns empty).
+    pub(crate) fn call_uart_shim_method(
+        &mut self,
+        shim: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        use crate::uart::*;
+        let port = self.shim_port(shim);
+        let timeout_ms = self.shim_word(shim, SHIM_W_TIMEOUT_MS);
+        let timeout = Value::fixnum(timeout_ms as i32).ok_or(Trap::Overflow)?;
+        match method_id {
+            SHIM_READ => {
+                let result = self.port_dispatch(port, PORT_READ, args, timeout)?;
+                self.shim_none_when_empty(result)
+            }
+            SHIM_READLINE => {
+                let result = self.port_dispatch(port, PORT_READLINE, args, timeout)?;
+                self.shim_none_when_empty(result)
+            }
+            SHIM_READINTO => {
+                let result = self.port_dispatch(port, PORT_READINTO, args, timeout)?;
+                if result.as_int() == Some(0) { Ok(Value::NONE) } else { Ok(result) }
+            }
+            SHIM_WRITE => self.port_dispatch(port, PORT_WRITE, args, Value::NONE),
+            SHIM_ANY => self.port_dispatch(port, PORT_ANY, args, Value::NONE),
+            SHIM_FLUSH => self.port_dispatch(port, PORT_FLUSH, args, Value::NONE),
+            SHIM_RESET_INPUT => self.port_dispatch(port, PORT_DISCARD_INPUT, args, Value::NONE),
+            SHIM_DEINIT => {
+                self.port_close(port);
+                Ok(Value::NONE)
+            }
+            SHIM_ENTER => Ok(shim),
+            SHIM_EXIT => {
+                self.port_close(port);
+                Ok(Value::NONE)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// The shims return `None` where the standard returns `b""` -- the wrapping lives here,
+    /// in the shim, never in the standard surface.
+    fn shim_none_when_empty(&self, result: Value) -> Result<Value, Trap> {
+        if self.bytes_value(result).is_some_and(<[u8]>::is_empty) {
+            return Ok(Value::NONE);
+        }
+        Ok(result)
     }
 
     /// The host simulated register file (last value written per address) -- a test oracle.
@@ -5530,11 +8026,13 @@ impl ObjectModel {
         }
     }
 
-    /// Claims `pin` for the app. Fails LOUD with `ValueError` if the
-    /// pin is already app-claimed or firmware-reserved -- one owner per pin.
+    /// Claims `pin` for the app. Fails LOUD with `OSError` (`pin N in use` -- CPython's
+    /// resource-busy flavor, like a socket bind on a taken address) if the pin is already
+    /// app-claimed or firmware-reserved -- one owner per pin.
     fn claim_pin(&mut self, pin: u32) -> Result<(), Trap> {
         if self.gpio_reserved.contains(&pin) || self.gpio_claimed.contains(&pin) {
-            return Err(Trap::ValueError);
+            let message = alloc::format!("pin {pin} in use");
+            return Err(self.raise_named_exception("OSError", &message));
         }
         self.gpio_claimed.push(pin);
         Ok(())
@@ -5618,6 +8116,9 @@ impl ObjectModel {
     fn open_pin(&mut self, pin: u32, output: bool) -> Result<Value, Trap> {
         use crate::gpio::{PIN_MODE_INPUT, PIN_MODE_OUTPUT};
         let board = self.board;
+        if !board.gpio_supported() {
+            return Err(self.with_message(Trap::Unsupported, "gpio is not supported on this board yet"));
+        }
         if pin > board.max_pin() {
             return Err(Trap::ValueError);
         }
@@ -5776,7 +8277,7 @@ impl ObjectModel {
 
     /// `dio.value` (getattr): the pin's level as a `bool` -- the last driven value for an output,
     /// or the sampled input for an input.
-    fn dio_read_value(&self, dio: Value) -> Result<Value, Trap> {
+    fn dio_read_value(&mut self, dio: Value) -> Result<Value, Trap> {
         use crate::gpio::*;
         let pin = self.dio_pin(dio);
         let reference = pin.as_ref().ok_or(Trap::TypeError)?;
@@ -5811,7 +8312,7 @@ impl ObjectModel {
                 "direction" => {
                     let output = value.as_int().unwrap_or(0) == i64::from(PIN_MODE_OUTPUT);
                     self.set_pin_direction(pin, output)?;
-                    return Ok(());
+         d           return Ok(());
                 }
                 _ => return Err(Trap::AttributeError),
             }
@@ -6088,6 +8589,8 @@ impl ObjectModel {
         template: &str,
         args: &[Value],
         kwargs: &[(&str, Value)],
+        functions: &[CodeObject],
+        depth: usize,
     ) -> Result<String, Trap> {
         let mut out = String::new();
         let mut chars = template.chars().peekable();
@@ -6100,11 +8603,19 @@ impl ObjectModel {
                 }
                 '{' => {
                     let mut field = String::new();
+                    let mut brace_depth = 1usize;
                     let mut closed = false;
                     for fc in chars.by_ref() {
-                        if fc == '}' {
-                            closed = true;
-                            break;
+                        match fc {
+                            '{' => brace_depth += 1,
+                            '}' => {
+                                brace_depth -= 1;
+                                if brace_depth == 0 {
+                                    closed = true;
+                                    break;
+                                }
+                            }
+                            _ => {}
                         }
                         field.push(fc);
                     }
@@ -6119,24 +8630,129 @@ impl ObjectModel {
                         Some((n, c)) => (n, Some(c)),
                         None => (name_conv, None),
                     };
-                    let arg = if name.is_empty() {
-                        let i = auto_index;
-                        auto_index += 1;
-                        *args.get(i).ok_or(Trap::IndexError)?
-                    } else if let Ok(index) = name.parse::<usize>() {
-                        *args.get(index).ok_or(Trap::IndexError)?
-                    } else if let Some(&(_, v)) = kwargs.iter().find(|(k, _)| *k == name) {
-                        v
-                    } else {
-                        let key = self.new_str(name)?;
-                        self.set_trap_arg(key);
-                        return Err(Trap::KeyError);
-                    };
+                    let arg = self.resolve_field_arg(name, args, kwargs, &mut auto_index)?;
                     let arg = self.apply_conversion(arg, conversion)?;
-                    match spec {
-                        None => out.push_str(&self.display(arg)),
-                        Some(spec) => out.push_str(&self.format_value_spec(arg, spec)?),
+                    let resolved = match spec {
+                        None => String::new(),
+                        Some(spec) => self.resolve_nested_spec(spec, args, kwargs, &mut auto_index)?,
+                    };
+                    if let Some(method) = self.find_dunder(arg, "__format__") {
+                        let spec_value = self.new_str(&resolved)?;
+                        let result =
+                            crate::interp::call_value(method, &[spec_value], functions, self, depth)?;
+                        let text = self.str_value(result).ok_or(Trap::TypeError)?;
+                        out.push_str(text);
+                    } else if spec.is_none() {
+                        out.push_str(&self.display(arg));
+                    } else {
+                        out.push_str(&self.format_value_spec(arg, &resolved)?);
                     }
+                }
+                '}' if chars.peek() == Some(&'}') => {
+                    chars.next();
+                    out.push('}');
+                }
+                '}' => return Err(Trap::Unsupported),
+                _ => out.push(c),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolves a format field NAME to its argument: an empty name is the next auto-numbered
+    /// positional (`{}`), digits an explicit positional (`{0}`), otherwise a keyword (`{name}`, a
+    /// `KeyError` if absent). `auto_index` advances only for an empty name, and is shared across the
+    /// template and any nested specs so auto-numbering stays sequential.
+    fn resolve_field_arg(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        kwargs: &[(&str, Value)],
+        auto_index: &mut usize,
+    ) -> Result<Value, Trap> {
+        let base_end = name.find(['.', '[']).unwrap_or(name.len());
+        let base = &name[..base_end];
+        let value = if base.is_empty() {
+            let i = *auto_index;
+            *auto_index += 1;
+            args.get(i).copied().ok_or(Trap::IndexError)?
+        } else if let Ok(index) = base.parse::<usize>() {
+            args.get(index).copied().ok_or(Trap::IndexError)?
+        } else if let Some(&(_, v)) = kwargs.iter().find(|(k, _)| *k == base) {
+            v
+        } else {
+            let key = self.new_str(base)?;
+            self.set_trap_arg(key);
+            return Err(Trap::KeyError);
+        };
+        self.apply_field_accessors(value, &name[base_end..])
+    }
+
+    /// Walks a format field's accessor chain (`.attr` / `[key]`) after the base argument. A bracket
+    /// key of all digits is an INTEGER index (`{0[1]}` -> list element 1); any other key is a string
+    /// (`{0[name]}` -> mapping lookup), matching str.format. An attribute reads via the object model.
+    fn apply_field_accessors(&mut self, mut value: Value, mut rest: &str) -> Result<Value, Trap> {
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix('.') {
+                let end = after.find(['.', '[']).unwrap_or(after.len());
+                let mut cache = InlineCache::empty();
+                value = self.getattr(value, &after[..end], &mut cache)?;
+                rest = &after[end..];
+            } else if let Some(after) = rest.strip_prefix('[') {
+                let close = after.find(']').ok_or(Trap::Unsupported)?;
+                let key = &after[..close];
+                let index = if !key.is_empty() && key.bytes().all(|b| b.is_ascii_digit()) {
+                    Value::fixnum(key.parse::<i32>().map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)?
+                } else {
+                    self.new_str(key)?
+                };
+                value = self.py_getitem(value, index)?;
+                rest = &after[close + 1..];
+            } else {
+                return Err(Trap::Unsupported);
+            }
+        }
+        Ok(value)
+    }
+
+    /// Resolves the replacement fields inside a format SPEC one nesting level deep -- `str.format`
+    /// allows a field's spec to reference other arguments (`"{x:>{w}}".format(x="hi", w=8)` -> the
+    /// `{w}` becomes `8`, then `>8` right-aligns). A nested field is a plain `[name]` with no spec or
+    /// conversion of its own (PEP 3101 permits only one level); `{{`/`}}` still escape. Shares
+    /// `auto_index` with the enclosing template.
+    fn resolve_nested_spec(
+        &mut self,
+        spec: &str,
+        args: &[Value],
+        kwargs: &[(&str, Value)],
+        auto_index: &mut usize,
+    ) -> Result<String, Trap> {
+        if !spec.contains('{') {
+            return Ok(String::from(spec));
+        }
+        let mut out = String::new();
+        let mut chars = spec.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '{' if chars.peek() == Some(&'{') => {
+                    chars.next();
+                    out.push('{');
+                }
+                '{' => {
+                    let mut name = String::new();
+                    let mut closed = false;
+                    for fc in chars.by_ref() {
+                        if fc == '}' {
+                            closed = true;
+                            break;
+                        }
+                        name.push(fc);
+                    }
+                    if !closed {
+                        return Err(Trap::Unsupported);
+                    }
+                    let arg = self.resolve_field_arg(&name, args, kwargs, auto_index)?;
+                    out.push_str(&self.display(arg));
                 }
                 '}' if chars.peek() == Some(&'}') => {
                     chars.next();
@@ -6220,6 +8836,9 @@ impl ObjectModel {
         if self.is_set(receiver) || self.is_frozenset(receiver) {
             return self.call_set_method(receiver, method_id, args);
         }
+        if self.is_ntinstance(receiver) {
+            return self.call_nt_method(receiver, method_id, args);
+        }
         if self.is_tuple(receiver) {
             return self.call_tuple_method(receiver, method_id, args);
         }
@@ -6248,6 +8867,15 @@ impl ObjectModel {
         if self.is_pin(receiver) {
             return self.call_pin_method(receiver, method_id, args);
         }
+        if self.is_uart(receiver) {
+            return self.call_uart_method(receiver, method_id, args);
+        }
+        if self.is_uart_port(receiver) {
+            return self.call_port_method(receiver, method_id, args);
+        }
+        if self.is_uart_shim(receiver) {
+            return self.call_uart_shim_method(receiver, method_id, args);
+        }
         match method_id {
             STR_UPPER | STR_LOWER => {
                 if !args.is_empty() {
@@ -6263,7 +8891,7 @@ impl ObjectModel {
             }
             STR_FORMAT => {
                 let template = self.str_value(receiver).map(String::from).ok_or(Trap::TypeError)?;
-                let rendered = self.format_template(&template, args, &[])?;
+                let rendered = self.format_template(&template, args, &[], &[], 0)?;
                 self.new_str(&rendered)
             }
             STR_FORMAT_MAP => {
@@ -6292,7 +8920,8 @@ impl ObjectModel {
                 };
                 let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
                 let parts: Vec<String> = match &sep {
-                    None => s.split_whitespace().map(String::from).collect(),
+                    None if maxsplit < 0 => s.split_whitespace().map(String::from).collect(),
+                    None => rsplit_whitespace_maxsplit(&s, maxsplit as usize),
                     Some(sep) => {
                         if sep.is_empty() {
                             return Err(Trap::ValueError);
@@ -6405,7 +9034,7 @@ impl ObjectModel {
                     None => -1,
                 };
                 if index < 0 && (method_id == STR_INDEX || method_id == STR_RINDEX) {
-                    return Err(Trap::ValueError);
+                    return Err(self.with_message(Trap::ValueError, "substring not found"));
                 }
                 Value::fixnum(index).ok_or(Trap::Overflow)
             }
@@ -6460,7 +9089,8 @@ impl ObjectModel {
                 Value::fixnum(window.matches(sub).count() as i32).ok_or(Trap::Overflow)
             }
             STR_ISDIGIT | STR_ISALPHA | STR_ISALNUM | STR_ISSPACE | STR_ISUPPER | STR_ISLOWER
-            | STR_ISDECIMAL | STR_ISNUMERIC | STR_ISASCII | STR_ISIDENTIFIER => {
+            | STR_ISDECIMAL | STR_ISNUMERIC | STR_ISASCII | STR_ISIDENTIFIER | STR_ISTITLE
+            | STR_ISPRINTABLE => {
                 if !args.is_empty() {
                     return Err(Trap::TypeError);
                 }
@@ -6485,7 +9115,8 @@ impl ObjectModel {
                 };
                 let s = String::from(self.str_value(receiver).ok_or(Trap::TypeError)?);
                 let parts: Vec<String> = match &sep {
-                    None => s.split_whitespace().map(String::from).collect(),
+                    None if maxsplit < 0 => s.split_whitespace().map(String::from).collect(),
+                    None => split_whitespace_maxsplit(&s, maxsplit as usize),
                     Some(sep) => {
                         if sep.is_empty() {
                             return Err(Trap::ValueError);
@@ -6843,7 +9474,12 @@ impl ObjectModel {
                     None => Err(Trap::ValueError),
                 }
             }
-            LIST_INDEX => self.seq_index(index, args),
+            LIST_INDEX => match self.seq_index(index, args) {
+                Err(Trap::ValueError) => {
+                    Err(self.with_message(Trap::ValueError, "list.index(x): x not in list"))
+                }
+                other => other,
+            },
             LIST_COUNT => {
                 let [value] = args else {
                     return Err(Trap::TypeError);
@@ -6878,11 +9514,10 @@ impl ObjectModel {
         }
     }
 
-    /// Dispatches a `dict` method: `get(k[, default])` (no KeyError), `keys`/`values`/`items`.
-    /// keys/values/items return a new `list` (a cut: CPython returns live views; iteration and
-    /// `list(...)` over them match).
+    /// Dispatches a `dict` method: `get(k[, default])` (no KeyError), and `keys`/`values`/`items`
+    /// returning live view objects (`dict_keys`/`dict_values`/`dict_items`, as CPython does).
     fn call_dict_method(&mut self, dict: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
-        let index = self.container_slot(dict, self.dict_type_id).ok_or(Trap::TypeError)?;
+        let index = self.dict_slot(dict).ok_or(Trap::TypeError)?;
         match method_id {
             DICT_GET => {
                 let (key, default) = match args {
@@ -6896,22 +9531,9 @@ impl ObjectModel {
                     .map(|(_, v)| *v);
                 Ok(found.unwrap_or(default))
             }
-            DICT_KEYS => {
-                let keys: Vec<Value> = self.dicts[index].iter().map(|(k, _)| *k).collect();
-                self.new_list(keys)
-            }
-            DICT_VALUES => {
-                let values: Vec<Value> = self.dicts[index].iter().map(|(_, v)| *v).collect();
-                self.new_list(values)
-            }
-            DICT_ITEMS => {
-                let pairs = self.dicts[index].clone();
-                let mut items = Vec::with_capacity(pairs.len());
-                for (key, value) in pairs {
-                    items.push(self.new_tuple(alloc::vec![key, value])?);
-                }
-                self.new_list(items)
-            }
+            DICT_KEYS => self.new_dict_view(dict, DictViewKind::Keys),
+            DICT_VALUES => self.new_dict_view(dict, DictViewKind::Values),
+            DICT_ITEMS => self.new_dict_view(dict, DictViewKind::Items),
             DICT_UPDATE => {
                 let other = match args {
                     [] => return Ok(Value::NONE),
@@ -6976,8 +9598,74 @@ impl ObjectModel {
                 }
                 match self.dicts[index].pop() {
                     Some((key, value)) => self.new_tuple(alloc::vec![key, value]),
-                    None => Err(Trap::KeyError),
+                    None => {
+                        let message = self.new_str("popitem(): dictionary is empty")?;
+                        self.set_trap_arg(message);
+                        Err(Trap::KeyError)
+                    }
                 }
+            }
+            COUNTER_MOST_COMMON => {
+                let n = match args {
+                    [] => None,
+                    [n] if n.is_none() => None,
+                    [n] => Some(n.as_int().ok_or(Trap::TypeError)?),
+                    _ => return Err(Trap::TypeError),
+                };
+                let entries = self.counter_display_entries(self.dicts[index].clone());
+                let take = match n {
+                    Some(n) if n >= 0 => (n as usize).min(entries.len()),
+                    Some(_) => 0,
+                    None => entries.len(),
+                };
+                let mut items = Vec::with_capacity(take);
+                for &(key, count) in entries.iter().take(take) {
+                    items.push(self.new_tuple(alloc::vec![key, count])?);
+                }
+                self.new_list(items)
+            }
+            COUNTER_ELEMENTS => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let entries = self.dicts[index].clone();
+                let mut out = Vec::new();
+                for (key, count) in entries {
+                    let n = self.as_i128(count).unwrap_or(0);
+                    for _ in 0..n.max(0) {
+                        out.push(key);
+                    }
+                }
+                let list = self.new_list(out)?;
+                self.new_iter(list)
+            }
+            COUNTER_TOTAL => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let mut total: i128 = 0;
+                for &(_, count) in &self.dicts[index] {
+                    total += self.as_i128(count).ok_or(Trap::TypeError)?;
+                }
+                self.int_from_i128(total)
+            }
+            ODICT_POPITEM => {
+                let last = match args {
+                    [] => true,
+                    [l] => self.py_truthy(*l)?.unwrap_or_else(|| l.is_truthy()),
+                    _ => return Err(Trap::TypeError),
+                };
+                if self.dicts[index].is_empty() {
+                    let message = self.new_str("dictionary is empty")?;
+                    self.set_trap_arg(message);
+                    return Err(Trap::KeyError);
+                }
+                let (key, value) = if last {
+                    self.dicts[index].pop().unwrap_or((Value::NONE, Value::NONE))
+                } else {
+                    self.dicts[index].remove(0)
+                };
+                self.new_tuple(alloc::vec![key, value])
             }
             _ => Err(Trap::AttributeError),
         }
@@ -6996,7 +9684,7 @@ impl ObjectModel {
         functions: &[CodeObject],
         depth: usize,
     ) -> Result<Value, Trap> {
-        let index = self.container_slot(receiver, self.dict_type_id).ok_or(Trap::TypeError)?;
+        let index = self.dict_slot(receiver).ok_or(Trap::TypeError)?;
         match method_id {
             DICT_GET => {
                 let (key, default) = match args {
@@ -7058,6 +9746,60 @@ impl ObjectModel {
                     }
                 }
                 Ok(Value::NONE)
+            }
+            COUNTER_UPDATE | COUNTER_SUBTRACT => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let sign: i128 = if method_id == COUNTER_UPDATE { 1 } else { -1 };
+                let deltas: Vec<(Value, i128)> = if let Some(entries) = self.dict_entries(*other) {
+                    let mut kv = Vec::with_capacity(entries.len());
+                    for (key, count) in entries {
+                        kv.push((key, self.as_i128(count).ok_or(Trap::TypeError)?));
+                    }
+                    kv
+                } else {
+                    let items =
+                        crate::builtins::collect_iterable(self, &[*other], functions, depth)?;
+                    items.into_iter().map(|key| (key, 1)).collect()
+                };
+                for (key, delta) in deltas {
+                    match self.dict_find_dyn(receiver, key, functions, depth)? {
+                        Some(slot) if slot < self.dicts[index].len() => {
+                            let current =
+                                self.as_i128(self.dicts[index][slot].1).ok_or(Trap::TypeError)?;
+                            let updated = self.int_from_i128(current + sign * delta)?;
+                            self.dicts[index][slot].1 = updated;
+                        }
+                        _ => {
+                            let fresh = self.int_from_i128(sign * delta)?;
+                            self.dicts[index].push((key, fresh));
+                        }
+                    }
+                }
+                Ok(Value::NONE)
+            }
+            ODICT_MOVE_TO_END => {
+                let (key, last) = match args {
+                    [k] => (*k, true),
+                    [k, l] => (*k, self.py_truthy(*l)?.unwrap_or_else(|| l.is_truthy())),
+                    _ => return Err(Trap::TypeError),
+                };
+                match self.dict_find_dyn(receiver, key, functions, depth)? {
+                    Some(slot) if slot < self.dicts[index].len() => {
+                        let entry = self.dicts[index].remove(slot);
+                        if last {
+                            self.dicts[index].push(entry);
+                        } else {
+                            self.dicts[index].insert(0, entry);
+                        }
+                        Ok(Value::NONE)
+                    }
+                    _ => {
+                        self.set_trap_arg(key);
+                        Err(Trap::KeyError)
+                    }
+                }
             }
             _ => self.call_dict_method(receiver, method_id, args),
         }
@@ -7127,9 +9869,14 @@ impl ObjectModel {
     /// Dispatches a `tuple` method: `index(x)` (the first position, `ValueError` if absent) and
     /// `count(x)` -- the immutable sequence reads over the shared arena.
     fn call_tuple_method(&mut self, tuple: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
-        let index = self.container_slot(tuple, self.tuple_type_id).ok_or(Trap::TypeError)?;
+        let index = self.tuple_slot(tuple).ok_or(Trap::TypeError)?;
         match method_id {
-            TUPLE_INDEX => self.seq_index(index, args),
+            TUPLE_INDEX => match self.seq_index(index, args) {
+                Err(Trap::ValueError) => {
+                    Err(self.with_message(Trap::ValueError, "tuple.index(x): x not in tuple"))
+                }
+                other => other,
+            },
             TUPLE_COUNT => {
                 let [value] = args else {
                     return Err(Trap::TypeError);
@@ -7165,6 +9912,10 @@ impl ObjectModel {
         let f = self.float_value(receiver).ok_or(Trap::TypeError)?;
         match method_id {
             FLOAT_IS_INTEGER => Ok(Value::from_bool(f.is_finite() && libm::floor(f) == f)),
+            FLOAT_HEX => {
+                let hex = float_to_hex(f);
+                self.new_str(&hex)
+            }
             FLOAT_CONJUGATE => Ok(receiver),
             FLOAT_AS_INTEGER_RATIO => {
                 let (num, den) = float_as_integer_ratio(f).ok_or(Trap::ValueError)?;
@@ -7277,11 +10028,37 @@ impl ObjectModel {
     fn call_bytes_method(&mut self, receiver: Value, method_id: u32, args: &[Value]) -> Result<Value, Trap> {
         match method_id {
             BYTES_HEX => {
-                if !args.is_empty() {
-                    return Err(Trap::TypeError);
-                }
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let (sep_arg, group) = match args {
+                    [] => (None, 1i64),
+                    [sep] => (Some(*sep), 1),
+                    [sep, n] => (Some(*sep), n.as_int().ok_or(Trap::TypeError)?),
+                    _ => return Err(Trap::TypeError),
+                };
+                let sep = match sep_arg {
+                    None => None,
+                    Some(value) => {
+                        let owned = String::from(self.str_value(value).ok_or(Trap::TypeError)?);
+                        if owned.chars().count() != 1 {
+                            return Err(self.with_message(Trap::ValueError, "sep must be length 1."));
+                        }
+                        Some(owned)
+                    }
+                };
+                let len = data.len() as i64;
                 let mut hex = String::new();
-                for &byte in self.bytes_value(receiver).ok_or(Trap::TypeError)? {
+                for (i, &byte) in data.iter().enumerate() {
+                    let idx = i as i64;
+                    if let Some(ref sep) = sep {
+                        let boundary = match group {
+                            0 => false,
+                            g if g > 0 => (len - idx) % g == 0,
+                            g => idx % -g == 0,
+                        };
+                        if idx != 0 && boundary {
+                            hex.push_str(sep);
+                        }
+                    }
                     hex.push_str(&alloc::format!("{byte:02x}"));
                 }
                 self.new_str(&hex)
@@ -7312,6 +10089,14 @@ impl ObjectModel {
                 let slot = self.byte_buffer_slot(receiver).ok_or(Trap::TypeError)?;
                 self.byte_buffers[slot].extend(extra);
                 Ok(Value::NONE)
+            }
+            BYTES_ISALPHA | BYTES_ISDIGIT | BYTES_ISALNUM | BYTES_ISSPACE | BYTES_ISUPPER
+            | BYTES_ISLOWER | BYTES_ISTITLE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
+                Ok(Value::from_bool(bytes_predicate(method_id, data)))
             }
             BYTES_STARTSWITH | BYTES_ENDSWITH => {
                 let [prefix] = args else {
@@ -7391,19 +10176,61 @@ impl ObjectModel {
                     self.new_bytes(data)
                 }
             }
-            BYTES_SPLIT => {
+            BYTES_SPLIT | BYTES_RSPLIT => {
+                let (sep, maxsplit) = match args {
+                    [] => (None, -1i64),
+                    [s] if s.is_none() => (None, -1),
+                    [s] => (Some(self.bytes_value(*s).ok_or(Trap::TypeError)?.to_vec()), -1),
+                    [s, m] => {
+                        let limit = m.as_int().ok_or(Trap::TypeError)?;
+                        let sep = if s.is_none() {
+                            None
+                        } else {
+                            Some(self.bytes_value(*s).ok_or(Trap::TypeError)?.to_vec())
+                        };
+                        (sep, limit)
+                    }
+                    _ => return Err(Trap::TypeError),
+                };
                 let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
                 let bytearray = self.is_bytearray(receiver);
-                let parts = match args {
-                    [] => split_whitespace_bytes(&data),
-                    [sep] => {
-                        let sep = self.bytes_value(*sep).ok_or(Trap::TypeError)?.to_vec();
+                let right = method_id == BYTES_RSPLIT;
+                let parts: Vec<Vec<u8>> = match sep {
+                    None if maxsplit < 0 => split_whitespace_bytes(&data),
+                    None if right => rsplit_whitespace_maxsplit_bytes(&data, maxsplit as usize),
+                    None => split_whitespace_maxsplit_bytes(&data, maxsplit as usize),
+                    Some(sep) => {
                         if sep.is_empty() {
                             return Err(Trap::ValueError);
                         }
-                        split_on_bytes(&data, &sep)
+                        let all = split_on_bytes(&data, &sep);
+                        if maxsplit < 0 || all.len() <= maxsplit as usize + 1 {
+                            all
+                        } else if right {
+                            let keep_from = all.len() - maxsplit as usize;
+                            let mut head = Vec::new();
+                            for (idx, part) in all[..keep_from].iter().enumerate() {
+                                if idx > 0 {
+                                    head.extend_from_slice(&sep);
+                                }
+                                head.extend_from_slice(part);
+                            }
+                            let mut parts = alloc::vec![head];
+                            parts.extend(all[keep_from..].iter().cloned());
+                            parts
+                        } else {
+                            let mut parts: Vec<Vec<u8>> = all[..maxsplit as usize].to_vec();
+                            let mut tail = Vec::new();
+                            for (idx, part) in all[maxsplit as usize..].iter().enumerate() {
+                                if idx > 0 {
+                                    tail.extend_from_slice(&sep);
+                                }
+                                tail.extend_from_slice(part);
+                            }
+                            parts.push(tail);
+                            parts
+                        }
                     }
-                    _ => return Err(Trap::TypeError),
                 };
                 let mut elements = Vec::with_capacity(parts.len());
                 for part in parts {
@@ -7433,6 +10260,217 @@ impl ObjectModel {
                     self.new_bytearray(stripped)
                 } else {
                     self.new_bytes(stripped)
+                }
+            }
+            BYTES_TITLE | BYTES_CAPITALIZE | BYTES_SWAPCASE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
+                let out = bytes_case_transform(method_id, data);
+                if self.is_bytearray(receiver) {
+                    self.new_bytearray(out)
+                } else {
+                    self.new_bytes(out)
+                }
+            }
+            BYTES_REMOVEPREFIX | BYTES_REMOVESUFFIX => {
+                let [affix] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let affix = self.bytes_value(*affix).ok_or(Trap::TypeError)?.to_vec();
+                let stripped = if method_id == BYTES_REMOVEPREFIX {
+                    data.strip_prefix(affix.as_slice()).map(<[u8]>::to_vec)
+                } else {
+                    data.strip_suffix(affix.as_slice()).map(<[u8]>::to_vec)
+                };
+                let result = stripped.unwrap_or(data);
+                if self.is_bytearray(receiver) {
+                    self.new_bytearray(result)
+                } else {
+                    self.new_bytes(result)
+                }
+            }
+            BYTES_JOIN => {
+                let [iterable] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let sep = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let elements = self.seq_value(*iterable).ok_or(Trap::TypeError)?.to_vec();
+                let mut result: Vec<u8> = Vec::new();
+                for (i, &elem) in elements.iter().enumerate() {
+                    if i > 0 {
+                        result.extend_from_slice(&sep);
+                    }
+                    result.extend_from_slice(self.bytes_value(elem).ok_or(Trap::TypeError)?);
+                }
+                if self.is_bytearray(receiver) {
+                    self.new_bytearray(result)
+                } else {
+                    self.new_bytes(result)
+                }
+            }
+            BYTES_RFIND | BYTES_INDEX | BYTES_RINDEX => {
+                let [sub] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?;
+                let needle = self.bytes_value(*sub).ok_or(Trap::TypeError)?;
+                let from_right = method_id == BYTES_RFIND || method_id == BYTES_RINDEX;
+                let pos = if needle.is_empty() {
+                    Some(if from_right { data.len() } else { 0 })
+                } else if from_right {
+                    data.windows(needle.len()).rposition(|w| w == needle)
+                } else {
+                    data.windows(needle.len()).position(|w| w == needle)
+                };
+                let index = match pos {
+                    Some(p) => p as i64,
+                    None if method_id == BYTES_INDEX || method_id == BYTES_RINDEX => {
+                        return Err(self.with_message(Trap::ValueError, "subsection not found"));
+                    }
+                    None => -1,
+                };
+                Value::fixnum(i32::try_from(index).map_err(|_| Trap::Overflow)?).ok_or(Trap::Overflow)
+            }
+            BYTES_LJUST | BYTES_RJUST | BYTES_CENTER => {
+                let (width, fill) = match args {
+                    [w] => (w.as_int().ok_or(Trap::TypeError)?, b' '),
+                    [w, f] => match self.bytes_value(*f).ok_or(Trap::TypeError)? {
+                        [b] => (w.as_int().ok_or(Trap::TypeError)?, *b),
+                        _ => return Err(Trap::TypeError),
+                    },
+                    _ => return Err(Trap::TypeError),
+                };
+                let width = width.max(0) as usize;
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let out = if data.len() >= width {
+                    data
+                } else {
+                    let pad = width - data.len();
+                    let (left, right) = match method_id {
+                        BYTES_LJUST => (0, pad),
+                        BYTES_RJUST => (pad, 0),
+                        _ => {
+                            let left = pad / 2 + (pad & width & 1);
+                            (left, pad - left)
+                        }
+                    };
+                    let mut r = Vec::with_capacity(width);
+                    r.resize(left, fill);
+                    r.extend_from_slice(&data);
+                    r.resize(r.len() + right, fill);
+                    r
+                };
+                if self.is_bytearray(receiver) {
+                    self.new_bytearray(out)
+                } else {
+                    self.new_bytes(out)
+                }
+            }
+            BYTES_ZFILL => {
+                let [width] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let width = width.as_int().ok_or(Trap::TypeError)?.max(0) as usize;
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let out = if data.len() >= width {
+                    data
+                } else {
+                    let pad = width - data.len();
+                    let mut r = Vec::with_capacity(width);
+                    if matches!(data.first(), Some(b'+' | b'-')) {
+                        r.push(data[0]);
+                        r.resize(1 + pad, b'0');
+                        r.extend_from_slice(&data[1..]);
+                    } else {
+                        r.resize(pad, b'0');
+                        r.extend_from_slice(&data);
+                    }
+                    r
+                };
+                if self.is_bytearray(receiver) {
+                    self.new_bytearray(out)
+                } else {
+                    self.new_bytes(out)
+                }
+            }
+            BYTES_PARTITION | BYTES_RPARTITION => {
+                let [sep] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let sep = self.bytes_value(*sep).ok_or(Trap::TypeError)?.to_vec();
+                if sep.is_empty() {
+                    return Err(Trap::ValueError);
+                }
+                let bytearray = self.is_bytearray(receiver);
+                let found = if method_id == BYTES_PARTITION {
+                    data.windows(sep.len()).position(|w| w == sep.as_slice())
+                } else {
+                    data.windows(sep.len()).rposition(|w| w == sep.as_slice())
+                };
+                let (before, mid, after) = match found {
+                    Some(p) => (data[..p].to_vec(), sep.clone(), data[p + sep.len()..].to_vec()),
+                    None if method_id == BYTES_PARTITION => (data, Vec::new(), Vec::new()),
+                    None => (Vec::new(), Vec::new(), data),
+                };
+                let b0 = if bytearray { self.new_bytearray(before)? } else { self.new_bytes(before)? };
+                let b1 = if bytearray { self.new_bytearray(mid)? } else { self.new_bytes(mid)? };
+                let b2 = if bytearray { self.new_bytearray(after)? } else { self.new_bytes(after)? };
+                self.new_tuple(alloc::vec![b0, b1, b2])
+            }
+            BYTES_SPLITLINES => {
+                let keepends = match args {
+                    [] => false,
+                    [k] => self.py_truthy(*k)?.unwrap_or(false),
+                    _ => return Err(Trap::TypeError),
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let bytearray = self.is_bytearray(receiver);
+                let mut elems = Vec::new();
+                for line in split_lines_bytes(&data, keepends) {
+                    elems.push(if bytearray {
+                        self.new_bytearray(line)?
+                    } else {
+                        self.new_bytes(line)?
+                    });
+                }
+                self.new_list(elems)
+            }
+            BYTES_EXPANDTABS => {
+                let tabsize = match args {
+                    [] => 8,
+                    [t] => t.as_int().ok_or(Trap::TypeError)?,
+                    _ => return Err(Trap::TypeError),
+                };
+                let data = self.bytes_value(receiver).ok_or(Trap::TypeError)?.to_vec();
+                let mut out = Vec::with_capacity(data.len());
+                let mut column: i64 = 0;
+                for &b in &data {
+                    match b {
+                        b'\t' => {
+                            if tabsize > 0 {
+                                let spaces = tabsize - (column % tabsize);
+                                out.resize(out.len() + spaces as usize, b' ');
+                                column += spaces;
+                            }
+                        }
+                        b'\n' | b'\r' => {
+                            out.push(b);
+                            column = 0;
+                        }
+                        _ => {
+                            out.push(b);
+                            column += 1;
+                        }
+                    }
+                }
+                if self.is_bytearray(receiver) {
+                    self.new_bytearray(out)
+                } else {
+                    self.new_bytes(out)
                 }
             }
             _ => Err(Trap::AttributeError),
@@ -7474,26 +10512,34 @@ impl ObjectModel {
                     self.new_set(elems)
                 }
             }
-            SET_UNION | SET_INTERSECTION | SET_DIFFERENCE | SET_SYMMETRIC_DIFFERENCE => {
+            SET_UNION | SET_INTERSECTION | SET_DIFFERENCE => {
+                let mut acc = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                for other in args {
+                    let b = self.collect_elements(*other)?;
+                    acc = match method_id {
+                        SET_UNION => self.set_union_elems(&acc, &b),
+                        SET_INTERSECTION => self.set_filter_elems(&acc, &b, true),
+                        _ => self.set_filter_elems(&acc, &b, false),
+                    };
+                }
+                if frozen {
+                    self.new_frozenset(acc)
+                } else {
+                    self.new_set(acc)
+                }
+            }
+            SET_SYMMETRIC_DIFFERENCE => {
                 let [other] = args else {
                     return Err(Trap::TypeError);
                 };
                 let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
                 let b = self.collect_elements(*other)?;
-                let result = match method_id {
-                    SET_UNION => self.set_union_elems(&a, &b),
-                    SET_INTERSECTION => self.set_filter_elems(&a, &b, true),
-                    SET_DIFFERENCE => self.set_filter_elems(&a, &b, false),
-                    _ => {
-                        let mut r = self.set_filter_elems(&a, &b, false);
-                        r.extend(self.set_filter_elems(&b, &a, false));
-                        r
-                    }
-                };
+                let mut r = self.set_filter_elems(&a, &b, false);
+                r.extend(self.set_filter_elems(&b, &a, false));
                 if frozen {
-                    self.new_frozenset(result)
+                    self.new_frozenset(r)
                 } else {
-                    self.new_set(result)
+                    self.new_set(r)
                 }
             }
             SET_ISSUBSET | SET_ISSUPERSET | SET_ISDISJOINT => {
@@ -7543,14 +10589,13 @@ impl ObjectModel {
                 Ok(self.sets[slot].remove(0))
             }
             SET_UPDATE => {
-                let [other] = args else {
-                    return Err(Trap::TypeError);
-                };
-                let b = self.collect_elements(*other)?;
                 let slot = self.container_slot(receiver, self.set_type_id).ok_or(Trap::TypeError)?;
-                for e in b {
-                    if !self.sets[slot].iter().any(|x| self.key_eq(*x, e)) {
-                        self.sets[slot].push(e);
+                for other in args {
+                    let b = self.collect_elements(*other)?;
+                    for e in b {
+                        if !self.sets[slot].iter().any(|x| self.key_eq(*x, e)) {
+                            self.sets[slot].push(e);
+                        }
                     }
                 }
                 Ok(Value::NONE)
@@ -7574,31 +10619,36 @@ impl ObjectModel {
     ) -> Result<Value, Trap> {
         let frozen = self.is_frozenset(receiver);
         match method_id {
-            SET_UNION | SET_INTERSECTION | SET_DIFFERENCE | SET_SYMMETRIC_DIFFERENCE => {
+            SET_UNION | SET_INTERSECTION | SET_DIFFERENCE => {
+                let mut acc = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                for other in args {
+                    let b = self.collect_elements(*other)?;
+                    acc = match method_id {
+                        SET_UNION => crate::interp::union_elems_dyn(&acc, &b, functions, self, depth)?,
+                        SET_INTERSECTION => {
+                            crate::interp::filter_elems_dyn(&acc, &b, true, functions, self, depth)?
+                        }
+                        _ => crate::interp::filter_elems_dyn(&acc, &b, false, functions, self, depth)?,
+                    };
+                }
+                if frozen {
+                    self.new_frozenset(acc)
+                } else {
+                    self.new_set(acc)
+                }
+            }
+            SET_SYMMETRIC_DIFFERENCE => {
                 let [other] = args else {
                     return Err(Trap::TypeError);
                 };
                 let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
                 let b = self.collect_elements(*other)?;
-                let result = match method_id {
-                    SET_UNION => crate::interp::union_elems_dyn(&a, &b, functions, self, depth)?,
-                    SET_INTERSECTION => {
-                        crate::interp::filter_elems_dyn(&a, &b, true, functions, self, depth)?
-                    }
-                    SET_DIFFERENCE => {
-                        crate::interp::filter_elems_dyn(&a, &b, false, functions, self, depth)?
-                    }
-                    _ => {
-                        let mut r =
-                            crate::interp::filter_elems_dyn(&a, &b, false, functions, self, depth)?;
-                        r.extend(crate::interp::filter_elems_dyn(&b, &a, false, functions, self, depth)?);
-                        r
-                    }
-                };
+                let mut r = crate::interp::filter_elems_dyn(&a, &b, false, functions, self, depth)?;
+                r.extend(crate::interp::filter_elems_dyn(&b, &a, false, functions, self, depth)?);
                 if frozen {
-                    self.new_frozenset(result)
+                    self.new_frozenset(r)
                 } else {
-                    self.new_set(result)
+                    self.new_set(r)
                 }
             }
             SET_ISSUBSET | SET_ISSUPERSET | SET_ISDISJOINT => {
@@ -7649,14 +10699,13 @@ impl ObjectModel {
                 }
             }
             SET_UPDATE => {
-                let [other] = args else {
-                    return Err(Trap::TypeError);
-                };
-                let b = self.collect_elements(*other)?;
-                for e in b {
-                    let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
-                    if !crate::interp::elems_contain(e, &a, functions, self, depth)? {
-                        self.set_push(receiver, e)?;
+                for other in args {
+                    let b = self.collect_elements(*other)?;
+                    for e in b {
+                        let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                        if !crate::interp::elems_contain(e, &a, functions, self, depth)? {
+                            self.set_push(receiver, e)?;
+                        }
                     }
                 }
                 Ok(Value::NONE)
@@ -8889,6 +11938,60 @@ mod tests {
     }
 
     #[test]
+    fn stopiteration_value_and_generator_return_stash() {
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let trap = model.raise_named_exception_with_value("StopIteration", Value::fixnum(99).unwrap());
+        assert_eq!(trap, Trap::Raised);
+        let exc = model.take_pending_exception().unwrap();
+        assert_eq!(model.py_getattr_instance(exc, "value").unwrap(), Value::fixnum(99).unwrap());
+
+        model.raise_named_exception_with_value("StopIteration", Value::NONE);
+        let bare = model.take_pending_exception().unwrap();
+        assert_eq!(model.py_getattr_instance(bare, "value").unwrap(), Value::NONE);
+
+        let value_error = model.exception_class("ValueError").unwrap();
+        let other = model.new_object(value_error).unwrap();
+        assert_eq!(model.py_getattr_instance(other, "value"), Err(Trap::AttributeError));
+
+        assert!(model.take_generator_return().is_none());
+        model.set_generator_return(Value::fixnum(7).unwrap());
+        assert_eq!(model.take_generator_return(), Some(Value::fixnum(7).unwrap()));
+        assert!(model.take_generator_return().is_none());
+    }
+
+    #[test]
+    fn import_star_binds_all_or_public_names() {
+        let mut model = ObjectModel::new(Vec::new(), 64 * 1024);
+        let f = |n: i32| Value::fixnum(n).unwrap();
+
+        let (alpha, hidden, beta) = (
+            model.new_str("alpha").unwrap(),
+            model.new_str("_hidden").unwrap(),
+            model.new_str("beta").unwrap(),
+        );
+        let ns1 = model.new_dict(alloc::vec![(alpha, f(1)), (hidden, f(2)), (beta, f(3))]).unwrap();
+        let module1 = model.new_module(ns1).unwrap();
+        model.import_star(module1).unwrap();
+        assert_eq!(model.current_module_global("alpha"), Some(f(1)));
+        assert_eq!(model.current_module_global("beta"), Some(f(3)));
+        assert_eq!(model.current_module_global("_hidden"), None);
+
+        let gamma_name = model.new_str("gamma").unwrap();
+        let all_list = model.new_list(alloc::vec![gamma_name]).unwrap();
+        let (all_key, gamma, delta) = (
+            model.new_str("__all__").unwrap(),
+            model.new_str("gamma").unwrap(),
+            model.new_str("delta").unwrap(),
+        );
+        let ns2 =
+            model.new_dict(alloc::vec![(all_key, all_list), (gamma, f(10)), (delta, f(20))]).unwrap();
+        let module2 = model.new_module(ns2).unwrap();
+        model.import_star(module2).unwrap();
+        assert_eq!(model.current_module_global("gamma"), Some(f(10)));
+        assert_eq!(model.current_module_global("delta"), None);
+    }
+
+    #[test]
     fn list_and_dict_methods() {
         let mut model = ObjectModel::new(Vec::new(), 16 * 1024);
         let n = |v: i32| Value::fixnum(v).unwrap();
@@ -8911,9 +12014,13 @@ mod tests {
         let get2 = model.getattr(dict, "get", &mut empty_cache()).unwrap();
         assert_eq!(model.call_bound_method(get2, &[n(9), n(99)]).unwrap().as_fixnum(), Some(99));
         let keys = model.getattr(dict, "keys", &mut empty_cache()).unwrap();
-        let key_list = model.call_bound_method(keys, &[]).unwrap();
-        assert!(model.is_list(key_list));
-        assert_eq!(model.py_len(key_list).unwrap().as_fixnum(), Some(1));
+        let keys_view = model.call_bound_method(keys, &[]).unwrap();
+        assert_eq!(model.dict_view_kind(keys_view), Some(DictViewKind::Keys));
+        assert_eq!(model.py_len(keys_view).unwrap().as_fixnum(), Some(1));
+        assert_eq!(model.repr(keys_view), "dict_keys([1])");
+        model.py_setitem(dict, n(2), n(20)).unwrap();
+        assert_eq!(model.py_len(keys_view).unwrap().as_fixnum(), Some(2));
+        assert_eq!(model.repr(keys_view), "dict_keys([1, 2])");
 
         assert_eq!(
             model.getattr(list, "nope", &mut empty_cache()),

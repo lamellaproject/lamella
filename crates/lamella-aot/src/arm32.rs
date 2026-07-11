@@ -211,6 +211,7 @@ fn lower_inst(
         | Inst::StringConcat { .. }
         | Inst::IntToString { .. }
         | Inst::Alloc { .. }
+        | Inst::AllocLike { .. }
         | Inst::AllocArray { .. }
         | Inst::ArrayLoad { .. }
         | Inst::ArrayStore { .. }
@@ -463,6 +464,12 @@ fn lower_spilled_inst(
             }
         }
         Inst::Binary { op, lhs, rhs } => {
+            if matches!(
+                value_types.get(lhs.0 as usize),
+                Some(MirType::F32 | MirType::F64)
+            ) {
+                return Err(LowerError::CallUnsupported);
+            }
             enc.ldr_sp(Reg::R0, slot(*lhs))
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_sp(Reg::R1, slot(*rhs))
@@ -541,6 +548,12 @@ fn lower_spilled_inst(
             }
         }
         Inst::Compare { op, lhs, rhs } => {
+            if matches!(
+                value_types.get(lhs.0 as usize),
+                Some(MirType::F32 | MirType::F64)
+            ) {
+                return Err(LowerError::CallUnsupported);
+            }
             enc.ldr_sp(Reg::R0, slot(*lhs))
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_sp(Reg::R1, slot(*rhs))
@@ -964,7 +977,7 @@ fn lower_spilled_inst(
                 emit_f2i(enc)?;
             } else if matches!(kind, ConvKind::IntToFloat32) {
                 emit_i2f(enc)?;
-            } else if matches!(kind, ConvKind::Float64ToInt) {
+            } else if aeabi_convert_helper(*kind).is_some() {
                 return Err(LowerError::CallUnsupported);
             } else {
                 extend_for(enc, Reg::R0, Reg::R0, *kind).map_err(|_| LowerError::TooManyValues)?;
@@ -1125,6 +1138,7 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::Alloc { .. }
+        | Inst::AllocLike { .. }
         | Inst::AllocArray { .. }
         | Inst::AllocArray2D { .. }
         | Inst::AllocArrayMD { .. }
@@ -1956,6 +1970,7 @@ fn lower_spilled_into(
                     | Inst::CastClassScan { .. }
                     | Inst::PyIntrinsic { .. }
                     | Inst::Alloc { .. }
+                    | Inst::AllocLike { .. }
                     | Inst::AllocArray { .. }
                     | Inst::AllocArray2D { .. }
                     | Inst::AllocArrayMD { .. }
@@ -2268,6 +2283,32 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 continue;
             }
+            if let Inst::AllocLike {
+                proto,
+                payload_size,
+            } = inst
+            {
+                let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
+                load_const_word(enc, &mut pool, Reg::R0, *payload_size)?;
+                enc.ldr_sp(Reg::R1, slot(*proto))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.subs_imm8(Reg::R1, 4)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.ldr_imm(Reg::R1, Reg::R1, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                load_const_word(enc, &mut pool, Reg::R2, alloc)?;
+                enc.blx(Reg::R2);
+                record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
+                let ok = enc.new_label();
+                enc.cmp_imm(Reg::R0, 0)
+                    .map_err(|_| LowerError::TooManyValues)?;
+                enc.b_cond(Cond::Ne, ok);
+                enc.udf(0);
+                enc.bind_label(ok);
+                enc.str_sp(Reg::R0, slot(*result))
+                    .map_err(|_| LowerError::TooManyValues)?;
+                continue;
+            }
             if let Inst::TypeDescAddr { handle } = inst {
                 let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
                     Some((_, label)) => *label,
@@ -2507,7 +2548,7 @@ fn lower_spilled_into(
                 } else if let Some(v) = value {
                     enc.ldr_sp(Reg::R0, slot(*v))
                         .map_err(|_| LowerError::TooManyValues)?;
-                    if func.value_type(*v) == Some(MirType::I64) {
+                    if matches!(func.value_type(*v), Some(MirType::I64 | MirType::F64)) {
                         enc.ldr_sp(Reg::R1, slot(*v) + 4)
                             .map_err(|_| LowerError::TooManyValues)?;
                     }
@@ -2528,10 +2569,15 @@ fn lower_spilled_into(
                     return Err(LowerError::ControlFlowUnsupported);
                 }
                 for (p, a) in params.iter().zip(args) {
-                    enc.ldr_sp(Reg::R0, slot(*a))
-                        .map_err(|_| LowerError::TooManyValues)?;
-                    enc.str_sp(Reg::R0, slot(*p))
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    let bytes = func.value_type(*a).map_or(4, |t| t.stack_slot_bytes() as u16);
+                    let mut off = 0u16;
+                    while off < bytes {
+                        enc.ldr_sp(Reg::R0, slot(*a) + off)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        enc.str_sp(Reg::R0, slot(*p) + off)
+                            .map_err(|_| LowerError::TooManyValues)?;
+                        off += 4;
+                    }
                 }
                 let label = *block_labels
                     .get(target.index())
@@ -2742,6 +2788,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                         ..
                     }
                     | Inst::Alloc { .. }
+                    | Inst::AllocLike { .. }
                     | Inst::AllocArray { .. }
                     | Inst::ArrayLoad { .. }
                     | Inst::ArrayStore { .. }
@@ -3966,6 +4013,33 @@ fn lower_runtime_calls(
                         vtable,
                     },
                 ));
+                insts.push((
+                    result,
+                    Inst::CallNative {
+                        symbol,
+                        args: alloc::vec![size, typedesc],
+                    },
+                ));
+                continue;
+            }
+            if let Inst::AllocLike {
+                proto,
+                payload_size,
+            } = &inst
+            {
+                let symbol = intern_extern(externs, "lamella_gc_alloc");
+                let size = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                let typedesc = ValueId(func.value_types.len() as u32);
+                func.value_types.push(MirType::I32);
+                insts.push((
+                    size,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i64::from(*payload_size),
+                    },
+                ));
+                insts.push((typedesc, Inst::LoadTypeDesc { object: *proto }));
                 insts.push((
                     result,
                     Inst::CallNative {
@@ -6875,6 +6949,106 @@ mod tests {
             lower_module_py(&[main], None, PySupport::default()),
             Err(LowerError::CallUnsupported)
         ));
+    }
+
+    #[test]
+    fn flat_path_rejects_soft_float_ops_instead_of_miscompiling() {
+        let single = |value_types: Vec<MirType>, result: ValueId, ops: Vec<(ValueId, Inst)>| Function {
+            params: Vec::new(),
+            ret: value_types.get(result.0 as usize).copied(),
+            value_types,
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: ops,
+                terminator: Some(Terminator::Return(Some(result))),
+            }],
+        };
+        let f64c = |v: ValueId| {
+            (
+                v,
+                Inst::ConstInt {
+                    ty: MirType::F64,
+                    value: 0,
+                },
+            )
+        };
+
+        let dbl_add = single(
+            vec![MirType::F64, MirType::F64, MirType::F64],
+            ValueId(2),
+            vec![
+                f64c(ValueId(0)),
+                f64c(ValueId(1)),
+                (
+                    ValueId(2),
+                    Inst::Binary {
+                        op: BinOp::Add,
+                        lhs: ValueId(0),
+                        rhs: ValueId(1),
+                    },
+                ),
+            ],
+        );
+        assert!(
+            matches!(
+                lower_module_py(&[dbl_add], None, PySupport::default()),
+                Err(LowerError::CallUnsupported)
+            ),
+            "f64 add must not silently lower as an integer add of the low words"
+        );
+
+        let dbl_cmp = single(
+            vec![MirType::F64, MirType::F64, MirType::I32],
+            ValueId(2),
+            vec![
+                f64c(ValueId(0)),
+                f64c(ValueId(1)),
+                (
+                    ValueId(2),
+                    Inst::Compare {
+                        op: CmpOp::SignedGt,
+                        lhs: ValueId(0),
+                        rhs: ValueId(1),
+                    },
+                ),
+            ],
+        );
+        assert!(
+            matches!(
+                lower_module_py(&[dbl_cmp], None, PySupport::default()),
+                Err(LowerError::CallUnsupported)
+            ),
+            "f64 compare must not silently lower as an integer compare of the low words"
+        );
+
+        let int_to_dbl = single(
+            vec![MirType::I32, MirType::F64],
+            ValueId(1),
+            vec![
+                (
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 3,
+                    },
+                ),
+                (
+                    ValueId(1),
+                    Inst::Convert {
+                        value: ValueId(0),
+                        kind: ConvKind::IntToFloat64,
+                    },
+                ),
+            ],
+        );
+        assert!(
+            matches!(
+                lower_module_py(&[int_to_dbl], None, PySupport::default()),
+                Err(LowerError::CallUnsupported)
+            ),
+            "int->f64 convert must not silently lower as an integer widen"
+        );
     }
 
     #[test]

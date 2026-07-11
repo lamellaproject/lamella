@@ -10,6 +10,7 @@ pub mod module;
 pub mod pdb;
 pub mod pe;
 pub mod root;
+mod sha256;
 pub mod signature;
 pub mod tables;
 
@@ -19,7 +20,8 @@ pub use heap::{
 };
 pub use module::ImageBuilder;
 pub use pdb::{
-    LocalVariable, MethodDebug, SequencePoint, build_portable_pdb, sequence_points_blob,
+    DebugDocument, LocalVariable, MethodDebug, SequencePoint, build_portable_pdb,
+    sequence_points_blob,
 };
 pub use pe::{COMIMAGE_FLAGS_ILONLY, cli_header, write_image, write_image_with_debug, write_pe};
 pub use root::metadata_root;

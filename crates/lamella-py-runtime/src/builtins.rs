@@ -8,9 +8,12 @@ use alloc::vec::Vec;
 use lamella_py_bytecode::{BinOp, CmpOp, CodeObject};
 
 use crate::bigint::BigInt;
-use crate::interp::{binary, bigint_pow, call_value, iterator_for, py_next_value};
+use crate::interp::{
+    binary, bigint_pow, call_value, coerce_index, getattr_hooked, iterator_for, py_next_value,
+};
 use crate::object::{
-    InlineCache, ObjectModel, LAZY_CALLABLE, LAZY_ENUMERATE, LAZY_FILTER, LAZY_MAP, LAZY_ZIP,
+    DictViewKind, InlineCache, ObjectModel, LAZY_CALLABLE, LAZY_ENUMERATE, LAZY_FILTER, LAZY_MAP,
+    LAZY_ZIP,
 };
 use crate::trap::Trap;
 use crate::value::Value;
@@ -160,6 +163,16 @@ pub enum Builtin {
     /// `type(...)` -- the type object of the `Ellipsis` singleton (CPython's `ellipsis`). Not a
     /// builtin NAME; reached only via `type(...)`.
     EllipsisType = 62,
+    /// `float.fromhex(s)` -- the classmethod parsing a hexadecimal floating-point string. Reached as
+    /// a type-level attribute off `float`, not a bare builtin name.
+    FloatFromhex = 63,
+    /// `type(d.keys())` -- the `dict_keys` view type object. Not a builtin NAME; reached only via
+    /// `type(...)`. Calling it raises (CPython: cannot create 'dict_keys' instances).
+    DictKeysType = 64,
+    /// `type(d.values())` -- the `dict_values` view type object (same reachability as DictKeysType).
+    DictValuesType = 65,
+    /// `type(d.items())` -- the `dict_items` view type object (same reachability as DictKeysType).
+    DictItemsType = 66,
 }
 
 impl Builtin {
@@ -231,6 +244,10 @@ impl Builtin {
             60 => Some(Builtin::MatchClassPositional),
             61 => Some(Builtin::NoneType),
             62 => Some(Builtin::EllipsisType),
+            63 => Some(Builtin::FloatFromhex),
+            64 => Some(Builtin::DictKeysType),
+            65 => Some(Builtin::DictValuesType),
+            66 => Some(Builtin::DictItemsType),
             _ => None,
         }
     }
@@ -309,6 +326,10 @@ impl Builtin {
             Builtin::MatchClassPositional => "__match_class__",
             Builtin::NoneType => "NoneType",
             Builtin::EllipsisType => "ellipsis",
+            Builtin::FloatFromhex => "fromhex",
+            Builtin::DictKeysType => "dict_keys",
+            Builtin::DictValuesType => "dict_values",
+            Builtin::DictItemsType => "dict_items",
         }
     }
 
@@ -335,11 +356,28 @@ impl Builtin {
                 | Builtin::Set
                 | Builtin::Frozenset
                 | Builtin::Range
+                | Builtin::Slice
                 | Builtin::Type
                 | Builtin::NoneType
                 | Builtin::EllipsisType
+                | Builtin::DictKeysType
+                | Builtin::DictValuesType
+                | Builtin::DictItemsType
         )
     }
+}
+
+/// Whether `x` is callable -- the `callable()` builtin's test, shared with the argument checks
+/// that require a callable (e.g. `defaultdict`'s factory).
+#[must_use]
+pub(crate) fn value_is_callable(x: Value, model: &ObjectModel) -> bool {
+    x.as_function_index().is_some()
+        || x.as_builtin_id().is_some()
+        || model.is_class(x)
+        || model.is_ntclass(x)
+        || model.is_bound_method(x)
+        || model.is_py_bound(x)
+        || model.is_py_function(x)
 }
 
 /// `type(x)`: the type object of `x` -- a built-in value's type is its constructor built-in (so
@@ -354,6 +392,12 @@ pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
     }
     if model.is_instance(value) {
         return Some(model.instance_class(value));
+    }
+    if let Some(class) = model.ntinstance_class(value) {
+        return Some(class);
+    }
+    if let Some(stdlib_type) = crate::stdlib::stdlib_type_of(value, model) {
+        return Some(stdlib_type);
     }
     #[cfg(feature = "complex")]
     if model.is_complex(value) {
@@ -385,6 +429,12 @@ pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
         Builtin::Set
     } else if model.is_frozenset(value) {
         Builtin::Frozenset
+    } else if let Some(kind) = model.dict_view_kind(value) {
+        match kind {
+            DictViewKind::Keys => Builtin::DictKeysType,
+            DictViewKind::Values => Builtin::DictValuesType,
+            DictViewKind::Items => Builtin::DictItemsType,
+        }
     } else if model.is_range(value) {
         Builtin::Range
     } else if model.is_lazy_iter(value) {
@@ -506,7 +556,7 @@ pub fn call_builtin(
     depth: usize,
 ) -> Result<Value, Trap> {
     if id >= crate::stdlib::STDLIB_BASE {
-        return crate::stdlib::call_stdlib(id, args, model);
+        return crate::stdlib::call_stdlib(id, args, functions, model, depth);
     }
     match Builtin::from_id(id).ok_or(Trap::Malformed)? {
         Builtin::Abs => {
@@ -522,6 +572,9 @@ pub fn call_builtin(
             }
             if let Some(big) = model.bigint_value(args[0]) {
                 return model.new_bigint(big.abs());
+            }
+            if let Some(method) = model.find_dunder(args[0], "__abs__") {
+                return call_value(method, &[], functions, model, depth);
             }
             let n = model.as_i128(args[0]).ok_or(Trap::TypeError)?;
             model.new_long(n.checked_abs().ok_or(Trap::Overflow)?)
@@ -540,13 +593,14 @@ pub fn call_builtin(
                 other => other,
             }
         }
-        Builtin::Str => {
-            if args.len() != 1 {
-                return Err(Trap::TypeError);
+        Builtin::Str => match args {
+            [] => model.new_str(""),
+            [arg] => {
+                let rendered = display_arg(*arg, functions, model, depth)?;
+                model.new_str(&rendered)
             }
-            let rendered = display_arg(args[0], functions, model, depth)?;
-            model.new_str(&rendered)
-        }
+            _ => Err(Trap::TypeError),
+        },
         Builtin::List => {
             let elems = collect_iterable(model, args, functions, depth)?;
             model.new_list(elems)
@@ -568,23 +622,19 @@ pub fn call_builtin(
             Ok(Value::NONE)
         }
         Builtin::Range => {
+            let index = |v: Value, model: &mut ObjectModel| {
+                coerce_index(v, functions, model, depth)?.as_int().ok_or(Trap::TypeError)
+            };
             let (start, stop, step) = match args {
-                [stop] => (0, stop.as_int().ok_or(Trap::TypeError)?, 1),
-                [start, stop] => (
-                    start.as_int().ok_or(Trap::TypeError)?,
-                    stop.as_int().ok_or(Trap::TypeError)?,
-                    1,
-                ),
+                [stop] => (0, index(*stop, model)?, 1),
+                [start, stop] => (index(*start, model)?, index(*stop, model)?, 1),
                 [start, stop, step] => {
-                    let step = step.as_int().ok_or(Trap::TypeError)?;
+                    let (start, stop) = (index(*start, model)?, index(*stop, model)?);
+                    let step = index(*step, model)?;
                     if step == 0 {
                         return Err(Trap::ValueError);
                     }
-                    (
-                        start.as_int().ok_or(Trap::TypeError)?,
-                        stop.as_int().ok_or(Trap::TypeError)?,
-                        step,
-                    )
+                    (start, stop, step)
                 }
                 _ => return Err(Trap::TypeError),
             };
@@ -607,6 +657,18 @@ pub fn call_builtin(
                 [it, s] => (*it, *s),
                 _ => return Err(Trap::TypeError),
             };
+            if model.is_str(start) {
+                return Err(model
+                    .with_message(Trap::TypeError, "sum() can't sum strings [use ''.join(seq) instead]"));
+            }
+            if model.is_bytes(start) {
+                return Err(model
+                    .with_message(Trap::TypeError, "sum() can't sum bytes [use b''.join(seq) instead]"));
+            }
+            if model.is_bytearray(start) {
+                return Err(model
+                    .with_message(Trap::TypeError, "sum() can't sum bytearray [use b''.join(seq) instead]"));
+            }
             let elements = collect_iterable(model, &[iterable], functions, depth)?;
             let all_numeric = model.as_f64(start).is_some()
                 && elements.iter().all(|&e| model.as_f64(e).is_some());
@@ -619,7 +681,7 @@ pub fn call_builtin(
             }
             let mut acc = start;
             for element in elements {
-                acc = binary(BinOp::Add, acc, element, model)?;
+                acc = crate::interp::dispatch_binary(BinOp::Add, acc, element, functions, model, depth)?;
             }
             Ok(acc)
         }
@@ -750,6 +812,17 @@ pub fn call_builtin(
             }
             _ => Err(Trap::TypeError),
         },
+        Builtin::FloatFromhex => {
+            let [x] = args else {
+                return Err(Trap::TypeError);
+            };
+            let text = model.str_value(*x).map(String::from).ok_or(Trap::TypeError)?;
+            match parse_hex_float(&text) {
+                Some(f) => model.new_float(f),
+                None => Err(model
+                    .with_message(Trap::ValueError, "invalid hexadecimal floating-point string")),
+            }
+        }
         #[cfg(feature = "complex")]
         Builtin::Complex => match args {
             [] => model.new_complex(0.0, 0.0),
@@ -858,11 +931,16 @@ pub fn call_builtin(
                 return Err(Trap::TypeError);
             }
             let arg = args[0];
+            if let Some(method) = model.find_dunder(arg, "__reversed__") {
+                return call_value(method, &[], functions, model, depth);
+            }
             let reversible = model.str_value(arg).is_some()
                 || model.is_list(arg)
                 || model.is_tuple(arg)
                 || model.is_range(arg)
-                || model.is_dict(arg);
+                || model.is_dict(arg)
+                || model.is_dict_view(arg)
+                || model.is_deque(arg);
             if !reversible {
                 return Err(Trap::TypeError);
             }
@@ -875,7 +953,8 @@ pub fn call_builtin(
             if args.len() != 1 {
                 return Err(Trap::TypeError);
             }
-            let code = args[0].as_int().ok_or(Trap::TypeError)?;
+            let arg = coerce_index(args[0], functions, model, depth)?;
+            let code = arg.as_int().ok_or(Trap::TypeError)?;
             let ch = u32::try_from(code)
                 .ok()
                 .and_then(char::from_u32)
@@ -898,6 +977,12 @@ pub fn call_builtin(
             let [a, b] = args else {
                 return Err(Trap::TypeError);
             };
+            if let Some(method) = model.find_dunder(*a, "__divmod__") {
+                return call_value(method, &[*b], functions, model, depth);
+            }
+            if let Some(method) = model.find_dunder(*b, "__rdivmod__") {
+                return call_value(method, &[*a], functions, model, depth);
+            }
             let quotient = binary(BinOp::FloorDiv, *a, *b, model)?;
             let remainder = binary(BinOp::Mod, *a, *b, model)?;
             model.new_tuple(alloc::vec![quotient, remainder])
@@ -956,9 +1041,9 @@ pub fn call_builtin(
             }
             _ => Err(Trap::TypeError),
         },
-        Builtin::Hex => format_radix(model, args, "0x", 16),
-        Builtin::Bin => format_radix(model, args, "0b", 2),
-        Builtin::Oct => format_radix(model, args, "0o", 8),
+        Builtin::Hex => format_radix(model, args, functions, depth, "0x", 16),
+        Builtin::Bin => format_radix(model, args, functions, depth, "0b", 2),
+        Builtin::Oct => format_radix(model, args, functions, depth, "0o", 8),
         Builtin::Frozenset => {
             let elems = collect_iterable(model, args, functions, depth)?;
             let deduped = crate::interp::dedup_elems(elems, functions, model, depth)?;
@@ -968,14 +1053,7 @@ pub fn call_builtin(
             if args.len() != 1 {
                 return Err(Trap::TypeError);
             }
-            let x = args[0];
-            let callable = x.as_function_index().is_some()
-                || x.as_builtin_id().is_some()
-                || model.is_class(x)
-                || model.is_bound_method(x)
-                || model.is_py_bound(x)
-                || model.is_py_function(x);
-            Ok(Value::from_bool(callable))
+            Ok(Value::from_bool(value_is_callable(args[0], model)))
         }
         Builtin::Next => {
             let (iterator, default) = match args {
@@ -995,12 +1073,12 @@ pub fn call_builtin(
                 None => match default {
                     Some(d) => Ok(d),
                     None => {
-                        let class = model
-                            .exception_class("StopIteration")
-                            .ok_or(Trap::Malformed)?;
-                        let instance = model.new_object(class)?;
-                        model.set_pending_exception(instance);
-                        Err(Trap::Raised)
+                        let value = if model.is_generator(iterator) {
+                            model.take_generator_return().unwrap_or(Value::NONE)
+                        } else {
+                            Value::NONE
+                        };
+                        Err(model.raise_named_exception_with_value("StopIteration", value))
                     }
                 },
             }
@@ -1016,13 +1094,20 @@ pub fn call_builtin(
         Builtin::Round => {
             let (value, ndigits) = match args {
                 [x] => (*x, None),
-                [x, n] => (*x, Some(n.as_int().ok_or(Trap::TypeError)?)),
+                [x, n] => (*x, Some(*n)),
                 _ => return Err(Trap::TypeError),
             };
             if let Some(f) = model.float_value(value) {
-                round_float(f, ndigits, model)
+                let nd = ndigits.map(|n| n.as_int().ok_or(Trap::TypeError)).transpose()?;
+                round_float(f, nd, model)
             } else if let Some(x) = model.as_i128(value) {
-                model.new_long(round_half_even(x, ndigits.unwrap_or(0)))
+                let nd = ndigits.map_or(Ok(0), |n| n.as_int().ok_or(Trap::TypeError))?;
+                model.new_long(round_half_even(x, nd))
+            } else if let Some(method) = model.find_dunder(value, "__round__") {
+                match ndigits {
+                    Some(n) => call_value(method, &[n], functions, model, depth),
+                    None => call_value(method, &[], functions, model, depth),
+                }
             } else {
                 Err(Trap::TypeError)
             }
@@ -1186,6 +1271,10 @@ pub fn call_builtin(
             [] => Ok(Value::ELLIPSIS),
             _ => Err(Trap::TypeError),
         },
+        view_type @ (Builtin::DictKeysType | Builtin::DictValuesType | Builtin::DictItemsType) => {
+            let message = alloc::format!("cannot create '{}' instances", view_type.python_name());
+            Err(model.raise_named_exception("TypeError", &message))
+        }
         Builtin::Getattr => {
             let (obj, name, default) = match args {
                 [obj, name] => (*obj, *name, None),
@@ -1194,12 +1283,16 @@ pub fn call_builtin(
             };
             let attr = String::from(model.str_value(name).ok_or(Trap::TypeError)?);
             let mut cache = InlineCache::empty();
-            match model.getattr(obj, &attr, &mut cache) {
+            match getattr_hooked(obj, &attr, &mut cache, functions, model, depth) {
                 Ok(value) => Ok(value),
                 Err(Trap::AttributeError) => match default {
                     Some(fallback) => Ok(fallback),
                     None => Err(model.attribute_error(obj, &attr)),
                 },
+                Err(Trap::Raised) if default.is_some() && model.pending_exception_is("AttributeError") => {
+                    model.take_pending_exception();
+                    Ok(default.expect("default present"))
+                }
                 Err(other) => Err(other),
             }
         }
@@ -1209,9 +1302,13 @@ pub fn call_builtin(
             };
             let attr = String::from(model.str_value(*name).ok_or(Trap::TypeError)?);
             let mut cache = InlineCache::empty();
-            match model.getattr(*obj, &attr, &mut cache) {
+            match getattr_hooked(*obj, &attr, &mut cache, functions, model, depth) {
                 Ok(_) => Ok(Value::TRUE),
                 Err(Trap::AttributeError) => Ok(Value::FALSE),
+                Err(Trap::Raised) if model.pending_exception_is("AttributeError") => {
+                    model.take_pending_exception();
+                    Ok(Value::FALSE)
+                }
                 Err(other) => Err(other),
             }
         }
@@ -1242,7 +1339,13 @@ pub fn call_builtin(
             if let Some(method) = model.find_dunder(*x, "__hash__") {
                 return call_value(method, &[], functions, model, depth + 1);
             }
-            model.py_hash(*x)
+            match model.py_hash(*x) {
+                Err(Trap::TypeError) => {
+                    let message = alloc::format!("unhashable type: '{}'", model.tp_name_of(*x));
+                    Err(model.raise_named_exception("TypeError", &message))
+                }
+                other => other,
+            }
         }
         Builtin::Id => {
             let [x] = args else {
@@ -1283,6 +1386,9 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
         return Ok(false);
     }
     if let Some(id) = classinfo.as_builtin_id() {
+        if let Some(matches) = crate::stdlib::stdlib_type_matches(id, value, model) {
+            return Ok(matches);
+        }
         let matches = match Builtin::from_id(id) {
             Some(Builtin::Bool) => value == Value::TRUE || value == Value::FALSE,
             Some(Builtin::Int) => model.is_int(value),
@@ -1298,9 +1404,26 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
             Some(Builtin::Dict) => model.is_dict(value),
             Some(Builtin::Set) => model.is_set(value),
             Some(Builtin::Frozenset) => model.is_frozenset(value),
+            Some(Builtin::Range) => model.is_range(value),
+            Some(Builtin::Slice) => model.is_slice(value),
+            Some(Builtin::Type) => {
+                model.is_class(value)
+                    || value.as_builtin_id().and_then(Builtin::from_id).is_some_and(Builtin::is_type)
+                    || value.as_builtin_id().is_some_and(crate::stdlib::stdlib_is_type)
+            }
+            Some(Builtin::NoneType) => value == Value::NONE,
+            Some(Builtin::EllipsisType) => value.is_ellipsis(),
+            Some(Builtin::DictKeysType) => model.dict_view_kind(value) == Some(DictViewKind::Keys),
+            Some(Builtin::DictValuesType) => {
+                model.dict_view_kind(value) == Some(DictViewKind::Values)
+            }
+            Some(Builtin::DictItemsType) => model.dict_view_kind(value) == Some(DictViewKind::Items),
             _ => return Err(Trap::TypeError),
         };
         return Ok(matches);
+    }
+    if model.is_ntclass(classinfo) {
+        return Ok(model.ntinstance_class(value) == Some(classinfo));
     }
     if model.is_class(classinfo) {
         return Ok(model.is_instance_of(value, classinfo));
@@ -1314,7 +1437,10 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
 /// user class is not reported as a subclass of a built-in type -- a small documented divergence.)
 fn issubclass_of(cls: Value, classinfo: Value, model: &ObjectModel) -> Result<bool, Trap> {
     let is_type = |v: Value| {
-        model.is_class(v) || v.as_builtin_id().and_then(Builtin::from_id).is_some_and(Builtin::is_type)
+        model.is_class(v)
+            || model.is_ntclass(v)
+            || v.as_builtin_id().and_then(Builtin::from_id).is_some_and(Builtin::is_type)
+            || v.as_builtin_id().is_some_and(crate::stdlib::stdlib_is_type)
     };
     if !is_type(cls) {
         return Err(Trap::TypeError);
@@ -1333,7 +1459,13 @@ fn issubclass_of(cls: Value, classinfo: Value, model: &ObjectModel) -> Result<bo
     if model.is_class(cls) && model.is_class(classinfo) {
         return Ok(model.is_subclass_of(cls, classinfo));
     }
+    if model.is_ntclass(cls) {
+        return Ok(cls == classinfo || classinfo.as_builtin_id() == Some(Builtin::Tuple.id()));
+    }
     if let (Some(a), Some(b)) = (cls.as_builtin_id(), classinfo.as_builtin_id()) {
+        if let Some(result) = crate::stdlib::stdlib_issubclass(a, b) {
+            return Ok(result);
+        }
         return Ok(match (Builtin::from_id(a), Builtin::from_id(b)) {
             (Some(x), Some(y)) if x == y => true,
             (Some(Builtin::Bool), Some(Builtin::Int)) => true,
@@ -1379,6 +1511,9 @@ pub fn call_builtin_kw(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
+    if id >= crate::stdlib::STDLIB_BASE {
+        return crate::stdlib::call_stdlib_kw(id, posargs, kwargs, functions, model, depth);
+    }
     match Builtin::from_id(id).ok_or(Trap::Malformed)? {
         Builtin::Sorted => sorted_kw(posargs, kwargs, functions, model, depth),
         Builtin::Dict => dict_kw(posargs, kwargs, functions, model, depth),
@@ -1544,12 +1679,15 @@ fn dict_kw(
 fn format_radix(
     model: &mut ObjectModel,
     args: &[Value],
+    functions: &[CodeObject],
+    depth: usize,
     prefix: &str,
     radix: u8,
 ) -> Result<Value, Trap> {
     let [arg] = args else {
         return Err(Trap::TypeError);
     };
+    let arg = coerce_index(*arg, functions, model, depth)?;
     let n = arg.as_int().ok_or(Trap::TypeError)?;
     let (sign, mag) = if n < 0 {
         ("-", n.unsigned_abs())
@@ -1597,6 +1735,7 @@ fn display_arg(
     if model.seq_value(value).is_some()
         || model.set_value(value).is_some()
         || model.dict_value(value).is_some()
+        || model.is_dict_view(value)
     {
         return repr_arg(value, functions, model, depth);
     }
@@ -1617,6 +1756,16 @@ fn repr_arg(
     }
     if let Some(method) = model.find_dunder(value, "__repr__") {
         return call_str_dunder(method, functions, model, depth);
+    }
+    if let Some(class) = model.ntinstance_class(value) {
+        let fields = model.ntclass_fields(class);
+        let elems = model.seq_value(value).cloned().unwrap_or_default();
+        let mut parts = Vec::with_capacity(fields.len());
+        for (field, element) in fields.iter().zip(&elems) {
+            let rendered = repr_arg(*element, functions, model, depth + 1)?;
+            parts.push(alloc::format!("{field}={rendered}"));
+        }
+        return Ok(alloc::format!("{}({})", model.ntclass_name(class), parts.join(", ")));
     }
     if let Some(elems) = model.seq_value(value).cloned() {
         let is_tuple = model.is_tuple(value);
@@ -1652,13 +1801,70 @@ fn repr_arg(
         });
     }
     if let Some(entries) = model.dict_value(value).cloned() {
+        if model.is_counter(value) {
+            if entries.is_empty() {
+                return Ok(String::from("Counter()"));
+            }
+            let entries = model.counter_display_entries(entries);
+            let mut parts = Vec::with_capacity(entries.len());
+            for (key, val) in &entries {
+                let key = repr_arg(*key, functions, model, depth + 1)?;
+                let val = repr_arg(*val, functions, model, depth + 1)?;
+                parts.push(alloc::format!("{key}: {val}"));
+            }
+            return Ok(alloc::format!("Counter({{{}}})", parts.join(", ")));
+        }
         let mut parts = Vec::with_capacity(entries.len());
         for (key, val) in &entries {
             let key = repr_arg(*key, functions, model, depth + 1)?;
             let val = repr_arg(*val, functions, model, depth + 1)?;
             parts.push(alloc::format!("{key}: {val}"));
         }
+        if let Some(factory) = model.defaultdict_factory(value) {
+            let factory = repr_arg(factory, functions, model, depth + 1)?;
+            return Ok(alloc::format!("defaultdict({factory}, {{{}}})", parts.join(", ")));
+        }
+        if model.is_ordereddict(value) {
+            return Ok(if parts.is_empty() {
+                String::from("OrderedDict()")
+            } else {
+                alloc::format!("OrderedDict({{{}}})", parts.join(", "))
+            });
+        }
         return Ok(alloc::format!("{{{}}}", parts.join(", ")));
+    }
+    if let Some(elems) = model.deque_elems(value).cloned() {
+        let mut parts = Vec::with_capacity(elems.len());
+        for element in &elems {
+            parts.push(repr_arg(*element, functions, model, depth + 1)?);
+        }
+        let inner = parts.join(", ");
+        return Ok(match model.deque_maxlen(value).unwrap_or(None) {
+            Some(m) => alloc::format!("deque([{inner}], maxlen={m})"),
+            None => alloc::format!("deque([{inner}])"),
+        });
+    }
+    if let Some(kind) = model.dict_view_kind(value) {
+        let entries = model.dict_view_dict(value);
+        let entries = model.dict_value(entries).cloned().unwrap_or_default();
+        let mut parts = Vec::with_capacity(entries.len());
+        for (key, val) in &entries {
+            parts.push(match kind {
+                DictViewKind::Keys => repr_arg(*key, functions, model, depth + 1)?,
+                DictViewKind::Values => repr_arg(*val, functions, model, depth + 1)?,
+                DictViewKind::Items => alloc::format!(
+                    "({}, {})",
+                    repr_arg(*key, functions, model, depth + 1)?,
+                    repr_arg(*val, functions, model, depth + 1)?
+                ),
+            });
+        }
+        let name = match kind {
+            DictViewKind::Keys => "dict_keys",
+            DictViewKind::Values => "dict_values",
+            DictViewKind::Items => "dict_items",
+        };
+        return Ok(alloc::format!("{name}([{}])", parts.join(", ")));
     }
     Ok(model.repr(value))
 }
@@ -1846,6 +2052,51 @@ fn parse_python_float(s: &str) -> Option<f64> {
         return None;
     }
     strip_underscores(trimmed)?.parse::<f64>().ok()
+}
+
+/// Parses CPython's `float.fromhex` grammar: an optional sign, then `inf`/`infinity`/`nan`
+/// (case-insensitive) or a hexadecimal float `['0x'] H ['.' H] ['p' ['+'|'-'] D]` -- `H` hex digits,
+/// the `p` exponent a power of TWO in decimal. `None` for anything malformed (the caller raises the
+/// ValueError). The significand accumulates in `f64`, exact for a normalized value (<= 13 hex
+/// fraction digits = 53 bits), so every representable double round-trips.
+fn parse_hex_float(s: &str) -> Option<f64> {
+    let trimmed = s.trim();
+    let (negative, rest) = match trimmed.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let lower = rest.to_ascii_lowercase();
+    match lower.as_str() {
+        "inf" | "infinity" => return Some(if negative { f64::NEG_INFINITY } else { f64::INFINITY }),
+        "nan" => return Some(f64::NAN),
+        _ => {}
+    }
+    let body = lower.strip_prefix("0x").unwrap_or(&lower);
+    let (mantissa, exp) = match body.split_once('p') {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (body, 0),
+    };
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    let mut significand = 0.0f64;
+    for ch in int_part.chars() {
+        significand = significand * 16.0 + f64::from(ch.to_digit(16)?);
+    }
+    let mut scale = 1.0f64;
+    for ch in frac_part.chars() {
+        scale /= 16.0;
+        significand += f64::from(ch.to_digit(16)?) * scale;
+    }
+    let value = significand * libm::exp2(f64::from(exp));
+    Some(if negative { -value } else { value })
 }
 
 /// Removes Python's numeric `_` separators, which must sit BETWEEN two digits (`1_000` is valid,

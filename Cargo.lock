@@ -299,7 +299,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-fs-mem"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil-runtime",
+]
+
+[[package]]
 name = "lamella-gc"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-heap"
 version = "0.0.0"
 
 [[package]]
@@ -321,6 +332,21 @@ dependencies = [
  "lamella-cil-runtime",
  "lamella-metadata",
  "lamella-token",
+]
+
+[[package]]
+name = "lamella-mcp"
+version = "0.0.0"
+dependencies = [
+ "lamella-assemble",
+ "lamella-dap",
+ "lamella-debug-backend",
+ "lamella-load",
+ "lamella-metadata",
+ "lamella-token",
+ "lamella-wire",
+ "lamella-wireline",
+ "serde_json",
 ]
 
 [[package]]
@@ -369,7 +395,9 @@ version = "0.0.0"
 dependencies = [
  "lamella-aot",
  "lamella-asm-arm32",
+ "lamella-elf",
  "lamella-ir",
+ "lamella-link",
  "lamella-py-bytecode",
 ]
 
@@ -403,6 +431,16 @@ dependencies = [
  "lamella-metadata",
  "lamella-mmio",
  "lamella-wire",
+]
+
+[[package]]
+name = "lamella-runtime-support-net"
+version = "0.0.0"
+dependencies = [
+ "lamella-cil-runtime",
+ "lamella-net-smoltcp",
+ "lamella-tls-mbedtls",
+ "smoltcp",
 ]
 
 [[package]]

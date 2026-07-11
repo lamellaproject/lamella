@@ -410,6 +410,21 @@ pub fn instruction_offsets(code: &[Instruction]) -> Option<Vec<u32>> {
     layout(code).ok()
 }
 
+/// The index of the instruction that spans CIL byte `offset` -- the last instruction
+/// whose offset is `<= offset`. This inverts [`instruction_offsets`], so a consumer can
+/// turn a Portable PDB sequence point's byte offset (or a wire breakpoint) into the
+/// instruction index the interpreter addresses breakpoints by -- the two are NOT equal
+/// once any instruction is more than one byte. `None` if `code` is malformed or `offset`
+/// is at or past the body's end.
+#[must_use]
+pub fn instruction_index_of_offset(code: &[Instruction], offset: u32) -> Option<usize> {
+    let offsets = instruction_offsets(code)?;
+    if offset >= *offsets.last()? {
+        return None;
+    }
+    Some(offsets.partition_point(|&start| start <= offset).saturating_sub(1))
+}
+
 fn instruction_size(instruction: &Instruction) -> Result<u32, EncodeError> {
     if !instruction.is_consistent() {
         return Err(EncodeError::OperandMismatch {
@@ -749,6 +764,18 @@ mod tests {
             Instruction::simple(Opcode::Nop),
             Instruction::simple(Opcode::Ret),
         ]);
+    }
+
+    #[test]
+    fn maps_a_byte_offset_to_the_containing_instruction_index() {
+        let code = [
+            Instruction::new(Opcode::LdcI4, Operand::Int32(7)),
+            Instruction::simple(Opcode::Ret),
+        ];
+        assert_eq!(instruction_index_of_offset(&code, 0), Some(0));
+        assert_eq!(instruction_index_of_offset(&code, 3), Some(0));
+        assert_eq!(instruction_index_of_offset(&code, 5), Some(1));
+        assert_eq!(instruction_index_of_offset(&code, 6), None);
     }
 
     #[test]

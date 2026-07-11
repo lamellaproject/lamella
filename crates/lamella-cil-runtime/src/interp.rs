@@ -2,7 +2,7 @@
 
 #[cfg(feature = "bcl")]
 use crate::module::IntrinsicFn;
-use crate::module::{MethodId, MethodKind, Module, TypeId, asm_key};
+use crate::module::{CastElem, CastPrim, MethodId, MethodKind, Module, TypeId, asm_key};
 use crate::object::{Heap, ObjectRef};
 use crate::trap::Trap;
 use crate::value::{Location, Value};
@@ -147,6 +147,13 @@ pub struct Vm {
     /// blocking) the managed `SslStream` drives over the socket layer. `None` until set (no TLS on
     /// this build); the embedder supplies it (the host with rustls / mbedTLS; a device with mbedTLS).
     tls_backend: Option<alloc::boxed::Box<dyn crate::tls::TlsBackend>>,
+    /// The file-system seam ([`crate::fs::FsBackend`]) -- blocking files + directories. `None`
+    /// until set (a device with no file system installs none): every managed file operation then
+    /// reports [`crate::fs::FsError::Io`] and the corlib throws a catchable `IOException`.
+    fs_backend: Option<alloc::boxed::Box<dyn crate::fs::FsBackend>>,
+    /// The live console tap ([`Vm::set_console_tap`]): a bench embedder mirrors every console
+    /// write to its UART as it happens, so a run that never completes still narrates itself.
+    console_tap: Option<fn(&[u16])>,
     /// The native off-heap memory seam ([`crate::memory::MemoryBackend`]) -- `Marshal.AllocHGlobal`
     /// + raw `Read*`/`Write*`. `None` until the embedder selects a backend (the Safe bounds-checked
     /// block table or Real host pointers); Marshal ops then report no native memory on this build.
@@ -458,6 +465,28 @@ impl Vm {
         self.tls_backend.as_deref_mut()
     }
 
+    /// Sets the file-system seam ([`crate::fs::FsBackend`]). The embedder provides it (the host
+    /// with `std::fs`; a device with a FAT-over-SD driver; tests with the in-memory tree);
+    /// without it, every managed file operation throws a catchable `IOException`.
+    pub fn set_fs_backend(&mut self, backend: alloc::boxed::Box<dyn crate::fs::FsBackend>) {
+        self.fs_backend = Some(backend);
+    }
+
+    /// The file-system seam, if set -- the `System.IO` intrinsics drive it. Blocking by design
+    /// (bounded operations, no reactor involvement -- see the [`crate::fs`] module docs).
+    pub fn fs_backend(&mut self) -> Option<&mut (dyn crate::fs::FsBackend + 'static)> {
+        self.fs_backend.as_deref_mut()
+    }
+
+    /// The heap and the file-system seam together, split-borrowed -- a bulk read/write intrinsic
+    /// crosses the seam straight to/from a packed array's bytes, which needs a view into the
+    /// heap live while the backend runs.
+    pub fn heap_and_fs(
+        &mut self,
+    ) -> (&mut Heap, Option<&mut (dyn crate::fs::FsBackend + 'static)>) {
+        (&mut self.heap, self.fs_backend.as_deref_mut())
+    }
+
     /// Sets the native off-heap memory seam ([`crate::memory::MemoryBackend`]). The embedder selects
     /// the mode at startup -- the Safe bounds-checked block table, or (Stage 2) Real host pointers;
     /// without it, the `Marshal` intrinsics report no native memory on this build.
@@ -554,10 +583,21 @@ impl Vm {
         }
     }
 
+    /// Installs a LIVE console tap: every [`Vm::write`] also hands its units to `tap` as
+    /// they arrive, before any cap clipping. A bench embedder points this at its UART so
+    /// a run that never completes (and so never ships its buffered output) still streams
+    /// its console in real time; `None` (the default) costs nothing.
+    pub fn set_console_tap(&mut self, tap: fn(&[u16])) {
+        self.console_tap = Some(tap);
+    }
+
     /// Appends UTF-16 code units to the console output, clipping at the configured cap
     /// ([`Vm::set_output_cap`]) -- the units past it are dropped and
     /// [`Vm::output_clipped`] reports that it happened.
     pub fn write(&mut self, chars: &[u16]) {
+        if let Some(tap) = self.console_tap {
+            tap(chars);
+        }
         let take = match self.output_cap {
             Some(cap) => cap.saturating_sub(self.output.len()).min(chars.len()),
             None => chars.len(),
@@ -921,6 +961,21 @@ enum Flow {
         /// The constructor arguments (without `this`), from the caller's stack.
         args: Vec<Value>,
     },
+    /// `newobj` of a String constructor over a raw `char*` (`String(char*)` /
+    /// `String(char*, int, int)`): materialize the code units the pointer reaches and push
+    /// the built string. Like [`Flow::LoadStack`], this defers to the frames-aware handler
+    /// because the pointer may name ANOTHER frame's stackalloc buffer; no instance is
+    /// pre-allocated and no ctor frame runs (a string is a dedicated heap object, not a
+    /// field-holding instance a constructor could fill in).
+    NewString {
+        /// The `char*` argument -- a managed pointer (or a null/zero native int).
+        pointer: Value,
+        /// The `startIndex` argument in code units (0 for the one-argument form).
+        start: i32,
+        /// The `length` argument in code units; `None` for the one-argument form, which
+        /// scans to the first U+0000 terminator instead.
+        length: Option<i32>,
+    },
     /// `newobj` of a value type: run its constructor against a managed pointer to a
     /// zero-initialized struct temporary, then leave that struct's VALUE (not a heap
     /// reference) on the caller's stack when it returns.
@@ -1094,7 +1149,7 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
             Flow::Call { .. } | Flow::CallVararg { .. } => {
                 return Err(Trap::Unsupported(Opcode::Call))
             }
-            Flow::NewObj { .. } | Flow::NewValueObj { .. } => {
+            Flow::NewObj { .. } | Flow::NewValueObj { .. } | Flow::NewString { .. } => {
                 return Err(Trap::Unsupported(Opcode::Newobj));
             }
             Flow::EnsureCctor(_) => return Err(Trap::Unsupported(Opcode::Ldsfld)),
@@ -1248,51 +1303,51 @@ fn next_ready_thread(threads: &[ThreadSlot], start: usize) -> Option<usize> {
         .find(|&index| threads[index].state == ThreadState::Ready)
 }
 
-/// The scheduler's reactor idle-hook: with no thread ready, block the OS thread until the nearest
-/// sleeping thread's deadline (real time, via the host clock seam), then wake every sleeper whose
-/// deadline has passed. Returns `false` when no thread is sleeping -- the scheduler then stops (all
-/// threads finished or deadlocked). Without a host clock, sleepers wake immediately (correct wake
-/// ORDERING by deadline, but no real delay). This single blocking wait is also the tickless-idle /
-/// low-power foundation, and where the socket reactor later adds an fd poll-set.
+/// The interpreter side of the reactor seam: `Vm` supplies the clock + network the block point
+/// blocks on. Each method delegates to `Vm`'s inherent one (the UFCS `Vm::method(self, ..)` calls
+/// pick those, not this trait's, so there is no recursion).
+impl crate::reactor::ReactorEnv for Vm {
+    fn now_millis(&self) -> Option<u64> {
+        Vm::now_millis(self)
+    }
+    fn sleep_millis(&mut self, millis: u64) {
+        Vm::sleep_millis(self, millis);
+    }
+    fn net_poll(&mut self, timeout_ms: Option<u64>) -> alloc::vec::Vec<u32> {
+        Vm::net_poll(self, timeout_ms)
+    }
+    fn net_deregister(&mut self, socket: u32) {
+        Vm::net_deregister(self, socket);
+    }
+}
+
+/// The scheduler's reactor idle-hook: with no thread ready, perform the ONE blocking wait (the
+/// nearest timer deadline and/or the socket poll-set) and wake the threads the reactor reports
+/// ready. The algorithm lives Session-free in [`crate::reactor`] so the AOT native scheduler drives
+/// the SAME impl; here it is fed the interpreter's parked threads and applies the wake back to their
+/// slots. Returns `false` when nothing is waitable -- the remaining threads are lock/join-deadlocked
+/// and the scheduler stops. The single OS block point / tickless-idle foundation.
 fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
-    let nearest_deadline = threads
+    use crate::reactor::WaitReason;
+    let parks: alloc::vec::Vec<(u32, WaitReason)> = threads
         .iter()
         .filter_map(|slot| match slot.state {
-            ThreadState::Sleeping(deadline) => Some(deadline),
+            ThreadState::Sleeping(deadline) => Some((slot.id, WaitReason::Sleep(deadline))),
+            ThreadState::IoWait(handle) => Some((slot.id, WaitReason::Io(handle))),
             _ => None,
         })
-        .min();
-    let any_io = threads
-        .iter()
-        .any(|slot| matches!(slot.state, ThreadState::IoWait(_)));
-    if nearest_deadline.is_none() && !any_io {
-        return false;
-    }
-    let timeout = match (nearest_deadline, vm.now_millis()) {
-        (Some(deadline), Some(now)) => Some(deadline.saturating_sub(now)),
-        (Some(_), None) => Some(0),
-        (None, _) => None,
-    };
-    let ready = if any_io {
-        vm.net_poll(timeout)
-    } else {
-        if let Some(ms) = timeout {
-            vm.sleep_millis(ms);
-        }
-        alloc::vec::Vec::new()
-    };
-    let now = vm.now_millis().unwrap_or(u64::MAX);
-    for slot in threads.iter_mut() {
-        match slot.state {
-            ThreadState::Sleeping(deadline) if deadline <= now => slot.state = ThreadState::Ready,
-            ThreadState::IoWait(socket) if ready.contains(&socket) => {
-                slot.state = ThreadState::Ready;
-                vm.net_deregister(socket);
+        .collect();
+    match crate::reactor::block_point(&parks, vm) {
+        None => false,
+        Some(woken) => {
+            for slot in threads.iter_mut() {
+                if woken.contains(&slot.id) {
+                    slot.state = ThreadState::Ready;
+                }
             }
-            _ => {}
+            true
         }
     }
-    true
 }
 
 /// Why [`Session::run_until_yield`] stopped: the thread finished (with its result), or it hit a
@@ -2221,6 +2276,30 @@ impl Session {
                 }
                 None => Err(Trap::NoSuchMethod(ctor)),
             },
+            Flow::NewString {
+                pointer,
+                start,
+                length,
+            } => match build_string_from_pointer(frames, vm, pointer, start, length) {
+                Ok(reference) => {
+                    frames
+                        .last_mut()
+                        .ok_or(Trap::CallStackOverflow)?
+                        .stack
+                        .push(Value::Object(reference));
+                    Ok(Status::Running)
+                }
+                #[cfg(feature = "exceptions")]
+                Err(trap) => match catchable_fault(&trap, vm) {
+                    Some(exception) => {
+                        vm.note_unhandled(exception);
+                        raise(frames, module, vm, exception)
+                    }
+                    None => Err(trap),
+                },
+                #[cfg(not(feature = "exceptions"))]
+                Err(trap) => Err(trap),
+            },
             Flow::EnsureCctor(cctor) => {
                 if let Some(top) = frames.last_mut() {
                     top.ip = instruction_ip;
@@ -2424,6 +2503,17 @@ fn array_element_index(vm: &Vm, array: ObjectRef, index: usize, byte_offset: u32
     }
 }
 
+/// The UTF-16 code unit at `index` of a string's units, treating the position one past the
+/// last unit as the U+0000 terminator .NET guarantees after every string's character data
+/// (so `fixed (char* p = "")` reads '\0' and a terminator scan stops at the end); anything
+/// further is outside the pinned data.
+fn string_unit_at(units: &[u16], index: usize) -> Option<u16> {
+    units
+        .get(index)
+        .copied()
+        .or_else(|| (index == units.len()).then_some(0))
+}
+
 /// The whole value at a managed-pointer `location` -- a frame local/arg, a heap
 /// object's field, an array element, or a static field -- if present.
 fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<Value> {
@@ -2440,6 +2530,14 @@ fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<
         } => vm
             .heap()
             .array_get(array, array_element_index(vm, array, index, byte_offset)),
+        Location::StringChar {
+            string,
+            byte_offset,
+        } => vm
+            .heap()
+            .as_string(string)
+            .and_then(|units| string_unit_at(&units, byte_offset as usize / 2))
+            .map(|unit| Value::Int32(i32::from(unit))),
         Location::Static { slot } => vm.static_field(slot),
         Location::Boxed { object } => vm.heap().boxed_value(object),
         Location::Nested { base, slot } => match read_location_value(frames, vm, (*base).clone()) {
@@ -2519,6 +2617,7 @@ fn write_location_value(
             write_location_value(frames, vm, *base, Value::Struct(fields))
         }
         Location::Stack { .. } => Err(Trap::Unsupported(Opcode::Stobj)),
+        Location::StringChar { .. } => Err(Trap::Unsupported(Opcode::Stobj)),
         Location::LocalBytes {
             frame,
             slot,
@@ -2554,6 +2653,121 @@ fn deref_byref_args_in_place(frames: &[Frame], vm: &Vm, args: &mut [Value]) {
     for arg in args.iter_mut() {
         if let Value::ByRef(location) = arg {
             *arg = read_byref(frames, vm, location.clone());
+        }
+    }
+}
+
+/// Materializes the string a `newobj String(char*[, int, int])` builds: decode the pointer
+/// argument, read the code units it reaches, and allocate the heap string. The bounds
+/// checks mirror .NET: a negative `startIndex` or `length` is ArgumentOutOfRangeException;
+/// a null pointer yields the empty string for the terminator-scanning form and for an
+/// empty range, and faults (reading through null) otherwise.
+fn build_string_from_pointer(
+    frames: &[Frame],
+    vm: &mut Vm,
+    pointer: Value,
+    start: i32,
+    length: Option<i32>,
+) -> Result<ObjectRef, Trap> {
+    let start = usize::try_from(start).map_err(|_| Trap::ArgumentOutOfRange(1))?;
+    let length = match length {
+        Some(length) => Some(usize::try_from(length).map_err(|_| Trap::ArgumentOutOfRange(2))?),
+        None => None,
+    };
+    let location = match pointer {
+        Value::ByRef(location) => location,
+        Value::Null | Value::Int32(0) | Value::NativeInt(0) => {
+            return match length {
+                None | Some(0) => Ok(vm.heap_mut().alloc_string(&[])),
+                Some(_) => Err(Trap::NullReference),
+            };
+        }
+        _ => return Err(Trap::TypeMismatch(Opcode::Newobj)),
+    };
+    let units = read_utf16_through_pointer(frames, vm, &location, start, length)?;
+    Ok(vm.heap_mut().alloc_string(&units))
+}
+
+/// Reads UTF-16 code units through a raw `char*` -- a managed `location` naming a
+/// (possibly cross-frame) stackalloc buffer, a pinned array's elements, or pinned string
+/// data -- starting `start` units past the pointer: exactly `length` units, or, for the
+/// terminator-scanning `String(char*)` form, up to (not including) the first U+0000.
+/// Running out of the underlying allocation traps ([`Trap::NullReference`], the fault the
+/// width-typed `ldind` paths report for an out-of-bounds localloc access).
+fn read_utf16_through_pointer(
+    frames: &[Frame],
+    vm: &Vm,
+    location: &Location,
+    start: usize,
+    length: Option<usize>,
+) -> Result<Vec<u16>, Trap> {
+    match location {
+        Location::Stack {
+            frame,
+            buffer,
+            offset,
+        } => {
+            let owner = frames.get(*frame).ok_or(Trap::NullReference)?;
+            collect_units(
+                |index| {
+                    let at = u32::try_from(*offset as usize + 2 * (start + index)).ok()?;
+                    let raw = owner.read_stack(*buffer, at, 2)?;
+                    Some(u16::from_le_bytes([raw[0], raw[1]]))
+                },
+                length,
+            )
+        }
+        Location::Element {
+            array,
+            index,
+            byte_offset,
+        } => {
+            let base = array_element_index(vm, *array, *index, *byte_offset) + start;
+            if let Some(length) = length {
+                return vm
+                    .heap()
+                    .array_utf16_units(*array, base, length)
+                    .ok_or(Trap::NullReference);
+            }
+            collect_units(
+                |index| match vm.heap().array_get(*array, base + index) {
+                    Some(Value::Int32(unit)) => Some(unit as u16),
+                    _ => None,
+                },
+                None,
+            )
+        }
+        Location::StringChar {
+            string,
+            byte_offset,
+        } => {
+            let units = vm.heap().as_string(*string).ok_or(Trap::NullReference)?;
+            let base = *byte_offset as usize / 2 + start;
+            collect_units(|index| string_unit_at(&units, base + index), length)
+        }
+        _ => Err(Trap::TypeMismatch(Opcode::Newobj)),
+    }
+}
+
+/// Collects code units from `unit_at`: exactly `length` units, or -- scanning -- up to the
+/// first U+0000. `None` from `unit_at` (out of the allocation) is [`Trap::NullReference`].
+fn collect_units(
+    unit_at: impl Fn(usize) -> Option<u16>,
+    length: Option<usize>,
+) -> Result<Vec<u16>, Trap> {
+    match length {
+        Some(length) => (0..length)
+            .map(|index| unit_at(index).ok_or(Trap::NullReference))
+            .collect(),
+        None => {
+            let mut units = Vec::new();
+            loop {
+                let unit = unit_at(units.len()).ok_or(Trap::NullReference)?;
+                if unit == 0 {
+                    return Ok(units);
+                }
+                units.push(unit);
+            }
         }
     }
 }
@@ -2656,6 +2870,40 @@ fn is_compare_exchange(module: &Module, method: MethodId) -> bool {
 #[cfg(not(feature = "bcl"))]
 fn is_compare_exchange(_module: &Module, _method: MethodId) -> bool {
     false
+}
+
+/// Which String char*-constructor `method` is bound to, if either: `Some(false)` for the
+/// terminator-scanning `String(char*)`, `Some(true)` for `String(char*, int, int)`. The
+/// two intrinsics are identity anchors -- the loader binds them so `newobj` resolves, and
+/// the interpreter routes both through [`Flow::NewString`] (which can reach a cross-frame
+/// stackalloc buffer the intrinsic ABI cannot).
+fn string_pointer_ctor_form(module: &Module, method: MethodId) -> Option<bool> {
+    match module.method_kind(method) {
+        Some(MethodKind::Intrinsic(func)) => {
+            if core::ptr::fn_addr_eq(
+                func,
+                crate::intrinsics::string_ctor_char_ptr as crate::module::IntrinsicFn,
+            ) {
+                Some(false)
+            } else if core::ptr::fn_addr_eq(
+                func,
+                crate::intrinsics::string_ctor_char_ptr_range as crate::module::IntrinsicFn,
+            ) {
+                Some(true)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The `int32` at `slot` of a popped constructor argument list.
+fn ctor_int_arg(args: &[Value], slot: usize) -> Result<i32, Trap> {
+    match args.get(slot) {
+        Some(&Value::Int32(value)) => Ok(value),
+        _ => Err(Trap::TypeMismatch(Opcode::Newobj)),
+    }
 }
 
 /// Stores `value` at `slot`, growing `slots` with `Null` placeholders to reach it.
@@ -3730,6 +3978,21 @@ fn step(
             let ctor = module
                 .resolve(asm, token)
                 .ok_or(Trap::UnresolvedCall(token))?;
+            if let Some(with_range) = string_pointer_ctor_form(module, ctor) {
+                let mut args = take_args_pooled(frame, vm, if with_range { 3 } else { 1 })?;
+                let (start, length) = if with_range {
+                    (ctor_int_arg(&args, 1)?, Some(ctor_int_arg(&args, 2)?))
+                } else {
+                    (0, None)
+                };
+                let pointer = args.swap_remove(0);
+                vm.frame_pool.give_values(args);
+                return Ok(Flow::NewString {
+                    pointer,
+                    start,
+                    length,
+                });
+            }
             let is_intrinsic =
                 matches!(module.method_kind(ctor), Some(MethodKind::Intrinsic(_)));
             let (type_id, defaults) = if is_intrinsic {
@@ -4083,15 +4346,35 @@ fn step(
             frame.stack.push(Value::Object(reference));
         }
         Opcode::Unbox => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::Unbox))?;
+            let token = token_operand(instruction)?;
             let reference = object_ref(frame.pop()?, Opcode::Unbox)?;
+            if !unbox_matches(module, asm, vm, reference, token) {
+                return Err(Trap::InvalidCast);
+            }
             frame
                 .stack
                 .push(Value::ByRef(Location::Boxed { object: reference }));
         }
         Opcode::UnboxAny => {
+            let module = module.ok_or(Trap::Unsupported(Opcode::UnboxAny))?;
+            let token = token_operand(instruction)?;
             let reference = object_ref(frame.pop()?, Opcode::UnboxAny)?;
-            let value = vm.heap().boxed_value(reference).ok_or(Trap::InvalidCast)?;
-            frame.stack.push(value);
+            match vm.heap().boxed_value(reference) {
+                Some(value) => {
+                    if !unbox_matches(module, asm, vm, reference, token) {
+                        return Err(Trap::InvalidCast);
+                    }
+                    frame.stack.push(value);
+                }
+                None => {
+                    let value = Value::Object(reference);
+                    if !cast_matches(module, asm, vm, &value, token) {
+                        return Err(Trap::InvalidCast);
+                    }
+                    frame.stack.push(value);
+                }
+            }
         }
 
         Opcode::Newarr => {
@@ -4379,6 +4662,7 @@ fn step(
             }
         }
 
+        #[allow(unreachable_patterns)]
         other => return Err(Trap::Unsupported(other)),
     }
     Ok(Flow::Next)
@@ -4823,6 +5107,13 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
             index: *index,
             byte_offset: walked(*byte_offset),
         },
+        Location::StringChar {
+            string,
+            byte_offset,
+        } => Location::StringChar {
+            string: *string,
+            byte_offset: walked(*byte_offset),
+        },
         Location::Local { frame, slot } => Location::LocalBytes {
             frame: *frame,
             slot: *slot,
@@ -4857,14 +5148,16 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
 }
 
 /// Whether a managed pointer is one of the byte-addressed kinds that pointer arithmetic
-/// walks: a `localloc` (`stackalloc`) buffer pointer, a pinned-array element pointer, or
-/// the address of a frame local/argument (which arithmetic promotes to its `*Bytes`
-/// displaced form). A heap field/static/box pointer is not byte-addressed.
+/// walks: a `localloc` (`stackalloc`) buffer pointer, a pinned-array element pointer, a
+/// pinned-string character pointer, or the address of a frame local/argument (which
+/// arithmetic promotes to its `*Bytes` displaced form). A heap field/static/box pointer
+/// is not byte-addressed.
 fn is_raw_pointer(location: &Location) -> bool {
     matches!(
         location,
         Location::Stack { .. }
             | Location::Element { .. }
+            | Location::StringChar { .. }
             | Location::Local { .. }
             | Location::Arg { .. }
             | Location::LocalBytes { .. }
@@ -4905,6 +5198,16 @@ fn raw_pointer_byte_difference(a: &Location, b: &Location) -> Option<i64> {
                 byte_offset: ob,
             },
         ) if aa == ab && ia == ib => Some(i64::from(*oa) - i64::from(*ob)),
+        (
+            Location::StringChar {
+                string: sa,
+                byte_offset: oa,
+            },
+            Location::StringChar {
+                string: sb,
+                byte_offset: ob,
+            },
+        ) if sa == sb => Some(i64::from(*oa) - i64::from(*ob)),
         _ => None,
     }
 }
@@ -4929,6 +5232,7 @@ fn pointer_compare(a: &Location, b: &Location) -> core::cmp::Ordering {
             Location::Static { .. } => 5,
             Location::Boxed { .. } => 6,
             Location::Nested { .. } => 7,
+            Location::StringChar { .. } => 8,
         }
     }
     match (a, b) {
@@ -4968,6 +5272,16 @@ fn pointer_compare(a: &Location, b: &Location) -> core::cmp::Ordering {
         ) => (oa, sa).cmp(&(ob, sb)),
         (Location::Static { slot: sa }, Location::Static { slot: sb }) => sa.cmp(sb),
         (Location::Boxed { object: oa }, Location::Boxed { object: ob }) => oa.cmp(ob),
+        (
+            Location::StringChar {
+                string: sa,
+                byte_offset: oa,
+            },
+            Location::StringChar {
+                string: sb,
+                byte_offset: ob,
+            },
+        ) => (sa, oa).cmp(&(sb, ob)),
         (
             Location::Nested {
                 base: ba,
@@ -5535,7 +5849,212 @@ fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, token: Token) 
         }
         return false;
     }
+    if let Some(op_elem) = vm.heap().array_element_type(reference) {
+        return array_cast_matches(module, asm, op_elem, token);
+    }
     true
+}
+
+/// Whether an ARRAY whose `newarr` element handle is `op_elem` (asm-folded; `0` = an
+/// untracked intrinsic mint, always lenient) casts to the type `token` names. Element
+/// compatibility follows I.8.7.1 as .NET implements it: same element type, same-width
+/// signed/unsigned INTEGER interchange (`int[]` casts to `uint[]`, but `bool`/`char`/floats
+/// match only themselves), enum/underlying interchange, and reference-element covariance.
+/// An interface target is accepted without a check -- the interpreter does not model
+/// `System.Array`'s implemented-interface surface (`(IEnumerable)array` must keep working).
+fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> bool {
+    if module.is_object_type_token(asm, token) {
+        return true;
+    }
+    if module.is_string_type_token(asm, token) {
+        return false;
+    }
+    match module.cast_elem(asm_key(asm, token.0)) {
+        Some(CastElem::Array(target_elem)) => {
+            if op_elem == 0 {
+                return true;
+            }
+            let op = classify_elem_handle(module, op_elem);
+            elem_compatible(module, &op, target_elem, ElemRule::Array)
+        }
+        Some(CastElem::Prim(_) | CastElem::String | CastElem::Object) => false,
+        Some(CastElem::Named(_)) | Some(CastElem::Lenient) | None => {
+            match module
+                .type_id_of(asm, token)
+                .and_then(|target_id| module.type_handle_of(target_id))
+                .and_then(|handle| module.reflect_type(handle))
+            {
+                Some(reflect) if reflect.is_interface => true,
+                Some(reflect) => reflect.full_name == "System.Array",
+                None => true,
+            }
+        }
+    }
+}
+
+/// The element-compatibility rule in force: array casts and `unbox.any` share the matcher
+/// but differ on integer leniency.
+#[derive(Clone, Copy, PartialEq)]
+enum ElemRule {
+    /// Array-element compatibility (I.8.7.1): same-width signed/unsigned integers
+    /// interchange, and reference elements are covariant.
+    Array,
+    /// `unbox.any` compatibility (III.4.33): the exact type, with an enum standing for its
+    /// exact underlying primitive -- an `int` box does NOT unbox as `uint`.
+    Unbox,
+}
+
+/// The [`CastElem`] shape of an already-asm-folded type handle: the loader's recorded
+/// classification when present, else derived from the runtime type maps. An unresolvable
+/// handle is [`CastElem::Lenient`] (unverified).
+fn classify_elem_handle(module: &Module, handle: u64) -> CastElem {
+    if let Some(elem) = module.cast_elem(handle) {
+        return elem.clone();
+    }
+    let asm = (handle >> 32) as u8;
+    let token = Token(handle as u32);
+    if module.is_string_type_token(asm, token) {
+        return CastElem::String;
+    }
+    if module.is_object_type_token(asm, token) {
+        return CastElem::Object;
+    }
+    if module.is_enum_by_handle(handle) || module.type_id_by_handle(handle).is_some() {
+        return CastElem::Named(handle);
+    }
+    CastElem::Lenient
+}
+
+/// The exact [`CastPrim`] a primitive value type's full name denotes, for a handle that
+/// reached the matcher as [`CastElem::Named`] (a path the loader did not classify).
+fn prim_of_full_name(full_name: &str) -> Option<CastPrim> {
+    Some(match full_name {
+        "System.Boolean" => CastPrim::Bool,
+        "System.Char" => CastPrim::Char,
+        "System.SByte" => CastPrim::I1,
+        "System.Byte" => CastPrim::U1,
+        "System.Int16" => CastPrim::I2,
+        "System.UInt16" => CastPrim::U2,
+        "System.Int32" => CastPrim::I4,
+        "System.UInt32" => CastPrim::U4,
+        "System.Int64" => CastPrim::I8,
+        "System.UInt64" => CastPrim::U8,
+        "System.Single" => CastPrim::F4,
+        "System.Double" => CastPrim::F8,
+        "System.IntPtr" => CastPrim::I,
+        "System.UIntPtr" => CastPrim::U,
+        _ => return None,
+    })
+}
+
+/// Whether an operand element shape is compatible with a target element shape under `rule`.
+/// Both sides normalize an enum to its exact underlying primitive first -- .NET lets an
+/// `int`-backed enum interchange with `int` and with any enum sharing that exact underlying
+/// type (never `uint` or another width). A [`CastElem::Lenient`] side always matches
+/// (unverified), as does a named type the module cannot resolve.
+fn elem_compatible(module: &Module, op: &CastElem, target: &CastElem, rule: ElemRule) -> bool {
+    let normalize = |elem: &CastElem| -> CastElem {
+        if let CastElem::Named(handle) = elem {
+            if let Some(prim) = module.enum_underlying_prim_by_handle(*handle) {
+                return CastElem::Prim(prim);
+            }
+        }
+        elem.clone()
+    };
+    let op = normalize(op);
+    let target = normalize(target);
+    match (&op, &target) {
+        (CastElem::Lenient, _) | (_, CastElem::Lenient) => true,
+        (CastElem::Prim(a), CastElem::Prim(b)) => {
+            a == b
+                || (rule == ElemRule::Array
+                    && matches!(
+                        (a.integer_width(), b.integer_width()),
+                        (Some(x), Some(y)) if x == y
+                    ))
+        }
+        (CastElem::String, CastElem::String) | (CastElem::Object, CastElem::Object) => true,
+        (CastElem::String, CastElem::Object) => rule == ElemRule::Array,
+        (CastElem::String, CastElem::Named(target_handle)) => {
+            rule == ElemRule::Array
+                && match (
+                    module.string_type_id(),
+                    module.type_id_by_handle(*target_handle),
+                ) {
+                    (Some(string_id), Some(target_id)) => {
+                        string_id == target_id
+                            || module.implements_interface(string_id, target_id)
+                    }
+                    _ => true,
+                }
+        }
+        (CastElem::Array(_), CastElem::Object) => rule == ElemRule::Array,
+        (CastElem::Array(op_elem), CastElem::Array(target_elem)) => {
+            elem_compatible(module, op_elem, target_elem, rule)
+        }
+        (CastElem::Array(_), CastElem::Named(handle)) => {
+            rule == ElemRule::Array
+                && module
+                    .reflect_type(*handle)
+                    .is_none_or(|reflect| {
+                        reflect.is_interface || reflect.full_name == "System.Array"
+                    })
+        }
+        (CastElem::Named(op_handle), CastElem::Object) => {
+            rule == ElemRule::Array
+                && module
+                    .reflect_type(*op_handle)
+                    .is_none_or(|reflect| !reflect.is_value_type)
+        }
+        (CastElem::Named(a), CastElem::Named(b)) => {
+            match (module.type_id_by_handle(*a), module.type_id_by_handle(*b)) {
+                (Some(a_id), Some(b_id)) => {
+                    if a_id == b_id {
+                        return true;
+                    }
+                    rule == ElemRule::Array
+                        && module
+                            .reflect_type(*a)
+                            .is_none_or(|reflect| !reflect.is_value_type)
+                        && (module.is_subtype(a_id, b_id)
+                            || module.implements_interface(a_id, b_id))
+                }
+                _ => true,
+            }
+        }
+        (CastElem::Named(handle), CastElem::Prim(p))
+        | (CastElem::Prim(p), CastElem::Named(handle)) => match module.reflect_type(*handle) {
+            Some(reflect) => match prim_of_full_name(&reflect.full_name) {
+                Some(named_prim) => {
+                    named_prim == *p
+                        || (rule == ElemRule::Array
+                            && matches!(
+                                (named_prim.integer_width(), p.integer_width()),
+                                (Some(x), Some(y)) if x == y
+                            ))
+                }
+                None => false,
+            },
+            None => true,
+        },
+        _ => false,
+    }
+}
+
+/// Whether the box at `reference` may be unboxed as the type `token` names (III.4.32 /
+/// III.4.33): the exact boxed type, or the enum/underlying interchange. A non-box reference
+/// never matches (`unbox` of a string is an InvalidCastException in .NET). A side the module
+/// cannot resolve is not checked, preserving cross-assembly loads with no classification.
+fn unbox_matches(module: &Module, asm: u8, vm: &Vm, reference: ObjectRef, token: Token) -> bool {
+    let Some(box_handle) = vm.heap().boxed_type_token(reference) else {
+        return false;
+    };
+    if box_handle == asm_key(asm, token.0) {
+        return true;
+    }
+    let op = classify_elem_handle(module, box_handle);
+    let target = classify_elem_handle(module, asm_key(asm, token.0));
+    elem_compatible(module, &op, &target, ElemRule::Unbox)
 }
 
 /// Reference equality for `ceq` / `cgt.un`: two nulls are equal, two objects are
@@ -5985,6 +6504,99 @@ mod tests {
             Instruction::simple(Opcode::Ret),
         ]);
         assert_eq!(result, Ok(Some(Value::Int32(0xABCD))));
+    }
+
+    #[test]
+    fn string_pinnable_pointer_reads_units_terminator_and_walks() {
+        let mut vm = Vm::new();
+        let s = vm.heap_mut().alloc_string(&[42, 43]);
+        let at = |offset: u32| {
+            read_location_value(
+                &[],
+                &vm,
+                Location::StringChar {
+                    string: s,
+                    byte_offset: offset,
+                },
+            )
+        };
+        assert_eq!(at(0), Some(Value::Int32(42)));
+        assert_eq!(at(2), Some(Value::Int32(43)));
+        assert_eq!(at(4), Some(Value::Int32(0)));
+        assert_eq!(at(6), None);
+        let pinned = Value::ByRef(Location::StringChar {
+            string: s,
+            byte_offset: 0,
+        });
+        let walked = stack_pointer_arithmetic(Opcode::Add, &pinned, &Value::Int32(2)).unwrap();
+        assert_eq!(
+            walked,
+            Some(Value::ByRef(Location::StringChar {
+                string: s,
+                byte_offset: 2,
+            }))
+        );
+        let empty = vm.heap_mut().alloc_string(&[]);
+        assert_eq!(
+            read_location_value(
+                &[],
+                &vm,
+                Location::StringChar {
+                    string: empty,
+                    byte_offset: 0,
+                },
+            ),
+            Some(Value::Int32(0))
+        );
+    }
+
+    #[test]
+    fn string_ctor_materializes_from_stackalloc_and_pinned_string() {
+        let mut vm = Vm::new();
+        let mut owner = Frame::new(0, Vec::new());
+        let pointer = owner.localloc(0, 6);
+        owner.write_stack(0, 0, [b'4', 0, 0, 0, 0, 0, 0, 0], 2).unwrap();
+        owner.write_stack(0, 2, [b'2', 0, 0, 0, 0, 0, 0, 0], 2).unwrap();
+        let frames = [owner];
+
+        let ranged = build_string_from_pointer(&frames, &mut vm, pointer.clone(), 0, Some(2));
+        let ranged = ranged.expect("range read");
+        assert_eq!(
+            vm.heap().as_string(ranged).as_deref(),
+            Some(&[u16::from(b'4'), u16::from(b'2')][..])
+        );
+        let scanned = build_string_from_pointer(&frames, &mut vm, pointer.clone(), 1, None);
+        let scanned = scanned.expect("terminator scan");
+        assert_eq!(
+            vm.heap().as_string(scanned).as_deref(),
+            Some(&[u16::from(b'2')][..])
+        );
+        assert_eq!(
+            build_string_from_pointer(&frames, &mut vm, pointer.clone(), 0, Some(4)),
+            Err(Trap::NullReference)
+        );
+        assert_eq!(
+            build_string_from_pointer(&frames, &mut vm, pointer, -1, Some(1)),
+            Err(Trap::ArgumentOutOfRange(1))
+        );
+
+        let source = vm.heap_mut().alloc_string(&[42, 43]);
+        let tail = build_string_from_pointer(
+            &frames,
+            &mut vm,
+            Value::ByRef(Location::StringChar {
+                string: source,
+                byte_offset: 2,
+            }),
+            0,
+            None,
+        )
+        .expect("pinned-string tail");
+        assert_eq!(vm.heap().as_string(tail).as_deref(), Some(&[43u16][..]));
+
+        let empty = build_string_from_pointer(&frames, &mut vm, Value::NativeInt(0), 0, None)
+            .expect("null pointer");
+        assert_eq!(vm.heap().as_string(empty).as_deref(), Some(&[][..]));
     }
 
     #[test]

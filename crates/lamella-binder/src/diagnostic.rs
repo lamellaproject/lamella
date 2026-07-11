@@ -405,6 +405,11 @@ pub enum DiagnosticKind {
         /// The type whose base chain is circular.
         type_name: Box<str>,
     },
+    /// `CS0110`: a circular constant definition (`const A = B; const B = A;`).
+    CircularConstant {
+        /// The qualified const field name (`C.A`) whose evaluation is circular.
+        member: Box<str>,
+    },
     /// `CS0529`: a circular base-interface dependency (interface I : J, J : I).
     CircularInterface {
         /// The interface whose base-interface hierarchy is circular.
@@ -599,6 +604,7 @@ impl DiagnosticKind {
             DiagnosticKind::NoMethodToOverride { .. } => 115,
             DiagnosticKind::AbstractMemberNotImplemented { .. } => 534,
             DiagnosticKind::CircularBase { .. } => 146,
+            DiagnosticKind::CircularConstant { .. } => 110,
             DiagnosticKind::StructLayoutCycle { .. } => 523,
             DiagnosticKind::CircularInterface { .. } => 529,
             DiagnosticKind::ExplicitConversionExists { .. } => 266,
@@ -849,6 +855,10 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::CircularBase { type_name } => write!(
                 f,
                 "Circular base class dependency involving '{type_name}'"
+            ),
+            DiagnosticKind::CircularConstant { member } => write!(
+                f,
+                "The evaluation of the constant value for '{member}' involves a circular definition"
             ),
             DiagnosticKind::CircularInterface { type_name, base } => write!(
                 f,

@@ -1,0 +1,13 @@
+[package]
+name = "lamella-heap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "A reclaiming O(1) segregated-fit global allocator for the constrained serve tiers: freed blocks return to a per-size-class free list and are reused, so a long-running evaluation's churn (net-poll drives, dead cctor temporaries, interpreter frames) stops accumulating -- the 'collected' rung of the allocation ladder for the interpreter's Rust-side working memory, without the O(n) free-list walk that made a linked-list heap grind the eager corlib cctor storm."
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -156,6 +156,21 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(field_is_static),
     #[cfg(feature = "NETMFv4_4")]
     entry!(field_set_value),
+    entry!(fs_close),
+    entry!(fs_create_dir),
+    entry!(fs_delete_dir),
+    entry!(fs_delete_file),
+    entry!(fs_dir_exists),
+    entry!(fs_file_exists),
+    entry!(fs_flush),
+    entry!(fs_length),
+    entry!(fs_list),
+    entry!(fs_move),
+    entry!(fs_open),
+    entry!(fs_read),
+    entry!(fs_seek),
+    entry!(fs_set_length),
+    entry!(fs_write),
     #[cfg(feature = "gc")]
     entry!(gc_collect),
     entry!(get_custom_attributes),
@@ -347,6 +362,8 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(string_concat_object2),
     entry!(string_concat_object3),
     entry!(string_create_from_chars),
+    entry!(string_ctor_char_ptr),
+    entry!(string_ctor_char_ptr_range),
     #[cfg(feature = "NETMFv4_4")]
     entry!(string_contains),
     #[cfg(feature = "NETMFv4_4")]
@@ -354,6 +371,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(string_equals),
     entry!(string_get_chars),
     entry!(string_get_length),
+    entry!(string_get_pinnable_reference),
     #[cfg(feature = "NETMFv4_4")]
     entry!(string_index_of_char),
     #[cfg(feature = "NETMFv4_4")]

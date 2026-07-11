@@ -197,6 +197,9 @@ pub struct BoundCatch {
     pub name: Option<Box<str>>,
     /// The handler body.
     pub body: Box<BoundStmt>,
+    /// The `catch (...)` clause header's span, for a debug build's sequence point on it
+    /// (a breakpoint on the catch clause).
+    pub span: Span,
 }
 
 /// One bound variable declarator (15.5.1).
@@ -536,6 +539,7 @@ impl Binder {
             exception_type,
             name: catch.name.clone(),
             body,
+            span: catch.span,
         }
     }
 
@@ -696,7 +700,7 @@ impl Binder {
                 };
                 let finally = BoundStmt {
                     kind: BoundStmtKind::Block(alloc::vec![disposable_decl, guard]),
-                    span,
+                    span: Span::HIDDEN,
                 };
                 BoundStmt {
                     kind: BoundStmtKind::Try {
@@ -773,7 +777,7 @@ impl Binder {
                 catches: Vec::new(),
                 finally: Some(Box::new(BoundStmt {
                     kind: BoundStmtKind::Block(alloc::vec![monitor_call("Exit")]),
-                    span,
+                    span: Span::HIDDEN,
                 })),
             },
             span,
@@ -928,7 +932,7 @@ impl Binder {
                 catches: Vec::new(),
                 finally: Some(Box::new(BoundStmt {
                     kind: BoundStmtKind::Block(finally_stmts),
-                    span,
+                    span: Span::HIDDEN,
                 })),
             },
             span,

@@ -115,6 +115,20 @@ pub enum Location {
         /// `ldelema` pointer; a multiple of the element width once walked by `p[i]`).
         byte_offset: u32,
     },
+    /// A UTF-16 code unit of a heap string's character data, addressed as a raw byte
+    /// displacement from the first unit -- the managed pointer `String.GetPinnableReference`
+    /// returns, which C# `fixed (char* p = s)` pins and walks (III.1.5 arithmetic steps
+    /// `byte_offset`; `ldind.u2` reads unit `byte_offset / 2`). The position one past the
+    /// last unit reads as U+0000: .NET guarantees a terminator after every string's
+    /// character data, and the empty string's pinned pointer points straight at it. Strings
+    /// are immutable, so stores through this pointer trap rather than corrupt the intern
+    /// table.
+    StringChar {
+        /// The heap string whose character data is addressed.
+        string: ObjectRef,
+        /// The raw byte displacement from the first code unit.
+        byte_offset: u32,
+    },
     /// A byte-displaced pointer into (or one past the end of) a frame LOCAL's storage --
     /// produced only by unsafe pointer arithmetic on the address of a local (C# 18.5.6:
     /// `S* q = &s; q++;`). `byte_offset == 0` addresses the local itself; a nonzero offset

@@ -10,8 +10,12 @@ namespace System
         public static bool IsUpper(char c) { return c >= 'A' && c <= 'Z'; }
         public static bool IsLower(char c) { return c >= 'a' && c <= 'z'; }
 
-        public static char ToUpper(char c) { if (c >= 'a' && c <= 'z') return (char)(c - 32); return c; }
-        public static char ToLower(char c) { if (c >= 'A' && c <= 'Z') return (char)(c + 32); return c; }
+        public static char ToUpper(char c) { return CaseMapping.ToUpper(c); }
+        public static char ToLower(char c) { return CaseMapping.ToLower(c); }
+#if LAMELLA_SURFACE_STRING_COMPARISON
+        public static char ToUpperInvariant(char c) { return CaseMapping.ToUpper(c); }
+        public static char ToLowerInvariant(char c) { return CaseMapping.ToLower(c); }
+#endif
 
         public bool Equals(char obj) { return this == obj; }
 

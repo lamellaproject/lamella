@@ -33,6 +33,22 @@ impl Span {
         }
     }
 
+    /// A sentinel span marking compiler-synthesized code with no source -- the emitter
+    /// turns a statement carrying it into a HIDDEN sequence point (`0xFEEFEE`), so a
+    /// debugger steps over it rather than stopping (a `using`/`lock` disposal, for
+    /// instance). No real source position reaches `u32::MAX`, so it never collides with
+    /// a genuine span.
+    pub const HIDDEN: Span = Span {
+        start: u32::MAX,
+        end: u32::MAX,
+    };
+
+    /// Whether this is the [`Span::HIDDEN`] sentinel (a synthesized, source-less span).
+    #[must_use]
+    pub fn is_hidden(self) -> bool {
+        self.start == u32::MAX
+    }
+
     /// The length of the span in bytes.
     #[must_use]
     pub fn len(self) -> u32 {

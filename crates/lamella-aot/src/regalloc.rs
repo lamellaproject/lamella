@@ -240,6 +240,9 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
                 Inst::Alloc { .. } => {}
+                Inst::AllocLike { proto, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *proto, ip);
+                }
                 Inst::AllocArray { length, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *length, ip);
                 }
@@ -469,6 +472,7 @@ pub(crate) fn is_safepoint(inst: &Inst) -> bool {
             | Inst::CallNative { .. }
             | Inst::InvokeDelegate { .. }
             | Inst::Alloc { .. }
+            | Inst::AllocLike { .. }
             | Inst::AllocArray { .. }
             | Inst::AllocArray2D { .. }
             | Inst::AllocArrayMD { .. }
@@ -507,6 +511,11 @@ pub(crate) fn safepoint_roots(
                             if is_root(v.index()) && !roots.contains(&v) {
                                 roots.push(v);
                             }
+                        }
+                    }
+                    if let Inst::AllocLike { proto, .. } = inst {
+                        if is_root(proto.index()) && !roots.contains(proto) {
+                            roots.push(*proto);
                         }
                     }
                     per_inst[i] = Some(roots);
@@ -615,6 +624,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         }
         Inst::IntToString { value } => f(*value),
         Inst::Alloc { .. } => {}
+        Inst::AllocLike { proto, .. } => f(*proto),
         Inst::AllocArray { length, .. } => f(*length),
         Inst::ArrayLoad { array, index, .. } | Inst::ArrayElemAddr { array, index, .. } => {
             f(*array);

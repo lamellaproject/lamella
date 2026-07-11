@@ -306,6 +306,7 @@ fn uses_memory(funcs: &[Function]) -> bool {
             matches!(
                 inst,
                 Inst::Alloc { .. }
+                    | Inst::AllocLike { .. }
                     | Inst::AllocArray { .. }
                     | Inst::InitStruct
                     | Inst::CopyStruct { .. }
@@ -1188,6 +1189,23 @@ fn lower_inst(
             body.local_set(local(result));
             body.local_get(local(result));
             body.i32_const(desc);
+            body.i32_store(MemArg::new(4, 0));
+            body.local_get(local(result));
+            body.i32_const(4);
+            body.i32_add();
+            body.local_set(local(result));
+        }
+        Inst::AllocLike {
+            proto,
+            payload_size,
+        } => {
+            emit_bump(body, (4 + payload_size.next_multiple_of(8)) as i32);
+            body.local_set(local(result));
+            body.local_get(local(result));
+            body.local_get(local(*proto));
+            body.i32_const(4);
+            body.i32_sub();
+            body.i32_load(MemArg::new(4, 0));
             body.i32_store(MemArg::new(4, 0));
             body.local_get(local(result));
             body.i32_const(4);

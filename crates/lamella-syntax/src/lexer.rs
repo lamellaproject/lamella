@@ -1441,8 +1441,10 @@ fn nfc_identifier(text: &str) -> Box<str> {
 
 /// A line terminator (9.3.2): carriage return (U+000D), line feed (U+000A), next line (U+0085),
 /// line separator (U+2028), or paragraph separator (U+2029). These end a single-line comment and
-/// advance the line count; they are NOT white space (9.3.3).
-fn is_new_line(c: char) -> bool {
+/// advance the line count; they are NOT white space (9.3.3). Public because the debug-info line
+/// map counts the same set, so the PDB's line numbers agree with the lexer (and with csc) on a
+/// source that uses a CR, NEL, or Unicode line/paragraph separator.
+pub fn is_new_line(c: char) -> bool {
     matches!(c, '\r' | '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}')
 }
 

@@ -110,6 +110,12 @@ pub enum Board {
     Stm32f4,
     /// Raspberry Pi RP2350 (Pico 2), driving GPIO through the single-cycle IO block (SIO).
     Rp2350,
+    /// Espressif ESP32-C6 (DevKitC-1). UART-first: its gpio facts are not tabled yet, so the
+    /// gpio arms are empty (a gpio claim fails loud as unsupported) while the UART arm is live.
+    Esp32c6,
+    /// Raspberry Pi RP2040 (Pico H). UART-first like the C6 -- its PL011 arm is live; the
+    /// RP2040 gpio facts (distinct block bases from the RP2350's) wait on their own table.
+    Rp2040,
 }
 
 impl Board {
@@ -118,6 +124,7 @@ impl Board {
         match self {
             Board::Stm32f4 => stm32f4::board_pin_id(name),
             Board::Rp2350 => rp2350::board_pin_id(name),
+            Board::Esp32c6 | Board::Rp2040 => None,
         }
     }
 
@@ -127,6 +134,15 @@ impl Board {
         match self {
             Board::Stm32f4 => stm32f4::pin_regs(pin),
             Board::Rp2350 => rp2350::pin_regs(pin),
+            Board::Esp32c6 | Board::Rp2040 => PinRegs {
+                pin_id: pin,
+                set_reg: 0,
+                set_val: 0,
+                clr_reg: 0,
+                clr_val: 0,
+                read_reg: 0,
+                read_mask: 0,
+            },
         }
     }
 
@@ -136,6 +152,7 @@ impl Board {
         match self {
             Board::Stm32f4 => stm32f4::direction_ops(pin, output),
             Board::Rp2350 => rp2350::direction_ops(pin, output),
+            Board::Esp32c6 | Board::Rp2040 => alloc::vec::Vec::new(),
         }
     }
 
@@ -145,6 +162,7 @@ impl Board {
         match self {
             Board::Stm32f4 => stm32f4::open_ops(pin, output),
             Board::Rp2350 => rp2350::open_ops(pin, output),
+            Board::Esp32c6 | Board::Rp2040 => alloc::vec::Vec::new(),
         }
     }
 
@@ -153,7 +171,14 @@ impl Board {
         match self {
             Board::Stm32f4 => stm32f4::MAX_PIN,
             Board::Rp2350 => rp2350::MAX_PIN,
+            Board::Esp32c6 | Board::Rp2040 => 0,
         }
+    }
+
+    /// Whether this board's GPIO arm is populated (the ESP32-C6 arm is UART-first: gpio waits
+    /// on its table).
+    pub(crate) fn gpio_supported(self) -> bool {
+        !matches!(self, Board::Esp32c6 | Board::Rp2040)
     }
 }
 

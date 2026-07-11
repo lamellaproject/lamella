@@ -31,7 +31,7 @@ pub use bound::{
 pub use conversion::has_implicit_conversion;
 pub use declaration::{collect_into, collect_model, collect_types};
 pub use diagnostic::{Diagnostic, DiagnosticKind};
-pub use flow::{always_exits, check_definite_assignment};
+pub use flow::{always_exits, check_definite_assignment, switch_section_reachability};
 pub use program::{
     bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references,
     bind_compilation_units_with_references,

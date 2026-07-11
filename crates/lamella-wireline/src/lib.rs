@@ -10,13 +10,13 @@ pub mod engine;
 #[cfg(feature = "debug-backend")]
 pub mod debug_backend;
 
+use lamella_wire::{Transport, TransportError};
 #[cfg(any(feature = "serial", feature = "usb"))]
-use lamella_wire::{Frame, FrameReader, Transport, TransportError, encode_frame};
+use lamella_wire::{Frame, FrameReader, encode_frame};
 #[cfg(feature = "serial")]
 use serialport::SerialPort;
 #[cfg(feature = "serial")]
 use std::io::{Read, Write};
-#[cfg(any(feature = "serial", feature = "usb"))]
 use std::time::{Duration, Instant};
 
 /// A [`Transport`] over a serial carrier (USB-CDC or UART). Frames are byte-framed via lamella-wire's
@@ -36,12 +36,24 @@ impl SerialTransport {
     /// # Errors
     /// [`TransportError::Carrier`] if the port cannot be opened.
     pub fn open(path: &str, baud: u32) -> Result<Self, TransportError> {
+        let espressif = serialport::available_ports()
+            .into_iter()
+            .flatten()
+            .find(|p| p.port_name.eq_ignore_ascii_case(path))
+            .map(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(ref i) if i.vid == 0x303a))
+            .unwrap_or(false);
         let mut port = serialport::new(path, baud)
             .timeout(Duration::from_millis(50))
+            .dtr_on_open(!espressif)
             .open()
             .map_err(|_| TransportError::Carrier)?;
-        port.write_data_terminal_ready(true).map_err(|_| TransportError::Carrier)?;
-        port.write_request_to_send(true).ok();
+        if espressif {
+            port.write_data_terminal_ready(false).ok();
+            port.write_request_to_send(false).ok();
+        } else {
+            port.write_data_terminal_ready(true).map_err(|_| TransportError::Carrier)?;
+            port.write_request_to_send(true).ok();
+        }
         std::thread::sleep(Duration::from_millis(300));
         Ok(Self { port, reader: FrameReader::new(), baud })
     }
@@ -337,6 +349,7 @@ pub fn deploy_blocking(
 ///
 /// # Errors
 /// Propagates a [`TransportError`], or reports the wire closed if a chunk goes unacked past `timeout`.
+#[cfg(any(feature = "serial", feature = "usb"))]
 pub fn deploy_chunked_blocking(
     transport: &mut impl Transport,
     seq: u16,
@@ -383,6 +396,7 @@ pub fn deploy_chunked_blocking(
 ///
 /// # Errors
 /// [`TransportError::Closed`] on timeout; otherwise a carrier [`TransportError`].
+#[cfg(any(feature = "serial", feature = "usb"))]
 pub fn deployed_status_blocking(
     transport: &mut impl Transport,
     seq: u16,
@@ -413,6 +427,7 @@ pub fn deployed_status_blocking(
 ///
 /// # Errors
 /// [`TransportError::Closed`] on timeout or an undecodable manifest; otherwise a carrier error.
+#[cfg(any(feature = "serial", feature = "usb"))]
 pub fn profile_manifest_blocking(
     transport: &mut impl Transport,
     seq: u16,
@@ -439,6 +454,7 @@ pub fn profile_manifest_blocking(
 ///
 /// # Errors
 /// A carrier [`TransportError`] if the command could not be sent.
+#[cfg(any(feature = "serial", feature = "usb"))]
 pub fn send_deploy_run(transport: &mut impl Transport, seq: u16) -> Result<(), TransportError> {
     transport.send(deploy::DEPLOY_RUN, seq, &[])
 }

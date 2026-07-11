@@ -1,0 +1,23 @@
+[package]
+name = "lamella-mcp-csharp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MCP server exposing the Lamella C# toolchain (compile + run) as tools for AI assistants."
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "lamella-mcp-csharp"
+path = "src/main.rs"
+
+[dependencies]
+# The canonical local server links the toolchain directly (no wasm, no JS): the wireline REPL engine gives
+# compile (LcscCompiler) + in-process run (LoopbackLink) -- the same path wire-repl / the Debug Console use.
+lamella-wireline = { path = "../lamella-wireline", features = ["repl-host"] }
+# Hand-rolled JSON-RPC on serde_json -- no tokio, no MCP SDK (dependency-minimal, matching the workspace).
+serde_json = "1"

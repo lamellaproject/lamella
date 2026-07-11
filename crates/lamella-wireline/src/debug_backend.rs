@@ -10,7 +10,7 @@ use lamella_debug_backend::{
 };
 use lamella_runner::RunResult;
 use lamella_runner::debug::{self, reason};
-use lamella_wire::{Capabilities, Frame as WireFrame, Transport, TransportError};
+use lamella_wire::{Capabilities, Frame as WireFrame, ProfileIdentity, Transport, TransportError};
 use std::time::{Duration, Instant};
 
 /// Packs a wire `(method_id, offset)` location into the seam's opaque address.
@@ -23,11 +23,53 @@ fn unpack(address: u64) -> (u32, u32) {
     ((address >> 32) as u32, address as u32)
 }
 
+/// A display name for a wireline `board_model` code, or `None` for UNKNOWN / a model this build doesn't name.
+/// Uses the `lamella_wire::board_model` constants so it tracks the protocol registry.
+fn board_model_name(model: u16) -> Option<&'static str> {
+    use lamella_wire::board_model as bm;
+    Some(match model {
+        bm::MICROBIT_V1 => "BBC micro:bit v1",
+        bm::PICO2 => "Raspberry Pi Pico 2",
+        bm::SAM4S_XPLAINED_PRO => "SAM4S Xplained Pro",
+        bm::SAME54_XPLAINED_PRO => "SAM E54 Xplained Pro",
+        bm::SAMD21_XPLAINED_PRO => "SAM D21 Xplained Pro",
+        bm::SAMW25_XPLAINED_PRO => "ATSAMW25 Xplained Pro",
+        7 => "STM32F091 Nucleo-64",
+        bm::STM32L476 => "STM32L476 Nucleo",
+        bm::MKR1000 => "Arduino MKR1000",
+        bm::PICO2_W => "Raspberry Pi Pico 2 W",
+        _ => return None,
+    })
+}
+
+/// The connect line the debug console shows for a target's self-reported [`ProfileIdentity`]: the board name
+/// (from its `board_model`) and, when the firmware fills it, the chip IDCODE (+ device id). `None` when there
+/// is nothing to identify (UNKNOWN board + no chip id), so a pre-chip-id target stays silent.
+fn identity_line(profile: &ProfileIdentity) -> Option<String> {
+    let board = board_model_name(profile.board_model);
+    let has_chip = profile.chip_idcode != 0;
+    if board.is_none() && !has_chip {
+        return None;
+    }
+    let mut line = String::from("Lamella Link: ");
+    line.push_str(board.unwrap_or("unrecognized board"));
+    if has_chip {
+        line.push_str(&format!(", chip IDCODE {:#010x}", profile.chip_idcode));
+        if profile.chip_devid != 0 {
+            line.push_str(&format!(" (devid {:#010x})", profile.chip_devid));
+        }
+    }
+    line.push('\n');
+    Some(line)
+}
+
 /// The carrier a [`WirelineBackend`] drives: a serial port (USB-CDC / UART / a debug-probe VCP), or --
 /// with the `usb` feature -- a board's native driverless-WinUSB device. A LOCAL enum (not `Box<dyn>`) so it
 /// implements the foreign `Transport` trait, and the blocking deploy/hello drivers take it directly.
 pub enum WireTransport {
+    /// A serial-port carrier (USB-CDC / UART / a debug-probe VCP).
     Serial(SerialTransport),
+    /// A board's native driverless-USB carrier (WinUSB / libusb), behind the `usb` feature.
     #[cfg(feature = "usb")]
     Usb(UsbTransport),
 }
@@ -59,6 +101,8 @@ struct MethodSrc {
     points: Vec<(u32, u32, u32)>,
 }
 
+/// The deployed image's source map -- `method_id -> (document, qualified name, sequence points)`, parsed from
+/// `lamella_srcmap`'s JSON. Makes a wireline session SOURCE-LEVEL: line lookups, source breakpoints, frame names.
 pub struct SrcMap {
     methods: std::collections::HashMap<u32, MethodSrc>,
 }
@@ -219,7 +263,8 @@ impl WirelineBackend {
             Capabilities::DEBUG_BASIC
                 | Capabilities::BREAKPOINTS
                 | Capabilities::STEPPING
-                | Capabilities::BAKED_IMAGE,
+                | Capabilities::BAKED_IMAGE
+                | Capabilities::PROFILE_CHIPID,
         );
         let session = hello_blocking(&mut transport, 0, caps, timeout)?;
         if !(session.caps.has(Capabilities::DEBUG_BASIC)
@@ -228,6 +273,7 @@ impl WirelineBackend {
         {
             return Err(TransportError::Closed);
         }
+        let pending_output = session.profile.as_ref().and_then(identity_line);
         Ok(Self {
             transport,
             image,
@@ -237,7 +283,7 @@ impl WirelineBackend {
             running: false,
             frames: Vec::new(),
             exit_code: 0,
-            pending_output: None,
+            pending_output,
             srcmap: None,
             user_bps: Vec::new(),
         })
@@ -604,5 +650,27 @@ mod tests {
         let map = SrcMap::parse(json).expect("parse");
         assert_eq!(map.name_of(42), None);
         assert!(map.location(42, 0).is_some());
+    }
+
+    #[test]
+    fn identity_line_names_board_and_chip() {
+        use lamella_wire::ProfileIdentity;
+        let mut p = ProfileIdentity::new(1, 0, "serve");
+        p.board_model = 6;
+        p.chip_idcode = 0x0bc11477;
+        let line = super::identity_line(&p).unwrap();
+        assert!(line.contains("ATSAMW25 Xplained Pro") && line.contains("0x0bc11477"), "{line}");
+
+        let mut p = ProfileIdentity::new(1, 0, "serve");
+        p.board_model = 4;
+        assert_eq!(super::identity_line(&p).unwrap(), "Lamella Link: SAM E54 Xplained Pro\n");
+
+        assert!(super::identity_line(&ProfileIdentity::new(1, 0, "serve")).is_none());
+
+        let mut p = ProfileIdentity::new(1, 0, "serve");
+        p.board_model = 0xffff;
+        p.chip_idcode = 0x2ba01477;
+        let line = super::identity_line(&p).unwrap();
+        assert!(line.contains("unrecognized board") && line.contains("0x2ba01477"), "{line}");
     }
 }

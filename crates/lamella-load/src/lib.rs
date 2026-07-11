@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -53,6 +54,7 @@ use lamella_cil_runtime::intrinsics::{
     md_array_get_length, md_array_length, md_array_set, object_ctor, object_get_type,
     object_reference_equals, object_to_string,
     initialize_array, get_custom_attributes, string_concat, string_concat_object2,
+    string_ctor_char_ptr, string_ctor_char_ptr_range, string_get_pinnable_reference,
     string_concat_object3, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
     string_create_from_chars, string_not_equals, string_substring, string_substring_len,
@@ -65,6 +67,8 @@ use lamella_cil_runtime::intrinsics::{
     tls_client_config, tls_server_config, tls_client_new, tls_server_new, tls_process,
     tls_wants_write, tls_write_tls, tls_read_tls, tls_read_plain, tls_write_plain, tls_peer_cert,
     tls_close, tls_default_stack,
+    fs_open, fs_read, fs_write, fs_seek, fs_length, fs_set_length, fs_flush, fs_close,
+    fs_file_exists, fs_dir_exists, fs_delete_file, fs_create_dir, fs_delete_dir, fs_move, fs_list,
     marshal_alloc_hglobal, marshal_free_hglobal, marshal_read_byte, marshal_read_int16,
     marshal_read_int32, marshal_read_int64, marshal_write_byte, marshal_write_int16,
     marshal_write_int32, marshal_write_int64, marshal_size_of,
@@ -134,8 +138,8 @@ use lamella_cil_runtime::module::{
     MethodParam, ReflectField, ReflectMethod, ReflectType, param_attr_key,
 };
 use lamella_cil_runtime::{
-    IntrinsicFn, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget, PrimKind, TypeId,
-    Value,
+    CastElem, CastPrim, IntrinsicFn, MethodId, Module, PInvokeParam, PInvokeReturn, PInvokeTarget,
+    PrimKind, TypeId, Value,
 };
 
 const TYPE_REF: u8 = 0x01;
@@ -1004,6 +1008,15 @@ fn load_assembly<'pe>(
                         if matches!(constant, ConstantValue::I8(_) | ConstantValue::U8(_)) {
                             module.set_enum_wide(asm, type_token);
                         }
+                        if matches!(
+                            constant,
+                            ConstantValue::U1(_)
+                                | ConstantValue::U2(_)
+                                | ConstantValue::U4(_)
+                                | ConstantValue::U8(_)
+                        ) {
+                            module.set_enum_unsigned(asm, type_token);
+                        }
                         module.set_enum_width(asm, type_token, enum_constant_width(&constant));
                         if let Some(value) = constant_as_i64(constant) {
                             module.set_enum_constant(asm, type_token, value, name.into());
@@ -1093,8 +1106,13 @@ fn load_assembly<'pe>(
                     }
                 }
             }
-            let runtime_supplied =
-                method.is_runtime_impl() || has_runtime_provided_attribute(assembly, token);
+            let string_ctor = name == ".ctor"
+                && type_def
+                    .name()
+                    .is_some_and(|declaring| declaring.namespace == "System" && declaring.name == "String");
+            let runtime_supplied = method.is_runtime_impl()
+                || has_runtime_provided_attribute(assembly, token)
+                || string_ctor;
             let intrinsic = runtime_supplied
                 .then(|| {
                     let signature = method.signature();
@@ -1187,7 +1205,11 @@ fn load_assembly<'pe>(
                                 box_tokens.insert(*operand);
                             }
                         }
-                        Opcode::Castclass | Opcode::Isinst | Opcode::Box => {
+                        Opcode::Castclass
+                        | Opcode::Isinst
+                        | Opcode::Box
+                        | Opcode::Unbox
+                        | Opcode::UnboxAny => {
                             type_test_tokens.insert(*operand);
                         }
                         Opcode::Sizeof => {
@@ -1275,6 +1297,12 @@ fn load_assembly<'pe>(
         }
         type_virtuals.push(virtuals);
         type_nonvirtuals.push(nonvirtuals);
+    }
+
+    for ctor in assembly.custom_attribute_ctors() {
+        if ctor.table() == MEMBER_REF {
+            bcl_call_tokens.insert(ctor);
+        }
     }
 
     bind_strings(assembly, module, asm, &string_tokens);
@@ -1707,6 +1735,13 @@ fn bcl_intrinsic(
             _ => {}
         }
     }
+    if namespace == "System" && type_name == "UIntPtr" {
+        match method {
+            "FromRawValue" => return Some(intrinsic!(intptr_from_raw_value)),
+            "ToRawValue" => return Some(intrinsic!(intptr_to_raw_value)),
+            _ => {}
+        }
+    }
     if namespace == "System.Runtime.InteropServices" && type_name == "Marshal" {
         match method {
             "__AllocHGlobal" => return Some(intrinsic!(marshal_alloc_hglobal)),
@@ -1808,6 +1843,26 @@ fn bcl_intrinsic(
             _ => {}
         }
     }
+    if namespace == "System.IO" && type_name == "NativeFs" {
+        match method {
+            "Open" => return Some(intrinsic!(fs_open)),
+            "Read" => return Some(intrinsic!(fs_read)),
+            "Write" => return Some(intrinsic!(fs_write)),
+            "Seek" => return Some(intrinsic!(fs_seek)),
+            "Length" => return Some(intrinsic!(fs_length)),
+            "SetLength" => return Some(intrinsic!(fs_set_length)),
+            "Flush" => return Some(intrinsic!(fs_flush)),
+            "Close" => return Some(intrinsic!(fs_close)),
+            "FileExists" => return Some(intrinsic!(fs_file_exists)),
+            "DirExists" => return Some(intrinsic!(fs_dir_exists)),
+            "DeleteFile" => return Some(intrinsic!(fs_delete_file)),
+            "CreateDir" => return Some(intrinsic!(fs_create_dir)),
+            "DeleteDir" => return Some(intrinsic!(fs_delete_dir)),
+            "Move" => return Some(intrinsic!(fs_move)),
+            "List" => return Some(intrinsic!(fs_list)),
+            _ => {}
+        }
+    }
     if namespace == "System" && type_name == "Environment" {
         match method {
             "get_TickCount" => return Some(intrinsic!(environment_tick_count)),
@@ -1825,6 +1880,11 @@ fn bcl_intrinsic(
         ("String", "Concat") => string_concat_overload(signature),
         ("String", "get_Length") => string_get_length_overload(signature),
         ("String", "get_Chars") => string_get_chars_overload(signature),
+        ("String", "GetPinnableReference") => match parameters_of(signature) {
+            [] => Some(intrinsic!(string_get_pinnable_reference)),
+            _ => None,
+        },
+        ("String", ".ctor") => string_ctor_overload(signature),
         ("String", "op_Equality") => string_equals_overload(signature),
         ("String", "op_Inequality") => string_not_equals_overload(signature),
         ("String", "IsNullOrEmpty") => string_is_null_or_empty_overload(signature),
@@ -2805,7 +2865,76 @@ fn classify_type_test_tokens(
                     module.bind_type_token(asm, *token, id);
                 }
             }
+            module.bind_cast_elem(
+                asm,
+                *token,
+                cast_elem_of_name(asm, name.namespace, name.name, *token),
+            );
+        } else if let Some(sig) = assembly.type_spec_signature(*token) {
+            module.bind_cast_elem(asm, *token, cast_elem_of_sig(asm, &sig));
         }
+    }
+}
+
+/// The [`CastElem`] shape a NAMED cast-test token denotes: the exact `System` primitive /
+/// `String` / `Object` by metadata name, else the named type itself (by asm-folded handle).
+fn cast_elem_of_name(asm: u8, namespace: &str, name: &str, token: Token) -> CastElem {
+    if namespace == "System" {
+        let prim = match name {
+            "Boolean" => Some(CastPrim::Bool),
+            "Char" => Some(CastPrim::Char),
+            "SByte" => Some(CastPrim::I1),
+            "Byte" => Some(CastPrim::U1),
+            "Int16" => Some(CastPrim::I2),
+            "UInt16" => Some(CastPrim::U2),
+            "Int32" => Some(CastPrim::I4),
+            "UInt32" => Some(CastPrim::U4),
+            "Int64" => Some(CastPrim::I8),
+            "UInt64" => Some(CastPrim::U8),
+            "Single" => Some(CastPrim::F4),
+            "Double" => Some(CastPrim::F8),
+            "IntPtr" => Some(CastPrim::I),
+            "UIntPtr" => Some(CastPrim::U),
+            _ => None,
+        };
+        if let Some(prim) = prim {
+            return CastElem::Prim(prim);
+        }
+        match name {
+            "String" => return CastElem::String,
+            "Object" => return CastElem::Object,
+            _ => {}
+        }
+    }
+    CastElem::Named(asm_key(asm, token.0))
+}
+
+/// The [`CastElem`] shape a `TypeSpec` signature denotes. Tokens inside the signature are in
+/// the same assembly's token space as the spec row itself. Shapes the cast checks do not
+/// model (multi-dimensional arrays, pointers, byrefs) become [`CastElem::Lenient`].
+fn cast_elem_of_sig(asm: u8, sig: &SigType) -> CastElem {
+    match sig {
+        SigType::Boolean => CastElem::Prim(CastPrim::Bool),
+        SigType::Char => CastElem::Prim(CastPrim::Char),
+        SigType::I1 => CastElem::Prim(CastPrim::I1),
+        SigType::U1 => CastElem::Prim(CastPrim::U1),
+        SigType::I2 => CastElem::Prim(CastPrim::I2),
+        SigType::U2 => CastElem::Prim(CastPrim::U2),
+        SigType::I4 => CastElem::Prim(CastPrim::I4),
+        SigType::U4 => CastElem::Prim(CastPrim::U4),
+        SigType::I8 => CastElem::Prim(CastPrim::I8),
+        SigType::U8 => CastElem::Prim(CastPrim::U8),
+        SigType::R4 => CastElem::Prim(CastPrim::F4),
+        SigType::R8 => CastElem::Prim(CastPrim::F8),
+        SigType::IntPtr => CastElem::Prim(CastPrim::I),
+        SigType::UIntPtr => CastElem::Prim(CastPrim::U),
+        SigType::String => CastElem::String,
+        SigType::Object => CastElem::Object,
+        SigType::Class(token) | SigType::ValueType(token) => {
+            CastElem::Named(asm_key(asm, token.0))
+        }
+        SigType::SzArray(element) => CastElem::Array(Box::new(cast_elem_of_sig(asm, element))),
+        _ => CastElem::Lenient,
     }
 }
 
@@ -3656,6 +3785,22 @@ fn string_substring_overload(signature: Option<&MethodSig>) -> Option<(Intrinsic
 fn string_get_chars_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
     match parameters_of(signature) {
         [SigType::I4] => Some(intrinsic!(string_get_chars)),
+        _ => None,
+    }
+}
+
+/// The `String(char*)` / `String(char*, int, int)` constructors. The bound intrinsics are
+/// identity anchors: the interpreter's `newobj` routes both through its frames-aware
+/// string materialization (the char* may point into a caller frame's stackalloc buffer),
+/// so binding here is what makes the constructor token resolve.
+fn string_ctor_overload(signature: Option<&MethodSig>) -> Option<(IntrinsicFn, u32)> {
+    match parameters_of(signature) {
+        [SigType::Pointer(value)] if **value == SigType::Char => {
+            Some(intrinsic!(string_ctor_char_ptr))
+        }
+        [SigType::Pointer(value), SigType::I4, SigType::I4] if **value == SigType::Char => {
+            Some(intrinsic!(string_ctor_char_ptr_range))
+        }
         _ => None,
     }
 }

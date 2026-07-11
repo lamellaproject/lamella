@@ -115,11 +115,11 @@ pub use lamella_elf::TYPE_DESC_PREFIX;
 /// and all other data, then rebuilds each object re-laid-out with its symbols and relocations remapped, so
 /// unused functions/descriptors and the undefined externs only they referenced drop out.
 pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
-    let mut defs: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    let mut defs: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     for (oi, obj) in objects.iter().enumerate() {
         for (si, s) in obj.symbols.iter().enumerate() {
             if s.defined && s.binding != Binding::Local && !s.name.is_empty() {
-                defs.entry(s.name.as_str()).or_insert((oi, si));
+                defs.entry(s.name.as_str()).or_default().push((oi, si));
             }
         }
     }
@@ -130,17 +130,19 @@ pub fn garbage_collect(objects: &[Object], entry: &str) -> Vec<Object> {
         if !reachable.insert(name.clone()) {
             continue;
         }
-        let Some(&(oi, si)) = defs.get(name.as_str()) else {
+        let Some(sites) = defs.get(name.as_str()) else {
             continue;
         };
-        let obj = &objects[oi];
-        let sym = &obj.symbols[si];
-        let start = sym.value & !1;
-        let end = start + sym.size;
-        for r in &obj.relocations {
-            if r.offset >= start && r.offset < end {
-                if let Some(target) = obj.symbols.get(r.symbol as usize) {
-                    stack.push(target.name.clone());
+        for &(oi, si) in sites {
+            let obj = &objects[oi];
+            let sym = &obj.symbols[si];
+            let start = sym.value & !1;
+            let end = start + sym.size;
+            for r in &obj.relocations {
+                if r.offset >= start && r.offset < end {
+                    if let Some(target) = obj.symbols.get(r.symbol as usize) {
+                        stack.push(target.name.clone());
+                    }
                 }
             }
         }
@@ -311,7 +313,7 @@ fn link_with_base(
     if machine == Machine::Arm {
         for (oi, obj) in objects.iter().enumerate() {
             for r in &obj.relocations {
-                if r.kind != arm::R_ARM_THM_CALL {
+                if r.kind != arm::R_ARM_THM_CALL && r.kind != arm::R_ARM_THM_JUMP24 {
                     continue;
                 }
                 let name = &obj.symbols[r.symbol as usize].name;
@@ -489,6 +491,27 @@ fn apply_relocation(
                 Ok(())
             }
             riscv::R_RISCV_32 => apply_abs32(text, site, text_base, target + addend, false),
+            riscv::R_RISCV_HI20 => {
+                let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+                let addr = i64::from(base) + target + addend;
+                let hi20 = (((addr + 0x800) >> 12) & 0xfffff) as u32;
+                patch_or(text, site as usize, hi20 << 12);
+                Ok(())
+            }
+            riscv::R_RISCV_LO12_I => {
+                let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+                let addr = i64::from(base) + target + addend;
+                let lo12 = (addr & 0xfff) as u32;
+                patch_or(text, site as usize, lo12 << 20);
+                Ok(())
+            }
+            riscv::R_RISCV_LO12_S => {
+                let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+                let addr = i64::from(base) + target + addend;
+                let lo12 = (addr & 0xfff) as u32;
+                patch_or(text, site as usize, ((lo12 >> 5) << 25) | ((lo12 & 0x1f) << 7));
+                Ok(())
+            }
             riscv::R_LAMELLA_REL_DESC => encode_rel32(text, site, target + addend - site_i),
             other => Err(LinkError::UnsupportedRelocation(other)),
         },
@@ -510,6 +533,28 @@ fn apply_relocation(
                 apply_abs32(text, site, text_base, target + addend, target_is_thumb)
             }
             arm::R_LAMELLA_REL_DESC => encode_rel32(text, site, target + addend - site_i),
+            arm::R_ARM_THM_JUMP24 => {
+                let direct = target + addend - site_i;
+                if thm_call_in_range(direct) {
+                    encode_thm_call(text, site, direct)
+                } else {
+                    let voff = veneers
+                        .get(&(target as u32))
+                        .copied()
+                        .ok_or(LinkError::RelocationOutOfRange(site))?;
+                    encode_thm_call(text, site, i64::from(voff) + addend - site_i)
+                }
+            }
+            arm::R_ARM_THM_MOVW_ABS_NC => {
+                let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+                let full = (i64::from(base) + target + addend) | i64::from(target_is_thumb);
+                encode_thm_mov(text, site, (full & 0xFFFF) as u16)
+            }
+            arm::R_ARM_THM_MOVT_ABS => {
+                let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+                let full = (i64::from(base) + target + addend) | i64::from(target_is_thumb);
+                encode_thm_mov(text, site, ((full >> 16) & 0xFFFF) as u16)
+            }
             other => Err(LinkError::UnsupportedRelocation(other)),
         },
     }
@@ -522,7 +567,10 @@ fn relocation_addend(text: &[u8], machine: Machine, site: u32, r: &ParsedRelocat
     if r.implicit_addend {
         match (machine, r.kind) {
             (Machine::Arm, arm::R_ARM_THM_CALL) => extract_thm_call(text, site),
+            (Machine::Arm, arm::R_ARM_THM_JUMP24) => extract_thm_call(text, site),
             (Machine::Arm, arm::R_ARM_CALL) => extract_arm_call(text, site),
+            (Machine::Arm, arm::R_ARM_THM_MOVW_ABS_NC) => extract_thm_mov(text, site),
+            (Machine::Arm, arm::R_ARM_THM_MOVT_ABS) => extract_thm_mov(text, site) << 16,
             (Machine::Arm, arm::R_ARM_ABS32) | (Machine::RiscV, riscv::R_RISCV_32) => {
                 text.get(site as usize..site as usize + 4).map_or(0, |b| {
                     u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i32 as i64
@@ -804,15 +852,55 @@ fn encode_thm_call(text: &mut [u8], site: u32, off: i64) -> Result<(), LinkError
     let imm11 = ((off >> 1) & 0x7FF) as u16;
     let j1 = (i1 ^ s) ^ 1;
     let j2 = (i2 ^ s) ^ 1;
-    let hw1 = 0xF000 | (s << 10) | imm10;
-    let hw2 = 0xD000 | (j1 << 13) | (j2 << 11) | imm11;
     let site = site as usize;
     let slot = text
         .get_mut(site..site + 4)
         .ok_or(LinkError::RelocationOutOfRange(site as u32))?;
+    let hw2_old = u16::from_le_bytes([slot[2], slot[3]]);
+    let hw1 = 0xF000 | (s << 10) | imm10;
+    let hw2 = 0x9000 | (hw2_old & 0x4000) | (j1 << 13) | (j2 << 11) | imm11;
     slot[0..2].copy_from_slice(&hw1.to_le_bytes());
     slot[2..4].copy_from_slice(&hw2.to_le_bytes());
     Ok(())
+}
+
+/// Writes the 16-bit immediate `imm16` into a Thumb-2 `MOVW`/`MOVT` at `site`, splitting it across the
+/// four scattered fields (imm4 = hw1[3:0], i = hw1[10], imm3 = hw2[14:12], imm8 = hw2[7:0]) and preserving
+/// everything else -- the opcode and `Rd` (hw2[11:8]). The MOVW/MOVT distinction (hw1[7]) and which half
+/// of the address is passed are the caller's; this is the shared field-packing.
+fn encode_thm_mov(text: &mut [u8], site: u32, imm16: u16) -> Result<(), LinkError> {
+    let site = site as usize;
+    let slot = text
+        .get_mut(site..site + 4)
+        .ok_or(LinkError::RelocationOutOfRange(site as u32))?;
+    let hw1 = u16::from_le_bytes([slot[0], slot[1]]);
+    let hw2 = u16::from_le_bytes([slot[2], slot[3]]);
+    let imm4 = (imm16 >> 12) & 0xF;
+    let i = (imm16 >> 11) & 1;
+    let imm3 = (imm16 >> 8) & 0x7;
+    let imm8 = imm16 & 0xFF;
+    let hw1 = (hw1 & !((1 << 10) | 0xF)) | (i << 10) | imm4;
+    let hw2 = (hw2 & !((0x7 << 12) | 0xFF)) | (imm3 << 12) | imm8;
+    slot[0..2].copy_from_slice(&hw1.to_le_bytes());
+    slot[2..4].copy_from_slice(&hw2.to_le_bytes());
+    Ok(())
+}
+
+/// The 16-bit immediate currently encoded in a Thumb-2 `MOVW`/`MOVT` at `site` -- the implicit addend of a
+/// `SHT_REL` `R_ARM_THM_MOVW_ABS_NC`/`MOVT_ABS` (the inverse of [`encode_thm_mov`]; a fresh
+/// `movw rd, #:lower16:sym` reads back 0). The caller shifts a MOVT's result into the high half.
+fn extract_thm_mov(text: &[u8], site: u32) -> i64 {
+    let site = site as usize;
+    let Some(b) = text.get(site..site + 4) else {
+        return 0;
+    };
+    let hw1 = u16::from_le_bytes([b[0], b[1]]);
+    let hw2 = u16::from_le_bytes([b[2], b[3]]);
+    let imm4 = hw1 & 0xF;
+    let i = (hw1 >> 10) & 1;
+    let imm3 = (hw2 >> 12) & 0x7;
+    let imm8 = hw2 & 0xFF;
+    i64::from((imm4 << 12) | (i << 11) | (imm3 << 8) | imm8)
 }
 
 /// Whether a Thumb `BL` can reach `off` -- a halfword-even displacement within +/-16 MB.
@@ -1078,6 +1166,84 @@ mod tests {
     }
 
     #[test]
+    fn gc_sections_follows_every_copy_of_a_multiply_defined_descriptor() {
+        let weak_desc = |name: &'static str, value: u32| Symbol {
+            name,
+            value,
+            size: 4,
+            binding: Binding::Weak,
+            kind: SymbolType::NoType,
+            section: SymbolSection::Text,
+        };
+        let prog = obj_arm(
+            &[0u8; 8],
+            &[func("f0", 1, 4), data("__lamella_typedesc_9", 4, 4)],
+            &[Relocation { offset: 0, symbol: 1, kind: arm::R_ARM_ABS32, addend: 0 }],
+        );
+        let corlib = obj_arm(
+            &[0u8; 8],
+            &[
+                weak_desc("__lamella_typedesc_9", 0),
+                weak_desc("__lamella_typedesc_5", 4),
+            ],
+            &[Relocation { offset: 0, symbol: 1, kind: arm::R_LAMELLA_REL_DESC, addend: 12 }],
+        );
+        let trimmed = garbage_collect(&[prog, corlib], "f0");
+        let defined: Vec<&str> = trimmed
+            .iter()
+            .flat_map(|o| &o.symbols)
+            .filter(|s| s.defined && !s.name.is_empty())
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(defined.contains(&"f0"), "the entry is kept");
+        assert!(defined.contains(&"__lamella_typedesc_9"), "the reached (shared) descriptor is kept");
+        assert!(
+            defined.contains(&"__lamella_typedesc_5"),
+            "the base descriptor reached ONLY through corlib's copy of the shared descriptor is kept"
+        );
+    }
+
+    #[test]
+    fn thm_movw_movt_roundtrip() {
+        for addr in [
+            0x0000_0000u32,
+            0x1234_5678,
+            0xFFFF_FFFF,
+            0x1000_0100,
+            0xDEAD_BEEF,
+            0x0000_F800,
+            0x8001_0001,
+        ] {
+            let mut movw = [0x40u8, 0xF2, 0x00, 0x03];
+            let mut movt = [0xC0u8, 0xF2, 0x00, 0x03];
+            encode_thm_mov(&mut movw, 0, (addr & 0xFFFF) as u16).unwrap();
+            encode_thm_mov(&mut movt, 0, ((addr >> 16) & 0xFFFF) as u16).unwrap();
+            let lo = extract_thm_mov(&movw, 0) as u32;
+            let hi = extract_thm_mov(&movt, 0) as u32;
+            assert_eq!((hi << 16) | lo, addr, "movw/movt roundtrip {addr:#010x}");
+            assert_eq!(movw[3] & 0x0F, 0x03, "movw Rd preserved");
+            assert_eq!(movt[3] & 0x0F, 0x03, "movt Rd preserved");
+            assert_eq!(movw[0] & 0x80, 0x00, "movw opcode preserved");
+            assert_eq!(movt[0] & 0x80, 0x80, "movt opcode preserved");
+        }
+    }
+
+    #[test]
+    fn thm_branch_preserves_bl_vs_bw_opcode() {
+        let off = 0x1234;
+        let mut bl = [0x00u8, 0xF0, 0x00, 0xD0];
+        let mut bw = [0x00u8, 0xF0, 0x00, 0x90];
+        encode_thm_call(&mut bl, 0, off).unwrap();
+        encode_thm_call(&mut bw, 0, off).unwrap();
+        assert_eq!(extract_thm_call(&bl, 0), off, "BL offset");
+        assert_eq!(extract_thm_call(&bw, 0), off, "B.W offset");
+        let bl_hw2 = u16::from_le_bytes([bl[2], bl[3]]);
+        let bw_hw2 = u16::from_le_bytes([bw[2], bw[3]]);
+        assert_eq!(bl_hw2 & 0x4000, 0x4000, "BL opcode (hw2 bit 14) preserved");
+        assert_eq!(bw_hw2 & 0x4000, 0x0000, "B.W opcode (hw2 bit 14) preserved");
+    }
+
+    #[test]
     fn gc_sections_remaps_a_reloc_into_the_smallest_covering_span() {
         let obj = obj_arm(
             &[0u8; 12],
@@ -1321,6 +1487,58 @@ mod tests {
             &img.text[8..16],
             &[0x13, 0x05, 0xa0, 0x02, 0x67, 0x80, 0x00, 0x00]
         );
+    }
+
+    #[test]
+    fn resolves_riscv_absolute_hi20_lo12_address_materialization() {
+        let loader = obj(
+            &[
+                0x37, 0x05, 0x00, 0x00,
+                0x13, 0x05, 0x05, 0x00,
+                0x23, 0x20, 0xa1, 0x00,
+                0x67, 0x80, 0x00, 0x00,
+            ],
+            &[
+                Symbol {
+                    name: "_start",
+                    value: 0,
+                    size: 16,
+                    binding: Binding::Global,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::Text,
+                },
+                Symbol {
+                    name: "sym",
+                    value: 0,
+                    size: 0,
+                    binding: Binding::Global,
+                    kind: SymbolType::NoType,
+                    section: SymbolSection::Undefined,
+                },
+            ],
+            &[
+                Relocation { offset: 0, symbol: 1, kind: riscv::R_RISCV_HI20, addend: 0 },
+                Relocation { offset: 4, symbol: 1, kind: riscv::R_RISCV_LO12_I, addend: 0 },
+                Relocation { offset: 8, symbol: 1, kind: riscv::R_RISCV_LO12_S, addend: 0 },
+            ],
+        );
+        let sym = obj(
+            &[0x67, 0x80, 0x00, 0x00],
+            &[Symbol {
+                name: "sym",
+                value: 0,
+                size: 4,
+                binding: Binding::Global,
+                kind: SymbolType::Func,
+                section: SymbolSection::Text,
+            }],
+            &[],
+        );
+        let img = link_at_base(&[loader, sym], "_start", 0x8000_0000).unwrap();
+        let insn = |o: usize| u32::from_le_bytes([img.text[o], img.text[o + 1], img.text[o + 2], img.text[o + 3]]);
+        assert_eq!(insn(0), 0x8000_0537, "lui a0, 0x80000");
+        assert_eq!(insn(4), 0x0105_0513, "addi a0, a0, 16");
+        assert_eq!(insn(8), 0x00a1_2823, "sw a0, 16(sp)");
     }
 
     #[test]

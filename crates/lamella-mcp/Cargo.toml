@@ -1,0 +1,49 @@
+[package]
+name = "lamella-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native Lamella MCP server: exposes the toolchain to AI assistants over stdio (JSON-RPC 2.0). Default build = compile / run / size / enumerate / identify. Build `--features bake` for the on-device path (bake / deploy / run-on-device / wireline source-level debug), which needs lamella-load's non-additive `code-in-place`. A thin front-end over the SAME lamella-wireline / lamella-dap seams the CLIs use."
+
+[dependencies]
+# DEFAULT surface (compile / run / enumerate / identify / deploy-status): the wireline REPL engine (host
+# compile + run: LcscCompiler + engine::Repl), the serial/usb carriers (UsbTransport::list / list_serial +
+# WireTransport for identify/status), and the wire debug backend TYPES. NO `baked` here -- see the `bake`
+# feature, which is the only thing that pulls lamella-load's `code-in-place`.
+lamella-wireline = { path = "../lamella-wireline", features = ["repl-host", "serial", "usb", "debug-backend"] }
+# The wire protocol types: Capabilities / Negotiated / ProfileIdentity / board_model for the HELLO identify path.
+lamella-wire = { path = "../lamella-wire" }
+# JSON-RPC 2.0 framing, the DAP JSON, and the embedded tool contract. serde_json only -- no tokio, no MCP SDK.
+serde_json = "1"
+
+# BAKE-only deps (behind the `bake` feature). `code-in-place` is NON-ADDITIVE -- it cfg's out
+# `Module::method_body` and switches `load`/`Program` to the 'static flash model -- so if it reached the SHARED
+# lamella-load in a default / `--workspace` build, lamella-dap's interpreter backend + lamella-repl (which load
+# from local bytes) would fail to compile. Gating these keeps the workspace green; the full server is
+# `cargo build -p lamella-mcp --features bake`.
+lamella-load = { path = "../lamella-load", optional = true }
+lamella-dap = { path = "../lamella-dap", default-features = false, optional = true }
+lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
+lamella-assemble = { path = "../lamella-assemble", optional = true }
+lamella-metadata = { path = "../lamella-metadata", optional = true }
+lamella-token = { path = "../lamella-token", optional = true }
+
+[features]
+# The on-device BAKE / DEPLOY / RUN-ON-DEVICE / DEBUG path: compile -> bake (`Module::write_baked`, needs
+# `code-in-place`) -> `.lmli`, the baked-image run-on-device link, and the wireline source-level debug session
+# (drives lamella_dap::Debugger over WirelineBackend). Default-OFF so the non-additive `code-in-place` never
+# reaches the workspace's shared lamella-load.
+bake = [
+    "dep:lamella-load", "lamella-load/code-in-place",
+    "lamella-wireline/baked",
+    "dep:lamella-dap",
+    "dep:lamella-debug-backend",
+    "dep:lamella-assemble",
+    "dep:lamella-metadata",
+    "dep:lamella-token",
+]
+
+[lints]
+workspace = true

@@ -242,6 +242,14 @@ impl GuidHeapBuilder {
         self.guids.len() as u32
     }
 
+    /// Overwrites the GUID at 1-based `index` (0 = no GUID). Fills a placeholder added up
+    /// front -- the module MVID -- once the content it derives from is known.
+    pub fn set(&mut self, index: u32, guid: [u8; 16]) {
+        if let Some(slot) = index.checked_sub(1).and_then(|i| self.guids.get_mut(i as usize)) {
+            *slot = guid;
+        }
+    }
+
     /// The heap's bytes, ready to place in the image.
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {

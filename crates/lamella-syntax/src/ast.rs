@@ -745,6 +745,12 @@ pub enum Member {
         initializer: Option<ConstructorInitializer>,
         /// The constructor body.
         body: Stmt,
+        /// The signature header -- the declaration start through the parameter list's
+        /// close paren -- for the debug sequence point on an implicit `: base()` call
+        /// (csc stops there before the body, so `step into` a constructor halts on it).
+        header_span: Span,
+        /// The member's attributes (24.2).
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -877,6 +883,7 @@ impl Member {
         match self {
             Member::Field { attributes: slot, .. }
             | Member::Method { attributes: slot, .. }
+            | Member::Constructor { attributes: slot, .. }
             | Member::Property { attributes: slot, .. }
             | Member::Indexer { attributes: slot, .. }
             | Member::EventField { attributes: slot, .. }
@@ -1017,6 +1024,9 @@ pub struct ConstructorInitializer {
     pub kind: ConstructorInitializerKind,
     /// The argument expressions.
     pub arguments: Vec<Expr>,
+    /// The `base`/`this` keyword's span, for a debug build's sequence point on the chain
+    /// call (a breakpoint on `: base(...)` / `: this(...)`).
+    pub span: Span,
 }
 
 /// Which constructor a [`ConstructorInitializer`] chains to (17.10.1).
@@ -1073,6 +1083,8 @@ pub struct CatchClause {
     pub name: Option<Box<str>>,
     /// The handler block.
     pub body: Box<Stmt>,
+    /// The `catch (...)` clause header's span, for a debug build's sequence point on it.
+    pub span: Span,
 }
 
 /// The resource of a `using` statement (15.13): a local declaration or an

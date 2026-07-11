@@ -621,7 +621,9 @@ fn lower_with_source(
         })
         .collect();
 
-    if is_merge(0) {
+    if preds.first().is_some_and(|entry_preds| !entry_preds.is_empty())
+        && (is_merge(0) || mem_arg.iter().any(|arg| arg.is_some()))
+    {
         return Err(CilError::UnsupportedControlFlow);
     }
 
@@ -858,6 +860,7 @@ fn lower_with_source(
                     unwind_finally(b),
                     resolver,
                     &is_merge,
+                    &args,
                     &locals,
                     local_count,
                     local_types,
@@ -873,6 +876,7 @@ fn lower_with_source(
                     end,
                     &block_of,
                     &is_merge,
+                    &args,
                     local_count,
                     &mut stack,
                     &locals,
@@ -888,6 +892,7 @@ fn lower_with_source(
                     end,
                     &block_of,
                     &is_merge,
+                    &args,
                     local_count,
                     &mut stack,
                     &locals,
@@ -1714,9 +1719,21 @@ fn apply_value_op(
         Opcode::ConvOvfU1 => convert(value_types, stack, insts, ConvKind::ZeroExtend8)?,
         Opcode::ConvOvfI2 => convert(value_types, stack, insts, ConvKind::SignExtend16)?,
         Opcode::ConvOvfU2 => convert(value_types, stack, insts, ConvKind::ZeroExtend16)?,
+        Opcode::ConvOvfI1Un => convert(value_types, stack, insts, ConvKind::SignExtend8)?,
+        Opcode::ConvOvfU1Un => convert(value_types, stack, insts, ConvKind::ZeroExtend8)?,
+        Opcode::ConvOvfI2Un => convert(value_types, stack, insts, ConvKind::SignExtend16)?,
+        Opcode::ConvOvfU2Un => convert(value_types, stack, insts, ConvKind::ZeroExtend16)?,
         Opcode::ConvI8 | Opcode::ConvOvfI8 => widen(value_types, stack, insts, true)?,
         Opcode::ConvU8 | Opcode::ConvOvfU8 => widen(value_types, stack, insts, false)?,
-        Opcode::ConvI4 | Opcode::ConvU4 | Opcode::ConvOvfI4 | Opcode::ConvOvfU4 => {
+        Opcode::ConvOvfI8Un | Opcode::ConvOvfU8Un => widen(value_types, stack, insts, false)?,
+        Opcode::ConvI4
+        | Opcode::ConvU4
+        | Opcode::ConvOvfI4
+        | Opcode::ConvOvfU4
+        | Opcode::ConvOvfI4Un
+        | Opcode::ConvOvfU4Un
+        | Opcode::ConvOvfIUn
+        | Opcode::ConvOvfUUn => {
             let top = *stack.last().ok_or(CilError::StackUnderflow)?;
             let convert = match value_types.get(top.index()) {
                 Some(MirType::F32) => Some(ConvKind::Float32ToInt),
@@ -3327,6 +3344,7 @@ fn build_eh_leave(
     unwind: Option<usize>,
     resolver: &dyn CallResolver,
     is_merge: &impl Fn(usize) -> bool,
+    entry_args: &[ValueId],
     locals: &[Option<ValueId>],
     local_count: usize,
     local_types: &[MirType],
@@ -3363,6 +3381,7 @@ fn build_eh_leave(
     let landing = split_edge_to_merge(
         leave_target,
         is_merge,
+        entry_args,
         local_count,
         locals,
         local_types,
@@ -3404,7 +3423,14 @@ enum TrapKind {
     /// `lo` is the inclusive lower bound; `hi` the inclusive upper, or `None` for a `u64` target (no
     /// upper). Bounds + the value's compares run at the value's own width (i64 when narrowing a `long`);
     /// a `u32`/`u64` upper bound past i32::MAX is unreachable from an i32 source, so that compare is skipped.
-    ConvOverflow { lo: i64, hi: Option<i64> },
+    /// `unsigned_source` is the `.un` family: the source reads UNSIGNED, so there is no lower bound (it is
+    /// never negative) and the upper compare is UNSIGNED -- e.g. `conv.ovf.i4.un` on `0xFFFFFFFF`
+    /// (4294967295) overflows, where `conv.ovf.i4` on the same bits (-1) does not.
+    ConvOverflow {
+        lo: i64,
+        hi: Option<i64>,
+        unsigned_source: bool,
+    },
 }
 
 /// Which checked arithmetic an [`TrapKind::Overflow`] guards, selecting the overflow test.
@@ -3471,18 +3497,29 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
     if let Some(kind) = overflow {
         return Some(TrapKind::Overflow(kind));
     }
-    let conv_range: Option<(i64, Option<i64>)> = match opcode {
-        Opcode::ConvOvfI1 => Some((-128, Some(127))),
-        Opcode::ConvOvfU1 => Some((0, Some(255))),
-        Opcode::ConvOvfI2 => Some((-32768, Some(32767))),
-        Opcode::ConvOvfU2 => Some((0, Some(65535))),
-        Opcode::ConvOvfI4 => Some((i64::from(i32::MIN), Some(i64::from(i32::MAX)))),
-        Opcode::ConvOvfU4 => Some((0, Some(i64::from(u32::MAX)))),
-        Opcode::ConvOvfU8 => Some((0, None)),
+    let conv_range: Option<(i64, Option<i64>, bool)> = match opcode {
+        Opcode::ConvOvfI1 => Some((-128, Some(127), false)),
+        Opcode::ConvOvfU1 => Some((0, Some(255), false)),
+        Opcode::ConvOvfI2 => Some((-32768, Some(32767), false)),
+        Opcode::ConvOvfU2 => Some((0, Some(65535), false)),
+        Opcode::ConvOvfI4 => Some((i64::from(i32::MIN), Some(i64::from(i32::MAX)), false)),
+        Opcode::ConvOvfU4 => Some((0, Some(i64::from(u32::MAX)), false)),
+        Opcode::ConvOvfU8 => Some((0, None, false)),
+        Opcode::ConvOvfI1Un => Some((0, Some(127), true)),
+        Opcode::ConvOvfU1Un => Some((0, Some(255), true)),
+        Opcode::ConvOvfI2Un => Some((0, Some(32767), true)),
+        Opcode::ConvOvfU2Un => Some((0, Some(65535), true)),
+        Opcode::ConvOvfI4Un | Opcode::ConvOvfIUn => Some((0, Some(i64::from(i32::MAX)), true)),
+        Opcode::ConvOvfU4Un | Opcode::ConvOvfUUn => Some((0, Some(i64::from(u32::MAX)), true)),
+        Opcode::ConvOvfI8Un => Some((0, Some(i64::MAX), true)),
         _ => None,
     };
-    if let Some((lo, hi)) = conv_range {
-        return Some(TrapKind::ConvOverflow { lo, hi });
+    if let Some((lo, hi, unsigned_source)) = conv_range {
+        return Some(TrapKind::ConvOverflow {
+            lo,
+            hi,
+            unsigned_source,
+        });
     }
     None
 }
@@ -3600,6 +3637,8 @@ fn eval_stack_widths(
             | Opcode::ConvU8
             | Opcode::ConvOvfI8
             | Opcode::ConvOvfU8
+            | Opcode::ConvOvfI8Un
+            | Opcode::ConvOvfU8Un
             | Opcode::ConvR8
             | Opcode::ConvRUn => {
                 stack.pop();
@@ -3617,6 +3656,14 @@ fn eval_stack_widths(
             | Opcode::ConvOvfU2
             | Opcode::ConvOvfI4
             | Opcode::ConvOvfU4
+            | Opcode::ConvOvfI1Un
+            | Opcode::ConvOvfU1Un
+            | Opcode::ConvOvfI2Un
+            | Opcode::ConvOvfU2Un
+            | Opcode::ConvOvfI4Un
+            | Opcode::ConvOvfU4Un
+            | Opcode::ConvOvfIUn
+            | Opcode::ConvOvfUUn
             | Opcode::ConvR4 => {
                 stack.pop();
                 stack.push(false);
@@ -3702,6 +3749,15 @@ fn trap_operand_types(inst: &Instruction, wide: bool, resolver: &dyn CallResolve
             | Opcode::ConvOvfI4
             | Opcode::ConvOvfU4
             | Opcode::ConvOvfU8
+            | Opcode::ConvOvfI1Un
+            | Opcode::ConvOvfU1Un
+            | Opcode::ConvOvfI2Un
+            | Opcode::ConvOvfU2Un
+            | Opcode::ConvOvfI4Un
+            | Opcode::ConvOvfU4Un
+            | Opcode::ConvOvfI8Un
+            | Opcode::ConvOvfIUn
+            | Opcode::ConvOvfUUn
     ) {
         return vec![if wide { MirType::I64 } else { MirType::I32 }];
     }
@@ -4090,37 +4146,68 @@ fn build_trap_access_check(
             let ovf = emit_overflow_check(kind, operands[0], operands[1], value_types, insts);
             (ovf, "OverflowException")
         }
-        TrapKind::ConvOverflow { lo, hi } => {
+        TrapKind::ConvOverflow {
+            lo,
+            hi,
+            unsigned_source,
+        } => {
             let value = operands[0];
             let ty = value_types
                 .get(value.0 as usize)
                 .copied()
                 .unwrap_or(MirType::I32);
-            let lo_c = new_value(value_types, ty);
-            insts.push((lo_c, Inst::ConstInt { ty, value: lo }));
-            let below = cmp_value(CmpOp::SignedLt, value, lo_c, value_types, insts);
-            let source_max = if ty == MirType::I64 {
-                i64::MAX
-            } else {
-                i64::from(i32::MAX)
-            };
-            match hi {
-                Some(hi) if hi <= source_max => {
-                    let hi_c = new_value(value_types, ty);
-                    insts.push((hi_c, Inst::ConstInt { ty, value: hi }));
-                    let above = cmp_value(CmpOp::SignedGt, value, hi_c, value_types, insts);
-                    let ovf = new_value(value_types, MirType::I32);
-                    insts.push((
-                        ovf,
-                        Inst::Binary {
-                            op: BinOp::Or,
-                            lhs: below,
-                            rhs: above,
-                        },
-                    ));
-                    (ovf, "OverflowException")
+            if unsigned_source {
+                let source_umax: u64 = if ty == MirType::I64 {
+                    u64::MAX
+                } else {
+                    u64::from(u32::MAX)
+                };
+                match hi {
+                    Some(hi) if (hi as u64) < source_umax => {
+                        let hi_c = new_value(value_types, ty);
+                        insts.push((hi_c, Inst::ConstInt { ty, value: hi }));
+                        let above = cmp_value(CmpOp::UnsignedGt, value, hi_c, value_types, insts);
+                        (above, "OverflowException")
+                    }
+                    _ => {
+                        let never = new_value(value_types, MirType::I32);
+                        insts.push((
+                            never,
+                            Inst::ConstInt {
+                                ty: MirType::I32,
+                                value: 0,
+                            },
+                        ));
+                        (never, "OverflowException")
+                    }
                 }
-                _ => (below, "OverflowException"),
+            } else {
+                let lo_c = new_value(value_types, ty);
+                insts.push((lo_c, Inst::ConstInt { ty, value: lo }));
+                let below = cmp_value(CmpOp::SignedLt, value, lo_c, value_types, insts);
+                let source_max = if ty == MirType::I64 {
+                    i64::MAX
+                } else {
+                    i64::from(i32::MAX)
+                };
+                match hi {
+                    Some(hi) if hi <= source_max => {
+                        let hi_c = new_value(value_types, ty);
+                        insts.push((hi_c, Inst::ConstInt { ty, value: hi }));
+                        let above = cmp_value(CmpOp::SignedGt, value, hi_c, value_types, insts);
+                        let ovf = new_value(value_types, MirType::I32);
+                        insts.push((
+                            ovf,
+                            Inst::Binary {
+                                op: BinOp::Or,
+                                lhs: below,
+                                rhs: above,
+                            },
+                        ));
+                        (ovf, "OverflowException")
+                    }
+                    _ => (below, "OverflowException"),
+                }
             }
         }
     };
@@ -4297,6 +4384,7 @@ fn build_branch(
     fallthrough: usize,
     block_of: &impl Fn(usize) -> Option<usize>,
     is_merge: &impl Fn(usize) -> bool,
+    entry_args: &[ValueId],
     local_count: usize,
     stack: &mut Vec<ValueId>,
     locals: &[Option<ValueId>],
@@ -4313,17 +4401,22 @@ fn build_branch(
 
     match control_flow::branch_kind(inst.opcode) {
         Some(control_flow::BranchKind::Unconditional) => {
-            let mut args = merge_args(
-                is_merge(target),
-                local_count,
-                locals,
-                local_types,
-                value_types,
-                insts,
-            );
-            if is_merge(target) {
-                args.extend(stack.iter().copied());
-            }
+            let args = if target == 0 && !entry_args.is_empty() {
+                entry_args.to_vec()
+            } else {
+                let mut args = merge_args(
+                    is_merge(target),
+                    local_count,
+                    locals,
+                    local_types,
+                    value_types,
+                    insts,
+                );
+                if is_merge(target) {
+                    args.extend(stack.iter().copied());
+                }
+                args
+            };
             Ok(Terminator::Jump {
                 target: BlockId(target as u32),
                 args,
@@ -4338,6 +4431,7 @@ fn build_branch(
                 split_edge_to_merge(
                     block,
                     is_merge,
+                    entry_args,
                     local_count,
                     locals,
                     local_types,
@@ -4377,6 +4471,7 @@ fn build_switch(
     fallthrough: usize,
     block_of: &impl Fn(usize) -> Option<usize>,
     is_merge: &impl Fn(usize) -> bool,
+    entry_args: &[ValueId],
     local_count: usize,
     stack: &mut Vec<ValueId>,
     locals: &[Option<ValueId>],
@@ -4396,6 +4491,7 @@ fn build_switch(
     let mut not_matched = split_edge_to_merge(
         default,
         is_merge,
+        entry_args,
         local_count,
         locals,
         local_types,
@@ -4410,6 +4506,7 @@ fn build_switch(
         let matched = split_edge_to_merge(
             target,
             is_merge,
+            entry_args,
             local_count,
             locals,
             local_types,
@@ -4445,6 +4542,7 @@ fn build_switch(
     let matched = split_edge_to_merge(
         target0,
         is_merge,
+        entry_args,
         local_count,
         locals,
         local_types,
@@ -4499,10 +4597,15 @@ fn emit_case_test(
 /// If `block` is a merge, splits the critical edge into it: appends a fresh param-less block
 /// that jumps to the merge carrying the branching block's `locals`, and returns its index.
 /// Otherwise returns `block` unchanged. So a conditional branch never targets a merge directly.
+///
+/// Block 0 (the entry) is the one non-merge that still needs a split block when targeted: when a
+/// back-edge makes it a loop header, its parameters are the arguments (`entry_args`), which a `Branch`
+/// edge cannot carry, so the edge is routed through a split block that Jumps to block 0 re-passing them.
 #[allow(clippy::too_many_arguments)]
 fn split_edge_to_merge(
     block: usize,
     is_merge: &impl Fn(usize) -> bool,
+    entry_args: &[ValueId],
     local_count: usize,
     locals: &[Option<ValueId>],
     local_types: &[MirType],
@@ -4511,19 +4614,25 @@ fn split_edge_to_merge(
     split_blocks: &mut Vec<BasicBlock>,
     block_count: usize,
 ) -> usize {
-    if !is_merge(block) {
+    let entry_loop_header = block == 0 && !entry_args.is_empty();
+    if !is_merge(block) && !entry_loop_header {
         return block;
     }
     let mut insts: Vec<(ValueId, Inst)> = Vec::new();
-    let mut args = merge_args(
-        true,
-        local_count,
-        locals,
-        local_types,
-        value_types,
-        &mut insts,
-    );
-    args.extend(stack.iter().copied());
+    let args = if entry_loop_header {
+        entry_args.to_vec()
+    } else {
+        let mut args = merge_args(
+            true,
+            local_count,
+            locals,
+            local_types,
+            value_types,
+            &mut insts,
+        );
+        args.extend(stack.iter().copied());
+        args
+    };
     let index = block_count + split_blocks.len();
     split_blocks.push(BasicBlock {
         params: Vec::new(),
@@ -5198,6 +5307,15 @@ mod control_flow {
                     | Opcode::ConvOvfI4
                     | Opcode::ConvOvfU4
                     | Opcode::ConvOvfU8
+                    | Opcode::ConvOvfI1Un
+                    | Opcode::ConvOvfU1Un
+                    | Opcode::ConvOvfI2Un
+                    | Opcode::ConvOvfU2Un
+                    | Opcode::ConvOvfI4Un
+                    | Opcode::ConvOvfU4Un
+                    | Opcode::ConvOvfI8Un
+                    | Opcode::ConvOvfIUn
+                    | Opcode::ConvOvfUUn
             );
             let in_catch_try = handlers.iter().any(|clause| {
                 matches!(clause.kind, EhKind::Catch(_))
@@ -5270,6 +5388,30 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.value_types.len(), 3);
         assert_eq!(func.ret, Some(MirType::I32));
+    }
+
+    #[test]
+    fn conv_ovf_un_trap_reads_the_source_unsigned() {
+        let range = |op: Opcode| match trap_kind_at(&Instruction::simple(op), &NoCalls) {
+            Some(TrapKind::ConvOverflow {
+                lo,
+                hi,
+                unsigned_source,
+            }) => Some((lo, hi, unsigned_source)),
+            _ => None,
+        };
+        assert_eq!(range(Opcode::ConvOvfI1Un), Some((0, Some(127), true)));
+        assert_eq!(range(Opcode::ConvOvfU1Un), Some((0, Some(255), true)));
+        assert_eq!(range(Opcode::ConvOvfI2Un), Some((0, Some(32767), true)));
+        assert_eq!(range(Opcode::ConvOvfU2Un), Some((0, Some(65535), true)));
+        assert_eq!(range(Opcode::ConvOvfI4Un), Some((0, Some(2_147_483_647), true)));
+        assert_eq!(range(Opcode::ConvOvfU4Un), Some((0, Some(4_294_967_295), true)));
+        assert_eq!(range(Opcode::ConvOvfIUn), Some((0, Some(2_147_483_647), true)));
+        assert_eq!(range(Opcode::ConvOvfUUn), Some((0, Some(4_294_967_295), true)));
+        assert_eq!(range(Opcode::ConvOvfI8Un), Some((0, Some(i64::MAX), true)));
+        assert_eq!(range(Opcode::ConvOvfU8Un), None);
+        assert_eq!(range(Opcode::ConvOvfI1), Some((-128, Some(127), false)));
+        assert_eq!(range(Opcode::ConvOvfU4), Some((0, Some(4_294_967_295), false)));
     }
 
     #[test]
@@ -5841,6 +5983,112 @@ mod tests {
         assert!(preds[0].is_empty());
         assert_eq!(preds[1], vec![0]);
         assert_eq!(preds[2], vec![0]);
+    }
+
+    #[test]
+    fn lowers_an_entry_block_as_a_loop_header() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::BrtrueS, Operand::Target(0)),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method(&body).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let back_edges = func
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(&b.terminator, Some(Terminator::Jump { target, args })
+                    if *target == BlockId(0) && args.len() == 1)
+            })
+            .count();
+        assert_eq!(back_edges, 1);
+        #[cfg(feature = "arm32")]
+        assert!(crate::arm32::lower(&func).is_ok());
+    }
+
+    #[test]
+    fn lowers_the_receive_core_entry_loop_shape() {
+        struct Poll;
+        impl CallResolver for Poll {
+            fn resolve(&self, _operand: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::I32),
+                    target: CallTarget::Internal(9),
+                })
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::Call, Operand::None),
+                Instruction::new(Opcode::StlocS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdlocS, Operand::Variable(0)),
+                Instruction::simple(Opcode::LdcI45),
+                Instruction::new(Opcode::BeqS, Operand::Target(0)),
+                Instruction::new(Opcode::LdlocS, Operand::Variable(0)),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) =
+            lower_method_typed(&body, &Poll, &[MirType::I32], &[MirType::I32]).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let back_edges = func
+            .blocks
+            .iter()
+            .filter(|b| {
+                matches!(&b.terminator, Some(Terminator::Jump { target, args })
+                    if *target == BlockId(0) && args.len() == 1)
+            })
+            .count();
+        assert_eq!(back_edges, 1);
+        let poll_result = func.blocks[0].insts.iter().find_map(|(v, i)| match i {
+            Inst::Call { callee: 9, .. } => Some(*v),
+            _ => None,
+        });
+        let returned = func.blocks.iter().find_map(|b| match &b.terminator {
+            Some(Terminator::Return(Some(v))) => Some(*v),
+            _ => None,
+        });
+        assert!(poll_result.is_some());
+        assert_eq!(returned, poll_result);
+    }
+
+    #[test]
+    fn rejects_a_memory_backed_arg_entry_loop_header() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::BrtrueS, Operand::Target(0)),
+                Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        assert!(matches!(
+            lower_method_typed(&body, &NoCalls, &[MirType::I32], &[]),
+            Err(CilError::UnsupportedControlFlow)
+        ));
     }
 
     #[test]

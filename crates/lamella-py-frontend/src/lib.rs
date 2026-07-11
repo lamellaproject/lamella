@@ -10,6 +10,7 @@ pub mod ast;
 pub mod compile;
 pub mod lexer;
 pub mod lower;
+mod named_chars;
 pub mod parser;
 
 /// The shared bytecode contract (the `lamella-py-bytecode` crate), re-exported so
@@ -73,6 +74,10 @@ pub fn compile_str(
 /// source by name, or `None` for a name that stays a native / built-in module (not bundled -- e.g.
 /// `math`). The import graph is walked breadth-first with a seen-set, so a module reached by several
 /// paths (a diamond) or an import cycle compiles once and terminates.
+///
+/// Only TOP-LEVEL imports are followed into the bundle; a module reached solely through a
+/// function-body import resolves at run time (native, else `ModuleNotFoundError`) -- a documented
+/// first-cut narrowing.
 pub fn compile_bundle(
     entry_name: &str,
     entry_source: &str,
@@ -106,7 +111,8 @@ pub fn compile_bundle(
     Ok(bytecode::Bundle { entry, modules })
 }
 
-/// The module names a module imports at top level (`import m [, n]` and `from m import ...`).
+/// The module names a module imports at top level (`import m [, n]`, `from m import ...`, and
+/// `from m import *`).
 fn top_level_imports(module: &ast::ModuleAst) -> alloc::vec::Vec<alloc::string::String> {
     let mut names = alloc::vec::Vec::new();
     for stmt in &module.body {
@@ -117,6 +123,7 @@ fn top_level_imports(module: &ast::ModuleAst) -> alloc::vec::Vec<alloc::string::
                 }
             }
             ast::Stmt::ImportFrom { module, .. } => names.push(module.clone()),
+            ast::Stmt::ImportStar { module } => names.push(module.clone()),
             _ => {}
         }
     }
@@ -210,6 +217,20 @@ print(fib(10))
         let bytes = bundle.encode(FeatureFlags::FIRST_LIGHT);
         let (decoded, _) = bytecode::Bundle::decode(&bytes).expect("decodes");
         assert_eq!(decoded, bundle);
+    }
+
+    #[test]
+    fn compile_bundle_walks_a_star_import() {
+        let resolve = |name: &str| -> Option<String> {
+            match name {
+                "shapes" => Some(String::from("__all__ = [\"PI\"]\nPI = 3\n")),
+                _ => None,
+            }
+        };
+        let bundle = compile_bundle("__main__", "from shapes import *\nprint(PI)\n", &resolve)
+            .expect("compiles");
+        let names: alloc::vec::Vec<&str> = bundle.modules.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"shapes"), "a star-imported module is a bundle dependency");
     }
 
     #[test]

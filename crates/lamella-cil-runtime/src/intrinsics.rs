@@ -8,7 +8,7 @@ use crate::net::{Interest, NetResult};
 use crate::tls::{TlsStack, VerifyMode};
 use crate::object::{Object, ObjectRef, decode_string};
 use crate::trap::Trap;
-use crate::value::Value;
+use crate::value::{Location, Value};
 #[cfg(feature = "float")]
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -663,6 +663,63 @@ pub fn string_create_from_chars(
     };
     let reference = vm.heap_mut().alloc_string(&units);
     Ok(Some(Value::Object(reference)))
+}
+
+/// `System.String.GetPinnableReference()`: the managed pointer to the string's first UTF-16
+/// code unit -- what modern C# `fixed (char* p = s)` lowers to and pins. The pointer is
+/// symbolic ([`Location::StringChar`]): `conv.u` keeps it, pointer arithmetic walks its byte
+/// offset, and `ldind.u2` reads code units (an empty string's pointer reads the U+0000
+/// terminator, per the .NET contract).
+///
+/// # Errors
+/// [`Trap::NullReference`] on a null receiver; [`Trap::TypeMismatch`] if the receiver is
+/// not a string.
+pub fn string_get_pinnable_reference(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let reference = match args.first() {
+        Some(&Value::Object(reference)) => reference,
+        Some(&Value::Null) => return Err(Trap::NullReference),
+        _ => return Err(Trap::TypeMismatch(Opcode::Call)),
+    };
+    if !vm.heap().is_string(reference) {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    }
+    Ok(Some(Value::ByRef(Location::StringChar {
+        string: reference,
+        byte_offset: 0,
+    })))
+}
+
+/// `System.String..ctor(char*)` -- an identity anchor: `newobj` on this constructor is
+/// routed by the interpreter through its frames-aware string materialization (the char*
+/// may name another frame's stackalloc buffer, which an intrinsic cannot reach), so this
+/// body never runs on that path; a direct `call` to a String constructor does not occur
+/// in the CIL csc or lcsc emit.
+///
+/// # Errors
+/// Always [`Trap::Unsupported`] (see above).
+pub fn string_ctor_char_ptr(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Err(Trap::Unsupported(Opcode::Newobj))
+}
+
+/// `System.String..ctor(char*, int, int)` -- an identity anchor exactly like
+/// [`string_ctor_char_ptr`]; the interpreter's `newobj` routing supplies the behavior.
+///
+/// # Errors
+/// Always [`Trap::Unsupported`] (see above).
+pub fn string_ctor_char_ptr_range(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Err(Trap::Unsupported(Opcode::Newobj))
 }
 
 /// `System.String.Concat(string, string, string)`: join three strings into a new
@@ -3685,6 +3742,352 @@ pub fn dns_resolve_host(
             .array_set(lengths, i, Value::Int32(address.len() as i32));
     }
     Ok(Some(Value::Int32(count as i32)))
+}
+
+
+/// The `i32` a unit fs result crosses the seam as: `0` for success, the error code otherwise.
+fn fs_unit_code(result: crate::fs::FsResult<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => error.code(),
+    }
+}
+
+/// `NativeFs.Open(string path, int mode, int access)`: opens/creates per the managed
+/// `FileMode`/`FileAccess`, returning the handle or a negative error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `path` is not a string or the codes are not ints.
+pub fn fs_open(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let (Some(&Value::Int32(mode)), Some(&Value::Int32(access))) = (args.get(1), args.get(2))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (Some(mode), Some(access)) = (
+        crate::fs::FileMode::from_i32(mode),
+        crate::fs::FileAccess::from_i32(access),
+    ) else {
+        return Ok(Some(Value::Int32(crate::fs::FsError::InvalidPath.code())));
+    };
+    let code = match vm.fs_backend() {
+        Some(backend) => match backend.open(&path, mode, access) {
+            Ok(handle) => handle as i32,
+            Err(error) => error.code(),
+        },
+        None => crate::fs::FsError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// The non-negative `u32` handle of an fs argument.
+fn fs_handle_arg(args: &[Value], index: usize) -> Result<u32, Trap> {
+    match args.get(index) {
+        Some(&Value::Int32(handle)) if handle >= 0 => Ok(handle as u32),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// `NativeFs.Read(int handle, byte[] buffer, int offset, int count)`: reads at the file
+/// position into the slice, returning the bytes read (`0` = end of file) or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on non-int/array arguments.
+pub fn fs_read(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = fs_handle_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (Some(&Value::Int32(offset)), Some(&Value::Int32(count))) = (args.get(2), args.get(3))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let code = {
+        let (heap, backend) = vm.heap_and_fs();
+        let Some(backend) = backend else {
+            return Ok(Some(Value::Int32(crate::fs::FsError::Io.code())));
+        };
+        match heap.array_u8_slice_mut(array, offset, count) {
+            Some(segment) => match backend.read(handle, segment) {
+                Ok(n) => n as i32,
+                Err(error) => error.code(),
+            },
+            None => {
+                let mut buf = alloc::vec![0u8; count];
+                match backend.read(handle, &mut buf) {
+                    Ok(n) => {
+                        for (i, &byte) in buf.iter().take(n).enumerate() {
+                            heap.array_set(array, offset + i, Value::Int32(i32::from(byte)));
+                        }
+                        n as i32
+                    }
+                    Err(error) => error.code(),
+                }
+            }
+        }
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeFs.Write(int handle, byte[] buffer, int offset, int count)`: writes the slice at
+/// the file position, returning the bytes written or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on non-int/array arguments.
+pub fn fs_write(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = fs_handle_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (Some(&Value::Int32(offset)), Some(&Value::Int32(count))) = (args.get(2), args.get(3))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let code = {
+        let (heap, backend) = vm.heap_and_fs();
+        let Some(backend) = backend else {
+            return Ok(Some(Value::Int32(crate::fs::FsError::Io.code())));
+        };
+        match heap.array_u8_slice(array, offset, count) {
+            Some(segment) => match backend.write(handle, segment) {
+                Ok(n) => n as i32,
+                Err(error) => error.code(),
+            },
+            None => {
+                let mut buf = alloc::vec![0u8; count];
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    let Some(Value::Int32(byte)) = heap.array_get(array, offset + i) else {
+                        return Err(Trap::TypeMismatch(Opcode::Call));
+                    };
+                    *slot = byte as u8;
+                }
+                match backend.write(handle, &buf) {
+                    Ok(n) => n as i32,
+                    Err(error) => error.code(),
+                }
+            }
+        }
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeFs.Seek(int handle, long offset, int origin)`: moves the position (origin 0 =
+/// begin / 1 = current / 2 = end), returning the new absolute position or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on malformed arguments.
+pub fn fs_seek(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = fs_handle_arg(args, 0)?;
+    let Some(&Value::Int64(offset)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(origin)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let code = match vm.fs_backend() {
+        Some(backend) => match backend.seek(handle, offset, origin) {
+            Ok(position) => position,
+            Err(error) => i64::from(error.code()),
+        },
+        None => i64::from(crate::fs::FsError::Io.code()),
+    };
+    Ok(Some(Value::Int64(code)))
+}
+
+/// `NativeFs.Length(int handle)`: the file's byte length, or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn fs_length(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = fs_handle_arg(args, 0)?;
+    let code = match vm.fs_backend() {
+        Some(backend) => match backend.length(handle) {
+            Ok(length) => length,
+            Err(error) => i64::from(error.code()),
+        },
+        None => i64::from(crate::fs::FsError::Io.code()),
+    };
+    Ok(Some(Value::Int64(code)))
+}
+
+/// `NativeFs.SetLength(int handle, long length)`: truncates or zero-extends; `0` or an
+/// error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on malformed arguments.
+pub fn fs_set_length(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = fs_handle_arg(args, 0)?;
+    let Some(&Value::Int64(length)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let code = match vm.fs_backend() {
+        Some(backend) => fs_unit_code(backend.set_length(handle, length)),
+        None => crate::fs::FsError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeFs.Flush(int handle)`: forces buffered writes out; `0` or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn fs_flush(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = fs_handle_arg(args, 0)?;
+    let code = match vm.fs_backend() {
+        Some(backend) => fs_unit_code(backend.flush(handle)),
+        None => crate::fs::FsError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeFs.Close(int handle)`: closes the handle (idempotent, void).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn fs_close(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = fs_handle_arg(args, 0)?;
+    if let Some(backend) = vm.fs_backend() {
+        backend.close(handle);
+    }
+    Ok(None)
+}
+
+/// `NativeFs.FileExists(string path)` / `NativeFs.DirExists(string path)`: existence tests
+/// (a missing backend reports `false` -- the exceptions belong to the mutating operations).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `path` is not a string.
+pub fn fs_file_exists(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let exists = vm.fs_backend().is_some_and(|backend| backend.file_exists(&path));
+    Ok(Some(Value::Int32(i32::from(exists))))
+}
+
+/// See [`fs_file_exists`].
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `path` is not a string.
+pub fn fs_dir_exists(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let exists = vm.fs_backend().is_some_and(|backend| backend.dir_exists(&path));
+    Ok(Some(Value::Int32(i32::from(exists))))
+}
+
+/// `NativeFs.DeleteFile(string path)`: deletes a file (missing file = success, matching
+/// `File.Delete`); `0` or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `path` is not a string.
+pub fn fs_delete_file(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let code = match vm.fs_backend() {
+        Some(backend) => fs_unit_code(backend.delete_file(&path)),
+        None => crate::fs::FsError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeFs.CreateDir(string path)`: creates the directory + missing parents; `0` or an
+/// error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `path` is not a string.
+pub fn fs_create_dir(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let code = match vm.fs_backend() {
+        Some(backend) => fs_unit_code(backend.create_dir(&path)),
+        None => crate::fs::FsError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeFs.DeleteDir(string path, bool recursive)`: deletes a directory (empty-only
+/// unless recursive); `0` or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on malformed arguments.
+pub fn fs_delete_dir(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let Some(&Value::Int32(recursive)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let code = match vm.fs_backend() {
+        Some(backend) => fs_unit_code(backend.delete_dir(&path, recursive != 0)),
+        None => crate::fs::FsError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeFs.Move(string from, string to)`: renames/moves a file or directory; `0` or an
+/// error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if either path is not a string.
+pub fn fs_move(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let from = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let to = string_value(vm, args.get(1)).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let code = match vm.fs_backend() {
+        Some(backend) => fs_unit_code(backend.move_entry(&from, &to)),
+        None => crate::fs::FsError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeFs.List(string path, bool dirsOnly)`: the directory's entry NAMES (files or
+/// subdirectories per the filter) as a `string[]`, or `null` on failure -- the managed
+/// `Directory.GetFiles`/`GetDirectories` maps null to the right exception (probing
+/// `DirExists` for the type) and joins the names onto the query path itself.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on malformed arguments.
+pub fn fs_list(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let path = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let Some(&Value::Int32(dirs_only)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let entries = match vm.fs_backend() {
+        Some(backend) => match backend.list_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(Some(Value::Null)),
+        },
+        None => return Ok(Some(Value::Null)),
+    };
+    let mut names: Vec<Value> = Vec::new();
+    for entry in entries {
+        if entry.is_dir == (dirs_only != 0) {
+            let chars: Vec<u16> = entry.name.encode_utf16().collect();
+            let name = vm.heap_mut().alloc_string(&chars);
+            names.push(Value::Object(name));
+        }
+    }
+    let array = vm.heap_mut().alloc_array(names);
+    Ok(Some(Value::Object(array)))
 }
 
 

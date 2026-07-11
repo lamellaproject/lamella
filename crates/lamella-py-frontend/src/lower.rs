@@ -332,6 +332,14 @@ fn inline_builtin(
             }, MirType::PyValue);
             (placeholder, MirType::PyValue)
         }
+        Builtin::Print => {
+            let placeholder =
+                emit(values, insts, Inst::WriteInt { value: args[0] }, MirType::PyValue);
+            (placeholder, MirType::PyValue)
+        }
+        Builtin::IntCast | Builtin::FloatCast | Builtin::Divmod | Builtin::Round => {
+            return Err(LowerError::DynamicOperation)
+        }
     })
 }
 
@@ -652,6 +660,7 @@ fn stack_exit(stack: &[StackEntry]) -> Result<Vec<(ValueId, MirType)>, LowerErro
         .map(|e| match e {
             StackEntry::Value(v, t) => Ok((*v, *t)),
             StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
+            StackEntry::Tuple(_) => Err(LowerError::DynamicOperation),
         })
         .collect()
 }
@@ -809,9 +818,9 @@ struct FuncSig {
 }
 
 /// A built-in the typed path handles with no runtime call: `abs`/`min`/`max` over integers
-/// (inlined to branchless arithmetic), and the MMIO primitives (lowered to a volatile
-/// `Store`/`Load`). Other built-ins (`len`, container/string operations) dispatch to the
-/// runtime and arrive with the dynamic surface.
+/// (inlined to branchless arithmetic), the MMIO primitives (lowered to a volatile `Store`/`Load`),
+/// and `print` of one int (lowered to a semihosting `WriteInt`). Other built-ins (`len`,
+/// container/string operations) dispatch to the runtime and arrive with the dynamic surface.
 ///
 /// The MMIO builtins are the AOT half of the language-neutral MMIO contract: `mmio_read{8,16,32}
 /// (addr) -> int` and `mmio_write{8,16,32}(addr, value)`, lowering to the SAME volatile ldr/str
@@ -826,6 +835,25 @@ enum Builtin {
     MmioRead { width: u32 },
     /// `mmio_write{8,16,32}(addr, value)` -- a volatile store of `width` bytes; returns None.
     MmioWrite { width: u32 },
+    /// `print(x)` for one int argument -- a semihosting `WriteInt` (signed decimal + newline);
+    /// returns None. Only the single-positional-int form; `print()`, multi-arg, and keyworded
+    /// `print` fall to the dynamic path (they need spacing/`sep`/`end` the primitive does not do).
+    Print,
+    /// `int(x)` on a numeric argument -- `int(int)` is identity, `int(float)` a `Float64ToInt`
+    /// convert (truncates toward zero == Python `int()`). A non-numeric arg (`int("5")`, base) is
+    /// dynamic. Handled in the `Call` op (it needs the argument's type), not `inline_builtin`.
+    IntCast,
+    /// `float(x)` on a numeric argument -- `float(float)` is identity, `float(int)` an `IntToFloat64`
+    /// convert. A non-numeric arg (`float("3.14")`) is dynamic. Handled in the `Call` op.
+    FloatCast,
+    /// `divmod(a, b)` on two ints -- returns the tuple `(a // b, a % b)`. Lowered in the `Call` op to
+    /// a threaded `StackEntry::Tuple` of the floor-quotient and floor-remainder (the same ops `//`
+    /// and `%` emit), so `q, r = divmod(a, b)` elides the heap tuple. Float args are dynamic.
+    Divmod,
+    /// `round(x)` (one arg) -- returns an int. `round(int)` is identity; `round(float)` is
+    /// round-half-to-even (`lamella_rint`) then `Float64ToInt`. `round(x, ndigits)` (two args, a float
+    /// result) is dynamic. Handled in the `Call` op (it needs the argument's type).
+    Round,
 }
 
 impl Builtin {
@@ -840,25 +868,39 @@ impl Builtin {
             "mmio_write8" => Some(Builtin::MmioWrite { width: 1 }),
             "mmio_write16" => Some(Builtin::MmioWrite { width: 2 }),
             "mmio_write32" => Some(Builtin::MmioWrite { width: 4 }),
+            "print" => Some(Builtin::Print),
+            "int" => Some(Builtin::IntCast),
+            "float" => Some(Builtin::FloatCast),
+            "divmod" => Some(Builtin::Divmod),
+            "round" => Some(Builtin::Round),
             _ => None,
         }
     }
 
     fn arity(self) -> usize {
         match self {
-            Builtin::Abs | Builtin::MmioRead { .. } => 1,
-            Builtin::Min | Builtin::Max | Builtin::MmioWrite { .. } => 2,
+            Builtin::Abs
+            | Builtin::MmioRead { .. }
+            | Builtin::Print
+            | Builtin::IntCast
+            | Builtin::FloatCast
+            | Builtin::Round => 1,
+            Builtin::Min | Builtin::Max | Builtin::MmioWrite { .. } | Builtin::Divmod => 2,
         }
     }
 }
 
-/// One operand-stack slot during abstract interpretation: a typed value, or a reference
-/// to a callee -- a user function or a built-in -- pushed by `LoadGlobal` and consumed
-/// by `Call`. Keeping callees on the stack lets nested calls (`f(g(x))`) resolve.
+/// One operand-stack slot during abstract interpretation: a typed value; a reference to a
+/// callee -- a user function or a built-in -- pushed by `LoadGlobal` and consumed by `Call`
+/// (keeping callees on the stack lets nested calls `f(g(x))` resolve); or a threaded `Tuple`
+/// of typed values, pushed by `BuildTuple` and consumed by `UnpackSequence`, which lets the
+/// `a, b = <exprs>` idiom elide its heap tuple (any other consumer pops it as a plain value
+/// via `pop_value` and falls to the dynamic path -- a real tuple object).
 enum StackEntry {
     Value(ValueId, MirType),
     Callable(FuncSig),
     Builtin(Builtin),
+    Tuple(Vec<(ValueId, MirType)>),
 }
 
 fn pop(stack: &mut Vec<StackEntry>) -> Result<StackEntry, LowerError> {
@@ -866,11 +908,13 @@ fn pop(stack: &mut Vec<StackEntry>) -> Result<StackEntry, LowerError> {
 }
 
 /// Pop a typed value; a callee here means a function or built-in name used as a plain
-/// value, which the typed subset does not support.
+/// value, which the typed subset does not support. A `Tuple` entry that was not consumed by
+/// an `UnpackSequence` is a real (heap) tuple value -- dynamic in the typed lane.
 fn pop_value(stack: &mut Vec<StackEntry>) -> Result<(ValueId, MirType), LowerError> {
     match pop(stack)? {
         StackEntry::Value(v, t) => Ok((v, t)),
         StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
+        StackEntry::Tuple(_) => Err(LowerError::DynamicOperation),
     }
 }
 
@@ -943,7 +987,7 @@ fn lower_op(
             let (value, _ty) = pop_value(stack)?;
             locals[slot] = value;
         }
-        bc::Op::Binary(b) => {
+        bc::Op::Binary(b) | bc::Op::InplaceBinOp(b) => {
             let (rhs, rt) = pop_value(stack)?;
             let (lhs, lt) = pop_value(stack)?;
             if lt == MirType::F64 || rt == MirType::F64 || matches!(b, bc::BinOp::TrueDiv) {
@@ -1111,8 +1155,28 @@ fn lower_op(
         bc::Op::BuildSlice => {
             return Err(LowerError::DynamicOperation);
         }
-        bc::Op::BuildList(_) | bc::Op::BuildTuple(_) | bc::Op::BuildDict(_) => {
+        bc::Op::BuildList(_) | bc::Op::BuildDict(_) => {
             return Err(LowerError::DynamicOperation);
+        }
+        bc::Op::BuildTuple(n) => {
+            let n = *n as usize;
+            let mut elems = Vec::with_capacity(n);
+            for _ in 0..n {
+                elems.push(pop_value(stack)?);
+            }
+            elems.reverse();
+            stack.push(StackEntry::Tuple(elems));
+        }
+        bc::Op::UnpackSequence(n) => {
+            let n = *n as usize;
+            match pop(stack)? {
+                StackEntry::Tuple(elems) if elems.len() == n => {
+                    for (v, t) in elems.into_iter().rev() {
+                        stack.push(StackEntry::Value(v, t));
+                    }
+                }
+                _ => return Err(LowerError::DynamicOperation),
+            }
         }
         bc::Op::GetIter | bc::Op::ForIter(_) => {
             return Err(LowerError::DynamicOperation);
@@ -1135,10 +1199,10 @@ fn lower_op(
         }
         bc::Op::MakeFunction { .. }
         | bc::Op::Yield
+        | bc::Op::YieldFrom
         | bc::Op::CallEx { .. }
         | bc::Op::BuildClass
         | bc::Op::SetAttr { .. }
-        | bc::Op::UnpackSequence(_)
         | bc::Op::ListAppend
         | bc::Op::SetAdd
         | bc::Op::DictInsert
@@ -1152,7 +1216,9 @@ fn lower_op(
         | bc::Op::StoreName(_)
         | bc::Op::LoadName(_)
         | bc::Op::ImportName(_)
-        | bc::Op::ImportFrom(_) => {
+        | bc::Op::ImportFrom(_)
+        | bc::Op::ImportStar
+        | bc::Op::StoreGlobal(_) => {
             return Err(LowerError::DynamicOperation);
         }
         bc::Op::PopTop => {
@@ -1211,6 +1277,120 @@ fn lower_op(
                     }));
                     stack.push(StackEntry::Value(id, sig.ret));
                 }
+                StackEntry::Builtin(Builtin::Divmod) => {
+                    if argc != 2 {
+                        return Err(LowerError::ArityMismatch {
+                            expected: 2,
+                            found: argc,
+                        });
+                    }
+                    let (lhs, lt) = typed_args[0];
+                    let (rhs, rt) = typed_args[1];
+                    if lt != MirType::I32 || rt != MirType::I32 {
+                        return Err(LowerError::DynamicOperation);
+                    }
+                    let trunc_q = emit(values, insts, Inst::Binary {
+                        op: MBinOp::DivSigned,
+                        lhs,
+                        rhs,
+                    }, MirType::I32);
+                    let trunc_r = emit(values, insts, Inst::Binary {
+                        op: MBinOp::RemSigned,
+                        lhs,
+                        rhs,
+                    }, MirType::I32);
+                    let adjust = floor_adjust(values, insts, trunc_r, lhs, rhs);
+                    let q = emit(values, insts, Inst::Binary {
+                        op: MBinOp::Sub,
+                        lhs: trunc_q,
+                        rhs: adjust,
+                    }, MirType::I32);
+                    let adjust_b = emit(values, insts, Inst::Binary {
+                        op: MBinOp::Mul,
+                        lhs: adjust,
+                        rhs,
+                    }, MirType::I32);
+                    let r = emit(values, insts, Inst::Binary {
+                        op: MBinOp::Add,
+                        lhs: trunc_r,
+                        rhs: adjust_b,
+                    }, MirType::I32);
+                    stack.push(StackEntry::Tuple(vec![(q, MirType::I32), (r, MirType::I32)]));
+                }
+                StackEntry::Builtin(Builtin::Abs) => {
+                    if argc != 1 {
+                        return Err(LowerError::ArityMismatch {
+                            expected: 1,
+                            found: argc,
+                        });
+                    }
+                    let (value, ty) = typed_args[0];
+                    match ty {
+                        MirType::I32 => {
+                            let (id, rty) = inline_builtin(Builtin::Abs, values, insts, &[value])?;
+                            stack.push(StackEntry::Value(id, rty));
+                        }
+                        MirType::F64 => {
+                            let id = emit(values, insts, Inst::PInvoke {
+                                import: "lamella_fabs".into(),
+                                args: vec![value],
+                            }, MirType::F64);
+                            stack.push(StackEntry::Value(id, MirType::F64));
+                        }
+                        _ => return Err(LowerError::DynamicOperation),
+                    }
+                }
+                StackEntry::Builtin(Builtin::Round) => {
+                    if argc != 1 {
+                        return Err(LowerError::DynamicOperation);
+                    }
+                    let (value, ty) = typed_args[0];
+                    let id = match ty {
+                        MirType::I32 => value,
+                        MirType::F64 => {
+                            let rounded = emit(values, insts, Inst::PInvoke {
+                                import: "lamella_rint".into(),
+                                args: vec![value],
+                            }, MirType::F64);
+                            emit(values, insts, Inst::Convert {
+                                value: rounded,
+                                kind: ConvKind::Float64ToInt,
+                            }, MirType::I32)
+                        }
+                        _ => return Err(LowerError::DynamicOperation),
+                    };
+                    stack.push(StackEntry::Value(id, MirType::I32));
+                }
+                StackEntry::Builtin(cast @ (Builtin::IntCast | Builtin::FloatCast)) => {
+                    if argc != 1 {
+                        return Err(LowerError::ArityMismatch {
+                            expected: 1,
+                            found: argc,
+                        });
+                    }
+                    let (value, ty) = typed_args[0];
+                    let (id, rty) = match (cast, ty) {
+                        (Builtin::IntCast, MirType::I32) | (Builtin::FloatCast, MirType::F64) => {
+                            (value, ty)
+                        }
+                        (Builtin::IntCast, MirType::F64) => (
+                            emit(values, insts, Inst::Convert {
+                                value,
+                                kind: ConvKind::Float64ToInt,
+                            }, MirType::I32),
+                            MirType::I32,
+                        ),
+                        (Builtin::FloatCast, MirType::I32) => (
+                            emit(values, insts, Inst::Convert {
+                                value,
+                                kind: ConvKind::IntToFloat64,
+                            }, MirType::F64),
+                            MirType::F64,
+                        ),
+                        _ => return Err(LowerError::DynamicOperation),
+                    };
+                    stack.push(StackEntry::Value(id, rty));
+                }
                 StackEntry::Builtin(builtin) => {
                     let mut args = Vec::with_capacity(argc);
                     for (value, ty) in typed_args {
@@ -1222,7 +1402,9 @@ fn lower_op(
                     let (id, ty) = inline_builtin(builtin, values, insts, &args)?;
                     stack.push(StackEntry::Value(id, ty));
                 }
-                StackEntry::Value(..) => return Err(LowerError::CallTargetNotCallable),
+                StackEntry::Value(..) | StackEntry::Tuple(_) => {
+                    return Err(LowerError::CallTargetNotCallable);
+                }
             }
         }
         bc::Op::CallKw { argc, kwnames } => {
@@ -1252,7 +1434,7 @@ fn lower_op(
             pos_values.reverse();
             let sig = match pop(stack)? {
                 StackEntry::Callable(sig) => sig,
-                StackEntry::Builtin(_) | StackEntry::Value(..) => {
+                StackEntry::Builtin(_) | StackEntry::Value(..) | StackEntry::Tuple(_) => {
                     return Err(LowerError::CallTargetNotCallable);
                 }
             };
@@ -1982,5 +2164,181 @@ def sign(n: int) -> int:
             lower_module(&module),
             Err(LowerError::UnresolvedGlobal(_))
         ));
+    }
+
+    #[test]
+    fn a_parallel_assignment_lowers_fully_typed_with_no_heap_tuple() {
+        let func = lower_named(
+            "def f() -> int:\n    a, b = 1, 2\n    a, b = b, a\n    return a * 10 + b\n",
+            "f",
+        );
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::Call { .. })), 0);
+    }
+
+    #[test]
+    fn a_swap_is_pure_value_threading() {
+        let func = lower_named(
+            "def f(a: int, b: int) -> int:\n    a, b = b, a\n    return a - b\n",
+            "f",
+        );
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::Binary { .. })), 1);
+    }
+
+    #[test]
+    fn fib_via_parallel_assignment_lowers_and_verifies() {
+        let func = lower_named(
+            "def fib(n: int) -> int:\n    a, b = 0, 1\n    i: int = 0\n    while i < n:\n        a, b = b, a + b\n        i = i + 1\n    return a\n",
+            "fib",
+        );
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+        assert!(func
+            .blocks
+            .iter()
+            .any(|b| matches!(b.terminator, Some(Terminator::Branch { .. }))));
+    }
+
+    #[test]
+    fn a_returned_tuple_falls_to_the_dynamic_path() {
+        let module = compile_str("test", "def f() -> int:\n    t = (1, 2)\n    return t[0]\n")
+            .expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn a_tuple_arity_mismatch_falls_to_the_dynamic_path() {
+        let module = compile_str("test", "def f() -> int:\n    a, b, c = 1, 2\n    return a\n")
+            .expect("compiles");
+        assert_eq!(lower_module(&module), Err(LowerError::DynamicOperation));
+    }
+
+    #[test]
+    fn print_of_an_int_lowers_to_a_semihosting_write() {
+        let func = lower_named(
+            "def f(x: int) -> int:\n    print(x)\n    print(x + 1)\n    return 0\n",
+            "f",
+        );
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::WriteInt { .. })), 2);
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::Call { .. })), 0);
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn print_of_the_wrong_arity_or_a_keyword_falls_to_the_dynamic_path() {
+        let two =
+            compile_str("test", "def f(a: int, b: int) -> int:\n    print(a, b)\n    return 0\n")
+                .expect("compiles");
+        assert!(lower_module(&two).is_err());
+        let kw = compile_str("test", "def f(a: int) -> int:\n    print(a, end=\"\")\n    return 0\n")
+            .expect("compiles");
+        assert!(lower_module(&kw).is_err());
+    }
+
+    #[test]
+    fn int_and_float_conversions_lower_to_converts() {
+        let to_int = lower_named("def f(x: float) -> int:\n    return int(x)\n", "f");
+        assert_eq!(
+            count_insts(&to_int, |i| matches!(i, Inst::Convert {
+                kind: ConvKind::Float64ToInt,
+                ..
+            })),
+            1
+        );
+        let to_float = lower_named("def f(n: int) -> float:\n    return float(n)\n", "f");
+        assert_eq!(
+            count_insts(&to_float, |i| matches!(i, Inst::Convert {
+                kind: ConvKind::IntToFloat64,
+                ..
+            })),
+            1
+        );
+    }
+
+    #[test]
+    fn a_same_type_conversion_is_identity() {
+        let ii = lower_named("def f(n: int) -> int:\n    return int(n)\n", "f");
+        assert_eq!(count_insts(&ii, |i| matches!(i, Inst::Convert { .. })), 0);
+        let ff = lower_named("def f(x: float) -> float:\n    return float(x)\n", "f");
+        assert_eq!(count_insts(&ff, |i| matches!(i, Inst::Convert { .. })), 0);
+    }
+
+    #[test]
+    fn a_conversion_of_a_non_numeric_falls_to_the_dynamic_path() {
+        let module =
+            compile_str("test", "def f() -> int:\n    return int(\"5\")\n").expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn divmod_lowers_to_a_threaded_tuple_with_no_heap_tuple_or_call() {
+        let func = lower_named(
+            "def f(a: int, b: int) -> int:\n    q, r = divmod(a, b)\n    return q * 100 + r\n",
+            "f",
+        );
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::Call { .. })), 0);
+        assert_eq!(count_insts(&func, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+        assert_eq!(
+            count_insts(&func, |i| matches!(i, Inst::Binary {
+                op: MBinOp::DivSigned,
+                ..
+            })),
+            1
+        );
+        assert_eq!(
+            count_insts(&func, |i| matches!(i, Inst::Binary {
+                op: MBinOp::RemSigned,
+                ..
+            })),
+            1
+        );
+    }
+
+    #[test]
+    fn divmod_on_floats_falls_to_the_dynamic_path() {
+        let module = compile_str("test", "def f(a: float, b: float) -> int:\n    q, r = divmod(a, b)\n    return int(q)\n")
+            .expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn a_divmod_result_not_unpacked_falls_to_the_dynamic_path() {
+        let module = compile_str("test", "def f(a: int, b: int) -> int:\n    t = divmod(a, b)\n    return t[0]\n")
+            .expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn abs_of_a_float_lowers_to_a_fabs_pinvoke() {
+        let ff = lower_named("def f(x: float) -> float:\n    return abs(x)\n", "f");
+        assert_eq!(
+            count_insts(&ff, |i| matches!(i, Inst::PInvoke { import, .. } if &**import == "lamella_fabs")),
+            1
+        );
+        assert_eq!(count_insts(&ff, |i| matches!(i, Inst::Call { .. })), 0);
+        let fi = lower_named("def f(x: int) -> int:\n    return abs(x)\n", "f");
+        assert_eq!(count_insts(&fi, |i| matches!(i, Inst::PInvoke { .. })), 0);
+        assert!(count_insts(&fi, |i| matches!(i, Inst::Binary {
+            op: MBinOp::ShrSigned,
+            ..
+        })) >= 1);
+    }
+
+    #[test]
+    fn round_of_a_float_lowers_to_rint_then_to_int() {
+        let rf = lower_named("def f(x: float) -> int:\n    return round(x)\n", "f");
+        assert_eq!(
+            count_insts(&rf, |i| matches!(i, Inst::PInvoke { import, .. } if &**import == "lamella_rint")),
+            1
+        );
+        assert_eq!(
+            count_insts(&rf, |i| matches!(i, Inst::Convert {
+                kind: ConvKind::Float64ToInt,
+                ..
+            })),
+            1
+        );
+        let ri = lower_named("def f(x: int) -> int:\n    return round(x)\n", "f");
+        assert_eq!(count_insts(&ri, |i| matches!(i, Inst::PInvoke { .. })), 0);
+        assert_eq!(count_insts(&ri, |i| matches!(i, Inst::Convert { .. })), 0);
     }
 }

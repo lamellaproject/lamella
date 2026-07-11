@@ -80,9 +80,10 @@ enum MatchPattern {
     Capture(String),
     /// a literal or dotted value (`1`, `"a"`, `None`, `Color.RED`) -- matches when subject == value.
     Value(Expr),
-    /// `p1 | p2 | ...` -- matches when any alternative sub-pattern matches. The alternatives are
-    /// non-binding (values, bare classes, non-capturing sequences, wildcards), so the whole pattern
-    /// binds nothing; a binding alternative (a capture inside an `|`) is out of the subset.
+    /// `p1 | p2 | ...` -- matches when any alternative sub-pattern matches. Every alternative must
+    /// bind the same set of names (CPython's rule); the whole pattern binds those names from whichever
+    /// alternative matched. A non-binding OR (values, bare classes, non-capturing sequences, wildcards)
+    /// binds nothing, the common case.
     Or(Vec<MatchPattern>),
     /// `(p0, p1, ...)` / `[p0, ...]` -- a sequence pattern: matches a list/tuple whose elements match
     /// the sub-patterns (each a capture / wildcard / value / nested sequence / class). With
@@ -233,8 +234,8 @@ fn or_tests(acc: Option<Expr>, next: Option<Expr>) -> Option<Expr> {
 }
 
 /// Whether a pattern binds any name (a capture / as-pattern, or a structural pattern containing one).
-/// An OR pattern's alternatives must not bind (CPython requires every alternative to bind the same
-/// names; this subset supports only non-binding alternatives).
+/// Used to tell a non-binding OR (no bindings to reconcile) from a binding OR (bind from whichever
+/// alternative matched).
 fn pattern_binds(pattern: &MatchPattern) -> bool {
     match pattern {
         MatchPattern::Wildcard | MatchPattern::Value(_) => false,
@@ -253,6 +254,58 @@ fn pattern_binds(pattern: &MatchPattern) -> bool {
             rest.is_some() || items.iter().any(|(_, p)| pattern_binds(p))
         }
     }
+}
+
+/// Collect the names a pattern binds (a capture, an `as`, a `*rest` / `**rest`, or a structural
+/// pattern containing them). Used to check that an OR pattern's alternatives all bind the same names.
+fn pattern_bound_names(pattern: &MatchPattern, out: &mut Vec<String>) {
+    match pattern {
+        MatchPattern::Wildcard | MatchPattern::Value(_) => {}
+        MatchPattern::Capture(n) => out.push(n.clone()),
+        MatchPattern::As { pattern, name } => {
+            out.push(name.clone());
+            pattern_bound_names(pattern, out);
+        }
+        MatchPattern::Or(alts) => {
+            if let Some(first) = alts.first() {
+                pattern_bound_names(first, out);
+            }
+        }
+        MatchPattern::Sequence { elems, .. } => {
+            for e in elems {
+                pattern_bound_names(e, out);
+            }
+        }
+        MatchPattern::Class {
+            positional,
+            keywords,
+            ..
+        } => {
+            for p in positional {
+                pattern_bound_names(p, out);
+            }
+            for (_, p) in keywords {
+                pattern_bound_names(p, out);
+            }
+        }
+        MatchPattern::Mapping { items, rest } => {
+            if let Some(r) = rest {
+                out.push(r.clone());
+            }
+            for (_, p) in items {
+                pattern_bound_names(p, out);
+            }
+        }
+    }
+}
+
+/// A pattern's bound names, sorted and de-duplicated -- for comparing two alternatives' bindings.
+fn sorted_bound_names(pattern: &MatchPattern) -> Vec<String> {
+    let mut names = Vec::new();
+    pattern_bound_names(pattern, &mut names);
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// The success body of a case, gated by its guard: `if guard: body else: rest` when there is a
@@ -289,14 +342,28 @@ fn match_pattern(pattern: &MatchPattern, subject: &Expr) -> (Option<Expr>, Vec<S
         ),
         MatchPattern::Value(value) => (Some(eq(subject, value.clone())), Vec::new()),
         MatchPattern::Or(alts) => {
-            let mut iter = alts.iter();
-            let (mut test, _) =
-                match_pattern(iter.next().expect("an OR pattern has alternatives"), subject);
-            for alt in iter {
-                let (t, _) = match_pattern(alt, subject);
-                test = or_tests(test, t);
+            let matched: Vec<(Option<Expr>, Vec<Stmt>)> =
+                alts.iter().map(|a| match_pattern(a, subject)).collect();
+            let mut iter = matched.iter();
+            let mut test = iter.next().expect("an OR pattern has alternatives").0.clone();
+            for (t, _) in iter {
+                test = or_tests(test, t.clone());
             }
-            (test, Vec::new())
+            if !alts.iter().any(pattern_binds) {
+                return (test, Vec::new());
+            }
+            let mut chain = matched.last().expect("an OR has alternatives").1.clone();
+            for (t, b) in matched.iter().rev().skip(1) {
+                chain = match t {
+                    None => b.clone(),
+                    Some(cond) => vec![Stmt::If {
+                        test: cond.clone(),
+                        body: b.clone(),
+                        orelse: chain,
+                    }],
+                };
+            }
+            (test, chain)
         }
         MatchPattern::Sequence { elems, star } => match_sequence(subject, elems, *star),
         MatchPattern::Class {
@@ -724,8 +791,8 @@ impl Parser {
         Ok(Stmt::Import { modules })
     }
 
-    /// `from module import name [as alias] (, name [as alias])*`. `from m import *` and dotted module
-    /// names are out of this subset.
+    /// `from module import name [as alias] (, name [as alias])*`, or `from module import *`. Dotted
+    /// module names are out of this subset.
     fn parse_from_import(&mut self) -> Result<Stmt, ParseError> {
         self.advance();
         let module = self.expect_name()?;
@@ -736,8 +803,9 @@ impl Parser {
             return Err(self.error("expected 'import' after the module name in a `from` import"));
         }
         self.advance();
-        if self.at(&Tok::Star) {
-            return Err(self.error("`from module import *` is not supported in this subset"));
+        if self.eat(&Tok::Star) {
+            self.expect_newline()?;
+            return Ok(Stmt::ImportStar { module });
         }
         let mut names = Vec::new();
         loop {
@@ -881,11 +949,13 @@ impl Parser {
         while self.eat(&Tok::Pipe) {
             alts.push(self.parse_closed_pattern()?);
         }
-        if alts.iter().any(pattern_binds) {
-            return Err(self.error(
-                "an `|` (or) pattern's alternatives must not bind names (a capture / `as` inside \
-                 `a | b` is out of the match subset)",
-            ));
+        let expected = sorted_bound_names(&alts[0]);
+        for alt in &alts[1..] {
+            if sorted_bound_names(alt) != expected {
+                return Err(self.error(
+                    "the alternatives of an `|` (or) pattern must all bind the same names",
+                ));
+            }
         }
         Ok(MatchPattern::Or(alts))
     }
@@ -1126,6 +1196,8 @@ impl Parser {
             self.parse_raise()
         } else if matches!(self.peek(), Tok::Reserved(s) if s == "nonlocal") {
             self.parse_nonlocal()
+        } else if matches!(self.peek(), Tok::Reserved(s) if s == "global") {
+            self.parse_global()
         } else {
             self.parse_assign_or_expr()
         }
@@ -1141,6 +1213,19 @@ impl Parser {
         }
         self.expect_newline()?;
         Ok(Stmt::Nonlocal(names))
+    }
+
+    /// `global name (, name)*` -- a declaration; it binds the listed names to the module globals, so
+    /// this function's reads resolve the global and its assignments store to the module namespace.
+    /// Emits no code itself.
+    fn parse_global(&mut self) -> Result<Stmt, ParseError> {
+        self.advance();
+        let mut names = vec![self.expect_name()?];
+        while self.eat(&Tok::Comma) {
+            names.push(self.expect_name()?);
+        }
+        self.expect_newline()?;
+        Ok(Stmt::Global(names))
     }
 
     fn parse_raise(&mut self) -> Result<Stmt, ParseError> {
@@ -1281,7 +1366,7 @@ impl Parser {
                     Ok(Stmt::Assign(Assign {
                         target: target.clone(),
                         annotation: None,
-                        value: Some(Expr::Binary {
+                        value: Some(Expr::InplaceBinary {
                             op,
                             lhs: Box::new(Expr::Name(target)),
                             rhs: Box::new(value),
@@ -1544,12 +1629,22 @@ impl Parser {
     fn parse_for(&mut self) -> Result<Stmt, ParseError> {
         self.expect(&Tok::KwFor, "'for'")?;
         let line = self.current_line();
-        let mut targets = vec![self.for_target(line)?];
-        while self.eat(&Tok::Comma) {
+        let mut targets = Vec::new();
+        let mut star: Option<usize> = None;
+        loop {
+            if self.eat(&Tok::Star) {
+                if star.is_some() {
+                    return Err(self.error("a for-loop target may have at most one starred name"));
+                }
+                star = Some(targets.len());
+            }
+            targets.push(self.for_target(line)?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
             if self.at(&Tok::KwIn) {
                 break;
             }
-            targets.push(self.for_target(line)?);
         }
         self.expect(&Tok::KwIn, "'in'")?;
         let iter = self.parse_rhs_value()?;
@@ -1557,25 +1652,27 @@ impl Parser {
         let mut body = self.parse_suite()?;
         let orelse = self.parse_loop_else()?;
 
-        if let [AssignTarget::Name(name)] = targets.as_slice() {
-            let target = name.clone();
-            if is_range_call(&iter) {
-                if let Ok((start, stop, step)) = self.range_bounds(iter.clone()) {
-                    return Ok(Stmt::For { target, start, stop, step, body, orelse });
+        if star.is_none() {
+            if let [AssignTarget::Name(name)] = targets.as_slice() {
+                let target = name.clone();
+                if is_range_call(&iter) {
+                    if let Ok((start, stop, step)) = self.range_bounds(iter.clone()) {
+                        return Ok(Stmt::For { target, start, stop, step, body, orelse });
+                    }
                 }
+                return Ok(Stmt::ForIter { target, iterable: iter, body, orelse });
             }
-            return Ok(Stmt::ForIter { target, iterable: iter, body, orelse });
         }
 
-        let unpack_targets = match targets.as_slice() {
-            [AssignTarget::Tuple(inner)] => inner.clone(),
-            _ => targets,
+        let (unpack_targets, unpack_star) = match targets.as_slice() {
+            [AssignTarget::Tuple(inner)] if star.is_none() => (inner.clone(), None),
+            _ => (targets, star),
         };
         let tmp = String::from(".unpack");
         let mut new_body = Vec::with_capacity(body.len() + 1);
         new_body.push(Stmt::TupleAssign {
             targets: unpack_targets,
-            star: None,
+            star: unpack_star,
             value: Expr::Name(tmp.clone()),
         });
         new_body.append(&mut body);
@@ -2062,11 +2159,14 @@ impl Parser {
     /// `yield_expr: "yield" [expression_list]`. A bare `yield` yields `None`; `yield e` yields `e`;
     /// and `yield a, b` yields the tuple `(a, b)` (an expression list, like a bare value position),
     /// with a `*` spread allowed after the first element. A `yield` anywhere in a function body makes
-    /// it a generator. (`yield from` is not yet in the subset.)
+    /// it a generator. `yield from e` delegates to the sub-iterator `e` (a single expression, not an
+    /// expression list).
     fn parse_yield(&mut self) -> Result<Expr, ParseError> {
         self.expect(&Tok::KwYield, "'yield'")?;
         if matches!(self.peek(), Tok::Reserved(s) if s == "from") {
-            return Err(self.error("'yield from' is not supported in this subset"));
+            self.advance();
+            let value = self.parse_expr()?;
+            return Ok(Expr::YieldFrom(Box::new(value)));
         }
         let bare = matches!(
             self.peek(),
@@ -2575,10 +2675,18 @@ impl Parser {
             }
         } else if conversion.is_some() {
             node
-        } else {
-            let func = if debug.is_some() { "repr" } else { "str" };
+        } else if debug.is_some() {
             Expr::Call {
-                func: Box::new(Expr::Name(String::from(func))),
+                func: Box::new(Expr::Name(String::from("repr"))),
+                args: vec![node],
+                keywords: Vec::new(),
+            }
+        } else {
+            Expr::Call {
+                func: Box::new(Expr::Attribute {
+                    value: Box::new(Expr::Str(String::from("{}"))),
+                    attr: String::from("format"),
+                }),
                 args: vec![node],
                 keywords: Vec::new(),
             }
@@ -3241,15 +3349,15 @@ mod tests {
     }
 
     #[test]
-    fn augmented_assignment_desugars_to_a_binary_assign() {
+    fn augmented_assignment_desugars_to_an_inplace_binary_assign() {
         let module = parse_ok("x += 5\n");
         let Stmt::Assign(assign) = &module.body[0] else {
             panic!("expected an assignment");
         };
         assert_eq!(assign.target, "x");
         assert_eq!(assign.annotation, None);
-        let Some(Expr::Binary { op, lhs, .. }) = &assign.value else {
-            panic!("expected a binary value");
+        let Some(Expr::InplaceBinary { op, lhs, .. }) = &assign.value else {
+            panic!("expected an in-place binary value");
         };
         assert_eq!(*op, BinOp::Add);
         assert_eq!(**lhs, Expr::Name("x".into()));
@@ -3275,8 +3383,8 @@ mod tests {
             let Stmt::Assign(assign) = &module.body[0] else {
                 panic!("expected an assignment for {src:?}");
             };
-            let Some(Expr::Binary { op, .. }) = &assign.value else {
-                panic!("expected a binary value for {src:?}");
+            let Some(Expr::InplaceBinary { op, .. }) = &assign.value else {
+                panic!("expected an in-place binary value for {src:?}");
             };
             assert_eq!(*op, want, "for source {src:?}");
         }
@@ -3368,12 +3476,16 @@ mod tests {
     }
 
     #[test]
-    fn fstring_desugars_to_str_and_concat() {
+    fn fstring_desugars_to_format_and_concat() {
         let single = parse_ok("f\"{x}\"\n");
         let Stmt::Expr(Expr::Call { func, args, .. }) = &single.body[0] else {
-            panic!("expected str(x)");
+            panic!("expected \"{{}}\".format(x)");
         };
-        assert!(matches!(&**func, Expr::Name(n) if n == "str"));
+        let Expr::Attribute { value, attr } = &**func else {
+            panic!("expected a .format attribute call");
+        };
+        assert!(matches!(&**value, Expr::Str(s) if s == "{}"));
+        assert_eq!(attr, "format");
         assert!(matches!(&args[0], Expr::Name(n) if n == "x"));
         assert!(matches!(parse_ok("f\"plain\"\n").body[0], Stmt::Expr(Expr::Str(_))));
         let braces = parse_ok("f\"{{x}}\"\n");
@@ -3412,9 +3524,9 @@ mod tests {
             if matches!(&**func, Expr::Attribute { attr, .. } if attr == "format")));
         let cmp = parse_ok("f\"{a == b}\"\n");
         let Stmt::Expr(Expr::Call { func, args, .. }) = &cmp.body[0] else {
-            panic!("expected str(a == b)");
+            panic!("expected \"{{}}\".format(a == b)");
         };
-        assert!(matches!(&**func, Expr::Name(n) if n == "str"));
+        assert!(matches!(&**func, Expr::Attribute { attr, .. } if attr == "format"));
         assert!(matches!(&args[0], Expr::Compare { .. }));
     }
 
@@ -3508,7 +3620,7 @@ mod tests {
         assert!(matches!(&**lhs, Expr::Binary { op: BinOp::MatMul, .. }));
         assert!(matches!(
             parse_ok("a @= b\n").body[0],
-            Stmt::Assign(Assign { value: Some(Expr::Binary { op: BinOp::MatMul, .. }), .. })
+            Stmt::Assign(Assign { value: Some(Expr::InplaceBinary { op: BinOp::MatMul, .. }), .. })
         ));
         assert!(matches!(
             parse_ok("@d\ndef f():\n    pass\n").body[0],
@@ -3829,7 +3941,7 @@ mod tests {
     }
 
     #[test]
-    fn or_patterns_allow_non_binding_alternatives() {
+    fn or_patterns_require_alternatives_to_bind_the_same_names() {
         for src in [
             "match v:\n    case 1 | 2 | 3:\n        pass\n",
             "match v:\n    case int() | float():\n        pass\n",
@@ -3839,14 +3951,16 @@ mod tests {
             "match v:\n    case 1 | _:\n        pass\n",
             "match v:\n    case [1 | 2, x]:\n        pass\n",
             "match v:\n    case (0, 0) | [0, 0]:\n        pass\n",
+            "match v:\n    case [x] | (x,):\n        pass\n",
+            "match v:\n    case [x, y] | (y, x):\n        pass\n",
         ] {
             assert!(parse_src(src).is_ok(), "should parse: {src:?}");
         }
         for src in [
             "match v:\n    case x | y:\n        pass\n",
-            "match v:\n    case [x] | (x,):\n        pass\n",
             "match v:\n    case Point(a) | Circle():\n        pass\n",
             "match v:\n    case 1 | x:\n        pass\n",
+            "match v:\n    case [x] | [x, y]:\n        pass\n",
         ] {
             assert!(parse_src(src).is_err(), "should reject: {src:?}");
         }
@@ -4251,8 +4365,13 @@ else:
         assert!(parse_src("1 = x\n").is_err());
         assert!(parse_src("def f(a=1, b): return a\n").is_err());
         assert!(parse_src("import a.b\n").is_err());
-        assert!(parse_src("from m import *\n").is_err());
-        assert!(parse_src("global x\n").is_err());
+        assert!(parse_src("from a.b import *\n").is_err());
+    }
+
+    #[test]
+    fn import_star_parses() {
+        let m = parse_ok("from math import *\n");
+        assert_eq!(m.body, vec![Stmt::ImportStar { module: "math".into() }]);
     }
 
     #[test]
@@ -4459,8 +4578,23 @@ else:
     }
 
     #[test]
-    fn yield_from_is_rejected() {
-        assert!(parse_src("def g():\n    yield from xs\n").is_err());
+    fn yield_from_parses() {
+        let m = parse_ok("def g():\n    yield from xs\n");
+        let Stmt::FuncDef(func) = &m.body[0] else {
+            panic!("expected a function");
+        };
+        let Stmt::Expr(Expr::YieldFrom(v)) = &func.body[0] else {
+            panic!("expected a yield-from expression");
+        };
+        assert_eq!(**v, Expr::Name("xs".into()));
+        let rv = parse_ok("def g():\n    x = yield from g2()\n");
+        let Stmt::FuncDef(func) = &rv.body[0] else {
+            panic!("expected a function");
+        };
+        let Stmt::Assign(a) = &func.body[0] else {
+            panic!("expected an assignment");
+        };
+        assert!(matches!(a.value, Some(Expr::YieldFrom(_))));
     }
 
     #[test]

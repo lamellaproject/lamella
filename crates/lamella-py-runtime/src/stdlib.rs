@@ -3,6 +3,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use lamella_py_bytecode::CodeObject;
+
 use crate::bigint::BigInt;
 use crate::object::ObjectModel;
 use crate::trap::Trap;
@@ -49,6 +51,17 @@ enum StdlibFn {
     MathIsnan,
     MathIsinf,
     MathIsfinite,
+    /// `collections.defaultdict` -- BOTH the constructor and the type object (`type(dd)` returns
+    /// this id, so `type(dd) is defaultdict` holds and `isinstance` accepts it).
+    CollectionsDefaultdict,
+    /// `collections.Counter` -- constructor + type object, like defaultdict.
+    CollectionsCounter,
+    /// `collections.OrderedDict` -- constructor + type object, like defaultdict.
+    CollectionsOrderedDict,
+    /// `collections.deque` -- constructor + type object, like defaultdict.
+    CollectionsDeque,
+    /// `collections.namedtuple` -- the class FACTORY (a plain function, not a type object).
+    CollectionsNamedtuple,
 }
 
 impl StdlibFn {
@@ -91,6 +104,11 @@ impl StdlibFn {
             26 => MathIsnan,
             27 => MathIsinf,
             28 => MathIsfinite,
+            29 => CollectionsDefaultdict,
+            30 => CollectionsCounter,
+            31 => CollectionsOrderedDict,
+            32 => CollectionsDeque,
+            33 => CollectionsNamedtuple,
             _ => return None,
         })
     }
@@ -128,8 +146,51 @@ impl StdlibFn {
             MathIsnan => "isnan",
             MathIsinf => "isinf",
             MathIsfinite => "isfinite",
+            CollectionsDefaultdict => "defaultdict",
+            CollectionsCounter => "Counter",
+            CollectionsOrderedDict => "OrderedDict",
+            CollectionsDeque => "deque",
+            CollectionsNamedtuple => "namedtuple",
         }
     }
+}
+
+/// Dispatches a KEYWORD call of stdlib function `id`. The only stdlib keyword surface is
+/// `deque(iterable, maxlen=N)`; any other stdlib function with no keywords falls back to the
+/// positional dispatch (a `*`-unpacking call), and a genuine keyword elsewhere is a TypeError.
+pub fn call_stdlib_kw(
+    id: u32,
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if StdlibFn::from_id(id) == Some(StdlibFn::CollectionsDeque) && !kwargs.is_empty() {
+        let mut maxlen = Value::NONE;
+        for &(name, value) in kwargs {
+            if name == "maxlen" {
+                maxlen = value;
+            } else {
+                return Err(Trap::TypeError);
+            }
+        }
+        let mut args: Vec<Value> = posargs.to_vec();
+        match args.len() {
+            0 => {
+                let empty = model.new_list(Vec::new())?;
+                args.push(empty);
+            }
+            1 => {}
+            _ => return Err(Trap::TypeError),
+        }
+        args.push(maxlen);
+        return call_stdlib(id, &args, functions, model, depth);
+    }
+    if kwargs.is_empty() {
+        return call_stdlib(id, posargs, functions, model, depth);
+    }
+    Err(Trap::TypeError)
 }
 
 /// The Python name of the stdlib function `id` names (for `repr` / `__name__`), or `None` if
@@ -140,14 +201,133 @@ pub fn stdlib_name(id: u32) -> Option<&'static str> {
     StdlibFn::from_id(id).map(StdlibFn::python_name)
 }
 
+/// Whether stdlib id `id` is a TYPE object (usable as `isinstance`'s second argument; repr'd as
+/// `<class 'module.Name'>`), versus a plain module function like `math.sqrt`.
+#[must_use]
+pub fn stdlib_is_type(id: u32) -> bool {
+    matches!(
+        StdlibFn::from_id(id),
+        Some(
+            StdlibFn::CollectionsDefaultdict
+                | StdlibFn::CollectionsCounter
+                | StdlibFn::CollectionsOrderedDict
+                | StdlibFn::CollectionsDeque
+        )
+    )
+}
+
+/// The defining module of stdlib id `id` (for the `<class 'collections.defaultdict'>` repr).
+#[must_use]
+pub fn stdlib_module_of(id: u32) -> Option<&'static str> {
+    StdlibFn::from_id(id).map(|f| match f {
+        StdlibFn::CollectionsDefaultdict
+        | StdlibFn::CollectionsCounter
+        | StdlibFn::CollectionsOrderedDict
+        | StdlibFn::CollectionsDeque => "collections",
+        _ => "math",
+    })
+}
+
+/// Whether stdlib type `id` spells its `tp_name` DOTTED in CPython's hash/attribute error
+/// messages: the C-implemented collections types do (`collections.deque`); the pure-Python
+/// `Counter` does not. Probed CPython 3.14 behavior, consumed by the error-message sites only.
+#[must_use]
+pub fn stdlib_tp_name_dotted(id: u32) -> bool {
+    matches!(
+        StdlibFn::from_id(id),
+        Some(
+            StdlibFn::CollectionsDefaultdict
+                | StdlibFn::CollectionsOrderedDict
+                | StdlibFn::CollectionsDeque
+        )
+    )
+}
+
+/// The `isinstance(value, <stdlib type>)` test for a stdlib TYPE id, or `None` when `id` is not a
+/// stdlib type (the caller then rejects it as a non-type).
+#[must_use]
+pub fn stdlib_type_matches(id: u32, value: Value, model: &ObjectModel) -> Option<bool> {
+    match StdlibFn::from_id(id)? {
+        StdlibFn::CollectionsDefaultdict => Some(model.is_defaultdict(value)),
+        StdlibFn::CollectionsCounter => Some(model.is_counter(value)),
+        StdlibFn::CollectionsOrderedDict => Some(model.is_ordereddict(value)),
+        StdlibFn::CollectionsDeque => Some(model.is_deque(value)),
+        _ => None,
+    }
+}
+
+/// `type(value)` for a value whose type is a STDLIB type object (`type(dd) is defaultdict`), or
+/// `None` when the value is not a stdlib-typed one (the core `type_of` chain then applies).
+#[must_use]
+pub fn stdlib_type_of(value: Value, model: &ObjectModel) -> Option<Value> {
+    if model.is_defaultdict(value) {
+        return Some(Value::builtin_ref(StdlibFn::CollectionsDefaultdict.id()));
+    }
+    if model.is_counter(value) {
+        return Some(Value::builtin_ref(StdlibFn::CollectionsCounter.id()));
+    }
+    if model.is_ordereddict(value) {
+        return Some(Value::builtin_ref(StdlibFn::CollectionsOrderedDict.id()));
+    }
+    if model.is_deque(value) {
+        return Some(Value::builtin_ref(StdlibFn::CollectionsDeque.id()));
+    }
+    None
+}
+
+/// `issubclass` between two stdlib/builtin ids where at least one is a stdlib type: a stdlib type
+/// is a subclass of itself, and the dict subtypes (defaultdict) are subclasses of `dict`. `None`
+/// when neither id is a stdlib type (the core builtin-vs-builtin rule then applies).
+#[must_use]
+pub fn stdlib_issubclass(cls_id: u32, base_id: u32) -> Option<bool> {
+    let cls = StdlibFn::from_id(cls_id);
+    let base = StdlibFn::from_id(base_id);
+    if cls.is_none() && base.is_none() {
+        return None;
+    }
+    if cls == base {
+        return Some(true);
+    }
+    if matches!(
+        cls,
+        Some(
+            StdlibFn::CollectionsDefaultdict
+                | StdlibFn::CollectionsCounter
+                | StdlibFn::CollectionsOrderedDict
+        )
+    ) {
+        return Some(base_id == crate::builtins::Builtin::Dict.id());
+    }
+    Some(false)
+}
+
 /// Builds a native stdlib module `name`, or `None` if there is no native module by that name.
 /// The import machinery calls this on a `sys.modules` miss; a `None` result is a
 /// `ModuleNotFoundError` at the import site.
 pub fn build_module(name: &str, model: &mut ObjectModel) -> Option<Result<Value, Trap>> {
     match name {
         "math" => Some(build_math_module(model)),
+        "collections" => Some(build_collections_module(model)),
         _ => None,
     }
+}
+
+/// Builds the `collections` module: the container types, each member both the constructor and the
+/// type object. Semantics follow Python 3.14.6 "collections -- Container datatypes".
+fn build_collections_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in [
+        StdlibFn::CollectionsDefaultdict,
+        StdlibFn::CollectionsCounter,
+        StdlibFn::CollectionsOrderedDict,
+        StdlibFn::CollectionsDeque,
+        StdlibFn::CollectionsNamedtuple,
+    ] {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
 }
 
 /// Builds the `math` module: a namespace dict of its constants + functions, wrapped in a module
@@ -185,9 +365,128 @@ fn build_math_module(model: &mut ObjectModel) -> Result<Value, Trap> {
 
 /// Dispatches a call of the stdlib function `id` with `args`. Precondition: `id >= STDLIB_BASE`
 /// (a core built-in never reaches here). An unknown id is `Malformed`.
-pub fn call_stdlib(id: u32, args: &[Value], model: &mut ObjectModel) -> Result<Value, Trap> {
+pub fn call_stdlib(
+    id: u32,
+    args: &[Value],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
     use StdlibFn::*;
     match StdlibFn::from_id(id).ok_or(Trap::Malformed)? {
+        CollectionsDefaultdict => {
+            let (factory, init) = match args {
+                [] => (Value::NONE, None),
+                [f] => (*f, None),
+                [f, init] => (*f, Some(*init)),
+                _ => return Err(Trap::TypeError),
+            };
+            if factory != Value::NONE && !crate::builtins::value_is_callable(factory, model) {
+                let message = "first argument must be callable or None";
+                return Err(model.raise_named_exception("TypeError", message));
+            }
+            let entries = match init {
+                None => Vec::new(),
+                Some(mapping) => model.dict_entries(mapping).ok_or(Trap::TypeError)?,
+            };
+            model.new_defaultdict(factory, entries)
+        }
+        CollectionsCounter => {
+            let entries = match args {
+                [] => Vec::new(),
+                [mapping] if model.dict_entries(*mapping).is_some() => {
+                    model.dict_entries(*mapping).unwrap_or_default()
+                }
+                [iterable] => {
+                    let items =
+                        crate::builtins::collect_iterable(model, &[*iterable], functions, depth)?;
+                    let mut counts: Vec<(Value, i128)> = Vec::new();
+                    for item in items {
+                        let mut found = false;
+                        for entry in &mut counts {
+                            if crate::interp::elem_eq(item, entry.0, functions, model, depth)? {
+                                entry.1 += 1;
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            counts.push((item, 1));
+                        }
+                    }
+                    let mut entries = Vec::with_capacity(counts.len());
+                    for (key, n) in counts {
+                        let count = model.int_from_i128(n)?;
+                        entries.push((key, count));
+                    }
+                    entries
+                }
+                _ => return Err(Trap::TypeError),
+            };
+            model.new_counter(entries)
+        }
+        CollectionsOrderedDict => {
+            let pairs = match args {
+                [] => Vec::new(),
+                [mapping] if model.dict_entries(*mapping).is_some() => {
+                    model.dict_entries(*mapping).unwrap_or_default()
+                }
+                [iterable] => {
+                    let items =
+                        crate::builtins::collect_iterable(model, &[*iterable], functions, depth)?;
+                    let mut kv = Vec::with_capacity(items.len());
+                    for item in items {
+                        let parts = model.unpack_sequence(item, 2)?;
+                        kv.push((parts[0], parts[1]));
+                    }
+                    kv
+                }
+                _ => return Err(Trap::TypeError),
+            };
+            model.new_ordereddict(pairs)
+        }
+        CollectionsDeque => {
+            let (iterable, maxlen_arg) = match args {
+                [] => (None, Value::NONE),
+                [iterable] => (Some(*iterable), Value::NONE),
+                [iterable, maxlen] => (Some(*iterable), *maxlen),
+                _ => return Err(Trap::TypeError),
+            };
+            let maxlen = if maxlen_arg == Value::NONE {
+                None
+            } else {
+                let m = maxlen_arg.as_int().ok_or(Trap::TypeError)?;
+                if m < 0 {
+                    let message = "maxlen must be non-negative";
+                    return Err(model.with_message(Trap::ValueError, message));
+                }
+                Some(m as usize)
+            };
+            let elements = match iterable {
+                None => Vec::new(),
+                Some(iterable) => {
+                    crate::builtins::collect_iterable(model, &[iterable], functions, depth)?
+                }
+            };
+            model.new_deque(elements, maxlen)
+        }
+        CollectionsNamedtuple => {
+            let [name_arg, fields_arg] = args else {
+                return Err(Trap::TypeError);
+            };
+            let name = model.str_value(*name_arg).map(String::from).ok_or(Trap::TypeError)?;
+            let fields: Vec<String> = if let Some(spec) = model.str_value(*fields_arg) {
+                spec.replace(',', " ").split_whitespace().map(String::from).collect()
+            } else {
+                let items = model.seq_value(*fields_arg).cloned().ok_or(Trap::TypeError)?;
+                let mut fields = Vec::with_capacity(items.len());
+                for item in items {
+                    fields.push(model.str_value(item).map(String::from).ok_or(Trap::TypeError)?);
+                }
+                fields
+            };
+            model.new_ntclass(&name, &fields)
+        }
         MathSqrt => {
             let x = one_real(args, model)?;
             if x < 0.0 {
@@ -543,7 +842,7 @@ mod tests {
     /// Calls math function `f` with real `args`, returning the result's f64.
     fn call_f(f: StdlibFn, args: &[f64], model: &mut ObjectModel) -> f64 {
         let vals: Vec<Value> = args.iter().map(|&a| model.new_float(a).unwrap()).collect();
-        let r = call_stdlib(f.id(), &vals, model).unwrap();
+        let r = call_stdlib(f.id(), &vals, &[], model, 0).unwrap();
         model.as_f64(r).unwrap()
     }
 
@@ -574,30 +873,30 @@ mod tests {
     fn math_int_returning_functions() {
         let mut m = model();
         let three_seven = m.new_float(3.7).unwrap();
-        let r = call_stdlib(StdlibFn::MathFloor.id(), &[three_seven], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathFloor.id(), &[three_seven], &[], &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(3));
         let three_two = m.new_float(3.2).unwrap();
-        let r = call_stdlib(StdlibFn::MathCeil.id(), &[three_two], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathCeil.id(), &[three_two], &[], &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(4));
         let neg = m.new_float(-3.7).unwrap();
-        let r = call_stdlib(StdlibFn::MathTrunc.id(), &[neg], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathTrunc.id(), &[neg], &[], &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(-3));
-        let r = call_stdlib(StdlibFn::MathFloor.id(), &[fixnum(5)], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathFloor.id(), &[fixnum(5)], &[], &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(5));
-        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(5)], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(5)], &[], &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(120));
-        let r = call_stdlib(StdlibFn::MathGcd.id(), &[fixnum(12), fixnum(18)], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathGcd.id(), &[fixnum(12), fixnum(18)], &[], &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(6));
-        let r = call_stdlib(StdlibFn::MathLcm.id(), &[fixnum(4), fixnum(6)], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathLcm.id(), &[fixnum(4), fixnum(6)], &[], &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(12));
-        let r = call_stdlib(StdlibFn::MathIsqrt.id(), &[fixnum(17)], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathIsqrt.id(), &[fixnum(17)], &[], &mut m, 0).unwrap();
         assert_eq!(m.as_i128(r), Some(4));
     }
 
     #[test]
     fn factorial_promotes_to_bigint() {
         let mut m = model();
-        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(25)], &mut m).unwrap();
+        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(25)], &[], &mut m, 0).unwrap();
         assert_eq!(m.repr(r), "15511210043330985984000000");
     }
 
@@ -607,28 +906,28 @@ mod tests {
         let inf = m.new_float(f64::INFINITY).unwrap();
         let nan = m.new_float(f64::NAN).unwrap();
         let one = m.new_float(1.0).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathIsinf.id(), &[inf], &mut m).unwrap(), Value::TRUE);
-        assert_eq!(call_stdlib(StdlibFn::MathIsnan.id(), &[nan], &mut m).unwrap(), Value::TRUE);
-        assert_eq!(call_stdlib(StdlibFn::MathIsfinite.id(), &[one], &mut m).unwrap(), Value::TRUE);
-        assert_eq!(call_stdlib(StdlibFn::MathIsfinite.id(), &[inf], &mut m).unwrap(), Value::FALSE);
+        assert_eq!(call_stdlib(StdlibFn::MathIsinf.id(), &[inf], &[], &mut m, 0).unwrap(), Value::TRUE);
+        assert_eq!(call_stdlib(StdlibFn::MathIsnan.id(), &[nan], &[], &mut m, 0).unwrap(), Value::TRUE);
+        assert_eq!(call_stdlib(StdlibFn::MathIsfinite.id(), &[one], &[], &mut m, 0).unwrap(), Value::TRUE);
+        assert_eq!(call_stdlib(StdlibFn::MathIsfinite.id(), &[inf], &[], &mut m, 0).unwrap(), Value::FALSE);
     }
 
     #[test]
     fn math_domain_errors() {
         let mut m = model();
         let neg = m.new_float(-1.0).unwrap();
-        let err = call_stdlib(StdlibFn::MathSqrt.id(), &[neg], &mut m).unwrap_err();
+        let err = call_stdlib(StdlibFn::MathSqrt.id(), &[neg], &[], &mut m, 0).unwrap_err();
         assert_eq!(err, Trap::ValueError);
         let zero = m.new_float(0.0).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathLog.id(), &[zero], &mut m).unwrap_err(), Trap::ValueError);
-        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(-1)], &mut m).unwrap_err();
+        assert_eq!(call_stdlib(StdlibFn::MathLog.id(), &[zero], &[], &mut m, 0).unwrap_err(), Trap::ValueError);
+        let r = call_stdlib(StdlibFn::MathFactorial.id(), &[fixnum(-1)], &[], &mut m, 0).unwrap_err();
         assert_eq!(r, Trap::ValueError);
         let half = m.new_float(3.5).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathFactorial.id(), &[half], &mut m).unwrap_err(), Trap::TypeError);
+        assert_eq!(call_stdlib(StdlibFn::MathFactorial.id(), &[half], &[], &mut m, 0).unwrap_err(), Trap::TypeError);
         let two = m.new_float(2.0).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathAcos.id(), &[two], &mut m).unwrap_err(), Trap::ValueError);
+        assert_eq!(call_stdlib(StdlibFn::MathAcos.id(), &[two], &[], &mut m, 0).unwrap_err(), Trap::ValueError);
         let big = m.new_float(10000.0).unwrap();
-        assert_eq!(call_stdlib(StdlibFn::MathExp.id(), &[big], &mut m).unwrap_err(), Trap::Overflow);
+        assert_eq!(call_stdlib(StdlibFn::MathExp.id(), &[big], &[], &mut m, 0).unwrap_err(), Trap::Overflow);
     }
 
     #[test]

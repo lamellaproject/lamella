@@ -81,6 +81,83 @@ pub struct LoadedAttribute {
     pub named_properties: Vec<(MethodId, AttrValue)>,
 }
 
+/// The exact CTS primitive a cast-test token names -- unlike [`PrimKind`] (which folds
+/// signed/unsigned and `bool`/`byte`, `char`/`ushort` onto shared storage widths), this keeps
+/// the full identity, because `unbox.any` and array-element compatibility (I.8.7.1) both
+/// distinguish them: unboxing an `int` box as `uint` throws InvalidCastException, and a
+/// `bool[]` is not castable to `byte[]` even though both pack 1-byte elements.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastPrim {
+    /// `bool`.
+    Bool,
+    /// `char`.
+    Char,
+    /// `sbyte`.
+    I1,
+    /// `byte`.
+    U1,
+    /// `short`.
+    I2,
+    /// `ushort`.
+    U2,
+    /// `int`.
+    I4,
+    /// `uint`.
+    U4,
+    /// `long`.
+    I8,
+    /// `ulong`.
+    U8,
+    /// `float`.
+    F4,
+    /// `double`.
+    F8,
+    /// `native int`.
+    I,
+    /// `native uint`.
+    U,
+}
+
+impl CastPrim {
+    /// The byte width of an INTEGER primitive (array-element compatibility treats same-width
+    /// signed/unsigned integers as interchangeable), or `None` for `bool`/`char`/floats --
+    /// which match only themselves.
+    #[must_use]
+    pub fn integer_width(self) -> Option<u8> {
+        match self {
+            CastPrim::I1 | CastPrim::U1 => Some(1),
+            CastPrim::I2 | CastPrim::U2 => Some(2),
+            CastPrim::I4 | CastPrim::U4 => Some(4),
+            CastPrim::I8 | CastPrim::U8 => Some(8),
+            CastPrim::I | CastPrim::U => Some(4),
+            CastPrim::Bool | CastPrim::Char | CastPrim::F4 | CastPrim::F8 => None,
+        }
+    }
+}
+
+/// What a cast-test token (`castclass` / `isinst` / `unbox.any` operand, or a `newarr`
+/// element) names, in the shape the runtime cast checks compare: the loader classifies each
+/// token once (decoding an array `TypeSpec`'s signature blob where needed), and `castclass`
+/// on an array or `unbox.any` on a box matches the operand's recorded shape against the
+/// target's. A token with no recorded shape is matched leniently (unverified), which is also
+/// the behavior for a module booted from a baked image (this table is not baked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CastElem {
+    /// An exact CTS primitive.
+    Prim(CastPrim),
+    /// `System.String`.
+    String,
+    /// `System.Object`.
+    Object,
+    /// A named class / value type / interface / enum: its asm-folded token handle.
+    Named(u64),
+    /// A single-dimensional zero-based array of the element shape.
+    Array(Box<CastElem>),
+    /// A shape the checks do not model (multi-dimensional array, pointer, byref):
+    /// matched leniently.
+    Lenient,
+}
+
 /// Reflection metadata for a type, keyed by its asm-folded handle (the `System.Type` a `typeof`
 /// or `GetType` yields). The `System.Type` introspection members (`Namespace`, `FullName`, the
 /// `Is*` kind predicates) read it. Recorded at load for every type in each loaded assembly: the
@@ -581,6 +658,11 @@ pub struct Module {
     /// mapped kind ([`crate::object::ArrayStorage::Packed`]) -- element storage at the true
     /// byte width -- which is also what tells a `byte[]` from an `int[]` for `System.Buffer`.
     array_prim_kinds: BTreeMap<u64, PrimKind>,
+    /// A cast-test token (`castclass` / `isinst` / `unbox.any` operand, `newarr` element)
+    /// mapped to the [`CastElem`] shape it names -- decoded once at load (including an array
+    /// `TypeSpec`'s signature blob), consumed by the `castclass`-on-array and `unbox.any`
+    /// type checks. A token with no entry is matched leniently.
+    cast_elems: BTreeMap<u64, CastElem>,
     /// A virtual method's vtable slot (only virtual methods appear).
     method_slots: BTreeMap<MethodId, u32>,
     /// A static field token mapped to its storage slot in the [`crate::interp::Vm`].
@@ -648,6 +730,10 @@ pub struct Module {
     /// `Enum.Format`'s "X" zero-pads to (`width * 2` hex digits). Absent for an enum whose width
     /// the loader could not determine; the formatter then defaults to 4 (the `int` default).
     enum_widths: BTreeMap<u64, u8>,
+    /// Tokens of enum types whose underlying type is UNSIGNED (`byte`/`ushort`/`uint`/`ulong`),
+    /// keyed like [`Self::enum_widths`]. `unbox.any` needs the sign: unboxing an `int`-backed
+    /// enum's box as `uint` throws InvalidCastException even though the widths agree.
+    enum_unsigned: BTreeSet<u64>,
     /// `newobj` tokens that construct a multi-dimensional array (an array TypeSpec's
     /// `.ctor`), mapped to the array's rank -- newobj allocates from that many lengths.
     md_array_ctors: BTreeMap<u64, u16>,
@@ -4186,6 +4272,22 @@ impl Module {
         self.array_prim_kinds.insert(asm_key(asm, token.0), kind);
     }
 
+    /// Records the [`CastElem`] shape of a cast-test token in assembly `asm` (a `castclass` /
+    /// `isinst` / `unbox.any` operand or a `newarr` element type), decoded by the loader --
+    /// including an array `TypeSpec`'s signature blob, which is what lets `castclass` compare
+    /// an array operand's element type against an array-typed target.
+    pub fn bind_cast_elem(&mut self, asm: u8, token: Token, elem: CastElem) {
+        self.cast_elems.insert(asm_key(asm, token.0), elem);
+    }
+
+    /// The recorded [`CastElem`] shape of an already-asm-folded type-token handle, or `None`
+    /// if the loader recorded none (the cast checks then match leniently). A module booted
+    /// from a baked image has no entries (the table is not baked), so it matches leniently too.
+    #[must_use]
+    pub fn cast_elem(&self, handle: u64) -> Option<&CastElem> {
+        self.cast_elems.get(&handle)
+    }
+
     /// The element type's primitive kind of a `newarr` element-type token in assembly `asm`,
     /// or `None` when none was bound (a reference / value-type element array). `newarr` packs
     /// the array's element storage at this kind, which also sizes it for `System.Buffer`.
@@ -4592,6 +4694,38 @@ impl Module {
     /// Records the underlying byte `width` (1/2/4/8) of the enum type `token` in assembly `asm`.
     pub fn set_enum_width(&mut self, asm: u8, token: u32, width: u8) {
         self.enum_widths.insert(asm_key(asm, token), width);
+    }
+
+    /// Records that the enum type named by `token` in assembly `asm` has an UNSIGNED underlying
+    /// type (`byte`/`ushort`/`uint`/`ulong`), read from its members' constant types at load.
+    pub fn set_enum_unsigned(&mut self, asm: u8, token: u32) {
+        self.enum_unsigned.insert(asm_key(asm, token));
+    }
+
+    /// The exact underlying [`CastPrim`] of the enum named by `handle` (resolving across
+    /// assemblies), or `None` if the handle names no known enum. `unbox.any` normalizes an
+    /// enum side to this before comparing: a box of an `int`-backed enum unboxes as that enum,
+    /// any same-underlying enum, or exactly `int` -- and nothing else.
+    #[must_use]
+    pub fn enum_underlying_prim_by_handle(&self, handle: u64) -> Option<CastPrim> {
+        if !self.is_enum_by_handle(handle) {
+            return None;
+        }
+        let unsigned = self.enum_unsigned.contains(&handle)
+            || self
+                .type_id_by_handle(handle)
+                .and_then(|type_id| self.type_handle_of(type_id))
+                .is_some_and(|canonical| self.enum_unsigned.contains(&canonical));
+        Some(match (self.enum_width_by_handle(handle), unsigned) {
+            (1, false) => CastPrim::I1,
+            (1, true) => CastPrim::U1,
+            (2, false) => CastPrim::I2,
+            (2, true) => CastPrim::U2,
+            (8, false) => CastPrim::I8,
+            (8, true) => CastPrim::U8,
+            (_, false) => CastPrim::I4,
+            (_, true) => CastPrim::U4,
+        })
     }
 
     /// The underlying byte width of the enum named by `handle` (resolving across assemblies),

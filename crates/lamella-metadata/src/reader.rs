@@ -976,6 +976,15 @@ impl<'a> Assembly<'a> {
 
     /// The custom attributes applied to `parent`, from the `CustomAttribute`
     /// table (II.22.10): each yields the constructor token and the raw value blob.
+    /// Every CustomAttribute row's constructor token (II.22.10, the `Type` column), in one table
+    /// pass. A ctor is referenced ONLY from this table, never a method body, so the loader feeds
+    /// these through its call-binding to make an attribute's ctor resolvable (a `const decimal`'s
+    /// DecimalConstantAttribute, a `[Field]`-target attribute) even though nothing constructs it.
+    pub fn custom_attribute_ctors(&self) -> impl Iterator<Item = Token> + '_ {
+        (1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE))
+            .filter_map(move |index| self.tables.row(table::CUSTOM_ATTRIBUTE, index).map(|row| row.token(1)))
+    }
+
     pub fn custom_attributes(
         &self,
         parent: Token,
@@ -1478,6 +1487,19 @@ impl<'a> Method<'a> {
     #[must_use]
     pub fn rid(&self) -> u32 {
         self.index
+    }
+
+    /// This method's `MethodDef` metadata token -- e.g. to look up its custom attributes.
+    #[must_use]
+    pub fn token(&self) -> Token {
+        Token::new(table::METHOD_DEF, self.index)
+    }
+
+    /// The custom attributes applied to this method (II.22.10) -- e.g. `[Obsolete]` on a
+    /// constructor, or a `[RuntimeProvided]` marker a loader reads to bind an intrinsic.
+    pub fn custom_attributes(&self) -> impl Iterator<Item = CustomAttribute<'a>> + '_ {
+        self.assembly
+            .custom_attributes(Token::new(table::METHOD_DEF, self.index))
     }
 
     /// The method attribute flags (II.23.1.10).

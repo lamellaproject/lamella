@@ -734,6 +734,9 @@ impl Lexer {
             't' => out.push('\t'),
             'v' => out.push('\u{0B}'),
             'x' => self.lex_hex_escape(out)?,
+            'u' => self.lex_unicode_escape(out, 4)?,
+            'U' => self.lex_unicode_escape(out, 8)?,
+            'N' => self.lex_named_escape(out)?,
             other => {
                 out.push('\\');
                 out.push(other);
@@ -756,6 +759,62 @@ impl Lexer {
         }
         out.push(char::from_u32(value).expect("a byte value is a valid scalar"));
         Ok(())
+    }
+
+    /// `\uXXXX` (4 hex digits) / `\UXXXXXXXX` (8 hex digits): the character at that code point. Unlike
+    /// `\x`, the value can exceed a byte and can be an invalid scalar (a surrogate, or above U+10FFFF),
+    /// which is an error, as in CPython.
+    fn lex_unicode_escape(&mut self, out: &mut String, digits: usize) -> Result<(), LexError> {
+        let mut value: u32 = 0;
+        for _ in 0..digits {
+            match self.peek() {
+                Some(c) if c.is_ascii_hexdigit() => {
+                    value = value * 16 + c.to_digit(16).expect("a hex digit");
+                    self.pos += 1;
+                }
+                _ => return Err(self.err("invalid unicode escape: too few hex digits")),
+            }
+        }
+        match char::from_u32(value) {
+            Some(ch) => out.push(ch),
+            None => return Err(self.err("invalid unicode escape: not a valid code point")),
+        }
+        Ok(())
+    }
+
+    /// `\N{NAME}`: the character with Unicode name NAME (a curated set of the common names; see
+    /// [`crate::named_chars`]). The `N` is already consumed. An unrecognized name is a clear error.
+    fn lex_named_escape(&mut self, out: &mut String) -> Result<(), LexError> {
+        if !matches!(self.peek(), Some('{')) {
+            return Err(self.err("invalid '\\N' escape: expected '{' then a Unicode name"));
+        }
+        self.pos += 1;
+        let mut name = String::new();
+        loop {
+            match self.peek() {
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
+                Some('\n') | None => {
+                    return Err(self.err("invalid '\\N' escape: unterminated name (no '}')"));
+                }
+                Some(c) => {
+                    name.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+        match crate::named_chars::char_from_name(&name.to_ascii_uppercase()) {
+            Some(ch) => {
+                out.push(ch);
+                Ok(())
+            }
+            None => Err(self.err(
+                "unknown Unicode character name in '\\N{...}' (only common names are supported; \
+                 use a '\\u'/'\\U' code-point escape)",
+            )),
+        }
     }
 
     /// `\ooo`: one to three octal digits, a character of that value.

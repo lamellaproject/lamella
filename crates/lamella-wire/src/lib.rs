@@ -442,6 +442,14 @@ pub mod board_model {
     pub const MKR1000: u16 = 9;
     /// Raspberry Pi Pico 2 W (RP2350 + CYW43439 WiFi).
     pub const PICO2_W: u16 = 10;
+    /// BBC micro:bit v2 / v2.1 (Nordic nRF52833).
+    pub const MICROBIT_V2: u16 = 11;
+    /// Arduino Zero (ATSAMD21G18A + on-board EDBG).
+    pub const ARDUINO_ZERO: u16 = 12;
+    /// Raspberry Pi Pico / Pico H (RP2040, no wireless). The Pico W / WH add the CYW43439.
+    pub const PICO: u16 = 13;
+    /// Espressif ESP32-C6 (RISC-V RV32IMAC HP core) -- a second-source RISC-V beyond the RP2350.
+    pub const ESP32_C6: u16 = 14;
 }
 
 /// The target's `HELLO_ACK`: the negotiated version + the target's capabilities, optionally

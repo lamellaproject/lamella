@@ -18,8 +18,8 @@ use lamella_cil::{Instruction, MethodBodyImage, encode_with_offsets, write_metho
 use lamella_metadata::signature::element;
 use lamella_metadata::{Assembly, encode_exception_base_chain, exception_tag_for_name};
 use lamella_pe::{
-    ImageBuilder, LocalVariable, MethodDebug, SequencePoint, TypeSig, field_signature,
-    local_signature, method_signature, property_signature, type_signature,
+    DebugDocument, ImageBuilder, LocalVariable, MethodDebug, SequencePoint, TypeSig,
+    field_signature, local_signature, method_signature, property_signature, type_signature,
 };
 use lamella_syntax::ast::{
     AssignmentOperator, AttributeArgument, AttributeSection, CompilationUnit, ConstructorInitializer,
@@ -76,6 +76,7 @@ const DELEGATE_INVOKE_FLAGS: u16 =
 const FIELD_PUBLIC: u16 = 0x0006;
 const FIELD_PRIVATE: u16 = 0x0001;
 const FIELD_STATIC: u16 = 0x0010;
+const FIELD_INITONLY: u16 = 0x0020;
 const FIELD_LITERAL: u16 = 0x0040;
 const FIELD_HAS_DEFAULT: u16 = 0x8000;
 const CTOR_FLAGS: u16 = 0x0006 | 0x0800 | 0x1000;
@@ -272,6 +273,8 @@ fn compile(
         };
     }
     let units = core::slice::from_ref(unit);
+    let debug_sources = debug.map(|pair| [pair]);
+    let debug = debug_sources.as_ref().map(|slice| &slice[..]);
     match build_image(units, module_name, assembly_name, references, debug, native_interop) {
         Ok((image, pdb)) => Compilation {
             diagnostics,
@@ -297,6 +300,9 @@ pub struct MultiCompilation {
     pub diagnostics: Vec<Vec<Diagnostic>>,
     /// The emitted assembly image, when no source had an error and lowering succeeded.
     pub image: Option<Vec<u8>>,
+    /// The standalone Portable PDB (multi-document, one row per source), when debug
+    /// info was requested and emitted.
+    pub pdb: Option<Vec<u8>>,
     /// Why lowering failed, when parsing and binding were clean but emission was not.
     pub emit_error: Option<crate::EmitError>,
 }
@@ -305,13 +311,15 @@ pub struct MultiCompilation {
 /// compilation, 16.1): every file's types enter one model -- so each file names the
 /// others' types -- then bodies bind and lower in file order. A syntax or binder error
 /// in any file blocks emission. `sources` pairs each file's decoded text with its path
-/// (for diagnostics); no debug information is emitted on this path.
+/// (used both for diagnostics and, when `emit_debug` is set, as the PDB's per-file
+/// `Document` -- a method attributes its sequence points to its own source file).
 #[must_use]
 pub fn compile_sources_with(
     sources: &[(&str, &str)],
     module_name: &str,
     assembly_name: &str,
     references: &[Assembly],
+    emit_debug: bool,
     options: LexOptions,
 ) -> MultiCompilation {
     let mut diagnostics: Vec<Vec<Diagnostic>> = Vec::with_capacity(sources.len());
@@ -333,6 +341,7 @@ pub fn compile_sources_with(
         return MultiCompilation {
             diagnostics,
             image: None,
+            pdb: None,
             emit_error: None,
         };
     }
@@ -350,25 +359,29 @@ pub fn compile_sources_with(
         return MultiCompilation {
             diagnostics,
             image: None,
+            pdb: None,
             emit_error: None,
         };
     }
+    let debug = emit_debug.then_some(sources);
     match build_image(
         &units,
         module_name,
         assembly_name,
         references,
-        None,
+        debug,
         native_interop,
     ) {
-        Ok((image, _pdb)) => MultiCompilation {
+        Ok((image, pdb)) => MultiCompilation {
             diagnostics,
             image: Some(image),
+            pdb,
             emit_error: None,
         },
         Err(error) => MultiCompilation {
             diagnostics,
             image: None,
+            pdb: None,
             emit_error: Some(error),
         },
     }
@@ -399,7 +412,7 @@ fn build_image(
     module_name: &str,
     assembly_name: &str,
     references: &[Assembly],
-    debug: Option<(&str, &str)>,
+    debug: Option<&[(&str, &str)]>,
     native_interop: bool,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let model = reference_model(units, references);
@@ -408,15 +421,29 @@ fn build_image(
     let mut binder = Binder::with_model(model);
     mark_external_value_types(binder.model(), &mut tokens);
     let mut image = ImageBuilder::new(module_name, assembly_name);
+    if let Some(sources) = debug {
+        let mut content: Vec<u8> = assembly_name.as_bytes().to_vec();
+        for &(source, _) in sources {
+            content.push(0);
+            content.extend_from_slice(source.as_bytes());
+        }
+        image.set_content_id(&content);
+    }
     register_external_assemblies(binder.model(), &mut image);
     let object =
         declared_system_type(&tokens, "Object").unwrap_or_else(|| image.object_type());
     let mut entry_point = None;
-    let context = debug.map(|(source, _)| DebugContext {
-        source,
-        lines: LineMap::new(source),
-    });
-    for unit in units {
+    let contexts: Vec<DebugContext> = debug
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(index, (source, _))| DebugContext {
+            source,
+            lines: LineMap::new(source),
+            document: index as u32 + 1,
+        })
+        .collect();
+    for (index, unit) in units.iter().enumerate() {
         binder.set_defined_symbols(unit.defined_symbols.clone());
         emit_namespace(
             &mut image,
@@ -427,13 +454,19 @@ fn build_image(
             &unit.usings,
             &unit.members,
             "",
-            context.as_ref(),
+            contexts.get(index),
         )?;
     }
     emit_exception_base_chains(&mut image, binder.model(), &tokens);
     let is_dll = entry_point.is_none();
     let entry = entry_point.unwrap_or(Token::new(0, 0));
-    let pdb = debug.map(|(_, path)| image.build_pdb(path, entry));
+    let pdb = debug.map(|sources| {
+        let documents: Vec<DebugDocument> = sources
+            .iter()
+            .map(|(source, path)| DebugDocument { path, source })
+            .collect();
+        image.build_pdb(&documents, entry)
+    });
     let image = match debug {
         Some(_) => image.finish_with_debug(entry, is_dll, &pdb_file_name(module_name)),
         None => image.finish(entry, is_dll),
@@ -1050,6 +1083,7 @@ pub(crate) fn build_bootstrap_delta(
 
     let prologue = ConstructorPrologue {
         ctor: image.object_ctor(),
+        span: None,
         arguments: Vec::new(),
         leading_body: 0,
     };
@@ -1065,6 +1099,7 @@ pub(crate) fn build_bootstrap_delta(
         1,
         &TypeSymbol::Special(SpecialType::Void),
         Some(&prologue),
+        None,
     )?;
     let body_image = MethodBodyImage {
         max_stack: max_stack(&emitted.code).max(1),
@@ -1145,6 +1180,7 @@ pub(crate) fn build_submission_delta(
         0,
         return_type,
         None,
+        None,
     )?;
     let local_var_sig = if emitted.local_types.is_empty() {
         None
@@ -1188,9 +1224,12 @@ pub(crate) fn build_submission_delta(
 }
 
 /// Source context for resolving a statement's span to line/column while emitting.
+/// One per source file in a compilation; `document` is that file's 1-based `Document`
+/// row, which every method emitted from this unit attributes its points to.
 struct DebugContext<'a> {
     source: &'a str,
     lines: LineMap,
+    document: u32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1763,6 +1802,7 @@ fn emit_type(
             None,
             &body,
             base_ctor,
+            None,
             debug,
         )?;
     }
@@ -1897,6 +1937,8 @@ fn emit_type(
                 parameters,
                 initializer,
                 body,
+                header_span,
+                attributes,
                 ..
             } if !is_static_constructor(modifiers) => {
                 let base_ctor = if is_struct || is_system_object {
@@ -1909,7 +1951,7 @@ fn emit_type(
                             .unwrap_or_else(|| object_base_ctor(image, tokens)),
                     )
                 };
-                emit_constructor(
+                let token = emit_constructor(
                     image,
                     binder,
                     &enclosing,
@@ -1919,8 +1961,10 @@ fn emit_type(
                     initializer.as_ref(),
                     body,
                     base_ctor,
+                    Some(*header_span),
                     debug,
                 )?;
+                emit_attributes(image, binder, tokens, &enclosing, token, attributes);
             }
             Member::Destructor { body, .. } => {
                 emit_destructor(
@@ -2520,6 +2564,7 @@ fn emit_constructor(
     initializer: Option<&ConstructorInitializer>,
     body: &lamella_syntax::ast::Stmt,
     base_ctor: Option<Token>,
+    header_span: Option<Span>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let params: Vec<(Box<str>, TypeSymbol)> = parameters
@@ -2528,6 +2573,7 @@ fn emit_constructor(
         .collect();
     let base_prologue = || base_ctor.map(|ctor| ConstructorPrologue {
         ctor,
+        span: header_span,
         arguments: Vec::new(),
         leading_body: 0,
     });
@@ -2546,6 +2592,7 @@ fn emit_constructor(
                         });
                     ConstructorPrologue {
                         ctor,
+                        span: Some(init.span),
                         arguments,
                         leading_body: 0,
                     }
@@ -2770,6 +2817,7 @@ fn emit_bound_body(
         .filter(|(index, _)| byref_flags.get(*index).copied().unwrap_or(false))
         .map(|(_, (name, ty))| (name.clone(), ty.clone()))
         .collect();
+    let debug_source = debug.map(|context| context.source.as_bytes());
     let EmittedBody {
         code,
         local_types,
@@ -2785,6 +2833,7 @@ fn emit_bound_body(
         arg_base,
         return_symbol,
         prologue,
+        debug_source,
     )
     .map_err(|error| error.in_method(name))?;
     let local_var_sig = if local_types.is_empty() {
@@ -2876,22 +2925,36 @@ fn build_method_debug(
 ) -> Result<MethodDebug, crate::EmitError> {
     let (code_bytes, offsets) = encode_with_offsets(code)
         .map_err(|_| crate::EmitError::Unsupported("method body could not be encoded"))?;
-    let sequence_points = points
-        .iter()
-        .map(|(index, span)| {
-            let lines = context.lines.span_lines(context.source, *span);
-            SequencePoint {
-                il_offset: offsets[*index as usize],
-                start_line: lines.start_line,
-                start_column: lines.start_column,
-                end_line: lines.end_line,
-                end_column: lines.end_column,
+    let mut sequence_points: Vec<SequencePoint> = Vec::new();
+    for (index, span) in points.iter() {
+        let point = match span {
+            None => SequencePoint::hidden(offsets[*index as usize]),
+            Some(span) if span.start == span.end => continue,
+            Some(span) => {
+                let lines = context.lines.span_lines(context.source, *span);
+                SequencePoint {
+                    il_offset: offsets[*index as usize],
+                    start_line: lines.start_line,
+                    start_column: lines.start_column,
+                    end_line: lines.end_line,
+                    end_column: lines.end_column,
+                    is_hidden: false,
+                }
             }
-        })
-        .collect();
+        };
+        if sequence_points
+            .last()
+            .is_some_and(|last| last.il_offset == point.il_offset)
+        {
+            *sequence_points.last_mut().unwrap() = point;
+        } else {
+            sequence_points.push(point);
+        }
+    }
     let locals = local_names
         .iter()
         .enumerate()
+        .filter(|(_, name)| !name.is_empty() && !matches!(name.as_bytes()[0], b'<' | b'$'))
         .map(|(index, name)| LocalVariable {
             index: index as u16,
             name: name.clone(),
@@ -2902,6 +2965,7 @@ fn build_method_debug(
         local_signature,
         locals,
         scope_length: code_bytes.len() as u32,
+        document: context.document,
     })
 }
 
@@ -3303,13 +3367,17 @@ fn emit_field(
         if is_static {
             flags |= FIELD_STATIC;
         }
+        let is_const_decimal =
+            is_const && matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal));
         if constant.is_some() {
             flags |= FIELD_LITERAL | FIELD_HAS_DEFAULT;
+        } else if is_const_decimal {
+            flags |= FIELD_INITONLY;
         }
         let field = image.add_field(&declarator.name, &signature, flags);
         if let Some((element, value)) = constant {
             image.add_constant(field, element, &value);
-        } else if is_const && matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal)) {
+        } else if is_const_decimal {
             emit_decimal_constant_attribute(image, tokens, binder, enclosing, &declarator.name, field);
         }
     }
@@ -4383,24 +4451,43 @@ fn static_constructor_body(declaration: &TypeDecl) -> Option<&Stmt> {
     })
 }
 
-/// Synthesizes `<field> = <init>;` for each static (non-const) field initializer, in
-/// declaration order -- the statements that run first in the static constructor.
-fn static_field_initializer_statements(declaration: &TypeDecl) -> Vec<Stmt> {
-    let mut statements = Vec::new();
-    for member in &declaration.members {
+/// The fields whose initializers run in the `.cctor`: every `static` field, plus a `const
+/// decimal` (which has no `Constant` form, so it initializes there as a static readonly). Every
+/// other `const` is a compile-time literal inlined at use, and an instance field initializes in
+/// the instance constructor -- neither belongs here. Yielding each field's bound type with its
+/// declarators keeps the `.cctor` emit DECISION and the `.cctor` BODY over the same field set.
+fn static_initializer_fields<'a>(
+    declaration: &'a TypeDecl,
+) -> impl Iterator<Item = (TypeSymbol, &'a [VariableDeclarator])> + 'a {
+    declaration.members.iter().filter_map(|member| {
         let Member::Field {
             modifiers,
+            ty,
             declarators,
             ..
         } = member
         else {
-            continue;
+            return None;
         };
         let is_static = modifiers.iter().any(|m| matches!(m, Modifier::Static));
         let is_const = modifiers.iter().any(|m| matches!(m, Modifier::Const));
-        if !is_static || is_const {
-            continue;
+        let field_ty = bind_type(ty);
+        if is_const {
+            if !matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal)) {
+                return None;
+            }
+        } else if !is_static {
+            return None;
         }
+        Some((field_ty, declarators.as_slice()))
+    })
+}
+
+/// Synthesizes `<field> = <init>;` for each static (and `const decimal`) field initializer, in
+/// declaration order -- the statements that run first in the static constructor.
+fn static_field_initializer_statements(declaration: &TypeDecl) -> Vec<Stmt> {
+    let mut statements = Vec::new();
+    for (_field_ty, declarators) in static_initializer_fields(declaration) {
         for declarator in declarators {
             let Some(init) = &declarator.initializer else {
                 continue;
@@ -4421,11 +4508,69 @@ fn static_field_initializer_statements(declaration: &TypeDecl) -> Vec<Stmt> {
     statements
 }
 
-/// Whether the type needs a static constructor `.cctor`: it has a declared static
-/// constructor or any static field initializer.
+/// Whether a static field initializer assigns exactly the field type's default value -- so csc
+/// leaves it to the runtime's zero-init and, when EVERY initializer is default (and no static
+/// constructor is declared), omits the `.cctor` outright. Deliberately conservative: only a
+/// default-valued LITERAL whose kind matches the field type (no boxing, no numeric conversion)
+/// counts; a folded constant expression or any conversion returns false, so lcsc still emits the
+/// `.cctor` there rather than risk dropping a live initializer.
+fn is_default_valued_static_init(field_ty: &TypeSymbol, init: &Expr) -> bool {
+    let ExprKind::Literal(literal) = &init.kind else {
+        return false;
+    };
+    match literal {
+        Literal::Null => true,
+        Literal::Boolean(false) => matches!(field_ty, TypeSymbol::Special(SpecialType::Boolean)),
+        Literal::Character(0) => matches!(field_ty, TypeSymbol::Special(SpecialType::Char)),
+        Literal::Integer { value: 0, .. } => {
+            matches!(field_ty, TypeSymbol::Special(special) if is_integer_special(*special))
+        }
+        Literal::Real { bits: 0, .. } => matches!(
+            field_ty,
+            TypeSymbol::Special(SpecialType::Single | SpecialType::Double)
+        ),
+        Literal::Decimal {
+            lo: 0,
+            mid: 0,
+            hi: 0,
+            scale: 0,
+            negative: false,
+        } => matches!(field_ty, TypeSymbol::Special(SpecialType::Decimal)),
+        _ => false,
+    }
+}
+
+/// The integer special types, for which a `0` literal is the field default (so its initializer
+/// is a no-op the runtime's zero-init already covers).
+fn is_integer_special(special: SpecialType) -> bool {
+    matches!(
+        special,
+        SpecialType::SByte
+            | SpecialType::Byte
+            | SpecialType::Int16
+            | SpecialType::UInt16
+            | SpecialType::Int32
+            | SpecialType::UInt32
+            | SpecialType::Int64
+            | SpecialType::UInt64
+    )
+}
+
+/// Whether the type needs a static constructor `.cctor`: it declares a static constructor, or it
+/// has a static field initializer that assigns a NON-default value. When every static (and
+/// `const decimal`) initializer is the field type's default and no static constructor is declared,
+/// csc omits the `.cctor` -- the fields already hold that default -- and lcsc now matches (it was
+/// emitting a redundant `.cctor`, which also cost the declaration a spurious sequence point).
 fn needs_static_constructor(declaration: &TypeDecl) -> bool {
     static_constructor_body(declaration).is_some()
-        || !static_field_initializer_statements(declaration).is_empty()
+        || static_initializer_fields(declaration).any(|(field_ty, declarators)| {
+            declarators.iter().any(|declarator| {
+                declarator
+                    .initializer
+                    .as_ref()
+                    .is_some_and(|init| !is_default_valued_static_init(&field_ty, init))
+            })
+        })
 }
 
 /// Whether the type declares an INSTANCE constructor (a static constructor does not
@@ -5202,6 +5347,153 @@ mod tests {
     }
 
     #[test]
+    fn synthesized_locals_are_not_named_in_the_pdb() {
+        let source = "class P { static int Run() { int u = 5; try { return u; } finally { } } }";
+        let unit = parse_compilation_unit(source).unit;
+        let pdb_bytes = compile_unit_with_debug(&unit, "p.dll", "p", &[], source, "p.cs")
+            .pdb
+            .expect("a pdb");
+        let pdb = lamella_metadata::PortablePdb::read(&pdb_bytes).expect("read the pdb");
+        let names: Vec<&str> = (1..=3)
+            .flat_map(|rid| pdb.local_variables(rid))
+            .map(|local| local.name)
+            .collect();
+        assert!(names.contains(&"u"), "the user local `u` is named: {names:?}");
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.is_empty() && !n.starts_with('<') && !n.starts_with('$')),
+            "no synthesized local (empty / `<`- / `$`-led) is named: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_const_decimal_initializes_in_the_cctor() {
+        let source =
+            "class C\n{\n    const decimal Pi = 3.14m;\n    static int Main() { return (int)Pi; }\n}\n";
+        let unit = parse_compilation_unit(source).unit;
+        let pdb_bytes = compile_unit_with_debug(&unit, "c.dll", "c", &[], source, "c.cs")
+            .pdb
+            .expect("a pdb");
+        let pdb = lamella_metadata::PortablePdb::read(&pdb_bytes).expect("read the pdb");
+        assert!(
+            (1..=4).any(|rid| pdb.sequence_points(rid).iter().any(|p| p.start_line == 3)),
+            "the const-decimal declaration (line 3) is covered by its .cctor init"
+        );
+    }
+
+    #[test]
+    fn all_default_static_initializers_omit_the_cctor() {
+        let omit = "class C { static int a = 0; static bool b = false; static string s = null; static double d = 0.0; }";
+        let keep = "class D { static int a = 0; static int b = 5; }";
+        let boxed = "class E { static object o = 0; }";
+        for (source, ty, expect_cctor) in [(omit, "C", false), (keep, "D", true), (boxed, "E", true)] {
+            let unit = parse_compilation_unit(source).unit;
+            let image = compile_unit(&unit, "t.dll", "t").image.expect("an image");
+            let assembly = Assembly::read(&image).expect("the image reads back");
+            let has_cctor = assembly
+                .find_type("", ty)
+                .expect("the type is present")
+                .methods()
+                .any(|method| method.name() == Some(".cctor"));
+            assert_eq!(has_cctor, expect_cctor, "type {ty}: .cctor presence mismatch");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_constant_switch_section_gets_hidden_points() {
+        let source = "class P\n{\n    static int Main()\n    {\n        int v;\n        switch (3)\n        {\n            case 1: v = 42; break;\n            case 2: break;\n            case 3: goto case 1;\n        }\n        return v;\n    }\n}\n";
+        let unit = parse_compilation_unit(source).unit;
+        let pdb_bytes = compile_unit_with_debug(&unit, "s.dll", "s", &[], source, "s.cs")
+            .pdb
+            .expect("a pdb");
+        let pdb = lamella_metadata::PortablePdb::read(&pdb_bytes).expect("read the pdb");
+        let lines: Vec<u32> = (1..=pdb.method_count())
+            .flat_map(|rid| {
+                pdb.sequence_points(rid)
+                    .into_iter()
+                    .map(|point| point.start_line)
+            })
+            .collect();
+        assert!(
+            !lines.contains(&9),
+            "case 2 (line 9) is unreachable -- it must carry no visible point, got {lines:?}"
+        );
+        assert!(lines.contains(&8), "case 1 (line 8, reached via goto) stays visible");
+        assert!(lines.contains(&10), "case 3 (line 10, selected) stays visible");
+    }
+
+    #[test]
+    fn a_constructor_points_its_implicit_base_call_before_the_body() {
+        let source = "class C\n{\n    int f;\n    public C(int a)\n    {\n        f = a;\n    }\n}\n";
+        let unit = parse_compilation_unit(source).unit;
+        let pdb_bytes = compile_unit_with_debug(&unit, "c.dll", "c", &[], source, "c.cs")
+            .pdb
+            .expect("a pdb");
+        let pdb = lamella_metadata::PortablePdb::read(&pdb_bytes).expect("read the pdb");
+        let ctor = (1..=4)
+            .map(|rid| pdb.sequence_points(rid))
+            .find(|points| points.iter().any(|p| p.start_line == 4))
+            .expect("a method covers the constructor signature (line 4)");
+        let base = ctor.iter().find(|p| p.start_line == 4).expect("base-call point");
+        let brace = ctor.iter().find(|p| p.start_line == 5).expect("body brace point");
+        assert!(
+            base.il_offset < brace.il_offset,
+            "the base call precedes the body brace"
+        );
+    }
+
+    #[test]
+    fn a_constructor_carries_its_custom_attributes() {
+        let source = "class MarkAttribute { }\nclass C\n{\n    [Mark] public C() { }\n    static void Main() { }\n}\n";
+        let unit = parse_compilation_unit(source).unit;
+        let image = compile_unit(&unit, "c.dll", "c").image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the image reads back");
+        let ctor = assembly
+            .find_type("", "C")
+            .expect("type C is present")
+            .methods()
+            .find(|method| method.name() == Some(".ctor"))
+            .expect("the constructor is present");
+        assert_eq!(
+            ctor.custom_attributes().count(),
+            1,
+            "the [Mark] attribute is emitted on the constructor row"
+        );
+    }
+
+    #[test]
+    fn multi_document_pdb_attributes_each_method_to_its_own_file() {
+        let a = "class A { static int Alpha() { int ax = 1; return ax; } }";
+        let b = "class B { static int Beta() { int bx = 2; return bx; } }";
+        let sources = [(a, "a.cs"), (b, "b.cs")];
+        let result =
+            compile_sources_with(&sources, "lib.dll", "lib", &[], true, LexOptions::default());
+        assert!(
+            result.diagnostics.iter().all(|d| d.is_empty()),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(result.image.is_some(), "{:?}", result.emit_error);
+        let pdb_bytes = result.pdb.expect("a multi-source pdb");
+        let pdb = lamella_metadata::PortablePdb::read(&pdb_bytes).expect("read the pdb");
+
+        assert_eq!(pdb.document_count(), 2);
+
+        let mut docs: Vec<String> = (1..=pdb.method_count())
+            .filter(|&rid| !pdb.sequence_points(rid).is_empty())
+            .filter_map(|rid| pdb.method_document(rid))
+            .collect();
+        docs.sort();
+        docs.dedup();
+        assert!(docs.iter().any(|d| d.contains("a.cs")), "a.cs unattributed: {docs:?}");
+        assert!(docs.iter().any(|d| d.contains("b.cs")), "b.cs unattributed: {docs:?}");
+
+        let (rid, _il) = pdb.resolve_breakpoint("b.cs", 1).expect("a breakpoint in b.cs");
+        assert!(pdb.method_document(rid).unwrap().contains("b.cs"));
+    }
+
+    #[test]
     fn pdb_queries_map_source_lines_and_breakpoints() {
         let source = "class Program\n{\n    static int Main()\n    {\n        int x = 6;\n        return x * 7;\n    }\n}\n";
         let unit = parse_compilation_unit(source).unit;
@@ -5213,21 +5505,20 @@ mod tests {
         let points = pdb.sequence_points(2);
         assert_eq!(
             points.iter().map(|p| p.start_line).collect::<Vec<_>>(),
-            [5, 6]
+            [4, 5, 6, 7]
         );
 
+        assert_eq!(pdb.source_location(2, 0).unwrap().start_line, 4);
+        let line6 = points.iter().find(|p| p.start_line == 6).expect("a point on line 6");
         assert_eq!(
-            pdb.source_location(2, points[1].il_offset)
-                .unwrap()
-                .start_line,
+            pdb.source_location(2, line6.il_offset).unwrap().start_line,
             6
         );
-        assert_eq!(pdb.source_location(2, 0).unwrap().start_line, 5);
         assert!(pdb.method_document(2).unwrap().contains("app.cs"));
 
         assert_eq!(
             pdb.resolve_breakpoint("app.cs", 6),
-            Some((2, points[1].il_offset))
+            Some((2, line6.il_offset))
         );
     }
 

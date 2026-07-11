@@ -88,7 +88,8 @@ pub enum Expr {
     /// arrives here as `Int(-3)`).
     Int(i64),
     /// A floating-point literal -- the `f64` value's raw bits (`to_bits`), so `Expr` stays `Eq`.
-    /// Floats are dynamic (heap-boxed in the interpreter); the typed AOT lane rejects them.
+    /// A float literal, stored as its IEEE-754 f64 bit pattern. Heap-boxed in the interpreter; the
+    /// typed AOT lane lowers it to a native `f64` (annotated or inferred `float`).
     Float(u64),
     /// An imaginary literal `Nj` -- the imaginary part's `f64` bits. Dynamic (a heap `complex`).
     Imaginary(u64),
@@ -116,6 +117,18 @@ pub enum Expr {
         /// The operator.
         op: BinOp,
         /// The left operand.
+        lhs: Box<Expr>,
+        /// The right operand.
+        rhs: Box<Expr>,
+    },
+    /// The in-place form of a binary operation, produced only by an augmented assignment `x OP= y`
+    /// (never written directly). Like [`Expr::Binary`] but compiles to `InplaceBinOp`, which mutates
+    /// a mutable target in place (`x += y` on a list extends it) rather than always building a new
+    /// value. `lhs` is the current value of the target; the enclosing assignment stores the result.
+    InplaceBinary {
+        /// The operator.
+        op: BinOp,
+        /// The left operand (the target's current value).
         lhs: Box<Expr>,
         /// The right operand.
         rhs: Box<Expr>,
@@ -253,6 +266,12 @@ pub enum Expr {
     /// `value` (or `None`). A `yield` anywhere in a function body makes that function a generator.
     /// The expression's own value is what a later `send` injects (`None` under `next`).
     Yield(Option<Box<Expr>>),
+    /// A `yield from iterable` expression -- delegates to a sub-iterator: it re-yields each of the
+    /// sub-iterator's values to this generator's caller (forwarding any sent value or thrown
+    /// exception into the sub) until the sub is exhausted. The expression's own value is the sub's
+    /// return value (its `StopIteration.value`). Like `yield`, it makes the enclosing function a
+    /// generator.
+    YieldFrom(Box<Expr>),
     /// `name := value` -- the walrus (assignment expression): binds `name` and yields `value`.
     Walrus {
         /// The bound name (the target is a bare name).
@@ -400,6 +419,10 @@ pub enum Stmt {
     /// variables (a shared cell), so an assignment in this function writes through rather than
     /// creating a new local. Each name must be bound in some enclosing function scope.
     Nonlocal(Vec<String>),
+    /// `global name, ...` -- declare that these names bind the MODULE globals, so a read resolves the
+    /// global and an assignment stores to the module namespace (not a frame local). Excludes each name
+    /// from this function's locals / cells.
+    Global(Vec<String>),
     /// An `if`/`elif`/`else`. Each `elif` is desugared by the parser into a
     /// nested `If` in the preceding clause's `orelse`.
     If {
@@ -513,6 +536,13 @@ pub enum Stmt {
         module: String,
         /// Each `(member_name, bound_name)`.
         names: Vec<(String, String)>,
+    },
+    /// `from module import *` -- bind every public name of a module into the current module's
+    /// namespace (its `__all__` if defined, else every name not starting with `_`). The bound names
+    /// are not known until run time, so they resolve as globals. Only valid at module level.
+    ImportStar {
+        /// The module imported from (a simple name).
+        module: String,
     },
     /// `break` -- exit the innermost enclosing loop.
     Break,
