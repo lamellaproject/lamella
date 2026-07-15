@@ -35,7 +35,8 @@ macro_rules! intrinsic {
     };
 }
 use lamella_cil_runtime::intrinsics::{
-    array_clone, array_empty, array_get_value, array_rank, array_set_value, boolean_to_string,
+    array_clear_range, array_clone, array_empty, array_get_value, array_rank, array_set_value,
+    boolean_to_string,
     buffer_block_copy, buffer_byte_length, char_to_string, console_write,
     decimal_add, decimal_compare, decimal_divide, decimal_multiply, decimal_remainder,
     decimal_subtract,
@@ -44,6 +45,7 @@ use lamella_cil_runtime::intrinsics::{
     console_write_line, console_write_line_bool, console_write_line_char, console_write_line_empty,
     console_write_line_int32, console_write_line_int64, console_write_line_object,
     console_write_line_uint32, console_write_line_uint64, debug_write,
+    clock_is_set, clock_set_ticks,
     datetime_now_ticks, delegate_combine, delegate_equals, delegate_not_equals, delegate_remove,
     environment_get_variable, environment_processor_count, environment_tick_count,
     enum_format, enum_get_name,
@@ -57,23 +59,29 @@ use lamella_cil_runtime::intrinsics::{
     string_ctor_char_ptr, string_ctor_char_ptr_range, string_get_pinnable_reference,
     string_concat_object3, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
+    string_intern, string_is_interned,
     string_create_from_chars, string_not_equals, string_substring, string_substring_len,
     type_from_handle, type_get_name,
     thread_start, thread_join, thread_yield, thread_sleep, monitor_enter, monitor_exit,
     monitor_try_enter, monitor_wait, monitor_pulse, monitor_pulse_all,
     socket_connect_start, socket_connect_poll, socket_listen, socket_accept,
-    socket_send, socket_recv, socket_local_port, socket_close,
+    socket_send, socket_recv, socket_set_recv_timeout, socket_local_port, socket_close,
     socket_udp_bind, socket_udp_send_to, socket_udp_recv_from, dns_resolve_host,
+    net_is_available, net_iface_count, net_iface_oper_status, net_iface_type, net_iface_ipv4,
+    net_iface_subnet, net_iface_gateway, net_iface_flags,
     tls_client_config, tls_server_config, tls_client_new, tls_server_new, tls_process,
     tls_wants_write, tls_write_tls, tls_read_tls, tls_read_plain, tls_write_plain, tls_peer_cert,
-    tls_close, tls_default_stack,
+    tls_session_flags, tls_close, tls_default_stack, tls_client_config_alpn, tls_alpn_is,
+    tls_exporter_key, tls_drop_key, aead_siv_encrypt, aead_siv_decrypt, aead_import_key,
     fs_open, fs_read, fs_write, fs_seek, fs_length, fs_set_length, fs_flush, fs_close,
     fs_file_exists, fs_dir_exists, fs_delete_file, fs_create_dir, fs_delete_dir, fs_move, fs_list,
+    serial_open, serial_read, serial_write, serial_bytes_to_read, serial_bytes_to_write,
+    serial_flush, serial_discard_in, serial_discard_out, serial_close,
     marshal_alloc_hglobal, marshal_free_hglobal, marshal_read_byte, marshal_read_int16,
     marshal_read_int32, marshal_read_int64, marshal_write_byte, marshal_write_int16,
     marshal_write_int32, marshal_write_int64, marshal_size_of,
     intptr_from_raw_value, intptr_to_raw_value,
-    mmio_read32, mmio_write32,
+    mmio_read32, mmio_write32, mmio_read8, mmio_write8, mmio_read16, mmio_write16,
 };
 #[cfg(feature = "gc")]
 use lamella_cil_runtime::intrinsics::{gc_collect, weak_make_cell, weak_read_cell, weak_write_cell};
@@ -761,89 +769,47 @@ pub fn load_with_corlib<'c, 'p>(
     corlib: &SourceAssembly<'c>,
     program: &SourceAssembly<'p>,
 ) -> Result<Program, LoadError> {
-    if program.image().entry_point_token() == 0 {
-        return Err(LoadError::NoEntryPoint);
-    }
-    let mut module = Module::new();
-    let mut index = NameIndex::new();
-    let mut type_index = TypeNameIndex::new();
-    let mut field_index = FieldNameIndex::new();
-    load_assembly(
-        &mut module,
-        corlib,
-        0,
-        &mut index,
-        &mut type_index,
-        &mut field_index,
-        true,
-    );
-    let entry = load_assembly(
-        &mut module,
-        program,
-        1,
-        &mut index,
-        &mut type_index,
-        &mut field_index,
-        true,
-    );
-    let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
-    module.freeze();
-    Ok(Program { module, entry })
+    load_with_corlib_and_libraries(corlib, &[], program)
 }
 
-/// Like [`load_with_corlib`] but loads an extra LIBRARY assembly (e.g. `System.Device.Gpio`)
-/// between corlib and the program: corlib -> asm 0, library -> asm 1, program -> asm 2. The
-/// program's cross-assembly references to the library -- a `newobj` of a library type, a virtual
-/// call into a library base a program type overrides, a static call -- resolve by name through the
-/// shared indices, exactly as a two-assembly load resolves a program's references to corlib. This
-/// is the deploy shape for a driver stack: the corlib, one (or more) device-API assemblies, and
-/// the app.
+/// [`load_with_corlib_and_libraries`] for exactly one library (e.g. `System.Device.Gpio`):
+/// corlib -> asm 0, library -> asm 1, program -> asm 2.
 ///
 /// # Errors
-/// [`LoadError::NoEntryPoint`] if the program names no entry point;
-/// [`LoadError::EntryHasNoBody`] if the entry-point token has no loadable body.
+/// As [`load_with_corlib_and_libraries`].
 pub fn load_with_corlib_and_library<'c, 'l, 'p>(
     corlib: &SourceAssembly<'c>,
     library: &SourceAssembly<'l>,
     program: &SourceAssembly<'p>,
 ) -> Result<Program, LoadError> {
-    if program.image().entry_point_token() == 0 {
-        return Err(LoadError::NoEntryPoint);
-    }
-    let mut module = Module::new();
-    let mut index = NameIndex::new();
-    let mut type_index = TypeNameIndex::new();
-    let mut field_index = FieldNameIndex::new();
-    load_assembly(
-        &mut module,
-        corlib,
-        0,
-        &mut index,
-        &mut type_index,
-        &mut field_index,
-        true,
-    );
-    load_assembly(
-        &mut module,
-        library,
-        1,
-        &mut index,
-        &mut type_index,
-        &mut field_index,
-        true,
-    );
-    let entry = load_assembly(
-        &mut module,
-        program,
-        2,
-        &mut index,
-        &mut type_index,
-        &mut field_index,
-        true,
-    );
-    let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
-    module.freeze();
-    Ok(Program { module, entry })
+    load_with_corlib_and_libraries(corlib, core::slice::from_ref(library), program)
+}
+
+/// Like [`load_with_corlib`] but loads any number of LIBRARY assemblies (e.g.
+/// `System.Device.Gpio`, `Lamella.Net.Time`, `System.Net.NetworkInformation`) between corlib
+/// and the program: corlib -> asm 0, the libraries -> asm 1..=N in the given order, program ->
+/// asm N+1. Every cross-assembly reference -- a program `newobj` of a library type, a virtual
+/// call into a library base, a static call, a library's own call into corlib or a sibling
+/// library -- resolves by name through the shared indices, exactly as a two-assembly load
+/// resolves a program's references to corlib. Resolution is name-keyed, so the library ORDER
+/// never changes what binds -- only which assembly id each image gets. This is the deploy
+/// shape for a driver or protocol stack: the corlib, the device/net API assemblies, the app.
+///
+/// # Errors
+/// [`LoadError::NoEntryPoint`] if the program names no entry point;
+/// [`LoadError::EntryHasNoBody`] if the entry-point token has no loadable body.
+///
+/// # Panics
+/// If given more than 253 libraries -- assembly ids are 8-bit (corlib 0, libraries 1..=N,
+/// program N+1), and no deploy tier approaches that.
+pub fn load_with_corlib_and_libraries<'c, 'l, 'p>(
+    corlib: &SourceAssembly<'c>,
+    libraries: &[SourceAssembly<'l>],
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LoadError> {
+    let mut loaded = load_with_corlib_and_libraries_unfrozen(corlib, libraries, program)?;
+    loaded.module.freeze();
+    Ok(loaded)
 }
 
 /// [`load_with_corlib_and_library`] WITHOUT the final freeze -- for baking (`write_baked`), which
@@ -856,6 +822,28 @@ pub fn load_with_corlib_and_library_unfrozen<'c, 'l, 'p>(
     library: &SourceAssembly<'l>,
     program: &SourceAssembly<'p>,
 ) -> Result<Program, LoadError> {
+    load_with_corlib_and_libraries_unfrozen(corlib, core::slice::from_ref(library), program)
+}
+
+/// [`load_with_corlib_and_libraries`] WITHOUT the final freeze -- for baking (`write_baked`),
+/// which needs the unfrozen module. See [`load_unfrozen`]. This is the one loading core every
+/// `load_with_corlib*` variant delegates to.
+///
+/// # Errors
+/// As [`load_with_corlib_and_libraries`].
+///
+/// # Panics
+/// As [`load_with_corlib_and_libraries`].
+pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
+    corlib: &SourceAssembly<'c>,
+    libraries: &[SourceAssembly<'l>],
+    program: &SourceAssembly<'p>,
+) -> Result<Program, LoadError> {
+    assert!(
+        libraries.len() <= usize::from(u8::MAX) - 2,
+        "assembly ids are 8-bit: corlib + at most {} libraries + the program",
+        usize::from(u8::MAX) - 2
+    );
     if program.image().entry_point_token() == 0 {
         return Err(LoadError::NoEntryPoint);
     }
@@ -872,19 +860,21 @@ pub fn load_with_corlib_and_library_unfrozen<'c, 'l, 'p>(
         &mut field_index,
         true,
     );
-    load_assembly(
-        &mut module,
-        library,
-        1,
-        &mut index,
-        &mut type_index,
-        &mut field_index,
-        true,
-    );
+    for (position, library) in libraries.iter().enumerate() {
+        load_assembly(
+            &mut module,
+            library,
+            1 + position as u8,
+            &mut index,
+            &mut type_index,
+            &mut field_index,
+            true,
+        );
+    }
     let entry = load_assembly(
         &mut module,
         program,
-        2,
+        1 + libraries.len() as u8,
         &mut index,
         &mut type_index,
         &mut field_index,
@@ -902,33 +892,7 @@ pub fn load_with_corlib_unfrozen<'c, 'p>(
     corlib: &SourceAssembly<'c>,
     program: &SourceAssembly<'p>,
 ) -> Result<Program, LoadError> {
-    if program.image().entry_point_token() == 0 {
-        return Err(LoadError::NoEntryPoint);
-    }
-    let mut module = Module::new();
-    let mut index = NameIndex::new();
-    let mut type_index = TypeNameIndex::new();
-    let mut field_index = FieldNameIndex::new();
-    load_assembly(
-        &mut module,
-        corlib,
-        0,
-        &mut index,
-        &mut type_index,
-        &mut field_index,
-        true,
-    );
-    let entry = load_assembly(
-        &mut module,
-        program,
-        1,
-        &mut index,
-        &mut type_index,
-        &mut field_index,
-        true,
-    );
-    let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
-    Ok(Program { module, entry })
+    load_with_corlib_and_libraries_unfrozen(corlib, &[], program)
 }
 
 /// Loads one assembly into `module` under assembly id `asm`, returning the entry-point
@@ -1762,6 +1726,17 @@ fn bcl_intrinsic(
         match method {
             "Read32" => return Some(intrinsic!(mmio_read32)),
             "Write32" => return Some(intrinsic!(mmio_write32)),
+            "Read8" => return Some(intrinsic!(mmio_read8)),
+            "Write8" => return Some(intrinsic!(mmio_write8)),
+            "Read16" => return Some(intrinsic!(mmio_read16)),
+            "Write16" => return Some(intrinsic!(mmio_write16)),
+            _ => {}
+        }
+    }
+    if namespace == "Lamella.Runtime" && type_name == "Clock" {
+        match (method, parameters_of(signature)) {
+            ("SetTicks", [SigType::I8]) => return Some(intrinsic!(clock_set_ticks)),
+            ("IsSet", []) => return Some(intrinsic!(clock_is_set)),
             _ => {}
         }
     }
@@ -1802,6 +1777,7 @@ fn bcl_intrinsic(
             "AcceptPoll" => return Some(intrinsic!(socket_accept)),
             "SendPoll" => return Some(intrinsic!(socket_send)),
             "ReceivePoll" => return Some(intrinsic!(socket_recv)),
+            "SetRecvTimeout" => return Some(intrinsic!(socket_set_recv_timeout)),
             "LocalPort" => return Some(intrinsic!(socket_local_port)),
             "CloseSocket" => return Some(intrinsic!(socket_close)),
             "UdpBind" => return Some(intrinsic!(socket_udp_bind)),
@@ -1813,6 +1789,19 @@ fn bcl_intrinsic(
     if namespace == "System.Net" && type_name == "Dns" {
         match method {
             "ResolveHost" => return Some(intrinsic!(dns_resolve_host)),
+            _ => {}
+        }
+    }
+    if namespace == "System.Net.NetworkInformation" && type_name == "NetworkInterface" {
+        match method {
+            "NetworkAvailable" => return Some(intrinsic!(net_is_available)),
+            "InterfaceCount" => return Some(intrinsic!(net_iface_count)),
+            "OperStatus" => return Some(intrinsic!(net_iface_oper_status)),
+            "IfaceType" => return Some(intrinsic!(net_iface_type)),
+            "IPv4" => return Some(intrinsic!(net_iface_ipv4)),
+            "Ipv4Mask" => return Some(intrinsic!(net_iface_subnet)),
+            "Ipv4Gateway" => return Some(intrinsic!(net_iface_gateway)),
+            "IfaceFlags" => return Some(intrinsic!(net_iface_flags)),
             _ => {}
         }
     }
@@ -1829,8 +1818,30 @@ fn bcl_intrinsic(
             "ReadPlain" => return Some(intrinsic!(tls_read_plain)),
             "WritePlain" => return Some(intrinsic!(tls_write_plain)),
             "PeerCert" => return Some(intrinsic!(tls_peer_cert)),
+            "SessionFlags" => return Some(intrinsic!(tls_session_flags)),
             "CloseTls" => return Some(intrinsic!(tls_close)),
             "DefaultStack" => return Some(intrinsic!(tls_default_stack)),
+            _ => {}
+        }
+    }
+    if namespace == "Lamella.Net.Time" && type_name == "NtsNative" {
+        match method {
+            "ClientConfigAlpn" => return Some(intrinsic!(tls_client_config_alpn)),
+            "ClientNew" => return Some(intrinsic!(tls_client_new)),
+            "Process" => return Some(intrinsic!(tls_process)),
+            "WantsWrite" => return Some(intrinsic!(tls_wants_write)),
+            "WriteTls" => return Some(intrinsic!(tls_write_tls)),
+            "ReadTls" => return Some(intrinsic!(tls_read_tls)),
+            "ReadPlain" => return Some(intrinsic!(tls_read_plain)),
+            "WritePlain" => return Some(intrinsic!(tls_write_plain)),
+            "CloseTls" => return Some(intrinsic!(tls_close)),
+            "DefaultStack" => return Some(intrinsic!(tls_default_stack)),
+            "AlpnIs" => return Some(intrinsic!(tls_alpn_is)),
+            "ExporterKey" => return Some(intrinsic!(tls_exporter_key)),
+            "DropKey" => return Some(intrinsic!(tls_drop_key)),
+            "SivEncrypt" => return Some(intrinsic!(aead_siv_encrypt)),
+            "SivDecrypt" => return Some(intrinsic!(aead_siv_decrypt)),
+            "ImportKey" => return Some(intrinsic!(aead_import_key)),
             _ => {}
         }
     }
@@ -1863,6 +1874,20 @@ fn bcl_intrinsic(
             _ => {}
         }
     }
+    if namespace == "System.IO.Ports" && type_name == "NativeSerial" {
+        match method {
+            "Open" => return Some(intrinsic!(serial_open)),
+            "Read" => return Some(intrinsic!(serial_read)),
+            "Write" => return Some(intrinsic!(serial_write)),
+            "BytesToRead" => return Some(intrinsic!(serial_bytes_to_read)),
+            "BytesToWrite" => return Some(intrinsic!(serial_bytes_to_write)),
+            "Flush" => return Some(intrinsic!(serial_flush)),
+            "DiscardIn" => return Some(intrinsic!(serial_discard_in)),
+            "DiscardOut" => return Some(intrinsic!(serial_discard_out)),
+            "Close" => return Some(intrinsic!(serial_close)),
+            _ => {}
+        }
+    }
     if namespace == "System" && type_name == "Environment" {
         match method {
             "get_TickCount" => return Some(intrinsic!(environment_tick_count)),
@@ -1888,6 +1913,8 @@ fn bcl_intrinsic(
         ("String", "op_Equality") => string_equals_overload(signature),
         ("String", "op_Inequality") => string_not_equals_overload(signature),
         ("String", "IsNullOrEmpty") => string_is_null_or_empty_overload(signature),
+        ("String", "InternCore") => Some(intrinsic!(string_intern)),
+        ("String", "IsInternedCore") => Some(intrinsic!(string_is_interned)),
         ("String", "Substring") => string_substring_overload(signature),
         ("String", "CreateFromChars") => match parameters_of(signature) {
             [SigType::SzArray(_), SigType::I4, SigType::I4] => Some(intrinsic!(string_create_from_chars)),
@@ -1996,6 +2023,7 @@ fn bcl_intrinsic(
         ("Array", "get_Length") => Some(intrinsic!(md_array_length)),
         ("Array", "GetLength") => Some(intrinsic!(md_array_get_length)),
         ("Array", "get_Rank") => Some(intrinsic!(array_rank)),
+        ("Array", "ClearCore") => Some(intrinsic!(array_clear_range)),
         ("Array", "GetValue") => match parameters_of(signature) {
             [SigType::I4] => Some(intrinsic!(array_get_value)),
             _ => None,

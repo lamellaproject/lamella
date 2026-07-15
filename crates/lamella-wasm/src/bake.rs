@@ -164,7 +164,7 @@ mod tests {
         );
         let app = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wireline/tests/fixtures/hello.exe"
+            "/../lamella-wire-host/tests/fixtures/hello.exe"
         );
         let (Ok(corlib), Ok(app)) = (std::fs::read(corlib), std::fs::read(app)) else {
             return;

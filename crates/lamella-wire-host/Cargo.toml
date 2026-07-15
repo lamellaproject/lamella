@@ -1,11 +1,11 @@
 [package]
-name = "lamella-wireline"
+name = "lamella-wire-host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Host side of the wireline debug + REPL channel: a serial (USB-CDC / UART) Transport over lamella-wire, and the host-stateless REPL -- the host compiles a submission and the target runs the CIL + returns its output. The reference runner runs in-process for host-side testing; the same runner core flashes onto a device behind the wire."
+description = "Host side of the Lamella Link debug + REPL channel: a serial (USB-CDC / UART) Transport over lamella-wire, and the host-stateless REPL -- the host compiles a submission and the target runs the CIL + returns its output. The reference runner runs in-process for host-side testing; the same runner core flashes onto a device behind the wire."
 
 [dependencies]
 # The no_std runner core (run_program / serve_one / RunResult / repl), shared with the on-device firmware;
@@ -27,10 +27,10 @@ lamella-metadata = { path = "../lamella-metadata", optional = true }
 # The `baked` link's host-side bake step (load the submission's PE, write the flash image).
 # Already in the tree via lamella-runner; declared so the link can name its API.
 lamella-load = { path = "../lamella-load", optional = true, default-features = false }
-# The debug seam (the DebugBackend trait, a dependency-free leaf): WirelineBackend
+# The debug seam (the DebugBackend trait, a dependency-free leaf): WireHostBackend
 # implements it over the wire's debug channel, so lamella-dap drives a DEVICE unchanged.
 lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
-# Host-only (debug-backend): parse the pre-built source map JSON (method_id -> source lines) so a wireline debug
+# Host-only (debug-backend): parse the pre-built source map JSON (method_id -> source lines) so a Lamella Link debug
 # session is SOURCE-LEVEL, not IL-level.
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
@@ -53,14 +53,14 @@ repl-host = ["dep:lamella-assemble", "dep:lamella-metadata"]
 # eval_image_blocking). Forwards the runner's baked-image knob (which pins loads to
 # Assembly<'static>; the link leaks one buffer per evaluation, the accepted host pattern).
 baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata"]
-# WirelineBackend: the lamella-debug-backend seam over the wire's debug channel (serial
+# WireHostBackend: the lamella-debug-backend seam over the wire's debug channel (serial
 # carrier). A code location crosses the seam as an opaque address packing the wire's
 # (method_id, offset) pair.
 debug-backend = ["serial", "dep:lamella-debug-backend", "dep:serde", "dep:serde_json"]
 
 # (The interactive REPL CLI now lives in the dedicated `lamella-repl` crate; the former
 # `lamella-repl` bin here was a duplicate of that binary name -- removed on merge to avoid a
-# target collision. lamella-wireline remains the host library the CLI builds on.)
+# target collision. lamella-wire-host remains the host library the CLI builds on.)
 
 [lints]
 workspace = true

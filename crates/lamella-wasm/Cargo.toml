@@ -35,7 +35,7 @@ lamella-py-runtime = { path = "../lamella-py-runtime", optional = true }
 # default features (the serial carrier + the csc `repl-host` front end) are host-only and not
 # wasm-buildable, so take only the carrier-neutral core (--no-default-features); this crate supplies
 # the compiler (over `compile`) and uses the engine's in-process LoopbackLink for the run side.
-lamella-wireline = { path = "../lamella-wireline", optional = true, default-features = false }
+lamella-wire-host = { path = "../lamella-wire-host", optional = true, default-features = false }
 
 [features]
 # Adds the lamella_selftest export so a wasm host can validate the module end to end
@@ -59,10 +59,10 @@ aot = ["dep:lamella-aot"]
 # Adds the in-page Python runner (lamella_py_run: Python source -> compile + run main() -> rendered
 # result + diagnostics) so Studio compiles + runs the user's Python client-side. Off by default.
 py = ["dep:lamella-py-frontend", "dep:lamella-py-runtime"]
-# Adds the in-page stateful C# REPL (lamella_repl_new/eval/reset) over lamella-wireline's
+# Adds the in-page stateful C# REPL (lamella_repl_new/eval/reset) over lamella-wire-host's
 # carrier-neutral tier-0 REPL engine, so Studio runs the SAME read-compile-eval-print engine the
 # CLI does. Pulls in `compile` (the in-wasm compiler the REPL's compile seam wraps). Off by default.
-repl = ["dep:lamella-wireline", "compile"]
+repl = ["dep:lamella-wire-host", "compile"]
 # Adds the in-page baker (lamella_bake: corlib + library + app -> a self-contained .lmli flash image)
 # so Studio bakes a compiled app to a deployable device image client-side -- the deploy half of the
 # browser hardware story. Pulls the loader's baked-image (code-in-place) + kernel profile surface.

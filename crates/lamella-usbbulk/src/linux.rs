@@ -183,38 +183,43 @@ impl Device {
         Self::open(vendor_id, product_id, serial)
     }
 
-    pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
+    /// One bulk transfer on `endpoint` (the usbfs ioctl carries the direction in the address's 0x80
+    /// bit), returning the byte count transferred. Both the packet and endpoint-addressed I/O route here.
+    fn bulk(&self, endpoint: u8, data: *mut libc::c_void, len: usize, timeout_ms: u32) -> Result<usize> {
         let mut bt = UsbdevfsBulktransfer {
-            ep: u32::from(self.ep_out),
-            len: data.len() as libc::c_uint,
-            timeout: 1000,
-            data: data.as_ptr() as *mut libc::c_void,
+            ep: u32::from(endpoint),
+            len: len as libc::c_uint,
+            timeout: timeout_ms,
+            data,
         };
         let rc = unsafe { libc::ioctl(self.file.as_raw_fd(), USBDEVFS_BULK, &mut bt) };
         if rc < 0 {
             return Err(Error::Os(format!(
-                "USBDEVFS_BULK (write): {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn read_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
-        let mut bt = UsbdevfsBulktransfer {
-            ep: u32::from(self.ep_in),
-            len: buf.len() as libc::c_uint,
-            timeout: timeout.as_millis().min(u128::from(u32::MAX)) as libc::c_uint,
-            data: buf.as_mut_ptr() as *mut libc::c_void,
-        };
-        let rc = unsafe { libc::ioctl(self.file.as_raw_fd(), USBDEVFS_BULK, &mut bt) };
-        if rc < 0 {
-            return Err(Error::Os(format!(
-                "USBDEVFS_BULK (read): {}",
+                "USBDEVFS_BULK (ep 0x{endpoint:02x}): {}",
                 std::io::Error::last_os_error()
             )));
         }
         Ok(rc as usize)
+    }
+
+    /// Sends one bulk OUT packet on a specific endpoint address (see [`crate::Device::write_endpoint`]).
+    pub fn write_endpoint(&mut self, endpoint: u8, data: &[u8]) -> Result<()> {
+        self.bulk(endpoint, data.as_ptr() as *mut libc::c_void, data.len(), 1000)
+            .map(|_| ())
+    }
+
+    /// Reads one bulk IN packet from a specific endpoint address (see [`crate::Device::read_endpoint`]).
+    pub fn read_endpoint(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        let ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        self.bulk(endpoint, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), ms)
+    }
+
+    pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
+        self.write_endpoint(self.ep_out, data)
+    }
+
+    pub fn read_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.read_endpoint(self.ep_in, buf, timeout)
     }
 }
 

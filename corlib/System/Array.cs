@@ -69,12 +69,15 @@ namespace System
 
         public static void Clear(Array array, int index, int length)
         {
-            int end = index + length;
-            for (int i = index; i < end; i++)
+            if ((object)array == null) throw new ArgumentNullException("array");
+            if (index < 0 || length < 0 || index > array.Length - length)
             {
-                array.SetValue(null, i);
+                throw new IndexOutOfRangeException();
             }
+            ClearCore(array, index, length);
         }
+
+        [Lamella.Runtime.RuntimeProvided] private static void ClearCore(Array array, int index, int length) { }
 
         public static void Sort(Array array)
         {

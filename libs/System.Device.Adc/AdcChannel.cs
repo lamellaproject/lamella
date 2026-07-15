@@ -1,4 +1,4 @@
-// Lamella System.Device.Adc -- a separate assembly matching the Windows.Devices.Adc /
+// System.Device.Adc -- third-party-compatibility ADC surface shaped after nanoFramework's Windows.Devices.Adc (dotnet/iot ships no core ADC class), shipped as its own assembly.
 namespace System.Device.Adc
 {
     /// <summary>Represents a single ADC channel.</summary>
@@ -14,7 +14,6 @@ namespace System.Device.Adc
             _channelNumber = channelNumber;
         }
 
-        /// <summary>Gets the ADC controller for this channel.</summary>
         public AdcController Controller { get { return _controller; } }
 
         /// <summary>Reads the digital representation of the analog value from the ADC.</summary>
@@ -44,7 +43,6 @@ namespace System.Device.Adc
             }
         }
 
-        /// <summary>Disposes the channel, closing it.</summary>
         public void Dispose()
         {
             Close();

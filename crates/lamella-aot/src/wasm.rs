@@ -314,6 +314,8 @@ fn uses_memory(funcs: &[Function]) -> bool {
                     | Inst::Store { .. }
                     | Inst::FieldLoad { .. }
                     | Inst::FieldStore { .. }
+                    | Inst::FieldLoadNarrow { .. }
+                    | Inst::FieldStoreNarrow { .. }
                     | Inst::FieldAddr { .. }
                     | Inst::ArrayLoad { .. }
                     | Inst::ArrayStore { .. }
@@ -1164,6 +1166,42 @@ fn lower_inst(
                 emit_typed_store(body, value_types[value.index()], *offset)?;
             }
         }
+        Inst::FieldLoadNarrow {
+            base,
+            offset,
+            size,
+            signed,
+        } => {
+            if !is_addressable(value_types, *base) {
+                return Err(LowerError::Unsupported);
+            }
+            body.local_get(local(*base));
+            match (*size, *signed) {
+                (1, false) => body.i32_load8_u(MemArg::new(1, *offset)),
+                (1, true) => body.i32_load8_s(MemArg::new(1, *offset)),
+                (2, false) => body.i32_load16_u(MemArg::new(2, *offset)),
+                (2, true) => body.i32_load16_s(MemArg::new(2, *offset)),
+                _ => return Err(LowerError::Unsupported),
+            }
+            body.local_set(local(result));
+        }
+        Inst::FieldStoreNarrow {
+            base,
+            offset,
+            value,
+            size,
+        } => {
+            if !is_addressable(value_types, *base) {
+                return Err(LowerError::Unsupported);
+            }
+            body.local_get(local(*base));
+            body.local_get(local(*value));
+            match *size {
+                1 => body.i32_store8(MemArg::new(1, *offset)),
+                2 => body.i32_store16(MemArg::new(2, *offset)),
+                _ => return Err(LowerError::Unsupported),
+            }
+        }
         Inst::FieldAddr { base, offset } => {
             if !is_addressable(value_types, *base) {
                 return Err(LowerError::Unsupported);
@@ -1288,12 +1326,22 @@ fn lower_inst(
             body.local_get(local(*value));
             emit_array_store(body, *element_size, value_types[value.index()])?;
         }
-        Inst::StaticLoad { offset } => {
+        Inst::StaticLoad { owner, offset } => {
+            if !matches!(owner, lamella_ir::StaticOwner::Own) {
+                return Err(LowerError::Unsupported);
+            }
             body.i32_const(STATIC_BASE);
             emit_typed_load(body, value_types[result.index()], *offset)?;
             body.local_set(local(result));
         }
-        Inst::StaticStore { offset, value } => {
+        Inst::StaticStore {
+            owner,
+            offset,
+            value,
+        } => {
+            if !matches!(owner, lamella_ir::StaticOwner::Own) {
+                return Err(LowerError::Unsupported);
+            }
             body.i32_const(STATIC_BASE);
             body.local_get(local(*value));
             emit_typed_store(body, value_types[value.index()], *offset)?;
@@ -2989,6 +3037,7 @@ mod tests {
                     (
                         ValueId(1),
                         Inst::StaticStore {
+                            owner: lamella_ir::StaticOwner::Own,
                             offset: 0,
                             value: ValueId(0),
                         },
@@ -2997,12 +3046,25 @@ mod tests {
                     (
                         ValueId(3),
                         Inst::StaticStore {
+                            owner: lamella_ir::StaticOwner::Own,
                             offset: 4,
                             value: ValueId(2),
                         },
                     ),
-                    (ValueId(4), Inst::StaticLoad { offset: 0 }),
-                    (ValueId(5), Inst::StaticLoad { offset: 4 }),
+                    (
+                        ValueId(4),
+                        Inst::StaticLoad {
+                            owner: lamella_ir::StaticOwner::Own,
+                            offset: 0,
+                        },
+                    ),
+                    (
+                        ValueId(5),
+                        Inst::StaticLoad {
+                            owner: lamella_ir::StaticOwner::Own,
+                            offset: 4,
+                        },
+                    ),
                     (
                         ValueId(6),
                         Inst::Binary {

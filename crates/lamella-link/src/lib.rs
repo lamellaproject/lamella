@@ -30,6 +30,16 @@ pub enum LinkError {
     /// An absolute relocation (`R_ARM_ABS32`, `R_RISCV_32`) was found, but the link is base-agnostic
     /// (use [`link_at_base`], which knows the load address an absolute reference needs).
     AbsoluteNeedsBase,
+    /// The managed statics regions (plus the EH word) need more RAM than the window allows --
+    /// `needed` bytes against a `cap`-byte window. The default windows are deliberately small
+    /// (they sit below the runtime-support worker-stack ladders); pass a bigger explicit window
+    /// via [`link_with_archives_ram`] if the target's RAM plan has one.
+    StaticsOverflow {
+        /// The bytes the regions + EH word need together.
+        needed: u32,
+        /// The window's capacity in bytes.
+        cap: u32,
+    },
 }
 
 /// On ARM, a Thumb function symbol carries the Thumb state in its value's low bit (`answer` =
@@ -109,6 +119,20 @@ pub fn link_at_base_gc(
 /// relocations cannot pin an otherwise-trimmed method); other data is retained wholesale.
 pub use lamella_elf::TYPE_DESC_PREFIX;
 
+/// Re-exported stack-map names (see [`lamella_elf`]): the backend NAMES record symbols with the
+/// prefixes; this linker applies the record keep-rule by them and defines the start/end symbols
+/// around the gathered pointer table.
+pub use lamella_elf::{
+    STACKMAP_END_SYMBOL, STACKMAP_RECORD_PREFIX, STACKMAP_START_SYMBOL, STACKMAP_STATICS_PREFIX,
+};
+
+/// Re-exported statics-layout names (see [`lamella_elf`]): the backend references regions and the
+/// EH word by them; this linker lays the regions out in a RAM window, defines every symbol, and
+/// brackets the span for a boot stub's zero loop.
+pub use lamella_elf::{
+    EH_TAG_SYMBOL, STATICS_BASE_PREFIX, STATICS_END_SYMBOL, STATICS_START_SYMBOL,
+};
+
 /// Function-level `--gc-sections`: builds the cross-object reference graph from `entry` -- following each
 /// reached symbol's relocations, a function's calls AND a data symbol's references (e.g. a type
 /// descriptor's vtable entries and base pointer) -- keeps the reachable functions, reachable descriptors,
@@ -161,11 +185,14 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
     let mut kept: Vec<usize> = (0..obj.symbols.len())
         .filter(|&i| {
             let s = &obj.symbols[i];
-            s.defined
-                && s.size > 0
-                && !s.name.is_empty()
-                && (reachable.contains(&s.name)
-                    || (s.kind != SymbolType::Func && !s.name.starts_with(TYPE_DESC_PREFIX)))
+            if !s.defined || s.size == 0 || s.name.is_empty() {
+                return false;
+            }
+            if let Some(func) = s.name.strip_prefix(STACKMAP_RECORD_PREFIX) {
+                return reachable.contains(func);
+            }
+            reachable.contains(&s.name)
+                || (s.kind != SymbolType::Func && !s.name.starts_with(TYPE_DESC_PREFIX))
         })
         .collect();
     kept.sort_by_key(|&i| obj.symbols[i].value & !1);
@@ -224,7 +251,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                 symbols.push(lamella_elf::ParsedSymbol {
                     name: target.name.clone(),
                     value: 0,
-                    size: 0,
+                    size: target.size,
                     binding: Binding::Global,
                     kind: target.kind,
                     defined: false,
@@ -256,6 +283,110 @@ fn link_with_base(
     entry: &str,
     text_base: Option<u32>,
     residents: &[(&str, u32)],
+) -> Result<LinkedImage, LinkError> {
+    link_with_base_ram(objects, entry, text_base, residents, None)
+}
+
+fn link_with_base_ram(
+    objects: &[Object],
+    entry: &str,
+    text_base: Option<u32>,
+    residents: &[(&str, u32)],
+    ram: Option<(u32, u32)>,
+) -> Result<LinkedImage, LinkError> {
+    if let Some(table) = stackmap_table_object(objects) {
+        let mut with_table: Vec<Object> = objects.to_vec();
+        with_table.push(table);
+        return link_with_base_inner(&with_table, entry, text_base, residents, ram);
+    }
+    link_with_base_inner(objects, entry, text_base, residents, ram)
+}
+
+/// The stack-map pointer-table object over every record symbol in `objects` (see
+/// [`link_with_base`]), or `None` when no object carries one. Weak duplicate definitions of a
+/// record name resolve to one address at the link, so each name is tabled once.
+fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
+    let machine = objects.first()?.machine;
+    let mut names: Vec<String> = objects
+        .iter()
+        .flat_map(|o| &o.symbols)
+        .filter(|s| {
+            s.defined
+                && (s.name.starts_with(STACKMAP_RECORD_PREFIX)
+                    || s.name.starts_with(STACKMAP_STATICS_PREFIX))
+        })
+        .map(|s| s.name.clone())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    names.dedup();
+    let mut text = Vec::with_capacity(4 + 4 * names.len());
+    text.extend_from_slice(&(names.len() as u32).to_le_bytes());
+    text.resize(4 + 4 * names.len(), 0);
+    let abs32 = match machine {
+        Machine::Arm => arm::R_ARM_ABS32,
+        Machine::RiscV => riscv::R_RISCV_32,
+    };
+    let mut symbols: Vec<lamella_elf::ParsedSymbol> = Vec::new();
+    symbols.push(lamella_elf::ParsedSymbol {
+        name: String::new(),
+        value: 0,
+        size: 0,
+        binding: Binding::Local,
+        kind: SymbolType::NoType,
+        defined: false,
+    });
+    symbols.push(lamella_elf::ParsedSymbol {
+        name: String::from(STACKMAP_START_SYMBOL),
+        value: 0,
+        size: text.len() as u32,
+        binding: Binding::Global,
+        kind: SymbolType::NoType,
+        defined: true,
+    });
+    symbols.push(lamella_elf::ParsedSymbol {
+        name: String::from(STACKMAP_END_SYMBOL),
+        value: text.len() as u32,
+        size: 0,
+        binding: Binding::Global,
+        kind: SymbolType::NoType,
+        defined: true,
+    });
+    let mut relocations: Vec<ParsedRelocation> = Vec::with_capacity(names.len());
+    for (i, name) in names.into_iter().enumerate() {
+        relocations.push(ParsedRelocation {
+            offset: 4 + 4 * i as u32,
+            symbol: symbols.len() as u32,
+            kind: abs32,
+            addend: 0,
+            implicit_addend: false,
+        });
+        symbols.push(lamella_elf::ParsedSymbol {
+            name,
+            value: 0,
+            size: 0,
+            binding: Binding::Global,
+            kind: SymbolType::NoType,
+            defined: false,
+        });
+    }
+    Some(Object {
+        machine,
+        text,
+        text_align: 4,
+        symbols,
+        relocations,
+    })
+}
+
+fn link_with_base_inner(
+    objects: &[Object],
+    entry: &str,
+    text_base: Option<u32>,
+    residents: &[(&str, u32)],
+    ram: Option<(u32, u32)>,
 ) -> Result<LinkedImage, LinkError> {
     let machine = link_machine(objects)?;
 
@@ -306,6 +437,80 @@ fn link_with_base(
                 normalized_value(machine, addr).wrapping_sub(base),
                 is_thumb_func(machine, addr),
             ));
+        }
+    }
+
+    let mut regions: Vec<(String, u32)> = Vec::new();
+    let mut eh_referenced = false;
+    let mut brackets_referenced = false;
+    for obj in objects {
+        for s in &obj.symbols {
+            if s.defined || s.name.is_empty() {
+                continue;
+            }
+            if statics_region_suffix(&s.name).is_some() {
+                match regions.iter_mut().find(|(n, _)| *n == s.name) {
+                    Some(r) => r.1 = r.1.max(s.size),
+                    None => regions.push((s.name.clone(), s.size)),
+                }
+            } else if s.name == EH_TAG_SYMBOL {
+                eh_referenced = true;
+            } else if s.name == STATICS_START_SYMBOL || s.name == STATICS_END_SYMBOL {
+                brackets_referenced = true;
+            }
+        }
+    }
+    regions.retain(|(n, _)| resolve(&defined, n).is_none());
+    if !regions.is_empty() || eh_referenced || brackets_referenced {
+        if let Some(entry_region) = objects
+            .iter()
+            .find(|o| o.symbols.iter().any(|s| s.defined && s.name == entry))
+            .and_then(|o| {
+                o.symbols
+                    .iter()
+                    .find(|s| !s.defined && statics_region_suffix(&s.name).is_some())
+                    .map(|s| s.name.clone())
+            })
+        {
+            if let Some(pos) = regions.iter().position(|(n, _)| *n == entry_region) {
+                let lead = regions.remove(pos);
+                regions.insert(0, lead);
+            }
+        }
+        let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+        let (ram_base, ram_cap) = ram.unwrap_or(match machine {
+            Machine::Arm => (0x2000_1000, 0x1000),
+            Machine::RiscV => (0x8030_0000, 0x1000),
+        });
+        let mut cursor = ram_base;
+        for (name, size) in &regions {
+            defined.push((name.clone(), cursor.wrapping_sub(base), false));
+            cursor += (*size).max(4).next_multiple_of(4);
+        }
+        let eh_addr = match regions.is_empty() {
+            false => ram_base,
+            true => {
+                cursor += 4;
+                ram_base
+            }
+        };
+        defined.push((String::from(EH_TAG_SYMBOL), eh_addr.wrapping_sub(base), false));
+        defined.push((
+            String::from(STATICS_START_SYMBOL),
+            ram_base.wrapping_sub(base),
+            false,
+        ));
+        defined.push((
+            String::from(STATICS_END_SYMBOL),
+            cursor.wrapping_sub(base),
+            false,
+        ));
+        let needed = cursor - ram_base;
+        if needed > ram_cap {
+            return Err(LinkError::StaticsOverflow {
+                needed,
+                cap: ram_cap,
+            });
         }
     }
 
@@ -365,6 +570,19 @@ fn is_thumb_func(machine: Machine, value: u32) -> bool {
     machine == Machine::Arm && value & 1 == 1
 }
 
+/// The assembly-hash suffix of a statics-REGION symbol name, or `None` for any other name. A
+/// region suffix is EXACTLY eight lowercase hex digits (the backend's fnv1a32 of the assembly's
+/// CIL bytes) -- which is what keeps `__lamella_statics_start`/`__lamella_statics_end` (the
+/// zero-span brackets, same prefix) from being mistaken for regions.
+fn statics_region_suffix(name: &str) -> Option<&str> {
+    let suffix = name.strip_prefix(STATICS_BASE_PREFIX)?;
+    (suffix.len() == 8
+        && suffix
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then_some(suffix)
+}
+
 /// Links `objects` plus, ON DEMAND, only the `archives` members needed to resolve them -- the classic
 /// `.a` semantics. Every explicit object is always included; an archive member is pulled only if it
 /// defines a symbol still undefined across the current set, iterated to a fixpoint (a pulled member
@@ -379,6 +597,23 @@ pub fn link_with_archives(
 ) -> Result<LinkedImage, LinkError> {
     let included = include_on_demand(objects, archives);
     link_with_base(&included, entry, text_base, &[])
+}
+
+/// As [`link_with_archives`], but with an EXPLICIT statics RAM window `(base, size in bytes)` for
+/// the managed regions + EH word (see the layout pass in `link_with_base_inner`) instead of the
+/// per-machine default. This is the per-target RAM-plan input: a board whose statics cannot live
+/// at the default window (ARM 0x2000_1000 + 4 KiB, RISC-V 0x8030_0000 + 4 KiB) passes its own.
+/// The defined region symbols appear in [`LinkedImage::symbols`] resident-style: their recorded
+/// offset plus `text_base` is the absolute RAM address.
+pub fn link_with_archives_ram(
+    objects: &[Object],
+    archives: &[Archive],
+    entry: &str,
+    text_base: Option<u32>,
+    ram: (u32, u32),
+) -> Result<LinkedImage, LinkError> {
+    let included = include_on_demand(objects, archives);
+    link_with_base_ram(&included, entry, text_base, &[], Some(ram))
 }
 
 /// The explicit objects plus the archive members pulled on demand (see [`link_with_archives`]).
@@ -1022,6 +1257,7 @@ fn encode_abs32(text: &mut [u8], site: u32, value: i64, thumb: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
     use lamella_elf::{
         ArchiveMember, Binding, Machine, Relocation, Symbol, SymbolSection, SymbolType, arm,
         read_object, write_relocatable_object,
@@ -1063,6 +1299,19 @@ mod tests {
         }
     }
 
+    /// An undefined reference CARRYING a size -- the statics-region shape (`st_size` = the
+    /// region's byte size, the linker's RAM-layout input).
+    fn undef_sized(name: &'static str, size: u32) -> Symbol<'static> {
+        Symbol {
+            name,
+            value: 0,
+            size,
+            binding: Binding::Global,
+            kind: SymbolType::NoType,
+            section: SymbolSection::Undefined,
+        }
+    }
+
     fn weak(name: &'static str, value: u32, size: u32) -> Symbol<'static> {
         Symbol {
             name,
@@ -1083,6 +1332,229 @@ mod tests {
             kind: SymbolType::NoType,
             section: SymbolSection::Text,
         }
+    }
+
+    /// A weak DATA symbol (a stack-map record's shape).
+    fn weak_data(name: &'static str, value: u32, size: u32) -> Symbol<'static> {
+        Symbol {
+            name,
+            value,
+            size,
+            binding: Binding::Weak,
+            kind: SymbolType::NoType,
+            section: SymbolSection::Text,
+        }
+    }
+
+    /// A minimal 16-byte METHOD_SLOTS stack-map record: `[func_addr=0][code_size][mode=1]`
+    /// `[frame_words][ret_lr_word][root_count=0]` -- enough for the linker-side rules, which never
+    /// parse a record's body (they act on the symbol name and its relocation).
+    fn smrec_bytes(code_size: u32, frame_words: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&code_size.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&frame_words.to_le_bytes());
+        out.extend_from_slice(&(frame_words - 1).to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn statics_regions_lay_out_entry_first_with_eh_alias_and_brackets() {
+        let lib = obj_arm(
+            &[0x70, 0x47, 0x00, 0x00, 0, 0, 0, 0],
+            &[
+                func("g", 1, 4),
+                undef_sized("__lamella_statics_bbbbbbbb", 8),
+            ],
+            &[Relocation {
+                offset: 4,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 4,
+            }],
+        );
+        let prog = obj_arm(
+            &[0x70, 0x47, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[
+                func("f0", 1, 4),
+                undef_sized("__lamella_statics_aaaaaaaa", 12),
+                undef("__lamella_eh_tag"),
+            ],
+            &[
+                Relocation {
+                    offset: 4,
+                    symbol: 1,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 8,
+                },
+                Relocation {
+                    offset: 8,
+                    symbol: 2,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                },
+            ],
+        );
+        let base = 0x100u32;
+        let img = link_at_base(&[lib, prog], "f0", base).unwrap();
+        let addr = |name: &str| {
+            img.symbols
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|&(_, off)| off.wrapping_add(base))
+                .unwrap_or_else(|| panic!("{name} is defined"))
+        };
+        assert_eq!(addr("__lamella_statics_aaaaaaaa"), 0x2000_1000, "entry first");
+        assert_eq!(addr("__lamella_statics_bbbbbbbb"), 0x2000_100C);
+        assert_eq!(addr(EH_TAG_SYMBOL), 0x2000_1000, "EH = entry region word 0");
+        assert_eq!(addr(STATICS_START_SYMBOL), 0x2000_1000);
+        assert_eq!(addr(STATICS_END_SYMBOL), 0x2000_1014, "12 + 8 bytes spanned");
+        let word = |off: usize| {
+            u32::from_le_bytes([
+                img.text[off],
+                img.text[off + 1],
+                img.text[off + 2],
+                img.text[off + 3],
+            ])
+        };
+        assert_eq!(word(4), 0x2000_100C + 4, "lib slot 1 -> ITS region + 4");
+        assert_eq!(word(8 + 4), 0x2000_1000 + 8, "prog slot 2 -> its region + 8");
+        assert_eq!(word(8 + 8), 0x2000_1000, "prog throw/catch -> the EH word");
+    }
+
+    #[test]
+    fn statics_window_overflow_fails_loud() {
+        let prog = obj_arm(
+            &[0x70, 0x47, 0x00, 0x00, 0, 0, 0, 0],
+            &[
+                func("f0", 1, 4),
+                undef_sized("__lamella_statics_aaaaaaaa", 0x2000),
+            ],
+            &[Relocation {
+                offset: 4,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+        );
+        assert!(matches!(
+            link_at_base(&[prog], "f0", 0x100),
+            Err(LinkError::StaticsOverflow {
+                needed: 0x2000,
+                cap: 0x1000
+            })
+        ));
+    }
+
+    #[test]
+    fn gc_trim_preserves_the_region_reference_size() {
+        let prog = obj_arm(
+            &[0x70, 0x47, 0x00, 0x00, 0, 0, 0, 0],
+            &[
+                func("f0", 1, 8),
+                undef_sized("__lamella_statics_aaaaaaaa", 24),
+            ],
+            &[Relocation {
+                offset: 4,
+                symbol: 1,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+        );
+        let trimmed = garbage_collect(&[prog], "f0");
+        let region = trimmed[0]
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_statics_aaaaaaaa")
+            .expect("the region reference survives the trim");
+        assert!(!region.defined);
+        assert_eq!(region.size, 24, "st_size survives the trim");
+        let img = link_at_base(&trimmed, "f0", 0x100).unwrap();
+        assert!(
+            img.symbols
+                .iter()
+                .any(|(n, _)| n == "__lamella_statics_aaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn stackmap_records_live_and_die_with_their_function() {
+        let mut text = vec![0x70, 0x47, 0x00, 0x00, 0x70, 0x47, 0x00, 0x00];
+        text.extend_from_slice(&smrec_bytes(4, 1));
+        text.extend_from_slice(&smrec_bytes(4, 1));
+        let o = obj_arm(
+            &text,
+            &[
+                func("f0", 1, 4),
+                func("dead0", 5, 4),
+                weak_data("__lamella_smrec_f0", 8, 16),
+                weak_data("__lamella_smrec_dead0", 24, 16),
+            ],
+            &[
+                Relocation {
+                    offset: 8,
+                    symbol: 0,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                },
+                Relocation {
+                    offset: 24,
+                    symbol: 1,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                },
+            ],
+        );
+        let trimmed = garbage_collect(&[o], "f0");
+        let names: Vec<&str> = trimmed[0]
+            .symbols
+            .iter()
+            .filter(|s| s.defined)
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(names.contains(&"__lamella_smrec_f0"), "{names:?}");
+        assert!(!names.contains(&"__lamella_smrec_dead0"), "{names:?}");
+        assert!(!names.contains(&"dead0"), "{names:?}");
+        let img = link_at_base(&trimmed, "f0", 0x100).unwrap();
+        assert!(img.symbols.iter().any(|(n, _)| n == "__lamella_smrec_f0"));
+    }
+
+    #[test]
+    fn stackmap_table_gathers_and_brackets_records() {
+        let mut text = vec![0x70, 0x47, 0x00, 0x00];
+        text.extend_from_slice(&smrec_bytes(4, 1));
+        let o = obj_arm(
+            &text,
+            &[func("f0", 1, 4), weak_data("__lamella_smrec_f0", 4, 16)],
+            &[Relocation {
+                offset: 4,
+                symbol: 0,
+                kind: arm::R_ARM_ABS32,
+                addend: 0,
+            }],
+        );
+        let base = 0x100u32;
+        let img = link_at_base(&[o], "f0", base).unwrap();
+        let addr_of = |name: &str| {
+            img.symbols
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, a)| *a)
+                .unwrap()
+        };
+        let start = addr_of(STACKMAP_START_SYMBOL);
+        let end = addr_of(STACKMAP_END_SYMBOL);
+        let word = |off: u32| {
+            let i = off as usize;
+            u32::from_le_bytes([img.text[i], img.text[i + 1], img.text[i + 2], img.text[i + 3]])
+        };
+        assert_eq!(end - start, 8, "count word + one pointer");
+        assert_eq!(word(start), 1, "one gathered record");
+        let record_addr = word(start + 4);
+        assert_eq!(record_addr, base + addr_of("__lamella_smrec_f0"));
+        assert_eq!(word(record_addr - base), base | 1);
     }
 
     #[test]

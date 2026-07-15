@@ -14,6 +14,7 @@
 #include <string.h>
 #include <time.h> /* struct tm, for the libc-free mbedtls_platform_gmtime_r below */
 
+#include <mbedtls/aes.h>
 #include <mbedtls/ctr_drbg.h>
 #include <mbedtls/entropy.h>
 #include <mbedtls/error.h>
@@ -89,6 +90,13 @@ char *strstr(const char *haystack, const char *needle)
  * counts; recv returns 0 when no ciphertext is queued (mapped to WANT_READ here). */
 extern int lamella_bio_send(void *user, const unsigned char *buf, size_t len);
 extern int lamella_bio_recv(void *user, unsigned char *buf, size_t len);
+
+/* Provided by src/lib.rs: the `index`-th bundled system root whose SUBJECT DN equals the
+ * `issuer` DN (the raw bytes of a child certificate's issuer Name), or NULL when there are no
+ * more matches. `*out_len` receives the DER length. The lazy trusted-cert callback walks this
+ * to gather only the candidate roots for the chain it is verifying. */
+extern const unsigned char *lamella_tls_root_der(
+    const unsigned char *issuer, size_t issuer_len, size_t index, size_t *out_len);
 /* Provided by src/lib.rs: fills `output` from the embedder's entropy source (e.g. the
  * SAM E54 TRNG on device); nonzero means the source failed. */
 extern int lamella_entropy_poll(unsigned char *output, size_t len);
@@ -171,7 +179,29 @@ typedef struct lam_tls {
     mbedtls_x509_crt ca;
     void *user;
     int have_ca;
+    /* Set to 1 by the skip-with-warning verify callback when it cleared a date-window error
+     * (expired / not-yet-valid) the clockless board could not check. Read post-handshake via
+     * lam_tls_dates_skipped so the managed side surfaces it as a policy-error warning. */
+    int dates_skipped;
 } lam_tls;
+
+/* The verify callback for the surface.net.tls.clock=skip-with-warning policy: clears ONLY the
+ * date-window failures (expired / not yet valid) while leaving every other flag (bad chain
+ * signature, untrusted root, hostname mismatch) intact for mbedTLS to reject. Records that it
+ * did, so the caveat is never silent. Runs per chain element; depth is unused (a date error at
+ * any depth is equally unverifiable without a clock). */
+static int lam_vrfy_skip_dates(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags)
+{
+    (void)crt;
+    (void)depth;
+    lam_tls *session = (lam_tls *)ctx;
+    uint32_t dated = *flags & (MBEDTLS_X509_BADCERT_EXPIRED | MBEDTLS_X509_BADCERT_FUTURE);
+    if (dated != 0) {
+        session->dates_skipped = 1;
+        *flags &= ~dated;
+    }
+    return 0;
+}
 
 static int lam_bio_send(void *ctx, const unsigned char *buf, size_t len)
 {
@@ -196,15 +226,51 @@ static void lam_tls_destroy(lam_tls *session)
     mbedtls_free(session);
 }
 
+/* The lazy trusted-certificate callback (mbedtls_ssl_conf_ca_cb) for system-root trust: given
+ * the peer chain's `child`, gather the bundled root(s) whose subject DN matches its issuer DN
+ * and hand them to mbedTLS as freshly-parsed candidates. mbedTLS verifies the signature against
+ * them and frees the list afterward. Parsing only the matching roots (usually one) keeps the
+ * device off parsing the whole ~120-root store into its small pool. Returns 0 with a (possibly
+ * empty) list; a genuine allocation failure returns an mbedTLS error so the handshake fails
+ * closed rather than trusting nothing silently. */
+static int lam_ca_cb(void *ctx, const mbedtls_x509_crt *child, mbedtls_x509_crt **candidates)
+{
+    (void)ctx;
+    mbedtls_x509_crt *list = (mbedtls_x509_crt *)mbedtls_calloc(1, sizeof(mbedtls_x509_crt));
+    if (list == NULL) {
+        return MBEDTLS_ERR_X509_ALLOC_FAILED;
+    }
+    mbedtls_x509_crt_init(list);
+    for (size_t index = 0;; index++) {
+        size_t der_len = 0;
+        const unsigned char *der =
+            lamella_tls_root_der(child->issuer_raw.p, child->issuer_raw.len, index, &der_len);
+        if (der == NULL || der_len == 0) {
+            break;
+        }
+        /* A single bad root DER should not abort the whole lookup: skip it and keep going. */
+        (void)mbedtls_x509_crt_parse_der(list, der, der_len);
+    }
+    *candidates = list;
+    return 0;
+}
+
 /* Builds a client session. verify_mode: 0 = required against ca_pem (a NUL-terminated PEM
  * bundle), 1 = accept-any (the managed validation callback owns the trust decision; the
- * handshake still proves key possession). `hostname` drives SNI + name verification.
- * Returns NULL on any setup failure. */
+ * handshake still proves key possession), 2 = required against the bundled SYSTEM ROOTS via the
+ * lazy ca_cb (ca_pem unused), 3 = verify-and-REPORT (OPTIONAL authmode against the bundled
+ * system roots when registered: chain + hostname + dates are checked, the handshake completes
+ * regardless, and the findings are read post-handshake via lam_tls_report_flags -- the managed
+ * validation callback receives them and decides trust). `skip_dates` (meaningful with
+ * verify_mode 0, 2 or 3) installs the clock-skip verify callback: the chain + hostname are
+ * still checked, only the validity WINDOW is tolerated (the surface.net.tls.clock policy).
+ * `hostname` drives SNI + name verification. Returns NULL on any setup failure. */
 lam_tls *lam_tls_client_new(
     const unsigned char *ca_pem,
     size_t ca_len,
     const char *hostname,
     int verify_mode,
+    int skip_dates,
     void *user)
 {
     lam_tls *session = (lam_tls *)mbedtls_calloc(1, sizeof(lam_tls));
@@ -218,6 +284,7 @@ lam_tls *lam_tls_client_new(
     mbedtls_x509_crt_init(&session->ca);
     session->user = user;
     session->have_ca = 0;
+    session->dates_skipped = 0;
 
     if (mbedtls_ctr_drbg_seed(
             &session->drbg, mbedtls_entropy_func, &session->entropy,
@@ -244,6 +311,39 @@ lam_tls *lam_tls_client_new(
         session->have_ca = 1;
         mbedtls_ssl_conf_ca_chain(&session->conf, &session->ca, NULL);
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        if (skip_dates) {
+            /* Clock-skip policy: tolerate ONLY the date window; the callback still lets
+             * mbedTLS reject a bad signature / untrusted root / hostname mismatch. */
+            mbedtls_ssl_conf_verify(&session->conf, lam_vrfy_skip_dates, session);
+        }
+    } else if (verify_mode == 2) {
+        /* System-root trust: the lazy ca_cb supplies only the matching bundled root(s) per
+         * chain, so the whole store never enters the pool. Still VERIFY_REQUIRED. */
+        mbedtls_ssl_conf_ca_cb(&session->conf, lam_ca_cb, session);
+        mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        if (skip_dates) {
+            mbedtls_ssl_conf_verify(&session->conf, lam_vrfy_skip_dates, session);
+        }
+    } else if (verify_mode == 3) {
+        /* Verify-and-report: OPTIONAL authmode completes the handshake regardless of the
+         * verification outcome; the findings are read post-handshake via lam_tls_report_flags
+         * and the managed callback decides trust. The trust source is the supplied ca_pem when
+         * given, else the lazy system-root lookup (an unregistered store just yields an empty
+         * candidate list -> NOT_TRUSTED recorded, never a setup failure). */
+        if (ca_pem != NULL && ca_len != 0) {
+            if (mbedtls_x509_crt_parse(&session->ca, ca_pem, ca_len) != 0) {
+                lam_tls_destroy(session);
+                return NULL;
+            }
+            session->have_ca = 1;
+            mbedtls_ssl_conf_ca_chain(&session->conf, &session->ca, NULL);
+        } else {
+            mbedtls_ssl_conf_ca_cb(&session->conf, lam_ca_cb, session);
+        }
+        mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+        if (skip_dates) {
+            mbedtls_ssl_conf_verify(&session->conf, lam_vrfy_skip_dates, session);
+        }
     } else {
         mbedtls_ssl_conf_authmode(&session->conf, MBEDTLS_SSL_VERIFY_NONE);
     }
@@ -312,10 +412,77 @@ int lam_tls_peer_cert(lam_tls *session, unsigned char *out, size_t out_len)
     return (int)peer->raw.len;
 }
 
+/* Whether the skip-with-warning callback cleared a validity-window error during the handshake
+ * (1 = the peer chain had an expired / not-yet-valid certificate the clockless board could not
+ * check, and it was tolerated). Read post-handshake to surface the caveat to managed. */
+int lam_tls_dates_skipped(lam_tls *session)
+{
+    return session->dates_skipped;
+}
+
+/* Post-handshake trust findings for the verify-and-report mode (verify_mode 3), mapped to the
+ * seam's session-flag bits: 2 = chain errors, 4 = hostname mismatch (mirroring the Rust
+ * session_flag constants). 0 = the chain verified clean. Meaningful once the handshake
+ * completed on a report-mode session; the Rust side gates the call on the stored mode.
+ * 0xFFFFFFFF ("no result available") maps to chain-errors: an unverified chain is a finding. */
+int lam_tls_report_flags(lam_tls *session)
+{
+    uint32_t result = mbedtls_ssl_get_verify_result(&session->ssl);
+    if (result == 0) {
+        return 0;
+    }
+    if (result == 0xFFFFFFFFu) {
+        return 2;
+    }
+    int flags = 0;
+    if (result & MBEDTLS_X509_BADCERT_CN_MISMATCH) {
+        flags |= 4;
+    }
+    if (result & ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH) {
+        flags |= 2;
+    }
+    return flags;
+}
+
 /* Queues close-notify (best effort -- it lands in the Rust outgoing queue for the managed
  * side to flush) and releases the whole session. */
 void lam_tls_close(lam_tls *session)
 {
     (void)mbedtls_ssl_close_notify(&session->ssl);
     lam_tls_destroy(session);
+}
+
+/* --- The AEAD composition's AES block primitive ---------------------------------------- */
+
+/* A bare AES-128 ENCRYPT-block context for the SIV composition: the Rust side builds
+ * CMAC / S2V / CTR over this one primitive (RFC 5297; the appendix vectors pin the
+ * composition byte-exact against the host backend). Only MBEDTLS_AES_C is needed --
+ * no cipher layer, no CMAC module -- so the device build stays minimal. */
+void *lam_aes128_new(const unsigned char key[16])
+{
+    mbedtls_aes_context *aes =
+        (mbedtls_aes_context *)mbedtls_calloc(1, sizeof(mbedtls_aes_context));
+    if (aes == NULL) {
+        return NULL;
+    }
+    mbedtls_aes_init(aes);
+    if (mbedtls_aes_setkey_enc(aes, key, 128) != 0) {
+        mbedtls_aes_free(aes);
+        mbedtls_free(aes);
+        return NULL;
+    }
+    return aes;
+}
+
+void lam_aes128_encrypt_block(void *ctx, const unsigned char in[16], unsigned char out[16])
+{
+    (void)mbedtls_aes_crypt_ecb((mbedtls_aes_context *)ctx, MBEDTLS_AES_ENCRYPT, in, out);
+}
+
+void lam_aes128_free(void *ctx)
+{
+    if (ctx != NULL) {
+        mbedtls_aes_free((mbedtls_aes_context *)ctx);
+        mbedtls_free(ctx);
+    }
 }

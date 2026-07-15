@@ -14,6 +14,11 @@ namespace System.Net.Sockets
 
         internal TcpClient(Socket acceptedSocket) { _socket = acceptedSocket; }
 
+        public Socket Client
+        {
+            get { return _socket; }
+        }
+
         public void Connect(IPAddress address, int port)
         {
             _socket.Connect(new IPEndPoint(address, port));

@@ -368,6 +368,20 @@ impl ImageBuilder {
         );
     }
 
+    /// The token of this module's single `Assembly` row (II.22.2, always row 1) -- the
+    /// `HasCustomAttribute` parent an `[assembly: ...]` global attribute (24.2) attaches to.
+    #[must_use]
+    pub fn assembly_token(&self) -> Token {
+        Token::new(table::ASSEMBLY, 1)
+    }
+
+    /// The token of this module's single `Module` row (II.22.30, always row 1) -- the
+    /// `HasCustomAttribute` parent a `[module: ...]` global attribute (24.2) attaches to.
+    #[must_use]
+    pub fn module_token(&self) -> Token {
+        Token::new(table::MODULE, 1)
+    }
+
     /// Adds a `CustomAttribute` row (II.22.10): the `value` blob (an attribute-argument
     /// blob) attached to `parent` (a `HasCustomAttribute` token) and identified by
     /// `constructor` (its `.ctor`, a MethodDef/MemberRef -- the `CustomAttributeType`).
@@ -699,7 +713,7 @@ impl ImageBuilder {
     /// token, or the nil token for a library).
     #[must_use]
     pub fn finish(self, entry_point: Token, is_dll: bool) -> Vec<u8> {
-        self.finish_inner(entry_point, is_dll, None)
+        self.finish_inner(entry_point, is_dll, Vec::new())
     }
 
     /// Like [`ImageBuilder::finish`], but also emits a debug directory whose
@@ -707,14 +721,35 @@ impl ImageBuilder {
     #[must_use]
     pub fn finish_with_debug(self, entry_point: Token, is_dll: bool, pdb_name: &str) -> Vec<u8> {
         let codeview = codeview_record(self.pdb_id, pdb_name);
-        self.finish_inner(entry_point, is_dll, Some(codeview))
+        self.finish_inner(entry_point, is_dll, alloc::vec![(2u32, codeview)])
+    }
+
+    /// Like [`ImageBuilder::finish_with_debug`], but EMBEDS the Portable PDB in the image itself
+    /// (no separate `.pdb`): the debug directory carries the CodeView record (type 2, keyed by
+    /// `pdb_name` so a debugger still matches the id), the DEFLATE-compressed PDB (type 17,
+    /// `EmbeddedPortablePdb`), and the PDB checksum (type 19). Builds the PDB from `documents`.
+    #[must_use]
+    pub fn finish_with_embedded_debug(
+        self,
+        entry_point: Token,
+        is_dll: bool,
+        documents: &[DebugDocument],
+        pdb_name: &str,
+    ) -> Vec<u8> {
+        let pdb = self.build_pdb(documents, entry_point);
+        let entries = alloc::vec![
+            (2u32, codeview_record(self.pdb_id, pdb_name)),
+            (17u32, embedded_pdb_record(&pdb)),
+            (19u32, pdb_checksum_record(&pdb)),
+        ];
+        self.finish_inner(entry_point, is_dll, entries)
     }
 
     fn finish_inner(
         mut self,
         entry_point: Token,
         is_dll: bool,
-        codeview: Option<Vec<u8>>,
+        debug_entries: Vec<(u32, Vec<u8>)>,
     ) -> Vec<u8> {
         align4(&mut self.bodies);
         self.tables.sort_by_coded_parent(table::CUSTOM_ATTRIBUTE);
@@ -746,8 +781,30 @@ impl ImageBuilder {
         text.extend_from_slice(&cli);
         text.extend_from_slice(&self.bodies);
         text.extend_from_slice(&metadata);
-        write_image_with_debug(&text, is_dll, codeview.as_deref())
+        let borrowed: Vec<(u32, &[u8])> =
+            debug_entries.iter().map(|(kind, data)| (*kind, data.as_slice())).collect();
+        write_image_with_debug(&text, is_dll, &borrowed)
     }
+}
+
+/// The `EmbeddedPortablePdb` debug record (PE-COFF type 17): the `"MPDB"` magic, the uncompressed
+/// PDB size, then the PDB compressed with (stored-block) DEFLATE. A reader inflates the tail back
+/// to the standalone PDB the debugger would otherwise load from disk.
+fn embedded_pdb_record(pdb: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(8 + pdb.len());
+    record.extend_from_slice(b"MPDB");
+    record.extend_from_slice(&(pdb.len() as u32).to_le_bytes());
+    record.extend_from_slice(&crate::deflate::deflate_store(pdb));
+    record
+}
+
+/// The `PdbChecksum` debug record (PE-COFF type 19): the zero-terminated algorithm name, then the
+/// digest -- so a loader can verify an embedded (or on-disk) PDB matches the image.
+fn pdb_checksum_record(pdb: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(7 + 32);
+    record.extend_from_slice(b"SHA256\0");
+    record.extend_from_slice(&crate::sha256::sha256(pdb));
+    record
 }
 
 /// The CodeView `RSDS` record a debug directory points at: the signature, the
@@ -768,6 +825,36 @@ mod tests {
     const PUBLIC_CLASS: u32 = 0x0000_0001;
     const PUBLIC_STATIC: u16 = 0x0006 | 0x0010;
     const IL_MANAGED: u16 = 0x0000;
+
+    #[test]
+    fn embedded_debug_carries_codeview_the_deflated_pdb_and_checksum() {
+        let mut builder = ImageBuilder::new("test.dll", "test");
+        let object = builder.object_type();
+        builder.add_type("App", "Program", object, PUBLIC_CLASS);
+        let entry = builder.add_method(
+            "Main",
+            &[0x00, 0x00, 0x01],
+            &[0x06, 0x2A],
+            PUBLIC_STATIC,
+            IL_MANAGED,
+            &[],
+        );
+
+        let expected_pdb = builder.build_pdb(&[], entry);
+        let image = builder.finish_with_embedded_debug(entry, false, &[], "test.pdb");
+
+        let entries = crate::pe::read_debug_directory(&image);
+        assert_eq!(entries.iter().map(|(kind, _)| *kind).collect::<Vec<_>>(), [2, 17, 19]);
+
+        let embedded = &entries[1].1;
+        assert_eq!(&embedded[..4], b"MPDB");
+        assert_eq!(u32::from_le_bytes(embedded[4..8].try_into().unwrap()) as usize, expected_pdb.len());
+        assert_eq!(&embedded[8..], crate::deflate::deflate_store(&expected_pdb).as_slice());
+
+        let checksum = &entries[2].1;
+        assert_eq!(&checksum[..7], b"SHA256\0");
+        assert_eq!(&checksum[7..], &crate::sha256::sha256(&expected_pdb)[..]);
+    }
 
     #[test]
     fn assembles_a_module_with_a_method_that_round_trips() {

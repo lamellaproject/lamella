@@ -100,4 +100,81 @@ pub trait NetBackend: core::fmt::Debug {
     /// (`None` = block indefinitely). Returns the handles now ready. The scheduler's single OS-thread
     /// block point, called only when every green thread is parked.
     fn poll(&mut self, timeout_ms: Option<u64>) -> Vec<SocketHandle>;
+
+
+    /// Whether any interface has a USABLE connection -- link up AND an IPv4 address assigned -- which
+    /// is the honest meaning of "can I open a socket now". Backs `NetworkInterface.GetIsNetworkAvailable()`.
+    fn network_available(&mut self) -> bool {
+        false
+    }
+
+    /// How many interfaces this backend exposes (most devices: exactly one). Backs
+    /// `NetworkInterface.GetAllNetworkInterfaces()` (the managed side builds one wrapper per index).
+    fn interface_count(&mut self) -> u32 {
+        0
+    }
+
+    /// A LIVE snapshot of interface `index` (`0..interface_count`), or `None` if out of range. Read
+    /// fresh on each managed property get, so `OperationalStatus` / `IPv4Address` reflect the CURRENT
+    /// link -- a cable pulled between two reads shows `Down`, a DHCP lease that just bound shows the
+    /// new address.
+    fn interface_info(&mut self, index: u32) -> Option<InterfaceInfo> {
+        let _ = index;
+        None
+    }
+}
+
+/// The operational state of an interface. The discriminants are the .NET
+/// `System.Net.NetworkInformation.OperationalStatus` values, so a status crosses the intrinsic seam
+/// as exactly the integer the managed enum carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OperStatus {
+    /// Up and able to pass packets.
+    Up = 1,
+    /// Down -- no link (cable out, radio disassociated).
+    Down = 2,
+    /// In a test mode; cannot pass packets.
+    Testing = 3,
+    /// State cannot be determined.
+    Unknown = 4,
+    /// Link present but pending some external action (e.g. awaiting DHCP).
+    Dormant = 5,
+    /// The hardware is missing.
+    NotPresent = 6,
+    /// A lower-layer interface this one stacks on is down.
+    LowerLayerDown = 7,
+}
+
+/// The interface medium. The discriminants are the IANA ifType values .NET's `NetworkInterfaceType`
+/// uses (Ethernet 6, Loopback 24, Wireless80211 71), so the value crosses the seam unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IfaceKind {
+    /// The medium is unknown.
+    Unknown = 1,
+    /// Wired Ethernet (IANA `ethernetCsmacd`).
+    Ethernet = 6,
+    /// A PPP serial/cellular link.
+    Ppp = 23,
+    /// A software loopback interface.
+    Loopback = 24,
+    /// IEEE 802.11 wireless (Wi-Fi).
+    Wireless80211 = 71,
+}
+
+/// A live snapshot of one interface -- the data behind the managed `NetworkInterface` poll surface.
+/// IPv4 fields are big-endian octets; `[0, 0, 0, 0]` means "unassigned" (e.g. DHCP not yet bound).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct InterfaceInfo {
+    /// Up / Down / Dormant / ... -- the current link state.
+    pub oper_status: OperStatus,
+    /// Ethernet / Wireless80211 / Loopback / ... -- the medium.
+    pub kind: IfaceKind,
+    /// The interface's IPv4 address (big-endian octets; `[0,0,0,0]` = none).
+    pub ipv4: [u8; 4],
+    /// The IPv4 subnet mask (big-endian octets).
+    pub subnet: [u8; 4],
+    /// The IPv4 default gateway (big-endian octets; `[0,0,0,0]` = none).
+    pub gateway: [u8; 4],
+    /// Whether the address was obtained by DHCP (vs a static configuration).
+    pub dhcp_enabled: bool,
 }

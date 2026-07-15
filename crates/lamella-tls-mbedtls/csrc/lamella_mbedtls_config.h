@@ -14,6 +14,9 @@
  *   silently ACCEPTS certificates that expire after the frozen instant -- the opposite of
  *   this fail-closed intent. A clockless board that must speak pinned TLS opts in to a
  *   skip-with-warning policy at the seam instead (never a quiet success).
+ * - Trust: a pinned certificate (a static ca_chain) OR the bundled Mozilla/curl system-root
+ *   store, reached through the lazy trusted-cert callback so only the root(s) matching a peer
+ *   chain's issuer are parsed per handshake (the whole ~120-root store never enters the pool).
  * - No filesystem, no built-in networking, no printf-family dependency beyond what the
  *   modules below need: the library runs as a pure byte transform behind the Rust seam.
  * - Memory: every allocation routes through lamella_mbedtls_calloc/free (provided in
@@ -90,6 +93,11 @@ long long lamella_mbedtls_time(long long *t);
 #define MBEDTLS_X509_USE_C
 #define MBEDTLS_X509_CRT_PARSE_C
 #define MBEDTLS_X509_REMOVE_INFO
+/* The lazy trusted-certificate callback: for system-root trust the ssl config carries a callback
+ * (mbedtls_ssl_conf_ca_cb) that, given the peer chain's child, returns only the bundled root(s)
+ * whose subject matches its issuer -- so the device parses one or two roots per handshake instead
+ * of the whole ~120-root store into its small pool (the pinned path keeps a static ca_chain). */
+#define MBEDTLS_X509_TRUSTED_CERTIFICATE_CALLBACK
 #define MBEDTLS_BASE64_C
 #define MBEDTLS_PEM_PARSE_C
 

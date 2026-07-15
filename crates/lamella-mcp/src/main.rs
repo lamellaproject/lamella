@@ -1,21 +1,21 @@
 //! The Lamella MCP server (canonical, native): exposes the Lamella toolchain -- compile / run / bake / size /
-//! enumerate / deploy / wireline SOURCE-LEVEL debug -- as MCP tools over stdio (JSON-RPC 2.0, newline-delimited),
+//! enumerate / deploy / Lamella Link SOURCE-LEVEL debug -- as MCP tools over stdio (JSON-RPC 2.0, newline-delimited),
 //! linking the crates directly (no wasm round-trip; always the latest toolchain; one self-contained binary).
 //! Hand-rolled on `serde_json` -- no tokio, no MCP SDK -- matching the workspace's dependency-minimal ethos.
 
 use lamella_wire::{Capabilities, Negotiated, TransportError};
-use lamella_wireline::debug_backend::WireTransport;
-use lamella_wireline::engine::{CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler};
+use lamella_wire_host::debug_backend::WireTransport;
+use lamella_wire_host::engine::{CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler};
 #[cfg(feature = "bake")]
-use lamella_wireline::engine::BakedSerialLink;
-use lamella_wireline::{deployed_status_blocking, hello_blocking, list_serial, SerialTransport, UsbTransport};
+use lamella_wire_host::engine::BakedSerialLink;
+use lamella_wire_host::{deployed_status_blocking, hello_blocking, list_serial, SerialTransport, UsbTransport};
 #[cfg(feature = "bake")]
-use lamella_wireline::{deploy_chunked_blocking, send_deploy_run};
+use lamella_wire_host::{deploy_chunked_blocking, send_deploy_run};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::time::Duration;
 
-/// The default serial baud for a wireline carrier (USB-CDC ignores it; a real UART wants it).
+/// The default serial baud for a Lamella Link carrier (USB-CDC ignores it; a real UART wants it).
 const BAUD: u32 = 115_200;
 
 #[cfg(feature = "bake")]
@@ -113,7 +113,7 @@ fn host_caps() -> Capabilities {
     )
 }
 
-/// A display name for a wireline `board_model`, mirroring the `lamella_wire::board_model` registry.
+/// A display name for a Lamella Link `board_model`, mirroring the `lamella_wire::board_model` registry.
 fn board_model_name(model: u16) -> Option<&'static str> {
     use lamella_wire::board_model as bm;
     Some(match model {
@@ -131,7 +131,7 @@ fn board_model_name(model: u16) -> Option<&'static str> {
     })
 }
 
-/// Enumerate attached boards (native-USB wireline devices + OS serial ports), cross-platform.
+/// Enumerate attached boards (native-USB Lamella Link devices + OS serial ports), cross-platform.
 fn tool_list_devices() -> Value {
     let mut items: Vec<Value> = Vec::new();
     if let Ok(boards) = UsbTransport::list() {
@@ -154,10 +154,10 @@ fn tool_list_devices() -> Value {
     text_result(text, false)
 }
 
-/// Render the identity a HELLO negotiated: wireline version, capabilities, and (when reported) the board name,
+/// Render the identity a HELLO negotiated: Lamella Link version, capabilities, and (when reported) the board name,
 /// profile name/abi, and chip IDCODE + device id.
 fn format_identity(target: &str, neg: &Negotiated) -> String {
-    let mut s = format!("target: {target}\nwireline version: {}\ncapabilities: {:#010x}\n", neg.version, neg.caps.0);
+    let mut s = format!("target: {target}\nLamella Link version: {}\ncapabilities: {:#010x}\n", neg.version, neg.caps.0);
     match &neg.profile {
         Some(p) => {
             let board = board_model_name(p.board_model).unwrap_or("(unrecognized board_model)");
@@ -213,7 +213,7 @@ fn compile_and_bake(compiler: &LcscCompiler, code: &str) -> Result<Vec<u8>, Stri
 #[cfg(feature = "bake")]
 fn tool_run_on_device(target: &str, code: &str) -> Value {
     if target.starts_with("usb") {
-        return text_result("run_on_device supports serial targets today (BakedSerialLink); usb wireline run is a follow-up.".to_owned(), true);
+        return text_result("run_on_device supports serial targets today (BakedSerialLink); usb Lamella Link run is a follow-up.".to_owned(), true);
     }
     let compiler = match LcscCompiler::discover() {
         Ok(c) => c,

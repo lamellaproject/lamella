@@ -553,6 +553,21 @@ namespace System
 
         public bool Equals(string value) { return this == value; }
 
+        public static string Intern(string str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return InternCore(str);
+        }
+
+        public static string IsInterned(string str)
+        {
+            if ((object)str == null) throw new ArgumentNullException("str");
+            return IsInternedCore(str);
+        }
+
+        [Lamella.Runtime.RuntimeProvided] private static string InternCore(string str) { return null; }
+        [Lamella.Runtime.RuntimeProvided] private static string IsInternedCore(string str) { return null; }
+
 #if LAMELLA_SURFACE_STRING_COMPARISON
         private static bool ComparisonFoldsCase(StringComparison comparisonType)
         {

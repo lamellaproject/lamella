@@ -309,6 +309,8 @@ pub enum DiagnosticKind {
         /// The label the `goto` named.
         label: Box<str>,
     },
+    /// `CS0164` (warning): a declared label that no `goto` targets.
+    UnreferencedLabel,
     /// `CS0500`: an `abstract` method declares a body.
     AbstractMethodWithBody {
         /// The method name.
@@ -318,6 +320,18 @@ pub enum DiagnosticKind {
     MethodMustHaveBody {
         /// The method's qualified signature (`C.M()`).
         method: Box<str>,
+    },
+    /// `CS8022`: a language feature outside the strict C# 1.0 (ISO-1) dialect lcsc targets -- an
+    /// automatically-implemented property (C# 3.0), a `static` class (C# 2.0), and so on. csc
+    /// reports the same under `/langversion:ISO-1`; the message names the feature and the version it
+    /// needs. lcsc GATES every post-1.0 feature here (strict C# 1.0 now), even ones whose emit path
+    /// is already implemented -- see the `GATED FEATURE (ISO-N)` markers -- until a real
+    /// language-version mode lifts the gate.
+    FeatureRequiresLaterVersion {
+        /// The feature name (e.g. "automatically implemented properties").
+        feature: Box<str>,
+        /// The minimum C# version, as rendered (e.g. "C# 3.0").
+        required: Box<str>,
     },
     /// `CS0513`: an `abstract` member is declared in a non-abstract type.
     AbstractMemberInNonAbstractType {
@@ -392,6 +406,24 @@ pub enum DiagnosticKind {
     NoMethodToOverride {
         /// The offending method's qualified signature (`C.M()`).
         method: Box<str>,
+    },
+    /// `CS0506`: an `override` matches a base method that is not `virtual`, `abstract`, or
+    /// `override`, so there is no slot to override.
+    CannotOverrideNonVirtual {
+        /// The overriding method's qualified signature (`D.M()`).
+        method: Box<str>,
+        /// The base member it cannot override (`B.M()`).
+        base: Box<str>,
+    },
+    /// `CS0508`: an `override`'s return type differs from the base member it overrides (C# 1.0
+    /// has no covariant return types).
+    OverrideReturnTypeMismatch {
+        /// The overriding method's qualified signature (`D.M()`).
+        method: Box<str>,
+        /// The return type the override must have to match the base member.
+        return_type: Box<str>,
+        /// The base member overridden (`B.M()`).
+        base: Box<str>,
     },
     /// `CS0534`: a non-abstract class does not implement an inherited abstract member.
     AbstractMemberNotImplemented {
@@ -584,8 +616,10 @@ impl DiagnosticKind {
             DiagnosticKind::DuplicateMethod { .. } => 111,
             DiagnosticKind::DuplicateLabel { .. } => 140,
             DiagnosticKind::UndefinedLabel { .. } => 159,
+            DiagnosticKind::UnreferencedLabel => 164,
             DiagnosticKind::AbstractMethodWithBody { .. } => 500,
             DiagnosticKind::MethodMustHaveBody { .. } => 501,
+            DiagnosticKind::FeatureRequiresLaterVersion { .. } => 8022,
             DiagnosticKind::AbstractMemberInNonAbstractType { .. } => 513,
             DiagnosticKind::VirtualOrAbstractMemberIsPrivate { .. } => 621,
             DiagnosticKind::ModifierNotValidForItem { .. } => 106,
@@ -602,6 +636,8 @@ impl DiagnosticKind {
             DiagnosticKind::ReadonlyAssignment { .. } => 191,
             DiagnosticKind::InterfaceMemberNotImplemented { .. } => 535,
             DiagnosticKind::NoMethodToOverride { .. } => 115,
+            DiagnosticKind::CannotOverrideNonVirtual { .. } => 506,
+            DiagnosticKind::OverrideReturnTypeMismatch { .. } => 508,
             DiagnosticKind::AbstractMemberNotImplemented { .. } => 534,
             DiagnosticKind::CircularBase { .. } => 146,
             DiagnosticKind::CircularConstant { .. } => 110,
@@ -642,7 +678,8 @@ impl DiagnosticKind {
             | DiagnosticKind::UnusedField { .. }
             | DiagnosticKind::FieldNeverUsed { .. }
             | DiagnosticKind::FieldNeverAssigned { .. }
-            | DiagnosticKind::UnreachableCode => Severity::Warning,
+            | DiagnosticKind::UnreachableCode
+            | DiagnosticKind::UnreferencedLabel => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -779,6 +816,9 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::UndefinedLabel { label } => {
                 write!(f, "No such label '{label}' within the scope of the goto statement")
             }
+            DiagnosticKind::UnreferencedLabel => {
+                write!(f, "This label has not been referenced")
+            }
             DiagnosticKind::AbstractMethodWithBody { member } => write!(
                 f,
                 "'{member}' cannot declare a body because it is marked abstract"
@@ -786,6 +826,10 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::MethodMustHaveBody { method } => write!(
                 f,
                 "'{method}' must declare a body because it is not marked abstract, extern, or partial"
+            ),
+            DiagnosticKind::FeatureRequiresLaterVersion { feature, required } => write!(
+                f,
+                "Feature '{feature}' is not available in C# 1.0; it requires {required} or greater"
             ),
             DiagnosticKind::AbstractMemberInNonAbstractType { member, type_name } => write!(
                 f,
@@ -848,6 +892,20 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NoMethodToOverride { method } => {
                 write!(f, "'{method}': no suitable method found to override")
             }
+            DiagnosticKind::CannotOverrideNonVirtual { method, base } => write!(
+                f,
+                "'{method}': cannot override inherited member '{base}' because it is not marked \
+                 virtual, abstract, or override"
+            ),
+            DiagnosticKind::OverrideReturnTypeMismatch {
+                method,
+                return_type,
+                base,
+            } => write!(
+                f,
+                "'{method}': return type must be '{return_type}' to match overridden member \
+                 '{base}'"
+            ),
             DiagnosticKind::AbstractMemberNotImplemented { type_name, member } => write!(
                 f,
                 "'{type_name}' does not implement inherited abstract member '{member}'"

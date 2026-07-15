@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use lamella_cil::Operand;
-use lamella_ir::{Function, MirType, TypeHandle};
+use lamella_ir::{Function, MirType, StaticOwner, TypeHandle};
 use lamella_metadata::tables::table;
 use lamella_metadata::{
     Assembly, CharSet, Method, MethodKind, ResolvedMethod, SigType, TargetLayout, TypeDef,
@@ -18,15 +18,52 @@ use crate::cil::{
     PInvokeCall, ReferenceLayout, lower_method_typed,
 };
 
+/// Reference-owned [`TypeHandle`]s ride table byte 0x03: a handle only ever carries a TypeRef
+/// (0x01) or TypeDef (0x02) token today, so 0x03 marks "a REFERENCE's TypeDef" with the
+/// reference ordinal in bits 20..23 and the owning row in bits 0..19 -- the handle itself says
+/// WHICH reference owns the row, so two references' equal rows stay distinct identities end to
+/// end, descriptor symbols included. This-assembly handles remain raw tokens. The whole encoding
+/// stays under bit 27, clear of every backend symbol FLAG (`DESC_SYMBOL_FLAG` is bit 30 -- a
+/// table-byte scheme above 0x07 would alias the flags when a handle rides a descriptor
+/// reference word). Capacity: 16 references, 2^20 rows each -- both loudly asserted at mint.
+pub const REFERENCE_HANDLE_TABLE: u32 = 0x03;
+const REFERENCE_ORDINAL_SHIFT: u32 = 20;
+const REFERENCE_ROW_MASK: u32 = 0x000f_ffff;
+
+/// Decodes a reference-owned handle to `(reference ordinal, owning-assembly TypeDef token)`,
+/// or `None` for a this-assembly handle.
+#[must_use]
+pub fn reference_handle_parts(handle: TypeHandle) -> Option<(usize, u32)> {
+    (handle.0 >> 24 == REFERENCE_HANDLE_TABLE).then_some((
+        ((handle.0 >> REFERENCE_ORDINAL_SHIFT) & 0xf) as usize,
+        ((table::TYPE_DEF as u32) << 24) | (handle.0 & REFERENCE_ROW_MASK),
+    ))
+}
+
+/// The qualified handle for `ordinal`'s type at `type_def_token` (see
+/// [`REFERENCE_HANDLE_TABLE`]). Panics past the encoding's capacity rather than aliasing.
+fn reference_handle(ordinal: usize, type_def_token: u32) -> TypeHandle {
+    let row = type_def_token & 0x00ff_ffff;
+    assert!(
+        ordinal < 16 && row <= REFERENCE_ROW_MASK,
+        "reference handle out of encoding range (ordinal {ordinal}, row {row})"
+    );
+    TypeHandle(
+        (REFERENCE_HANDLE_TABLE << 24) | ((ordinal as u32) << REFERENCE_ORDINAL_SHIFT) | row,
+    )
+}
+
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
 pub struct MetadataResolver<'a> {
     assembly: &'a Assembly<'a>,
-    /// The REFERENCED assembly (corlib) for cross-assembly vtable-slot agreement: with it, a type
-    /// extending a referenced base numbers its slots INCLUDING the base's inherited virtuals (as the
-    /// referenced assembly itself numbers them), and a `callvirt` on a `MemberRef` resolves to that
-    /// shared slot. Without it, numbering stays this-assembly-relative (self-consistent, but a
-    /// referenced type's virtual dispatched on a this-assembly object static-devirtualizes).
-    reference: Option<&'a Assembly<'a>>,
+    /// The REFERENCED assemblies, in reference order, for cross-assembly vtable-slot agreement:
+    /// with them, a type extending a referenced base numbers its slots INCLUDING the base's
+    /// inherited virtuals (as the referenced assembly itself numbers them), and a `callvirt` on a
+    /// `MemberRef` resolves to that shared slot. Without any, numbering stays this-assembly-relative
+    /// (self-consistent, but a referenced type's virtual dispatched on a this-assembly object
+    /// static-devirtualizes). Resolution is BY NAME, first reference wins -- the same order the
+    /// build was handed the assemblies (corlib first by convention).
+    references: Vec<&'a Assembly<'a>>,
     /// For module lowering: each callee's `MethodDef` rid paired with its function index in
     /// the module. Empty for single-method lowering, where a call keeps its rid (a one-
     /// function lowering does not dispatch internal calls anyway).
@@ -39,18 +76,51 @@ impl<'a> MetadataResolver<'a> {
     pub fn new(assembly: &'a Assembly<'a>) -> MetadataResolver<'a> {
         MetadataResolver {
             assembly,
-            reference: None,
+            references: Vec::new(),
             rid_to_index: Vec::new(),
         }
     }
 
-    /// Attaches the referenced assembly (corlib), enabling cross-assembly slot numbering: inherited
-    /// referenced-base virtuals occupy their referenced-assembly slots (filled with extern entries a
-    /// library object exports), and `virtual_slot` resolves a `MemberRef` against that numbering.
+    /// Attaches a referenced assembly (corlib, or a further library), enabling cross-assembly slot
+    /// numbering: inherited referenced-base virtuals occupy their referenced-assembly slots (filled
+    /// with extern entries a library object exports), and `virtual_slot` resolves a `MemberRef`
+    /// against that numbering. Repeated calls APPEND -- references resolve by name in the order
+    /// attached.
     #[must_use]
     pub fn with_reference(mut self, reference: &'a Assembly<'a>) -> MetadataResolver<'a> {
-        self.reference = Some(reference);
+        self.references.push(reference);
         self
+    }
+
+    /// [`with_reference`](Self::with_reference) for a whole reference list at once (the
+    /// multi-assembly deploy shape: corlib + System.Device + a BSP + ...), preserving order.
+    #[must_use]
+    pub fn with_references(mut self, references: &[&'a Assembly<'a>]) -> MetadataResolver<'a> {
+        self.references.extend_from_slice(references);
+        self
+    }
+
+    /// The attached reference list, in order -- the object-build typing path threads it into the
+    /// value-type/enum resolution family so a cross-assembly `ValueType` TypeRef (e.g. a driver
+    /// method's `AdcChannelMode` parameter) resolves to its owning assembly before it is laid out.
+    pub(crate) fn references(&self) -> &[&'a Assembly<'a>] {
+        &self.references
+    }
+
+    /// The first attached reference declaring `namespace.name`, with its ordinal and `TypeDef` --
+    /// the one cross-assembly name-resolution rule every consumer shares. Reference ORDER is the
+    /// tie-break (a name declared by two references resolves to the earlier one, exactly as the
+    /// build was handed them).
+    fn find_reference_type(
+        &self,
+        namespace: &str,
+        name: &str,
+    ) -> Option<(usize, &'a Assembly<'a>, TypeDef<'a>)> {
+        self.references.iter().enumerate().find_map(|(ordinal, reference)| {
+            reference
+                .find_type(namespace, name)
+                .map(|td| (ordinal, *reference, td))
+        })
     }
 
     /// Wraps an assembly to resolve calls among the methods of a module: `method_rids` are
@@ -65,7 +135,7 @@ impl<'a> MetadataResolver<'a> {
             .collect();
         MetadataResolver {
             assembly,
-            reference: None,
+            references: Vec::new(),
             rid_to_index,
         }
     }
@@ -96,29 +166,6 @@ impl<'a> MetadataResolver<'a> {
 
     /// Whether `type_def` is a delegate -- its `extends` chain reaches `System.MulticastDelegate` (or
     /// `System.Delegate`). The bounded base-chain walk the catch-type and cast detection also use.
-    fn is_delegate_type(&self, type_def: &TypeDef<'a>) -> bool {
-        let mut current = type_def.extends();
-        for _ in 0..64 {
-            if current.row() == 0 {
-                return false;
-            }
-            let Some(name) = self.assembly.type_token_name(current) else {
-                return false;
-            };
-            if name.namespace == "System" && matches!(name.name, "MulticastDelegate" | "Delegate") {
-                return true;
-            }
-            if current.table() != table::TYPE_DEF {
-                return false;
-            }
-            let Some(base_def) = self.assembly.type_def(current.row()) else {
-                return false;
-            };
-            current = base_def.extends();
-        }
-        false
-    }
-
     /// The type token a metadata token names: a type token as-is (`TypeRef`/`TypeDef`/
     /// `TypeSpec`), or the declaring type of a constructor token -- a `MemberRef`'s parent (an
     /// external type like `System.Exception`), or a `MethodDef`'s owning type resolved by name
@@ -177,12 +224,14 @@ impl<'a> MetadataResolver<'a> {
     fn vtable_methods(&self, type_def: TypeDef<'a>) -> Vec<VSlot<'a>> {
         let chain = assembly_base_chain(self.assembly, type_def);
         let mut slots: Vec<VSlot<'a>> = Vec::new();
-        if let (Some(reference), Some(root)) = (self.reference, chain.last()) {
+        if let Some(root) = chain.last() {
             let base = root.extends();
             if base.row() != 0 && base.table() != table::TYPE_DEF {
                 if let Some(base_name) = self.assembly.type_token_name(base) {
-                    if let Some(ref_td) = reference.find_type(base_name.namespace, base_name.name) {
-                        slots = reference_vtable_slots(reference, ref_td);
+                    if let Some((_, reference, ref_td)) =
+                        self.find_reference_type(base_name.namespace, base_name.name)
+                    {
+                        slots = reference_vtable_slots(&self.references, reference, ref_td);
                     }
                 }
             }
@@ -310,12 +359,10 @@ impl<'a> MetadataResolver<'a> {
     /// boundary (`base` None) and interface dispatch on such a type is not yet threaded (empty
     /// itable). `None` without a reference, or if the handle is not a reference TypeDef.
     pub fn reference_type_meta(&self, handle: TypeHandle) -> Option<TypeMeta> {
-        let reference = self.reference?;
-        if handle.0 >> 24 != table::TYPE_DEF as u32 {
-            return None;
-        }
-        let type_def = reference.type_def(handle.0 & 0x00ff_ffff)?;
-        let vtable: Vec<VtableEntry> = reference_vtable_slots(reference, type_def)
+        let (ordinal, token) = reference_handle_parts(handle)?;
+        let reference = *self.references.get(ordinal)?;
+        let type_def = reference.type_def(token & 0x00ff_ffff)?;
+        let vtable: Vec<VtableEntry> = reference_vtable_slots(&self.references, reference, type_def)
             .into_iter()
             .map(|slot| match slot.impl_ {
                 SlotImpl::Extern(symbol) => VtableEntry::Extern(symbol),
@@ -454,20 +501,80 @@ fn assembly_base_chain<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>) ->
     chain
 }
 
-/// `type_def`'s vtable slots numbered ENTIRELY within `assembly` (the referenced corlib) -- the same
-/// root-first newslot/override walk as `vtable_methods` -- each slot's most-derived implementation
-/// named by its stable extern symbol (what the library object exports it as), ready to seed a
-/// derived program type's numbering or to answer a `MemberRef`'s slot.
-fn reference_vtable_slots<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>) -> Vec<VSlot<'x>> {
-    struct Building<'x> {
-        name: Option<&'x str>,
-        key: String,
-        params: Vec<SigType>,
-        owner_namespace: String,
-        owner_name: String,
+/// Whether `type_def` is a delegate type, judged within its OWN `assembly` (the program's, or the
+/// referenced corlib's for a cross-assembly `new ThreadStart(...)`): its `extends` chain reaches
+/// `System.MulticastDelegate`/`System.Delegate`. The walk is bounded so a malformed cyclic base
+/// cannot loop.
+fn is_delegate_type_of<'x>(assembly: &'x Assembly<'x>, type_def: &TypeDef<'x>) -> bool {
+    let mut current = type_def.extends();
+    for _ in 0..64 {
+        if current.row() == 0 {
+            return false;
+        }
+        let Some(name) = assembly.type_token_name(current) else {
+            return false;
+        };
+        if name.namespace == "System" && matches!(name.name, "MulticastDelegate" | "Delegate") {
+            return true;
+        }
+        if current.table() != table::TYPE_DEF {
+            return false;
+        }
+        let Some(base_def) = assembly.type_def(current.row()) else {
+            return false;
+        };
+        current = base_def.extends();
     }
-    let mut slots: Vec<Building<'x>> = Vec::new();
-    for td in assembly_base_chain(assembly, type_def).into_iter().rev() {
+    false
+}
+
+/// `type_def`'s vtable slots as `assembly` numbers them, INCLUDING inherited virtuals from a base
+/// declared in a FURTHER referenced assembly. Same root-first newslot/override walk as
+/// [`MetadataResolver::vtable_methods`], and -- the fix a 3-assembly inheritance chain forced -- the
+/// SAME cross-assembly base-seed: when the chain's root `extends` a type in ANOTHER assembly, that
+/// base's slots are numbered FIRST (recursively, resolved through `references`), so a referenced type
+/// whose own base is itself a reference -- e.g. `[System.Device]AdcDriver : [corlib]Object` -- lays
+/// Object's inherited virtuals as a prefix, exactly as the caller (which seeds via `vtable_methods`)
+/// numbers them. Omitting that prefix under-numbered the type by its cross-assembly base's virtual
+/// count, so a `callvirt` from the base's own assembly (numbered WITH the prefix) indexed a slot the
+/// derived assembly laid LOWER -- the silent cross-assembly mis-dispatch a BSP driver
+/// (`Rp2350AdcDriver : AdcDriver : Object`) hit only on real MMIO, where the wrong slot returned a
+/// constant. Each slot's implementation is its stable extern symbol (what the owning library object
+/// exports it as), ready to seed a derived type's numbering or answer a `MemberRef`'s slot. The base
+/// walk is bounded like every other so a malformed cross-assembly cycle cannot loop.
+fn reference_vtable_slots<'x>(
+    references: &[&'x Assembly<'x>],
+    assembly: &'x Assembly<'x>,
+    type_def: TypeDef<'x>,
+) -> Vec<VSlot<'x>> {
+    reference_vtable_slots_seeded(references, assembly, type_def, 0)
+}
+
+fn reference_vtable_slots_seeded<'x>(
+    references: &[&'x Assembly<'x>],
+    assembly: &'x Assembly<'x>,
+    type_def: TypeDef<'x>,
+    depth: u32,
+) -> Vec<VSlot<'x>> {
+    let chain = assembly_base_chain(assembly, type_def);
+    let mut slots: Vec<VSlot<'x>> = Vec::new();
+    if depth < 64 {
+        if let Some(root) = chain.last() {
+            let base = root.extends();
+            if base.row() != 0 && base.table() != table::TYPE_DEF {
+                if let Some(base_name) = assembly.type_token_name(base) {
+                    if let Some((owner, base_td)) = references.iter().find_map(|reference| {
+                        reference
+                            .find_type(base_name.namespace, base_name.name)
+                            .map(|td| (*reference, td))
+                    }) {
+                        slots = reference_vtable_slots_seeded(references, owner, base_td, depth + 1);
+                    }
+                }
+            }
+        }
+    }
+    for td in chain.into_iter().rev() {
         let owner = assembly.type_token_name(td.token());
         let owner_namespace: String = owner.as_ref().map(|n| n.namespace.into()).unwrap_or_default();
         let owner_name: String = owner.as_ref().map(|n| n.name.into()).unwrap_or_default();
@@ -481,44 +588,31 @@ fn reference_vtable_slots<'x>(assembly: &'x Assembly<'x>, type_def: TypeDef<'x>)
                 .map(|sig| sig.parameters)
                 .unwrap_or_default();
             let key = param_key(assembly, &params);
+            let symbol = extern_method_symbol(
+                &owner_namespace,
+                &owner_name,
+                name.unwrap_or(""),
+                &params,
+                &|token| assembly.type_token_name(token).map(|n| joined_full_name(&n)),
+            );
             let newslot = method.flags() & 0x0100 != 0;
             if !newslot {
                 if let Some(entry) = slots
                     .iter_mut()
                     .find(|slot| slot.name == name && slot.key == key)
                 {
-                    entry.params = params;
-                    entry.owner_namespace = owner_namespace.clone();
-                    entry.owner_name = owner_name.clone();
+                    entry.impl_ = SlotImpl::Extern(symbol);
                     continue;
                 }
             }
-            slots.push(Building {
+            slots.push(VSlot {
                 name,
                 key,
-                params,
-                owner_namespace: owner_namespace.clone(),
-                owner_name: owner_name.clone(),
+                impl_: SlotImpl::Extern(symbol),
             });
         }
     }
     slots
-        .into_iter()
-        .map(|building| {
-            let symbol = extern_method_symbol(
-                &building.owner_namespace,
-                &building.owner_name,
-                building.name.unwrap_or(""),
-                &building.params,
-                &|token| assembly.type_token_name(token).map(|n| joined_full_name(&n)),
-            );
-            VSlot {
-                name: building.name,
-                key: building.key,
-                impl_: SlotImpl::Extern(symbol),
-            }
-        })
-        .collect()
 }
 
 /// A vtable slot's emitted form: a module FUNCTION INDEX (this-assembly implementation), or the
@@ -553,24 +647,101 @@ pub struct TypeMeta {
     pub base: Option<TypeHandle>,
 }
 
-/// The reference layout of `type_def` computed from its own `assembly` -- payload size and
-/// reference-field offsets (a class's payload is its fields); `None` for a value type. Used for a
-/// `newobj` of either a this-assembly class or a referenced-assembly (corlib) class.
-fn reference_layout_of<'a>(
-    assembly: &Assembly<'a>,
-    type_def: TypeDef<'a>,
-) -> Option<ReferenceLayout> {
-    if type_def.is_value_type() {
-        return None;
+impl<'a> MetadataResolver<'a> {
+    /// The reference layout of `type_def` (declared in `owner`) -- payload size and
+    /// reference-field offsets; `None` for a value type. Used for a `newobj` of either a
+    /// this-assembly class or a referenced-assembly class. The payload spans the WHOLE extends
+    /// chain, base blocks first ([`Self::cross_class_chain`]) -- INCLUDING a base declared in
+    /// another assembly. A derived class's own TypeDef often declares NO fields
+    /// (`AutoResetEvent : WaitHandle` same-assembly; a BSP's `Rp2350I2cDriver : I2cDriver`
+    /// cross-assembly, where the base carries `_probeScratch`), and sizing it by the visible
+    /// portion alone allocated OVERLAPPING objects -- the first write through an inherited
+    /// field then rewrote the NEXT object's header. Each block computes from its OWNING
+    /// assembly's metadata, so both sides of a boundary agree on every offset.
+    fn reference_layout_of(
+        &self,
+        owner: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+    ) -> Option<ReferenceLayout> {
+        if type_def.is_value_type() {
+            return None;
+        }
+        let mut size = 0u32;
+        let mut reference_offsets = Vec::new();
+        for (link_assembly, link) in self.cross_class_chain(owner, type_def) {
+            let layout = link_assembly
+                .value_type_layout(link.token(), &TargetLayout::ilp32())
+                .ok()?;
+            for offset in layout.reference_offsets {
+                reference_offsets.push(size + offset);
+            }
+            size = (size + layout.size).next_multiple_of(4);
+        }
+        Some(ReferenceLayout {
+            handle: TypeHandle(type_def.token().0),
+            size,
+            reference_offsets,
+        })
     }
-    let layout = assembly
-        .value_type_layout(type_def.token(), &TargetLayout::ilp32())
-        .ok()?;
-    Some(ReferenceLayout {
-        handle: TypeHandle(type_def.token().0),
-        size: layout.size,
-        reference_offsets: layout.reference_offsets,
-    })
+
+    /// The EXTENDS chain of `type_def` (declared in `owner`), BASE-FIRST (the System.Object-most
+    /// ancestor first, `type_def` itself last), each link paired with its OWNING assembly. A
+    /// TypeDef base continues in the same assembly; a TypeRef base hops through the resolver's
+    /// reference list ([`Self::find_reference_type`] -- name-based, first declarer wins, the one
+    /// cross-assembly rule) and continues in the owner it resolves to. Stops at an absent or
+    /// unresolvable base; bounded against a malformed cyclic chain like `subtype_tags`' walk.
+    fn cross_class_chain(
+        &self,
+        owner: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+    ) -> Vec<(&'a Assembly<'a>, TypeDef<'a>)> {
+        let mut assembly = owner;
+        let mut chain = alloc::vec![(assembly, type_def)];
+        let mut current = type_def.extends();
+        for _ in 0..64 {
+            if current.row() == 0 {
+                break;
+            }
+            let base = match current.table() {
+                table::TYPE_DEF => match assembly.type_def(current.row()) {
+                    Some(base) => base,
+                    None => break,
+                },
+                table::TYPE_REF => {
+                    let Some(name) = assembly.type_token_name(current) else {
+                        break;
+                    };
+                    let Some((_, base_owner, base)) =
+                        self.find_reference_type(name.namespace, name.name)
+                    else {
+                        break;
+                    };
+                    assembly = base_owner;
+                    base
+                }
+                _ => break,
+            };
+            chain.push((assembly, base));
+            current = base.extends();
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// The payload offset where `type_def`'s OWN field block starts: the word-aligned sum of
+    /// every base block before it -- [`Self::reference_layout_of`]'s accumulation, stopped
+    /// before `type_def` (the chain's LAST entry by construction).
+    fn class_block_start(&self, owner: &'a Assembly<'a>, type_def: TypeDef<'a>) -> Option<u32> {
+        let chain = self.cross_class_chain(owner, type_def);
+        let mut start = 0u32;
+        for (link_assembly, link) in &chain[..chain.len() - 1] {
+            let layout = link_assembly
+                .value_type_layout(link.token(), &TargetLayout::ilp32())
+                .ok()?;
+            start = (start + layout.size).next_multiple_of(4);
+        }
+        Some(start)
+    }
 }
 
 /// The AOT's interface-method identity tag: FNV-1a32 of the interface's full name, the method name, and
@@ -706,15 +877,60 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        self.assembly.field_offset(*token, &TargetLayout::ilp32())
+        match token.table() {
+            table::MEMBER_REF => {
+                let member = self.assembly.member_ref(token.row())?;
+                if !member.is_field() {
+                    return None;
+                }
+                let parent = self.assembly.type_token_name(member.parent())?;
+                let field_name = member.name()?;
+                let (_, owner, type_def) =
+                    self.find_reference_type(parent.namespace, parent.name)?;
+                let field = type_def
+                    .fields()
+                    .find(|f| f.name() == Some(field_name))
+                    .filter(|f| !f.is_static())?;
+                let block = owner.field_offset(field.token(), &TargetLayout::ilp32())?;
+                Some(self.class_block_start(owner, type_def)? + block)
+            }
+            _ => {
+                let block = self.assembly.field_offset(*token, &TargetLayout::ilp32())?;
+                let declaring = self
+                    .assembly
+                    .type_defs()
+                    .find(|type_def| type_def.fields().any(|field| field.token() == *token))?;
+                Some(self.class_block_start(self.assembly, declaring)? + block)
+            }
+        }
     }
 
     fn field_type(&self, operand: &Operand) -> Option<MirType> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let signature = self.assembly.field_signature(*token)?;
+        let signature = match token.table() {
+            table::MEMBER_REF => self.assembly.member_ref(token.row())?.field_type()?,
+            _ => self.assembly.field_signature(*token)?,
+        };
         mir_type(&signature, self.assembly, &TargetLayout::ilp32())
+    }
+
+    fn field_narrow(&self, operand: &Operand) -> Option<(u8, bool)> {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let signature = match token.table() {
+            table::MEMBER_REF => self.assembly.member_ref(token.row())?.field_type()?,
+            _ => self.assembly.field_signature(*token)?,
+        };
+        match signature {
+            SigType::Boolean | SigType::U1 => Some((1, false)),
+            SigType::I1 => Some((1, true)),
+            SigType::Char | SigType::U2 => Some((2, false)),
+            SigType::I2 => Some((2, true)),
+            _ => None,
+        }
     }
 
     fn value_type_size(&self, operand: &Operand) -> Option<u32> {
@@ -732,25 +948,30 @@ impl CallResolver for MetadataResolver<'_> {
             return false;
         };
         let declaring = match token.table() {
-            table::MEMBER_REF => self.assembly.member_ref(token.row()).map(|m| m.parent()),
+            table::MEMBER_REF => self
+                .assembly
+                .member_ref(token.row())
+                .map(|m| m.parent())
+                .and_then(|parent| match parent.table() {
+                    table::TYPE_DEF => Some((self.assembly, self.assembly.type_def(parent.row())?)),
+                    table::TYPE_REF => {
+                        let name = self.assembly.type_token_name(parent)?;
+                        self.find_reference_type(name.namespace, name.name)
+                            .map(|(_, owner, type_def)| (owner, type_def))
+                    }
+                    _ => None,
+                }),
             table::FIELD => self
                 .assembly
                 .type_defs()
                 .find(|type_def| type_def.fields().any(|field| field.token() == *token))
-                .map(|type_def| type_def.token()),
+                .map(|type_def| (self.assembly, type_def)),
             _ => None,
         };
-        let Some(declaring) = declaring.filter(|t| t.table() == table::TYPE_DEF) else {
+        let Some((owner, type_def)) = declaring else {
             return false;
         };
-        let Some(base) = self
-            .assembly
-            .type_def(declaring.row())
-            .map(|type_def| type_def.extends())
-        else {
-            return false;
-        };
-        !self.assembly.type_token_name(base).is_some_and(|name| {
+        !owner.type_token_name(type_def.extends()).is_some_and(|name| {
             name.namespace == "System" && matches!(name.name, "ValueType" | "Enum")
         })
     }
@@ -776,20 +997,37 @@ impl CallResolver for MetadataResolver<'_> {
         };
         let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
         if let Some(type_def) = self.assembly.find_type(declaring.namespace, declaring.name) {
-            return reference_layout_of(self.assembly, type_def);
+            return self.reference_layout_of(self.assembly, type_def);
         }
-        let reference = self.reference?;
-        let type_def = reference.find_type(declaring.namespace, declaring.name)?;
-        reference_layout_of(reference, type_def)
+        let (ordinal, reference, type_def) =
+            self.find_reference_type(declaring.namespace, declaring.name)?;
+        let mut layout = self.reference_layout_of(reference, type_def)?;
+        layout.handle = reference_handle(ordinal, type_def.token().0);
+        Some(layout)
     }
 
     fn newobj_delegate(&self, operand: &Operand) -> Option<ReferenceLayout> {
-        let type_def = self.newobj_type_def(operand)?;
-        if !self.is_delegate_type(&type_def) {
+        let Operand::Token(token) = operand else {
+            return None;
+        };
+        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
+        let (ordinal, owner, type_def) =
+            match self.assembly.find_type(declaring.namespace, declaring.name) {
+                Some(type_def) => (None, self.assembly, type_def),
+                None => {
+                    let (ordinal, owner, type_def) =
+                        self.find_reference_type(declaring.namespace, declaring.name)?;
+                    (Some(ordinal), owner, type_def)
+                }
+            };
+        if !is_delegate_type_of(owner, &type_def) {
             return None;
         }
         Some(ReferenceLayout {
-            handle: TypeHandle(type_def.token().0),
+            handle: match ordinal {
+                Some(ordinal) => reference_handle(ordinal, type_def.token().0),
+                None => TypeHandle(type_def.token().0),
+            },
             size: crate::cil::DELEGATE_SIZE,
             reference_offsets: alloc::vec![
                 crate::cil::DELEGATE_TARGET_OFFSET,
@@ -807,10 +1045,15 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         }
         let declaring = method.declaring_type?;
-        let type_def = self
-            .assembly
-            .find_type(declaring.namespace, declaring.name)?;
-        if !self.is_delegate_type(&type_def) {
+        let (owner, type_def) = match self.assembly.find_type(declaring.namespace, declaring.name) {
+            Some(type_def) => (self.assembly, type_def),
+            None => {
+                let (_, owner, type_def) =
+                    self.find_reference_type(declaring.namespace, declaring.name)?;
+                (owner, type_def)
+            }
+        };
+        if !is_delegate_type_of(owner, &type_def) {
             return None;
         }
         let sig = method.signature?;
@@ -942,11 +1185,37 @@ impl CallResolver for MetadataResolver<'_> {
         }
     }
 
-    fn static_field_offset(&self, operand: &Operand) -> Option<u32> {
+    fn static_field_offset(&self, operand: &Operand) -> Option<(StaticOwner, u32)> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        (token.table() == table::FIELD).then(|| token.row() * 4)
+        match token.table() {
+            table::FIELD => static_field_slots(self.assembly)
+                .into_iter()
+                .find(|(row, _)| *row == token.row())
+                .map(|(_, slot)| (StaticOwner::Own, slot * 4)),
+            table::MEMBER_REF => {
+                let member = self.assembly.member_ref(token.row())?;
+                if !member.is_field() {
+                    return None;
+                }
+                let parent = self.assembly.type_token_name(member.parent())?;
+                let field_name = member.name()?;
+                let (ordinal, owner, type_def) =
+                    self.find_reference_type(parent.namespace, parent.name)?;
+                let field_row = type_def
+                    .fields()
+                    .find(|f| f.name() == Some(field_name))?
+                    .token()
+                    .row();
+                let slot = static_field_slots(owner)
+                    .into_iter()
+                    .find(|(row, _)| *row == field_row)
+                    .map(|(_, slot)| slot)?;
+                Some((StaticOwner::Reference(u8::try_from(ordinal).ok()?), slot * 4))
+            }
+            _ => None,
+        }
     }
 
     fn exception_tag(&self, operand: &Operand) -> Option<u32> {
@@ -1166,14 +1435,15 @@ impl CallResolver for MetadataResolver<'_> {
                 }
             }
         }
+        if let Some(underlying) =
+            enum_underlying(self.assembly, *token, self.references(), &TargetLayout::ilp32())
+        {
+            return Some(underlying);
+        }
         if let Ok(layout) = self
             .assembly
             .value_type_layout(*token, &TargetLayout::ilp32())
         {
-            if let Some(underlying) = enum_underlying(self.assembly, *token, &TargetLayout::ilp32())
-            {
-                return Some(underlying);
-            }
             return Some(MirType::ValueType {
                 handle: TypeHandle(token.0),
                 size: layout.size,
@@ -1202,16 +1472,16 @@ impl CallResolver for MetadataResolver<'_> {
                     .position(|slot| matches!(&slot.impl_, SlotImpl::Rid(r) if *r == rid))
             }
             table::MEMBER_REF => {
-                let reference = self.reference?;
                 let method = self.assembly.resolve_method(*token)?;
                 let declaring = method.declaring_type.as_ref()?;
-                let ref_td = reference.find_type(declaring.namespace, declaring.name)?;
+                let (_, reference, ref_td) =
+                    self.find_reference_type(declaring.namespace, declaring.name)?;
                 if ref_td.is_interface() {
                     return None;
                 }
                 let signature = method.signature.as_ref()?;
                 let key = param_key(self.assembly, &signature.parameters);
-                reference_vtable_slots(reference, ref_td)
+                reference_vtable_slots(&self.references, reference, ref_td)
                     .iter()
                     .position(|slot| slot.name == method.name && slot.key == key)
             }
@@ -1278,7 +1548,7 @@ fn mir_type(sig: &SigType, assembly: &Assembly, target: &TargetLayout) -> Option
         SigType::IntPtr | SigType::UIntPtr => MirType::NativeInt,
         SigType::Class(_) | SigType::Object | SigType::String => MirType::ObjectRef,
         SigType::SzArray(_) | SigType::Array { .. } => MirType::ObjectRef,
-        SigType::ValueType(token) => match enum_underlying(assembly, *token, target) {
+        SigType::ValueType(token) => match enum_underlying(assembly, *token, &[], target) {
             Some(underlying) => underlying,
             None => MirType::ValueType {
                 handle: TypeHandle(token.0),
@@ -1287,6 +1557,31 @@ fn mir_type(sig: &SigType, assembly: &Assembly, target: &TargetLayout) -> Option
         },
         _ => return None,
     })
+}
+
+/// The DENSE static-field layout of one assembly: every static, non-literal Field row paired with
+/// its region slot, in metadata order, slots numbered from 1 -- slot 0 (region offset 0) is
+/// RESERVED, because offset 0 is the MIR-level EH-tag marker (`cil::G_EXCEPTION_TAG_OFFSET`) and a
+/// field slot there would alias every throw/catch. Literal (`const`) fields have no runtime
+/// storage (ECMA-335 II.16.1.2) and are skipped -- a compiler inlines their values, and an
+/// `ldsfld` naming one fails the offset lookup LOUD rather than reading a phantom slot. This is
+/// the ONE source for both the `ldsfld`/`stsfld` lowering ([`CallResolver::static_field_offset`])
+/// and the mode-2 statics stack-map record (`build::assembly_statics`) -- the two must never
+/// drift, or the collector walks the wrong words. Each slot is 4 bytes; a wider static (i64/f64/
+/// struct) still gets ONE slot because the lowering moves one word (a pre-existing truncation,
+/// unchanged by the dense layout -- widening slots buys nothing until the lowering moves more).
+pub(crate) fn static_field_slots(assembly: &Assembly) -> Vec<(u32, u32)> {
+    let mut slots = Vec::new();
+    let mut next = 1u32;
+    for type_def in assembly.type_defs() {
+        for field in type_def.fields() {
+            if field.is_static() && !field.is_literal() {
+                slots.push((field.token().row(), next));
+                next += 1;
+            }
+        }
+    }
+    slots
 }
 
 /// A type's dotted full name (`namespace.name`, or just `name` in the global namespace) -- what a
@@ -1379,19 +1674,45 @@ fn encode_type(sig: &SigType, type_full_name: &dyn Fn(Token) -> Option<String>, 
     }
 }
 
+/// A `ValueType` signature token resolved to the assembly that DECLARES it plus its `TypeDef`: a
+/// this-assembly `TypeDef` stays put; a `TypeRef` into a referenced assembly (a parameter/field/
+/// local typed as another assembly's enum or struct) resolves BY NAME through `references` to its
+/// owner -- the value-type twin of [`MetadataResolver::find_reference_type`] and the cross-assembly
+/// base-chain walk. `None` for a token that is neither, or a name no reference declares.
+fn resolve_value_type_def<'x>(
+    assembly: &'x Assembly<'x>,
+    token: Token,
+    references: &[&'x Assembly<'x>],
+) -> Option<(&'x Assembly<'x>, TypeDef<'x>)> {
+    match token.table() {
+        table::TYPE_DEF => Some((assembly, assembly.type_def(token.row())?)),
+        table::TYPE_REF => {
+            let name = assembly.type_token_name(token)?;
+            references.iter().find_map(|reference| {
+                reference
+                    .find_type(name.namespace, name.name)
+                    .map(|type_def| (*reference, type_def))
+            })
+        }
+        _ => None,
+    }
+}
+
 /// If `token` names an enum (a value type whose base is `System.Enum`), the MirType of its underlying
 /// integer. An enum is erased to that integer for codegen, so its values are scalars, not structs.
-/// `None` for a non-enum value type (a real struct) or a token that is not a this-module `TypeDef`.
-pub(crate) fn enum_underlying(
-    assembly: &Assembly,
+/// The token is resolved through [`resolve_value_type_def`] FIRST -- so a CROSS-ASSEMBLY enum (a
+/// `TypeRef` into a referenced assembly, e.g. a BSP driver method's `AdcChannelMode` parameter)
+/// erases the same as a this-assembly one; before, a `TypeRef` fell straight to `None` and the enum
+/// parameter became a size-0 value type the emit verify rejected (`NotWellFormed`). `None` for a
+/// real struct or an unresolvable token.
+pub(crate) fn enum_underlying<'x>(
+    assembly: &'x Assembly<'x>,
     token: Token,
+    references: &[&'x Assembly<'x>],
     target: &TargetLayout,
 ) -> Option<MirType> {
-    if token.table() != table::TYPE_DEF {
-        return None;
-    }
-    let type_def = assembly.type_def(token.row())?;
-    let base = assembly.type_token_name(type_def.extends())?;
+    let (owner, type_def) = resolve_value_type_def(assembly, token, references)?;
+    let base = owner.type_token_name(type_def.extends())?;
     if base.namespace != "System" || base.name != "Enum" {
         return None;
     }
@@ -1399,7 +1720,7 @@ pub(crate) fn enum_underlying(
         .fields()
         .find(|field| !field.is_static())?
         .signature()?;
-    mir_type(&underlying, assembly, target)
+    mir_type(&underlying, owner, target)
 }
 
 /// Lowers the given methods of an `assembly` to MIR as one module: a call from one of them

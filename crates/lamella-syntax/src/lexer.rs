@@ -71,6 +71,11 @@ pub struct LexOptions {
     /// unmanaged boundary it cannot honor; on for AOT mixed (managed + native) scenarios. When off,
     /// those attributes are rejected rather than emitted as inert metadata.
     pub native_interop: bool,
+    /// Whether the Portable PDB is EMBEDDED in the image (the `EmbeddedPortablePdb` debug directory
+    /// entry, DEFLATE-compressed) rather than written beside it as a standalone `.pdb`. Purely an
+    /// emit-time option -- it touches neither lexing nor binding -- threaded here for want of a
+    /// separate emit-options bag, alongside `native_interop`. Off by default (standalone `.pdb`).
+    pub embed_pdb: bool,
 }
 
 impl LexOptions {
@@ -1285,11 +1290,13 @@ impl<'a> Lexer<'a> {
     }
 
     /// Recognizes a post-1.0 operator at the current position that the target version does not
-    /// support (`=>` from C# 3.0, `??`/`::` from 2.0, `?.`/`?[` from 6.0), reports a `CS1644`
+    /// support (`=>` from C# 3.0, `??`/`::` from 2.0, `?.`/`?[` from 6.0), reports a `CS8022`
     /// feature diagnostic, consumes it as one token, and returns `Unknown`. Without this, maximal
     /// munch over the 1.0 operator set would split it (`=` then `>`, two `?`, ...) and the error
     /// would name those, not the feature. `?.` is NOT gated when a digit follows -- it is then a
     /// conditional `?` and a `.5`-style real literal (`a ?.5 : b`), valid in any version (9.4.4.3).
+    /// The opaque `Unknown` would otherwise trip a parser cascade at the same offset; that secondary
+    /// cascade is dropped downstream (`without_gated_operator_cascades`) so only this CS8022 stands.
     fn try_gate_post_1_0_operator(&mut self, start: usize) -> Option<TokenKind> {
         const GATED: &[(&str, Feature)] = &[
             ("=>", Feature::LambdaArrow),
@@ -1686,12 +1693,12 @@ mod tests {
     }
 
     #[test]
-    fn post_1_0_operators_report_cs1644_under_csharp1() {
+    fn post_1_0_operators_report_cs8022_under_csharp1() {
         for src in ["a => b", "a ?? b", "a?.b", "a?[0]", "global::System"] {
             let diagnostics = tokenize(src).diagnostics;
             assert!(
-                diagnostics.iter().any(|d| d.code() == 1644),
-                "{src:?} should report CS1644, got {diagnostics:?}"
+                diagnostics.iter().any(|d| d.code() == 8022),
+                "{src:?} should report CS8022, got {diagnostics:?}"
             );
         }
         assert!(

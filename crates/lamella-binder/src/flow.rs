@@ -12,44 +12,96 @@ use alloc::vec::Vec;
 use lamella_syntax::ast::{AssignmentOperator, Literal, UnaryOperator};
 use lamella_syntax::span::Span;
 
-/// Whether executing `stmt` always transfers control away rather than reaching
-/// its endpoint -- the basis for `CS0161`.
+/// Whether executing `stmt` always transfers control away rather than reaching its
+/// endpoint -- the structural, label-blind view (every `goto` is taken to exit). Codegen
+/// consumes this form; the `CS0161` test uses the label-aware [`method_body_always_exits`].
 #[must_use]
 pub fn always_exits(stmt: &BoundStmt) -> bool {
+    exits(stmt, &BTreeSet::new())
+}
+
+/// The `CS0161` endpoint test for a whole method body: like [`always_exits`], except a `goto`
+/// to an UNDEFINED label (already `CS0159`) does NOT count as exiting. Such a `goto` cannot
+/// jump, so csc treats the endpoint -- and thus the method endpoint -- as reachable and reports
+/// `CS0161` too (`{ goto Nowhere; }` is CS0159 + CS0161). A valid program has no undefined
+/// labels, so the set below is empty and this is identical to [`always_exits`]: it can never
+/// turn a valid value-returning method into a false CS0161.
+#[must_use]
+pub fn method_body_always_exits(body: &BoundStmt) -> bool {
+    exits(body, &undefined_goto_labels(body))
+}
+
+/// The `goto` targets in `body` that name no declared label -- exactly the labels [`check_labels`]
+/// reports `CS0159` for. Computed the same way (collect every declared label method-wide, then keep
+/// the goto targets not among them), so the exit analysis and CS0159 agree on which `goto`s cannot
+/// jump.
+fn undefined_goto_labels(body: &BoundStmt) -> BTreeSet<Box<str>> {
+    let mut declared: BTreeSet<Box<str>> = BTreeSet::new();
+    visit_statements(body, &mut |stmt| {
+        if let BoundStmtKind::Labeled { label, .. } = &stmt.kind {
+            declared.insert(label.clone());
+        }
+    });
+    let mut undefined: BTreeSet<Box<str>> = BTreeSet::new();
+    visit_statements(body, &mut |stmt| {
+        if let BoundStmtKind::Goto(label) = &stmt.kind {
+            if !declared.contains(label) {
+                undefined.insert(label.clone());
+            }
+        }
+    });
+    undefined
+}
+
+/// The core endpoint-reachability test, threading the set of undefined `goto` labels (empty for
+/// the structural [`always_exits`]): whether `stmt` always transfers control away rather than
+/// reaching its endpoint.
+fn exits(stmt: &BoundStmt, undefined_labels: &BTreeSet<Box<str>>) -> bool {
     use BoundStmtKind as Kind;
     match &stmt.kind {
         Kind::Return(_) | Kind::Throw(_) => true,
-        Kind::Goto(_) | Kind::GotoCase(_) | Kind::GotoCaseString(_) | Kind::GotoDefault => true,
-        Kind::Block(statements) => statements.iter().any(always_exits),
+        Kind::Goto(label) => !undefined_labels.contains(label),
+        Kind::GotoCase(_) | Kind::GotoCaseString(_) | Kind::GotoDefault => true,
+        Kind::Block(statements) => statements.iter().any(|s| exits(s, undefined_labels)),
         Kind::If {
             then_branch,
             else_branch: Some(else_branch),
             ..
-        } => always_exits(then_branch) && always_exits(else_branch),
+        } => exits(then_branch, undefined_labels) && exits(else_branch, undefined_labels),
         Kind::While { condition, .. } => is_const_true(condition),
         Kind::For { condition, .. } => condition.as_ref().is_none_or(is_const_true),
-        Kind::DoWhile { body, condition } => always_exits(body) || is_const_true(condition),
-        Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
-            always_exits(body)
+        Kind::DoWhile { body, condition } => {
+            exits(body, undefined_labels) || is_const_true(condition)
         }
-        Kind::Checked(inner) | Kind::Unchecked(inner) => always_exits(inner),
-        Kind::Labeled { body, .. } => always_exits(body),
+        Kind::Lock { body, .. } | Kind::Using { body, .. } | Kind::Fixed { body, .. } => {
+            exits(body, undefined_labels)
+        }
+        Kind::Checked(inner) | Kind::Unchecked(inner) => exits(inner, undefined_labels),
+        Kind::Labeled { body, .. } => exits(body, undefined_labels),
         Kind::Try {
             body,
             catches,
             finally,
         } => {
-            finally.as_ref().is_some_and(|block| always_exits(block))
-                || (always_exits(body) && catches.iter().all(|catch| always_exits(&catch.body)))
+            finally
+                .as_ref()
+                .is_some_and(|block| exits(block, undefined_labels))
+                || (exits(body, undefined_labels)
+                    && catches
+                        .iter()
+                        .all(|catch| exits(&catch.body, undefined_labels)))
         }
         Kind::Switch { sections, .. } => {
             let has_default = sections
                 .iter()
                 .any(|section| section.labels.contains(&BoundSwitchLabel::Default));
             has_default
-                && sections
-                    .iter()
-                    .all(|section| section.statements.iter().any(always_exits))
+                && sections.iter().all(|section| {
+                    section
+                        .statements
+                        .iter()
+                        .any(|s| exits(s, undefined_labels))
+                })
         }
         _ => false,
     }
@@ -76,165 +128,252 @@ enum Flow {
     Exits,
 }
 
-/// Reports `CS0168`/`CS0219` for a local whose name never appears anywhere in the
-/// body. Counting *every* occurrence -- even an assignment target -- as a use makes
-/// this a safe subset of csc (it under-reports rather than risk a false warning): it
-/// fires only when a declared local is truly never referenced again. `CS0219` "assigned
-/// but its value is never used" fires only when the initializer is a compile-time
-/// CONSTANT -- csc does not warn a local initialized with a non-constant expression
-/// (`s.Length`, `M()`), whose evaluation may matter -- and `CS0168` "declared but never
-/// used" when there is no initializer at all.
+/// Reports `CS0168`/`CS0219` for a declared local that no use reads. Uses are resolved to a
+/// specific DECLARATION by lexical scope (see [`UnusedScan`]), not matched by bare name, so a
+/// shadowed or duplicated outer local that is assigned-never-read is caught even though another
+/// local of the same name is read. `CS0219` "assigned but its value is never used" fires only when
+/// the initializer is a compile-time CONSTANT -- csc does not warn a local initialized with a
+/// non-constant expression (`s.Length`, `M()`), whose evaluation may matter -- and `CS0168`
+/// "declared but never used" when there is no initializer at all. A local of an unresolved type
+/// already carries CS0246, so it is tracked for scope resolution but never itself warned.
 #[must_use]
 pub fn check_unused_locals(body: &BoundStmt, also_used: &BTreeSet<Box<str>>) -> Vec<Diagnostic> {
-    let mut used: BTreeSet<Box<str>> = also_used.clone();
-    let mut declared: Vec<(Box<str>, Span, Option<bool>)> = Vec::new();
-    collect_locals(body, &mut used, &mut declared);
+    let mut scan = UnusedScan {
+        scopes: alloc::vec![BTreeMap::new()],
+        declared: Vec::new(),
+        used: BTreeSet::new(),
+    };
+    scan.statement(body);
+    let seeded: Vec<usize> = scan
+        .declared
+        .iter()
+        .enumerate()
+        .filter(|(_, decl)| also_used.contains(&decl.name))
+        .map(|(index, _)| index)
+        .collect();
+    scan.used.extend(seeded);
+    let UnusedScan { declared, used, .. } = scan;
     declared
         .into_iter()
-        .filter(|(name, _, _)| !used.contains(name))
-        .filter_map(|(name, span, initializer)| {
-            let kind = match initializer {
-                Some(true) => DiagnosticKind::UnusedLocalValue { name },
-                None => DiagnosticKind::UnusedLocal { name },
+        .enumerate()
+        .filter(|(index, decl)| decl.warnable && !used.contains(index))
+        .filter_map(|(_, decl)| {
+            let kind = match decl.initializer {
+                Some(true) => DiagnosticKind::UnusedLocalValue { name: decl.name },
+                None => DiagnosticKind::UnusedLocal { name: decl.name },
                 Some(false) => return None,
             };
-            Some(Diagnostic::new(kind, span))
+            Some(Diagnostic::new(kind, decl.span))
         })
         .collect()
 }
 
-/// Records every declared local (with its span and whether it has an initializer)
-/// and gathers every local name that appears anywhere in `stmt`.
-fn collect_locals(
-    stmt: &BoundStmt,
-    used: &mut BTreeSet<Box<str>>,
-    declared: &mut Vec<(Box<str>, Span, Option<bool>)>,
-) {
-    match &stmt.kind {
-        BoundStmtKind::Local { ty, declarators } => {
-            let report = !ty.is_error();
-            for declarator in declarators {
-                if report {
+/// One declared local for the unused-local scan.
+struct LocalDecl {
+    name: Box<str>,
+    span: Span,
+    /// `None` = no initializer (CS0168), `Some(true)` = a constant initializer (CS0219),
+    /// `Some(false)` = a non-constant initializer (no warning -- matching csc).
+    initializer: Option<bool>,
+    /// Whether this declaration is a warning candidate. A local of an unresolved type (already
+    /// CS0246) is tracked for scope resolution -- so a use of its name resolves to it rather than
+    /// leaking to an outer local -- but is never itself warned.
+    warnable: bool,
+}
+
+/// Resolves each local USE to the declaration it reads -- the innermost in-scope local of that name,
+/// the FIRST declaration winning within a single scope (csc's recovery for a duplicate) -- so a
+/// declaration is warned only when NO use resolves to IT, not merely when its name is reused. Every
+/// use of a uniquely-named local still resolves to its one declaration, so this is identical to
+/// name-keying on all code without repeated names; it differs only for a shadow (CS0136), a
+/// duplicate (CS0128), or a valid same-name reuse across disjoint scopes -- exactly the cases csc
+/// keys per-declaration.
+struct UnusedScan {
+    /// A stack of lexical scopes, innermost last; each maps a local name to the index in `declared`
+    /// of the first declaration of that name in the scope.
+    scopes: Vec<BTreeMap<Box<str>, usize>>,
+    declared: Vec<LocalDecl>,
+    /// The indices in `declared` that some use resolves to.
+    used: BTreeSet<usize>,
+}
+
+impl UnusedScan {
+    /// The declaration a use of `name` reads: the innermost scope that declares it.
+    fn resolve(&self, name: &str) -> Option<usize> {
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).copied())
+    }
+
+    /// Marks the declaration a use of `name` reads (if any) used.
+    fn use_local(&mut self, name: &str) {
+        if let Some(index) = self.resolve(name) {
+            self.used.insert(index);
+        }
+    }
+
+    /// Records a local in the current (innermost) scope. A later same-name declaration in the same
+    /// scope (a duplicate) does not displace the first for resolution, but is still tracked so it can
+    /// be warned as the dead one.
+    fn declare(&mut self, name: &str, span: Span, initializer: Option<bool>, warnable: bool) {
+        let index = self.declared.len();
+        self.declared.push(LocalDecl {
+            name: name.into(),
+            span,
+            initializer,
+            warnable,
+        });
+        self.scopes
+            .last_mut()
+            .expect("a scope is always open")
+            .entry(name.into())
+            .or_insert(index);
+    }
+
+    /// Resolves every local use in `expr` against the current scopes.
+    fn uses(&mut self, expr: &BoundExpr) {
+        visit_local_uses(expr, &mut |name| self.use_local(name));
+    }
+
+    /// Walks `statements` as one fresh lexical scope (a block, a `switch` body).
+    fn block(&mut self, statements: &[BoundStmt]) {
+        self.scopes.push(BTreeMap::new());
+        for statement in statements {
+            self.statement(statement);
+        }
+        self.scopes.pop();
+    }
+
+    /// Walks `stmt`, declaring the locals it introduces into the current scope and resolving the
+    /// uses it contains. Only a block and the `for`/`using`/`switch` bodies open a new scope; an
+    /// embedded non-block statement cannot declare a local, so it needs none.
+    fn statement(&mut self, stmt: &BoundStmt) {
+        match &stmt.kind {
+            BoundStmtKind::Local { ty, declarators } => {
+                let warnable = !ty.is_error();
+                for declarator in declarators {
                     let initializer = declarator
                         .initializer
                         .as_ref()
                         .map(|init| constant_literal_value(init).is_some());
-                    declared.push((declarator.name.clone(), stmt.span, initializer));
-                }
-                if let Some(initializer) = &declarator.initializer {
-                    collect_uses(initializer, used);
-                }
-            }
-        }
-        BoundStmtKind::Empty
-        | BoundStmtKind::Error
-        | BoundStmtKind::Break
-        | BoundStmtKind::Continue
-        | BoundStmtKind::Goto(_)
-        | BoundStmtKind::GotoCase(_)
-        | BoundStmtKind::GotoCaseString(_)
-        | BoundStmtKind::GotoDefault => {}
-        BoundStmtKind::Block(statements) => {
-            for statement in statements {
-                collect_locals(statement, used, declared);
-            }
-        }
-        BoundStmtKind::Expression(expr) => collect_uses(expr, used),
-        BoundStmtKind::If {
-            condition,
-            then_branch,
-            else_branch,
-        } => {
-            collect_uses(condition, used);
-            collect_locals(then_branch, used, declared);
-            if let Some(else_branch) = else_branch {
-                collect_locals(else_branch, used, declared);
-            }
-        }
-        BoundStmtKind::While { condition, body } | BoundStmtKind::DoWhile { condition, body } => {
-            collect_uses(condition, used);
-            collect_locals(body, used, declared);
-        }
-        BoundStmtKind::For {
-            initializer,
-            condition,
-            iterators,
-            body,
-        } => {
-            for statement in initializer {
-                collect_locals(statement, used, declared);
-            }
-            if let Some(condition) = condition {
-                collect_uses(condition, used);
-            }
-            for iterator in iterators {
-                collect_uses(iterator, used);
-            }
-            collect_locals(body, used, declared);
-        }
-        BoundStmtKind::ForEach {
-            collection, body, ..
-        } => {
-            collect_uses(collection, used);
-            collect_locals(body, used, declared);
-        }
-        BoundStmtKind::Return(value) | BoundStmtKind::Throw(value) => {
-            if let Some(value) = value {
-                collect_uses(value, used);
-            }
-        }
-        BoundStmtKind::Try {
-            body,
-            catches,
-            finally,
-        } => {
-            collect_locals(body, used, declared);
-            for catch in catches {
-                collect_locals(&catch.body, used, declared);
-            }
-            if let Some(finally) = finally {
-                collect_locals(finally, used, declared);
-            }
-        }
-        BoundStmtKind::Switch {
-            expression,
-            sections,
-        } => {
-            collect_uses(expression, used);
-            for section in sections {
-                for statement in &section.statements {
-                    collect_locals(statement, used, declared);
+                    self.declare(&declarator.name, stmt.span, initializer, warnable);
+                    if let Some(init) = &declarator.initializer {
+                        self.uses(init);
+                    }
                 }
             }
-        }
-        BoundStmtKind::Lock { expression, body } => {
-            collect_uses(expression, used);
-            collect_locals(body, used, declared);
-        }
-        BoundStmtKind::Fixed { init, body, .. } => {
-            collect_uses(init, used);
-            collect_locals(body, used, declared);
-        }
-        BoundStmtKind::Using { resource, body } => {
-            for statement in resource {
-                collect_locals(statement, used, declared);
+            BoundStmtKind::Block(statements) => self.block(statements),
+            BoundStmtKind::Expression(expr) => self.uses(expr),
+            BoundStmtKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
+                self.uses(condition);
+                self.statement(then_branch);
+                if let Some(else_branch) = else_branch {
+                    self.statement(else_branch);
+                }
             }
-            collect_locals(body, used, declared);
+            BoundStmtKind::While { condition, body } | BoundStmtKind::DoWhile { condition, body } => {
+                self.uses(condition);
+                self.statement(body);
+            }
+            BoundStmtKind::For {
+                initializer,
+                condition,
+                iterators,
+                body,
+            } => {
+                self.scopes.push(BTreeMap::new());
+                for statement in initializer {
+                    self.statement(statement);
+                }
+                if let Some(condition) = condition {
+                    self.uses(condition);
+                }
+                for iterator in iterators {
+                    self.uses(iterator);
+                }
+                self.statement(body);
+                self.scopes.pop();
+            }
+            BoundStmtKind::ForEach {
+                collection, body, ..
+            } => {
+                self.uses(collection);
+                self.statement(body);
+            }
+            BoundStmtKind::Return(value) | BoundStmtKind::Throw(value) => {
+                if let Some(value) = value {
+                    self.uses(value);
+                }
+            }
+            BoundStmtKind::Try {
+                body,
+                catches,
+                finally,
+            } => {
+                self.statement(body);
+                for catch in catches {
+                    self.statement(&catch.body);
+                }
+                if let Some(finally) = finally {
+                    self.statement(finally);
+                }
+            }
+            BoundStmtKind::Switch {
+                expression,
+                sections,
+            } => {
+                self.uses(expression);
+                self.scopes.push(BTreeMap::new());
+                for section in sections {
+                    for statement in &section.statements {
+                        self.statement(statement);
+                    }
+                }
+                self.scopes.pop();
+            }
+            BoundStmtKind::Lock { expression, body } => {
+                self.uses(expression);
+                self.statement(body);
+            }
+            BoundStmtKind::Fixed { init, body, .. } => {
+                self.uses(init);
+                self.statement(body);
+            }
+            BoundStmtKind::Using { resource, body } => {
+                self.scopes.push(BTreeMap::new());
+                for statement in resource {
+                    self.statement(statement);
+                }
+                self.statement(body);
+                self.scopes.pop();
+            }
+            BoundStmtKind::Checked(inner)
+            | BoundStmtKind::Unchecked(inner)
+            | BoundStmtKind::Labeled { body: inner, .. } => self.statement(inner),
+            BoundStmtKind::Empty
+            | BoundStmtKind::Error
+            | BoundStmtKind::Break
+            | BoundStmtKind::Continue
+            | BoundStmtKind::Goto(_)
+            | BoundStmtKind::GotoCase(_)
+            | BoundStmtKind::GotoCaseString(_)
+            | BoundStmtKind::GotoDefault => {}
         }
-        BoundStmtKind::Checked(inner)
-        | BoundStmtKind::Unchecked(inner)
-        | BoundStmtKind::Labeled { body: inner, .. } => collect_locals(inner, used, declared),
     }
 }
 
-/// Gathers every local name that appears anywhere in `expr` (an assignment target is
-/// counted too, which only makes the unused check more conservative). Also used by
-/// the binder to record locals referenced in `switch` case-label expressions.
-pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
+/// Visits every local USE in `expr` -- a `Local` reference in any position, an assignment target
+/// included (counting a target as a use only makes the unused check more conservative) -- calling
+/// `f` with each local's name. Shared by [`collect_uses`], which gathers the names, and
+/// [`UnusedScan`], which resolves each name to its declaration.
+fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
     match &expr.kind {
-        BoundExprKind::Local(name) => {
-            used.insert(name.clone());
-        }
+        BoundExprKind::Local(name) => f(name),
         BoundExprKind::Literal(_)
         | BoundExprKind::This
         | BoundExprKind::Base
@@ -245,74 +384,83 @@ pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
         | BoundExprKind::Error => {}
         BoundExprKind::FieldAccess { receiver, .. }
         | BoundExprKind::PropertyAccess { receiver, .. }
-        | BoundExprKind::MethodGroup { receiver, .. } => collect_uses(receiver, used),
+        | BoundExprKind::MethodGroup { receiver, .. } => visit_local_uses(receiver, f),
         BoundExprKind::Ref { operand, .. }
         | BoundExprKind::Dereference { operand }
-        | BoundExprKind::AddressOf { operand } => collect_uses(operand, used),
+        | BoundExprKind::AddressOf { operand } => visit_local_uses(operand, f),
         BoundExprKind::MakeRef(operand) | BoundExprKind::RefType(operand) => {
-            collect_uses(operand, used);
+            visit_local_uses(operand, f);
         }
-        BoundExprKind::RefValue { reference, .. } => collect_uses(reference, used),
-        BoundExprKind::StackAlloc { count, .. } => collect_uses(count, used),
+        BoundExprKind::RefValue { reference, .. } => visit_local_uses(reference, f),
+        BoundExprKind::StackAlloc { count, .. } => visit_local_uses(count, f),
         BoundExprKind::Call {
             callee, arguments, ..
         } => {
-            collect_uses(callee, used);
+            visit_local_uses(callee, f);
             for argument in arguments {
-                collect_uses(argument, used);
+                visit_local_uses(argument, f);
             }
         }
         BoundExprKind::ElementAccess { receiver, indices } => {
-            collect_uses(receiver, used);
+            visit_local_uses(receiver, f);
             for index in indices {
-                collect_uses(index, used);
+                visit_local_uses(index, f);
             }
         }
         BoundExprKind::ArrayCreation { lengths, elements } => {
             for length in lengths {
-                collect_uses(length, used);
+                visit_local_uses(length, f);
             }
             for element in elements {
-                collect_uses(element, used);
+                visit_local_uses(element, f);
             }
         }
         BoundExprKind::ObjectCreation { arguments, .. } => {
             for argument in arguments {
-                collect_uses(argument, used);
+                visit_local_uses(argument, f);
             }
         }
         BoundExprKind::DelegateCreation { receiver, .. } => {
             if let Some(receiver) = receiver {
-                collect_uses(receiver, used);
+                visit_local_uses(receiver, f);
             }
         }
         BoundExprKind::Binary { left, right, .. } => {
-            collect_uses(left, used);
-            collect_uses(right, used);
+            visit_local_uses(left, f);
+            visit_local_uses(right, f);
         }
         BoundExprKind::Unary { operand, .. } | BoundExprKind::Postfix { operand, .. } => {
-            collect_uses(operand, used);
+            visit_local_uses(operand, f);
         }
         BoundExprKind::Cast { operand, .. }
         | BoundExprKind::TypeTest { operand, .. }
-        | BoundExprKind::Conversion { operand, .. } => collect_uses(operand, used),
+        | BoundExprKind::Conversion { operand, .. } => visit_local_uses(operand, f),
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
-            collect_uses(inner, used);
+            visit_local_uses(inner, f);
         }
         BoundExprKind::Conditional {
             condition,
             when_true,
             when_false,
         } => {
-            collect_uses(condition, used);
-            collect_uses(when_true, used);
-            collect_uses(when_false, used);
+            visit_local_uses(condition, f);
+            visit_local_uses(when_true, f);
+            visit_local_uses(when_false, f);
         }
         BoundExprKind::Assignment { target, value, .. } => {
-            collect_uses(target, used);
-            collect_uses(value, used);
+            visit_local_uses(target, f);
+            visit_local_uses(value, f);
         }
     }
+}
+
+/// Gathers every local name that appears anywhere in `expr` into `used`. Used by the binder to
+/// record locals referenced in `switch` case-label expressions (which the bound tree folds to
+/// constants) so [`check_unused_locals`] can seed them as used.
+pub(crate) fn collect_uses(expr: &BoundExpr, used: &mut BTreeSet<Box<str>>) {
+    visit_local_uses(expr, &mut |name| {
+        used.insert(name.into());
+    });
 }
 
 /// A set of `(declaring-type dotted name, field name)` pairs -- the key a field access and
@@ -836,9 +984,12 @@ fn visit_statements<'a>(stmt: &'a BoundStmt, visit: &mut impl FnMut(&'a BoundStm
 pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     let mut labels: BTreeSet<Box<str>> = BTreeSet::new();
+    let mut label_decls: Vec<(Box<str>, lamella_syntax::span::Span)> = Vec::new();
     visit_statements(body, &mut |stmt| {
         if let BoundStmtKind::Labeled { label, .. } = &stmt.kind {
-            if !labels.insert(label.clone()) {
+            if labels.insert(label.clone()) {
+                label_decls.push((label.clone(), stmt.span));
+            } else {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticKind::DuplicateLabel {
                         label: label.clone(),
@@ -848,8 +999,10 @@ pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
             }
         }
     });
+    let mut goto_targets: BTreeSet<Box<str>> = BTreeSet::new();
     visit_statements(body, &mut |stmt| {
         if let BoundStmtKind::Goto(label) = &stmt.kind {
+            goto_targets.insert(label.clone());
             if !labels.contains(label) {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticKind::UndefinedLabel {
@@ -860,6 +1013,11 @@ pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
             }
         }
     });
+    for (label, span) in label_decls {
+        if !goto_targets.contains(&label) {
+            diagnostics.push(Diagnostic::new(DiagnosticKind::UnreferencedLabel, span));
+        }
+    }
     diagnostics
 }
 

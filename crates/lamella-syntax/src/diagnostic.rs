@@ -178,7 +178,7 @@ impl DiagnosticKind {
             DiagnosticKind::TypeDeclarationExpected => 1518,
             DiagnosticKind::OverloadableOperatorExpected => 1037,
             DiagnosticKind::InExpected => 1515,
-            DiagnosticKind::FeatureRequiresLaterVersion { .. } => 1644,
+            DiagnosticKind::FeatureRequiresLaterVersion { .. } => 8022,
         }
     }
 

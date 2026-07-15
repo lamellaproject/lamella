@@ -46,6 +46,12 @@ const ERROR_BITS: u32 = 0b1_0110;
 /// `Ellipsis` (`...`) -- a reserved `2 (mod 4)` singleton the GC skips, distinct from
 /// None=2/False=6/True=10, the callable nibble `...1110`, STOP=18, ERROR=22.
 const ELLIPSIS_BITS: u32 = 0b1_1010;
+/// `NotImplemented` -- the singleton an operator dunder returns to signal "I don't handle this
+/// operand pair" (the interpreter then tries the reflected operation). A reserved `2 (mod 4)`
+/// singleton the GC skips; the low five bits (`0_0010`) are shared with `None`, so identity is
+/// always tested against the full word, and the low nibble (`0010`, not `1110`) is never a
+/// callable. All eight 5-bit singleton slots are taken, so this is the first 6-bit one.
+const NOT_IMPLEMENTED_BITS: u32 = 0b10_0010;
 
 /// The most negative integer representable as a fixnum (the rest overflow to a
 /// bignum).
@@ -71,11 +77,19 @@ impl Value {
     pub const PY_ERROR: Value = Value(ERROR_BITS);
     /// The Python `Ellipsis` (`...`) singleton.
     pub const ELLIPSIS: Value = Value(ELLIPSIS_BITS);
+    /// The Python `NotImplemented` singleton (an operator dunder's "I don't handle this pair").
+    pub const NOT_IMPLEMENTED: Value = Value(NOT_IMPLEMENTED_BITS);
 
     /// Whether this word is the `Ellipsis` singleton.
     #[must_use]
     pub const fn is_ellipsis(self) -> bool {
         self.0 == ELLIPSIS_BITS
+    }
+
+    /// Whether this word is the `NotImplemented` singleton.
+    #[must_use]
+    pub const fn is_not_implemented(self) -> bool {
+        self.0 == NOT_IMPLEMENTED_BITS
     }
 
     /// Wraps `n` as a fixnum, or `None` if it falls outside the 31-bit fixnum range
@@ -328,6 +342,8 @@ impl core::fmt::Debug for Value {
             write!(f, "Value::Stop")
         } else if self.is_py_error() {
             write!(f, "Value::PyError")
+        } else if self.is_not_implemented() {
+            write!(f, "Value::NotImplemented")
         } else if self.is_unbound() {
             write!(f, "Value::Unbound")
         } else {

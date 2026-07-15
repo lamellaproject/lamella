@@ -40,6 +40,8 @@ namespace System.Threading
 
         public static bool Yield() { YieldThread(); return true; }
 
+        private static void ThreadEntry(ThreadStart start) { start(); }
+
         [Lamella.Runtime.RuntimeProvided] private static int StartThread(ThreadStart start, bool isBackground) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static void JoinThread(int id) { }
         [Lamella.Runtime.RuntimeProvided] private static void YieldThread() { }

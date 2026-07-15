@@ -1,0 +1,11 @@
+[package]
+name = "lamella-bsp-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Harvests docs/peripheral-tables/*.toml (the register-fact SSOT) and emits the generated per-language bindings under bsp/."
+
+[lints]
+workspace = true

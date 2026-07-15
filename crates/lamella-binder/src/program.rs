@@ -334,6 +334,50 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             }
         }
     }
+    if declaration.kind != TypeKind::Interface {
+        for member in &declaration.members {
+            let Member::Property {
+                modifiers,
+                getter,
+                setter,
+                span,
+                ..
+            } = member
+            else {
+                continue;
+            };
+            let bodyless_allowed = modifiers
+                .iter()
+                .any(|modifier| matches!(modifier, Modifier::Abstract | Modifier::Extern));
+            let has_bodyless_accessor = [getter, setter]
+                .into_iter()
+                .flatten()
+                .any(|accessor| accessor.body.is_none());
+            if !bodyless_allowed && has_bodyless_accessor {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::FeatureRequiresLaterVersion {
+                        feature: "automatically implemented properties".into(),
+                        required: "C# 3.0".into(),
+                    },
+                    *span,
+                ));
+            }
+        }
+    }
+    if declaration.kind == TypeKind::Class
+        && declaration
+            .modifiers
+            .iter()
+            .any(|modifier| matches!(modifier, Modifier::Static))
+    {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::FeatureRequiresLaterVersion {
+                feature: "static classes".into(),
+                required: "C# 2.0".into(),
+            },
+            declaration.span,
+        ));
+    }
     if matches!(declaration.kind, TypeKind::Class | TypeKind::Struct) {
         let type_is_abstract = declaration
             .modifiers
@@ -2125,6 +2169,33 @@ mod tests {
         assert_eq!(sorted_codes("class C { const int X = 5; }"), []);
         assert_eq!(sorted_codes("interface I { int x; }"), [525]);
         assert_eq!(sorted_codes("interface I { const int X = 5; }"), []);
+    }
+
+    #[test]
+    fn auto_implemented_property_is_cs8022() {
+        assert_eq!(sorted_codes("class C { int P { get; set; } }"), [8022]);
+        assert_eq!(sorted_codes("struct S { int P { get; } }"), [8022]);
+        assert_eq!(
+            sorted_codes("abstract class C { public abstract int P { get; set; } }"),
+            []
+        );
+        assert_eq!(sorted_codes("interface I { int P { get; set; } }"), []);
+        assert_eq!(sorted_codes("class C { extern int P { get; set; } }"), []);
+        assert_eq!(
+            sorted_codes("class C { int _f; int P { get { return _f; } set { _f = value; } } }"),
+            []
+        );
+    }
+
+    #[test]
+    fn static_class_is_gated_cs8022() {
+        assert_eq!(sorted_codes("static class C { }"), [8022]);
+        assert_eq!(
+            sorted_codes("static class C { public static int F() { return 1; } }"),
+            [8022]
+        );
+        assert_eq!(sorted_codes("sealed class C { }"), []);
+        assert_eq!(sorted_codes("abstract class C { }"), []);
     }
 
     #[test]

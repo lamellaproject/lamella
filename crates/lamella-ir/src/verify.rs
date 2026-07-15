@@ -239,6 +239,13 @@ fn check_inst(
             use_value(func, defined, *base, errors);
             use_value(func, defined, *value, errors);
         }
+        Inst::FieldLoadNarrow { base, .. } => {
+            use_value(func, defined, *base, errors);
+        }
+        Inst::FieldStoreNarrow { base, value, .. } => {
+            use_value(func, defined, *base, errors);
+            use_value(func, defined, *value, errors);
+        }
         Inst::FieldAddr { base, .. } => {
             use_value(func, defined, *base, errors);
         }

@@ -10,6 +10,7 @@ use lamella_py_bytecode::{BinOp, CmpOp, CodeObject};
 use crate::bigint::BigInt;
 use crate::interp::{
     binary, bigint_pow, call_value, coerce_index, getattr_hooked, iterator_for, py_next_value,
+    set_attr,
 };
 use crate::object::{
     DictViewKind, InlineCache, ObjectModel, LAZY_CALLABLE, LAZY_ENUMERATE, LAZY_FILTER, LAZY_MAP,
@@ -173,6 +174,12 @@ pub enum Builtin {
     DictValuesType = 65,
     /// `type(d.items())` -- the `dict_items` view type object (same reachability as DictKeysType).
     DictItemsType = 66,
+    /// `type(NotImplemented)` -- the type object of the `NotImplemented` singleton (CPython's
+    /// `NotImplementedType`). Not a builtin NAME; reached only via `type(NotImplemented)`.
+    NotImplementedType = 67,
+    /// `vars(obj)` -- `obj.__dict__` (an instance/class/module namespace). The no-argument form
+    /// (CPython's `locals()`) is unsupported here (no frame-locals access from a builtin).
+    Vars = 68,
 }
 
 impl Builtin {
@@ -248,6 +255,8 @@ impl Builtin {
             64 => Some(Builtin::DictKeysType),
             65 => Some(Builtin::DictValuesType),
             66 => Some(Builtin::DictItemsType),
+            67 => Some(Builtin::NotImplementedType),
+            68 => Some(Builtin::Vars),
             _ => None,
         }
     }
@@ -330,6 +339,8 @@ impl Builtin {
             Builtin::DictKeysType => "dict_keys",
             Builtin::DictValuesType => "dict_values",
             Builtin::DictItemsType => "dict_items",
+            Builtin::NotImplementedType => "NotImplementedType",
+            Builtin::Vars => "vars",
         }
     }
 
@@ -363,6 +374,7 @@ impl Builtin {
                 | Builtin::DictKeysType
                 | Builtin::DictValuesType
                 | Builtin::DictItemsType
+                | Builtin::NotImplementedType
         )
     }
 }
@@ -389,6 +401,9 @@ pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
     }
     if value.is_ellipsis() {
         return Some(Value::builtin_ref(Builtin::EllipsisType.id()));
+    }
+    if value.is_not_implemented() {
+        return Some(Value::builtin_ref(Builtin::NotImplementedType.id()));
     }
     if model.is_instance(value) {
         return Some(model.instance_class(value));
@@ -518,6 +533,7 @@ pub fn builtin_id(name: &str) -> Option<u32> {
         "hasattr" => Builtin::Hasattr,
         "setattr" => Builtin::Setattr,
         "delattr" => Builtin::Delattr,
+        "vars" => Builtin::Vars,
         "hash" => Builtin::Hash,
         "__match_class__" => Builtin::MatchClassPositional,
         _ => return None,
@@ -771,6 +787,20 @@ pub fn call_builtin(
                         );
                         Err(model.with_message(Trap::ValueError, &message))
                     }
+                } else if let Some(method) = model.find_dunder(*x, "__int__") {
+                    let result = call_value(method, &[], functions, model, depth)?;
+                    if model.is_int(result) {
+                        Ok(result)
+                    } else {
+                        Err(Trap::TypeError)
+                    }
+                } else if let Some(method) = model.find_dunder(*x, "__index__") {
+                    let result = call_value(method, &[], functions, model, depth)?;
+                    if model.is_int(result) {
+                        Ok(result)
+                    } else {
+                        Err(Trap::TypeError)
+                    }
                 } else {
                     Err(Trap::TypeError)
                 }
@@ -805,6 +835,18 @@ pub fn call_builtin(
                             );
                             Err(model.with_message(Trap::ValueError, &message))
                         }
+                    }
+                } else if let Some(method) = model.find_dunder(*x, "__float__") {
+                    let result = call_value(method, &[], functions, model, depth)?;
+                    match model.as_f64(result) {
+                        Some(f) => model.new_float(f),
+                        None => Err(Trap::TypeError),
+                    }
+                } else if let Some(method) = model.find_dunder(*x, "__index__") {
+                    let result = call_value(method, &[], functions, model, depth)?;
+                    match model.as_f64(result) {
+                        Some(f) => model.new_float(f),
+                        None => Err(Trap::TypeError),
                     }
                 } else {
                     Err(Trap::TypeError)
@@ -1271,6 +1313,10 @@ pub fn call_builtin(
             [] => Ok(Value::ELLIPSIS),
             _ => Err(Trap::TypeError),
         },
+        Builtin::NotImplementedType => match args {
+            [] => Ok(Value::NOT_IMPLEMENTED),
+            _ => Err(Trap::TypeError),
+        },
         view_type @ (Builtin::DictKeysType | Builtin::DictValuesType | Builtin::DictItemsType) => {
             let message = alloc::format!("cannot create '{}' instances", view_type.python_name());
             Err(model.raise_named_exception("TypeError", &message))
@@ -1296,6 +1342,21 @@ pub fn call_builtin(
                 Err(other) => Err(other),
             }
         }
+        Builtin::Vars => {
+            let [obj] = args else {
+                let message = "vars() with no arguments is not supported";
+                return Err(model.raise_named_exception("TypeError", message));
+            };
+            let mut cache = InlineCache::empty();
+            match getattr_hooked(*obj, "__dict__", &mut cache, functions, model, depth) {
+                Ok(dict) => Ok(dict),
+                Err(Trap::AttributeError) => {
+                    let message = "vars() argument must have __dict__ attribute";
+                    Err(model.raise_named_exception("TypeError", message))
+                }
+                Err(other) => Err(other),
+            }
+        }
         Builtin::Hasattr => {
             let [obj, name] = args else {
                 return Err(Trap::TypeError);
@@ -1317,11 +1378,7 @@ pub fn call_builtin(
                 return Err(Trap::TypeError);
             };
             let attr = String::from(model.str_value(*name).ok_or(Trap::TypeError)?);
-            if model.is_instance(*obj) {
-                model.py_setattr_instance(*obj, &attr, *value)?;
-            } else {
-                model.py_setattr_native(*obj, &attr, *value)?;
-            }
+            set_attr(*obj, &attr, *value, functions, model, depth)?;
             Ok(Value::NONE)
         }
         Builtin::Delattr => {
@@ -1413,6 +1470,7 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
             }
             Some(Builtin::NoneType) => value == Value::NONE,
             Some(Builtin::EllipsisType) => value.is_ellipsis(),
+            Some(Builtin::NotImplementedType) => value.is_not_implemented(),
             Some(Builtin::DictKeysType) => model.dict_view_kind(value) == Some(DictViewKind::Keys),
             Some(Builtin::DictValuesType) => {
                 model.dict_view_kind(value) == Some(DictViewKind::Values)
@@ -1521,6 +1579,7 @@ pub fn call_builtin_kw(
         Builtin::Max => min_max_kw(posargs, kwargs, Ordering::Greater, functions, model, depth),
         Builtin::Print => print_kw(posargs, kwargs, functions, model, depth),
         Builtin::Enumerate => enumerate_kw(posargs, kwargs, functions, model, depth),
+        Builtin::Zip => zip_kw(posargs, kwargs, functions, model, depth),
         _ if kwargs.is_empty() => call_builtin(id, posargs, functions, model, depth),
         _ => Err(Trap::TypeError),
     }
@@ -1552,6 +1611,29 @@ fn enumerate_kw(
         call_args.push(start);
     }
     call_builtin(Builtin::Enumerate.id(), &call_args, functions, model, depth)
+}
+
+/// `zip(*iterables, strict=False)`: accepts the keyword-only `strict`. When truthy, the lazy iterator
+/// raises `ValueError` if the sources differ in length (enforced during iteration); the flag rides the
+/// iterator's state slot. Any other keyword is a `TypeError`.
+fn zip_kw(
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let mut strict = false;
+    for &(name, value) in kwargs {
+        if name == "strict" {
+            strict = model.py_truthy(value)?.unwrap_or_else(|| value.is_truthy());
+        } else {
+            return Err(Trap::TypeError);
+        }
+    }
+    let sources = source_iters(model, posargs, functions, depth)?;
+    let flag = if strict { Value::TRUE } else { Value::NONE };
+    model.new_lazy_iter(LAZY_ZIP, flag, sources)
 }
 
 /// `print(*args, sep=' ', end='\n')`: the args rendered with str() and joined by `sep`, then `end`.

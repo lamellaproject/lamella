@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 
 use lamella_ir::{
     BasicBlock, BinOp as MBinOp, BlockId, CmpOp as MCmpOp, ConvKind, Function, Inst, MirType, PyOp,
-    Terminator, ValueId,
+    StaticOwner, Terminator, TypeHandle, ValueId,
 };
 use lamella_py_bytecode as bc;
 
@@ -124,9 +124,98 @@ fn mir_type(ty: bc::StaticType) -> MirType {
     match ty {
         bc::StaticType::Int => MirType::I32,
         bc::StaticType::Float => MirType::F64,
+        bc::StaticType::ListInt
+        | bc::StaticType::ListFloat
+        | bc::StaticType::TupleInt
+        | bc::StaticType::TupleFloat => MirType::ObjectRef,
         bc::StaticType::Dynamic => MirType::PyValue,
     }
 }
+
+/// What the typed lane knows about a sequence-array `ObjectRef`: its element kind (`I32`/`F64`, which
+/// drives an element op's `element_size` and the loaded value's type) and whether it is MUTABLE. A
+/// `list` and a `tuple` share ALL the array read machinery (index / `len` / iterate over `[u32 len]
+/// [elems...]`); the ONLY difference is that a tuple is immutable, so `t[i] = v` is a CPython
+/// `TypeError` -- the `Setitem` arm refuses a non-mutable array. Keyed by value id in `arrays`.
+#[derive(Clone, Copy)]
+struct ArrayInfo {
+    elem: MirType,
+    mutable: bool,
+}
+
+/// The [`ArrayInfo`] a typed sequence static type carries, or `None` if `ty` is not a typed sequence.
+/// A list is mutable; a tuple is not (its element store is rejected).
+fn seq_info_of(ty: bc::StaticType) -> Option<ArrayInfo> {
+    match ty {
+        bc::StaticType::ListInt => Some(ArrayInfo { elem: MirType::I32, mutable: true }),
+        bc::StaticType::ListFloat => Some(ArrayInfo { elem: MirType::F64, mutable: true }),
+        bc::StaticType::TupleInt => Some(ArrayInfo { elem: MirType::I32, mutable: false }),
+        bc::StaticType::TupleFloat => Some(ArrayInfo { elem: MirType::F64, mutable: false }),
+        _ => None,
+    }
+}
+
+/// Emit the fixed-array materialization for a homogeneous numeric sequence literal (a `list` or a
+/// `tuple`): `AllocArray(len)` then one `ArrayStore` per element, index `0..n`, returning the array
+/// `ObjectRef` and recording its [`ArrayInfo`] in `arrays`. Every element must be a value of the one
+/// numeric kind `elem` (`I32`/`F64`); anything else is out of the typed lane (`DynamicOperation`).
+/// Shared by `BuildList` (mutable) and the tuple-store path (immutable).
+fn materialize_array(
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    arrays: &mut BTreeMap<ValueId, ArrayInfo>,
+    elems: &[(ValueId, MirType)],
+    elem: MirType,
+    mutable: bool,
+) -> Result<ValueId, LowerError> {
+    if !matches!(elem, MirType::I32 | MirType::F64) || elems.iter().any(|&(_, t)| t != elem) {
+        return Err(LowerError::DynamicOperation);
+    }
+    let element_size = elem_size(elem);
+    let length = emit(
+        values,
+        insts,
+        Inst::ConstInt { ty: MirType::I32, value: elems.len() as i64 },
+        MirType::I32,
+    );
+    let obj = emit(
+        values,
+        insts,
+        Inst::AllocArray { handle: LIST_TYPE_HANDLE, length, element_size },
+        MirType::ObjectRef,
+    );
+    for (k, &(value, _)) in elems.iter().enumerate() {
+        let index = emit(
+            values,
+            insts,
+            Inst::ConstInt { ty: MirType::I32, value: k as i64 },
+            MirType::I32,
+        );
+        emit(
+            values,
+            insts,
+            Inst::ArrayStore { array: obj, index, value, element_size },
+            MirType::I32,
+        );
+    }
+    arrays.insert(obj, ArrayInfo { elem, mutable });
+    Ok(obj)
+}
+
+/// The byte size of one array element of the given (numeric) element type: 4 for an `i32`, 8 for an
+/// `f64`. This is the `element_size` the array MIR ops carry (`array + 4 + index*element_size`).
+fn elem_size(elem: MirType) -> u32 {
+    match elem {
+        MirType::F64 => 8,
+        _ => 4,
+    }
+}
+
+/// The `TypeHandle` stamped on a typed list's `AllocArray`. A primitive-element array (`list[int]`/
+/// `list[float]`) has no interior references, so the backend emits a minimal all-zero descriptor for
+/// it (no vtable, nothing to trace element-wise) regardless of the handle -- one shared handle is
+/// enough. `list[<obj>]` (PyValue elements) will need a distinct, ref-map-carrying handle later.
+const LIST_TYPE_HANDLE: TypeHandle = TypeHandle(0);
 
 /// Emit one instruction of type `ty`, returning its result value.
 fn emit(values: &mut Values, insts: &mut Vec<(ValueId, Inst)>, inst: Inst, ty: MirType) -> ValueId {
@@ -134,6 +223,13 @@ fn emit(values: &mut Values, insts: &mut Vec<(ValueId, Inst)>, inst: Inst, ty: M
     insts.push((id, inst));
     id
 }
+
+/// The static-region byte offset of `g_exception_tag`, the no-GC exception model's in-flight tag
+/// word: a `raise` stores the thrown type's tag here, a `catch`/`except` dispatch loads and compares
+/// it, and zero means no exception is propagating. This is the SAME reserved word (offset 0) the C#
+/// lowering uses, so a mixed image shares one convention; the typed Python lane emits no other static
+/// field, so nothing aliases it.
+const EXCEPTION_TAG_OFFSET: u32 = 0;
 
 /// Promote a value to `f64`: an F64 passes through; an I32 is widened with `IntToFloat64` (Python
 /// promotes an int operand of a mixed or true-division expression to float). Any other type is out
@@ -337,9 +433,12 @@ fn inline_builtin(
                 emit(values, insts, Inst::WriteInt { value: args[0] }, MirType::PyValue);
             (placeholder, MirType::PyValue)
         }
-        Builtin::IntCast | Builtin::FloatCast | Builtin::Divmod | Builtin::Round => {
-            return Err(LowerError::DynamicOperation)
-        }
+        Builtin::IntCast
+        | Builtin::FloatCast
+        | Builtin::Divmod
+        | Builtin::Round
+        | Builtin::BoolCast
+        | Builtin::Len => return Err(LowerError::DynamicOperation),
     })
 }
 
@@ -379,6 +478,28 @@ fn emit_select_extreme(
         lhs: pick,
         rhs: masked,
     }, MirType::I32)
+}
+
+/// Normalize a Python subscript index to a non-negative array offset, BRANCHLESSLY (the abstract-
+/// interp lowering cannot emit a mid-expression branch, so a `select` is not available): compute
+/// `i < 0 ? i + len : i`. With `len` read from the array header at offset 0 and `sign = i >>signed 31`
+/// (`0` when `i >= 0`, all-ones `-1` when `i < 0`), the result is `i + (len & sign)` -- `i` unchanged
+/// when non-negative, `i + len` when negative, exactly CPython's wrap. It is arithmetically identical
+/// to `i` for a provably-non-negative index (the extra ops fold to a no-op at the value level), so the
+/// normalize is always emitted. An index still out of range after this (`xs[5]` on a length-3 list, or
+/// a very negative one whose wrap stays negative) is caught by the `ArrayLoad`/`ArrayStore` bounds
+/// check (a trap when unguarded -- the documented divergence, the same class as an unguarded `//0`).
+fn normalize_index(
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    array: ValueId,
+    index: ValueId,
+) -> ValueId {
+    let len = emit(values, insts, Inst::FieldLoad { base: array, offset: 0 }, MirType::I32);
+    let bits = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 31 }, MirType::I32);
+    let sign = emit(values, insts, Inst::Binary { op: MBinOp::ShrSigned, lhs: index, rhs: bits }, MirType::I32);
+    let wrap = emit(values, insts, Inst::Binary { op: MBinOp::And, lhs: len, rhs: sign }, MirType::I32);
+    emit(values, insts, Inst::Binary { op: MBinOp::Add, lhs: index, rhs: wrap }, MirType::I32)
 }
 
 /// Allocates dense, single-assignment value ids and records each one's type.
@@ -461,7 +582,7 @@ fn lower_function(
     let ret_ty = mir_type(co.ret_ty);
     let mut values = Values::new();
 
-    let metas = block_layout(&co.ops)?;
+    let metas = block_layout(&co.ops, &co.exc_table)?;
     if metas.is_empty() {
         return Err(LowerError::RunsOffEnd);
     }
@@ -469,6 +590,25 @@ fn lower_function(
     let preds = compute_preds(&metas);
     let reachable = reachable_blocks(&metas);
     let live_in = liveness(&metas, &co.ops, n_locals);
+
+    let fn_uses_exc = !co.exc_table.is_empty();
+    let block_of_leader: BTreeMap<usize, BlockId> = metas
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.start, BlockId(i as u32)))
+        .collect();
+    let handler_of = |raise_idx: usize| -> Option<BlockId> {
+        enclosing_handler(&co.exc_table, raise_idx).and_then(|h| block_of_leader.get(&h).copied())
+    };
+    let is_handler_target: Vec<bool> = {
+        let mut v = vec![false; n_bc];
+        for e in &co.exc_table {
+            if let Some(b) = block_of_leader.get(&(e.target as usize)) {
+                v[b.index()] = true;
+            }
+        }
+        v
+    };
 
     let is_merge: Vec<bool> = (0..n_bc)
         .map(|i| reachable[i] && preds[i].len() + usize::from(i == 0) >= 2)
@@ -499,6 +639,8 @@ fn lower_function(
     let mut exit_locals: Vec<Option<Vec<ValueId>>> = vec![None; n_bc];
     let mut exit_stack: Vec<Option<Vec<(ValueId, MirType)>>> = vec![None; n_bc];
 
+    let mut arrays: BTreeMap<ValueId, ArrayInfo> = BTreeMap::new();
+
     for i in 0..n_bc {
         if !reachable[i] {
             blocks.push(unreachable_block());
@@ -525,7 +667,9 @@ fn lower_function(
             (Vec::new(), inherited)
         };
 
-        let mut stack: Vec<StackEntry> = if is_merge[i] {
+        let mut stack: Vec<StackEntry> = if is_handler_target[i] {
+            Vec::new()
+        } else if is_merge[i] {
             let incoming = preds[i]
                 .iter()
                 .find_map(|p| exit_stack[*p].clone())
@@ -557,10 +701,149 @@ fn lower_function(
         };
         let mut insts: Vec<(ValueId, Inst)> = Vec::new();
         for op in &co.ops[meta.start..body_end] {
-            lower_op(co, funcs, constants, &local_ty, &mut values, &mut insts, &mut locals, &mut stack, op)?;
+            lower_op(co, funcs, constants, &local_ty, &mut values, &mut insts, &mut locals, &mut stack, &mut arrays, op)?;
         }
 
-        let terminator = if !meta.ends_in_terminator {
+        let terminator = if meta.call_exc_handler.is_some() {
+            let tag =
+                emit(&mut values, &mut insts, Inst::StaticLoad { owner: StaticOwner::Own, offset: EXCEPTION_TAG_OFFSET }, MirType::I32);
+            let sv = stack_exit(&stack)?;
+            let if_false =
+                branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &sv, tramp_base, &mut tramps);
+            let if_true =
+                branch_edge(&is_merge, &live_in, meta.succs[1], &locals, &[], tramp_base, &mut tramps);
+            Terminator::Branch {
+                cond: tag,
+                if_true,
+                true_args: Vec::new(),
+                if_false,
+                false_args: Vec::new(),
+            }
+        } else if meta.div_check_handler.is_some() {
+            let (divisor, dty) = match stack.last() {
+                Some(&StackEntry::Value(v, t)) if t == MirType::I32 || t == MirType::F64 => (v, t),
+                _ => return Err(LowerError::DynamicOperation),
+            };
+            let zero = emit(&mut values, &mut insts, Inst::ConstInt { ty: dty, value: 0 }, dty);
+            let is_zero = emit(
+                &mut values,
+                &mut insts,
+                Inst::Compare { op: MCmpOp::Eq, lhs: divisor, rhs: zero },
+                MirType::I32,
+            );
+            let sv = stack_exit(&stack)?;
+            let if_false =
+                branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &sv, tramp_base, &mut tramps);
+            let handler = meta.succs[1];
+            let raise_id = BlockId((tramp_base + tramps.len()) as u32);
+            let mut raise_insts: Vec<(ValueId, Inst)> = Vec::new();
+            let tagv = emit(
+                &mut values,
+                &mut raise_insts,
+                Inst::ConstInt { ty: MirType::I32, value: i64::from(bc::exception_tag("ZeroDivisionError")) },
+                MirType::I32,
+            );
+            let _stored = emit(
+                &mut values,
+                &mut raise_insts,
+                Inst::StaticStore { owner: StaticOwner::Own, offset: EXCEPTION_TAG_OFFSET, value: tagv },
+                MirType::I32,
+            );
+            tramps.push(BasicBlock {
+                params: Vec::new(),
+                insts: raise_insts,
+                terminator: Some(Terminator::Jump {
+                    target: handler,
+                    args: merge_args(&is_merge, &live_in, handler, &locals, &[]),
+                }),
+            });
+            Terminator::Branch {
+                cond: is_zero,
+                if_true: raise_id,
+                true_args: Vec::new(),
+                if_false,
+                false_args: Vec::new(),
+            }
+        } else if meta.subscript_check.is_some() {
+            let n = stack.len();
+            let index = match stack.get(n.wrapping_sub(1)) {
+                Some(&StackEntry::Value(v, MirType::I32)) => Some(v),
+                _ => None,
+            };
+            let obj = match stack.get(n.wrapping_sub(2)) {
+                Some(&StackEntry::Value(v, _)) if arrays.contains_key(&v) => Some(v),
+                _ => None,
+            };
+            match (index, obj) {
+                (Some(index), Some(obj)) => {
+                    let len =
+                        emit(&mut values, &mut insts, Inst::FieldLoad { base: obj, offset: 0 }, MirType::I32);
+                    let bits =
+                        emit(&mut values, &mut insts, Inst::ConstInt { ty: MirType::I32, value: 31 }, MirType::I32);
+                    let sign = emit(
+                        &mut values,
+                        &mut insts,
+                        Inst::Binary { op: MBinOp::ShrSigned, lhs: index, rhs: bits },
+                        MirType::I32,
+                    );
+                    let wrap = emit(
+                        &mut values,
+                        &mut insts,
+                        Inst::Binary { op: MBinOp::And, lhs: len, rhs: sign },
+                        MirType::I32,
+                    );
+                    let normalized = emit(
+                        &mut values,
+                        &mut insts,
+                        Inst::Binary { op: MBinOp::Add, lhs: index, rhs: wrap },
+                        MirType::I32,
+                    );
+                    let oob = emit(
+                        &mut values,
+                        &mut insts,
+                        Inst::Compare { op: MCmpOp::UnsignedGe, lhs: normalized, rhs: len },
+                        MirType::I32,
+                    );
+                    let sv = stack_exit(&stack)?;
+                    let if_false =
+                        branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &sv, tramp_base, &mut tramps);
+                    let handler = meta.succs[1];
+                    let raise_id = BlockId((tramp_base + tramps.len()) as u32);
+                    let mut raise_insts: Vec<(ValueId, Inst)> = Vec::new();
+                    let tagv = emit(
+                        &mut values,
+                        &mut raise_insts,
+                        Inst::ConstInt { ty: MirType::I32, value: i64::from(bc::exception_tag("IndexError")) },
+                        MirType::I32,
+                    );
+                    let _stored = emit(
+                        &mut values,
+                        &mut raise_insts,
+                        Inst::StaticStore { owner: StaticOwner::Own, offset: EXCEPTION_TAG_OFFSET, value: tagv },
+                        MirType::I32,
+                    );
+                    tramps.push(BasicBlock {
+                        params: Vec::new(),
+                        insts: raise_insts,
+                        terminator: Some(Terminator::Jump {
+                            target: handler,
+                            args: merge_args(&is_merge, &live_in, handler, &locals, &[]),
+                        }),
+                    });
+                    Terminator::Branch {
+                        cond: oob,
+                        if_true: raise_id,
+                        true_args: Vec::new(),
+                        if_false,
+                        false_args: Vec::new(),
+                    }
+                }
+                _ => {
+                    let sv = stack_exit(&stack)?;
+                    jump_to(&is_merge, &live_in, meta.succs[0], &locals, &sv)
+                }
+            }
+        } else if !meta.ends_in_terminator {
             let sv = stack_exit(&stack)?;
             jump_to(&is_merge, &live_in, meta.succs[0], &locals, &sv)
         } else {
@@ -592,8 +875,38 @@ fn lower_function(
                     if ty != ret_ty {
                         return Err(LowerError::ReturnTypeMismatch);
                     }
+                    if fn_uses_exc {
+                        let zero =
+                            emit(&mut values, &mut insts, Inst::ConstInt { ty: MirType::I32, value: 0 }, MirType::I32);
+                        let _cleared = emit(
+                            &mut values,
+                            &mut insts,
+                            Inst::StaticStore { owner: StaticOwner::Own, offset: EXCEPTION_TAG_OFFSET, value: zero },
+                            MirType::I32,
+                        );
+                    }
                     Terminator::Return(Some(value))
                 }
+                bc::Op::Raise(1) => {
+                    let name = match pop(&mut stack)? {
+                        StackEntry::ExcType(n) => n,
+                        _ => return Err(LowerError::DynamicOperation),
+                    };
+                    let tag = bc::exception_tag(&name);
+                    let tagv =
+                        emit(&mut values, &mut insts, Inst::ConstInt { ty: MirType::I32, value: i64::from(tag) }, MirType::I32);
+                    let _stored = emit(
+                        &mut values,
+                        &mut insts,
+                        Inst::StaticStore { owner: StaticOwner::Own, offset: EXCEPTION_TAG_OFFSET, value: tagv },
+                        MirType::I32,
+                    );
+                    raise_route(handler_of(meta.end - 1), &is_merge, &live_in, ret_ty, &locals, &mut values, &mut insts)
+                }
+                bc::Op::Raise(0) | bc::Op::Reraise => {
+                    raise_route(handler_of(meta.end - 1), &is_merge, &live_in, ret_ty, &locals, &mut values, &mut insts)
+                }
+                bc::Op::Raise(_) => return Err(LowerError::DynamicOperation),
                 _ => return Err(LowerError::RunsOffEnd),
             }
         };
@@ -661,6 +974,7 @@ fn stack_exit(stack: &[StackEntry]) -> Result<Vec<(ValueId, MirType)>, LowerErro
             StackEntry::Value(v, t) => Ok((*v, *t)),
             StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
             StackEntry::Tuple(_) => Err(LowerError::DynamicOperation),
+            StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => Err(LowerError::DynamicOperation),
         })
         .collect()
 }
@@ -709,6 +1023,28 @@ fn branch_edge(
     }
 }
 
+/// The terminator routing an in-flight exception (its tag already stored) to `handler`, or -- when
+/// no `try` guards the raise -- out of the function: a `Return` of a typed-zero placeholder, leaving
+/// `g_exception_tag` set so the caller/entry observes it. The handler is entered at value-stack depth
+/// 0 (the exception table truncates the stack), so only locals cross.
+fn raise_route(
+    handler: Option<BlockId>,
+    is_merge: &[bool],
+    live_in: &[Vec<bool>],
+    ret_ty: MirType,
+    locals: &[ValueId],
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Terminator {
+    match handler {
+        Some(h) => jump_to(is_merge, live_in, h, locals, &[]),
+        None => {
+            let zero = emit(values, insts, Inst::ConstInt { ty: ret_ty, value: 0 }, ret_ty);
+            Terminator::Return(Some(zero))
+        }
+    }
+}
+
 /// One basic block's op range and how it leaves.
 struct BlockMeta {
     /// The first op index (a leader).
@@ -719,12 +1055,56 @@ struct BlockMeta {
     succs: Vec<BlockId>,
     /// Whether the block's last op is a control-flow op (else it falls through).
     ends_in_terminator: bool,
+    /// Set when the block's last op is a `Call`/`CallKw` inside a `try`: the handler op index the
+    /// callee's in-flight exception routes to. The block then ends in an after-call tag check
+    /// (a `Branch` on `g_exception_tag`), not a plain fall-through. `succs` are `[continue, handler]`.
+    call_exc_handler: Option<usize>,
+    /// Set when the NEXT block begins with a `try`-guarded division (`//`/`%`/`/`): the handler op
+    /// index a `ZeroDivisionError` routes to. The block ends in a divisor check (a `Branch` on
+    /// `divisor == 0`) BEFORE the division runs. `succs` are `[divide, handler]`.
+    div_check_handler: Option<usize>,
+    /// Set when the NEXT block begins with a `try`-guarded subscript load/store (`xs[i]` / `xs[i]=v`):
+    /// the handler op index an `IndexError` routes to. When the container is a typed list, the block
+    /// ends in a bounds check (a `Branch` on `index >=u len`) BEFORE the element op, and `succs` are
+    /// `[access, handler]`; when it is a dynamic container the check is skipped (a plain fall-through --
+    /// that access stays the interpreter's), the handler edge unused.
+    subscript_check: Option<usize>,
+}
+
+/// Whether `op` is a division that raises `ZeroDivisionError` on a zero divisor: floor-division
+/// (`//`), modulo (`%`), or true-division (`/`). When one is guarded by a `try`, the lowering emits a
+/// divisor check ahead of it (a synthesized raise, the twin of the C# bounds/divide-by-zero check).
+fn is_zero_div_op(op: &bc::Op) -> bool {
+    matches!(
+        op,
+        bc::Op::Binary(bc::BinOp::FloorDiv | bc::BinOp::Mod | bc::BinOp::TrueDiv)
+    )
+}
+
+/// Whether `op` is a subscript element access -- a load (`xs[i]`) or a store (`xs[i] = v`) -- that
+/// raises `IndexError` out of range on a typed list. When one is guarded by a `try`, the lowering
+/// emits a bounds check ahead of it (the `IndexError` twin of the `ZeroDivisionError` divisor check).
+fn is_subscript_op(op: &bc::Op) -> bool {
+    matches!(op, bc::Op::Subscript { .. } | bc::Op::Setitem)
+}
+
+/// The handler op index a raise at `idx` transfers to: the target of the INNERMOST exception-table
+/// entry whose protected range covers `idx`, or `None` when no `try` guards `idx` (an uncaught raise
+/// that propagates out of the function). The table lists entries innermost-first, so the first match
+/// is the tightest.
+fn enclosing_handler(exc_table: &[bc::ExcEntry], idx: usize) -> Option<usize> {
+    exc_table
+        .iter()
+        .find(|e| (e.start as usize) <= idx && idx < (e.end as usize))
+        .map(|e| e.target as usize)
 }
 
 /// Split the op stream into basic blocks at leaders and record each block's
-/// successors. A leader is op 0, any jump target, and the op after any jump or
-/// return.
-fn block_layout(ops: &[bc::Op]) -> Result<Vec<BlockMeta>, LowerError> {
+/// successors. A leader is op 0, any jump target, the op after any jump / return /
+/// raise, and any exception-table handler target (entered only via the table). A block
+/// ending in `raise`/re-raise leaves to its enclosing handler (or exits the function,
+/// leaving the in-flight tag set, when none guards it) -- the exception edge in the CFG.
+fn block_layout(ops: &[bc::Op], exc_table: &[bc::ExcEntry]) -> Result<Vec<BlockMeta>, LowerError> {
     if ops.is_empty() {
         return Ok(Vec::new());
     }
@@ -737,9 +1117,25 @@ fn block_layout(ops: &[bc::Op]) -> Result<Vec<BlockMeta>, LowerError> {
                     leaders.push(i + 1);
                 }
             }
-            bc::Op::Return if i + 1 < ops.len() => leaders.push(i + 1),
+            bc::Op::Return | bc::Op::Raise(_) | bc::Op::Reraise if i + 1 < ops.len() => {
+                leaders.push(i + 1);
+            }
+            bc::Op::Call(_) | bc::Op::CallKw { .. }
+                if i + 1 < ops.len() && enclosing_handler(exc_table, i).is_some() =>
+            {
+                leaders.push(i + 1);
+            }
+            _ if is_zero_div_op(op) && enclosing_handler(exc_table, i).is_some() => {
+                leaders.push(i);
+            }
+            _ if is_subscript_op(op) && enclosing_handler(exc_table, i).is_some() => {
+                leaders.push(i);
+            }
             _ => {}
         }
+    }
+    for e in exc_table {
+        leaders.push(e.target as usize);
     }
     leaders.sort_unstable();
     leaders.dedup();
@@ -757,10 +1153,46 @@ fn block_layout(ops: &[bc::Op]) -> Result<Vec<BlockMeta>, LowerError> {
     for (i, &start) in leaders.iter().enumerate() {
         let end = leaders.get(i + 1).copied().unwrap_or(ops.len());
         let last = &ops[end - 1];
+        let call_exc_handler = match last {
+            bc::Op::Call(_) | bc::Op::CallKw { .. } => enclosing_handler(exc_table, end - 1),
+            _ => None,
+        };
+        let div_check_handler = match ops.get(end) {
+            Some(op) if call_exc_handler.is_none() && is_zero_div_op(op) => {
+                enclosing_handler(exc_table, end)
+            }
+            _ => None,
+        };
+        let subscript_check = match ops.get(end) {
+            Some(op)
+                if call_exc_handler.is_none()
+                    && div_check_handler.is_none()
+                    && is_subscript_op(op) =>
+            {
+                enclosing_handler(exc_table, end)
+            }
+            _ => None,
+        };
         let (succs, ends_in_terminator) = match last {
             bc::Op::Jump(t) => (vec![block_id(*t as usize)?], true),
             bc::Op::PopJumpIfFalse(t) => (vec![block_id(*t as usize)?, block_id(end)?], true),
             bc::Op::Return => (Vec::new(), true),
+            bc::Op::Raise(_) | bc::Op::Reraise => {
+                let succs = match enclosing_handler(exc_table, end - 1) {
+                    Some(handler) => vec![block_id(handler)?],
+                    None => Vec::new(),
+                };
+                (succs, true)
+            }
+            _ if call_exc_handler.is_some() => {
+                (vec![block_id(end)?, block_id(call_exc_handler.unwrap())?], false)
+            }
+            _ if div_check_handler.is_some() => {
+                (vec![block_id(end)?, block_id(div_check_handler.unwrap())?], false)
+            }
+            _ if subscript_check.is_some() => {
+                (vec![block_id(end)?, block_id(subscript_check.unwrap())?], false)
+            }
             _ => (vec![block_id(end)?], false),
         };
         metas.push(BlockMeta {
@@ -768,6 +1200,9 @@ fn block_layout(ops: &[bc::Op]) -> Result<Vec<BlockMeta>, LowerError> {
             end,
             succs,
             ends_in_terminator,
+            call_exc_handler,
+            div_check_handler,
+            subscript_check,
         });
     }
     Ok(metas)
@@ -854,6 +1289,13 @@ enum Builtin {
     /// round-half-to-even (`lamella_rint`) then `Float64ToInt`. `round(x, ndigits)` (two args, a float
     /// result) is dynamic. Handled in the `Call` op (it needs the argument's type).
     Round,
+    /// `bool(x)` on a numeric argument -- the truthiness `x != 0` (int) / `x != 0.0` (float), an i32
+    /// 0/1. A non-numeric arg (container/string truthiness) is dynamic. Handled in the `Call` op.
+    BoolCast,
+    /// `len(xs)` on a typed list -- reads the `u32` length prefix at the array header (offset 0), an
+    /// i32, with NO runtime call. A non-array argument (`len(str)`, a dynamic container) is dynamic.
+    /// Handled in the `Call` op (it needs the argument's type -- an array `ObjectRef`), not inline.
+    Len,
 }
 
 impl Builtin {
@@ -873,6 +1315,8 @@ impl Builtin {
             "float" => Some(Builtin::FloatCast),
             "divmod" => Some(Builtin::Divmod),
             "round" => Some(Builtin::Round),
+            "bool" => Some(Builtin::BoolCast),
+            "len" => Some(Builtin::Len),
             _ => None,
         }
     }
@@ -884,7 +1328,9 @@ impl Builtin {
             | Builtin::Print
             | Builtin::IntCast
             | Builtin::FloatCast
-            | Builtin::Round => 1,
+            | Builtin::Round
+            | Builtin::BoolCast
+            | Builtin::Len => 1,
             Builtin::Min | Builtin::Max | Builtin::MmioWrite { .. } | Builtin::Divmod => 2,
         }
     }
@@ -901,6 +1347,14 @@ enum StackEntry {
     Callable(FuncSig),
     Builtin(Builtin),
     Tuple(Vec<(ValueId, MirType)>),
+    /// A built-in exception TYPE pushed by `LoadGlobal` (`raise IndexError`, `except IndexError:`).
+    /// It is not a plain value: only `Raise` (which stores its tag) and `MatchExc` (which tests the
+    /// in-flight tag against its subtype closure) consume it; anywhere else falls to the dynamic path.
+    ExcType(String),
+    /// A tuple of built-in exception types pushed by `BuildTuple` when every element is an `ExcType`
+    /// (`except (A, B):`). Only `MatchExc` consumes it (testing the in-flight tag against the UNION of
+    /// the members' subtype closures); anywhere else it is a real tuple value -> the dynamic path.
+    ExcTypeTuple(Vec<String>),
 }
 
 fn pop(stack: &mut Vec<StackEntry>) -> Result<StackEntry, LowerError> {
@@ -915,6 +1369,7 @@ fn pop_value(stack: &mut Vec<StackEntry>) -> Result<(ValueId, MirType), LowerErr
         StackEntry::Value(v, t) => Ok((v, t)),
         StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
         StackEntry::Tuple(_) => Err(LowerError::DynamicOperation),
+        StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => Err(LowerError::DynamicOperation),
     }
 }
 
@@ -928,6 +1383,7 @@ fn lower_op(
     insts: &mut Vec<(ValueId, Inst)>,
     locals: &mut [ValueId],
     stack: &mut Vec<StackEntry>,
+    arrays: &mut BTreeMap<ValueId, ArrayInfo>,
     op: &bc::Op,
 ) -> Result<(), LowerError> {
     match op {
@@ -977,12 +1433,23 @@ fn lower_op(
         bc::Op::LoadFast(i) => {
             let slot = *i as usize;
             let value = *locals.get(slot).ok_or(LowerError::BadLocalIndex(*i))?;
+            if let Some(info) = seq_info_of(co.local_types[slot]) {
+                arrays.insert(value, info);
+            }
             stack.push(StackEntry::Value(value, local_ty[slot]));
         }
         bc::Op::StoreFast(i) => {
             let slot = *i as usize;
             if slot >= locals.len() {
                 return Err(LowerError::BadLocalIndex(*i));
+            }
+            if let Some(info) = seq_info_of(co.local_types[slot]) {
+                if !info.mutable && matches!(stack.last(), Some(StackEntry::Tuple(_))) {
+                    let StackEntry::Tuple(elems) = pop(stack)? else { unreachable!() };
+                    let obj = materialize_array(values, insts, arrays, &elems, info.elem, false)?;
+                    locals[slot] = obj;
+                    return Ok(());
+                }
             }
             let (value, _ty) = pop_value(stack)?;
             locals[slot] = value;
@@ -1142,30 +1609,70 @@ fn lower_op(
             stack.push(StackEntry::Value(id, MirType::PyValue));
         }
         bc::Op::Subscript { cache } => {
-            let (index, _it) = pop_value(stack)?;
+            let (index, it) = pop_value(stack)?;
             let (container, _ct) = pop_value(stack)?;
-            let id = values.fresh(MirType::PyValue);
-            insts.push((id, Inst::PyIntrinsic {
-                op: PyOp::Getitem,
-                args: vec![container, index],
-                cache: *cache,
-            }));
-            stack.push(StackEntry::Value(id, MirType::PyValue));
+            if let Some(&info) = arrays.get(&container) {
+                if it != MirType::I32 {
+                    return Err(LowerError::DynamicOperation);
+                }
+                let index = normalize_index(values, insts, container, index);
+                let id = emit(
+                    values,
+                    insts,
+                    Inst::ArrayLoad { array: container, index, element_size: elem_size(info.elem), signed: false },
+                    info.elem,
+                );
+                stack.push(StackEntry::Value(id, info.elem));
+            } else {
+                let id = values.fresh(MirType::PyValue);
+                insts.push((id, Inst::PyIntrinsic {
+                    op: PyOp::Getitem,
+                    args: vec![container, index],
+                    cache: *cache,
+                }));
+                stack.push(StackEntry::Value(id, MirType::PyValue));
+            }
         }
         bc::Op::BuildSlice => {
             return Err(LowerError::DynamicOperation);
         }
-        bc::Op::BuildList(_) | bc::Op::BuildDict(_) => {
-            return Err(LowerError::DynamicOperation);
-        }
-        bc::Op::BuildTuple(n) => {
+        bc::Op::BuildList(n) => {
             let n = *n as usize;
-            let mut elems = Vec::with_capacity(n);
+            if n == 0 {
+                return Err(LowerError::DynamicOperation);
+            }
+            let mut elems: Vec<(ValueId, MirType)> = Vec::with_capacity(n);
             for _ in 0..n {
                 elems.push(pop_value(stack)?);
             }
             elems.reverse();
-            stack.push(StackEntry::Tuple(elems));
+            let obj = materialize_array(values, insts, arrays, &elems, elems[0].1, true)?;
+            stack.push(StackEntry::Value(obj, MirType::ObjectRef));
+        }
+        bc::Op::BuildDict(_) => {
+            return Err(LowerError::DynamicOperation);
+        }
+        bc::Op::BuildTuple(n) => {
+            let n = *n as usize;
+            let base = stack.len().checked_sub(n).ok_or(LowerError::StackUnderflow)?;
+            if n > 0 && stack[base..].iter().all(|e| matches!(e, StackEntry::ExcType(_))) {
+                let names = stack
+                    .split_off(base)
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        StackEntry::ExcType(name) => Some(name),
+                        _ => None,
+                    })
+                    .collect();
+                stack.push(StackEntry::ExcTypeTuple(names));
+            } else {
+                let mut elems = Vec::with_capacity(n);
+                for _ in 0..n {
+                    elems.push(pop_value(stack)?);
+                }
+                elems.reverse();
+                stack.push(StackEntry::Tuple(elems));
+            }
         }
         bc::Op::UnpackSequence(n) => {
             let n = *n as usize;
@@ -1182,16 +1689,117 @@ fn lower_op(
             return Err(LowerError::DynamicOperation);
         }
         bc::Op::Setitem => {
-            return Err(LowerError::DynamicOperation);
+            let (index, it) = pop_value(stack)?;
+            let (container, _ct) = pop_value(stack)?;
+            if let Some(&info) = arrays.get(&container) {
+                if !info.mutable {
+                    return Err(LowerError::DynamicOperation);
+                }
+                let (value, vt) = pop_value(stack)?;
+                if it != MirType::I32 || vt != info.elem {
+                    return Err(LowerError::DynamicOperation);
+                }
+                let index = normalize_index(values, insts, container, index);
+                emit(
+                    values,
+                    insts,
+                    Inst::ArrayStore { array: container, index, value, element_size: elem_size(info.elem) },
+                    MirType::I32,
+                );
+            } else {
+                return Err(LowerError::DynamicOperation);
+            }
         }
         bc::Op::Contains { .. } => {
             return Err(LowerError::DynamicOperation);
         }
-        bc::Op::Raise(_)
-        | bc::Op::MatchExc
-        | bc::Op::LoadExc
-        | bc::Op::PopExcept
-        | bc::Op::Reraise
+        bc::Op::MatchExc => {
+            let tags: Vec<u32> = match pop(stack)? {
+                StackEntry::ExcType(name) => crate::exc::subtype_tags(&name),
+                StackEntry::ExcTypeTuple(names) => {
+                    let mut union: Vec<u32> = Vec::new();
+                    for name in &names {
+                        for tag in crate::exc::subtype_tags(name) {
+                            if !union.contains(&tag) {
+                                union.push(tag);
+                            }
+                        }
+                    }
+                    union
+                }
+                _ => return Err(LowerError::DynamicOperation),
+            };
+            let loaded = emit(
+                values,
+                insts,
+                Inst::StaticLoad {
+                    owner: StaticOwner::Own,
+                    offset: EXCEPTION_TAG_OFFSET,
+                },
+                MirType::I32,
+            );
+            let mut cond: Option<ValueId> = None;
+            for tag in tags {
+                let expected = emit(
+                    values,
+                    insts,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i64::from(tag),
+                    },
+                    MirType::I32,
+                );
+                let matched = emit(
+                    values,
+                    insts,
+                    Inst::Compare {
+                        op: MCmpOp::Eq,
+                        lhs: loaded,
+                        rhs: expected,
+                    },
+                    MirType::I32,
+                );
+                cond = Some(match cond {
+                    None => matched,
+                    Some(prev) => emit(
+                        values,
+                        insts,
+                        Inst::Binary {
+                            op: MBinOp::Or,
+                            lhs: prev,
+                            rhs: matched,
+                        },
+                        MirType::I32,
+                    ),
+                });
+            }
+            stack.push(StackEntry::Value(cond.unwrap_or(loaded), MirType::I32));
+        }
+        bc::Op::PopExcept => {
+            let zero = emit(
+                values,
+                insts,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+                MirType::I32,
+            );
+            let _cleared = emit(
+                values,
+                insts,
+                Inst::StaticStore {
+                    owner: StaticOwner::Own,
+                    offset: EXCEPTION_TAG_OFFSET,
+                    value: zero,
+                },
+                MirType::I32,
+            );
+        }
+        bc::Op::Raise(_) | bc::Op::Reraise => {
+            return Err(LowerError::UnsupportedControlFlow);
+        }
+        bc::Op::LoadExc
         | bc::Op::DeleteItem
         | bc::Op::DeleteAttr { .. }
         | bc::Op::DeleteFast(_) => {
@@ -1244,6 +1852,8 @@ fn lower_op(
                     MirType::I32,
                 );
                 stack.push(StackEntry::Value(id, MirType::I32));
+            } else if crate::exc::is_builtin_exception(name) {
+                stack.push(StackEntry::ExcType(name.clone()));
             } else {
                 return Err(LowerError::UnresolvedGlobal(name.clone()));
             }
@@ -1340,6 +1950,20 @@ fn lower_op(
                         _ => return Err(LowerError::DynamicOperation),
                     }
                 }
+                StackEntry::Builtin(Builtin::Len) => {
+                    if argc != 1 {
+                        return Err(LowerError::ArityMismatch {
+                            expected: 1,
+                            found: argc,
+                        });
+                    }
+                    let (obj, _ty) = typed_args[0];
+                    if !arrays.contains_key(&obj) {
+                        return Err(LowerError::DynamicOperation);
+                    }
+                    let id = emit(values, insts, Inst::FieldLoad { base: obj, offset: 0 }, MirType::I32);
+                    stack.push(StackEntry::Value(id, MirType::I32));
+                }
                 StackEntry::Builtin(Builtin::Round) => {
                     if argc != 1 {
                         return Err(LowerError::DynamicOperation);
@@ -1360,6 +1984,35 @@ fn lower_op(
                         _ => return Err(LowerError::DynamicOperation),
                     };
                     stack.push(StackEntry::Value(id, MirType::I32));
+                }
+                StackEntry::Builtin(mm @ (Builtin::Min | Builtin::Max)) => {
+                    if argc != 2 {
+                        return Err(LowerError::ArityMismatch {
+                            expected: 2,
+                            found: argc,
+                        });
+                    }
+                    let (a, at) = typed_args[0];
+                    let (b, bt) = typed_args[1];
+                    match (at, bt) {
+                        (MirType::I32, MirType::I32) => {
+                            let (id, rty) = inline_builtin(mm, values, insts, &[a, b])?;
+                            stack.push(StackEntry::Value(id, rty));
+                        }
+                        (MirType::F64, MirType::F64) => {
+                            let import = if matches!(mm, Builtin::Min) {
+                                "lamella_fmin"
+                            } else {
+                                "lamella_fmax"
+                            };
+                            let id = emit(values, insts, Inst::PInvoke {
+                                import: import.into(),
+                                args: vec![a, b],
+                            }, MirType::F64);
+                            stack.push(StackEntry::Value(id, MirType::F64));
+                        }
+                        _ => return Err(LowerError::DynamicOperation),
+                    }
                 }
                 StackEntry::Builtin(cast @ (Builtin::IntCast | Builtin::FloatCast)) => {
                     if argc != 1 {
@@ -1391,6 +2044,29 @@ fn lower_op(
                     };
                     stack.push(StackEntry::Value(id, rty));
                 }
+                StackEntry::Builtin(Builtin::BoolCast) => {
+                    if argc != 1 {
+                        return Err(LowerError::ArityMismatch {
+                            expected: 1,
+                            found: argc,
+                        });
+                    }
+                    let (value, ty) = typed_args[0];
+                    let zero_ty = match ty {
+                        MirType::I32 | MirType::F64 => ty,
+                        _ => return Err(LowerError::DynamicOperation),
+                    };
+                    let zero = emit(values, insts, Inst::ConstInt {
+                        ty: zero_ty,
+                        value: 0,
+                    }, zero_ty);
+                    let id = emit(values, insts, Inst::Compare {
+                        op: MCmpOp::Ne,
+                        lhs: value,
+                        rhs: zero,
+                    }, MirType::I32);
+                    stack.push(StackEntry::Value(id, MirType::I32));
+                }
                 StackEntry::Builtin(builtin) => {
                     let mut args = Vec::with_capacity(argc);
                     for (value, ty) in typed_args {
@@ -1404,6 +2080,9 @@ fn lower_op(
                 }
                 StackEntry::Value(..) | StackEntry::Tuple(_) => {
                     return Err(LowerError::CallTargetNotCallable);
+                }
+                StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => {
+                    return Err(LowerError::DynamicOperation);
                 }
             }
         }
@@ -1436,6 +2115,9 @@ fn lower_op(
                 StackEntry::Callable(sig) => sig,
                 StackEntry::Builtin(_) | StackEntry::Value(..) | StackEntry::Tuple(_) => {
                     return Err(LowerError::CallTargetNotCallable);
+                }
+                StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => {
+                    return Err(LowerError::DynamicOperation);
                 }
             };
             if argc + k != sig.arity {
@@ -2199,10 +2881,10 @@ def sign(n: int) -> int:
     }
 
     #[test]
-    fn a_returned_tuple_falls_to_the_dynamic_path() {
-        let module = compile_str("test", "def f() -> int:\n    t = (1, 2)\n    return t[0]\n")
+    fn an_inline_indexed_tuple_literal_falls_to_the_dynamic_path() {
+        let module = compile_str("test", "def f() -> int:\n    return (1, 2)[0]\n")
             .expect("compiles");
-        assert!(lower_module(&module).is_err());
+        assert_eq!(lower_module(&module), Err(LowerError::DynamicOperation));
     }
 
     #[test]
@@ -2340,5 +3022,452 @@ def sign(n: int) -> int:
         let ri = lower_named("def f(x: int) -> int:\n    return round(x)\n", "f");
         assert_eq!(count_insts(&ri, |i| matches!(i, Inst::PInvoke { .. })), 0);
         assert_eq!(count_insts(&ri, |i| matches!(i, Inst::Convert { .. })), 0);
+    }
+
+    #[test]
+    fn min_max_of_floats_lower_to_fmin_fmax_pinvokes() {
+        let mn = lower_named("def f(a: float, b: float) -> float:\n    return min(a, b)\n", "f");
+        assert_eq!(
+            count_insts(&mn, |i| matches!(i, Inst::PInvoke { import, .. } if &**import == "lamella_fmin")),
+            1
+        );
+        let mx = lower_named("def f(a: float, b: float) -> float:\n    return max(a, b)\n", "f");
+        assert_eq!(
+            count_insts(&mx, |i| matches!(i, Inst::PInvoke { import, .. } if &**import == "lamella_fmax")),
+            1
+        );
+        let mi = lower_named("def f(a: int, b: int) -> int:\n    return min(a, b)\n", "f");
+        assert_eq!(count_insts(&mi, |i| matches!(i, Inst::PInvoke { .. })), 0);
+    }
+
+    #[test]
+    fn min_of_mixed_int_and_float_is_dynamic() {
+        let module =
+            compile_str("test", "def f(a: int, b: float) -> int:\n    return int(min(a, b))\n")
+                .expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn bool_of_a_numeric_lowers_to_a_not_equal_zero_compare() {
+        let bi = lower_named("def f(x: int) -> int:\n    return bool(x)\n", "f");
+        assert_eq!(
+            count_insts(&bi, |i| matches!(i, Inst::Compare { op: MCmpOp::Ne, .. })),
+            1
+        );
+        assert_eq!(
+            count_insts(&bi, |i| matches!(i, Inst::Call { .. } | Inst::PInvoke { .. })),
+            0
+        );
+        let bf = lower_named("def f(x: float) -> int:\n    return bool(x)\n", "f");
+        assert_eq!(
+            count_insts(&bf, |i| matches!(i, Inst::Compare { op: MCmpOp::Ne, .. })),
+            1
+        );
+    }
+
+    fn tag_stores(func: &Function) -> usize {
+        count_insts(func, |i| matches!(i, Inst::StaticStore { offset: EXCEPTION_TAG_OFFSET, .. }))
+    }
+
+    fn tag_loads(func: &Function) -> usize {
+        count_insts(func, |i| matches!(i, Inst::StaticLoad { offset: EXCEPTION_TAG_OFFSET, .. }))
+    }
+
+    #[test]
+    fn typed_raise_catch_lowers_and_verifies() {
+        let f = lower_named(
+            "def main() -> int:\n    try:\n        raise IndexError\n    except IndexError:\n        return 42\n    return 0\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(tag_stores(&f), 2);
+        assert_eq!(tag_loads(&f), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Compare { op: MCmpOp::Eq, .. })), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn typed_raise_catch_threads_a_caught_local() {
+        let f = lower_named(
+            "def main() -> int:\n    x = 1\n    try:\n        raise IndexError\n    except IndexError:\n        x = 42\n    return x\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(tag_stores(&f), 3);
+        assert_eq!(tag_loads(&f), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn typed_bare_except_catches_without_a_type_test() {
+        let f = lower_named(
+            "def main() -> int:\n    try:\n        raise IndexError\n    except:\n        return 42\n    return 0\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(tag_loads(&f), 0);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Compare { .. })), 0);
+        assert_eq!(tag_stores(&f), 2);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    fn eq_compares(func: &Function) -> usize {
+        count_insts(func, |i| matches!(i, Inst::Compare { op: MCmpOp::Eq, .. }))
+    }
+
+    #[test]
+    fn typed_except_base_matches_a_derived_raise() {
+        let f = lower_named(
+            "def main() -> int:\n    try:\n        raise IndexError\n    except LookupError:\n        return 42\n    return 0\n",
+            "main",
+        );
+        let closure = crate::exc::subtype_tags("LookupError").len();
+        assert!(closure >= 3, "LookupError closure = itself + its two children, from the hierarchy");
+        assert_eq!(tag_loads(&f), 1);
+        assert_eq!(eq_compares(&f), closure);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn typed_multi_except_dispatches_to_the_matching_clause() {
+        let f = lower_named(
+            "def main() -> int:\n    try:\n        raise KeyError\n    except IndexError:\n        return 1\n    except KeyError:\n        return 2\n    return 0\n",
+            "main",
+        );
+        assert_eq!(tag_loads(&f), 2);
+        assert_eq!(eq_compares(&f), 2);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn typed_tuple_except_ors_the_union_of_member_closures() {
+        let f = lower_named(
+            "def main() -> int:\n    try:\n        raise IndexError\n    except (ValueError, LookupError):\n        return 42\n    return 0\n",
+            "main",
+        );
+        let mut union: Vec<u32> = Vec::new();
+        for name in ["ValueError", "LookupError"] {
+            for tag in crate::exc::subtype_tags(name) {
+                if !union.contains(&tag) {
+                    union.push(tag);
+                }
+            }
+        }
+        assert!(union.len() >= 4, "ValueError + LookupError + IndexError + KeyError");
+        assert_eq!(tag_loads(&f), 1);
+        assert_eq!(eq_compares(&f), union.len());
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn typed_try_except_else_lowers_and_verifies() {
+        let f = lower_named(
+            "def main() -> int:\n    x = 0\n    try:\n        x = 1\n    except IndexError:\n        return -1\n    else:\n        x = 3\n    return x\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn typed_nested_try_finally_propagates_and_lowers() {
+        let f = lower_named(
+            "def main() -> int:\n    x = 0\n    try:\n        try:\n            raise IndexError\n        finally:\n            x = 1\n    except IndexError:\n        x = x + 40\n    return x\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert!(tag_stores(&f) >= 1);
+        assert_eq!(tag_loads(&f), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    const CROSSFN_SRC: &str = "\
+def boom() -> int:
+    raise IndexError
+    return 0
+
+
+def main() -> int:
+    try:
+        return boom()
+    except IndexError:
+        return 42
+    return 0
+";
+
+    #[test]
+    fn typed_cross_function_raise_routes_to_the_caller_handler() {
+        let f = lower_named(CROSSFN_SRC, "main");
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Call { .. })), 1);
+        assert_eq!(tag_loads(&f), 2);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+        let boom = lower_named(CROSSFN_SRC, "boom");
+        assert!(tag_stores(&boom) >= 1);
+    }
+
+    #[test]
+    fn typed_cross_function_call_result_crosses_the_no_exception_edge() {
+        let f = lower_named(
+            "def calc(n: int) -> int:\n    return n * 2\n\n\ndef main() -> int:\n    try:\n        return calc(21)\n    except IndexError:\n        return -1\n    return 0\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Call { .. })), 1);
+        assert!(tag_loads(&f) >= 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    fn has_const_int(func: &Function, value: i64) -> bool {
+        func.blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .any(|(_, i)| matches!(i, Inst::ConstInt { value: v, .. } if *v == value))
+    }
+
+    #[test]
+    fn typed_protected_divide_by_zero_synthesizes_zerodivisionerror() {
+        let f = lower_named(
+            "def main() -> int:\n    a = 10\n    b = 0\n    try:\n        return a // b\n    except ZeroDivisionError:\n        return 42\n    return 0\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert!(has_const_int(&f, i64::from(bc::exception_tag("ZeroDivisionError"))));
+        assert!(tag_stores(&f) >= 1);
+        assert_eq!(tag_loads(&f), 1);
+        assert_eq!(eq_compares(&f), 2);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn typed_unprotected_divide_has_no_check() {
+        let f = lower_named(
+            "def main() -> int:\n    a = 84\n    b = 2\n    return a // b\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(tag_stores(&f), 0);
+        assert_eq!(tag_loads(&f), 0);
+        assert!(!has_const_int(&f, i64::from(bc::exception_tag("ZeroDivisionError"))));
+    }
+
+    fn count_array_stores(f: &Function) -> usize {
+        count_insts(f, |i| matches!(i, Inst::ArrayStore { .. }))
+    }
+
+    #[test]
+    fn a_numeric_list_literal_lowers_to_an_allocarray_and_element_stores() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20, 30]\n    return xs[0]\n",
+            "main",
+        );
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::AllocArray { element_size: 4, .. })),
+            1
+        );
+        assert_eq!(count_array_stores(&f), 3);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_list_index_read_lowers_to_an_arrayload_not_a_getitem() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20, 30]\n    i = 1\n    return xs[i]\n",
+            "main",
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { element_size: 4, .. })), 1);
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { op: PyOp::Getitem, .. })),
+            0
+        );
+    }
+
+    #[test]
+    fn a_float_list_uses_element_size_eight() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [1.5, 2.5]\n    return int(xs[0])\n",
+            "main",
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::AllocArray { element_size: 8, .. })), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { element_size: 8, .. })), 1);
+    }
+
+    #[test]
+    fn len_of_a_typed_list_reads_the_header_word_with_no_call() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [1, 2, 3, 4]\n    return len(xs)\n",
+            "main",
+        );
+        assert!(count_insts(&f, |i| matches!(i, Inst::FieldLoad { offset: 0, .. })) >= 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Call { .. })), 0);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_subscript_normalizes_a_negative_index_branchlessly() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20, 30]\n    return xs[-1]\n",
+            "main",
+        );
+        assert!(count_insts(&f, |i| matches!(i, Inst::Binary { op: MBinOp::ShrSigned, .. })) >= 1);
+        assert!(count_insts(&f, |i| matches!(i, Inst::Binary { op: MBinOp::And, .. })) >= 1);
+        assert!(count_insts(&f, |i| matches!(i, Inst::FieldLoad { offset: 0, .. })) >= 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { .. })), 1);
+    }
+
+    #[test]
+    fn a_mixed_numeric_list_is_not_a_typed_array() {
+        let module = compile_str(
+            "test",
+            "def main() -> int:\n    xs = [1, 2.0]\n    return xs[0]\n",
+        )
+        .expect("compiles");
+        assert_eq!(lower_module(&module), Err(LowerError::DynamicOperation));
+    }
+
+    #[test]
+    fn an_empty_list_is_not_a_typed_array() {
+        let module = compile_str(
+            "test",
+            "def main() -> int:\n    xs = []\n    xs.append(1)\n    return xs[0]\n",
+        )
+        .expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn a_dynamic_subscript_still_lowers_to_getitem() {
+        let f = lower_named("def f(s, i):\n    return s[i]\n", "f");
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { op: PyOp::Getitem, .. })),
+            1
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { .. })), 0);
+    }
+
+    #[test]
+    fn a_list_index_store_lowers_to_an_arraystore() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20, 30]\n    xs[1] = 99\n    xs[-1] = 7\n    return xs[0]\n",
+            "main",
+        );
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::ArrayStore { element_size: 4, .. })),
+            5
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_protected_subscript_synthesizes_an_indexerror_bounds_check() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20]\n    try:\n        return xs[5]\n    except IndexError:\n        return 42\n    return 0\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert!(has_const_int(&f, i64::from(bc::exception_tag("IndexError"))));
+        assert!(tag_stores(&f) >= 1);
+        assert_eq!(tag_loads(&f), 1);
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::Compare { op: MCmpOp::UnsignedGe, .. })),
+            1
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { .. })), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn an_unprotected_subscript_has_no_bounds_check() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20, 30]\n    return xs[1]\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert!(!has_const_int(&f, i64::from(bc::exception_tag("IndexError"))));
+        assert_eq!(tag_stores(&f), 0);
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::Compare { op: MCmpOp::UnsignedGe, .. })),
+            0
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { .. })), 1);
+    }
+
+    #[test]
+    fn a_for_loop_over_a_typed_list_lowers_to_counted_array_loads() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20, 30]\n    total = 0\n    for x in xs:\n        total = total + x\n    return total\n",
+            "main",
+        );
+        assert!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { .. })) >= 1);
+        assert!(count_insts(&f, |i| matches!(i, Inst::FieldLoad { offset: 0, .. })) >= 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn an_aliased_list_store_targets_the_same_object() {
+        let f = lower_named(
+            "def main() -> int:\n    a = [1, 2, 3]\n    b = a\n    a[0] = 99\n    return b[0]\n",
+            "main",
+        );
+        assert!(count_insts(&f, |i| matches!(i, Inst::ArrayStore { .. })) >= 4);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { .. })), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_numeric_tuple_lowers_to_the_same_allocarray_as_a_list() {
+        let f = lower_named(
+            "def main() -> int:\n    t = (10, 20, 30)\n    return t[0] + t[2]\n",
+            "main",
+        );
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::AllocArray { element_size: 4, .. })),
+            1
+        );
+        assert_eq!(count_array_stores(&f), 3);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { element_size: 4, .. })), 2);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_tuple_rejects_item_assignment() {
+        let module = compile_str(
+            "test",
+            "def main() -> int:\n    t = (1, 2, 3)\n    t[0] = 9\n    return t[0]\n",
+        )
+        .expect("compiles");
+        assert_eq!(lower_module(&module), Err(LowerError::DynamicOperation));
+    }
+
+    #[test]
+    fn a_float_tuple_uses_element_size_eight() {
+        let f = lower_named(
+            "def main() -> int:\n    t = (1.5, 2.5)\n    return int(t[0])\n",
+            "main",
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::AllocArray { element_size: 8, .. })), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { element_size: 8, .. })), 1);
+    }
+
+    #[test]
+    fn a_for_loop_over_a_typed_tuple_lowers_to_counted_array_loads() {
+        let f = lower_named(
+            "def main() -> int:\n    total = 0\n    for x in (10, 20, 30):\n        total = total + x\n    return total\n",
+            "main",
+        );
+        assert!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { .. })) >= 1);
+        assert!(count_insts(&f, |i| matches!(i, Inst::FieldLoad { offset: 0, .. })) >= 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_mixed_numeric_tuple_is_not_a_typed_array() {
+        let module = compile_str(
+            "test",
+            "def main() -> int:\n    t = (1, 2.0)\n    return int(t[1])\n",
+        )
+        .expect("compiles");
+        assert_eq!(lower_module(&module), Err(LowerError::DynamicOperation));
     }
 }

@@ -1,5 +1,5 @@
-//! [`WirelineBackend`]: the [`lamella_debug_backend::DebugBackend`] seam implemented over
-//! the wireline debug channel -- VS Code (via lamella-dap) debugs code running ON A DEVICE
+//! [`WireHostBackend`]: the [`lamella_debug_backend::DebugBackend`] seam implemented over
+//! the Lamella Link debug channel -- VS Code (via lamella-dap) debugs code running ON A DEVICE
 //! with zero adapter changes.
 
 use crate::{SerialTransport, deploy_chunked_blocking, hello_blocking};
@@ -23,7 +23,7 @@ fn unpack(address: u64) -> (u32, u32) {
     ((address >> 32) as u32, address as u32)
 }
 
-/// A display name for a wireline `board_model` code, or `None` for UNKNOWN / a model this build doesn't name.
+/// A display name for a Lamella Link `board_model` code, or `None` for UNKNOWN / a model this build doesn't name.
 /// Uses the `lamella_wire::board_model` constants so it tracks the protocol registry.
 fn board_model_name(model: u16) -> Option<&'static str> {
     use lamella_wire::board_model as bm;
@@ -63,7 +63,7 @@ fn identity_line(profile: &ProfileIdentity) -> Option<String> {
     Some(line)
 }
 
-/// The carrier a [`WirelineBackend`] drives: a serial port (USB-CDC / UART / a debug-probe VCP), or --
+/// The carrier a [`WireHostBackend`] drives: a serial port (USB-CDC / UART / a debug-probe VCP), or --
 /// with the `usb` feature -- a board's native driverless-WinUSB device. A LOCAL enum (not `Box<dyn>`) so it
 /// implements the foreign `Transport` trait, and the blocking deploy/hello drivers take it directly.
 pub enum WireTransport {
@@ -92,7 +92,7 @@ impl Transport for WireTransport {
 }
 
 /// A pre-built source map for the DEPLOYED image (`lamella_srcmap`'s JSON, keyed by the SAME method_id the wire
-/// reports), loaded alongside the `.lmli` so a wireline session is SOURCE-LEVEL. `points` are `(il_offset, line,
+/// reports), loaded alongside the `.lmli` so a Lamella Link session is SOURCE-LEVEL. `points` are `(il_offset, line,
 /// column)` ascending by offset -- the wire reports the CIL offset directly, so no index conversion is needed.
 struct MethodSrc {
     document: String,
@@ -102,7 +102,7 @@ struct MethodSrc {
 }
 
 /// The deployed image's source map -- `method_id -> (document, qualified name, sequence points)`, parsed from
-/// `lamella_srcmap`'s JSON. Makes a wireline session SOURCE-LEVEL: line lookups, source breakpoints, frame names.
+/// `lamella_srcmap`'s JSON. Makes a Lamella Link session SOURCE-LEVEL: line lookups, source breakpoints, frame names.
 pub struct SrcMap {
     methods: std::collections::HashMap<u32, MethodSrc>,
 }
@@ -181,8 +181,8 @@ impl SrcMap {
     }
 }
 
-/// A [`DebugBackend`] driving a wireline target's on-device interpreter session.
-pub struct WirelineBackend {
+/// A [`DebugBackend`] driving a Lamella Link target's on-device interpreter session.
+pub struct WireHostBackend {
     transport: WireTransport,
     /// The deployed image's source map, if present -- makes the session source-level; `None` => IL-level.
     srcmap: Option<SrcMap>,
@@ -202,7 +202,7 @@ pub struct WirelineBackend {
     pending_output: Option<String>,
 }
 
-impl WirelineBackend {
+impl WireHostBackend {
     /// Open `port`, HELLO the target, and require the debug capabilities. `image` is the
     /// baked program this backend launches (and relaunches on a restart).
     ///
@@ -218,7 +218,7 @@ impl WirelineBackend {
         Self::from_transport(WireTransport::Serial(SerialTransport::open(port, baud)?), image, timeout)
     }
 
-    /// Open a NATIVE-USB (driverless WinUSB) wireline target by `vid`/`pid` + an optional serial
+    /// Open a NATIVE-USB (driverless WinUSB) Lamella Link target by `vid`/`pid` + an optional serial
     /// substring (the picker key: an RP2350 reports its 16-hex chip id, the F427 `F427-0001`).
     ///
     /// # Errors
@@ -397,9 +397,192 @@ impl WirelineBackend {
             self.await_type(debug::DBG_ACK);
         }
     }
+
+    /// Requests one frame's variables (`DBG_LOCALS`, `frame_index` in the [`WireHostBackend::stack`]
+    /// order, 0 = innermost) and decodes the positional `DBG_VARS` reply into `(locals, args)`.
+    /// `None` on a wire failure/timeout; a target without `Capabilities::LOCALS` never gets asked
+    /// (the caller gates on the HELLO). Slot NAMES are the caller's to layer on (the srcmap's
+    /// `local_variables` slot -> name lane); the wire is positional by design.
+    pub fn locals(&mut self, frame_index: u16) -> Option<(Vec<WireValue>, Vec<WireValue>)> {
+        let seq = self.next_seq();
+        self.transport.send(debug::DBG_LOCALS, seq, &frame_index.to_le_bytes()).ok()?;
+        let frame = self.await_type(debug::DBG_VARS)?;
+        decode_vars(&frame.payload)
+    }
+
+    /// Expands one value's children (`DBG_EXPAND` with the STATELESS selector: the frame, the
+    /// root local/argument slot, and a path of child indices re-walked on-device from that
+    /// root) and decodes the `DBG_CHILDREN` reply into `(name, value)` pairs. The names are the
+    /// target's runtime type metadata (`fieldN`, `[i]`, a box's `value`). An unresolvable
+    /// selector (e.g. the target resumed since the slot was read) decodes as the empty list.
+    pub fn expand(
+        &mut self,
+        frame_index: u16,
+        root_is_argument: bool,
+        root_slot: u16,
+        path: &[u16],
+    ) -> Option<Vec<(String, WireValue)>> {
+        let mut payload = Vec::with_capacity(6 + path.len() * 2);
+        payload.extend_from_slice(&frame_index.to_le_bytes());
+        payload.push(u8::from(root_is_argument));
+        payload.extend_from_slice(&root_slot.to_le_bytes());
+        payload.push(path.len().min(255) as u8);
+        for step in path.iter().take(255) {
+            payload.extend_from_slice(&step.to_le_bytes());
+        }
+        let seq = self.next_seq();
+        self.transport.send(debug::DBG_EXPAND, seq, &payload).ok()?;
+        let frame = self.await_type(debug::DBG_CHILDREN)?;
+        decode_children(&frame.payload)
+    }
 }
 
-impl DebugBackend for WirelineBackend {
+/// One decoded `<val>` from a `DBG_VARS`/`DBG_CHILDREN` payload (the wire encoding is
+/// specified at [`lamella_runner::debug::val`]). Positional and shallow: an [`WireValue::Object`]
+/// or a non-empty [`WireValue::Struct`] drills down via [`WireHostBackend::expand`]; the
+/// `type_token` resolves to a display name through the host's metadata (0 = no recoverable
+/// type identity on the target).
+#[derive(Debug, Clone, PartialEq)]
+pub enum WireValue {
+    /// The null reference.
+    Null,
+    /// A 32-bit integer (also `bool`/`char`/small ints, widened on the target's stack).
+    Int32(i32),
+    /// A 64-bit integer.
+    Int64(i64),
+    /// A native-sized integer.
+    NativeInt(i64),
+    /// A `System.Double`.
+    Float(f64),
+    /// A `System.Single`.
+    Single(f32),
+    /// An object reference: the target heap handle (display/correlation only -- stale after
+    /// a resume) and the asm-folded type handle.
+    Object {
+        /// The target heap slot (an id, never a pointer).
+        handle: u32,
+        /// The asm-folded `TypeDef` handle, 0 when the target has no type identity for it.
+        type_token: u64,
+    },
+    /// An inline value-type instance: its field count (drill down for the fields).
+    Struct {
+        /// How many fields the instance carries.
+        field_count: u16,
+        /// Always 0 today: an inline struct carries no runtime type id on the target.
+        type_token: u64,
+    },
+    /// A managed pointer, as the wire's fixed-width location descriptor.
+    ByRef {
+        /// The location kind (see the wire spec's kind table).
+        kind: u8,
+        /// The first descriptor word (its meaning depends on `kind`).
+        a: u32,
+        /// The second descriptor word.
+        b: u32,
+        /// The third descriptor word.
+        c: u32,
+    },
+    /// A typed reference: the referent's type token plus the location descriptor.
+    TypedRef {
+        /// The asm-folded type handle of the referent.
+        type_token: u64,
+        /// The location kind.
+        kind: u8,
+        /// The first descriptor word.
+        a: u32,
+        /// The second descriptor word.
+        b: u32,
+        /// The third descriptor word.
+        c: u32,
+    },
+}
+
+/// Decodes one `<val>` at `*at`, advancing past it. `None` on a truncated/unknown payload.
+fn decode_value(payload: &[u8], at: &mut usize) -> Option<WireValue> {
+    use lamella_runner::debug::val;
+    let tag = *payload.get(*at)?;
+    *at += 1;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let bytes = payload.get(*at..*at + n)?;
+        *at += n;
+        Some(bytes)
+    };
+    Some(match tag {
+        val::NULL => WireValue::Null,
+        val::INT32 => WireValue::Int32(i32::from_le_bytes(take(4)?.try_into().ok()?)),
+        val::INT64 => WireValue::Int64(i64::from_le_bytes(take(8)?.try_into().ok()?)),
+        val::NATIVE_INT => WireValue::NativeInt(i64::from_le_bytes(take(8)?.try_into().ok()?)),
+        val::FLOAT => WireValue::Float(f64::from_le_bytes(take(8)?.try_into().ok()?)),
+        val::SINGLE => WireValue::Single(f32::from_le_bytes(take(4)?.try_into().ok()?)),
+        val::OBJECT => {
+            let handle = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            let type_token = u64::from_le_bytes(take(8)?.try_into().ok()?);
+            WireValue::Object { handle, type_token }
+        }
+        val::STRUCT => {
+            let field_count = u16::from_le_bytes(take(2)?.try_into().ok()?);
+            let type_token = u64::from_le_bytes(take(8)?.try_into().ok()?);
+            WireValue::Struct { field_count, type_token }
+        }
+        val::BYREF => {
+            let kind = *take(1)?.first()?;
+            let a = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            let b = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            let c = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            WireValue::ByRef { kind, a, b, c }
+        }
+        val::TYPED_REF => {
+            let type_token = u64::from_le_bytes(take(8)?.try_into().ok()?);
+            let kind = *take(1)?.first()?;
+            let a = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            let b = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            let c = u32::from_le_bytes(take(4)?.try_into().ok()?);
+            WireValue::TypedRef { type_token, kind, a, b, c }
+        }
+        _ => return None,
+    })
+}
+
+/// Decodes a `DBG_VARS` payload into `(locals, args)`. `None` on a malformed payload.
+#[must_use]
+pub fn decode_vars(payload: &[u8]) -> Option<(Vec<WireValue>, Vec<WireValue>)> {
+    let mut at = 0;
+    let mut count = |at: &mut usize| -> Option<usize> {
+        let bytes = payload.get(*at..*at + 2)?;
+        *at += 2;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
+    };
+    let locals_n = count(&mut at)?;
+    let mut locals = Vec::with_capacity(locals_n);
+    for _ in 0..locals_n {
+        locals.push(decode_value(payload, &mut at)?);
+    }
+    let args_n = count(&mut at)?;
+    let mut args = Vec::with_capacity(args_n);
+    for _ in 0..args_n {
+        args.push(decode_value(payload, &mut at)?);
+    }
+    Some((locals, args))
+}
+
+/// Decodes a `DBG_CHILDREN` payload into `(name, value)` pairs. `None` on a malformed payload.
+#[must_use]
+pub fn decode_children(payload: &[u8]) -> Option<Vec<(String, WireValue)>> {
+    let bytes = payload.get(0..2)?;
+    let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+    let mut at = 2;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = *payload.get(at)? as usize;
+        at += 1;
+        let name = String::from_utf8(payload.get(at..at + len)?.to_vec()).ok()?;
+        at += len;
+        out.push((name, decode_value(payload, &mut at)?));
+    }
+    Some(out)
+}
+
+impl DebugBackend for WireHostBackend {
     fn launch(&mut self) -> bool {
         if self.session_live {
             let seq = self.next_seq();
@@ -672,5 +855,60 @@ mod tests {
         p.chip_idcode = 0x2ba01477;
         let line = super::identity_line(&p).unwrap();
         assert!(line.contains("unrecognized board") && line.contains("0x2ba01477"), "{line}");
+    }
+
+    #[test]
+    fn wire_value_payloads_decode() {
+        use super::{WireValue, decode_children, decode_vars};
+
+        let mut vars = Vec::new();
+        vars.extend_from_slice(&4u16.to_le_bytes());
+        vars.push(0x01);
+        vars.extend_from_slice(&18i32.to_le_bytes());
+        vars.push(0x06);
+        vars.extend_from_slice(&5u32.to_le_bytes());
+        vars.extend_from_slice(&0x0002_0000_0001u64.to_le_bytes());
+        vars.push(0x07);
+        vars.extend_from_slice(&2u16.to_le_bytes());
+        vars.extend_from_slice(&0u64.to_le_bytes());
+        vars.push(0x00);
+        vars.extend_from_slice(&1u16.to_le_bytes());
+        vars.push(0x08);
+        vars.push(0);
+        vars.extend_from_slice(&0u32.to_le_bytes());
+        vars.extend_from_slice(&3u32.to_le_bytes());
+        vars.extend_from_slice(&0u32.to_le_bytes());
+        let (locals, args) = decode_vars(&vars).expect("the payload decodes");
+        assert_eq!(
+            locals,
+            vec![
+                WireValue::Int32(18),
+                WireValue::Object { handle: 5, type_token: 0x0002_0000_0001 },
+                WireValue::Struct { field_count: 2, type_token: 0 },
+                WireValue::Null,
+            ]
+        );
+        assert_eq!(args, vec![WireValue::ByRef { kind: 0, a: 0, b: 3, c: 0 }]);
+
+        let mut kids = Vec::new();
+        kids.extend_from_slice(&2u16.to_le_bytes());
+        kids.push(6);
+        kids.extend_from_slice(b"field0");
+        kids.push(0x02);
+        kids.extend_from_slice(&(-9i64).to_le_bytes());
+        kids.push(3);
+        kids.extend_from_slice(b"[1]");
+        kids.push(0x04);
+        kids.extend_from_slice(&1.5f64.to_le_bytes());
+        let children = decode_children(&kids).expect("the payload decodes");
+        assert_eq!(children[0], ("field0".to_string(), WireValue::Int64(-9)));
+        assert_eq!(children[1], ("[1]".to_string(), WireValue::Float(1.5)));
+
+        for cut in 0..vars.len() - 1 {
+            let _ = decode_vars(&vars[..cut]);
+        }
+        for cut in 0..kids.len() - 1 {
+            let _ = decode_children(&kids[..cut]);
+        }
     }
 }

@@ -6,15 +6,19 @@ use alloc::vec::Vec;
 
 use lamella_cil::{EhClause, EhKind, Instruction, MethodBodyImage, Opcode, Operand, OperandKind};
 use lamella_ir::{
-    BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, TypeHandle,
-    ValueId,
+    BasicBlock, BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, StaticOwner, Terminator,
+    TypeHandle, ValueId,
 };
 
 /// The reserved static-region offset of `g_exception_tag`: the no-GC exception model's
 /// in-flight tag word. A `throw` stores the thrown type's tag here; a catch dispatch loads it
 /// and compares; zero means no exception is propagating. User statics start past it (the
-/// resolver shifts them), so a throw/dispatch and an `ldsfld`/`stsfld` never alias.
-const G_EXCEPTION_TAG_OFFSET: u32 = 0;
+/// resolver's dense layout numbers slots from 1), so a throw/dispatch and an `ldsfld`/`stsfld`
+/// never alias -- which is what lets the arm32 OBJECT lowering split offset 0 out to the ONE
+/// VES-global `__lamella_eh_tag` symbol shared by every assembly, while any other offset
+/// addresses the assembly's OWN region symbol. If this stopped being the discriminator, a
+/// corlib throw and a program catch would use different words and cross-assembly EH would break.
+pub(crate) const G_EXCEPTION_TAG_OFFSET: u32 = 0;
 
 /// A delegate's field offsets within its heap object: `object _target` (a GC ref) first, then
 /// `IntPtr _methodPtr` (the `ldftn` code address), then `Delegate[] _invocationList` (a GC ref, null for
@@ -228,9 +232,20 @@ pub trait CallResolver {
         None
     }
 
-    /// The byte offset of a static field (an `ldsfld`/`stsfld` operand token) within the module's
-    /// static storage region. Defaults to `None`.
-    fn static_field_offset(&self, _operand: &Operand) -> Option<u32> {
+    /// A static field (an `ldsfld`/`stsfld` operand token) as `(owner, byte offset)`: whose
+    /// static region it lives in -- this assembly's own, or a referenced assembly's for a field
+    /// `MemberRef` -- and its offset within THAT region (the owner's dense slot numbering).
+    /// Defaults to `None`.
+    fn static_field_offset(&self, _operand: &Operand) -> Option<(StaticOwner, u32)> {
+        None
+    }
+
+    /// `(size, signed)` when the field is SUB-WORD -- `bool`/`byte` (1, false), `sbyte`
+    /// (1, true), `char`/`ushort` (2, false), `short` (2, true) -- so `ldfld`/`stfld` lower to
+    /// the width-exact [`Inst::FieldLoadNarrow`]/[`Inst::FieldStoreNarrow`]: such fields sit at
+    /// unaligned offsets in the natural layout, and a word-wide store would stomp the neighbors.
+    /// `None` for a word-or-wider field. Defaults to `None`.
+    fn field_narrow(&self, _operand: &Operand) -> Option<(u8, bool)> {
         None
     }
 
@@ -685,6 +700,16 @@ fn lower_with_source(
     let mut propagate_fixups: Vec<usize> = Vec::new();
 
     for (b, &(start, end)) in blocks.iter().enumerate() {
+        if b != 0 && preds[b].is_empty() && handler_clause[b].is_none() && trap_access[b].is_none() {
+            exit_locals[b] = alloc::vec![None; local_count];
+            mir_blocks.push(BasicBlock {
+                params: block_params[b].clone(),
+                insts: Vec::new(),
+                terminator: Some(Terminator::Unreachable),
+            });
+            source_map.push(Vec::new());
+            continue;
+        }
         let mut locals: Vec<Option<ValueId>> = if b == 0 {
             vec![None; local_count]
         } else if handler_clause[b].is_some() {
@@ -2305,7 +2330,18 @@ fn apply_value_op(
                     .ok_or(CilError::BadOperand)?;
             let field_ty = resolver.field_type(&inst.operand).unwrap_or(MirType::I32);
             let result = new_value(value_types, field_ty);
-            insts.push((result, Inst::FieldLoad { base, offset }));
+            match resolver.field_narrow(&inst.operand) {
+                Some((size, signed)) => insts.push((
+                    result,
+                    Inst::FieldLoadNarrow {
+                        base,
+                        offset,
+                        size,
+                        signed,
+                    },
+                )),
+                None => insts.push((result, Inst::FieldLoad { base, offset })),
+            }
             stack.push(result);
         }
         Opcode::Stfld => {
@@ -2322,14 +2358,25 @@ fn apply_value_op(
                     .field_offset(&inst.operand)
                     .ok_or(CilError::BadOperand)?;
             let placeholder = new_value(value_types, MirType::I32);
-            insts.push((
-                placeholder,
-                Inst::FieldStore {
-                    base,
-                    offset,
-                    value,
-                },
-            ));
+            match resolver.field_narrow(&inst.operand) {
+                Some((size, _)) => insts.push((
+                    placeholder,
+                    Inst::FieldStoreNarrow {
+                        base,
+                        offset,
+                        value,
+                        size,
+                    },
+                )),
+                None => insts.push((
+                    placeholder,
+                    Inst::FieldStore {
+                        base,
+                        offset,
+                        value,
+                    },
+                )),
+            }
         }
         Opcode::Newarr => {
             let element = resolver
@@ -2698,21 +2745,21 @@ fn apply_value_op(
             stack.push(result);
         }
         Opcode::Ldsfld => {
-            let offset = resolver
+            let (owner, offset) = resolver
                 .static_field_offset(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
             let field_ty = resolver.field_type(&inst.operand).unwrap_or(MirType::I32);
             let result = new_value(value_types, field_ty);
-            insts.push((result, Inst::StaticLoad { offset }));
+            insts.push((result, Inst::StaticLoad { owner, offset }));
             stack.push(result);
         }
         Opcode::Stsfld => {
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
-            let offset = resolver
+            let (owner, offset) = resolver
                 .static_field_offset(&inst.operand)
                 .ok_or(CilError::BadOperand)?;
             let placeholder = new_value(value_types, MirType::I32);
-            insts.push((placeholder, Inst::StaticStore { offset, value }));
+            insts.push((placeholder, Inst::StaticStore { owner, offset, value }));
         }
         Opcode::Newobj => {
             if let Some(tag) = resolver.exception_tag(&inst.operand) {
@@ -2861,6 +2908,7 @@ fn apply_value_op(
                         },
                     ));
                 }
+                CallTarget::Intrinsic(Intrinsic::ObjectCtor) => {}
                 CallTarget::Intrinsic(_) => {
                     return Err(CilError::UnresolvedCall);
                 }
@@ -2906,6 +2954,10 @@ fn apply_value_op(
                 },
             ));
             stack.push(result);
+        }
+        Opcode::Unbox => {
+            let object = stack.pop().ok_or(CilError::StackUnderflow)?;
+            stack.push(object);
         }
         Opcode::Castclass => {
             let object = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -3126,6 +3178,7 @@ fn synthesize_dispatch(
         dispatch_insts.push((
             loaded,
             Inst::StaticLoad {
+                owner: StaticOwner::Own,
                 offset: G_EXCEPTION_TAG_OFFSET,
             },
         ));
@@ -3187,6 +3240,7 @@ fn synthesize_dispatch(
         clear_insts.push((
             exception,
             Inst::StaticLoad {
+                owner: StaticOwner::Own,
                 offset: G_EXCEPTION_TAG_OFFSET,
             },
         ));
@@ -3202,6 +3256,7 @@ fn synthesize_dispatch(
         clear_insts.push((
             cleared,
             Inst::StaticStore {
+                owner: StaticOwner::Own,
                 offset: G_EXCEPTION_TAG_OFFSET,
                 value: zero,
             },
@@ -3283,6 +3338,7 @@ fn build_eh_throw(
     insts.push((
         stored,
         Inst::StaticStore {
+            owner: StaticOwner::Own,
             offset: G_EXCEPTION_TAG_OFFSET,
             value: tag,
         },
@@ -3364,6 +3420,7 @@ fn build_eh_leave(
     insts.push((
         in_flight,
         Inst::StaticLoad {
+            owner: StaticOwner::Own,
             offset: G_EXCEPTION_TAG_OFFSET,
         },
     ));
@@ -4325,6 +4382,7 @@ fn build_eh_endfinally(
     insts.push((
         in_flight,
         Inst::StaticLoad {
+            owner: StaticOwner::Own,
             offset: G_EXCEPTION_TAG_OFFSET,
         },
     ));
@@ -5761,6 +5819,38 @@ mod tests {
     }
 
     #[test]
+    fn a_predecessorless_block_lowers_to_an_unreachable_trap() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::BrtrueS, Operand::Target(4)),
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Ret),
+                Instruction::simple(Opcode::LdcI42),
+                Instruction::simple(Opcode::Ret),
+                Instruction::simple(Opcode::LdcI43),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let func = lower_method_typed(&body, &NoCalls, &[MirType::I32], &[])
+            .expect("a predecessorless trailing block lowers instead of UnsupportedControlFlow")
+            .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+        let trapped = func.blocks.iter().any(|blk| {
+            matches!(blk.terminator, Some(Terminator::Unreachable)) && blk.insts.is_empty()
+        });
+        assert!(
+            trapped,
+            "the predecessorless block must lower to an empty Unreachable trap"
+        );
+    }
+
+    #[test]
     fn lowers_string_op_equality_to_a_compare() {
         struct StringMock;
         impl CallResolver for StringMock {
@@ -6354,6 +6444,63 @@ mod tests {
                 "the lamella_gc_alloc address is emitted as the Alloc call target"
             );
         }
+    }
+
+    #[test]
+    fn lowers_box_unbox_ldobj() {
+        use lamella_token::Token;
+        struct BoxMock;
+        impl CallResolver for BoxMock {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                None
+            }
+            fn boxed_layout(&self, _: &Operand) -> Option<ReferenceLayout> {
+                Some(ReferenceLayout {
+                    handle: lamella_ir::TypeHandle(7),
+                    size: 4,
+                    reference_offsets: Vec::new(),
+                })
+            }
+            fn type_operand_mir(&self, _: &Operand) -> Option<MirType> {
+                Some(MirType::I32)
+            }
+        }
+        let int = Operand::Token(Token::new(0x01, 7));
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(40)),
+                Instruction::new(Opcode::Box, int.clone()),
+                Instruction::new(Opcode::Unbox, int.clone()),
+                Instruction::new(Opcode::Ldobj, int),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_debug_with(&body, &BoxMock).unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(insts.iter().any(|(_, i)| matches!(
+            i,
+            Inst::Alloc {
+                payload_size: 4,
+                ..
+            }
+        )));
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldStore { offset: 0, .. }))
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::FieldLoad { offset: 0, .. }))
+        );
+        assert_eq!(func.ret, Some(MirType::I32));
     }
 
     #[test]

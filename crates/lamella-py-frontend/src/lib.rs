@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod ast;
 pub mod compile;
+pub mod exc;
 pub mod lexer;
 pub mod lower;
 mod named_chars;

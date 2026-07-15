@@ -122,6 +122,7 @@ impl Session {
             let types_unit = CompilationUnit {
                 usings: Vec::new(),
                 members: parsed.types.clone(),
+                global_attributes: Vec::new(),
                 span: Span::empty_at(0),
                 defined_symbols: BTreeSet::new(),
             };
@@ -203,6 +204,7 @@ impl Session {
             let unit = CompilationUnit {
                 usings: Vec::new(),
                 members,
+                global_attributes: Vec::new(),
                 span: Span::empty_at(0),
                 defined_symbols: BTreeSet::new(),
             };

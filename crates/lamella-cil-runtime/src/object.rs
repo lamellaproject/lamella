@@ -16,6 +16,18 @@ use alloc::vec::Vec;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectRef(pub(crate) u32);
 
+impl ObjectRef {
+    /// The heap slot index, as a debugger's display/correlation id (the Lamella Link
+    /// `DBG_VARS` Object handle): two equal indices name the same object. Meaningful
+    /// only while execution is halted -- a compacting collection may renumber slots --
+    /// and never a pointer; on-device drill-down goes through the stateless
+    /// slot/field-path selector, not this id.
+    #[must_use]
+    pub fn index(self) -> u32 {
+        self.0
+    }
+}
+
 /// The in-heap representation of a `System.String`'s code units, chosen by the string
 /// storage encoding. UTF-16 by default (O(1) indexing, lone surrogates free); the
 /// `string-utf8` feature switches to UTF-8 (~half the size for ASCII text, at O(n) UTF-16
@@ -309,6 +321,25 @@ impl ArrayStorage {
     }
 }
 
+/// The type-DEFAULT value with the same shape as `value` -- the zero a boxed array slot takes on
+/// `Array.Clear`: `0` for a number, `null` for any reference, and a struct whose every field is
+/// recursively zeroed for a value type. A managed pointer / typed reference has no default (it
+/// cannot be an array element in verified IL), so it is left unchanged.
+fn zeroed_value(value: &Value) -> Value {
+    match value {
+        Value::Int32(_) => Value::Int32(0),
+        Value::Int64(_) => Value::Int64(0),
+        Value::NativeInt(_) => Value::NativeInt(0),
+        #[cfg(feature = "float")]
+        Value::Float(_) => Value::Float(0.0),
+        #[cfg(feature = "float")]
+        Value::Single(_) => Value::Single(0.0),
+        Value::Object(_) | Value::Null => Value::Null,
+        Value::Struct(fields) => Value::Struct(fields.iter().map(zeroed_value).collect()),
+        other => other.clone(),
+    }
+}
+
 /// Decodes one packed element (`chunk` is exactly the kind's width) to its stack value:
 /// sub-`int32` integers widen by the ELEMENT type's signedness (III.1.1.1), 32/64-bit
 /// integers load their raw bits, floats reinterpret their IEEE bytes. The float kinds
@@ -486,6 +517,14 @@ impl Heap {
     pub fn intern_string_le(&mut self, bytes: &[u8]) -> ObjectRef {
         let units = decode_le_units(bytes);
         self.intern_string(&units)
+    }
+
+    /// The canonical interned `System.String` for `chars` IF one already exists, without
+    /// allocating -- `String.IsInterned`'s "is this content in the pool" query (vs
+    /// [`Heap::intern_string`], which adds it).
+    #[must_use]
+    pub fn interned(&self, chars: &[u16]) -> Option<ObjectRef> {
+        self.intern.get(chars).copied()
     }
 
     /// The object `reference` names, if it is live.
@@ -912,6 +951,46 @@ impl Heap {
                     true
                 }
                 None => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Zeros the `[index, index + length)` element range of the array at `reference` to each
+    /// element's type DEFAULT (`Array.Clear`): a packed primitive array zeros its bytes; a boxed
+    /// array sets each slot to the zero of its current value's shape (`0` for a number, `null` for
+    /// a reference, a field-zeroed struct for a value type -- recursively). Handles reference AND
+    /// value-type element arrays uniformly, unlike a `SetValue(null)` loop. `false` if `reference`
+    /// is not a vector or the range is out of bounds (the managed wrapper bounds-checks first).
+    pub fn clear_range(&mut self, reference: ObjectRef, index: usize, length: usize) -> bool {
+        let end = match index.checked_add(length) {
+            Some(end) => end,
+            None => return false,
+        };
+        match self.objects.get_mut(reference.0 as usize) {
+            Some(Object::Array { store, .. }) => match store {
+                ArrayStorage::Packed { bytes, kind } => {
+                    let width = kind.byte_width();
+                    match (index.checked_mul(width), end.checked_mul(width)) {
+                        (Some(start), Some(stop)) => match bytes.get_mut(start..stop) {
+                            Some(slice) => {
+                                slice.fill(0);
+                                true
+                            }
+                            None => false,
+                        },
+                        _ => false,
+                    }
+                }
+                ArrayStorage::Values(elements) => {
+                    if end > elements.len() {
+                        return false;
+                    }
+                    for slot in &mut elements[index..end] {
+                        *slot = zeroed_value(slot);
+                    }
+                    true
+                }
             },
             _ => false,
         }

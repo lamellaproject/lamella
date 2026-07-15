@@ -17,6 +17,8 @@ pub mod module;
 pub mod net;
 pub mod object;
 pub mod reactor;
+pub mod serial;
+pub mod aead;
 pub mod tls;
 pub mod trap;
 pub mod value;
@@ -33,4 +35,4 @@ pub use module::{
 };
 pub use object::{ArrayStorage, Heap, Object, ObjectRef, PrimKind};
 pub use trap::Trap;
-pub use value::Value;
+pub use value::{Location, Value};

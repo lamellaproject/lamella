@@ -48,6 +48,15 @@ pub enum RelocKind {
     /// `--gc-sections` re-layout (a baked [`Encoder::data_word_diff`] would not). See
     /// [`Encoder::data_word_symbol_reldesc`].
     RelDesc32,
+    /// A 32-bit `B.W` unconditional branch (encoding T4): the SAME S:I1:I2:imm10:imm11 swizzle as
+    /// [`RelocKind::ThumbCall`], but hw2 bit 14 is clear (a branch, not a link) -- reach about
+    /// +/-16 MB. A far [`RelocKind::ThumbBranch11`] grows into this on a Mainline (wide-Thumb-2)
+    /// target, where ARMv6-M would instead need a literal-pool veneer.
+    ThumbBranch24,
+    /// A 32-bit `ADR.W` (`ADD`/`SUB Rd, PC, #imm12`, encoding T3/T2): the wide form of a PC-relative
+    /// address, reach about +/-4 KB from `Align(PC, 4)`. A far `adr` (a string blob) grows into this
+    /// on a Mainline target instead of hard-erroring at the ~1 KB [`RelocKind::ThumbLdrLit8`] reach.
+    ThumbAdrWide,
 }
 
 /// A reference to an externally defined symbol, left for the link step.
@@ -135,6 +144,12 @@ pub struct Encoder {
     /// `ThumbLdrLit8` targets -- an `adr` to a string or a multi-word descriptor -- are NOT listed
     /// here and are never split this way.
     pool_literals: Vec<u32>,
+    /// Whether the target is a Mainline (wide-Thumb-2) profile -- ARMv7-M / ARMv8-M Mainline, e.g. the
+    /// RP2350's Cortex-M33. When set, a far unconditional branch relaxes to `B.W` and a far `adr` to
+    /// `ADR.W` (see [`Encoder::relax`]) rather than the ARMv6-M literal-pool veneer. The object build
+    /// sets it from the target's [`crate::target::Profile`]; the default `false` keeps every existing
+    /// ARMv6-M path byte-identical.
+    wide: bool,
 }
 
 use crate::cond::Cond;
@@ -145,6 +160,13 @@ impl Encoder {
     #[must_use]
     pub fn new() -> Encoder {
         Encoder::default()
+    }
+
+    /// Marks the target as a Mainline (wide-Thumb-2) profile, so [`Encoder::finish`] relaxes a far
+    /// unconditional branch to `B.W` and a far `adr` to `ADR.W` instead of hard-erroring at the
+    /// ARMv6-M reach. Call before emitting; leave it off (the default) for an ARMv6-M target.
+    pub fn set_wide_thumb2(&mut self, enabled: bool) {
+        self.wide = enabled;
     }
 
     /// The current byte offset, i.e. where the next emitted byte lands.
@@ -755,6 +777,17 @@ impl Encoder {
         Ok(())
     }
 
+    /// `ADD Rdm, SP, Rdm` -- add the stack pointer into a LOW register in place. 16-bit encoding
+    /// T1 of ADD (SP plus register) (A6.7.4): `0100 0100 DM 1101 Rdm` with `Rm = SP`. The
+    /// big-frame slot addressing builds a byte offset in `rdm` and rebases it onto SP with this.
+    pub fn add_sp_reg(&mut self, rdm: Reg) -> Result<(), AssembleError> {
+        if !rdm.is_low() {
+            return Err(AssembleError::UnencodableOperand);
+        }
+        self.emit_u16(0x4468 | u16::from(rdm.number()));
+        Ok(())
+    }
+
     /// `SUB SP, SP, #imm` -- lower the stack pointer (reserve a frame). 16-bit
     /// encoding T1 (SUB (SP minus immediate), A6.7.67); `imm` a multiple of 4 in
     /// 0..=508.
@@ -979,9 +1012,23 @@ impl Encoder {
     /// `Abs32` reloc the link step fills), for a function-pointer or type-descriptor pool entry. The
     /// word is islandable too; islanding replicates the relocation onto the relocated copy.
     pub fn pool_word_symbol(&mut self, label: Label, symbol: u32) {
+        self.pool_word_symbol_addend(label, symbol, 0);
+    }
+
+    /// Like [`Encoder::pool_word_symbol`] but the word resolves to `symbol + addend` -- a static
+    /// field's slot within its assembly's region symbol, or any other offset-from-symbol datum.
+    /// Islanding copies the whole relocation, addend included.
+    pub fn pool_word_symbol_addend(&mut self, label: Label, symbol: u32, addend: i32) {
         self.bind_label(label);
         self.pool_literals.push(label.0);
-        self.data_word_symbol(symbol);
+        let at = self.position();
+        self.relocs.push(Reloc {
+            at,
+            kind: RelocKind::Abs32,
+            symbol,
+            addend,
+        });
+        self.bytes.extend_from_slice(&[0; 4]);
     }
 
     /// Inserts `insert` bytes at byte offset `at`, shifting every later reference -- any bound
@@ -1025,11 +1072,74 @@ impl Encoder {
             if self.widen_far_conditional_branch()? {
                 continue;
             }
+            if self.wide && self.widen_far_unconditional_branch()? {
+                continue;
+            }
+            if self.wide && self.widen_far_adr()? {
+                continue;
+            }
             if self.island_far_literal()? {
                 continue;
             }
             return Ok(());
         }
+    }
+
+    /// Grows the first far unconditional branch (`ThumbBranch11`, its +/-2 KB reach exceeded) into a
+    /// 32-bit `B.W` (+/-16 MB) -- a Mainline-only relaxation. Splices the second halfword and re-kinds
+    /// the fixup; the caller re-checks from the top because the spliced halfword shifts later refs.
+    /// (An ARMv6-M target, which has no wide branch, would instead need a literal-pool veneer.)
+    fn widen_far_unconditional_branch(&mut self) -> Result<bool, AssembleError> {
+        for idx in 0..self.fixups.len() {
+            let (at, kind, label_id) = self.fixups[idx];
+            if kind != RelocKind::ThumbBranch11 {
+                continue;
+            }
+            let target = match self.labels.get(label_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+            };
+            let offset = i64::from(target) - (i64::from(at) + 4);
+            if (-2048..=2046).contains(&offset) && offset % 2 == 0 {
+                continue;
+            }
+            self.splice_in(at + 2, &[0x00, 0x00, 0x00, 0xBF]);
+            self.fixups[idx].1 = RelocKind::ThumbBranch24;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Grows the first far `adr` (a `ThumbLdrLit8` fixup whose instruction is an `ADR`, its ~1 KB
+    /// reach exceeded) into a 32-bit `ADR.W` (+/-4 KB) -- a Mainline-only relaxation, the alternative
+    /// to blob-islanding a far string on a v6-M target. Only the `ADR` opcode (`0xA0xx`) grows here; a
+    /// pool WORD (an `LDR` literal, `0x48xx`) still relocates through [`Encoder::island_far_literal`].
+    fn widen_far_adr(&mut self) -> Result<bool, AssembleError> {
+        for idx in 0..self.fixups.len() {
+            let (at, kind, label_id) = self.fixups[idx];
+            if kind != RelocKind::ThumbLdrLit8 {
+                continue;
+            }
+            let is_adr = self
+                .bytes
+                .get(at as usize..at as usize + 2)
+                .is_some_and(|b| u16::from_le_bytes([b[0], b[1]]) & 0xF800 == 0xA000);
+            if !is_adr {
+                continue;
+            }
+            let target = match self.labels.get(label_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+            };
+            let pc = (at + 4) & !3u32;
+            if target >= pc && target - pc <= 1020 && (target - pc) % 4 == 0 {
+                continue;
+            }
+            self.splice_in(at + 2, &[0x00, 0x00, 0x00, 0xBF]);
+            self.fixups[idx].1 = RelocKind::ThumbAdrWide;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Grows the first conditional branch whose +/-256-byte reach is exceeded into the two-halfword
@@ -1194,6 +1304,47 @@ impl Encoder {
                     let j2 = (!(i2 ^ s)) & 1;
                     let hw1 = 0xF000 | (s << 10) | imm10;
                     let hw2 = 0xD000 | (j1 << 13) | (j2 << 11) | imm11;
+                    if let Some(slot) = self.bytes.get_mut(site..site + 4) {
+                        slot[0..2].copy_from_slice(&hw1.to_le_bytes());
+                        slot[2..4].copy_from_slice(&hw2.to_le_bytes());
+                    }
+                }
+                RelocKind::ThumbBranch24 => {
+                    let off = i64::from(target) - (i64::from(*at) + 4);
+                    if off % 2 != 0 || !(-16_777_216..=16_777_214).contains(&off) {
+                        return Err(AssembleError::BranchOutOfRange { at: *at });
+                    }
+                    let s = ((off >> 24) & 1) as u16;
+                    let i1 = ((off >> 23) & 1) as u16;
+                    let i2 = ((off >> 22) & 1) as u16;
+                    let imm10 = ((off >> 12) & 0x3FF) as u16;
+                    let imm11 = ((off >> 1) & 0x7FF) as u16;
+                    let j1 = (!(i1 ^ s)) & 1;
+                    let j2 = (!(i2 ^ s)) & 1;
+                    let hw1 = 0xF000 | (s << 10) | imm10;
+                    let hw2 = 0x9000 | (j1 << 13) | (j2 << 11) | imm11;
+                    if let Some(slot) = self.bytes.get_mut(site..site + 4) {
+                        slot[0..2].copy_from_slice(&hw1.to_le_bytes());
+                        slot[2..4].copy_from_slice(&hw2.to_le_bytes());
+                    }
+                }
+                RelocKind::ThumbAdrWide => {
+                    let rd = self
+                        .bytes
+                        .get(site..site + 2)
+                        .map_or(0, |b| (u16::from_le_bytes([b[0], b[1]]) >> 8) & 7);
+                    let pc = i64::from((*at + 4) & !3u32);
+                    let delta = i64::from(target) - pc;
+                    let (add, mag) = if delta >= 0 { (true, delta) } else { (false, -delta) };
+                    if !(0..=4095).contains(&mag) {
+                        return Err(AssembleError::BranchOutOfRange { at: *at });
+                    }
+                    let mag = mag as u16;
+                    let i = (mag >> 11) & 1;
+                    let imm3 = (mag >> 8) & 7;
+                    let imm8 = mag & 0xFF;
+                    let hw1 = (if add { 0xF20F } else { 0xF2AF }) | (i << 10);
+                    let hw2 = (imm3 << 12) | (rd << 8) | imm8;
                     if let Some(slot) = self.bytes.get_mut(site..site + 4) {
                         slot[0..2].copy_from_slice(&hw1.to_le_bytes());
                         slot[2..4].copy_from_slice(&hw2.to_le_bytes());
@@ -1585,6 +1736,116 @@ mod tests {
     }
 
     #[test]
+    fn a_far_unconditional_branch_widens_to_bw_on_a_wide_target() {
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(true);
+        let target = enc.new_label();
+        enc.b(target);
+        for _ in 0..1500 {
+            enc.nop();
+        }
+        enc.bind_label(target);
+        enc.nop();
+        let out = enc
+            .finish()
+            .expect("a far unconditional branch widens to B.W on a wide target");
+        let hw1 = u16::from_le_bytes([out.bytes[0], out.bytes[1]]);
+        let hw2 = u16::from_le_bytes([out.bytes[2], out.bytes[3]]);
+        assert_eq!(hw1 & 0xF800, 0xF000, "B.W first halfword");
+        assert_eq!(hw2 & 0xD000, 0x9000, "B.W second halfword (a branch, not the BL 0xD000)");
+        assert_eq!((hw1 >> 10) & 1, 0, "a forward branch has S clear");
+        let i1 = 1 - u32::from((hw2 >> 13) & 1);
+        let i2 = 1 - u32::from((hw2 >> 11) & 1);
+        let off = (i1 << 23) | (i2 << 22) | (u32::from(hw1 & 0x3FF) << 12) | (u32::from(hw2 & 0x7FF) << 1);
+        assert_eq!(4 + off, out.label_position(target).unwrap(), "B.W lands on the target");
+    }
+
+    #[test]
+    fn a_far_adr_widens_to_adrw_on_a_wide_target() {
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(true);
+        let blob = enc.new_label();
+        enc.adr(Reg::R0, blob).unwrap();
+        for _ in 0..800 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.bind_label(blob);
+        enc.emit_word(0x1234_5678);
+        let out = enc
+            .finish()
+            .expect("a far adr widens to ADR.W on a wide target");
+        let hw1 = u16::from_le_bytes([out.bytes[0], out.bytes[1]]);
+        let hw2 = u16::from_le_bytes([out.bytes[2], out.bytes[3]]);
+        assert_eq!(hw1 & 0xFBFF, 0xF20F, "ADR.W ADD form (Rd, PC, #imm)");
+        assert_eq!((hw2 >> 8) & 0xF, 0, "ADR.W targets R0");
+        let imm = (u32::from((hw1 >> 10) & 1) << 11) | (u32::from((hw2 >> 12) & 7) << 8) | u32::from(hw2 & 0xFF);
+        assert_eq!(4 + imm, out.label_position(blob).unwrap(), "ADR.W points at the blob");
+    }
+
+    #[test]
+    fn a_far_unconditional_branch_hard_errors_without_the_wide_capability() {
+        let mut enc = Encoder::new();
+        let target = enc.new_label();
+        enc.b(target);
+        for _ in 0..1500 {
+            enc.nop();
+        }
+        enc.bind_label(target);
+        enc.nop();
+        assert!(matches!(
+            enc.finish(),
+            Err(AssembleError::BranchOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn a_near_branch_encodes_identically_with_or_without_the_wide_capability() {
+        let build = |wide: bool| {
+            let mut enc = Encoder::new();
+            enc.set_wide_thumb2(wide);
+            let t = enc.new_label();
+            enc.b(t);
+            enc.nop();
+            enc.bind_label(t);
+            enc.nop();
+            enc.finish().unwrap().bytes
+        };
+        assert_eq!(
+            build(false),
+            build(true),
+            "a near branch encodes identically with or without the wide capability"
+        );
+    }
+
+    #[test]
+    fn a_widening_between_a_load_and_its_pool_word_keeps_the_word_aligned() {
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(true);
+        let pool = enc.new_label();
+        let far = enc.new_label();
+        enc.ldr_literal(Reg::R0, pool).unwrap();
+        enc.b(far);
+        enc.align_to_word();
+        enc.pool_word(pool, 0xCAFE_F00D);
+        for _ in 0..1500 {
+            enc.nop();
+        }
+        enc.bind_label(far);
+        enc.nop();
+        let out = enc
+            .finish()
+            .expect("a widening between a load and its in-reach word keeps the word 4-aligned");
+        let pos = out.label_position(pool).unwrap() as usize;
+        assert_eq!(
+            &out.bytes[pos..pos + 4],
+            &0xCAFE_F00Du32.to_le_bytes(),
+            "the load's pool word is intact past the widened branch"
+        );
+        assert_eq!(pos % 4, 0, "the pool word stayed 4-aligned across the widening");
+    }
+
+    #[test]
     fn relaxed_positions_returns_bound_offsets_when_nothing_relaxes() {
         let mut enc = Encoder::new();
         let a = enc.new_label();
@@ -1639,6 +1900,18 @@ mod tests {
         assert_eq!(one.as_bytes(), &[0xFD, 0xB0]);
         assert_eq!(
             Encoder::new().sub_sp_far(510),
+            Err(AssembleError::UnencodableOperand)
+        );
+    }
+
+    #[test]
+    fn add_sp_reg_encodes_the_sp_plus_register_form() {
+        let mut enc = Encoder::new();
+        enc.add_sp_reg(Reg::R0).unwrap();
+        enc.add_sp_reg(Reg::R7).unwrap();
+        assert_eq!(enc.as_bytes(), &[0x68, 0x44, 0x6F, 0x44]);
+        assert_eq!(
+            Encoder::new().add_sp_reg(Reg::R8),
             Err(AssembleError::UnencodableOperand)
         );
     }

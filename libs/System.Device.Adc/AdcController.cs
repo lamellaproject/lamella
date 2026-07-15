@@ -1,4 +1,4 @@
-// Lamella System.Device.Adc -- a separate assembly matching the Windows.Devices.Adc /
+// System.Device.Adc -- third-party-compatibility ADC surface shaped after nanoFramework's Windows.Devices.Adc (dotnet/iot ships no core ADC class), shipped as its own assembly.
 namespace System.Device.Adc
 {
     /// <summary>Represents an analog-to-digital converter (ADC) controller on the system.</summary>
@@ -8,7 +8,6 @@ namespace System.Device.Adc
         private readonly bool[] _open;
         private AdcChannelMode _channelMode;
 
-        /// <summary>Creates a controller over <paramref name="driver"/>.</summary>
         public AdcController(AdcDriver driver)
         {
             _driver = driver;
@@ -16,16 +15,12 @@ namespace System.Device.Adc
             _channelMode = AdcChannelMode.SingleEnded;
         }
 
-        /// <summary>The number of channels available on the ADC controller.</summary>
         public int ChannelCount { get { return _driver.ChannelCount; } }
 
-        /// <summary>The resolution of the controller as the number of bits it has.</summary>
         public int ResolutionInBits { get { return _driver.ResolutionInBits; } }
 
-        /// <summary>The minimum value the controller can report.</summary>
         public int MinValue { get { return _driver.MinValue; } }
 
-        /// <summary>The maximum value that the controller can report.</summary>
         public int MaxValue { get { return _driver.MaxValue; } }
 
         /// <summary>The channel mode for the ADC controller. Setting a mode the hardware does
@@ -44,7 +39,6 @@ namespace System.Device.Adc
             }
         }
 
-        /// <summary>Verifies that the specified channel mode is supported by the controller.</summary>
         public bool IsChannelModeSupported(AdcChannelMode channelMode)
         {
             return _driver.IsChannelModeSupported(channelMode);

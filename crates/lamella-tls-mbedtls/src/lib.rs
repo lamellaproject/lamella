@@ -12,6 +12,9 @@
 
 extern crate alloc;
 
+pub mod aead;
+pub use aead::MbedAead;
+
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -19,7 +22,8 @@ use core::ffi::{c_char, c_int, c_void};
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use lamella_cil_runtime::tls::{
-    TlsBackend, TlsConfigHandle, TlsHandle, TlsStack, TlsState, VerifyMode,
+    ClockPolicy, TlsBackend, TlsConfigHandle, TlsHandle, TlsStack, TlsState, TlsVersion,
+    TlsVersionRange, VerifyMode, session_flag,
 };
 
 unsafe extern "C" {
@@ -28,12 +32,15 @@ unsafe extern "C" {
         ca_len: usize,
         hostname: *const c_char,
         verify_mode: c_int,
+        skip_dates: c_int,
         user: *mut c_void,
     ) -> *mut c_void;
     fn lam_tls_handshake(session: *mut c_void) -> c_int;
     fn lam_tls_read(session: *mut c_void, buf: *mut u8, len: usize) -> c_int;
     fn lam_tls_write(session: *mut c_void, buf: *const u8, len: usize) -> c_int;
     fn lam_tls_peer_cert(session: *mut c_void, out: *mut u8, out_len: usize) -> c_int;
+    fn lam_tls_dates_skipped(session: *mut c_void) -> c_int;
+    fn lam_tls_report_flags(session: *mut c_void) -> c_int;
     fn lam_tls_close(session: *mut c_void);
 }
 
@@ -57,26 +64,85 @@ pub fn set_entropy_source(source: fn(&mut [u8]) -> bool) {
 static TIME_SOURCE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Registers the wall clock certificate validity WINDOWS are checked against (the current
-/// time in Unix seconds). Without one the clock reads 0 (the epoch): every real certificate
-/// then pre-dates "now", so a REQUIRED (pinned-cert / system-root) verify fails "not yet
-/// valid" LOUDLY rather than trusting an unchecked window -- fail closed. A device points
-/// this at an RTC, an SNTP-synced counter, or a baked build-time floor; the accept-any
-/// bench path (VERIFY_NONE) never consults it. Optional: a client that only uses accept-any
-/// need not register a clock.
+/// time in Unix seconds; 0 = "never set"). Point this at the SAME clock the managed
+/// `SystemClock` manages -- an RTC, a synced counter, or a baked build-time floor -- because
+/// two things read it and must agree: the engine's date check, and the default
+/// [`ClockPolicy::Adaptive`] resolution ("is the clock set" = a nonzero reading at session
+/// creation). Without a source the clock reads 0: under the default policy the validity
+/// window is tolerated and RECORDED (the clockless leap-of-faith rung); under a forced
+/// [`ClockPolicy::Require`] every real certificate pre-dates "now", so a REQUIRED
+/// (pinned-cert / system-root) verify fails "not yet valid" LOUDLY -- fail closed. The
+/// accept-any bench path (VERIFY_NONE) never consults it.
 pub fn set_time_source(source: fn() -> u64) {
     TIME_SOURCE.store(source as *mut (), Ordering::Release);
+}
+
+/// The registered system-root lookup (`None` until the firmware provides one). Stored as a raw
+/// fn pointer, like the entropy/time sources, so registration works from a bare-metal boot path.
+/// The signature returns the `index`-th bundled root whose subject DN equals the given issuer DN.
+static SYSTEM_ROOTS: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Registers the bundled system root store the `SystemRoots` verify mode trusts. `lookup(issuer,
+/// index)` returns the `index`-th root DER whose subject DN equals `issuer` (a child certificate's
+/// raw issuer Name), or `None` when there are no more matches -- exactly `lamella_tls_roots::
+/// roots_for_issuer(issuer).nth(index)`. Until this is registered `SystemRoots` fails at
+/// configuration (a device carries no ambient platform store); a firmware that wants system-root
+/// trust links the `lamella-tls-roots` bundle and registers its lookup here, once at boot.
+pub fn set_system_roots(lookup: fn(&[u8], usize) -> Option<&'static [u8]>) {
+    SYSTEM_ROOTS.store(lookup as *mut (), Ordering::Release);
+}
+
+/// Whether a system-root store has been registered.
+fn system_roots_available() -> bool {
+    !SYSTEM_ROOTS.load(Ordering::Acquire).is_null()
+}
+
+/// C hook (`csrc/lamella_tls_shim.c` -> the lazy `lam_ca_cb`): the `index`-th bundled root whose
+/// subject DN equals the `issuer` DN, or null when no more match. `*out_len` receives the DER
+/// length.
+///
+/// Safety: mbedTLS passes a valid `issuer`/`issuer_len` pair and a writable `out_len`.
+#[unsafe(no_mangle)]
+extern "C" fn lamella_tls_root_der(
+    issuer: *const u8,
+    issuer_len: usize,
+    index: usize,
+    out_len: *mut usize,
+) -> *const u8 {
+    let lookup = SYSTEM_ROOTS.load(Ordering::Acquire);
+    if lookup.is_null() || issuer.is_null() || out_len.is_null() {
+        return core::ptr::null();
+    }
+    let lookup: fn(&[u8], usize) -> Option<&'static [u8]> =
+        unsafe { core::mem::transmute(lookup) };
+    let issuer_dn = unsafe { core::slice::from_raw_parts(issuer, issuer_len) };
+    match lookup(issuer_dn, index) {
+        Some(der) => {
+            unsafe { *out_len = der.len() };
+            der.as_ptr()
+        }
+        None => core::ptr::null(),
+    }
+}
+
+/// The current wall clock in Unix seconds from the registered source, or 0 (the epoch --
+/// "never set") without one. BOTH clock consumers read this one value -- the C engine's
+/// date check ([`lamella_tls_time`]) and the [`ClockPolicy::Adaptive`] resolution at
+/// session creation -- so the skip decision and the window check can never disagree.
+fn wall_clock_seconds() -> u64 {
+    let source = TIME_SOURCE.load(Ordering::Acquire);
+    if source.is_null() {
+        return 0;
+    }
+    let source: fn() -> u64 = unsafe { core::mem::transmute(source) };
+    source()
 }
 
 /// C hook (`csrc/lamella_tls_shim.c` -> `lamella_mbedtls_time`): the current time in Unix
 /// seconds, or 0 when no source is registered.
 #[unsafe(no_mangle)]
 extern "C" fn lamella_tls_time() -> i64 {
-    let source = TIME_SOURCE.load(Ordering::Acquire);
-    if source.is_null() {
-        return 0;
-    }
-    let source: fn() -> u64 = unsafe { core::mem::transmute(source) };
-    source() as i64
+    wall_clock_seconds() as i64
 }
 
 /// C hook (`csrc/lamella_tls_shim.c` -> `mbedtls_hardware_poll`): fills `output` from the
@@ -96,11 +162,13 @@ extern "C" fn lamella_entropy_poll(output: *mut u8, len: usize) -> c_int {
 
 
 /// The pool size. On a device: one session's record buffers (16 KiB in + 4 KiB out) +
-/// ssl/x509 state + bignum churn peak, with working headroom -- an embedder wanting
-/// concurrent sessions grows this and its RAM budget together. On a HOST the pool is
-/// roomier: the conformance tests run sessions in parallel test threads, and host RAM is
+/// ssl/x509 state + bignum churn peak, with working headroom for a FULL chain
+/// verification -- parsing the peer's chain and the matching root plus the ECDSA/RSA
+/// verify bignums peaks well past the AcceptAny bench's footprint. An embedder wanting 
+/// concurrent sessions grows this and its RAM budget together. On a HOST the pool is 
+/// roomier: the conformance tests run sessions in parallel test threads, and host RAM is 
 /// not the scarce resource the pool exists to discipline.
-const POOL_BYTES: usize = if cfg!(target_os = "none") { 32 * 1024 } else { 128 * 1024 };
+const POOL_BYTES: usize = if cfg!(target_os = "none") { 48 * 1024 } else { 128 * 1024 };
 
 /// Block granularity and payload alignment: every block size is a multiple of this, and
 /// headers are one unit so payloads stay aligned.
@@ -295,6 +363,9 @@ struct Session {
     established: bool,
     closed: bool,
     failed: bool,
+    /// Whether this is a [`VerifyMode::Report`] session, so `session_flags` reads the
+    /// post-handshake verification findings (`lam_tls_report_flags`) too.
+    report: bool,
 }
 
 /// The device TLS engine. `configs`/`sessions` are append-only tables; a handle is an
@@ -303,6 +374,14 @@ struct Session {
 pub struct MbedTlsDevice {
     configs: Vec<StoredConfig>,
     sessions: Vec<Option<Session>>,
+    /// The `surface.net.tls.clock` policy (default [`ClockPolicy::Adaptive`]: full window
+    /// validation whenever the registered time source reads nonzero, tolerate-and-record only
+    /// while it was never set). The firmware sets a FORCE from its build knob when it wants the
+    /// non-adaptive behavior; the resolution is taken per session, at creation.
+    clock_policy: ClockPolicy,
+    /// The `surface.net.tls.version` pin (default: the whole modern range). This engine is compiled
+    /// TLS 1.2-only, so a pin that DEMANDS a newer version is rejected loudly at configuration.
+    version_range: TlsVersionRange,
 }
 
 impl core::fmt::Debug for MbedTlsDevice {
@@ -320,6 +399,24 @@ impl MbedTlsDevice {
     #[must_use]
     pub fn new() -> MbedTlsDevice {
         MbedTlsDevice::default()
+    }
+
+    /// Sets the `surface.net.tls.clock` policy the firmware selected at build (default
+    /// [`ClockPolicy::Adaptive`]: sessions harden to full window validation the moment the
+    /// registered time source reads a real clock -- an RTC, a seed, or a synced `SystemClock` --
+    /// and tolerate-and-record only while it was never set). [`ClockPolicy::Require`] forces
+    /// fail-closed even clockless; [`ClockPolicy::SkipWithWarning`] forces the recorded date
+    /// skip even with a clock (testing).
+    pub fn set_clock_policy(&mut self, policy: ClockPolicy) {
+        self.clock_policy = policy;
+    }
+
+    /// Sets the `surface.net.tls.version` pin (default: the whole modern range). This engine is
+    /// TLS 1.2-only; a pin whose whole window is newer than TLS 1.2 makes every client
+    /// configuration fail loudly (there is no supported version to negotiate). A pin that merely
+    /// disallows a version this engine never offered is inert.
+    pub fn set_version_range(&mut self, range: TlsVersionRange) {
+        self.version_range = range;
     }
 
     fn session_mut(&mut self, tls: TlsHandle) -> Option<&mut Session> {
@@ -350,8 +447,16 @@ impl TlsBackend for MbedTlsDevice {
         if ENTROPY_SOURCE.load(Ordering::Acquire).is_null() {
             return None;
         }
+        if !self.version_range.is_valid() || !self.version_range.admits(TlsVersion::Tls12) {
+            return None;
+        }
         let roots = match verify {
-            VerifyMode::SystemRoots => return None,
+            VerifyMode::SystemRoots => {
+                if !system_roots_available() {
+                    return None;
+                }
+                None
+            }
             VerifyMode::PinnedCert => {
                 let pem = roots_pem?;
                 if pem.is_empty() {
@@ -362,6 +467,11 @@ impl TlsBackend for MbedTlsDevice {
                 Some(bundle)
             }
             VerifyMode::AcceptAny => None,
+            VerifyMode::Report => roots_pem.filter(|pem| !pem.is_empty()).map(|pem| {
+                let mut bundle = pem.to_vec();
+                bundle.push(0);
+                bundle
+            }),
         };
         self.configs.push(StoredConfig { verify, roots });
         Some((self.configs.len() - 1) as TlsConfigHandle)
@@ -380,6 +490,7 @@ impl TlsBackend for MbedTlsDevice {
 
     fn client_new(&mut self, config: TlsConfigHandle, hostname: &str) -> Option<TlsHandle> {
         let stored = self.configs.get(config as usize)?;
+        let stored_verify = stored.verify;
         if hostname.as_bytes().contains(&0) {
             return None;
         }
@@ -390,8 +501,16 @@ impl TlsBackend for MbedTlsDevice {
         let verify_mode: c_int = match stored.verify {
             VerifyMode::PinnedCert => 0,
             VerifyMode::AcceptAny => 1,
-            VerifyMode::SystemRoots => return None,
+            VerifyMode::SystemRoots => 2,
+            VerifyMode::Report => 3,
         };
+        let tolerate_window = match self.clock_policy {
+            ClockPolicy::Adaptive => wall_clock_seconds() == 0,
+            ClockPolicy::Require => false,
+            ClockPolicy::SkipWithWarning => true,
+        };
+        let skip_dates: c_int =
+            c_int::from(tolerate_window && stored.verify != VerifyMode::AcceptAny);
         let (ca_ptr, ca_len) = match &stored.roots {
             Some(bundle) => (bundle.as_ptr(), bundle.len()),
             None => (core::ptr::null(), 0),
@@ -407,6 +526,7 @@ impl TlsBackend for MbedTlsDevice {
                 ca_len,
                 hostname_z.as_ptr().cast::<c_char>(),
                 verify_mode,
+                skip_dates,
                 bio.cast::<c_void>(),
             )
         };
@@ -420,6 +540,7 @@ impl TlsBackend for MbedTlsDevice {
             established: false,
             closed: false,
             failed: false,
+            report: stored_verify == VerifyMode::Report,
         }));
         Some((self.sessions.len() - 1) as TlsHandle)
     }
@@ -527,6 +648,21 @@ impl TlsBackend for MbedTlsDevice {
         };
         let len = unsafe { lam_tls_peer_cert(session.shim, out.as_mut_ptr(), out.len()) };
         len.max(0) as usize
+    }
+
+    fn session_flags(&mut self, tls: TlsHandle) -> i32 {
+        let Some(session) = self.session_mut(tls) else {
+            return 0;
+        };
+        let mut flags = if unsafe { lam_tls_dates_skipped(session.shim) } != 0 {
+            session_flag::DATES_UNCHECKED
+        } else {
+            0
+        };
+        if session.report && session.established {
+            flags |= unsafe { lam_tls_report_flags(session.shim) };
+        }
+        flags
     }
 
     fn close(&mut self, tls: TlsHandle) {

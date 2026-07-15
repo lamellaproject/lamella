@@ -1,5 +1,5 @@
 //! In-page SOURCE MAP (feature `bake`): given the assemblies + the app's Portable PDB, return the
-//! `method_id -> source line` table the WIRELINE DEBUGGER needs, keyed by the SAME `method_id` the deployed
+//! `method_id -> source line` table the LAMELLA LINK DEBUGGER needs, keyed by the SAME `method_id` the deployed
 //! baked image reports on the wire. It loads + trims EXACTLY as `bake` does (so the numbering matches the
 //! image the device runs) and reads the PDB via `lamella_metadata::PortablePdb` through the loader's own
 //! token binding (`Module::resolve`) -- the mapping `lamella-dap`'s `InterpreterBackend::with_pdb` builds.

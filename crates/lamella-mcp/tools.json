@@ -39,13 +39,13 @@
     {
       "name": "lamella_identify_device",
       "title": "Identify a board",
-      "description": "HELLO a wireline target and return what it is: board name (from its board_model), chip IDCODE + device id when the firmware reports them, negotiated capabilities, and the resolved chip SKU. Read-only -- does not deploy or run anything.",
+      "description": "HELLO a Lamella Link target and return what it is: board name (from its board_model), chip IDCODE + device id when the firmware reports them, negotiated capabilities, and the resolved chip SKU. Read-only -- does not deploy or run anything.",
       "inputSchema": { "type": "object", "properties": { "target": { "type": "string", "description": "COM port (e.g. 'COM9') or 'usb'[':'<serial>]." } }, "required": ["target"] },
       "annotations": { "readOnlyHint": true, "openWorldHint": true }
     },
     {
       "name": "lamella_run_on_device",
-      "title": "Run on device (wireline interpreter)",
+      "title": "Run on device (Lamella Link interpreter)",
       "description": "Compile a submission and run it ON THE DEVICE over Lamella Link -- the target runs the CIL on its interpreter and returns the output. Transient (nothing is flashed). Use this to exercise real hardware (GPIO, peripherals) without a persistent deploy.",
       "inputSchema": { "type": "object", "properties": { "target": { "type": "string", "description": "COM port or usb target." }, "code": { "type": "string", "description": "The C# program source." } }, "required": ["target", "code"] },
       "annotations": { "readOnlyHint": false, "destructiveHint": false, "openWorldHint": true }
@@ -109,7 +109,7 @@
     {
       "name": "lamella_debug_eval",
       "title": "Debug: evaluate",
-      "description": "Evaluate an expression / submission in the session's Debug Console (compiled + run through the wireline engine) and return its output. Runs code on the device.",
+      "description": "Evaluate an expression / submission in the session's Debug Console (compiled + run through the Lamella Link engine) and return its output. Runs code on the device.",
       "inputSchema": { "type": "object", "properties": { "session": { "type": "string" }, "expression": { "type": "string" } }, "required": ["session", "expression"] },
       "annotations": { "readOnlyHint": false, "openWorldHint": true }
     },

@@ -158,7 +158,7 @@ pub fn compile_unit_with_references(
     assembly_name: &str,
     references: &[Assembly],
 ) -> Compilation {
-    compile(unit, module_name, assembly_name, references, None, false)
+    compile(unit, module_name, assembly_name, references, None, false, false)
 }
 
 /// Like [`compile_unit_with_references`], but also emits a standalone Portable PDB
@@ -179,6 +179,7 @@ pub fn compile_unit_with_debug(
         assembly_name,
         references,
         Some((source, source_path)),
+        false,
         false,
     )
 }
@@ -221,6 +222,7 @@ pub fn compile_source_with(
     options: LexOptions,
 ) -> Compilation {
     let native_interop = options.native_interop;
+    let embed_pdb = options.embed_pdb;
     let parsed = parse_compilation_unit_with(source, options);
     let parse_diagnostics: Vec<Diagnostic> = parsed
         .diagnostics
@@ -243,6 +245,7 @@ pub fn compile_source_with(
         references,
         debug,
         native_interop,
+        embed_pdb,
     );
     if !parse_diagnostics.is_empty() {
         let mut diagnostics = parse_diagnostics;
@@ -259,6 +262,7 @@ fn compile(
     references: &[Assembly],
     debug: Option<(&str, &str)>,
     native_interop: bool,
+    embed_pdb: bool,
 ) -> Compilation {
     let diagnostics: Vec<Diagnostic> = bind_compilation_unit_with_references(unit, references)
         .iter()
@@ -275,7 +279,7 @@ fn compile(
     let units = core::slice::from_ref(unit);
     let debug_sources = debug.map(|pair| [pair]);
     let debug = debug_sources.as_ref().map(|slice| &slice[..]);
-    match build_image(units, module_name, assembly_name, references, debug, native_interop) {
+    match build_image(units, module_name, assembly_name, references, debug, native_interop, embed_pdb) {
         Ok((image, pdb)) => Compilation {
             diagnostics,
             image: Some(image),
@@ -326,6 +330,7 @@ pub fn compile_sources_with(
     let mut units: Vec<CompilationUnit> = Vec::with_capacity(sources.len());
     let mut syntax_error = false;
     let native_interop = options.native_interop;
+    let embed_pdb = options.embed_pdb;
     for (source, _path) in sources {
         let parsed = parse_compilation_unit_with(source, options.clone());
         let parse_diagnostics: Vec<Diagnostic> = parsed
@@ -371,6 +376,7 @@ pub fn compile_sources_with(
         references,
         debug,
         native_interop,
+        embed_pdb,
     ) {
         Ok((image, pdb)) => MultiCompilation {
             diagnostics,
@@ -414,6 +420,7 @@ fn build_image(
     references: &[Assembly],
     debug: Option<&[(&str, &str)]>,
     native_interop: bool,
+    embed_pdb: bool,
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::EmitError> {
     let model = reference_model(units, references);
     let mut tokens = assign_tokens(units, model.signature_canon());
@@ -457,19 +464,28 @@ fn build_image(
             contexts.get(index),
         )?;
     }
+    for unit in units {
+        emit_global_attributes(&mut image, &binder, &mut tokens, &unit.global_attributes);
+    }
     emit_exception_base_chains(&mut image, binder.model(), &tokens);
     let is_dll = entry_point.is_none();
     let entry = entry_point.unwrap_or(Token::new(0, 0));
-    let pdb = debug.map(|sources| {
-        let documents: Vec<DebugDocument> = sources
+    let documents: Option<Vec<DebugDocument>> = debug.map(|sources| {
+        sources
             .iter()
             .map(|(source, path)| DebugDocument { path, source })
-            .collect();
-        image.build_pdb(&documents, entry)
+            .collect()
     });
-    let image = match debug {
-        Some(_) => image.finish_with_debug(entry, is_dll, &pdb_file_name(module_name)),
-        None => image.finish(entry, is_dll),
+    let (image, pdb) = match documents.as_deref() {
+        Some(docs) if embed_pdb => (
+            image.finish_with_embedded_debug(entry, is_dll, docs, &pdb_file_name(module_name)),
+            None,
+        ),
+        Some(docs) => {
+            let pdb = image.build_pdb(docs, entry);
+            (image.finish_with_debug(entry, is_dll, &pdb_file_name(module_name)), Some(pdb))
+        }
+        None => (image.finish(entry, is_dll), None),
     };
     Ok((image, pdb))
 }
@@ -554,6 +570,28 @@ fn emit_attributes(
         };
         for attribute in &section.attributes {
             emit_one_attribute(image, binder, tokens, enclosing, attribute_parent, attribute);
+        }
+    }
+}
+
+/// Emits a `CustomAttribute` row for each global `[assembly: ...]` / `[module: ...]` attribute
+/// (24.2), attached to the assembly's (or module's) manifest row rather than to a declaration --
+/// the parser routes a top-level targeted section here. The profile validator reads these back
+/// from metadata (e.g. `[assembly: Lamella.Runtime.RequiresCapability("net.tls")]`).
+fn emit_global_attributes(
+    image: &mut ImageBuilder,
+    binder: &Binder,
+    tokens: &mut Tokens,
+    sections: &[AttributeSection],
+) {
+    let enclosing = TypeSymbol::Special(SpecialType::Object);
+    for section in sections {
+        let parent = match section.target.as_deref() {
+            Some("module") => image.module_token(),
+            _ => image.assembly_token(),
+        };
+        for attribute in &section.attributes {
+            emit_one_attribute(image, binder, tokens, &enclosing, parent, attribute);
         }
     }
 }
@@ -1313,7 +1351,7 @@ fn emit_namespace(
                 )?;
             }
             NamespaceMember::Delegate(declaration) => {
-                emit_delegate(image, tokens, namespace, declaration)?;
+                emit_delegate(image, binder, tokens, namespace, declaration)?;
             }
             NamespaceMember::Enum(declaration) => {
                 emit_enum(image, binder, tokens, namespace, declaration)?;
@@ -1472,10 +1510,15 @@ fn emit_interface(
 /// through to the `Invoke` signature, so it agrees with the byref target and the call site.
 fn emit_delegate(
     image: &mut ImageBuilder,
-    tokens: &Tokens,
+    binder: &Binder,
+    tokens: &mut Tokens,
     namespace: &str,
     declaration: &DelegateDecl,
 ) -> Result<(), crate::EmitError> {
+    mint_signature_type(binder, &bind_type(&declaration.return_type), image, tokens);
+    for parameter in &declaration.parameters {
+        mint_signature_type(binder, &bind_type(&parameter.ty), image, tokens);
+    }
     let base = system_base(image, tokens, "MulticastDelegate");
     image.add_type(namespace, &declaration.name, base, DELEGATE_TYPE_FLAGS);
     let ctor_signature =
@@ -1651,6 +1694,24 @@ fn object_base_ctor(image: &mut ImageBuilder, tokens: &Tokens) -> Token {
         .unwrap_or_else(|| image.object_ctor())
 }
 
+/// The parameterless `.ctor` of a class's declared base, for the implicit base call of a
+/// synthesized default constructor (and of an explicit constructor with no `: base(...)` chain).
+/// A base declared in THIS assembly has its constructor registered by the token pre-pass; a base
+/// in a REFERENCED assembly does not, so mint a `MemberRef` to it -- mirroring how the `extends`
+/// clause resolves the base type (this module's TypeDef, else a TypeRef into the owning assembly).
+/// Falling back to `Object::.ctor` here (the previous behaviour) silently skips the base's own
+/// construction -- its field initializers and constructor body never run.
+fn base_class_ctor(image: &mut ImageBuilder, tokens: &Tokens, base_class: &TypeSymbol) -> Token {
+    if let Some(token) = tokens.method(base_class, ".ctor", &[]) {
+        return token;
+    }
+    if let Some((namespace, name)) = split_type_name(base_class) {
+        let parent = image.type_ref(&namespace, &name);
+        return image.member_ref(parent, ".ctor", &method_signature(true, &[], &TypeSig::Void));
+    }
+    object_base_ctor(image, tokens)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_type(
     image: &mut ImageBuilder,
@@ -1783,13 +1844,10 @@ fn emit_type(
     {
         let base_ctor = if is_system_object {
             None
+        } else if let Some(symbol) = base_class.as_ref() {
+            Some(base_class_ctor(image, tokens, symbol))
         } else {
-            Some(
-                base_class
-                    .as_ref()
-                    .and_then(|symbol| tokens.method(symbol, ".ctor", &[]))
-                    .unwrap_or_else(|| object_base_ctor(image, tokens)),
-            )
+            Some(object_base_ctor(image, tokens))
         };
         let body = Stmt::new(StmtKind::Block(Vec::new()), declaration.span);
         emit_constructor(
@@ -1943,13 +2001,10 @@ fn emit_type(
             } if !is_static_constructor(modifiers) => {
                 let base_ctor = if is_struct || is_system_object {
                     None
+                } else if let Some(symbol) = base_class.as_ref() {
+                    Some(base_class_ctor(image, tokens, symbol))
                 } else {
-                    Some(
-                        base_class
-                            .as_ref()
-                            .and_then(|symbol| tokens.method(symbol, ".ctor", &[]))
-                            .unwrap_or_else(|| object_base_ctor(image, tokens)),
-                    )
+                    Some(object_base_ctor(image, tokens))
                 };
                 let token = emit_constructor(
                     image,
@@ -5162,6 +5217,40 @@ mod tests {
                 exception_tag_for_name("System", "SystemException"),
                 exception_tag_for_name("System", "Exception"),
             ])
+        );
+    }
+
+    #[test]
+    fn synthesized_ctor_chains_to_a_referenced_base_not_object() {
+        let refs = parse_compilation_unit(
+            "namespace Lib { public class Base { public int X; public Base() { X = 42; } } }",
+        )
+        .unit;
+        let ref_image = compile_unit(&refs, "lib.dll", "lib").image.expect("ref image");
+        let reference = Assembly::read(&ref_image).expect("ref assembly");
+
+        let program = parse_compilation_unit("public class Derived : Lib.Base { }").unit;
+        let compiled =
+            compile_unit_with_references(&program, "p.dll", "p", core::slice::from_ref(&reference));
+        assert!(compiled.diagnostics.is_empty(), "{:?}", compiled.diagnostics);
+        let image = compiled
+            .image
+            .unwrap_or_else(|| panic!("program image; emit_error = {:?}", compiled.emit_error));
+        let assembly = Assembly::read(&image).expect("program assembly");
+
+        let chains_to_base = assembly.member_refs().any(|member| {
+            member.name() == Some(".ctor") && {
+                let parent = member.parent();
+                parent.table() == TYPE_REF
+                    && assembly
+                        .type_ref(parent.row())
+                        .and_then(|type_ref| type_ref.name())
+                        .is_some_and(|name| name.namespace == "Lib" && name.name == "Base")
+            }
+        });
+        assert!(
+            chains_to_base,
+            "the synthesized constructor must chain to Lib.Base::.ctor, not System.Object::.ctor"
         );
     }
 

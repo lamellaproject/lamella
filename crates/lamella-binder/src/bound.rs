@@ -428,6 +428,11 @@ pub struct Binder {
     /// the unused-field warning when the declaration has any of those issues). The final pass
     /// warns a written-never-read field CS0414, and an eligible never-written-never-read one CS0169.
     private_fields: Vec<(Box<str>, Box<str>, Span, bool, Box<str>)>,
+    /// Fields whose only assignment is itself an error -- a readonly violation (CS0191) or a value
+    /// that does not convert (CS0029). csc suppresses every unused-field warning (CS0414/CS0169/
+    /// CS0649) for such a field: it is referenced (so not "never used") but not validly written (so
+    /// not "assigned but unused"). Keyed like [`Self::field_writes`]; cleared per unit.
+    fields_with_errors: alloc::collections::BTreeSet<(Box<str>, Box<str>)>,
 }
 
 impl Binder {
@@ -490,6 +495,16 @@ impl Binder {
         }
     }
 
+    /// Records that a field's assignment is itself an error (a readonly violation, or a value that
+    /// does not convert), so the final pass suppresses the unused-field warnings for it -- csc does
+    /// not warn a field unused when its only write is erroneous (it is referenced, but not validly
+    /// assigned).
+    fn record_field_write_error(&mut self, declaring: &TypeSymbol, name: &str) {
+        if let Some(key) = crate::flow::field_type_key(declaring) {
+            self.fields_with_errors.insert((key, name.into()));
+        }
+    }
+
     /// Emits `CS0414` for every private, non-const field the unit assigned (an initializer or a
     /// simple `=`) but never read, then clears the field-use accumulators for the next unit. A
     /// private field's every access is within its own type, so once the whole unit is bound the
@@ -500,6 +515,9 @@ impl Binder {
             core::mem::take(&mut self.private_fields)
         {
             let key = (declaring.clone(), name.clone());
+            if self.fields_with_errors.contains(&key) {
+                continue;
+            }
             let read = self.field_reads.contains(&key);
             let written = self.field_writes.contains(&key);
             let kind = if written && !read {
@@ -524,6 +542,7 @@ impl Binder {
         }
         self.field_reads.clear();
         self.field_writes.clear();
+        self.fields_with_errors.clear();
     }
 
     /// Records the locals a `switch` case-label expression references, so the
@@ -581,6 +600,18 @@ impl Binder {
         }
         if let TypeSymbol::Pointer(element) = ty {
             return TypeSymbol::Pointer(Box::new(self.resolve_named_type(element, span)));
+        }
+        if let TypeSymbol::Named(parts) = ty {
+            if let [prefix @ .., name] = &parts[..] {
+                if !prefix.is_empty() {
+                    let prefix_ns = prefix.join(".");
+                    if let Some(full_ns) = self.resolve_partial_namespace(&prefix_ns) {
+                        if self.model.get(&full_ns, name).is_some() {
+                            return qualified_type_symbol(&full_ns, name).fold_builtin();
+                        }
+                    }
+                }
+            }
         }
         resolve_type(&self.world, ty, &mut self.diagnostics, span).fold_builtin()
     }
@@ -1084,6 +1115,31 @@ impl Binder {
         }
     }
 
+    /// Resolves a namespace name written PARTIALLY against the enclosing namespaces (10.8): a name
+    /// `A` used inside `namespace N.B` finds the sibling namespace `N.A`. Returns the full namespace
+    /// name, most-specific enclosing scope first, or `None`. A fallback after a direct namespace
+    /// lookup, so it only ever ADDS the enclosing-scope resolution -- it never changes a direct hit.
+    fn resolve_partial_namespace(&self, name: &str) -> Option<Box<str>> {
+        let current = self.current_namespace().unwrap_or_default();
+        let mut scope: Option<&str> = Some(&current);
+        while let Some(prefix) = scope {
+            let candidate = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                alloc::format!("{prefix}.{name}")
+            };
+            if self.model.is_namespace(&candidate) {
+                return Some(candidate.into());
+            }
+            scope = if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix.rsplit_once('.').map_or("", |(head, _)| head))
+            };
+        }
+        None
+    }
+
     /// The distinct in-scope namespaces (current, global, and imported) that hold
     /// a type with this name.
     /// The namespaces (in scope) that declare a type of this simple name, ordered
@@ -1152,7 +1208,7 @@ impl Binder {
         }
         let bound = self.bind_statement(body);
         self.exit_scope();
-        if returns_value && !crate::flow::always_exits(&bound) {
+        if returns_value && !crate::flow::method_body_always_exits(&bound) {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::NotAllPathsReturn {
                     method: name.into(),
@@ -2797,6 +2853,8 @@ impl Binder {
                     },
                     target_span,
                 ));
+                let (declaring, name) = (field.declaring_type.clone(), field.name.clone());
+                self.record_field_write_error(&declaring, &name);
             }
         }
         let mut value = if operator == AssignmentOperator::Assign
@@ -2952,6 +3010,13 @@ impl Binder {
                 .push(Diagnostic::new(DiagnosticKind::NotAssignable, target_span));
         } else if !target.ty.is_error() && !value.ty.is_error() {
             self.check_assignment(operator, &target.ty, &value, span);
+            if matches!(operator, AssignmentOperator::Assign) && !self.assignable(&value, &target.ty)
+            {
+                if let BoundExprKind::FieldAccess { field: Some(field), .. } = &target.kind {
+                    let (declaring, name) = (field.declaring_type.clone(), field.name.clone());
+                    self.record_field_write_error(&declaring, &name);
+                }
+            }
             if matches!(operator, AssignmentOperator::Add)
                 && matches!(target.ty, TypeSymbol::Special(SpecialType::String))
             {
@@ -3000,8 +3065,78 @@ impl Binder {
     }
 
     fn bind_member_access(&mut self, receiver_expr: &Expr, name: &str, span: Span) -> BoundExpr {
+        let mark = self.diagnostics.len();
         let receiver = self.bind_expression(receiver_expr);
+        if let Some(type_receiver) = self.color_color_type_receiver(receiver_expr, &receiver, name) {
+            self.diagnostics.truncate(mark);
+            return self.member_access_of(type_receiver, name, span);
+        }
         self.member_access_of(receiver, name, span)
+    }
+
+    /// The TYPE-reference receiver for a color-color access (7.6.4.1, "Identical simple names and
+    /// type names"): if `receiver_expr` is a single identifier E that bound to a VALUE (field/
+    /// property/local/parameter) whose type is a type also named E, and `member` is a static member
+    /// or nested type of that type, returns E as a TYPE reference -- so E.member is the legal static
+    /// access csc reports, not the CS0176 an instance receiver gives. The value meaning is otherwise
+    /// kept (an instance member reaches it). Returns `None` when color-color does not apply.
+    fn color_color_type_receiver(
+        &self,
+        receiver_expr: &Expr,
+        receiver: &BoundExpr,
+        member: &str,
+    ) -> Option<BoundExpr> {
+        let ExprKind::Name(id) = &receiver_expr.kind else {
+            return None;
+        };
+        let receiver_is_value = !matches!(
+            receiver.kind,
+            BoundExprKind::TypeReference(_) | BoundExprKind::NamespaceReference(_)
+        ) && !receiver.ty.is_error();
+        if receiver_is_value
+            && self
+                .simple_name_as_type(id)
+                .is_some_and(|ty| dotted_type_name(&ty) == dotted_type_name(&receiver.ty))
+            && self.member_is_static_or_nested(&receiver.ty, member)
+        {
+            let ty = receiver.ty.clone();
+            Some(BoundExpr {
+                kind: BoundExprKind::TypeReference(ty.clone()),
+                ty,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// The type a single identifier denotes as a type-name -- an alias, or a type in the
+    /// namespaces in scope (including a nested type of the current type) -- if any. Used for the
+    /// color-color rule (7.6.4.1), where a name is both a value and a type of the same type.
+    fn simple_name_as_type(&self, id: &str) -> Option<TypeSymbol> {
+        if let Some(target) = self.alias_target(id) {
+            return Some(target);
+        }
+        self.type_namespaces_containing(id)
+            .first()
+            .map(|(namespace, _)| type_symbol_in(namespace, id))
+    }
+
+    /// Whether `name` is a static member, or a nested type, of `ty` -- the members color-color
+    /// reaches by interpreting the receiver as a type (7.6.4.1). An instance member is left to the
+    /// value interpretation.
+    fn member_is_static_or_nested(&self, ty: &TypeSymbol, name: &str) -> bool {
+        match self.resolve_member(ty, name) {
+            MemberResolution::Field(field) => field.is_static,
+            MemberResolution::Property { is_static, .. } => is_static,
+            MemberResolution::MethodGroup => {
+                self.methods_in_chain(ty, name).iter().any(|m| m.is_static)
+            }
+            MemberResolution::NoSuchMember(_) => matches!(
+                ty,
+                TypeSymbol::Named(parts) if self.model.get(&parts.join("."), name).is_some()
+            ),
+            MemberResolution::Unknown => false,
+        }
     }
 
     /// Resolves `receiver.name` from an already-bound receiver (14.5.4). Split from
@@ -3130,7 +3265,15 @@ impl Binder {
         let ExprKind::MemberAccess { receiver, name } = &target.kind else {
             return self.bind_expression(target);
         };
+        let mark = self.diagnostics.len();
         let recv = self.bind_expression(receiver);
+        let recv = match self.color_color_type_receiver(receiver, &recv, name) {
+            Some(type_receiver) => {
+                self.diagnostics.truncate(mark);
+                type_receiver
+            }
+            None => recv,
+        };
         if let BoundExprKind::NamespaceReference(namespace) = &recv.kind {
             let namespace = namespace.clone();
             return self.bind_qualified_name(&namespace, name, target.span);
@@ -4166,6 +4309,7 @@ impl Binder {
                 modifiers,
                 name,
                 parameters,
+                return_type,
                 explicit_interface: None,
                 span,
                 ..
@@ -4185,18 +4329,43 @@ impl Binder {
                     self.normalize_for_signature(&crate::bind::parameter_symbol(parameter))
                 })
                 .collect();
-            let (found, resolved) = self.base_signature_exists(class_ty, name, &query);
-            if !found && resolved {
-                self.diagnostics.push(Diagnostic::new(
+            let method_sig =
+                || crate::program::method_signature(&declaration.name, name, parameters);
+            match self.base_method_match(class_ty, name, &query) {
+                (None, true) => self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::NoMethodToOverride {
-                        method: crate::program::method_signature(
-                            &declaration.name,
-                            name,
-                            parameters,
-                        ),
+                        method: method_sig(),
                     },
                     *span,
-                ));
+                )),
+                (None, false) => {}
+                (Some((base, base_type)), _) => {
+                    let base_sig =
+                        crate::program::method_signature(&base_type, name, parameters);
+                    if !base.is_virtual && !base.is_abstract && !base.is_override {
+                        self.diagnostics.push(Diagnostic::new(
+                            DiagnosticKind::CannotOverrideNonVirtual {
+                                method: method_sig(),
+                                base: base_sig,
+                            },
+                            *span,
+                        ));
+                    } else {
+                        let overriding = self
+                            .normalize_for_signature(&crate::bind::bind_type(return_type));
+                        let overridden = self.normalize_for_signature(&base.return_type);
+                        if overriding != overridden {
+                            self.diagnostics.push(Diagnostic::new(
+                                DiagnosticKind::OverrideReturnTypeMismatch {
+                                    method: method_sig(),
+                                    return_type: overridden.to_string().into(),
+                                    base: base_sig,
+                                },
+                                *span,
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -4284,12 +4453,18 @@ impl Binder {
     /// and the `string` keyword compare equal). Returns `(found, resolved)`; `resolved` is false
     /// when an unknown base type truncated the walk or `System.Object` is absent from the model,
     /// so the caller can decline to report.
-    fn base_signature_exists(
+    /// Finds the base-CLASS method an `override` of `name(query)` targets: the first matching
+    /// (name + normalized params) method up the base chain, paired with its declaring type's
+    /// simple name (for the diagnostic message). The bool is whether the chain fully resolved
+    /// (false = an unknown base, so the target cannot be confirmed present or absent -- report
+    /// nothing). Interfaces are not override targets (implementing one is CS0535), so only the
+    /// base *class* chain is walked.
+    fn base_method_match(
         &self,
         class_ty: &TypeSymbol,
         name: &str,
         query: &[TypeSymbol],
-    ) -> (bool, bool) {
+    ) -> (Option<(MethodSymbol, Box<str>)>, bool) {
         let mut visited: Vec<TypeSymbol> = Vec::new();
         let mut current = self
             .model
@@ -4301,10 +4476,10 @@ impl Binder {
             }
             visited.push(ty.clone());
             let Some(info) = self.model.get_by_symbol(&ty) else {
-                return (false, false);
+                return (None, false);
             };
-            if self.type_declares_signature(info, name, query) {
-                return (true, true);
+            if let Some(method) = self.matching_method(info, name, query) {
+                return (Some((method.clone(), info.name.clone())), true);
             }
             current = info.base.clone();
         }
@@ -4314,20 +4489,28 @@ impl Binder {
                 continue;
             }
             match self.model.get_by_symbol(&root_ty) {
-                Some(info) if self.type_declares_signature(info, name, query) => return (true, true),
-                Some(_) => {}
-                None if root == "Object" => return (false, false),
+                Some(info) => {
+                    if let Some(method) = self.matching_method(info, name, query) {
+                        return (Some((method.clone(), info.name.clone())), true);
+                    }
+                }
+                None if root == "Object" => return (None, false),
                 None => {}
             }
         }
-        (false, true)
+        (None, true)
     }
 
-    /// Whether `info` declares a method named `name` whose parameter types match `query` (already
-    /// normalized); each candidate parameter is normalized so metadata- and source-derived
-    /// framework types compare equal.
-    fn type_declares_signature(&self, info: &TypeInfo, name: &str, query: &[TypeSymbol]) -> bool {
-        info.methods.iter().any(|method| {
+    /// The method in `info` named `name` whose parameter types match `query` (already normalized);
+    /// each candidate parameter is normalized so metadata- and source-derived framework types
+    /// compare equal.
+    fn matching_method<'info>(
+        &self,
+        info: &'info TypeInfo,
+        name: &str,
+        query: &[TypeSymbol],
+    ) -> Option<&'info MethodSymbol> {
+        info.methods.iter().find(|method| {
             &*method.name == name
                 && method.parameters.len() == query.len()
                 && method
@@ -4427,16 +4610,22 @@ impl Binder {
         result
     }
 
-    /// Whether `class_ty` implements interface `member` -- implicitly (a method with the
-    /// same name + parameter types anywhere in the class chain) or explicitly (a method
-    /// registered under a mangled `<interface>.<member>` name). The explicit check is
-    /// lenient (any `.<member>` impl) so a real explicit impl is never falsely flagged.
+    /// Whether `class_ty` implements interface `member` -- implicitly (a matching method in the
+    /// class's own type or a base CLASS, or a property/event whose accessor the member names) or
+    /// explicitly (a method registered under a mangled
+    /// `<interface>.<member>` name). The implicit search walks only the base-class chain, NOT the
+    /// interfaces: the interface's own abstract declaration must not be mistaken for its
+    /// implementation (that is the CS0535 the caller reports). The explicit check is lenient (any
+    /// `.<member>` impl) so a real explicit impl is never falsely flagged.
     fn implements_interface_member(&self, class_ty: &TypeSymbol, member: &MethodSymbol) -> bool {
         if self
-            .methods_in_chain(class_ty, &member.name)
+            .methods_in_class_chain(class_ty, &member.name)
             .iter()
             .any(|candidate| candidate.parameters == member.parameters)
         {
+            return true;
+        }
+        if self.accessor_provided_by_property_or_event(class_ty, member) {
             return true;
         }
         let mut suffix = String::from(".");
@@ -4444,6 +4633,95 @@ impl Binder {
         self.model
             .get_by_symbol(class_ty)
             .is_some_and(|info| info.methods.iter().any(|m| m.name.ends_with(&suffix)))
+    }
+
+    /// The methods named `name` in `ty`'s own type and its base CLASS chain (walking `info.base`,
+    /// which `link_bases` resolves to the base *class*, never an interface). Used to decide
+    /// implicit interface implementation: a candidate here is a concrete provider of the member,
+    /// whereas `methods_in_chain` would also surface the interface's own abstract method.
+    fn methods_in_class_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
+        let mut methods: Vec<MethodSymbol> = Vec::new();
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut current = Some(member_lookup_type(ty));
+        while let Some(cur) = current {
+            if visited.contains(&cur) {
+                break;
+            }
+            visited.push(cur.clone());
+            let Some(info) = self.type_info_of(&cur) else {
+                break;
+            };
+            for method in info.methods_named(name) {
+                methods.push(method.clone());
+            }
+            current = info.base.clone();
+        }
+        methods
+    }
+
+    /// Whether interface accessor method `member` is satisfied by a property or field-like event
+    /// of the same name in `class_ty`'s own type or a base CLASS. A source type keeps a property's
+    /// `get_`/`set_` (and an event's `add_`/`remove_`) accessors in `properties`/`events` rather
+    /// than as synthesized methods -- only indexers and metadata-loaded types carry the accessor
+    /// methods themselves -- so an interface accessor a source type implements via a property or
+    /// event is invisible to the method walk and would be a false CS0535. Lenient by design
+    /// (matched on accessor name and kind, not the full signature): a strict subset never risks a
+    /// false positive, so a subtler type mismatch is left for csc (CS0738) rather than reported.
+    fn accessor_provided_by_property_or_event(
+        &self,
+        class_ty: &TypeSymbol,
+        member: &MethodSymbol,
+    ) -> bool {
+        let property = member
+            .name
+            .strip_prefix("get_")
+            .filter(|_| member.parameters.is_empty())
+            .map(|name| (name, true))
+            .or_else(|| {
+                member
+                    .name
+                    .strip_prefix("set_")
+                    .filter(|_| member.parameters.len() == 1)
+                    .map(|name| (name, false))
+            });
+        let event = member
+            .name
+            .strip_prefix("add_")
+            .or_else(|| member.name.strip_prefix("remove_"))
+            .filter(|_| member.parameters.len() == 1);
+        if property.is_none() && event.is_none() {
+            return false;
+        }
+        let mut visited: Vec<TypeSymbol> = Vec::new();
+        let mut current = Some(member_lookup_type(class_ty));
+        while let Some(cur) = current {
+            if visited.contains(&cur) {
+                break;
+            }
+            visited.push(cur.clone());
+            let Some(info) = self.type_info_of(&cur) else {
+                break;
+            };
+            if let Some((name, need_getter)) = property {
+                if info.properties.iter().any(|candidate| {
+                    &*candidate.name == name
+                        && if need_getter {
+                            candidate.has_getter
+                        } else {
+                            candidate.has_setter
+                        }
+                }) {
+                    return true;
+                }
+            }
+            if let Some(name) = event {
+                if info.events.iter().any(|candidate| &*candidate.name == name) {
+                    return true;
+                }
+            }
+            current = info.base.clone();
+        }
+        false
     }
 
     /// Reports `CS0146` if `class_ty`'s base-class chain is circular (A : B, B : A). The
@@ -4967,6 +5245,12 @@ impl Binder {
         if self.model.is_namespace(name) {
             return BoundExpr {
                 kind: BoundExprKind::NamespaceReference(name.into()),
+                ty: TypeSymbol::Error,
+            };
+        }
+        if let Some(full) = self.resolve_partial_namespace(name) {
+            return BoundExpr {
+                kind: BoundExprKind::NamespaceReference(full),
                 ty: TypeSymbol::Error,
             };
         }
@@ -6684,6 +6968,33 @@ mod tests {
     }
 
     #[test]
+    fn sibling_namespace_resolves_through_the_enclosing_namespace() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes(
+                "namespace N.A { public enum E { X, Y } } \
+                 namespace N.B { class C { static int Run() { A.E e = A.E.Y; return (int)e; } } }"
+            ),
+            []
+        );
+        assert!(codes(
+            "namespace N.A { public enum E { X } } \
+             namespace N.B { class C { Z.E f; static int Run() { return 0; } } }"
+        )
+        .contains(&246));
+    }
+
+    #[test]
     fn using_directives_resolve_unqualified_type_names() {
         use crate::declaration::collect_model;
         use lamella_syntax::parser::parse_compilation_unit;
@@ -6909,6 +7220,8 @@ mod tests {
             []
         );
         assert_eq!(codes(int.clone(), "{ while (true) { } }"), []);
+        assert_eq!(codes(int.clone(), "{ goto Nowhere; }"), [161, 159]);
+        assert_eq!(codes(int.clone(), "{ L: goto L; }"), []);
         assert_eq!(codes(int, "{ throw; }"), []);
         assert_eq!(codes(void, "{ int x = 1; }"), []);
     }
@@ -7064,6 +7377,175 @@ mod tests {
     }
 
     #[test]
+    fn color_color_resolves_the_type_not_cs0176() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes(
+                "enum E { A } \
+                 class C { E e_field; E E { get { return e_field; } } void M() { E x = E.A; } }"
+            ),
+            [219, 649]
+        );
+        assert_eq!(
+            codes(
+                "class Palette { public static int Default() { return 7; } } \
+                 class C { Palette Palette; int M() { return Palette.Default(); } }"
+            ),
+            [169]
+        );
+        assert!(codes(
+            "class A { public static int S; } \
+             class C { int M() { A a = new A(); return a.S; } }"
+        )
+        .contains(&176));
+    }
+
+    #[test]
+    fn unimplemented_interface_member_is_cs0535() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes("interface I { void M(); } class C : I { }"),
+            [535]
+        );
+        assert_eq!(
+            codes("interface I { void M(); } class C : I { public void M() { } }"),
+            []
+        );
+        assert_eq!(
+            codes(
+                "interface I { void M(); } class B { public void M() { } } class C : B, I { }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes("interface I { void M(); } abstract class C : I { }"),
+            []
+        );
+    }
+
+    #[test]
+    fn interface_accessor_implemented_by_a_property_or_event_is_not_cs0535() {
+        use crate::symbols::{
+            Accessibility, EventSymbol, MethodSymbol, PropertySymbol, TypeInfo, TypeKind,
+        };
+        let int = || TypeSymbol::Special(SpecialType::Int32);
+        let accessor = |name: &str, parameters: Vec<TypeSymbol>| MethodSymbol {
+            name: name.into(),
+            return_type: int(),
+            parameters,
+            is_static: false,
+            is_params: false,
+            is_virtual: true,
+            is_abstract: true,
+            is_override: false,
+            accessibility: Accessibility::Public,
+            conditional: Vec::new(),
+        };
+        let get_p = accessor("get_P", Vec::new());
+        let set_p = accessor("set_P", vec![int()]);
+        let add_e = accessor("add_E", vec![int()]);
+        let remove_e = accessor("remove_E", vec![int()]);
+        let property = |has_getter, has_setter| PropertySymbol {
+            name: "P".into(),
+            ty: int(),
+            is_static: false,
+            accessibility: Accessibility::Public,
+            has_getter,
+            has_setter,
+        };
+        let event = || EventSymbol {
+            name: "E".into(),
+            ty: int(),
+            is_static: false,
+            accessibility: Accessibility::Public,
+        };
+        let implements =
+            |properties: Vec<PropertySymbol>, events: Vec<EventSymbol>, member: &MethodSymbol| {
+                let mut class = TypeInfo::new("", "C", TypeKind::Class);
+                class.properties = properties;
+                class.events = events;
+                let mut model = Model::new();
+                model.insert(class);
+                Binder::with_model(model)
+                    .implements_interface_member(&TypeSymbol::Named(["C".into()].into()), member)
+            };
+
+        assert!(implements(vec![property(true, true)], Vec::new(), &get_p));
+        assert!(implements(vec![property(true, true)], Vec::new(), &set_p));
+        assert!(implements(Vec::new(), vec![event()], &add_e));
+        assert!(implements(Vec::new(), vec![event()], &remove_e));
+        assert!(!implements(Vec::new(), Vec::new(), &get_p));
+        assert!(!implements(Vec::new(), Vec::new(), &add_e));
+        assert!(implements(vec![property(true, false)], Vec::new(), &get_p));
+        assert!(!implements(vec![property(true, false)], Vec::new(), &set_p));
+    }
+
+    #[test]
+    fn override_of_a_non_overridable_or_return_mismatched_base_is_cs0506_cs0508() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(
+            codes("class B { public void M() { } } class D : B { public override void M() { } }"),
+            [506]
+        );
+        assert_eq!(
+            codes(
+                "class B { public virtual int M() { return 0; } } \
+                 class D : B { public override string M() { return null; } }"
+            ),
+            [508]
+        );
+        assert_eq!(
+            codes(
+                "class B { public virtual int M() { return 0; } } \
+                 class D : B { public override int M() { return 1; } }"
+            ),
+            []
+        );
+        assert_eq!(
+            codes("class C { public override string ToString() { return \"c\"; } }"),
+            []
+        );
+        assert_eq!(
+            codes(
+                "class B { public virtual int M() { return 0; } } \
+                 class D : B { public override int M() { return 1; } } \
+                 class E : D { public override int M() { return 2; } }"
+            ),
+            []
+        );
+    }
+
+    #[test]
     fn switch_binds_constant_cases_and_flags_a_non_constant_label() {
         use lamella_syntax::parser::parse_compilation_unit;
         let codes = |source: &str| {
@@ -7143,11 +7625,11 @@ mod tests {
 
         assert_eq!(
             codes("class C { static int Run() { int x = 1; int x = 2; return x; } }"),
-            [128]
+            [128, 219]
         );
         assert_eq!(
             codes("class C { static int Run() { int x = 1; { int x = 2; return x; } } }"),
-            [136]
+            [136, 219]
         );
         assert_eq!(
             codes("class C { static int Run() { int x = 1; { int y = 2; return x + y; } } }"),
@@ -7237,6 +7719,18 @@ mod tests {
             codes("class C { static int Run() { Bogus b = null; return 0; } }"),
             [246]
         );
+        assert_eq!(
+            codes("class C { static int Run() { { int x = 1; } { int x = 2; return x; } } }"),
+            [219]
+        );
+        assert_eq!(
+            codes("class C { static int Run() { int x = 1; if (x > 0) { int x = 2; return x; } return x; } }"),
+            [136]
+        );
+        assert_eq!(
+            codes("class C { static int Run() { int x = 5; { return x; } } }"),
+            []
+        );
     }
 
     #[test]
@@ -7282,6 +7776,40 @@ mod tests {
         assert_eq!(
             codes("class C { int f; static int Run() { return 0; } }"),
             [169]
+        );
+        assert_eq!(
+            codes("class C { readonly int f; void M() { f = 3; } static int Run() { return 0; } }"),
+            [191]
+        );
+        assert_eq!(
+            codes(
+                "class C { int f; void M() { f = \"x\"; } static int Run() { return 0; } }"
+            ),
+            [29]
+        );
+    }
+
+    #[test]
+    fn unreferenced_label_is_cs0164() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let codes = |source: &str| {
+            let unit = parse_compilation_unit(source).unit;
+            let mut codes: Vec<u16> = crate::bind_compilation_unit(&unit)
+                .iter()
+                .map(Diagnostic::code)
+                .collect();
+            codes.sort_unstable();
+            codes
+        };
+
+        assert_eq!(codes("class C { static int Run() { Foo: return 0; } }"), [164]);
+        assert_eq!(
+            codes("class C { static int Run() { goto Foo; Foo: return 0; } }"),
+            []
+        );
+        assert_eq!(
+            codes("class C { static int Run() { Again: ; Again: ; return 0; } }"),
+            [140, 164]
         );
     }
 

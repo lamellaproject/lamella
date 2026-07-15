@@ -1012,6 +1012,12 @@ fn emit_property_load(
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if name == "Length" && matches!(&receiver.ty, TypeSymbol::Array { rank: 1, .. }) {
+        emit_expression(receiver, frame, tokens, out)?;
+        out.push(Instruction::simple(Opcode::Ldlen));
+        out.push(Instruction::simple(Opcode::ConvI4));
+        return Ok(());
+    }
     let is_static = matches!(receiver.kind, BoundExprKind::TypeReference(_));
     let value_type_receiver = !is_static && is_value_type(&receiver.ty, tokens);
     if !is_static {

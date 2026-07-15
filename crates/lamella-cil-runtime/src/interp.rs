@@ -103,13 +103,34 @@ pub struct Vm {
     /// without the `exceptions` feature.
     #[cfg(feature = "exceptions")]
     unhandled: Option<ObjectRef>,
-    /// The current time, as a count of 100-nanosecond ticks since the .NET epoch
-    /// (0001-01-01 00:00:00). The interpreter core is no_std and has no clock of its own:
-    /// the embedder sets this (the host from `std::time`, a device from its RTC) via
-    /// [`Vm::set_now_ticks`], and `DateTime.Now`/`UtcNow`/`Today` read it through the
-    /// `datetime_now_ticks` intrinsic. It defaults to 0 (the epoch) when the embedder
-    /// never sets it, so an unconfigured host reads a defined value rather than garbage.
-    now_ticks: i64,
+    /// The wall clock, ANCHORED to the monotonic clock: `(monotonic_ms_at_set, ticks_at_set)`,
+    /// where ticks are 100-nanosecond units since the .NET epoch (0001-01-01 00:00:00). The
+    /// interpreter core is no_std and has no clock of its own -- the embedder sets the wall time
+    /// (the host from `std::time`, a device from its RTC, or a synced `SystemClock`) via
+    /// [`Vm::set_now_ticks`], which records it against the current monotonic reading so
+    /// `DateTime.Now`/`UtcNow` (through `datetime_now_ticks`) ADVANCE with elapsed monotonic time
+    /// rather than freezing at the set instant. `None` until set -> the epoch (a defined value,
+    /// not garbage), so an unconfigured build is unchanged.
+    wall_anchor: Option<(u64, i64)>,
+    /// The embedder's observer for wall-clock SETS ([`Vm::set_wall_clock_sink`]): called with the
+    /// new anchor ticks on every [`Vm::set_now_ticks`] -- an RTC load, a managed `Seed`, a
+    /// completed SNTP/NTS sync -- so a device embedder can MIRROR the one managed wall clock into
+    /// an engine that reads time through its own registered source (the device TLS engine's
+    /// `set_time_source`). A plain fn pointer, like the clock seam, so a bare-metal boot path can
+    /// register it. `None` = no observer (the default; nothing extra happens on a set).
+    wall_sink: Option<fn(i64)>,
+    /// Native KEY material the managed tier references only by HANDLE (a TLS exporter output,
+    /// an AEAD key): the bytes live here, runtime-side, and never appear in managed values.
+    /// Append-only like the TLS handle tables; a released slot is ZEROIZED before it is
+    /// dropped so key bytes do not linger on the heap.
+    native_keys: Vec<Option<Vec<u8>>>,
+    /// Per-socket receive timeouts in milliseconds (`Socket.ReceiveTimeout`, the SO_RCVTIMEO
+    /// shape), keyed by handle; absent = infinite (the .NET default). A `Read`-interest park for
+    /// a mapped handle is DEADLINE-BOUNDED: the reactor wakes the thread when the deadline passes
+    /// even if the socket never readies, the re-polled op returns WouldBlock again, and the
+    /// MANAGED receive loop decides expiry (throws its `SocketException`) -- the runtime only
+    /// bounds the park. Entries are dropped on close so a recycled handle cannot inherit one.
+    recv_timeouts: BTreeMap<u32, u32>,
     /// The cooperative green-thread scheduler's signal channel: a threading intrinsic
     /// (`Thread.Start` / `Join` / `Yield`) sets this to request a scheduler action; the top-level
     /// scheduler loop takes it the moment the running thread next pauses. `None` between requests.
@@ -147,10 +168,19 @@ pub struct Vm {
     /// blocking) the managed `SslStream` drives over the socket layer. `None` until set (no TLS on
     /// this build); the embedder supplies it (the host with rustls / mbedTLS; a device with mbedTLS).
     tls_backend: Option<alloc::boxed::Box<dyn crate::tls::TlsBackend>>,
+    /// The AEAD crypto seam ([`crate::aead::AeadBackend`]) -- RFC 5297 AES-SIV for the
+    /// authenticated protocol tier (NTS). `None` until the embedder installs one; the AEAD
+    /// intrinsics then report failure rather than encrypt with nothing.
+    aead_backend: Option<alloc::boxed::Box<dyn crate::aead::AeadBackend>>,
     /// The file-system seam ([`crate::fs::FsBackend`]) -- blocking files + directories. `None`
     /// until set (a device with no file system installs none): every managed file operation then
     /// reports [`crate::fs::FsError::Io`] and the corlib throws a catchable `IOException`.
     fs_backend: Option<alloc::boxed::Box<dyn crate::fs::FsBackend>>,
+    /// The serial-port seam ([`crate::serial::SerialBackend`]) -- a blocking UART/COM byte pipe.
+    /// `None` until set (a device with no serial hardware installs none): every managed
+    /// `System.IO.Ports.SerialPort` operation then reports [`crate::serial::SerialError::Io`] and
+    /// the corlib throws a catchable `IOException`.
+    serial_backend: Option<alloc::boxed::Box<dyn crate::serial::SerialBackend>>,
     /// The live console tap ([`Vm::set_console_tap`]): a bench embedder mirrors every console
     /// write to its UART as it happens, so a run that never completes still narrates itself.
     console_tap: Option<fn(&[u16])>,
@@ -169,6 +199,14 @@ pub struct Vm {
     /// file below, so a driver runs + is verifiable off-device with no seam installed.
     mmio_write_fn: Option<fn(u32, u32)>,
     mmio_read_fn: Option<fn(u32) -> u32>,
+    /// The SUB-WORD volatile MMIO seam (`Mmio` Read8/Write8/Read16/Write16). A driver needs these
+    /// where a 32-bit access is impossible: Cortex-M0+ (ARMv6-M) faults on an unaligned word, and
+    /// byte/halfword-addressed registers (SAMD pinmux, STM32 config bytes, ...) sit at unaligned
+    /// addresses. A device installs them beside the 32-bit seam; `None` falls back to the host sim.
+    mmio_write8_fn: Option<fn(u32, u8)>,
+    mmio_read8_fn: Option<fn(u32) -> u8>,
+    mmio_write16_fn: Option<fn(u32, u16)>,
+    mmio_read16_fn: Option<fn(u32) -> u16>,
     /// A simulated MMIO register file, HOST-ONLY: the default `Mmio` target when no seam is
     /// installed, so a driver can be exercised and its register writes verified off-device. On a
     /// device build (`target_os = "none"`) this field does not exist -- MMIO with no seam is a
@@ -465,6 +503,18 @@ impl Vm {
         self.tls_backend.as_deref_mut()
     }
 
+    /// Sets the AEAD crypto seam ([`crate::aead::AeadBackend`]) -- RFC 5297 AES-SIV. The
+    /// embedder provides it (host: RustCrypto aes-siv; device: the mbedTLS-composed SIV);
+    /// without it the AEAD intrinsics report failure.
+    pub fn set_aead_backend(&mut self, backend: alloc::boxed::Box<dyn crate::aead::AeadBackend>) {
+        self.aead_backend = Some(backend);
+    }
+
+    /// The AEAD crypto seam, if set. Pure byte transforms, like the TLS seam.
+    pub fn aead_backend(&mut self) -> Option<&mut (dyn crate::aead::AeadBackend + 'static)> {
+        self.aead_backend.as_deref_mut()
+    }
+
     /// Sets the file-system seam ([`crate::fs::FsBackend`]). The embedder provides it (the host
     /// with `std::fs`; a device with a FAT-over-SD driver; tests with the in-memory tree);
     /// without it, every managed file operation throws a catchable `IOException`.
@@ -485,6 +535,33 @@ impl Vm {
         &mut self,
     ) -> (&mut Heap, Option<&mut (dyn crate::fs::FsBackend + 'static)>) {
         (&mut self.heap, self.fs_backend.as_deref_mut())
+    }
+
+    /// Sets the serial-port seam ([`crate::serial::SerialBackend`]). The embedder provides it (the
+    /// host with the `serialport` crate over a real COM port; a device with a SERCOM/USART driver;
+    /// tests with the in-memory loopback); without it, every managed serial operation throws a
+    /// catchable `IOException`.
+    pub fn set_serial_backend(
+        &mut self,
+        backend: alloc::boxed::Box<dyn crate::serial::SerialBackend>,
+    ) {
+        self.serial_backend = Some(backend);
+    }
+
+    /// The serial-port seam, if set -- the `System.IO.Ports` intrinsics drive it. Blocking by
+    /// design (bounded, timeout-capped operations, no reactor involvement -- see the
+    /// [`crate::serial`] module docs).
+    pub fn serial_backend(&mut self) -> Option<&mut (dyn crate::serial::SerialBackend + 'static)> {
+        self.serial_backend.as_deref_mut()
+    }
+
+    /// The heap and the serial-port seam together, split-borrowed -- the bulk read/write
+    /// intrinsics cross the seam straight to/from a packed array's bytes, which needs a view into
+    /// the heap live while the backend runs (the same discipline as [`Vm::heap_and_fs`]).
+    pub fn heap_and_serial(
+        &mut self,
+    ) -> (&mut Heap, Option<&mut (dyn crate::serial::SerialBackend + 'static)>) {
+        (&mut self.heap, self.serial_backend.as_deref_mut())
     }
 
     /// Sets the native off-heap memory seam ([`crate::memory::MemoryBackend`]). The embedder selects
@@ -524,6 +601,22 @@ impl Vm {
         self.mmio_read_fn = Some(read);
     }
 
+    /// Installs the SUB-WORD volatile MMIO seam (8- and 16-bit `write_volatile`/`read_volatile`),
+    /// the narrow counterpart of [`Vm::set_mmio`]. A device firmware installs both seams; the host
+    /// leaves these unset and uses the aligned-word read-modify-write of the simulated register file.
+    pub fn set_mmio_subword(
+        &mut self,
+        write8: fn(u32, u8),
+        read8: fn(u32) -> u8,
+        write16: fn(u32, u16),
+        read16: fn(u32) -> u16,
+    ) {
+        self.mmio_write8_fn = Some(write8);
+        self.mmio_read8_fn = Some(read8);
+        self.mmio_write16_fn = Some(write16);
+        self.mmio_read16_fn = Some(read16);
+    }
+
     /// A `Mmio.Write32`: the installed volatile seam if any, else the HOST simulated register file
     /// (a no-op on a device build with no seam installed).
     pub fn mmio_write(&mut self, address: u32, value: u32) {
@@ -552,6 +645,75 @@ impl Vm {
         0
     }
 
+    /// A `Mmio.Write8`: the installed sub-word seam if any, else the HOST simulated register file as
+    /// a read-modify-write of the aligned 32-bit word (a no-op on a device build with no seam). The
+    /// sim keys every access to the aligned word, so 8-/16-/32-bit accesses to the same word stay
+    /// coherent -- exactly as the silicon bus does.
+    pub fn mmio_write8(&mut self, address: u32, value: u8) {
+        if let Some(write) = self.mmio_write8_fn {
+            write(address, value);
+            return;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let word_addr = address & !0b11;
+            let shift = (address & 0b11) * 8;
+            let word = self.mmio_sim.get(&word_addr).copied().unwrap_or(0);
+            self.mmio_sim
+                .insert(word_addr, (word & !(0xFFu32 << shift)) | (u32::from(value) << shift));
+        }
+    }
+
+    /// A `Mmio.Read8`: the installed sub-word seam if any, else the aligned-word HOST sim (0 on a
+    /// device build with no seam installed).
+    #[must_use]
+    pub fn mmio_read8(&self, address: u32) -> u8 {
+        if let Some(read) = self.mmio_read8_fn {
+            return read(address);
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let word = self.mmio_sim.get(&(address & !0b11)).copied().unwrap_or(0);
+            (word >> ((address & 0b11) * 8)) as u8
+        }
+        #[cfg(target_os = "none")]
+        0
+    }
+
+    /// A `Mmio.Write16`: the installed sub-word seam if any, else the aligned-word HOST sim RMW (a
+    /// no-op on a device build with no seam). A 16-bit access is 2-byte aligned, so the halfword
+    /// sits wholly within one word at bit offset 0 or 16.
+    pub fn mmio_write16(&mut self, address: u32, value: u16) {
+        if let Some(write) = self.mmio_write16_fn {
+            write(address, value);
+            return;
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let word_addr = address & !0b11;
+            let shift = (address & 0b10) * 8;
+            let word = self.mmio_sim.get(&word_addr).copied().unwrap_or(0);
+            self.mmio_sim
+                .insert(word_addr, (word & !(0xFFFFu32 << shift)) | (u32::from(value) << shift));
+        }
+    }
+
+    /// A `Mmio.Read16`: the installed sub-word seam if any, else the aligned-word HOST sim (0 on a
+    /// device build with no seam installed).
+    #[must_use]
+    pub fn mmio_read16(&self, address: u32) -> u16 {
+        if let Some(read) = self.mmio_read16_fn {
+            return read(address);
+        }
+        #[cfg(not(target_os = "none"))]
+        {
+            let word = self.mmio_sim.get(&(address & !0b11)).copied().unwrap_or(0);
+            (word >> ((address & 0b10) * 8)) as u16
+        }
+        #[cfg(target_os = "none")]
+        0
+    }
+
     /// The HOST simulated MMIO register file, for a test/harness to inspect what a driver wrote.
     #[cfg(not(target_os = "none"))]
     #[must_use]
@@ -560,9 +722,31 @@ impl Vm {
     }
 
     /// Requests that the scheduler park the running thread on socket I/O (a socket op would block):
-    /// register `socket` for `interest`, then wake when the reactor's poll reports it ready.
+    /// register `socket` for `interest`, then wake when the reactor's poll reports it ready. A
+    /// `Read` park on a handle with a receive timeout installed ([`Vm::set_recv_timeout`]) is also
+    /// bounded by that deadline, so a silent peer cannot park the thread forever.
     pub fn request_block_on_io(&mut self, socket: u32, interest: crate::net::Interest) {
-        self.thread_op = Some(ThreadOp::BlockOnIo { socket, interest });
+        let deadline = match interest {
+            crate::net::Interest::Read => self.recv_timeouts.get(&socket).map(|&millis| {
+                self.now_millis()
+                    .map_or(0, |now| now.saturating_add(u64::from(millis)))
+            }),
+            crate::net::Interest::Write => None,
+        };
+        self.thread_op = Some(ThreadOp::BlockOnIo { socket, interest, deadline });
+    }
+
+    /// Installs socket `handle`'s receive timeout in milliseconds (the `Socket.ReceiveTimeout` /
+    /// SO_RCVTIMEO shape); 0 clears it (infinite, the default). While set, each `Read`-interest
+    /// park for the handle wakes by the deadline even if the socket never readies; the woken
+    /// receive op re-polls, still sees WouldBlock, and the managed receive loop owns the expiry
+    /// decision. Send-side parks are unaffected.
+    pub fn set_recv_timeout(&mut self, handle: u32, millis: u32) {
+        if millis == 0 {
+            self.recv_timeouts.remove(&handle);
+        } else {
+            self.recv_timeouts.insert(handle, millis);
+        }
     }
 
     /// The reactor's poll: block until a watched socket is ready or `timeout_ms` elapses, returning
@@ -712,21 +896,87 @@ impl Vm {
         }
     }
 
-    /// Sets the current time the host clock seam reports, as 100-nanosecond ticks since
-    /// the .NET epoch (0001-01-01 00:00:00). The embedder supplies this -- the host from
-    /// `std::time`, a device from its RTC -- and `DateTime.Now`/`UtcNow`/`Today` read it.
-    /// For v1 these are all UTC-based (no timezone), so `Now` and `UtcNow` report the same
-    /// value.
+    /// Sets the current wall time, as 100-nanosecond ticks since the .NET epoch
+    /// (0001-01-01 00:00:00), ANCHORING it to the current monotonic reading so the clock then
+    /// advances with elapsed time. The embedder supplies this -- the host from `std::time`, a
+    /// device from its RTC, or a synced `SystemClock` (SNTP/NTS). For v1 these are all UTC-based
+    /// (no timezone), so `Now` and `UtcNow` report the same value.
     pub fn set_now_ticks(&mut self, ticks: i64) {
-        self.now_ticks = ticks;
+        self.wall_anchor = Some((self.now_millis().unwrap_or(0), ticks));
+        if let Some(sink) = self.wall_sink {
+            sink(ticks);
+        }
     }
 
-    /// The current time in 100-nanosecond ticks since the .NET epoch, as last set by
-    /// [`Vm::set_now_ticks`] (0 -- the epoch -- if never set). The `datetime_now_ticks`
-    /// intrinsic returns this to the managed `DateTime.Now`/`UtcNow`.
+    /// Registers the embedder's wall-clock sink: `sink` is called with the new anchor ticks on
+    /// every [`Vm::set_now_ticks`], and IMMEDIATELY with the current wall reading when the clock
+    /// is already set at registration -- so wiring order (seed the clock, then install the TLS
+    /// backend, or the reverse) never loses a set. The device TLS bridge is the customer: the
+    /// sink mirrors the managed clock into the statics the engine's time source reads, which is
+    /// how "point the TLS time source at the clock `SystemClock` manages" is satisfied on a
+    /// board whose only wall clock IS the managed one (adaptive TLS then full-validates
+    /// certificate dates from the first session after a sync).
+    pub fn set_wall_clock_sink(&mut self, sink: fn(i64)) {
+        self.wall_sink = Some(sink);
+        if self.wall_anchor.is_some() {
+            sink(self.now_ticks());
+        }
+    }
+
+    /// Stores native key material and returns its HANDLE -- the only form the managed tier
+    /// ever holds (a TLS exporter output, an AEAD key). The bytes stay runtime-side.
+    pub fn insert_native_key(&mut self, bytes: Vec<u8>) -> i32 {
+        self.native_keys.push(Some(bytes));
+        (self.native_keys.len() - 1) as i32
+    }
+
+    /// The key bytes behind a native-key handle, or `None` for a bad/released handle.
+    #[must_use]
+    pub fn native_key(&self, handle: i32) -> Option<&[u8]> {
+        usize::try_from(handle)
+            .ok()
+            .and_then(|index| self.native_keys.get(index))
+            .and_then(|slot| slot.as_deref())
+    }
+
+    /// Releases a native key, ZEROIZING its bytes first so the material does not linger on
+    /// the heap. A bad/released handle is a no-op.
+    pub fn drop_native_key(&mut self, handle: i32) {
+        let Ok(index) = usize::try_from(handle) else {
+            return;
+        };
+        if let Some(slot) = self.native_keys.get_mut(index) {
+            if let Some(bytes) = slot.as_mut() {
+                bytes.iter_mut().for_each(|byte| *byte = 0);
+            }
+            *slot = None;
+        }
+    }
+
+    /// The current wall time in 100-nanosecond ticks since the .NET epoch: the value last set by
+    /// [`Vm::set_now_ticks`] PLUS the monotonic time elapsed since that set (so the clock advances),
+    /// or 0 (the epoch) if never set. The `datetime_now_ticks` intrinsic returns this to the managed
+    /// `DateTime.Now`/`UtcNow`.
     #[must_use]
     pub fn now_ticks(&self) -> i64 {
-        self.now_ticks
+        match self.wall_anchor {
+            Some((anchor_ms, anchor_ticks)) => {
+                let elapsed_ms = self.now_millis().unwrap_or(anchor_ms).saturating_sub(anchor_ms);
+                anchor_ticks.saturating_add((elapsed_ms as i64).saturating_mul(10_000))
+            }
+            None => 0,
+        }
+    }
+
+    /// Whether the wall clock has been SET (via [`Vm::set_now_ticks`] -- an RTC, a seed, or a synced
+    /// `SystemClock`) versus never set (reading the epoch). The managed `SystemClock.IsSet` reads
+    /// it, and the adaptive TLS clock policy keys on the SAME clock through the embedder's TLS time
+    /// source (the embedder points both at one clock: full cert-date validation once it is set,
+    /// leap-of-faith only while unset). Kept in the RUNTIME (not a managed static) so it survives
+    /// on AOT without a reference-assembly `.cctor`.
+    #[must_use]
+    pub fn clock_is_set(&self) -> bool {
+        self.wall_anchor.is_some()
     }
 
     /// The monotonic millisecond count truncated to `int` (wrapping like .NET's `Environment.TickCount`,
@@ -1206,10 +1456,12 @@ enum ThreadOp {
     /// Block the running thread until `now` + this many milliseconds (`Thread.Sleep`).
     SleepFor(u64),
     /// Block the running thread on socket I/O: register `socket` for `interest` with the reactor and
-    /// park until its `poll` reports the socket ready (a socket op that would block).
+    /// park until its `poll` reports the socket ready (a socket op that would block). A receive
+    /// timeout, when installed for the socket, bounds the park with a wake `deadline` (monotonic ms).
     BlockOnIo {
         socket: u32,
         interest: crate::net::Interest,
+        deadline: Option<u64>,
     },
 }
 
@@ -1287,9 +1539,11 @@ enum ThreadState {
     /// Sleeping until this monotonic-millisecond deadline (`Thread.Sleep`); woken by the scheduler's
     /// `idle_wait` once the deadline passes.
     Sleeping(u64),
-    /// Blocked on socket I/O -- parked until this socket handle becomes ready. Set by a socket op
-    /// that would block; woken in `idle_wait` when the reactor's poll reports the socket ready.
-    IoWait(u32),
+    /// Blocked on socket I/O -- parked until this socket handle becomes ready, or (when a receive
+    /// timeout bounds the park) until the deadline passes. Set by a socket op that would block;
+    /// woken in `idle_wait` when the reactor's poll reports the socket ready or the deadline hits
+    /// (the managed op then re-polls and decides whether expiry is an error).
+    IoWait(u32, Option<u64>),
     /// Finished (its `result` is set).
     Done,
 }
@@ -1329,19 +1583,27 @@ impl crate::reactor::ReactorEnv for Vm {
 /// and the scheduler stops. The single OS block point / tickless-idle foundation.
 fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
     use crate::reactor::WaitReason;
-    let parks: alloc::vec::Vec<(u32, WaitReason)> = threads
-        .iter()
-        .filter_map(|slot| match slot.state {
-            ThreadState::Sleeping(deadline) => Some((slot.id, WaitReason::Sleep(deadline))),
-            ThreadState::IoWait(handle) => Some((slot.id, WaitReason::Io(handle))),
-            _ => None,
-        })
-        .collect();
+    let mut parks: alloc::vec::Vec<(u32, WaitReason)> = alloc::vec::Vec::new();
+    for slot in threads.iter() {
+        match slot.state {
+            ThreadState::Sleeping(deadline) => parks.push((slot.id, WaitReason::Sleep(deadline))),
+            ThreadState::IoWait(handle, deadline) => {
+                parks.push((slot.id, WaitReason::Io(handle)));
+                if let Some(deadline) = deadline {
+                    parks.push((slot.id, WaitReason::Sleep(deadline)));
+                }
+            }
+            _ => {}
+        }
+    }
     match crate::reactor::block_point(&parks, vm) {
         None => false,
         Some(woken) => {
             for slot in threads.iter_mut() {
                 if woken.contains(&slot.id) {
+                    if let ThreadState::IoWait(handle, Some(_)) = slot.state {
+                        vm.net_deregister(handle);
+                    }
                     slot.state = ThreadState::Ready;
                 }
             }
@@ -1458,11 +1720,11 @@ pub fn run(
                     threads[index].state = ThreadState::Sleeping(deadline);
                     cursor = index + 1;
                 }
-                Some(ThreadOp::BlockOnIo { socket, interest }) => {
+                Some(ThreadOp::BlockOnIo { socket, interest, deadline }) => {
                     if let Some(backend) = vm.net_backend() {
                         backend.register(socket, interest);
                     }
-                    threads[index].state = ThreadState::IoWait(socket);
+                    threads[index].state = ThreadState::IoWait(socket, deadline);
                     cursor = index + 1;
                 }
                 None => cursor = index + 1,
@@ -1524,7 +1786,7 @@ pub struct CodeLocation {
 /// Why a [`Session`] run loop ([`Session::continue_`], [`Session::step_into`],
 /// [`Session::step_over`], [`Session::step_out`]) stopped.
 ///
-/// This is the device-agnostic stop seam: the on-device wireline stub and the host
+/// This is the device-agnostic stop seam: the on-device Lamella Link stub and the host
 /// `lamella-dap` backend both read it. It is the [`Session`]-level counterpart of the
 /// host adapter's `Stop`, kept in the no_std core so a device driver shares it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1575,7 +1837,8 @@ pub struct NamedValue {
 }
 
 /// Whether `value` can be drilled into by [`Session::expand`] -- an object instance with
-/// fields, an array with elements, or a box. A bare scalar cannot.
+/// fields, an array with elements, a box, or an inline value-type instance with fields.
+/// A bare scalar cannot.
 #[must_use]
 fn is_expandable(vm: &Vm, value: &Value) -> bool {
     match value {
@@ -1584,6 +1847,7 @@ fn is_expandable(vm: &Vm, value: &Value) -> bool {
                 || vm.heap().boxed_value(*reference).is_some()
                 || matches!(vm.heap().get(*reference), Some(crate::object::Object::Instance { .. }))
         }
+        Value::Struct(fields) => !fields.is_empty(),
         _ => false,
     }
 }
@@ -1648,7 +1912,7 @@ impl Session {
     /// Enables or disables the breakpoint at `(method, instruction)`, creating it (in the
     /// requested state) if it does not exist. A disabled breakpoint is remembered but does
     /// not pause execution -- the toggle a DAP `setBreakpoints` with `enabled: false`, or a
-    /// wireline `Disable`, maps to.
+    /// Lamella Link `Disable`, maps to.
     pub fn set_breakpoint_enabled(&mut self, method: MethodId, instruction: u32, enabled: bool) {
         self.breakpoints.insert((method, instruction), enabled);
     }
@@ -1851,7 +2115,7 @@ impl Session {
 
     /// Resumes until an enabled breakpoint, an unhandled exception
     /// ([`Session::set_pause_on_unhandled_exception`]), or completion -- the device-agnostic
-    /// "continue" the wireline and `lamella-dap` both drive. Unlike [`Session::resume`], it
+    /// "continue" the Lamella Link and `lamella-dap` both drive. Unlike [`Session::resume`], it
     /// reports *why* it stopped and *where* via a [`Stop`], and (when enabled) pauses on an
     /// unhandled exception rather than trapping. It steps off a breakpoint it is already
     /// sitting on before running, so a repeated `continue_` makes progress.
@@ -1994,13 +2258,25 @@ impl Session {
     }
 
     /// Expands an inspectable `value` into its constituents for a debugger's variable tree:
-    /// an object instance's fields (`fieldN` by slot), an array's elements (`[i]`), or a
-    /// box's single inner value. A scalar (or any value that is not a heap aggregate) expands
-    /// to nothing. `vm` owns the heap the references point into. This is the read side of
-    /// variable drill-down the wireline and the DAP `variables` request both use. (Instance
-    /// field *names* live in metadata a driver can layer on; the core names them by slot.)
+    /// an object instance's fields (`fieldN` by slot), an array's elements (`[i]`), a
+    /// box's single inner value, or an INLINE value-type instance's fields (`fieldN` -- a
+    /// struct local/argument is a [`Value::Struct`], not a heap reference). A scalar
+    /// expands to nothing. `vm` owns the heap the references point into. This is the read
+    /// side of variable drill-down the Lamella Link and the DAP `variables` request both use.
+    /// (Instance field *names* live in metadata a driver can layer on; the core names them
+    /// by slot.)
     #[must_use]
     pub fn expand(&self, vm: &Vm, value: &Value) -> Vec<NamedValue> {
+        if let Value::Struct(fields) = value {
+            return fields
+                .iter()
+                .enumerate()
+                .map(|(slot, value)| NamedValue {
+                    name: alloc::format!("field{slot}"),
+                    value: value.clone(),
+                })
+                .collect();
+        }
         let Value::Object(reference) = value else {
             return Vec::new();
         };
@@ -6314,6 +6590,95 @@ mod tests {
 
     fn run(code: Vec<Instruction>) -> Result<Option<Value>, Trap> {
         run_method(&method(code), Vec::new())
+    }
+
+    #[test]
+    fn wall_clock_advances_from_its_set_anchor() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        static MONO_MS: AtomicU64 = AtomicU64::new(1000);
+        fn mono_ms() -> u64 {
+            MONO_MS.load(Ordering::Relaxed)
+        }
+        fn no_sleep(_ms: u64) {}
+
+        let mut vm = Vm::default();
+        assert_eq!(vm.now_ticks(), 0);
+
+        vm.set_clock(mono_ms, no_sleep);
+        let base = 637_000_000_000_000_000i64;
+        vm.set_now_ticks(base);
+        assert_eq!(vm.now_ticks(), base);
+
+        MONO_MS.store(6000, Ordering::Relaxed);
+        assert_eq!(vm.now_ticks(), base + 5000 * 10_000);
+    }
+
+    #[test]
+    fn wall_clock_sink_observes_every_set_and_a_late_registration() {
+        use core::sync::atomic::{AtomicI64, Ordering};
+        static SEEN: AtomicI64 = AtomicI64::new(0);
+        fn sink(ticks: i64) {
+            SEEN.store(ticks, Ordering::Relaxed);
+        }
+
+        let mut vm = Vm::default();
+        vm.set_wall_clock_sink(sink);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 0);
+
+        vm.set_now_ticks(637_000_000_000_000_000);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 637_000_000_000_000_000);
+        vm.set_now_ticks(638_000_000_000_000_000);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 638_000_000_000_000_000);
+
+        SEEN.store(0, Ordering::Relaxed);
+        let mut seeded = Vm::default();
+        seeded.set_now_ticks(639_000_000_000_000_000);
+        seeded.set_wall_clock_sink(sink);
+        assert_eq!(SEEN.load(Ordering::Relaxed), 639_000_000_000_000_000);
+    }
+
+    #[test]
+    fn native_keys_are_handle_only_and_zeroized_on_release() {
+        let mut vm = Vm::default();
+        let first = vm.insert_native_key(alloc::vec![0xAA; 32]);
+        let second = vm.insert_native_key(alloc::vec![0xBB; 16]);
+        assert_ne!(first, second);
+        assert_eq!(vm.native_key(first), Some(&[0xAA; 32][..]));
+        assert_eq!(vm.native_key(second), Some(&[0xBB; 16][..]));
+        vm.drop_native_key(first);
+        assert_eq!(vm.native_key(first), None);
+        assert_eq!(vm.native_key(second), Some(&[0xBB; 16][..]));
+        vm.drop_native_key(first);
+        vm.drop_native_key(-1);
+        assert_eq!(vm.native_key(-1), None);
+    }
+
+    #[test]
+    fn subword_mmio_sim_is_aligned_word_coherent() {
+        let mut vm = Vm::new();
+
+        vm.mmio_write8(0x4100_44B5, 0x33);
+        assert_eq!(vm.mmio_read8(0x4100_44B5), 0x33);
+
+        vm.mmio_write8(0x2000_0000, 0x11);
+        vm.mmio_write8(0x2000_0001, 0x22);
+        vm.mmio_write8(0x2000_0002, 0x33);
+        vm.mmio_write8(0x2000_0003, 0x44);
+        assert_eq!(vm.mmio_read(0x2000_0000), 0x4433_2211);
+        assert_eq!(vm.mmio_read8(0x2000_0002), 0x33);
+        assert_eq!(vm.mmio_read8(0x2000_0011), 0x00);
+
+        vm.mmio_write16(0x4000_0C02, 0x4018);
+        assert_eq!(vm.mmio_read16(0x4000_0C02), 0x4018);
+        assert_eq!(vm.mmio_read16(0x4000_0C00), 0x0000);
+        assert_eq!(vm.mmio_read(0x4000_0C00), 0x4018_0000);
+
+        vm.mmio_write16(0x2000_0100, 0xBEEF);
+        assert_eq!(vm.mmio_read8(0x2000_0100), 0xEF);
+        assert_eq!(vm.mmio_read8(0x2000_0101), 0xBE);
+
+        vm.mmio_write(0x4003_1084, 0x4031_0084);
+        assert_eq!(vm.mmio_read(0x4003_1084), 0x4031_0084);
     }
 
     #[test]

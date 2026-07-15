@@ -24,10 +24,10 @@ lamella-load = { path = "../lamella-load", optional = true }
 lamella-metadata = { path = "../lamella-metadata", optional = true }
 # Source mapping rebuilds method tokens to resolve a PDB rid to the interpreter's MethodId.
 lamella-token = { path = "../lamella-token", optional = true }
-# The wireline REPL engine (engine::Repl + the ReplCompiler/ReplLink seams) backs the Debug
+# The Lamella Link REPL engine (engine::Repl + the ReplCompiler/ReplLink seams) backs the Debug
 # Console `evaluate` handler; lamella-wire supplies TransportError for the in-process ReplLink,
 # and lamella-assemble is the compile seam.
-lamella-wireline = { path = "../lamella-wireline", default-features = false, features = ["repl-host"], optional = true }
+lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = ["repl-host"], optional = true }
 lamella-wire = { path = "../lamella-wire", optional = true }
 lamella-assemble = { path = "../lamella-assemble", optional = true }
 
@@ -41,7 +41,7 @@ interpreter = [
     "dep:lamella-load",
     "dep:lamella-metadata",
     "dep:lamella-token",
-    "dep:lamella-wireline",
+    "dep:lamella-wire-host",
     "dep:lamella-wire",
     "dep:lamella-assemble",
     # The host debugger renders the full value model, so it opts into the same full-compliance
@@ -50,14 +50,14 @@ interpreter = [
     "lamella-cil-runtime/typed-references",
 ]
 
-# The wireline DEVICE server: DAP-JSON over stdio on one side, wireline frames over a serial
+# The Lamella Link DEVICE server: DAP-JSON over stdio on one side, Lamella Link frames over a serial
 # port OR the board's native driverless-WinUSB device on the other -- the on-device interpreter
-# debugged from VS Code with zero adapter changes (WirelineBackend implements the same DebugBackend seam).
-wireline-device = [
-    "dep:lamella-wireline",
-    "lamella-wireline/serial",
-    "lamella-wireline/usb",
-    "lamella-wireline/debug-backend",
+# debugged from VS Code with zero adapter changes (WireHostBackend implements the same DebugBackend seam).
+link-device = [
+    "dep:lamella-wire-host",
+    "lamella-wire-host/serial",
+    "lamella-wire-host/usb",
+    "lamella-wire-host/debug-backend",
 ]
 
 # The CIL server binary needs the interpreter; a device server is a separate binary.
@@ -69,7 +69,7 @@ required-features = ["interpreter"]
 [[bin]]
 name = "lamella-dap-wire"
 path = "src/bin/lamella-dap-wire.rs"
-required-features = ["wireline-device"]
+required-features = ["link-device"]
 
 [dev-dependencies]
 lamella-assemble = { path = "../lamella-assemble" }

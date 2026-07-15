@@ -39,7 +39,7 @@ pub fn parse_expression(source: &str) -> ParsedExpression {
     let expr = parser.parse_expression();
     ParsedExpression {
         expr,
-        diagnostics: parser.diagnostics,
+        diagnostics: without_gated_operator_cascades(parser.diagnostics),
     }
 }
 
@@ -60,7 +60,7 @@ pub fn parse_statement(source: &str) -> ParsedStatement {
     let statement = parser.parse_statement();
     ParsedStatement {
         statement,
-        diagnostics: parser.diagnostics,
+        diagnostics: without_gated_operator_cascades(parser.diagnostics),
     }
 }
 
@@ -92,7 +92,7 @@ pub fn parse_compilation_unit_with(
     let unit = parser.parse_compilation_unit();
     ParsedCompilationUnit {
         unit,
-        diagnostics: parser.diagnostics,
+        diagnostics: without_gated_operator_cascades(parser.diagnostics),
     }
 }
 
@@ -134,7 +134,7 @@ pub fn parse_submission(source: &str) -> ParsedSubmission {
         types,
         statements,
         trailing,
-        diagnostics: parser.diagnostics,
+        diagnostics: without_gated_operator_cascades(parser.diagnostics),
     }
 }
 
@@ -954,8 +954,15 @@ impl Parser {
         let start = self.current().span.start;
         let usings = self.parse_using_directives();
         let mut members = Vec::new();
+        let mut global_attributes = Vec::new();
         while !matches!(self.current().kind, TokenKind::EndOfFile) {
             let before = self.position;
+            if self.current_punctuator() == Some(Punctuator::OpenBracket)
+                && self.is_global_attribute_target()
+            {
+                global_attributes.push(self.parse_attribute_section());
+                continue;
+            }
             members.push(self.parse_namespace_member());
             if self.position == before {
                 self.bump();
@@ -965,9 +972,30 @@ impl Parser {
         CompilationUnit {
             usings,
             members,
+            global_attributes,
             span: Span::new(start, end),
             defined_symbols: core::mem::take(&mut self.defined_symbols),
         }
+    }
+
+    /// Whether the attribute section starting at the current `[` targets `assembly` or `module`
+    /// (24.2) -- a global attribute attaching to the assembly/module manifest, not a following
+    /// declaration. A 2-token lookahead (`[ assembly|module :`), so a member's `[Attr]` is left
+    /// for the normal member-attribute path.
+    fn is_global_attribute_target(&self) -> bool {
+        let target = self
+            .tokens
+            .get(self.position + 1)
+            .and_then(|token| match &token.kind {
+                TokenKind::Identifier(text) => Some(&**text),
+                TokenKind::Keyword(keyword) => Some(keyword.as_str()),
+                _ => None,
+            });
+        matches!(target, Some("assembly") | Some("module"))
+            && matches!(
+                self.tokens.get(self.position + 2).map(|token| &token.kind),
+                Some(TokenKind::Punctuator(Punctuator::Colon))
+            )
     }
 
     /// Parses a run of leading `using` directives (16.3).
@@ -983,6 +1011,18 @@ impl Parser {
     fn parse_using_directive(&mut self) -> UsingDirective {
         let start = self.current().span.start;
         self.bump();
+        if self.current_keyword() == Some(Keyword::Static) {
+            self.report(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: crate::version::Feature::UsingStatic.description(),
+                    required: crate::version::Feature::UsingStatic
+                        .introduced_in()
+                        .display_name(),
+                },
+                Span::empty_at(self.current().span.start),
+            );
+            self.bump();
+        }
         let kind = if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::Equals)
         {
@@ -1541,6 +1581,27 @@ impl Parser {
             }
             let accessor_start = self.current().span.start;
             let attributes = self.parse_attribute_sections();
+            if matches!(
+                self.current_keyword(),
+                Some(Keyword::Public | Keyword::Protected | Keyword::Internal | Keyword::Private)
+            ) {
+                let at = self.current().span.start;
+                self.report(
+                    DiagnosticKind::FeatureRequiresLaterVersion {
+                        feature: crate::version::Feature::AccessorAccessibility.description(),
+                        required: crate::version::Feature::AccessorAccessibility
+                            .introduced_in()
+                            .display_name(),
+                    },
+                    Span::empty_at(at),
+                );
+                while matches!(
+                    self.current_keyword(),
+                    Some(Keyword::Public | Keyword::Protected | Keyword::Internal | Keyword::Private)
+                ) {
+                    self.bump();
+                }
+            }
             let is_getter = match self.current_identifier_text() {
                 Some("get") => true,
                 Some("set") => false,
@@ -1906,7 +1967,21 @@ impl Parser {
                 _ => None,
             };
             let ty = self.parse_type();
-            let (name, end) = self.expect_identifier();
+            let (name, mut end) = self.expect_identifier();
+            if self.current_punctuator() == Some(Punctuator::Equals) {
+                let at = self.current().span.start;
+                self.report(
+                    DiagnosticKind::FeatureRequiresLaterVersion {
+                        feature: crate::version::Feature::DefaultParameterValues.description(),
+                        required: crate::version::Feature::DefaultParameterValues
+                            .introduced_in()
+                            .display_name(),
+                    },
+                    Span::empty_at(at),
+                );
+                self.bump();
+                end = self.parse_expression().span.end;
+            }
             parameters.push(Parameter {
                 modifier,
                 ty,
@@ -1981,7 +2056,7 @@ impl Parser {
             if RELATIONAL >= minimum {
                 if let Some(operation) = type_test_operation(&self.current().kind) {
                     self.bump();
-                    let target = self.parse_type();
+                    let target = self.parse_type_inner(false);
                     let span = Span::new(left.span.start, target.span.end);
                     left = Expr::new(
                         ExprKind::TypeTest {
@@ -2372,6 +2447,27 @@ impl Parser {
                     .expect("the guard checked it is a predefined type");
                 Expr::new(ExprKind::PredefinedType(predefined), span)
             }
+            TokenKind::Keyword(Keyword::Delegate) => {
+                self.report(
+                    DiagnosticKind::FeatureRequiresLaterVersion {
+                        feature: crate::version::Feature::AnonymousMethods.description(),
+                        required: crate::version::Feature::AnonymousMethods
+                            .introduced_in()
+                            .display_name(),
+                    },
+                    Span::empty_at(span.start),
+                );
+                self.bump();
+                if self.current_punctuator() == Some(Punctuator::OpenParen) {
+                    self.skip_balanced(Punctuator::OpenParen, Punctuator::CloseParen);
+                }
+                let end = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                    self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace)
+                } else {
+                    span.end
+                };
+                Expr::new(ExprKind::Error, Span::new(span.start, end))
+            }
             _ => {
                 self.report(DiagnosticKind::ExpressionExpected, span);
                 Expr::new(ExprKind::Error, Span::empty_at(span.start))
@@ -2390,6 +2486,22 @@ impl Parser {
         }
         loop {
             let before = self.position;
+            if matches!(self.current().kind, TokenKind::Identifier(_))
+                && self.next_is(Punctuator::Colon)
+            {
+                let at = self.current().span.start;
+                self.report(
+                    DiagnosticKind::FeatureRequiresLaterVersion {
+                        feature: crate::version::Feature::NamedArguments.description(),
+                        required: crate::version::Feature::NamedArguments
+                            .introduced_in()
+                            .display_name(),
+                    },
+                    Span::empty_at(at),
+                );
+                self.bump();
+                self.bump();
+            }
             let ref_out = match self.current_keyword() {
                 Some(Keyword::Ref) => {
                     self.bump();
@@ -2493,6 +2605,13 @@ impl Parser {
     }
 
     fn parse_type(&mut self) -> TypeRef {
+        self.parse_type_inner(true)
+    }
+
+    /// Parses a type (clause 11). `allow_nullable` gates the C# 2.0 nullable suffix `T?`: it is on
+    /// for ordinary type positions (declarations, casts, `typeof`) and OFF for the `is`/`as` target,
+    /// where a trailing `?` is the conditional operator (`x is int ? a : b`) not a nullable type.
+    fn parse_type_inner(&mut self, allow_nullable: bool) -> TypeRef {
         let mut base = self.parse_non_array_type();
         let start = base.span.start;
         while !matches!(base.kind, TypeRefKind::Error)
@@ -2501,6 +2620,22 @@ impl Parser {
             let end = self.current().span.end;
             self.bump();
             base = TypeRef::new(TypeRefKind::Pointer(Box::new(base)), Span::new(start, end));
+        }
+        if allow_nullable
+            && self.current_punctuator() == Some(Punctuator::Question)
+            && matches!(&base.kind, TypeRefKind::Predefined(p) if is_predefined_value_type(*p))
+        {
+            let at = self.current().span.start;
+            self.report(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: crate::version::Feature::NullableValueTypes.description(),
+                    required: crate::version::Feature::NullableValueTypes
+                        .introduced_in()
+                        .display_name(),
+                },
+                Span::empty_at(at),
+            );
+            self.bump();
         }
         let mut ranks = Vec::new();
         while let Some(rank) = self.try_rank_specifier() {
@@ -2527,12 +2662,28 @@ impl Parser {
     /// Array initializers (`{ ... }`) are not parsed yet.
     fn parse_new(&mut self, start: u32) -> Expr {
         self.bump();
+        if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+            self.report(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: crate::version::Feature::AnonymousObjectCreation.description(),
+                    required: crate::version::Feature::AnonymousObjectCreation
+                        .introduced_in()
+                        .display_name(),
+                },
+                Span::empty_at(start),
+            );
+            let end = self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace);
+            return Expr::new(ExprKind::Error, Span::new(start, end));
+        }
         let element = self.parse_non_array_type();
         match self.current_punctuator() {
             Some(Punctuator::OpenParen) => {
                 self.bump();
-                let (arguments, end) = self
+                let (arguments, mut end) = self
                     .parse_arguments(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+                if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+                    end = self.gate_object_initializer();
+                }
                 Expr::new(
                     ExprKind::ObjectCreation {
                         target: element,
@@ -2542,6 +2693,16 @@ impl Parser {
                 )
             }
             Some(Punctuator::OpenBracket) => self.parse_array_creation(start, element),
+            Some(Punctuator::OpenBrace) => {
+                let end = self.gate_object_initializer();
+                Expr::new(
+                    ExprKind::ObjectCreation {
+                        target: element,
+                        arguments: Vec::new(),
+                    },
+                    Span::new(start, end),
+                )
+            }
             _ => {
                 let end = self.expect(
                     Punctuator::OpenParen,
@@ -2556,6 +2717,24 @@ impl Parser {
                 )
             }
         }
+    }
+
+    /// Reports the C# 3.0 object/collection-initializer gate (CS8022) at the current `{`, then
+    /// skips the balanced `{ ... }` and returns the offset past its `}`. Strict C# 1.0 has no
+    /// initializer, so a gated `new T { ... }` / `new T(args) { ... }` recovers to a plain object
+    /// creation instead of cascading. Shared by the parenless and argument-list `new` arms.
+    fn gate_object_initializer(&mut self) -> u32 {
+        let at = self.current().span.start;
+        self.report(
+            DiagnosticKind::FeatureRequiresLaterVersion {
+                feature: crate::version::Feature::ObjectAndCollectionInitializers.description(),
+                required: crate::version::Feature::ObjectAndCollectionInitializers
+                    .introduced_in()
+                    .display_name(),
+            },
+            Span::empty_at(at),
+        );
+        self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace)
     }
 
     /// Parses the bracket part of an array creation, with the scanner at the
@@ -2637,7 +2816,78 @@ impl Parser {
             parts.push(part);
             end = part_end;
         }
+        if self.current_punctuator() == Some(Punctuator::LessThan) {
+            let at = self.current().span.start;
+            self.report(
+                DiagnosticKind::FeatureRequiresLaterVersion {
+                    feature: crate::version::Feature::Generics.description(),
+                    required: crate::version::Feature::Generics
+                        .introduced_in()
+                        .display_name(),
+                },
+                Span::empty_at(at),
+            );
+            end = self.skip_type_argument_list();
+        }
         TypeRef::new(TypeRefKind::Name(parts), Span::new(start, end))
+    }
+
+    /// Skips a generic type-argument list `< ... >` from the current `<`, balancing nested `<`/`>`
+    /// (a `>>` right-shift token closes two levels). Returns the offset past the last `>`. Recovery
+    /// after the CS8022 generics gate so the rest of the declaration still parses.
+    fn skip_type_argument_list(&mut self) -> u32 {
+        let mut depth = 0i32;
+        let mut end = self.current().span.end;
+        loop {
+            if matches!(self.current().kind, TokenKind::EndOfFile) {
+                return end;
+            }
+            end = self.current().span.end;
+            let punct = self.current_punctuator();
+            self.bump();
+            match punct {
+                Some(Punctuator::LessThan) => depth += 1,
+                Some(Punctuator::GreaterThan) => {
+                    depth -= 1;
+                    if depth <= 0 {
+                        return end;
+                    }
+                }
+                Some(Punctuator::GreaterThanGreaterThan) => {
+                    depth -= 2;
+                    if depth <= 0 {
+                        return end;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Skips a balanced `open` ... `close` group starting at the current `open` token, counting
+    /// nested pairs, and returns the offset past the matching `close` (or end-of-file). Recovery
+    /// for a gated construct (an anonymous method's body, an object initializer) so the rest of the
+    /// enclosing statement still parses. Brace/paren pairs never span a string or comment -- those
+    /// are single tokens by the time the parser sees them -- so a token-level count is exact.
+    fn skip_balanced(&mut self, open: Punctuator, close: Punctuator) -> u32 {
+        let mut depth = 0u32;
+        let mut end = self.current().span.end;
+        loop {
+            if matches!(self.current().kind, TokenKind::EndOfFile) {
+                return end;
+            }
+            end = self.current().span.end;
+            let punct = self.current_punctuator();
+            self.bump();
+            if punct == Some(open) {
+                depth += 1;
+            } else if punct == Some(close) {
+                depth -= 1;
+                if depth == 0 {
+                    return end;
+                }
+            }
+        }
     }
 
     /// Consumes an array rank-specifier `[` `,`* `]` if one begins here, returning
@@ -2700,6 +2950,48 @@ fn predefined_type(kind: &TokenKind) -> Option<PredefinedType> {
         Keyword::Void => PredefinedType::Void,
         _ => return None,
     })
+}
+
+/// Drops the parser cascade a gated post-1.0 operator provokes, leaving only its feature diagnostic.
+/// A gated operator (`=>`, `??`, `::`, `?.`, `?[`) tokenizes as an opaque `Unknown` after the lexer
+/// has already reported CS8022 for it; the parser, not recognizing the token, then adds a secondary
+/// CS1xxx at the SAME byte offset. csc reports only the feature diagnostic there, so a non-CS8022
+/// diagnostic that shares an offset with a CS8022 is the cascade the gate already explains -- remove
+/// it. Diagnostics at any OTHER offset are untouched, so a genuinely unexpected character (also
+/// `Unknown`, but CS1056 with no CS8022 at its offset) keeps its normal report.
+fn without_gated_operator_cascades(mut diagnostics: Vec<Diagnostic>) -> Vec<Diagnostic> {
+    let gated: Vec<u32> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code() == 8022)
+        .map(|diagnostic| diagnostic.span.start)
+        .collect();
+    if gated.is_empty() {
+        return diagnostics;
+    }
+    diagnostics.retain(|diagnostic| diagnostic.code() == 8022 || !gated.contains(&diagnostic.span.start));
+    diagnostics
+}
+
+/// Whether `ty` is one of the predefined VALUE types -- the ones with a nullable form `T?` (C# 2.0).
+/// The predefined reference types (`string`, `object`) and `void` are excluded: `string?`/`object?`
+/// are nullable reference types (a separate, later feature) and `void?` is meaningless.
+fn is_predefined_value_type(ty: PredefinedType) -> bool {
+    matches!(
+        ty,
+        PredefinedType::Bool
+            | PredefinedType::Byte
+            | PredefinedType::Sbyte
+            | PredefinedType::Short
+            | PredefinedType::Ushort
+            | PredefinedType::Int
+            | PredefinedType::Uint
+            | PredefinedType::Long
+            | PredefinedType::Ulong
+            | PredefinedType::Char
+            | PredefinedType::Float
+            | PredefinedType::Double
+            | PredefinedType::Decimal
+    )
 }
 
 /// Maps a punctuator to the prefix unary operator it spells, if any (14.6).
@@ -4127,6 +4419,69 @@ mod tests {
     }
 
     #[test]
+    fn global_assembly_and_module_attributes_parse_and_collect() {
+        assert_eq!(unit_codes("[assembly: Foo(\"x\")] class C {}"), []);
+        let parsed = parse_compilation_unit("[assembly: A] [module: B] class C {} class D {}");
+        assert!(parsed.diagnostics.is_empty());
+        assert_eq!(parsed.unit.members.len(), 2);
+        assert_eq!(parsed.unit.global_attributes.len(), 2);
+        assert_eq!(parsed.unit.global_attributes[0].target.as_deref(), Some("assembly"));
+        assert_eq!(parsed.unit.global_attributes[1].target.as_deref(), Some("module"));
+        let parsed = parse_compilation_unit("[Serializable] class C {}");
+        assert!(parsed.unit.global_attributes.is_empty());
+        assert_eq!(parsed.unit.members.len(), 1);
+    }
+
+    #[test]
+    fn post_1_0_features_report_cs8022() {
+        assert_eq!(unit_codes("class C { System.Collections.Generic.List<int> f; }"), [8022]);
+        assert_eq!(unit_codes("class C : System.Collections.Generic.List<int> { }"), [8022]);
+        assert_eq!(
+            unit_codes(
+                "class C { System.Collections.Generic.List<System.Collections.Generic.List<int>> f; }"
+            ),
+            [8022]
+        );
+        assert_eq!(unit_codes("class C { object M(object a) { return a ?? a; } }"), [8022]);
+        assert_eq!(unit_codes("class C { void M() { int x = A::B; } }"), [8022]);
+        assert_eq!(unit_codes("class C { void M(string a) { a?.ToString(); } }"), [8022]);
+        assert_eq!(unit_codes("class C { int P; int Q => 5; }"), [8022]);
+        assert!(unit_codes("class C { void M() { System.Func<int,int> f = x => x; } }").contains(&8022));
+        assert_eq!(unit_codes("class C { void M() { D d = delegate { }; } }"), [8022]);
+        assert_eq!(
+            unit_codes("class C { void M() { D d = delegate (int x) { return x + 1; }; } }"),
+            [8022]
+        );
+        assert_eq!(unit_codes("using static System.Math; class C { }"), [8022]);
+        assert_eq!(unit_codes("class C { C M() { return new C() { F = 1 }; } }"), [8022]);
+        assert_eq!(unit_codes("class C { C M() { return new C { F = 1 }; } }"), [8022]);
+        assert_eq!(unit_codes("class C { object M() { return new { A = 1 }; } }"), [8022]);
+        assert_eq!(unit_codes("class C { void M(int x = 5) { } }"), [8022]);
+        assert_eq!(unit_codes("class C { void M(int x) { } void N() { M(x: 5); } }"), [8022]);
+        assert_eq!(
+            unit_codes(
+                "class C { int f; public int P { get { return f; } private set { f = value; } } }"
+            ),
+            [8022]
+        );
+        assert_eq!(unit_codes("class C { int? f; }"), [8022]);
+        assert_eq!(unit_codes("class C { int? M() { return 0; } }"), [8022]);
+        assert_eq!(unit_codes("class C { void M(int? x) { } }"), [8022]);
+        assert_eq!(unit_codes("class C { object M(int x) { return (int?)x; } }"), [8022]);
+        assert_eq!(unit_codes("class C { System.Type M() { return typeof(int?); } }"), [8022]);
+        assert!(
+            !unit_codes("class C { bool M(object x, bool a, bool b) { return x is int ? a : b; } }")
+                .contains(&8022)
+        );
+        assert!(
+            !unit_codes("class C { int M(bool Foo, int a, int c) { return Foo ? a : c; } }")
+                .contains(&8022)
+        );
+        assert!(!unit_codes("class C { void M() { int[] a = new int[] { 1, 2 }; } }").contains(&8022));
+        assert!(!unit_codes("class C { int F() { return 1; } }").contains(&8022));
+    }
+
+    #[test]
     fn an_invalid_token_in_a_member_declaration_is_cs1519() {
         assert_eq!(unit_codes("class C { public static void }"), vec![1519]);
         assert_eq!(unit_codes("class C { int 5x; }"), vec![1519, 1519]);
@@ -4535,6 +4890,34 @@ mod tests {
         assert_eq!(
             unit_tree("namespace N { class C { delegate void D(); } }"),
             "(namespace N (class C (delegate void D ())))"
+        );
+    }
+
+    /// A deeply nested expression recurses the parser as deep as the input nests. The compiler
+    /// drivers (lcsc and the compile-file harness) compile on a large-stack worker thread so this
+    /// cannot overflow the small default main-thread stack. Parsing the same shape here on a
+    /// thread with a generous stack -- the default test-thread stack (about 2 MiB) would itself
+    /// overflow -- confirms the parser carries no pathological per-frame cost. Both the parse and
+    /// the deep tree's recursive drop run on the worker, so only the diagnostic count crosses back.
+    #[test]
+    fn a_deeply_nested_expression_parses_on_a_generous_stack() {
+        let depth = 3000;
+        let mut source = String::from("class C { void M() { int x = ");
+        source.push_str(&"(".repeat(depth));
+        source.push('1');
+        source.push_str(&")".repeat(depth));
+        source.push_str("; } }");
+
+        let diagnostic_count = std::thread::Builder::new()
+            .stack_size(256 * 1024 * 1024)
+            .spawn(move || parse_compilation_unit(&source).diagnostics.len())
+            .expect("spawn a generous-stack parse thread")
+            .join()
+            .expect("the deep-nesting parse thread panicked");
+
+        assert_eq!(
+            diagnostic_count, 0,
+            "a balanced deeply nested expression parses without a syntax error"
         );
     }
 }

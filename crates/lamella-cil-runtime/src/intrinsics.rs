@@ -464,6 +464,26 @@ pub fn string_concat(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Op
     Ok(Some(Value::Object(reference)))
 }
 
+/// `String.Intern(str)` (via the corlib's null-checked wrapper): the canonical interned string for
+/// the argument's content -- allocated into the intern pool on first sight, so every `Intern` (and
+/// `ldstr`) of the same characters returns the SAME object. The managed wrapper guards null.
+pub fn string_intern(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    let reference = vm.heap_mut().intern_string(&chars);
+    Ok(Some(Value::Object(reference)))
+}
+
+/// `String.IsInterned(str)` (via the corlib's null-checked wrapper): the interned string equal to
+/// the argument's content if one is ALREADY in the pool, else `null` -- a query that never
+/// allocates or adds (unlike [`string_intern`]).
+pub fn string_is_interned(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let chars = string_arg_chars(vm, args.first())?;
+    match vm.heap().interned(&chars) {
+        Some(reference) => Ok(Some(Value::Object(reference))),
+        None => Ok(Some(Value::Null)),
+    }
+}
+
 /// `System.String.get_Length` (the `Length` property): the number of UTF-16 code
 /// units. The string is the implicit `this`, the only argument.
 ///
@@ -755,6 +775,36 @@ pub fn datetime_now_ticks(
     _args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     Ok(Some(Value::Int64(vm.now_ticks())))
+}
+
+/// `Lamella.Runtime.Clock.SetTicks(long ticks)`: installs the wall clock to `ticks` (100 ns since
+/// the .NET epoch), ANCHORED to the current monotonic reading so it then advances -- the corlib
+/// write-side twin of `DateTime.NowTicks`, the sink a synced `SystemClock` (SNTP/NTS) writes, the
+/// same [`Vm::set_now_ticks`] a device does from its RTC.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the argument is not a 64-bit integer.
+pub fn clock_set_ticks(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int64(ticks)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    vm.set_now_ticks(ticks);
+    Ok(None)
+}
+
+/// `Lamella.Runtime.Clock.IsSet()` -> `1` if the wall clock has been set (RTC / seed / sync), else
+/// `0` (never set -> reading the epoch). The adaptive TLS clock policy keys on this (full
+/// cert-date validation when set, leap-of-faith only when unset).
+pub fn clock_is_set(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(vm.clock_is_set()))))
 }
 
 /// The additional NETMFv4_4-profile BCL surface, beyond the ECMA-335 Kernel
@@ -3548,16 +3598,37 @@ pub fn socket_local_port(
     Ok(Some(Value::Int32(port.map_or(-1, i32::from))))
 }
 
-/// `Socket.CloseSocket(int handle)`: closes a socket or listener and releases its handle.
+/// `Socket.CloseSocket(int handle)`: closes a socket or listener and releases its handle. Any
+/// receive timeout installed for the handle is dropped with it, so a recycled handle starts
+/// with the infinite default.
 pub fn socket_close(
     vm: &mut Vm,
     _module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let handle = socket_arg(args, 0)?;
+    vm.set_recv_timeout(handle, 0);
     if let Some(backend) = vm.net_backend() {
         backend.close(handle);
     }
+    Ok(None)
+}
+
+/// `Socket.SetRecvTimeout(int handle, int millis)`: installs the socket's receive timeout (the
+/// `Socket.ReceiveTimeout` / SO_RCVTIMEO shape; 0 = infinite, the default). The runtime bounds a
+/// `Read`-interest park by the deadline so a silent peer cannot park the thread forever; the woken
+/// receive op re-polls, still sees WouldBlock, and the MANAGED receive loop owns the expiry
+/// decision (its `SocketException`).
+pub fn socket_set_recv_timeout(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let Some(&Value::Int32(millis)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    vm.set_recv_timeout(handle, millis.max(0) as u32);
     Ok(None)
 }
 
@@ -3742,6 +3813,104 @@ pub fn dns_resolve_host(
             .array_set(lengths, i, Value::Int32(address.len() as i32));
     }
     Ok(Some(Value::Int32(count as i32)))
+}
+
+
+/// Fetches interface `index` (arg 0) from the backend, or `None` (no backend, or `index` out of range).
+fn iface_info_arg(vm: &mut Vm, args: &[Value]) -> Option<crate::net::InterfaceInfo> {
+    let &Value::Int32(index) = args.first()? else {
+        return None;
+    };
+    let index = u32::try_from(index).ok()?;
+    vm.net_backend()?.interface_info(index)
+}
+
+/// `NetworkInterface.NetworkAvailable()` -> `1` if any interface has a usable connection, else `0`.
+pub fn net_is_available(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let available = match vm.net_backend() {
+        Some(backend) => backend.network_available(),
+        None => false,
+    };
+    Ok(Some(Value::Int32(i32::from(available))))
+}
+
+/// `NetworkInterface.InterfaceCount()` -> the number of interfaces the backend exposes.
+pub fn net_iface_count(
+    vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let count = match vm.net_backend() {
+        Some(backend) => backend.interface_count(),
+        None => 0,
+    };
+    Ok(Some(Value::Int32(count as i32)))
+}
+
+/// `NetworkInterface.OperStatus(int index)` -> the .NET `OperationalStatus` integer (`Unknown` if gone).
+pub fn net_iface_oper_status(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let status = iface_info_arg(vm, args)
+        .map_or(crate::net::OperStatus::Unknown as i32, |info| info.oper_status as i32);
+    Ok(Some(Value::Int32(status)))
+}
+
+/// `NetworkInterface.IfaceType(int index)` -> the .NET `NetworkInterfaceType` (IANA ifType) integer.
+pub fn net_iface_type(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let kind = iface_info_arg(vm, args)
+        .map_or(crate::net::IfaceKind::Unknown as i32, |info| info.kind as i32);
+    Ok(Some(Value::Int32(kind)))
+}
+
+/// `NetworkInterface.IPv4(int index)` -> the address's four big-endian octets packed (`0` = none).
+pub fn net_iface_ipv4(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let packed = iface_info_arg(vm, args).map_or(0, |info| i32::from_be_bytes(info.ipv4));
+    Ok(Some(Value::Int32(packed)))
+}
+
+/// `NetworkInterface.Ipv4Mask(int index)` -> the subnet mask's four big-endian octets packed.
+pub fn net_iface_subnet(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let packed = iface_info_arg(vm, args).map_or(0, |info| i32::from_be_bytes(info.subnet));
+    Ok(Some(Value::Int32(packed)))
+}
+
+/// `NetworkInterface.Ipv4Gateway(int index)` -> the default gateway's four big-endian octets packed.
+pub fn net_iface_gateway(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let packed = iface_info_arg(vm, args).map_or(0, |info| i32::from_be_bytes(info.gateway));
+    Ok(Some(Value::Int32(packed)))
+}
+
+/// `NetworkInterface.IfaceFlags(int index)` -> a bitfield: bit 0 = the address is DHCP-configured.
+pub fn net_iface_flags(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let flags = iface_info_arg(vm, args).map_or(0, |info| i32::from(info.dhcp_enabled));
+    Ok(Some(Value::Int32(flags)))
 }
 
 
@@ -4091,6 +4260,244 @@ pub fn fs_list(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<V
 }
 
 
+/// The `i32` a unit serial result crosses the seam as: `0` for success, the error code otherwise.
+fn serial_unit_code(result: crate::serial::SerialResult<()>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(error) => error.code(),
+    }
+}
+
+/// The non-negative `u32` handle of a serial argument.
+fn serial_handle_arg(args: &[Value], index: usize) -> Result<u32, Trap> {
+    match args.get(index) {
+        Some(&Value::Int32(handle)) if handle >= 0 => Ok(handle as u32),
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
+/// `NativeSerial.Open(string portName, int baudRate, int parity, int dataBits, int stopBits,
+/// int handshake)`: opens the port with the frozen line configuration, returning the handle or a
+/// negative error code. The five config ints decode to a [`crate::serial::SerialConfig`]; any out
+/// of range reports [`crate::serial::SerialError::Io`] rather than guessing a line setting.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if `portName` is not a string or a config code is not an int.
+pub fn serial_open(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let port_name = string_value(vm, args.first()).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+    let (
+        Some(&Value::Int32(baud)),
+        Some(&Value::Int32(parity)),
+        Some(&Value::Int32(data_bits)),
+        Some(&Value::Int32(stop_bits)),
+        Some(&Value::Int32(handshake)),
+    ) = (args.get(1), args.get(2), args.get(3), args.get(4), args.get(5))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(config) = crate::serial::config_from_i32(baud, parity, data_bits, stop_bits, handshake)
+    else {
+        return Ok(Some(Value::Int32(crate::serial::SerialError::Io.code())));
+    };
+    let code = match vm.serial_backend() {
+        Some(backend) => match backend.open(&port_name, &config) {
+            Ok(handle) => handle as i32,
+            Err(error) => error.code(),
+        },
+        None => crate::serial::SerialError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSerial.Read(int handle, byte[] buffer, int offset, int count, int timeoutMs)`: reads the
+/// available bytes into the slice (waiting up to `timeoutMs` for the first), returning the count
+/// read (`0` = timed out with nothing) or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on non-int/array arguments.
+pub fn serial_read(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = serial_handle_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (Some(&Value::Int32(offset)), Some(&Value::Int32(count)), Some(&Value::Int32(timeout))) =
+        (args.get(2), args.get(3), args.get(4))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let code = {
+        let (heap, backend) = vm.heap_and_serial();
+        let Some(backend) = backend else {
+            return Ok(Some(Value::Int32(crate::serial::SerialError::Io.code())));
+        };
+        match heap.array_u8_slice_mut(array, offset, count) {
+            Some(segment) => match backend.read(handle, segment, timeout) {
+                Ok(n) => n as i32,
+                Err(error) => error.code(),
+            },
+            None => {
+                let mut buf = alloc::vec![0u8; count];
+                match backend.read(handle, &mut buf, timeout) {
+                    Ok(n) => {
+                        for (i, &byte) in buf.iter().take(n).enumerate() {
+                            heap.array_set(array, offset + i, Value::Int32(i32::from(byte)));
+                        }
+                        n as i32
+                    }
+                    Err(error) => error.code(),
+                }
+            }
+        }
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSerial.Write(int handle, byte[] buffer, int offset, int count, int timeoutMs)`: writes
+/// the slice (waiting up to `timeoutMs` for room), returning the bytes accepted or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on non-int/array arguments.
+pub fn serial_write(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = serial_handle_arg(args, 0)?;
+    let Some(&Value::Object(array)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (Some(&Value::Int32(offset)), Some(&Value::Int32(count)), Some(&Value::Int32(timeout))) =
+        (args.get(2), args.get(3), args.get(4))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let (offset, count) = (offset.max(0) as usize, count.max(0) as usize);
+    let code = {
+        let (heap, backend) = vm.heap_and_serial();
+        let Some(backend) = backend else {
+            return Ok(Some(Value::Int32(crate::serial::SerialError::Io.code())));
+        };
+        match heap.array_u8_slice(array, offset, count) {
+            Some(segment) => match backend.write(handle, segment, timeout) {
+                Ok(n) => n as i32,
+                Err(error) => error.code(),
+            },
+            None => {
+                let mut buf = alloc::vec![0u8; count];
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    let Some(Value::Int32(byte)) = heap.array_get(array, offset + i) else {
+                        return Err(Trap::TypeMismatch(Opcode::Call));
+                    };
+                    *slot = byte as u8;
+                }
+                match backend.write(handle, &buf, timeout) {
+                    Ok(n) => n as i32,
+                    Err(error) => error.code(),
+                }
+            }
+        }
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSerial.BytesToRead(int handle)`: bytes waiting in the receive buffer, or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn serial_bytes_to_read(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = serial_handle_arg(args, 0)?;
+    let code = match vm.serial_backend() {
+        Some(backend) => match backend.bytes_to_read(handle) {
+            Ok(n) => n as i32,
+            Err(error) => error.code(),
+        },
+        None => crate::serial::SerialError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSerial.BytesToWrite(int handle)`: bytes still queued for transmission, or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn serial_bytes_to_write(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = serial_handle_arg(args, 0)?;
+    let code = match vm.serial_backend() {
+        Some(backend) => match backend.bytes_to_write(handle) {
+            Ok(n) => n as i32,
+            Err(error) => error.code(),
+        },
+        None => crate::serial::SerialError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSerial.Flush(int handle)`: blocks until the transmit buffer drains; `0` or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn serial_flush(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = serial_handle_arg(args, 0)?;
+    let code = match vm.serial_backend() {
+        Some(backend) => serial_unit_code(backend.flush(handle)),
+        None => crate::serial::SerialError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSerial.DiscardIn(int handle)`: discards the unread receive buffer; `0` or an error code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn serial_discard_in(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = serial_handle_arg(args, 0)?;
+    let code = match vm.serial_backend() {
+        Some(backend) => serial_unit_code(backend.discard_in(handle)),
+        None => crate::serial::SerialError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSerial.DiscardOut(int handle)`: discards the untransmitted send buffer; `0` or an error
+/// code.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn serial_discard_out(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = serial_handle_arg(args, 0)?;
+    let code = match vm.serial_backend() {
+        Some(backend) => serial_unit_code(backend.discard_out(handle)),
+        None => crate::serial::SerialError::Io.code(),
+    };
+    Ok(Some(Value::Int32(code)))
+}
+
+/// `NativeSerial.Close(int handle)`: closes the port (idempotent, void).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] on a malformed handle.
+pub fn serial_close(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = serial_handle_arg(args, 0)?;
+    if let Some(backend) = vm.serial_backend() {
+        backend.close(handle);
+    }
+    Ok(None)
+}
+
+
 /// Returned by a TLS intrinsic when the operation failed or no backend is installed.
 const TLS_ERROR: i32 = -1;
 /// Returned by `tls_read_plain` when the peer has closed (no more plaintext).
@@ -4346,6 +4753,17 @@ pub fn tls_peer_cert(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Op
     Ok(Some(Value::Int32(der_len as i32)))
 }
 
+/// `TlsNative.SessionFlags(int tls)`: the post-handshake session-flag bits (trust caveats the
+/// engine tolerated under a capability knob -- e.g. a skipped validity window). `0` = clean.
+pub fn tls_session_flags(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let flags = match vm.tls_backend() {
+        Some(backend) => backend.session_flags(handle),
+        None => 0,
+    };
+    Ok(Some(Value::Int32(flags)))
+}
+
 /// `TlsNative.CloseTls(int tls)`: closes the session and releases its handle.
 pub fn tls_close(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let handle = socket_arg(args, 0)?;
@@ -4367,6 +4785,217 @@ pub fn tls_default_stack(
         None => 0,
     };
     Ok(Some(Value::Int32(stack)))
+}
+
+/// `TlsNative.ClientConfigAlpn(int stack, int verifyMode, byte[] rootsPem, string alpn)`: like
+/// `ClientConfig` but the configuration OFFERS the comma-separated `alpn` protocol list (RFC 8915
+/// NTS-KE offers exactly `"ntske/1"`). Returns the config handle, or `TLS_ERROR` -- including on
+/// a backend that cannot offer ALPN, so an ALPN-requiring protocol fails loudly at configuration.
+pub fn tls_client_config_alpn(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(stack)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(verify)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let roots = match args.get(2) {
+        Some(&Value::Object(array)) => Some(read_whole_array(vm, array)),
+        _ => None,
+    };
+    let alpn_list = string_value(vm, args.get(3)).unwrap_or_default();
+    let protocols: Vec<Vec<u8>> = alpn_list
+        .split(',')
+        .filter(|proto| !proto.is_empty())
+        .map(|proto| proto.as_bytes().to_vec())
+        .collect();
+    let protocol_refs: Vec<&[u8]> = protocols.iter().map(Vec::as_slice).collect();
+    let result = match vm.tls_backend() {
+        Some(backend) => backend.client_config_alpn(
+            TlsStack::from_i32(stack),
+            VerifyMode::from_i32(verify),
+            roots.as_deref(),
+            &protocol_refs,
+        ),
+        None => return Ok(Some(Value::Int32(TLS_ERROR))),
+    };
+    Ok(Some(Value::Int32(result.map_or(TLS_ERROR, |h| h as i32))))
+}
+
+/// `TlsNative.AlpnIs(int tls, string protocol)`: `1` when the established session negotiated
+/// exactly `protocol` via ALPN, else `0` -- the RFC 8915 "the client MUST verify ntske/1 was
+/// selected" check.
+pub fn tls_alpn_is(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let protocol = string_value(vm, args.get(1)).unwrap_or_default();
+    let matched = match vm.tls_backend() {
+        Some(backend) => backend.alpn_is(handle, protocol.as_bytes()),
+        None => false,
+    };
+    Ok(Some(Value::Int32(i32::from(matched))))
+}
+
+/// `TlsNative.ExporterKey(int tls, string label, byte[] context, int length)`: RFC 5705/8446
+/// keying-material export from the established session, returned as a NATIVE KEY HANDLE -- the
+/// bytes go straight into the runtime's key store ([`Vm::insert_native_key`]) and never appear
+/// in a managed value. `context` may be null (exporter with no context). Returns the handle, or
+/// `TLS_ERROR` when the session cannot export (not established, backend without an exporter).
+pub fn tls_exporter_key(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let handle = socket_arg(args, 0)?;
+    let label = string_value(vm, args.get(1)).unwrap_or_default();
+    let context = match args.get(2) {
+        Some(&Value::Object(array)) => Some(read_whole_array(vm, array)),
+        _ => None,
+    };
+    let Some(&Value::Int32(length)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Ok(length) = usize::try_from(length) else {
+        return Ok(Some(Value::Int32(TLS_ERROR)));
+    };
+    let mut key = alloc::vec![0u8; length];
+    let exported = match vm.tls_backend() {
+        Some(backend) => backend.export_keying_material(
+            handle,
+            &mut key,
+            label.as_bytes(),
+            context.as_deref(),
+        ),
+        None => false,
+    };
+    if !exported {
+        return Ok(Some(Value::Int32(TLS_ERROR)));
+    }
+    Ok(Some(Value::Int32(vm.insert_native_key(key))))
+}
+
+/// `TlsNative.DropKey(int key)`: releases a native key handle, zeroizing its material. A bad or
+/// already-released handle is a no-op.
+pub fn tls_drop_key(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    vm.drop_native_key(handle);
+    Ok(None)
+}
+
+/// `NtsNative.SivEncrypt(int key, byte[] ad, byte[] nonce, byte[] plaintext, byte[] output)`:
+/// RFC 5297 AES-SIV seal through the AEAD seam, S2V components `[ad, nonce]` (the RFC 8915
+/// shape; `ad` may be null for none). `output` receives `V(16) || C` and must be exactly
+/// `plaintext.Length + 16`. Returns the sealed length, or `-1` (bad key handle / shapes / no
+/// backend). The key is a NATIVE HANDLE -- material never crosses into managed.
+pub fn aead_siv_encrypt(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(key_handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let ad = match args.get(1) {
+        Some(&Value::Object(array)) => read_whole_array(vm, array),
+        _ => alloc::vec::Vec::new(),
+    };
+    let Some(&Value::Object(nonce_array)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(plaintext_array)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(output_array)) = args.get(4) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let nonce = read_whole_array(vm, nonce_array);
+    let plaintext = read_whole_array(vm, plaintext_array);
+    let output_len = vm.heap_mut().array_len(output_array).unwrap_or(0);
+    let mut sealed = alloc::vec![0u8; plaintext.len() + 16];
+    if output_len != sealed.len() {
+        return Ok(Some(Value::Int32(-1)));
+    }
+    let Some(key) = vm.native_key(key_handle).map(<[u8]>::to_vec) else {
+        return Ok(Some(Value::Int32(-1)));
+    };
+    let sealed_ok = match vm.aead_backend() {
+        Some(backend) => {
+            backend.siv_encrypt(&key, &[&ad, &nonce], &plaintext, &mut sealed)
+        }
+        None => false,
+    };
+    if !sealed_ok {
+        return Ok(Some(Value::Int32(-1)));
+    }
+    write_byte_segment(vm, output_array, 0, &sealed);
+    Ok(Some(Value::Int32(sealed.len() as i32)))
+}
+
+/// `NtsNative.SivDecrypt(int key, byte[] ad, byte[] nonce, byte[] sealed, byte[] output)`:
+/// RFC 5297 AES-SIV open + AUTHENTICATE. `output` must be exactly `sealed.Length - 16`.
+/// Returns the plaintext length, or `-1` on authentication failure (nothing is written) /
+/// bad shapes / no backend.
+pub fn aead_siv_decrypt(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Int32(key_handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let ad = match args.get(1) {
+        Some(&Value::Object(array)) => read_whole_array(vm, array),
+        _ => alloc::vec::Vec::new(),
+    };
+    let Some(&Value::Object(nonce_array)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(sealed_array)) = args.get(3) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Object(output_array)) = args.get(4) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let nonce = read_whole_array(vm, nonce_array);
+    let sealed = read_whole_array(vm, sealed_array);
+    let output_len = vm.heap_mut().array_len(output_array).unwrap_or(0);
+    if sealed.len() < 16 || output_len != sealed.len() - 16 {
+        return Ok(Some(Value::Int32(-1)));
+    }
+    let Some(key) = vm.native_key(key_handle).map(<[u8]>::to_vec) else {
+        return Ok(Some(Value::Int32(-1)));
+    };
+    let mut plaintext = alloc::vec![0u8; sealed.len() - 16];
+    let opened = match vm.aead_backend() {
+        Some(backend) => backend.siv_decrypt(&key, &[&ad, &nonce], &sealed, &mut plaintext),
+        None => false,
+    };
+    if !opened {
+        return Ok(Some(Value::Int32(-1)));
+    }
+    write_byte_segment(vm, output_array, 0, &plaintext);
+    Ok(Some(Value::Int32(plaintext.len() as i32)))
+}
+
+/// `NtsNative.ImportKey(byte[] key)`: stores caller-supplied key bytes in the native key
+/// store, returning the handle. The INJECTION direction only -- managed already holds these
+/// bytes, so nothing leaks; the deterministic AEAD checks (RFC 5297 vectors through the whole
+/// managed -> intrinsic -> backend chain) key themselves with it. Protocol keys (NTS) come
+/// from the TLS exporter and never take this path.
+pub fn aead_import_key(
+    vm: &mut Vm,
+    _module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(key_array)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let key = read_whole_array(vm, key_array);
+    Ok(Some(Value::Int32(vm.insert_native_key(key))))
 }
 
 /// `System.Threading.Monitor.EnterLock(object)`: acquires the per-object lock for the running
@@ -4789,6 +5418,26 @@ fn type_handle_token(arg: Option<&Value>) -> u64 {
 pub fn array_empty(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
     let array = vm.heap_mut().alloc_array(Vec::new());
     Ok(Some(Value::Object(array)))
+}
+
+/// `Array.Clear(array, index, length)` (via the corlib's null/bounds-checked wrapper): zero the
+/// element range to each element's type default -- works for value-type element arrays (a packed
+/// buffer or a struct array), not just reference arrays. The managed wrapper has already validated
+/// the range, so an out-of-range result here is simply ignored (no partial clear escaped).
+pub fn array_clear_range(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let Some(&Value::Object(array)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(index)) = args.get(1) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    let Some(&Value::Int32(length)) = args.get(2) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    if index >= 0 && length >= 0 {
+        vm.heap_mut().clear_range(array, index as usize, length as usize);
+    }
+    Ok(None)
 }
 
 /// `Environment.get_TickCount()`: the monotonic millisecond count as `int` (the host clock seam),
@@ -5549,6 +6198,45 @@ pub fn mmio_write32(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opt
 /// Never errors.
 pub fn mmio_read32(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     Ok(Some(Value::Int32(vm.mmio_read(mmio_u32(args, 0)) as i32)))
+}
+
+/// `Lamella.Hardware.Mmio.Write8(uint address, byte value)`: a VOLATILE 8-bit store to a
+/// memory-mapped register -- the narrow-register seam a driver crosses where a 32-bit access is
+/// impossible (Cortex-M0+ faults on an unaligned word; byte-addressed registers like SAMD pinmux).
+///
+/// # Errors
+/// Never errors.
+pub fn mmio_write8(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    vm.mmio_write8(mmio_u32(args, 0), mmio_u32(args, 1) as u8);
+    Ok(None)
+}
+
+/// `Lamella.Hardware.Mmio.Read8(uint address) -> byte`: a VOLATILE 8-bit load (the read counterpart
+/// of [`mmio_write8`]).
+///
+/// # Errors
+/// Never errors.
+pub fn mmio_read8(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(vm.mmio_read8(mmio_u32(args, 0))))))
+}
+
+/// `Lamella.Hardware.Mmio.Write16(uint address, ushort value)`: a VOLATILE 16-bit store to a
+/// memory-mapped register (the halfword counterpart of [`mmio_write32`]).
+///
+/// # Errors
+/// Never errors.
+pub fn mmio_write16(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    vm.mmio_write16(mmio_u32(args, 0), mmio_u32(args, 1) as u16);
+    Ok(None)
+}
+
+/// `Lamella.Hardware.Mmio.Read16(uint address) -> ushort`: a VOLATILE 16-bit load (the read
+/// counterpart of [`mmio_write16`]).
+///
+/// # Errors
+/// Never errors.
+pub fn mmio_read16(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(i32::from(vm.mmio_read16(mmio_u32(args, 0))))))
 }
 
 /// `Marshal.SizeOf(Type)`: the unmanaged size in bytes of a primitive type (`int` -> 4, `long` -> 8,
@@ -7506,6 +8194,131 @@ mod tests {
         assert_eq!(format_single(0.0001_f32), "0.0001");
         assert_eq!(format_single(1.5_f32), "1.5");
         assert_eq!(format_single(123.456_f32), "123.456");
+    }
+
+    #[derive(Debug)]
+    struct MockNet {
+        info: crate::net::InterfaceInfo,
+        available: bool,
+    }
+
+    impl crate::net::NetBackend for MockNet {
+        fn resolve(&mut self, _host: &str) -> alloc::vec::Vec<alloc::vec::Vec<u8>> {
+            alloc::vec::Vec::new()
+        }
+        fn tcp_connect(&mut self, _addr: &[u8], _port: u16) -> crate::net::NetResult<crate::net::SocketHandle> {
+            crate::net::NetResult::Error
+        }
+        fn connect_check(&mut self, _s: crate::net::SocketHandle) -> crate::net::NetResult<()> {
+            crate::net::NetResult::Error
+        }
+        fn tcp_listen(&mut self, _addr: &[u8], _port: u16, _backlog: i32) -> crate::net::NetResult<crate::net::SocketHandle> {
+            crate::net::NetResult::Error
+        }
+        fn accept(&mut self, _l: crate::net::SocketHandle) -> crate::net::NetResult<crate::net::SocketHandle> {
+            crate::net::NetResult::Error
+        }
+        fn recv(&mut self, _s: crate::net::SocketHandle, _buf: &mut [u8]) -> crate::net::NetResult<usize> {
+            crate::net::NetResult::Error
+        }
+        fn send(&mut self, _s: crate::net::SocketHandle, _buf: &[u8]) -> crate::net::NetResult<usize> {
+            crate::net::NetResult::Error
+        }
+        fn udp_bind(&mut self, _addr: &[u8], _port: u16) -> crate::net::NetResult<crate::net::SocketHandle> {
+            crate::net::NetResult::Error
+        }
+        fn udp_send_to(&mut self, _s: crate::net::SocketHandle, _buf: &[u8], _addr: &[u8], _port: u16) -> crate::net::NetResult<usize> {
+            crate::net::NetResult::Error
+        }
+        fn udp_recv_from(&mut self, _s: crate::net::SocketHandle, _buf: &mut [u8], _sender: &mut [u8]) -> crate::net::NetResult<(usize, usize, u16)> {
+            crate::net::NetResult::Error
+        }
+        fn local_port(&mut self, _s: crate::net::SocketHandle) -> Option<u16> {
+            None
+        }
+        fn close(&mut self, _s: crate::net::SocketHandle) {}
+        fn register(&mut self, _s: crate::net::SocketHandle, _i: crate::net::Interest) {}
+        fn deregister(&mut self, _s: crate::net::SocketHandle) {}
+        fn poll(&mut self, _timeout_ms: Option<u64>) -> alloc::vec::Vec<crate::net::SocketHandle> {
+            alloc::vec::Vec::new()
+        }
+
+        fn network_available(&mut self) -> bool {
+            self.available
+        }
+        fn interface_count(&mut self) -> u32 {
+            1
+        }
+        fn interface_info(&mut self, index: u32) -> Option<crate::net::InterfaceInfo> {
+            if index == 0 { Some(self.info) } else { None }
+        }
+    }
+
+    #[test]
+    fn network_interface_seam_reports_the_backend_state() {
+        let mut vm = Vm::default();
+        vm.set_net_backend(Box::new(MockNet {
+            available: true,
+            info: crate::net::InterfaceInfo {
+                oper_status: crate::net::OperStatus::Up,
+                kind: crate::net::IfaceKind::Ethernet,
+                ipv4: [192, 168, 1, 50],
+                subnet: [255, 255, 255, 0],
+                gateway: [192, 168, 1, 1],
+                dhcp_enabled: true,
+            },
+        }));
+        let m = Module::new();
+        let i0 = [Value::Int32(0)];
+
+        assert_eq!(net_is_available(&mut vm, &m, &[]).unwrap(), Some(Value::Int32(1)));
+        assert_eq!(net_iface_count(&mut vm, &m, &[]).unwrap(), Some(Value::Int32(1)));
+
+        assert_eq!(net_iface_oper_status(&mut vm, &m, &i0).unwrap(), Some(Value::Int32(1)));
+        assert_eq!(net_iface_type(&mut vm, &m, &i0).unwrap(), Some(Value::Int32(6)));
+
+        assert_eq!(
+            net_iface_ipv4(&mut vm, &m, &i0).unwrap(),
+            Some(Value::Int32(i32::from_be_bytes([192, 168, 1, 50])))
+        );
+        assert_eq!(
+            net_iface_subnet(&mut vm, &m, &i0).unwrap(),
+            Some(Value::Int32(i32::from_be_bytes([255, 255, 255, 0])))
+        );
+        assert_eq!(
+            net_iface_gateway(&mut vm, &m, &i0).unwrap(),
+            Some(Value::Int32(i32::from_be_bytes([192, 168, 1, 1])))
+        );
+
+        assert_eq!(net_iface_flags(&mut vm, &m, &i0).unwrap(), Some(Value::Int32(1)));
+
+        let i9 = [Value::Int32(9)];
+        assert_eq!(net_iface_oper_status(&mut vm, &m, &i9).unwrap(), Some(Value::Int32(4)));
+        assert_eq!(net_iface_type(&mut vm, &m, &i9).unwrap(), Some(Value::Int32(1)));
+        assert_eq!(net_iface_ipv4(&mut vm, &m, &i9).unwrap(), Some(Value::Int32(0)));
+    }
+
+    #[test]
+    fn network_interface_seam_without_a_backend_is_empty() {
+        let mut vm = Vm::default();
+        let m = Module::new();
+        assert_eq!(net_is_available(&mut vm, &m, &[]).unwrap(), Some(Value::Int32(0)));
+        assert_eq!(net_iface_count(&mut vm, &m, &[]).unwrap(), Some(Value::Int32(0)));
+    }
+
+    #[test]
+    fn clock_intrinsics_set_and_report_the_wall_clock() {
+        let mut vm = Vm::default();
+        let m = Module::new();
+        assert_eq!(clock_is_set(&mut vm, &m, &[]).unwrap(), Some(Value::Int32(0)));
+        assert_eq!(datetime_now_ticks(&mut vm, &m, &[]).unwrap(), Some(Value::Int64(0)));
+
+        let ticks = 637_000_000_000_000_000i64;
+        assert_eq!(clock_set_ticks(&mut vm, &m, &[Value::Int64(ticks)]).unwrap(), None);
+        assert_eq!(clock_is_set(&mut vm, &m, &[]).unwrap(), Some(Value::Int32(1)));
+        assert_eq!(datetime_now_ticks(&mut vm, &m, &[]).unwrap(), Some(Value::Int64(ticks)));
+
+        assert!(clock_set_ticks(&mut vm, &m, &[Value::Int32(5)]).is_err());
     }
 
     #[test]

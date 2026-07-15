@@ -18,13 +18,18 @@ namespace System.Net.Security
         private int _stack;
         private const int VerifySystemRoots = 0;
         private const int VerifyAcceptAny = 2;
+        private const int VerifyReport = 3;
         private const int StateEstablished = 1;
         private const int StateError = 3;
         private const int PlainClosed = -2;
+        private const int FlagDatesUnchecked = 1;
+        private const int FlagChainErrors = 2;
+        private const int FlagNameMismatch = 4;
 
         private Stream _inner;
         private bool _leaveInnerStreamOpen;
         private RemoteCertificateValidationCallback _validationCallback;
+        private bool _acceptAnyCertificate;
         private int _tls;
         private bool _authenticated;
         private byte[] _xfer;
@@ -54,25 +59,56 @@ namespace System.Net.Security
         public bool IsAuthenticated { get { return _authenticated; } }
         public bool IsEncrypted { get { return _authenticated; } }
 
+        public bool AcceptAnyCertificate
+        {
+            get { return _acceptAnyCertificate; }
+            set { _acceptAnyCertificate = value; }
+        }
+
         public void AuthenticateAsClient(string targetHost)
         {
             _xfer = new byte[TlsBufferSize];
-            int verifyMode = (object)_validationCallback != null ? VerifyAcceptAny : VerifySystemRoots;
+            int verifyMode = VerifySystemRoots;
+            if (_acceptAnyCertificate) verifyMode = VerifyAcceptAny;
+            else if ((object)_validationCallback != null) verifyMode = VerifyReport;
             int config = TlsNative.ClientConfig(_stack, verifyMode, null);
             if (config < 0) throw new AuthenticationException("Could not build the TLS client configuration.");
             _tls = TlsNative.ClientNew(config, targetHost);
             if (_tls < 0) throw new AuthenticationException("Could not start the TLS client session.");
             Handshake();
+            int flags = TlsNative.SessionFlags(_tls);
+            SslPolicyErrors errors = SslPolicyErrors.None;
+            if ((flags & (FlagDatesUnchecked | FlagChainErrors)) != 0)
+            {
+                errors |= SslPolicyErrors.RemoteCertificateChainErrors;
+            }
+            if ((flags & FlagNameMismatch) != 0)
+            {
+                errors |= SslPolicyErrors.RemoteCertificateNameMismatch;
+            }
+            if (_acceptAnyCertificate)
+            {
+                errors |= SslPolicyErrors.RemoteCertificateChainErrors;
+            }
             if ((object)_validationCallback != null)
             {
                 X509Certificate peer = GetPeerCertificate();
-                bool accepted = _validationCallback(
-                    this, peer, new X509Chain(), SslPolicyErrors.RemoteCertificateChainErrors);
+                if ((object)peer == null)
+                {
+                    errors |= SslPolicyErrors.RemoteCertificateNotAvailable;
+                }
+                bool accepted = _validationCallback(this, peer, new X509Chain(), errors);
                 if (!accepted)
                 {
                     Close();
                     throw new AuthenticationException("The remote certificate was rejected by the validation callback.");
                 }
+            }
+            else if (errors != SslPolicyErrors.None && !_acceptAnyCertificate)
+            {
+                Close();
+                throw new AuthenticationException(
+                    "The remote certificate's validity dates could not be verified (no clock) and no validation callback accepted them.");
             }
             _authenticated = true;
         }

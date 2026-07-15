@@ -476,7 +476,10 @@ fn match_sequence(
         if star == Some(i) {
             if let MatchPattern::Capture(name) = elem {
                 let post = elems_len - i - 1;
-                let value = slice_from(subject, i, (post > 0).then(|| -(post as i64)));
+                let value = call1(
+                    "list",
+                    slice_from(subject, i, (post > 0).then(|| -(post as i64))),
+                );
                 binds.push(Stmt::Assign(Assign {
                     target: name.clone(),
                     annotation: None,
@@ -2788,12 +2791,16 @@ impl Parser {
 
     /// A comma-separated target list `a` or `a, b, c` (a trailing comma before `in` is ok).
     fn parse_target_list(&mut self) -> Result<Vec<String>, ParseError> {
+        let paren = self.eat(&Tok::LParen);
         let mut targets = vec![self.expect_name()?];
         while self.eat(&Tok::Comma) {
-            if self.at(&Tok::KwIn) {
+            if self.at(&Tok::KwIn) || (paren && self.at(&Tok::RParen)) {
                 break;
             }
             targets.push(self.expect_name()?);
+        }
+        if paren {
+            self.expect(&Tok::RParen, "')' closing the parenthesized comprehension target")?;
         }
         Ok(targets)
     }
@@ -4023,6 +4030,17 @@ mod tests {
             panic!("expected a dict comprehension");
         };
         assert_eq!(clauses[0].targets, ["k", "v"]);
+        fn comp_targets(src: &str) -> Vec<String> {
+            let m = parse_ok(src);
+            let Stmt::Expr(Expr::ListComp { clauses, .. }) = &m.body[0] else {
+                panic!("expected a list comprehension");
+            };
+            clauses[0].targets.clone()
+        }
+        assert_eq!(comp_targets("[a for (a, b) in pairs]\n"), ["a", "b"]);
+        assert_eq!(comp_targets("[a for (a) in xs]\n"), ["a"]);
+        assert_eq!(comp_targets("[a for (a,) in xs]\n"), ["a"]);
+        assert_eq!(comp_targets("[a for (a, b, c) in xs]\n"), ["a", "b", "c"]);
         assert!(matches!(
             parse_ok("{k: v for k in r}\n").body[0],
             Stmt::Expr(Expr::DictComp { .. })

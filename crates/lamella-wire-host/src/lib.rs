@@ -1,4 +1,4 @@
-//! The HOST side of the wireline debug + REPL channel:
+//! The HOST side of the Lamella Link debug + REPL channel:
 
 pub use lamella_runner::{
     RunResult, baked_image_checksum, debug, deploy, repl, run_program, send_image, send_program,
@@ -86,7 +86,7 @@ impl Transport for SerialTransport {
     }
 }
 
-/// A [`Transport`] over the native USB (driverless WinUSB) wireline carrier -- the device's vendor
+/// A [`Transport`] over the native USB (driverless WinUSB) Lamella Link carrier -- the device's vendor
 /// interface bulk pipes carry the same [`encode_frame`] framing a UART carrier uses. `send` writes an
 /// encoded frame (the OS splits it across the bulk max packet); `poll` reads a bulk packet with a short
 /// timeout and feeds a [`FrameReader`], so the self-synchronizing framing reassembles across packets.
@@ -98,7 +98,7 @@ pub struct UsbTransport {
 
 #[cfg(feature = "usb")]
 impl UsbTransport {
-    /// Open the Lamella wireline vendor interface -- its VID/PID + WinUSB interface GUID from
+    /// Open the Lamella Link vendor interface -- its VID/PID + WinUSB interface GUID from
     /// [`lamella_wire::usb`].
     ///
     /// # Errors
@@ -107,7 +107,7 @@ impl UsbTransport {
         Self::open_ids(lamella_wire::usb::VID, lamella_wire::usb::PID)
     }
 
-    /// Open a specific `vid`/`pid` on the wireline interface GUID (a board built with its own id pair).
+    /// Open a specific `vid`/`pid` on the Lamella Link interface GUID (a board built with its own id pair).
     ///
     /// # Errors
     /// [`TransportError::Carrier`] if no matching device is present or it cannot be opened.
@@ -115,7 +115,7 @@ impl UsbTransport {
         Self::open_matching(vid, pid, None)
     }
 
-    /// Open the wireline board matching `vid`/`pid` AND -- when several boards share the id
+    /// Open the Lamella Link board matching `vid`/`pid` AND -- when several boards share the id
     /// pair -- a case-insensitive substring of its USB serial number (the F427 reports
     /// `F427-0001`; an RP2350 reports its 16-hex-digit chip id). `None` opens the first match.
     ///
@@ -132,7 +132,7 @@ impl UsbTransport {
         Ok(Self { device, reader: FrameReader::new() })
     }
 
-    /// List the attached wireline boards (any VID/PID under the wireline interface GUID), with
+    /// List the attached Lamella Link boards (any VID/PID under the Lamella Link interface GUID), with
     /// product + serial strings where the OS reports them -- the picker's data source.
     ///
     /// # Errors
@@ -188,10 +188,10 @@ pub fn list_serial() -> Vec<SerialPortDesc> {
 }
 
 /// Parse an example's `usb` target argument into (vid, pid, serial-substring):
-/// - `usb` -- the Lamella wireline VID/PID, first attached board;
+/// - `usb` -- the Lamella Link VID/PID, first attached board;
 /// - `usb:<vid>:<pid>` -- hex id pair (each exactly 4 hex digits), e.g. `usb:1209:0001`;
 /// - `usb:<vid>:<pid>:<serial>` -- id pair plus a serial-substring pick;
-/// - `usb:<serial>` -- the wireline VID/PID, board picked by a case-insensitive serial
+/// - `usb:<serial>` -- the Lamella Link VID/PID, board picked by a case-insensitive serial
 ///   substring (chip-id serials are hex, so a single token is ALWAYS a serial -- overriding
 ///   the ids requires the full pair form).
 #[cfg(feature = "usb")]
@@ -480,7 +480,7 @@ mod usb_target_tests {
     use super::parse_usb_target;
 
     #[test]
-    fn bare_usb_is_the_wireline_ids_first_board() {
+    fn bare_usb_is_the_link_ids_first_board() {
         assert_eq!(parse_usb_target("usb"), (0x1209, 0x0001, None));
     }
 

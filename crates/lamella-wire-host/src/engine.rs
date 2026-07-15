@@ -578,7 +578,7 @@ mod tests {
     /// End-to-end through the project's OWN in-process compiler (`lamella-assemble`) -- no Microsoft
     /// compiler. Ignored by default: the compiler resolves the BCL against the .NET reference
     /// assemblies (metadata), so the pack must be present, as for the differential. Run on demand:
-    /// `cargo test -p lamella-wireline --features repl-host -- --ignored`.
+    /// `cargo test -p lamella-wire-host --features repl-host -- --ignored`.
     #[cfg(feature = "repl-host")]
     #[test]
     #[ignore = "needs the .NET reference assemblies (the compiler resolves the BCL against them); run with --ignored"]

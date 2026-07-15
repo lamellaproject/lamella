@@ -7,9 +7,26 @@ namespace System.Net.Sockets
         private int _handle;
         private IPEndPoint _bindEndPoint;
         private SocketType _socketType;
+        private int _receiveTimeout;
+        private int _armedReceiveTimeout;
 
         private const int WouldBlock = -1;
         private const int SockError = -2;
+
+        public int ReceiveTimeout
+        {
+            get { return _receiveTimeout; }
+            set { _receiveTimeout = value < 0 ? 0 : value; }
+        }
+
+        private void ArmReceiveTimeout()
+        {
+            if (_handle >= 0 && _armedReceiveTimeout != _receiveTimeout)
+            {
+                SetRecvTimeout(_handle, _receiveTimeout);
+                _armedReceiveTimeout = _receiveTimeout;
+            }
+        }
 
         public Socket(AddressFamily addressFamily, SocketType socketType, ProtocolType protocolType)
         {
@@ -63,8 +80,14 @@ namespace System.Net.Sockets
         {
             byte[] senderAddr = new byte[16];
             int[] senderMeta = new int[2];
+            ArmReceiveTimeout();
+            int deadline = unchecked(Environment.TickCount + _receiveTimeout);
             int received;
-            while ((received = UdpReceiveFrom(_handle, buffer, 0, buffer.Length, senderAddr, senderMeta)) == WouldBlock) { }
+            while ((received = UdpReceiveFrom(_handle, buffer, 0, buffer.Length, senderAddr, senderMeta)) == WouldBlock)
+            {
+                if (_receiveTimeout > 0 && unchecked(Environment.TickCount - deadline) >= 0)
+                    throw new SocketException("The receive timed out.");
+            }
             if (received == SockError) throw new SocketException();
             int addrLength = senderMeta[0];
             byte[] address = new byte[addrLength];
@@ -112,8 +135,14 @@ namespace System.Net.Sockets
 
         private int ReceiveCore(byte[] buffer, int offset, int size)
         {
+            ArmReceiveTimeout();
+            int deadline = unchecked(Environment.TickCount + _receiveTimeout);
             int received;
-            while ((received = ReceivePoll(_handle, buffer, offset, size)) == WouldBlock) { }
+            while ((received = ReceivePoll(_handle, buffer, offset, size)) == WouldBlock)
+            {
+                if (_receiveTimeout > 0 && unchecked(Environment.TickCount - deadline) >= 0)
+                    throw new SocketException("The receive timed out.");
+            }
             if (received == SockError) throw new SocketException();
             return received;
         }
@@ -139,6 +168,7 @@ namespace System.Net.Sockets
         [Lamella.Runtime.RuntimeProvided] private static int SendPoll(int handle, byte[] buffer, int offset, int count) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static int ReceivePoll(int handle, byte[] buffer, int offset, int count) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static int LocalPort(int handle) { return 0; }
+        [Lamella.Runtime.RuntimeProvided] private static void SetRecvTimeout(int handle, int millis) { }
         [Lamella.Runtime.RuntimeProvided] private static void CloseSocket(int handle) { }
         [Lamella.Runtime.RuntimeProvided] private static int UdpBind(byte[] addr, int port) { return 0; }
         [Lamella.Runtime.RuntimeProvided] private static int UdpSendTo(int handle, byte[] buffer, int offset, int count, byte[] addr, int port) { return 0; }

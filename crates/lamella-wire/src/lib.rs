@@ -1,4 +1,4 @@
-//! The Lamella wireline debug + REPL protocol -- the carrier-agnostic core shared by the host
+//! The Lamella Link debug + REPL protocol -- the carrier-agnostic core shared by the host
 //! front-ends (the DAP adapter + the gdb/lldb-style CLI) and the on-device runner.
 
 #![no_std]
@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 /// The current protocol version this build implements. A peer advertises a [`ProtocolRange`] around it.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Identity + descriptors for the native driverless-WinUSB wireline carrier (the fast
+/// Identity + descriptors for the native driverless-WinUSB Lamella Link carrier (the fast
 /// interpreter-flash path): the shared VID/PID + WinUSB interface GUID + bulk endpoints, plus the
 /// BOS / Microsoft OS 2.0 / WebUSB descriptor bytes a firmware embeds so Windows auto-loads
 /// `winusb.sys` (no INF) and a browser can claim it. One home so firmware, host, and browser cannot
@@ -450,6 +450,31 @@ pub mod board_model {
     pub const PICO: u16 = 13;
     /// Espressif ESP32-C6 (RISC-V RV32IMAC HP core) -- a second-source RISC-V beyond the RP2350.
     pub const ESP32_C6: u16 = 14;
+
+    /// The display name for a `board_model` wire value, or `None` for an unrecognized code. THE ONE canonical
+    /// value -> name map: the JS registry (`engine-sdk/registry.data.mjs`, via a generated `board_models.json`),
+    /// the MCP servers, and the Lamella Link debug backend all DERIVE from this instead of hand-mirroring a
+    /// table.
+    #[must_use]
+    pub fn name(model: u16) -> Option<&'static str> {
+        Some(match model {
+            UNKNOWN => "custom board",
+            MICROBIT_V1 => "BBC micro:bit v1",
+            PICO2 => "Raspberry Pi Pico 2",
+            SAM4S_XPLAINED_PRO => "SAM4S Xplained Pro",
+            SAME54_XPLAINED_PRO => "SAME54 Xplained Pro",
+            SAMD21_XPLAINED_PRO => "SAMD21 Xplained Pro",
+            SAMW25_XPLAINED_PRO => "ATSAMW25 Xplained Pro",
+            STM32L476 => "STM32L476 Nucleo",
+            MKR1000 => "Arduino MKR1000",
+            PICO2_W => "Raspberry Pi Pico 2 W",
+            MICROBIT_V2 => "BBC micro:bit v2",
+            ARDUINO_ZERO => "Arduino Zero",
+            PICO => "Raspberry Pi Pico",
+            ESP32_C6 => "Espressif ESP32-C6",
+            _ => return None,
+        })
+    }
 }
 
 /// The target's `HELLO_ACK`: the negotiated version + the target's capabilities, optionally

@@ -206,6 +206,11 @@ const ODICT_POPITEM: u32 = 26;
 /// A synthetic method id: a `super().__init__(*args)` that resolves to the built-in
 /// `BaseException.__init__` (sets `self.args`). Reserved (`u32::MAX`) -- never a real per-type id.
 const EXC_INIT: u32 = u32::MAX;
+/// The no-op object-default methods (`object.__init__` / `object.__init_subclass__`) that a
+/// `super()` call resolves to when no user base provides one -- a bound method that ignores its
+/// args and returns `None`, so idiomatic `super().__init__()` / `super().__init_subclass__(**kw)`
+/// terminate cleanly at the (implicit) object base.
+const OBJECT_NOOP: u32 = u32::MAX - 1;
 const SET_UNION: u32 = 0;
 const SET_INTERSECTION: u32 = 1;
 const SET_DIFFERENCE: u32 = 2;
@@ -372,6 +377,15 @@ pub(crate) enum DictViewKind {
     Keys,
     Values,
     Items,
+}
+
+/// How a user descriptor resolves an instance attribute READ (see `instance_descriptor_read`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DescriptorRead {
+    /// Call this `__get__` (already bound to the descriptor) with `[instance, class]`.
+    Get(Value),
+    /// The instance-dict entry that shadows a non-data descriptor -- use it directly.
+    Value(Value),
 }
 
 pub(crate) const LAZY_MAP: u32 = 0;
@@ -659,6 +673,141 @@ fn float_method_id(name: &str) -> Option<u32> {
         "hex" => Some(FLOAT_HEX),
         _ => None,
     }
+}
+
+
+/// Every dunder name the layer can carry. APPEND-ONLY: a name's index is its reserved-id offset, so
+/// new dunders go at the END to keep earlier ids stable.
+const DUNDER_NAMES: &[&str] = &[
+    "__add__", "__radd__", "__sub__", "__rsub__", "__mul__", "__rmul__",
+    "__truediv__", "__rtruediv__", "__floordiv__", "__rfloordiv__",
+    "__mod__", "__rmod__", "__pow__", "__rpow__", "__divmod__", "__rdivmod__",
+    "__and__", "__rand__", "__or__", "__ror__", "__xor__", "__rxor__",
+    "__lshift__", "__rlshift__", "__rshift__", "__rrshift__",
+    "__neg__", "__pos__", "__abs__", "__invert__",
+    "__int__", "__float__", "__bool__",
+    "__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__",
+    "__hash__", "__repr__", "__str__",
+    "__len__", "__getitem__", "__setitem__", "__delitem__", "__contains__", "__iter__",
+];
+const DUNDER_BASE: u32 = 0xFFF0_0000;
+
+/// The reserved method id for the layer-handled dunder `name`, or `None`.
+fn builtin_dunder_id(name: &str) -> Option<u32> {
+    DUNDER_NAMES
+        .iter()
+        .position(|entry| *entry == name)
+        .map(|i| DUNDER_BASE + i as u32)
+}
+
+/// The dunder name a reserved id maps back to (for dispatch), or `None` if it is not one.
+fn dunder_name_of(id: u32) -> Option<&'static str> {
+    id.checked_sub(DUNDER_BASE)
+        .and_then(|i| DUNDER_NAMES.get(i as usize))
+        .copied()
+}
+
+/// The `(operator, is-reflected)` for a binary-operator dunder (`__add__`/`__radd__`/...), else `None`.
+fn binop_of_dunder(name: &str) -> Option<(BinOp, bool)> {
+    Some(match name {
+        "__add__" => (BinOp::Add, false),
+        "__radd__" => (BinOp::Add, true),
+        "__sub__" => (BinOp::Sub, false),
+        "__rsub__" => (BinOp::Sub, true),
+        "__mul__" => (BinOp::Mul, false),
+        "__rmul__" => (BinOp::Mul, true),
+        "__truediv__" => (BinOp::TrueDiv, false),
+        "__rtruediv__" => (BinOp::TrueDiv, true),
+        "__floordiv__" => (BinOp::FloorDiv, false),
+        "__rfloordiv__" => (BinOp::FloorDiv, true),
+        "__mod__" => (BinOp::Mod, false),
+        "__rmod__" => (BinOp::Mod, true),
+        "__pow__" => (BinOp::Pow, false),
+        "__rpow__" => (BinOp::Pow, true),
+        "__and__" => (BinOp::BitAnd, false),
+        "__rand__" => (BinOp::BitAnd, true),
+        "__or__" => (BinOp::BitOr, false),
+        "__ror__" => (BinOp::BitOr, true),
+        "__xor__" => (BinOp::BitXor, false),
+        "__rxor__" => (BinOp::BitXor, true),
+        "__lshift__" => (BinOp::LShift, false),
+        "__rlshift__" => (BinOp::LShift, true),
+        "__rshift__" => (BinOp::RShift, false),
+        "__rrshift__" => (BinOp::RShift, true),
+        _ => return None,
+    })
+}
+
+/// The comparison operator for a comparison dunder (`__eq__`/...), else `None`.
+fn cmpop_of_dunder(name: &str) -> Option<CmpOp> {
+    Some(match name {
+        "__eq__" => CmpOp::Eq,
+        "__ne__" => CmpOp::Ne,
+        "__lt__" => CmpOp::Lt,
+        "__le__" => CmpOp::Le,
+        "__gt__" => CmpOp::Gt,
+        "__ge__" => CmpOp::Ge,
+        _ => return None,
+    })
+}
+
+/// Whether an `int`/`bool` value exposes dunder `name` (CPython's int method set: arithmetic, the
+/// full bitwise family, comparisons, divmod, the unary ops incl. `__invert__`, and int/float/bool).
+fn int_supports_dunder(name: &str) -> bool {
+    binop_of_dunder(name).is_some()
+        || cmpop_of_dunder(name).is_some()
+        || matches!(
+            name,
+            "__divmod__"
+                | "__rdivmod__"
+                | "__neg__"
+                | "__pos__"
+                | "__abs__"
+                | "__invert__"
+                | "__int__"
+                | "__float__"
+                | "__bool__"
+                | "__hash__"
+                | "__repr__"
+                | "__str__"
+        )
+}
+
+/// Whether a `float` value exposes dunder `name` -- like int MINUS the bitwise/`__invert__` family
+/// (a float has no `__and__`/`__lshift__`/`__invert__`/...).
+fn float_supports_dunder(name: &str) -> bool {
+    if matches!(
+        name,
+        "__and__"
+            | "__rand__"
+            | "__or__"
+            | "__ror__"
+            | "__xor__"
+            | "__rxor__"
+            | "__lshift__"
+            | "__rlshift__"
+            | "__rshift__"
+            | "__rrshift__"
+            | "__invert__"
+    ) {
+        return false;
+    }
+    binop_of_dunder(name).is_some()
+        || cmpop_of_dunder(name).is_some()
+        || matches!(
+            name,
+            "__divmod__"
+                | "__rdivmod__"
+                | "__neg__"
+                | "__pos__"
+                | "__abs__"
+                | "__int__"
+                | "__float__"
+                | "__bool__"
+                | "__hash__"
+                | "__repr__"
+                | "__str__"
+        )
 }
 
 /// `float.hex()`: CPython's exact hexadecimal rendering of a double -- `[sign] 0xL.MMMMMMMMMMMMMp±E`,
@@ -1483,6 +1632,18 @@ impl InlineCache {
     }
 }
 
+/// A simulated I2C target's register file (the LSM303AGR shape): a byte array addressed by an
+/// internal pointer (SUB). A write's first byte sets the pointer; the ST SUB bit-7 convention gates
+/// whether READS auto-increment it (a demo that forgets `| 0x80` reads one register repeatedly,
+/// exactly as on silicon). Lives at the sim layer so a C# capstone half verifies the same device.
+#[cfg(not(target_os = "none"))]
+#[derive(Debug)]
+struct I2cSimDevice {
+    registers: Vec<u8>,
+    pointer: u8,
+    read_auto_increment: bool,
+}
+
 /// The dynamic object space: the shared heap plus the type table that gives each
 /// heap object's header word a Python meaning.
 ///
@@ -1627,7 +1788,39 @@ pub struct ObjectModel {
     uart_resource_type_id: u32,
     /// The GC type-descriptor id of an open `Port` (a GC leaf of raw config/state words).
     uart_port_type_id: u32,
-    /// The GC type-descriptor id of the `busio` module singleton.
+    /// The GC type-descriptor id of the `spi` module singleton (the clean SPI API).
+    spi_type_id: u32,
+    /// The GC type-descriptor id of a board SPI resource (`board.SPI0`): one raw instance word.
+    spi_resource_type_id: u32,
+    /// The GC type-descriptor id of an open `SpiBus` (a GC leaf of raw config/state words).
+    spi_bus_type_id: u32,
+    /// The GC type-descriptor id of the `i2c` module singleton (the clean I2C API).
+    i2c_type_id: u32,
+    /// The GC type-descriptor id of a board I2C resource (`board.I2C0`): one raw instance word.
+    i2c_resource_type_id: u32,
+    /// The GC type-descriptor id of an open `I2cBus` (a GC leaf of raw config/state words).
+    i2c_bus_type_id: u32,
+    /// The GC type-descriptor id of the `adc` module singleton (the clean ADC API).
+    adc_type_id: u32,
+    /// The GC type-descriptor id of a board ADC resource (`board.A0`): `(channel, pin)` raw words.
+    adc_resource_type_id: u32,
+    /// The GC type-descriptor id of an open ADC `Channel` (a GC leaf of raw config/state words).
+    adc_channel_type_id: u32,
+    /// The GC type-descriptor id of a shim SPI factory (`machine.SPI` / `busio.SPI`, a callable
+    /// carrying its flavor) and a shim SPI instance (the wrapped `SpiBus` + flavor).
+    pub(crate) spi_shim_factory_type_id: u32,
+    pub(crate) spi_shim_type_id: u32,
+    /// The GC type-descriptor id of a shim I2C factory (`machine.I2C` / `busio.I2C`) and a shim I2C
+    /// instance (the wrapped `I2cBus` + flavor).
+    pub(crate) i2c_shim_factory_type_id: u32,
+    pub(crate) i2c_shim_type_id: u32,
+    /// The GC type-descriptor id of a shim ADC factory (`machine.ADC` / `analogio.AnalogIn`) and a
+    /// shim ADC instance (the wrapped `Channel` + flavor).
+    pub(crate) adc_shim_factory_type_id: u32,
+    pub(crate) adc_shim_type_id: u32,
+    /// The GC type-descriptor id of the `analogio` module singleton (the CircuitPython ADC shim).
+    analogio_type_id: u32,
+    /// The GC type-descriptor id of the `busio` module singleton (the CircuitPython shim).
     busio_type_id: u32,
     /// The GC type-descriptor id of a shim UART factory (`machine.UART` / `busio.UART`, a
     /// callable carrying its flavor word).
@@ -1717,6 +1910,13 @@ pub struct ObjectModel {
     gpio_claimed: Vec<u32>,
     /// App-claimed UART instances -- one owner per port, same fail-loud rule as pins.
     uart_claimed: Vec<u32>,
+    /// App-claimed SPI bus instances -- one owner per bus, same fail-loud rule.
+    spi_claimed: Vec<u32>,
+    /// App-claimed I2C bus instances -- one owner per bus, same fail-loud rule.
+    i2c_claimed: Vec<u32>,
+    /// Currently-open ADC channels -- each exclusively claimed; the SHARED converter block brings
+    /// up on the first open (empty -> non-empty) and releases on the last close.
+    adc_channels_open: Vec<u32>,
     /// Firmware-reserved pins (seeded from the target profile): a claim of one fails loud, so an
     /// app-vs-firmware conflict is caught rather than silently colliding.
     gpio_reserved: Vec<u32>,
@@ -1739,6 +1939,47 @@ pub struct ObjectModel {
     /// The host UART sim's transmitted bytes (FIFO writes append) -- the TX oracle.
     #[cfg(not(target_os = "none"))]
     uart_sim_tx: Vec<u8>,
+    /// The host SPI sim's transmitted (MOSI) bytes -- the TX oracle.
+    #[cfg(not(target_os = "none"))]
+    spi_sim_tx: Vec<u8>,
+    /// The host SPI sim's scripted MISO stream (a test queues; each TX byte consumes one as its
+    /// full-duplex reply, 0x00 when exhausted).
+    #[cfg(not(target_os = "none"))]
+    spi_sim_respond: alloc::collections::VecDeque<u8>,
+    /// The host SPI sim's replies waiting to be read back (a data-register write pushes one, a read
+    /// pops it) -- so the driver's write-then-read-one transfer loop returns the queued MISO byte.
+    #[cfg(not(target_os = "none"))]
+    spi_sim_rx_pending: alloc::collections::VecDeque<u8>,
+    /// The host sim's accumulated reset-DONE bits: a write to the board's RESETS clear-alias sets
+    /// those bits, and a read of the RESETS done register reflects them. Modeled as an accumulator
+    /// (not a fixed per-peripheral value) so peripherals SHARING the done register on one board --
+    /// UART bit 26, SPI bit 18 -- each see their own bit cleared, not the other's.
+    #[cfg(not(target_os = "none"))]
+    reset_done_bits: u32,
+    /// The host I2C sim's addressable devices (`addr -> register-file device`) -- a test installs
+    /// them; a transaction to an absent address NACKs the ADDRESS phase.
+    #[cfg(not(target_os = "none"))]
+    i2c_sim_devices: alloc::collections::BTreeMap<u8, I2cSimDevice>,
+    /// The host I2C sim's received bytes (a read command clocks one from the target; an
+    /// IC_DATA_CMD read pops it).
+    #[cfg(not(target_os = "none"))]
+    i2c_sim_rx: alloc::collections::VecDeque<u8>,
+    /// The host I2C sim's current transaction abort source (`IC_TX_ABRT_SOURCE`; 0 = acknowledged).
+    #[cfg(not(target_os = "none"))]
+    i2c_sim_abort: u32,
+    /// The host I2C sim's STOP_DET latch (the bus reached STOP).
+    #[cfg(not(target_os = "none"))]
+    i2c_sim_stopped: bool,
+    /// The host I2C sim's transaction-local flag: the next write byte is the register pointer (SUB).
+    #[cfg(not(target_os = "none"))]
+    i2c_sim_expect_pointer: bool,
+    /// The host ADC sim's scripted conversion results (`channel -> raw count`), the analogue a test
+    /// presents at each channel; a read of RESULT returns the currently-selected channel's value.
+    #[cfg(not(target_os = "none"))]
+    adc_sim_raw: alloc::collections::BTreeMap<u32, u32>,
+    /// The host ADC sim's currently-selected channel (tracked from the CS AINSEL writes).
+    #[cfg(not(target_os = "none"))]
+    adc_sim_ainsel: u32,
     /// The host-only ordered log of every MMIO write, so a test can assert the exact drive
     /// sequence (e.g. a blinky's alternating set/reset) that the last-value sim map cannot show.
     #[cfg(not(target_os = "none"))]
@@ -2099,6 +2340,102 @@ impl ObjectModel {
             ref_offsets: Vec::new(),
             tagged_offsets: alloc::vec![0],
         });
+        let spi_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let spi_resource_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let spi_bus_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::spi::BUS_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let i2c_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let i2c_resource_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let i2c_bus_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::i2c::BUS_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let adc_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let adc_resource_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 8,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let adc_channel_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::adc::CH_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let spi_shim_factory_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let spi_shim_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::shims::spi::SHIM_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![crate::shims::spi::SHIM_W_BUS],
+        });
+        let i2c_shim_factory_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let i2c_shim_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::shims::i2c::SHIM_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![crate::shims::i2c::SHIM_W_BUS],
+        });
+        let adc_shim_factory_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
+        let adc_shim_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: crate::shims::adc::SHIM_WORDS * 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: alloc::vec![crate::shims::adc::SHIM_W_CHANNEL],
+        });
+        let analogio_type_id = descs.len() as u32;
+        descs.push(TypeDesc {
+            payload_size: 4,
+            ref_offsets: Vec::new(),
+            tagged_offsets: Vec::new(),
+        });
         ObjectModel {
             heap: Heap::new(heap_capacity, descs),
             types,
@@ -2147,6 +2484,22 @@ impl ObjectModel {
             uart_type_id,
             uart_resource_type_id,
             uart_port_type_id,
+            spi_type_id,
+            spi_resource_type_id,
+            spi_bus_type_id,
+            i2c_type_id,
+            i2c_resource_type_id,
+            i2c_bus_type_id,
+            adc_type_id,
+            adc_resource_type_id,
+            adc_channel_type_id,
+            spi_shim_factory_type_id,
+            spi_shim_type_id,
+            i2c_shim_factory_type_id,
+            i2c_shim_type_id,
+            adc_shim_factory_type_id,
+            adc_shim_type_id,
+            analogio_type_id,
             busio_type_id,
             uart_shim_factory_type_id,
             uart_shim_type_id,
@@ -2177,6 +2530,9 @@ impl ObjectModel {
             frame_pool: Vec::new(),
             gpio_claimed: Vec::new(),
             uart_claimed: Vec::new(),
+            spi_claimed: Vec::new(),
+            i2c_claimed: Vec::new(),
+            adc_channels_open: Vec::new(),
             gpio_reserved: Vec::new(),
             mmio_write_fn: None,
             mmio_read_fn: None,
@@ -2187,6 +2543,28 @@ impl ObjectModel {
             uart_sim_rx: alloc::collections::VecDeque::new(),
             #[cfg(not(target_os = "none"))]
             uart_sim_tx: Vec::new(),
+            #[cfg(not(target_os = "none"))]
+            spi_sim_tx: Vec::new(),
+            #[cfg(not(target_os = "none"))]
+            spi_sim_respond: alloc::collections::VecDeque::new(),
+            #[cfg(not(target_os = "none"))]
+            spi_sim_rx_pending: alloc::collections::VecDeque::new(),
+            #[cfg(not(target_os = "none"))]
+            reset_done_bits: 0,
+            #[cfg(not(target_os = "none"))]
+            i2c_sim_devices: alloc::collections::BTreeMap::new(),
+            #[cfg(not(target_os = "none"))]
+            i2c_sim_rx: alloc::collections::VecDeque::new(),
+            #[cfg(not(target_os = "none"))]
+            i2c_sim_abort: 0,
+            #[cfg(not(target_os = "none"))]
+            i2c_sim_stopped: false,
+            #[cfg(not(target_os = "none"))]
+            i2c_sim_expect_pointer: false,
+            #[cfg(not(target_os = "none"))]
+            adc_sim_raw: alloc::collections::BTreeMap::new(),
+            #[cfg(not(target_os = "none"))]
+            adc_sim_ainsel: 0,
             #[cfg(not(target_os = "none"))]
             mmio_trace: Vec::new(),
             delay_fn: None,
@@ -2745,6 +3123,9 @@ impl ObjectModel {
     /// instance) are true. Always `Ok(Some(_))` for the value subset we have (the `Option` keeps
     /// the seam for a future `__bool__`/`__len__` dispatch that could defer).
     pub fn py_truthy(&self, value: Value) -> Result<Option<bool>, Trap> {
+        if value.is_not_implemented() {
+            return Err(Trap::TypeError);
+        }
         if value.is_none() || value == Value::FALSE {
             return Ok(Some(false));
         }
@@ -4293,6 +4674,14 @@ impl ObjectModel {
         if self.is_dict(container) {
             return Ok(self.dict_find_dyn(container, element, functions, depth)?.is_some());
         }
+        if let Some(elements) = self.seq_value(container).cloned() {
+            for candidate in elements {
+                if crate::interp::elem_eq(element, candidate, functions, self, depth)? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
         self.py_contains(container, element)
     }
 
@@ -4312,6 +4701,9 @@ impl ObjectModel {
         }
         if value.is_ellipsis() {
             return String::from("Ellipsis");
+        }
+        if value.is_not_implemented() {
+            return String::from("NotImplemented");
         }
         if let Some(n) = value.as_fixnum() {
             return alloc::format!("{n}");
@@ -5215,6 +5607,38 @@ impl ObjectModel {
         value.as_function_index().is_some() || self.is_py_function(value)
     }
 
+    /// The raw callable for an implicit-classmethod dunder (`__class_getitem__` / `__init_subclass__`)
+    /// defined in `class`'s MRO, or `None` if absent. A classmethod/staticmethod wrapper is unwrapped
+    /// to its underlying function; a plain function is returned as-is. The caller invokes it with
+    /// `cls` prepended -- CPython treats both dunders as implicit classmethods regardless of how the
+    /// user wrote them.
+    pub(crate) fn class_method_dunder(&self, class: Value, name: &str) -> Option<Value> {
+        let found = self.find_in_class(class, name)?;
+        Some(if self.is_method_wrapper(found) {
+            self.method_wrapper_func(found)
+        } else {
+            found
+        })
+    }
+
+    /// The raw `__init_subclass__` inherited from `class`'s BASES -- the class's OWN namespace is
+    /// skipped, since a class's `__init_subclass__` governs its future subclasses, not itself. A
+    /// classmethod wrapper is unwrapped to its function. `None` if no base defines one. Called at
+    /// class creation with `cls` = the new class (CPython's class-creation hook).
+    pub(crate) fn inherited_init_subclass(&self, class: Value) -> Option<Value> {
+        for ancestor in self.class_mro_vec(class).into_iter().skip(1) {
+            let namespace = self.read_slot(ancestor, 2);
+            if let Some(found) = self.dict_lookup_str(namespace, "__init_subclass__") {
+                return Some(if self.is_method_wrapper(found) {
+                    self.method_wrapper_func(found)
+                } else {
+                    found
+                });
+            }
+        }
+        None
+    }
+
     fn bind_class_member(&mut self, found: Value, owner: Value, class_value: Value) -> Result<Value, Trap> {
         if self.is_method_wrapper(found) {
             let func = self.method_wrapper_func(found);
@@ -5825,6 +6249,9 @@ impl ObjectModel {
                 if name == "__init__" && self.is_exception_value(receiver) {
                     return self.new_bound_method(receiver, EXC_INIT);
                 }
+                if matches!(name, "__init__" | "__init_subclass__") {
+                    return self.new_bound_method(receiver, OBJECT_NOOP);
+                }
                 return Err(Trap::AttributeError);
             }
         };
@@ -5862,6 +6289,12 @@ impl ObjectModel {
     /// `AttributeError`.
     pub fn py_getattr_instance(&mut self, instance: Value, name: &str) -> Result<Value, Trap> {
         let dict = self.read_slot(instance, 1);
+        if name == "__dict__" {
+            if self.instance_slots(instance).is_some() {
+                return Err(Trap::AttributeError);
+            }
+            return Ok(dict);
+        }
         if let Some(found) = self.dict_lookup_str(dict, name) {
             return Ok(found);
         }
@@ -5890,22 +6323,28 @@ impl ObjectModel {
         Err(Trap::AttributeError)
     }
 
+    /// The union of `__slots__` names when EVERY class in the instance's MRO is slotted (so the
+    /// instance has NO `__dict__`), else `None` (some class admits a dict). Gates both `__slots__`
+    /// write enforcement and the `__dict__` attribute's absence on a fully-slotted instance.
+    fn instance_slots(&self, instance: Value) -> Option<Vec<String>> {
+        let mro = self.class_mro_vec(self.instance_class(instance));
+        if mro.is_empty() {
+            return None;
+        }
+        let mut slots = Vec::new();
+        for class in &mro {
+            match self.class_own_slots(*class) {
+                Some(names) => slots.extend(names),
+                None => return None,
+            }
+        }
+        Some(slots)
+    }
+
     /// `instance.name = value` (`Op::SetAttr`): stores into the instance `__dict__`.
     pub fn py_setattr_instance(&mut self, instance: Value, name: &str, value: Value) -> Result<(), Trap> {
-        let mro = self.class_mro_vec(self.instance_class(instance));
-        if !mro.is_empty() {
-            let mut slots = Vec::new();
-            let mut restricted = true;
-            for class in &mro {
-                match self.class_own_slots(*class) {
-                    Some(names) => slots.extend(names),
-                    None => {
-                        restricted = false;
-                        break;
-                    }
-                }
-            }
-            if restricted && !slots.iter().any(|s| s == name) {
+        if let Some(slots) = self.instance_slots(instance) {
+            if !slots.iter().any(|s| s == name) {
                 let class_name = String::from(self.instance_class_name(instance).unwrap_or(""));
                 let message = alloc::format!(
                     "'{class_name}' object has no attribute '{name}' and no __dict__ for setting new attributes"
@@ -5971,6 +6410,21 @@ impl ObjectModel {
         dict
     }
 
+    /// The qualified name a user function carries in its code object (`f.__qualname__`), resolving
+    /// the code against the function's HOME module (a `function_ref` immediate's packed index/home,
+    /// or a `PyFunction`'s fields), or `None` if it is not a user function.
+    fn function_qualname(&self, func: Value) -> Option<String> {
+        let index = if let Some(idx) = func.as_function_index() {
+            idx
+        } else if self.is_py_function(func) {
+            self.py_function_index(func)
+        } else {
+            return None;
+        };
+        let functions = self.managed_functions_rc(self.function_home(func))?;
+        functions.get(index as usize).map(|code| code.name.clone())
+    }
+
     /// The value of function attribute `name` (`f.tag`), or `None` if `func` has no such attribute.
     #[must_use]
     fn function_attr(&self, func: Value, name: &str) -> Option<Value> {
@@ -6029,38 +6483,83 @@ impl ObjectModel {
         }
     }
 
-    /// Builds the built-in exception class hierarchy on first use (idempotent). Each entry's
-    /// base is built before it; `""` is the root's (BaseException's) base.
+    /// How `instance.name` resolves when a USER descriptor (a class attribute whose own class defines
+    /// `__get__`) sits on the class. `Get` = call its `__get__(instance, class)`; `Value` = the
+    /// instance-dict entry that shadows a NON-data descriptor. `None` for the common case (no such
+    /// class attr, or a method/property/plain value -- those fall through to the normal read path).
+    /// Encodes CPython's precedence: a DATA descriptor (also `__set__`/`__delete__`) wins over the
+    /// instance dict; a NON-data descriptor (only `__get__`) yields to it.
+    pub(crate) fn instance_descriptor_read(
+        &mut self,
+        instance: Value,
+        name: &str,
+    ) -> Option<DescriptorRead> {
+        if !self.is_instance(instance) {
+            return None;
+        }
+        let class = self.read_slot(instance, 0);
+        let attr = self.find_in_class(class, name)?;
+        let get = self.find_dunder(attr, "__get__")?;
+        let is_data = self.find_dunder(attr, "__set__").is_some()
+            || self.find_dunder(attr, "__delete__").is_some();
+        if is_data {
+            return Some(DescriptorRead::Get(get));
+        }
+        if let Some(value) = self.instance_attr(instance, name) {
+            return Some(DescriptorRead::Value(value));
+        }
+        Some(DescriptorRead::Get(get))
+    }
+
+    /// The `__set__` (bound to the descriptor) for `instance.name` when a user data descriptor sits on
+    /// the class, else `None` -- so `instance.name = value` routes through it before the instance-dict
+    /// store. (`property` stays a native fast path; this is for USER descriptors.)
+    pub(crate) fn instance_set_descriptor(&mut self, instance: Value, name: &str) -> Option<Value> {
+        if !self.is_instance(instance) {
+            return None;
+        }
+        let class = self.read_slot(instance, 0);
+        let attr = self.find_in_class(class, name)?;
+        self.find_dunder(attr, "__set__")
+    }
+
+    /// The `__delete__` (bound to the descriptor) for `del instance.name` when a user data descriptor
+    /// sits on the class, else `None`.
+    pub(crate) fn instance_delete_descriptor(&mut self, instance: Value, name: &str) -> Option<Value> {
+        if !self.is_instance(instance) {
+            return None;
+        }
+        let class = self.read_slot(instance, 0);
+        let attr = self.find_in_class(class, name)?;
+        self.find_dunder(attr, "__delete__")
+    }
+
+    /// The `(name, __set_name__ bound to the class-body value)` pairs for every entry in `class`'s own
+    /// namespace whose value's class defines `__set_name__` -- the class-creation walk that lets a
+    /// descriptor learn the attribute name it was assigned to. Order follows the namespace dict.
+    pub(crate) fn set_name_hooks(&mut self, class: Value) -> Vec<(Value, Value)> {
+        let namespace = self.read_slot(class, 2);
+        let Some(entries) = self.dict_value(namespace).cloned() else {
+            return Vec::new();
+        };
+        let mut hooks = Vec::new();
+        for (key, value) in entries {
+            if let Some(hook) = self.find_dunder(value, "__set_name__") {
+                hooks.push((key, hook));
+            }
+        }
+        hooks
+    }
+
+    /// Builds the built-in exception class hierarchy on first use (idempotent), from the shared
+    /// [`lamella_py_bytecode::EXCEPTION_HIERARCHY`] table (the one definition every engine
+    /// derives from). Each entry's base is built before it; `""` is the root's
+    /// (BaseException's) base.
     fn ensure_exception_types(&mut self) {
         if !self.exception_classes.is_empty() {
             return;
         }
-        const HIERARCHY: &[(&str, &str)] = &[
-            ("BaseException", ""),
-            ("Exception", "BaseException"),
-            ("ArithmeticError", "Exception"),
-            ("ZeroDivisionError", "ArithmeticError"),
-            ("OverflowError", "ArithmeticError"),
-            ("LookupError", "Exception"),
-            ("IndexError", "LookupError"),
-            ("KeyError", "LookupError"),
-            ("AttributeError", "Exception"),
-            ("NameError", "Exception"),
-            ("UnboundLocalError", "NameError"),
-            ("TypeError", "Exception"),
-            ("ValueError", "Exception"),
-            ("AssertionError", "Exception"),
-            ("RuntimeError", "Exception"),
-            ("RecursionError", "RuntimeError"),
-            ("NotImplementedError", "RuntimeError"),
-            ("StopIteration", "Exception"),
-            ("ImportError", "Exception"),
-            ("ModuleNotFoundError", "ImportError"),
-            ("OSError", "Exception"),
-            ("TimeoutError", "OSError"),
-            ("GeneratorExit", "BaseException"),
-        ];
-        for &(name, base_name) in HIERARCHY {
+        for &(name, base_name) in lamella_py_bytecode::EXCEPTION_HIERARCHY {
             let name_value = match self.new_str(name) {
                 Ok(v) => v,
                 Err(_) => return,
@@ -6614,6 +7113,17 @@ impl ObjectModel {
         None
     }
 
+    /// Records `active` as `exception.__context__` for implicit chaining, but only if unset -- so a
+    /// trap/builtin-raised exception raised WHILE another is being handled chains to it like CPython,
+    /// without clobbering the `__context__` an explicit `raise` (Op::Raise) already set. A no-op when
+    /// `active` IS the exception (a re-raise does not chain to itself). The unwind path calls this.
+    pub(crate) fn chain_context_if_unset(&mut self, exception: Value, active: Value) -> Result<(), Trap> {
+        if active == exception || self.instance_attr(exception, "__context__").is_some() {
+            return Ok(());
+        }
+        self.py_setattr_instance(exception, "__context__", active)
+    }
+
     /// The name of a class instance's class (its class object's name slot), or `None`.
     #[must_use]
     fn instance_class_name(&self, instance: Value) -> Option<&str> {
@@ -6775,6 +7285,11 @@ impl ObjectModel {
                 return Ok(class);
             }
         }
+        if let Some(id) = builtin_dunder_id(name) {
+            if self.builtin_supports_dunder(obj, name) {
+                return self.new_bound_method(obj, id);
+            }
+        }
         if let Some(id) = obj.as_builtin_id() {
             if name == "__name__" {
                 if let Some(builtin) = Builtin::from_id(id) {
@@ -6833,7 +7348,21 @@ impl ObjectModel {
             return self.new_bound_method(obj, method_id);
         }
         if self.is_user_function(obj) {
-            return self.function_attr(obj, name).ok_or(Trap::AttributeError);
+            if let Some(value) = self.function_attr(obj, name) {
+                return Ok(value);
+            }
+            if matches!(name, "__name__" | "__qualname__") {
+                if let Some(qualname) = self.function_qualname(obj) {
+                    if qualname.contains("<lambda") {
+                        return self.new_str("<lambda>");
+                    }
+                    if name == "__qualname__" {
+                        return self.new_str(&qualname);
+                    }
+                    return self.new_str(qualname.rsplit('.').next().unwrap_or(&qualname));
+                }
+            }
+            return Err(Trap::AttributeError);
         }
         let reference = obj.as_ref().ok_or(Trap::AttributeError)?;
         let type_id = self.heap.type_id_of(reference);
@@ -7009,6 +7538,15 @@ impl ObjectModel {
             if let Some(instance) = self.board.uart_instance(name) {
                 return self.new_uart_resource(instance);
             }
+            if let Some(instance) = self.board.spi_instance(name) {
+                return self.new_spi_resource(instance);
+            }
+            if let Some(instance) = self.board.i2c_instance(name) {
+                return self.new_i2c_resource(instance);
+            }
+            if let Some((channel, pin)) = self.board.adc_resource(name) {
+                return self.new_adc_resource(channel, pin);
+            }
             if let Some((tx, rx)) = self.board.uart_default_pins(0) {
                 match name {
                     "TX" => return Value::fixnum(tx as i32).ok_or(Trap::Overflow),
@@ -7050,9 +7588,70 @@ impl ObjectModel {
             let method_id = crate::uart::port_method_id(name).ok_or(Trap::AttributeError)?;
             return self.new_bound_method(obj, method_id);
         }
+        if type_id == self.spi_type_id {
+            let method_id = crate::spi::spi_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.spi_bus_type_id {
+            use crate::spi::{bit_order_name, BUS_W_BIT_ORDER, BUS_W_FREQUENCY, BUS_W_MODE};
+            match name {
+                "frequency" => {
+                    let value = self.spi_bus_word(obj, BUS_W_FREQUENCY);
+                    return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+                }
+                "mode" => {
+                    let value = self.spi_bus_word(obj, BUS_W_MODE);
+                    return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+                }
+                "bit_order" => {
+                    let code = self.spi_bus_word(obj, BUS_W_BIT_ORDER);
+                    return self.new_str(bit_order_name(code));
+                }
+                _ => {}
+            }
+            let method_id = crate::spi::spi_bus_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.i2c_type_id {
+            let method_id = crate::i2c::i2c_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.i2c_bus_type_id {
+            if name == "frequency" {
+                let value = self.i2c_bus_word(obj, crate::i2c::BUS_W_FREQUENCY);
+                return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+            }
+            let method_id = crate::i2c::i2c_bus_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.adc_type_id {
+            let method_id = crate::adc::adc_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.adc_channel_type_id {
+            match name {
+                "bits" => {
+                    let value = self.adc_channel_word(obj, crate::adc::CH_W_BITS);
+                    return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+                }
+                "reference_uv" => {
+                    let value = self.adc_channel_word(obj, crate::adc::CH_W_REFERENCE_UV);
+                    return Value::fixnum(value as i32).ok_or(Trap::Overflow);
+                }
+                _ => {}
+            }
+            let method_id = crate::adc::adc_channel_method_id(name).ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
         if type_id == self.busio_type_id {
             if name == "UART" {
                 return self.uart_shim_factory_singleton(crate::uart::SHIM_FLAVOR_BUSIO);
+            }
+            if name == "SPI" {
+                return self.spi_shim_factory(crate::shims::spi::SHIM_FLAVOR_BUSIO);
+            }
+            if name == "I2C" {
+                return self.i2c_shim_factory(crate::shims::i2c::SHIM_FLAVOR_BUSIO);
             }
             return Err(Trap::AttributeError);
         }
@@ -7079,10 +7678,60 @@ impl ObjectModel {
             if name == "UART" {
                 return self.uart_shim_factory_singleton(crate::uart::SHIM_FLAVOR_MACHINE);
             }
+            if name == "SPI" {
+                return self.spi_shim_factory(crate::shims::spi::SHIM_FLAVOR_MACHINE);
+            }
+            if name == "I2C" {
+                return self.i2c_shim_factory(crate::shims::i2c::SHIM_FLAVOR_MACHINE);
+            }
+            if name == "ADC" {
+                return self.adc_shim_factory(crate::shims::adc::SHIM_FLAVOR_MACHINE);
+            }
             if name == "Pin" {
                 return self.pin_factory_singleton();
             }
             return Err(Trap::AttributeError);
+        }
+        if type_id == self.analogio_type_id {
+            if name == "AnalogIn" {
+                return self.adc_shim_factory(crate::shims::adc::SHIM_FLAVOR_ANALOGIO);
+            }
+            return Err(Trap::AttributeError);
+        }
+        if type_id == self.adc_shim_type_id {
+            let flavor = self.adc_shim_flavor(obj);
+            if flavor == crate::shims::adc::SHIM_FLAVOR_ANALOGIO {
+                let channel = self.adc_shim_channel(obj);
+                if name == "value" {
+                    return self.call_adc_channel_method(channel, crate::adc::CH_READ_U16, &[]);
+                }
+                if name == "reference_voltage" {
+                    let uv = self.adc_channel_word(channel, crate::adc::CH_W_REFERENCE_UV);
+                    return self.new_float(f64::from(uv) / 1_000_000.0);
+                }
+            }
+            let method_id = crate::shims::adc::adc_shim_method_id(flavor, name)
+                .ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.spi_shim_factory_type_id {
+            return match name {
+                "MSB" => Ok(Value::fixnum(0).unwrap()),
+                "LSB" => Ok(Value::fixnum(1).unwrap()),
+                _ => Err(Trap::AttributeError),
+            };
+        }
+        if type_id == self.spi_shim_type_id {
+            let flavor = self.spi_shim_flavor(obj);
+            let method_id = crate::shims::spi::spi_shim_method_id(flavor, name)
+                .ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
+        }
+        if type_id == self.i2c_shim_type_id {
+            let flavor = self.i2c_shim_flavor(obj);
+            let method_id = crate::shims::i2c::i2c_shim_method_id(flavor, name)
+                .ok_or(Trap::AttributeError)?;
+            return self.new_bound_method(obj, method_id);
         }
         if type_id == self.pin_factory_type_id {
             let mode = crate::gpio::machine_pin_const(name).ok_or(Trap::AttributeError)?;
@@ -7115,11 +7764,17 @@ impl ObjectModel {
             if name == "__name__" {
                 return Ok(self.read_slot(obj, 0));
             }
+            if name == "__qualname__" {
+                return Ok(self.read_slot(obj, 0));
+            }
             if name == "__module__" {
                 return match self.find_in_class(obj, "__module__") {
                     Some(module) => Ok(module),
                     None => self.new_str("builtins"),
                 };
+            }
+            if name == "__dict__" {
+                return Ok(self.read_slot(obj, 2));
             }
             let found = self.find_in_class(obj, name).ok_or(Trap::AttributeError)?;
             return self.bind_class_member(found, obj, obj);
@@ -7187,6 +7842,14 @@ impl ObjectModel {
                     self.uart_sim_tx.push((value & 0xFF) as u8);
                 }
             }
+            self.spi_sim_write(address, value);
+            self.i2c_sim_write(address, value);
+            self.adc_sim_write(address, value);
+            if let Some((clear_alias, _done)) = self.board.reset_regs() {
+                if address == clear_alias {
+                    self.reset_done_bits |= value;
+                }
+            }
             self.mmio_sim.insert(address, value);
             self.mmio_trace.push((address, value));
         }
@@ -7203,6 +7866,11 @@ impl ObjectModel {
         }
         #[cfg(not(target_os = "none"))]
         {
+            if let Some((_clear_alias, done)) = self.board.reset_regs() {
+                if address == done {
+                    return self.reset_done_bits;
+                }
+            }
             if let Some(facts) = self.board.uart_facts(0) {
                 match facts.status {
                     crate::uart::UartStatus::Counts { status, rx_shift, rx_mask, tx_shift, tx_mask }
@@ -7228,6 +7896,15 @@ impl ObjectModel {
                         return value;
                     }
                 }
+            }
+            if let Some(value) = self.spi_sim_read(address) {
+                return value;
+            }
+            if let Some(value) = self.i2c_sim_read(address) {
+                return value;
+            }
+            if let Some(value) = self.adc_sim_read(address) {
+                return value;
             }
             self.mmio_sim.get(&address).copied().unwrap_or(0)
         }
@@ -7497,10 +8174,6 @@ impl ObjectModel {
                 let message = "baudrate out of range for this uart";
                 return Err(self.with_message(Trap::ValueError, message));
             }
-            Some(Err(crate::uart::UartConfigError::ParityNotTabled)) => {
-                let message = "parity is not in this chip's table yet (parity='none' only)";
-                return Err(self.with_message(Trap::ValueError, message));
-            }
             Some(Ok(ops)) => ops,
         };
         self.uart_claimed.push(instance);
@@ -7739,7 +8412,1393 @@ impl ObjectModel {
     }
 
 
-    /// The `busio` module singleton.
+    /// Allocates a GC-leaf object of `type_id` with its payload words set from `words`.
+    pub(crate) fn alloc_leaf(&mut self, type_id: u32, words: &[u32]) -> Result<Value, Trap> {
+        let reference = self.alloc_object(type_id).ok_or(Trap::OutOfMemory)?;
+        for (i, &word) in words.iter().enumerate() {
+            self.heap.write_u32(reference.0 + (i as u32) * 4, word);
+        }
+        Ok(Value::from_ref(reference))
+    }
+
+    /// One raw payload word of a GC-leaf object.
+    pub(crate) fn leaf_word(&self, obj: Value, word: u32) -> u32 {
+        obj.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + word * 4))
+    }
+
+    /// Sets one raw payload word of a GC-leaf object.
+    pub(crate) fn leaf_set_word(&mut self, obj: Value, word: u32, value: u32) {
+        if let Some(r) = obj.as_ref() {
+            self.heap.write_u32(r.0 + word * 4, value);
+        }
+    }
+
+    /// Whether `value` is a heap object of the given GC type id (the shared `is_*` shape, so a
+    /// sibling module can test a shim's own type without reaching into the private heap).
+    pub(crate) fn is_type(&self, value: Value, type_id: u32) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == type_id)
+    }
+
+    /// The selected target board (so a sibling shim module can reach the per-board pin facts).
+    pub(crate) fn board(&self) -> crate::gpio::Board {
+        self.board
+    }
+
+    /// Copies `data` into the prefix of a `bytearray` (up to its capacity), returning the count --
+    /// the `readinto`/`readfrom_into` fill path for a shim that reads through the standard verbs.
+    pub(crate) fn fill_bytearray_prefix(&mut self, buf: Value, data: &[u8]) -> Result<usize, Trap> {
+        if !self.is_bytearray(buf) {
+            return Err(self.with_message(Trap::TypeError, "expected a bytearray to read into"));
+        }
+        let capacity = self.bytes_value(buf).map_or(0, <[u8]>::len);
+        let n = data.len().min(capacity);
+        if let Some(slot) = self.byte_buffer_slot(buf) {
+            for (at, &byte) in data.iter().take(n).enumerate() {
+                self.byte_buffers[slot][at] = byte;
+            }
+        }
+        Ok(n)
+    }
+
+    /// A shim's pin argument (`clock=`/`sda=`/...) must MATCH the table-fixed pin -- `None` (omitted)
+    /// passes, a differing pin fails loud rather than silently driving the wrong line.
+    pub(crate) fn shim_require_pin(
+        &mut self,
+        given: Value,
+        expected: u32,
+        which: &str,
+    ) -> Result<(), Trap> {
+        if given.is_none() || given.as_int() == Some(i64::from(expected)) {
+            return Ok(());
+        }
+        let message = alloc::format!(
+            "{which} is fixed to pin {expected} by this board's table (pass that pin, or omit it)"
+        );
+        Err(self.with_message(Trap::ValueError, &message))
+    }
+
+
+    /// The `spi` module singleton. Bind it as the global `spi` so a program reaches `spi.open(...)`.
+    pub fn spi_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.spi_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is the `spi` singleton.
+    #[must_use]
+    pub fn is_spi(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.spi_type_id)
+    }
+
+    /// Whether `value` is an open-or-closed `SpiBus`.
+    #[must_use]
+    pub fn is_spi_bus(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.spi_bus_type_id)
+    }
+
+    /// Allocates a board SPI resource handle (`board.SPI0`) carrying its instance number.
+    pub(crate) fn new_spi_resource(&mut self, instance: u32) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.spi_resource_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, instance);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The instance number if `value` is a board SPI resource.
+    fn spi_resource_instance(&self, value: Value) -> Option<u32> {
+        value
+            .as_ref()
+            .filter(|r| self.heap.type_id_of(*r) == self.spi_resource_type_id)
+            .map(|r| self.heap.read_u32(r.0))
+    }
+
+    /// Allocates an OPEN `SpiBus` over `instance` with the realized rate + config echoed in.
+    fn new_spi_bus(
+        &mut self,
+        instance: u32,
+        config: &crate::spi::SpiConfig,
+        realized: u32,
+        cs_pin: u32,
+    ) -> Result<Value, Trap> {
+        use crate::spi::*;
+        let reference = self.alloc_object(self.spi_bus_type_id).ok_or(Trap::OutOfMemory)?;
+        let base = reference.0;
+        self.heap.write_u32(base + BUS_W_INSTANCE * 4, instance);
+        self.heap.write_u32(base + BUS_W_OPEN * 4, 1);
+        self.heap.write_u32(base + BUS_W_FREQUENCY * 4, realized);
+        self.heap.write_u32(base + BUS_W_MODE * 4, config.mode);
+        self.heap.write_u32(base + BUS_W_BIT_ORDER * 4, config.bit_order);
+        self.heap.write_u32(base + BUS_W_CS_PIN * 4, cs_pin);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// One raw word of a `SpiBus`'s payload.
+    fn spi_bus_word(&self, bus: Value, word: u32) -> u32 {
+        bus.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + word * 4))
+    }
+
+    fn spi_bus_set_word(&mut self, bus: Value, word: u32, value: u32) {
+        if let Some(r) = bus.as_ref() {
+            self.heap.write_u32(r.0 + word * 4, value);
+        }
+    }
+
+    /// Replays one SPI driver-sequence step over the MMIO seam; a `ReadInto` returns the inbound
+    /// (full-duplex MISO) byte it read, everything else `None`.
+    fn apply_spi_op(&mut self, op: crate::spi::SpiOp) -> Option<u32> {
+        use crate::spi::SpiOp;
+        match op {
+            SpiOp::Write { reg, value } => {
+                self.mmio_write(reg, value);
+                None
+            }
+            SpiOp::PollEq { reg, mask, want } => {
+                while self.mmio_read(reg) & mask != want {}
+                None
+            }
+            SpiOp::ReadInto { reg, mask } => Some(self.mmio_read(reg) & mask),
+        }
+    }
+
+    /// Asserts the managed chip-select (drives it LOW = selected); a raw bus ([`NO_CS`]) no-ops.
+    fn spi_cs_assert(&mut self, cs_pin: u32) {
+        if cs_pin == crate::spi::NO_CS {
+            return;
+        }
+        let regs = self.board.pin_regs(cs_pin);
+        self.mmio_write(regs.clr_reg, regs.clr_val);
+    }
+
+    /// Deasserts the managed chip-select (drives it HIGH = idle/deselected); a raw bus no-ops.
+    fn spi_cs_deassert(&mut self, cs_pin: u32) {
+        if cs_pin == crate::spi::NO_CS {
+            return;
+        }
+        let regs = self.board.pin_regs(cs_pin);
+        self.mmio_write(regs.set_reg, regs.set_val);
+    }
+
+    /// Clocks `out` full-duplex, returning the `out.len()` bytes clocked in simultaneously.
+    fn spi_clock_bytes(&mut self, instance: u32, out: &[u8]) -> alloc::vec::Vec<u8> {
+        let board = self.board;
+        let mut inbound = alloc::vec::Vec::with_capacity(out.len());
+        for &byte in out {
+            for op in board.spi_transfer_byte_ops(instance, byte) {
+                if let Some(rx) = self.apply_spi_op(op) {
+                    inbound.push(rx as u8);
+                }
+            }
+        }
+        inbound
+    }
+
+    /// `spi.open(resource, **config)`: validates the config, claims the BUS (+ the managed CS pin,
+    /// atomically -- a failed CS claim releases the bus), replays the bring-up, drives CS idle HIGH,
+    /// and returns the `SpiBus`.
+    pub(crate) fn spi_open(&mut self, posargs: &[Value], kwargs: &[(&str, Value)]) -> Result<Value, Trap> {
+        use crate::spi::*;
+        let [resource] = posargs else {
+            let message = "open() takes exactly one positional argument (the board SPI resource)";
+            return Err(self.with_message(Trap::TypeError, message));
+        };
+        let Some(instance) = self.spi_resource_instance(*resource) else {
+            let message = "open() expects a board SPI resource (e.g. board.SPI0)";
+            return Err(self.with_message(Trap::TypeError, message));
+        };
+        let mut config = SpiConfig::default();
+        let mut cs = Value::NONE;
+        for &(name, value) in kwargs {
+            match name {
+                "frequency" => {
+                    let hz = value.as_int().unwrap_or(0);
+                    if hz <= 0 || hz > i64::from(u32::MAX) {
+                        let message = "frequency must be a positive integer";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                    config.frequency = hz as u32;
+                }
+                "mode" => match value.as_int() {
+                    Some(mode @ 0..=3) => config.mode = mode as u32,
+                    _ => {
+                        let message = "mode must be 0, 1, 2 or 3 (CPOL<<1 | CPHA)";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                },
+                "bit_order" => {
+                    let Some(code) = self.str_value(value).and_then(bit_order_code) else {
+                        let message = "bit_order must be 'msb' or 'lsb'";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    };
+                    config.bit_order = code;
+                }
+                "cs" => cs = value,
+                other => {
+                    let message =
+                        alloc::format!("open() got an unexpected keyword argument '{other}'");
+                    return Err(self.raise_named_exception("TypeError", &message));
+                }
+            }
+        }
+        let cs_pin = if cs.is_none() {
+            NO_CS
+        } else {
+            let Some(pin) = cs.as_int().and_then(|n| u32::try_from(n).ok()) else {
+                let message = "cs must be a board pin (e.g. board.GP5) or None";
+                return Err(self.with_message(Trap::TypeError, message));
+            };
+            if self.board.spi_function_pins(instance).contains(&pin) {
+                let message = alloc::format!(
+                    "cs=pin {pin} is muxed to the SPI function by this board's table; name a free gpio"
+                );
+                return Err(self.with_message(Trap::ValueError, &message));
+            }
+            pin
+        };
+        if self.spi_claimed.contains(&instance) {
+            let message = alloc::format!("SPI{instance} in use");
+            return Err(self.raise_named_exception("OSError", &message));
+        }
+        let (ops, realized) = match self.board.spi_open_ops(instance, &config) {
+            None => {
+                let message = "spi is not supported on this board yet";
+                return Err(self.with_message(Trap::Unsupported, message));
+            }
+            Some(Err(SpiConfigError::BaudUnreachable)) => {
+                let message = "frequency is below this spi's divider floor";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
+            Some(Err(SpiConfigError::BitOrderNotTabled)) => {
+                let message =
+                    "bit_order='lsb' is not in this chip's table (the PL022 is MSB-first only)";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
+            Some(Ok(pair)) => pair,
+        };
+        self.spi_claimed.push(instance);
+        if cs_pin != NO_CS {
+            if let Err(err) = self.claim_pin(cs_pin) {
+                self.spi_claimed.retain(|&claimed| claimed != instance);
+                return Err(err);
+            }
+        }
+        for op in ops {
+            self.apply_spi_op(op);
+        }
+        if cs_pin != NO_CS {
+            let board = self.board;
+            for op in board.open_ops(cs_pin, true) {
+                self.apply_reg_op(op);
+            }
+            let regs = board.pin_regs(cs_pin);
+            self.mmio_write(regs.set_reg, regs.set_val);
+        }
+        self.new_spi_bus(instance, &config, realized, cs_pin)
+    }
+
+    /// Dispatches a `spi` module method, positional form.
+    pub(crate) fn call_spi_method(
+        &mut self,
+        _spi: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        match method_id {
+            crate::spi::SPI_OPEN => self.spi_open(args, &[]),
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a keyword call on the `spi` module or a `SpiBus` (`Op::CallKw`):
+    /// `spi.open(baudrate=..., cs=...)`, `bus.read(n, fill=...)`.
+    pub(crate) fn call_spi_bound_kw(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        posargs: &[Value],
+        kwargs: &[(&str, Value)],
+    ) -> Result<Value, Trap> {
+        use crate::spi::*;
+        if self.is_spi(receiver) {
+            return match method_id {
+                SPI_OPEN => self.spi_open(posargs, kwargs),
+                _ => Err(Trap::AttributeError),
+            };
+        }
+        let mut fill = Value::NONE;
+        for &(name, value) in kwargs {
+            if name == "fill" && method_id == BUS_READ {
+                fill = value;
+            } else {
+                let message =
+                    alloc::format!("this method got an unexpected keyword argument '{name}'");
+                return Err(self.raise_named_exception("TypeError", &message));
+            }
+        }
+        self.spi_bus_dispatch(receiver, method_id, posargs, fill)
+    }
+
+    /// Dispatches a `SpiBus` method, positional form (`fill` defaults to 0x00).
+    pub(crate) fn call_spi_bus_method(
+        &mut self,
+        bus: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        self.spi_bus_dispatch(bus, method_id, args, Value::NONE)
+    }
+
+    /// The instance of an OPEN bus (`ValueError` after `close`).
+    fn spi_bus_require_open(&mut self, bus: Value) -> Result<u32, Trap> {
+        use crate::spi::{BUS_W_INSTANCE, BUS_W_OPEN};
+        if self.spi_bus_word(bus, BUS_W_OPEN) == 0 {
+            return Err(self.with_message(Trap::ValueError, "I/O operation on closed spi bus"));
+        }
+        Ok(self.spi_bus_word(bus, BUS_W_INSTANCE))
+    }
+
+    /// The one `SpiBus` dispatch both call forms funnel through. Managed CS brackets every whole
+    /// operation with ONE assert/deassert pair (the family wire contract).
+    pub(crate) fn spi_bus_dispatch(
+        &mut self,
+        bus: Value,
+        method_id: u32,
+        args: &[Value],
+        fill: Value,
+    ) -> Result<Value, Trap> {
+        use crate::spi::*;
+        match method_id {
+            BUS_TRANSFER => {
+                let [out] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let Some(out) = self.bytes_value(*out).map(<[u8]>::to_vec) else {
+                    return Err(self.spi_needs_bytes(*out));
+                };
+                let instance = self.spi_bus_require_open(bus)?;
+                let cs = self.spi_bus_word(bus, BUS_W_CS_PIN);
+                self.spi_cs_assert(cs);
+                let inbound = self.spi_clock_bytes(instance, &out);
+                self.spi_cs_deassert(cs);
+                self.new_bytes(inbound)
+            }
+            BUS_WRITE => {
+                let [data] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let Some(data) = self.bytes_value(*data).map(<[u8]>::to_vec) else {
+                    return Err(self.spi_needs_bytes(*data));
+                };
+                let instance = self.spi_bus_require_open(bus)?;
+                let cs = self.spi_bus_word(bus, BUS_W_CS_PIN);
+                self.spi_cs_assert(cs);
+                let _ = self.spi_clock_bytes(instance, &data);
+                self.spi_cs_deassert(cs);
+                Value::fixnum(data.len() as i32).ok_or(Trap::Overflow)
+            }
+            BUS_READ => {
+                let [n] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let Some(n) = n.as_int().filter(|&n| n >= 0) else {
+                    let message = "read size must be an int >= 0";
+                    return Err(self.with_message(Trap::ValueError, message));
+                };
+                let fill_byte = if fill.is_none() {
+                    0u8
+                } else {
+                    match fill.as_int() {
+                        Some(b @ 0..=255) => b as u8,
+                        _ => {
+                            let message = "fill must be a byte value in 0..255";
+                            return Err(self.with_message(Trap::ValueError, message));
+                        }
+                    }
+                };
+                let instance = self.spi_bus_require_open(bus)?;
+                let cs = self.spi_bus_word(bus, BUS_W_CS_PIN);
+                self.spi_cs_assert(cs);
+                let out = alloc::vec![fill_byte; n as usize];
+                let inbound = self.spi_clock_bytes(instance, &out);
+                self.spi_cs_deassert(cs);
+                self.new_bytes(inbound)
+            }
+            BUS_TRANSFER_INTO => {
+                let [out, into] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let Some(out) = self.bytes_value(*out).map(<[u8]>::to_vec) else {
+                    return Err(self.spi_needs_bytes(*out));
+                };
+                if !self.is_bytearray(*into) {
+                    let message = "transfer_into() destination must be a bytearray";
+                    return Err(self.with_message(Trap::TypeError, message));
+                }
+                let capacity = self.bytes_value(*into).map_or(0, <[u8]>::len);
+                if capacity < out.len() {
+                    let message = "transfer_into() destination is smaller than the source";
+                    return Err(self.with_message(Trap::ValueError, message));
+                }
+                let instance = self.spi_bus_require_open(bus)?;
+                let cs = self.spi_bus_word(bus, BUS_W_CS_PIN);
+                self.spi_cs_assert(cs);
+                let inbound = self.spi_clock_bytes(instance, &out);
+                self.spi_cs_deassert(cs);
+                if let Some(slot) = self.byte_buffer_slot(*into) {
+                    for (at, &byte) in inbound.iter().enumerate() {
+                        self.byte_buffers[slot][at] = byte;
+                    }
+                }
+                Value::fixnum(inbound.len() as i32).ok_or(Trap::Overflow)
+            }
+            BUS_CLOSE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                self.spi_bus_close(bus);
+                Ok(Value::NONE)
+            }
+            BUS_ENTER => Ok(bus),
+            BUS_EXIT => {
+                self.spi_bus_close(bus);
+                Ok(Value::NONE)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// The `a bytes-like object is required, not 'X'` TypeError for an SPI verb's data argument.
+    fn spi_needs_bytes(&mut self, value: Value) -> Trap {
+        let message =
+            alloc::format!("a bytes-like object is required, not '{}'", self.type_name_of(value));
+        self.raise_named_exception("TypeError", &message)
+    }
+
+    /// Closes a bus: releases the instance claim AND the managed CS pin (idempotent, like a file).
+    fn spi_bus_close(&mut self, bus: Value) {
+        use crate::spi::{BUS_W_CS_PIN, BUS_W_INSTANCE, BUS_W_OPEN, NO_CS};
+        if self.spi_bus_word(bus, BUS_W_OPEN) == 0 {
+            return;
+        }
+        let instance = self.spi_bus_word(bus, BUS_W_INSTANCE);
+        let cs = self.spi_bus_word(bus, BUS_W_CS_PIN);
+        self.spi_claimed.retain(|&claimed| claimed != instance);
+        if cs != NO_CS {
+            self.release_pin(cs);
+        }
+        self.spi_bus_set_word(bus, BUS_W_OPEN, 0);
+    }
+
+    /// Reconfigures an OPEN bus in place (the `busio.SPI.configure` shim path): re-runs the SSP
+    /// block reprogram UNDER the held claim (no release, no steal window) and WITHOUT the board-
+    /// shared clock bring-up, then updates the read-only echoes. The public standard's
+    /// "reconfigure = close + reopen" is untouched.
+    pub(crate) fn spi_reconfigure(
+        &mut self,
+        bus: Value,
+        config: &crate::spi::SpiConfig,
+    ) -> Result<(), Trap> {
+        use crate::spi::*;
+        let instance = self.spi_bus_word(bus, BUS_W_INSTANCE);
+        let (ops, realized) = match self.board.spi_reconfigure_ops(instance, config) {
+            None => {
+                let message = "spi reconfigure is not supported on this board";
+                return Err(self.with_message(Trap::Unsupported, message));
+            }
+            Some(Err(SpiConfigError::BaudUnreachable)) => {
+                let message = "frequency is below this spi's divider floor";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
+            Some(Err(SpiConfigError::BitOrderNotTabled)) => {
+                let message =
+                    "bit_order='lsb' is not in this chip's table (the PL022 is MSB-first only)";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
+            Some(Ok(pair)) => pair,
+        };
+        if realized == self.spi_bus_word(bus, BUS_W_FREQUENCY)
+            && config.mode == self.spi_bus_word(bus, BUS_W_MODE)
+            && config.bit_order == self.spi_bus_word(bus, BUS_W_BIT_ORDER)
+        {
+            return Ok(());
+        }
+        for op in ops {
+            self.apply_spi_op(op);
+        }
+        self.spi_bus_set_word(bus, BUS_W_FREQUENCY, realized);
+        self.spi_bus_set_word(bus, BUS_W_MODE, config.mode);
+        self.spi_bus_set_word(bus, BUS_W_BIT_ORDER, config.bit_order);
+        Ok(())
+    }
+
+    /// The host SPI sim's write side-effect: a data-register write captures the MOSI byte and
+    /// queues its full-duplex reply (the scripted MISO stream, 0x00 when exhausted).
+    #[cfg(not(target_os = "none"))]
+    fn spi_sim_write(&mut self, address: u32, value: u32) {
+        if let Some(facts) = self.board.spi_facts(0) {
+            if address == facts.data_reg {
+                self.spi_sim_tx.push((value & 0xFF) as u8);
+                let reply = self.spi_sim_respond.pop_front().unwrap_or(0);
+                self.spi_sim_rx_pending.push_back(reply);
+            }
+        }
+    }
+
+    /// The host SPI sim's read: the status register (idle flags, RX-ready when a reply is queued),
+    /// the data register (pops one queued reply), and the reset-done ready bits.
+    #[cfg(not(target_os = "none"))]
+    fn spi_sim_read(&mut self, address: u32) -> Option<u32> {
+        let facts = self.board.spi_facts(0)?;
+        if address == facts.status_reg {
+            let mut status = facts.status_idle_flags;
+            if !self.spi_sim_rx_pending.is_empty() {
+                status |= facts.status_rx_ready;
+            }
+            return Some(status);
+        }
+        if address == facts.data_reg {
+            return Some(u32::from(self.spi_sim_rx_pending.pop_front().unwrap_or(0)));
+        }
+        for &(reg, value) in facts.sim_ready {
+            if address == reg {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    /// Queues MISO bytes into the host SPI sim (the scripted device response). Each byte the
+    /// program clocks out consumes one as its full-duplex reply; an exhausted queue reads 0x00
+    /// (a test convention -- a real undriven MISO is indeterminate).
+    #[cfg(not(target_os = "none"))]
+    pub fn spi_sim_respond(&mut self, data: &[u8]) {
+        self.spi_sim_respond.extend(data.iter().copied());
+    }
+
+    /// The bytes the program has clocked out through the host SPI sim (MOSI) -- the TX oracle.
+    #[cfg(not(target_os = "none"))]
+    #[must_use]
+    pub fn spi_sim_tx(&self) -> &[u8] {
+        &self.spi_sim_tx
+    }
+
+
+    /// The `i2c` module singleton. Bind it as the global `i2c` so a program reaches `i2c.open(...)`.
+    pub fn i2c_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.i2c_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is the `i2c` singleton.
+    #[must_use]
+    pub fn is_i2c(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.i2c_type_id)
+    }
+
+    /// Whether `value` is an open-or-closed `I2cBus`.
+    #[must_use]
+    pub fn is_i2c_bus(&self, value: Value) -> bool {
+        value.as_ref().is_some_and(|r| self.heap.type_id_of(r) == self.i2c_bus_type_id)
+    }
+
+    /// Allocates a board I2C resource handle (`board.I2C0`) carrying its instance number.
+    pub(crate) fn new_i2c_resource(&mut self, instance: u32) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.i2c_resource_type_id).ok_or(Trap::OutOfMemory)?;
+        self.heap.write_u32(reference.0, instance);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// The instance number if `value` is a board I2C resource.
+    fn i2c_resource_instance(&self, value: Value) -> Option<u32> {
+        value
+            .as_ref()
+            .filter(|r| self.heap.type_id_of(*r) == self.i2c_resource_type_id)
+            .map(|r| self.heap.read_u32(r.0))
+    }
+
+    /// Allocates an OPEN `I2cBus` over `instance` with the realized SCL rate echoed in.
+    fn new_i2c_bus(&mut self, instance: u32, realized: u32) -> Result<Value, Trap> {
+        use crate::i2c::*;
+        let reference = self.alloc_object(self.i2c_bus_type_id).ok_or(Trap::OutOfMemory)?;
+        let base = reference.0;
+        self.heap.write_u32(base + BUS_W_INSTANCE * 4, instance);
+        self.heap.write_u32(base + BUS_W_OPEN * 4, 1);
+        self.heap.write_u32(base + BUS_W_FREQUENCY * 4, realized);
+        Ok(Value::from_ref(reference))
+    }
+
+    /// One raw word of an `I2cBus`'s payload.
+    fn i2c_bus_word(&self, bus: Value, word: u32) -> u32 {
+        bus.as_ref().map_or(0, |r| self.heap.read_u32(r.0 + word * 4))
+    }
+
+    fn i2c_bus_set_word(&mut self, bus: Value, word: u32, value: u32) {
+        if let Some(r) = bus.as_ref() {
+            self.heap.write_u32(r.0 + word * 4, value);
+        }
+    }
+
+    /// Replays one I2C init step over the MMIO seam.
+    fn apply_i2c_op(&mut self, op: crate::i2c::I2cOp) {
+        use crate::i2c::I2cOp;
+        match op {
+            I2cOp::Write { reg, value } => self.mmio_write(reg, value),
+            I2cOp::PollEq { reg, mask, want } => while self.mmio_read(reg) & mask != want {},
+        }
+    }
+
+    /// `i2c.open(resource, **config)`: validates the config, claims the bus, replays the bring-up,
+    /// returns the `I2cBus`.
+    pub(crate) fn i2c_open(&mut self, posargs: &[Value], kwargs: &[(&str, Value)]) -> Result<Value, Trap> {
+        use crate::i2c::*;
+        let [resource] = posargs else {
+            let message = "open() takes exactly one positional argument (the board I2C resource)";
+            return Err(self.with_message(Trap::TypeError, message));
+        };
+        let Some(instance) = self.i2c_resource_instance(*resource) else {
+            let message = "open() expects a board I2C resource (e.g. board.I2C0)";
+            return Err(self.with_message(Trap::TypeError, message));
+        };
+        let mut config = I2cConfig::default();
+        for &(name, value) in kwargs {
+            match name {
+                "frequency" => {
+                    let freq = value.as_int().unwrap_or(0);
+                    if freq <= 0 || freq > i64::from(u32::MAX) {
+                        let message = "frequency must be a positive integer";
+                        return Err(self.with_message(Trap::ValueError, message));
+                    }
+                    config.frequency = freq as u32;
+                }
+                other => {
+                    let message =
+                        alloc::format!("open() got an unexpected keyword argument '{other}'");
+                    return Err(self.raise_named_exception("TypeError", &message));
+                }
+            }
+        }
+        if self.i2c_claimed.contains(&instance) {
+            let message = alloc::format!("I2C{instance} in use");
+            return Err(self.raise_named_exception("OSError", &message));
+        }
+        let (ops, realized) = match self.board.i2c_open_ops(instance, &config) {
+            None => {
+                let message = "i2c is not supported on this board yet";
+                return Err(self.with_message(Trap::Unsupported, message));
+            }
+            Some(Err(I2cConfigError::FrequencyUnreachable)) => {
+                let message = "frequency is out of range for this i2c";
+                return Err(self.with_message(Trap::ValueError, message));
+            }
+            Some(Ok(pair)) => pair,
+        };
+        self.i2c_claimed.push(instance);
+        for op in ops {
+            self.apply_i2c_op(op);
+        }
+        self.new_i2c_bus(instance, realized)
+    }
+
+    /// The retarget window: the DW_apb_i2c latches IC_TAR only while disabled.
+    fn i2c_retarget(&mut self, facts: &crate::i2c::I2cFacts, addr: u8) {
+        self.mmio_write(facts.enable, 0);
+        self.mmio_write(facts.tar, u32::from(addr));
+        self.mmio_write(facts.enable, 1);
+    }
+
+    /// A multi-byte master write (START + addr + bytes + STOP, or the abort), raising on NACK
+    /// AFTER the abort-clear recovery -- an ADDRESS NACK and a DATA NACK carry distinct messages.
+    fn i2c_write(
+        &mut self,
+        facts: &crate::i2c::I2cFacts,
+        addr: u8,
+        data: &[u8],
+    ) -> Result<(), Trap> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.i2c_retarget(facts, addr);
+        for (i, &byte) in data.iter().enumerate() {
+            while self.mmio_read(facts.status) & facts.status_tfnf == 0 {}
+            let stop = if i + 1 == data.len() { facts.cmd_stop } else { 0 };
+            self.mmio_write(facts.data_cmd, u32::from(byte) | stop);
+        }
+        while self.mmio_read(facts.raw_intr_stat) & facts.intr_tx_empty == 0 {}
+        let abort = self.mmio_read(facts.abort_source);
+        if abort != 0 {
+            self.mmio_read(facts.clr_tx_abrt);
+        }
+        while self.mmio_read(facts.raw_intr_stat) & facts.intr_stop_det == 0 {}
+        self.mmio_read(facts.clr_stop_det);
+        if abort != 0 {
+            return Err(self.i2c_nack_error(facts, addr, abort));
+        }
+        Ok(())
+    }
+
+    /// A multi-byte master read (START + addr + R, n bytes + STOP), raising on NACK.
+    fn i2c_read(
+        &mut self,
+        facts: &crate::i2c::I2cFacts,
+        addr: u8,
+        n: usize,
+    ) -> Result<alloc::vec::Vec<u8>, Trap> {
+        if n == 0 {
+            return Ok(alloc::vec::Vec::new());
+        }
+        self.i2c_retarget(facts, addr);
+        let mut out = alloc::vec::Vec::with_capacity(n);
+        for i in 0..n {
+            while self.mmio_read(facts.status) & facts.status_tfnf == 0 {}
+            let stop = if i + 1 == n { facts.cmd_stop } else { 0 };
+            self.mmio_write(facts.data_cmd, facts.cmd_read | stop);
+            if self.mmio_read(facts.raw_intr_stat) & facts.intr_tx_abrt != 0 {
+                let abort = self.mmio_read(facts.abort_source);
+                self.mmio_read(facts.clr_tx_abrt);
+                return Err(self.i2c_nack_error(facts, addr, abort));
+            }
+            while self.mmio_read(facts.rxflr) == 0 {}
+            out.push((self.mmio_read(facts.data_cmd) & 0xFF) as u8);
+        }
+        Ok(out)
+    }
+
+    /// Write-then-read joined by a repeated START (the register-read shape): the `out` bytes with
+    /// NO stop, then `n` reads (RESTART on the first, STOP on the last). `n` >= 1.
+    fn i2c_write_then_read(
+        &mut self,
+        facts: &crate::i2c::I2cFacts,
+        addr: u8,
+        out: &[u8],
+        n: usize,
+    ) -> Result<alloc::vec::Vec<u8>, Trap> {
+        self.i2c_retarget(facts, addr);
+        for &byte in out {
+            while self.mmio_read(facts.status) & facts.status_tfnf == 0 {}
+            self.mmio_write(facts.data_cmd, u32::from(byte));
+        }
+        let mut result = alloc::vec::Vec::with_capacity(n);
+        for i in 0..n {
+            while self.mmio_read(facts.status) & facts.status_tfnf == 0 {}
+            let mut cmd = facts.cmd_read;
+            if i == 0 {
+                cmd |= facts.cmd_restart;
+            }
+            if i + 1 == n {
+                cmd |= facts.cmd_stop;
+            }
+            self.mmio_write(facts.data_cmd, cmd);
+            if self.mmio_read(facts.raw_intr_stat) & facts.intr_tx_abrt != 0 {
+                let abort = self.mmio_read(facts.abort_source);
+                self.mmio_read(facts.clr_tx_abrt);
+                return Err(self.i2c_nack_error(facts, addr, abort));
+            }
+            while self.mmio_read(facts.rxflr) == 0 {}
+            result.push((self.mmio_read(facts.data_cmd) & 0xFF) as u8);
+        }
+        Ok(result)
+    }
+
+    /// A one-byte read probe: returns whether the address ACKs (present), without raising -- the
+    /// scanner's primitive, keeping absence in the DATA path, not the exception path.
+    fn i2c_try_probe(&mut self, facts: &crate::i2c::I2cFacts, addr: u8) -> bool {
+        self.i2c_retarget(facts, addr);
+        while self.mmio_read(facts.status) & facts.status_tfnf == 0 {}
+        self.mmio_write(facts.data_cmd, facts.cmd_read | facts.cmd_stop);
+        if self.mmio_read(facts.raw_intr_stat) & facts.intr_tx_abrt != 0 {
+            self.mmio_read(facts.abort_source);
+            self.mmio_read(facts.clr_tx_abrt);
+            return false;
+        }
+        while self.mmio_read(facts.rxflr) == 0 {}
+        self.mmio_read(facts.data_cmd);
+        true
+    }
+
+    /// The `OSError` for a NACK: an ADDRESS NACK vs a DATA-byte NACK, the phase named (the type is
+    /// the family contract; the message text is per-language and non-tier-stable).
+    fn i2c_nack_error(&mut self, facts: &crate::i2c::I2cFacts, addr: u8, abort: u32) -> Trap {
+        let message = if abort & facts.abrt_data_nack != 0 {
+            alloc::format!("data byte not acknowledged by address {addr:#04x}")
+        } else {
+            alloc::format!("no acknowledgment from address {addr:#04x}")
+        };
+        self.raise_named_exception("OSError", &message)
+    }
+
+    /// Parses a 7-bit address argument.
+    fn i2c_addr_arg(&mut self, value: Value) -> Result<u8, Trap> {
+        match value.as_int() {
+            Some(a @ 0..=127) => Ok(a as u8),
+            _ => Err(self.with_message(Trap::ValueError, "address must be an int in 0..127")),
+        }
+    }
+
+    /// Parses a register-byte argument.
+    fn i2c_byte_arg(&mut self, value: Value) -> Result<u8, Trap> {
+        match value.as_int() {
+            Some(b @ 0..=255) => Ok(b as u8),
+            _ => Err(self.with_message(Trap::ValueError, "register must be a byte in 0..255")),
+        }
+    }
+
+    /// Parses a byte-count argument.
+    fn i2c_count_arg(&mut self, value: Value) -> Result<usize, Trap> {
+        match value.as_int() {
+            Some(n) if n >= 0 => Ok(n as usize),
+            _ => Err(self.with_message(Trap::ValueError, "count must be an int >= 0")),
+        }
+    }
+
+    /// The `a bytes-like object is required, not 'X'` TypeError for an I2C verb's data argument.
+    fn i2c_needs_bytes(&mut self, value: Value) -> Trap {
+        let message =
+            alloc::format!("a bytes-like object is required, not '{}'", self.type_name_of(value));
+        self.raise_named_exception("TypeError", &message)
+    }
+
+    /// The instance + facts of an OPEN bus (`ValueError` after `close`).
+    fn i2c_bus_require_open(&mut self, bus: Value) -> Result<crate::i2c::I2cFacts, Trap> {
+        use crate::i2c::{BUS_W_INSTANCE, BUS_W_OPEN};
+        if self.i2c_bus_word(bus, BUS_W_OPEN) == 0 {
+            return Err(self.with_message(Trap::ValueError, "I/O operation on closed i2c bus"));
+        }
+        let instance = self.i2c_bus_word(bus, BUS_W_INSTANCE);
+        self.board.i2c_facts(instance).ok_or(Trap::Malformed)
+    }
+
+    /// Dispatches an `i2c` module method, positional form.
+    pub(crate) fn call_i2c_method(
+        &mut self,
+        _i2c: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        match method_id {
+            crate::i2c::I2C_OPEN => self.i2c_open(args, &[]),
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a keyword call on the `i2c` module or an `I2cBus` (`Op::CallKw`):
+    /// `i2c.open(frequency=...)`, `bus.read_register(addr, reg, n=...)`.
+    pub(crate) fn call_i2c_bound_kw(
+        &mut self,
+        receiver: Value,
+        method_id: u32,
+        posargs: &[Value],
+        kwargs: &[(&str, Value)],
+    ) -> Result<Value, Trap> {
+        use crate::i2c::*;
+        if self.is_i2c(receiver) {
+            return match method_id {
+                I2C_OPEN => self.i2c_open(posargs, kwargs),
+                _ => Err(Trap::AttributeError),
+            };
+        }
+        let mut kw_n = Value::NONE;
+        for &(name, value) in kwargs {
+            if name == "n" && method_id == BUS_READ_REGISTER {
+                kw_n = value;
+            } else {
+                let message =
+                    alloc::format!("this method got an unexpected keyword argument '{name}'");
+                return Err(self.raise_named_exception("TypeError", &message));
+            }
+        }
+        self.i2c_bus_dispatch(receiver, method_id, posargs, kw_n)
+    }
+
+    /// Dispatches an `I2cBus` method, positional form.
+    pub(crate) fn call_i2c_bus_method(
+        &mut self,
+        bus: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        self.i2c_bus_dispatch(bus, method_id, args, Value::NONE)
+    }
+
+    /// The one `I2cBus` dispatch both call forms funnel through.
+    pub(crate) fn i2c_bus_dispatch(
+        &mut self,
+        bus: Value,
+        method_id: u32,
+        args: &[Value],
+        kw_n: Value,
+    ) -> Result<Value, Trap> {
+        use crate::i2c::*;
+        match method_id {
+            BUS_SCAN => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let facts = self.i2c_bus_require_open(bus)?;
+                let mut found = alloc::vec::Vec::new();
+                for addr in SCAN_START..=SCAN_END {
+                    if self.i2c_try_probe(&facts, addr) {
+                        found.push(Value::fixnum(i32::from(addr)).ok_or(Trap::Overflow)?);
+                    }
+                }
+                self.new_list(found)
+            }
+            BUS_PROBE => {
+                let [addr] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let addr = self.i2c_addr_arg(*addr)?;
+                let facts = self.i2c_bus_require_open(bus)?;
+                Ok(Value::from_bool(self.i2c_try_probe(&facts, addr)))
+            }
+            BUS_READ => {
+                let [addr, n] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let addr = self.i2c_addr_arg(*addr)?;
+                let n = self.i2c_count_arg(*n)?;
+                let facts = self.i2c_bus_require_open(bus)?;
+                let bytes = self.i2c_read(&facts, addr, n)?;
+                self.new_bytes(bytes)
+            }
+            BUS_WRITE => {
+                let [addr, data] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let addr = self.i2c_addr_arg(*addr)?;
+                let Some(data) = self.bytes_value(*data).map(<[u8]>::to_vec) else {
+                    return Err(self.i2c_needs_bytes(*data));
+                };
+                let facts = self.i2c_bus_require_open(bus)?;
+                self.i2c_write(&facts, addr, &data)?;
+                Value::fixnum(data.len() as i32).ok_or(Trap::Overflow)
+            }
+            BUS_WRITE_THEN_READ => {
+                let [addr, out, n] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let addr = self.i2c_addr_arg(*addr)?;
+                let Some(out) = self.bytes_value(*out).map(<[u8]>::to_vec) else {
+                    return Err(self.i2c_needs_bytes(*out));
+                };
+                let n = self.i2c_count_arg(*n)?;
+                if n == 0 {
+                    let message = "write_then_read count must be >= 1";
+                    return Err(self.with_message(Trap::ValueError, message));
+                }
+                let facts = self.i2c_bus_require_open(bus)?;
+                let bytes = self.i2c_write_then_read(&facts, addr, &out, n)?;
+                self.new_bytes(bytes)
+            }
+            BUS_READ_REGISTER => {
+                let (addr, register, n) = match args {
+                    [addr, register] => (self.i2c_addr_arg(*addr)?, self.i2c_byte_arg(*register)?, 1),
+                    [addr, register, n] => (
+                        self.i2c_addr_arg(*addr)?,
+                        self.i2c_byte_arg(*register)?,
+                        self.i2c_count_arg(*n)?,
+                    ),
+                    _ => return Err(Trap::TypeError),
+                };
+                let n = if kw_n.is_none() { n } else { self.i2c_count_arg(kw_n)? };
+                if n == 0 {
+                    let message = "read_register n must be >= 1";
+                    return Err(self.with_message(Trap::ValueError, message));
+                }
+                let facts = self.i2c_bus_require_open(bus)?;
+                let bytes = self.i2c_write_then_read(&facts, addr, &[register], n)?;
+                self.new_bytes(bytes)
+            }
+            BUS_WRITE_REGISTER => {
+                let [addr, register, data] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let addr = self.i2c_addr_arg(*addr)?;
+                let register = self.i2c_byte_arg(*register)?;
+                let Some(data) = self.bytes_value(*data).map(<[u8]>::to_vec) else {
+                    return Err(self.i2c_needs_bytes(*data));
+                };
+                let facts = self.i2c_bus_require_open(bus)?;
+                let mut payload = alloc::vec![register];
+                payload.extend_from_slice(&data);
+                self.i2c_write(&facts, addr, &payload)?;
+                Value::fixnum(data.len() as i32).ok_or(Trap::Overflow)
+            }
+            BUS_CLOSE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                self.i2c_bus_close(bus);
+                Ok(Value::NONE)
+            }
+            BUS_ENTER => Ok(bus),
+            BUS_EXIT => {
+                self.i2c_bus_close(bus);
+                Ok(Value::NONE)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Closes a bus: releases the instance claim (idempotent, like a file's close).
+    fn i2c_bus_close(&mut self, bus: Value) {
+        use crate::i2c::{BUS_W_INSTANCE, BUS_W_OPEN};
+        if self.i2c_bus_word(bus, BUS_W_OPEN) == 0 {
+            return;
+        }
+        let instance = self.i2c_bus_word(bus, BUS_W_INSTANCE);
+        self.i2c_claimed.retain(|&claimed| claimed != instance);
+        self.i2c_bus_set_word(bus, BUS_W_OPEN, 0);
+    }
+
+    /// The host I2C sim's write side-effect: a retarget (IC_TAR) starts a fresh transaction; an
+    /// IC_DATA_CMD word clocks a read/write against the addressed device (absent = ADDRESS NACK).
+    #[cfg(not(target_os = "none"))]
+    fn i2c_sim_write(&mut self, address: u32, value: u32) {
+        let Some(facts) = self.board.i2c_facts(0) else {
+            return;
+        };
+        if address == facts.tar {
+            self.i2c_sim_abort = 0;
+            self.i2c_sim_rx.clear();
+            self.i2c_sim_stopped = false;
+            self.i2c_sim_expect_pointer = true;
+            return;
+        }
+        if address != facts.data_cmd || self.i2c_sim_abort != 0 {
+            return;
+        }
+        let target = (self.mmio_sim.get(&facts.tar).copied().unwrap_or(0) & 0x7F) as u8;
+        let is_read = value & facts.cmd_read != 0;
+        let has_stop = value & facts.cmd_stop != 0;
+        let expect_pointer = self.i2c_sim_expect_pointer;
+        match self.i2c_sim_devices.get_mut(&target) {
+            None => self.i2c_sim_abort = facts.abrt_addr_nack,
+            Some(device) => {
+                if is_read {
+                    let at = device.pointer as usize;
+                    let byte = device.registers.get(at).copied().unwrap_or(0xFF);
+                    if device.read_auto_increment && at < device.registers.len() {
+                        device.pointer = device.pointer.wrapping_add(1);
+                    }
+                    self.i2c_sim_rx.push_back(byte);
+                } else if expect_pointer {
+                    device.pointer = (value & 0x7F) as u8;
+                    device.read_auto_increment = value & 0x80 != 0;
+                    self.i2c_sim_expect_pointer = false;
+                } else {
+                    let at = device.pointer as usize;
+                    if at < device.registers.len() {
+                        device.registers[at] = (value & 0xFF) as u8;
+                        device.pointer = device.pointer.wrapping_add(1);
+                    } else {
+                        self.i2c_sim_abort = facts.abrt_data_nack;
+                    }
+                }
+            }
+        }
+        if has_stop || self.i2c_sim_abort != 0 {
+            self.i2c_sim_stopped = true;
+        }
+    }
+
+    /// The host I2C sim's read: IC_STATUS (room), IC_RAW_INTR_STAT (completion/abort/stop),
+    /// IC_TX_ABRT_SOURCE, the clear-on-read registers, IC_RXFLR, and the RX pop via IC_DATA_CMD.
+    #[cfg(not(target_os = "none"))]
+    fn i2c_sim_read(&mut self, address: u32) -> Option<u32> {
+        let facts = self.board.i2c_facts(0)?;
+        if address == facts.status {
+            return Some(facts.status_tfnf);
+        }
+        if address == facts.raw_intr_stat {
+            let mut value = facts.intr_tx_empty;
+            if self.i2c_sim_abort != 0 {
+                value |= facts.intr_tx_abrt;
+            }
+            if self.i2c_sim_stopped {
+                value |= facts.intr_stop_det;
+            }
+            return Some(value);
+        }
+        if address == facts.abort_source {
+            return Some(self.i2c_sim_abort);
+        }
+        if address == facts.clr_tx_abrt {
+            self.i2c_sim_abort = 0;
+            return Some(0);
+        }
+        if address == facts.clr_stop_det {
+            self.i2c_sim_stopped = false;
+            return Some(0);
+        }
+        if address == facts.rxflr {
+            return Some(self.i2c_sim_rx.len() as u32);
+        }
+        if address == facts.data_cmd {
+            return Some(u32::from(self.i2c_sim_rx.pop_front().unwrap_or(0)));
+        }
+        None
+    }
+
+    /// Installs a simulated I2C target: a register-file device at `addr` (an 8-bit SUB pointer,
+    /// SUB-bit-7-gated read auto-increment -- the LSM303AGR shape). A transaction to an address
+    /// with no installed device NACKs, so a sensor demo runs off-device.
+    #[cfg(not(target_os = "none"))]
+    pub fn i2c_sim_add_device(&mut self, addr: u8, registers: &[u8]) {
+        self.i2c_sim_devices.insert(
+            addr,
+            I2cSimDevice { registers: registers.to_vec(), pointer: 0, read_auto_increment: false },
+        );
+    }
+
+
+    /// The `adc` module singleton. Bind it as the global `adc` so a program reaches `adc.open(...)`.
+    pub fn adc_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.adc_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is the `adc` singleton.
+    #[must_use]
+    pub fn is_adc(&self, value: Value) -> bool {
+        self.is_type(value, self.adc_type_id)
+    }
+
+    /// The `analogio` module singleton (the CircuitPython ADC shim namespace). Bind it as the
+    /// global `analogio` so a program reaches `analogio.AnalogIn(...)`.
+    pub fn analogio_singleton(&mut self) -> Result<Value, Trap> {
+        let reference = self.alloc_object(self.analogio_type_id).ok_or(Trap::OutOfMemory)?;
+        Ok(Value::from_ref(reference))
+    }
+
+    /// Whether `value` is an open-or-closed ADC `Channel`.
+    #[must_use]
+    pub fn is_adc_channel(&self, value: Value) -> bool {
+        self.is_type(value, self.adc_channel_type_id)
+    }
+
+    /// Allocates a board ADC resource handle (`board.A0` / `board.TEMP_SENSOR`) carrying its
+    /// `(channel, pin)`.
+    pub(crate) fn new_adc_resource(&mut self, channel: u32, pin: u32) -> Result<Value, Trap> {
+        self.alloc_leaf(self.adc_resource_type_id, &[channel, pin])
+    }
+
+    /// Whether `value` is a board ADC resource.
+    pub(crate) fn is_adc_resource(&self, value: Value) -> bool {
+        self.is_type(value, self.adc_resource_type_id)
+    }
+
+    /// The `(channel, pin)` if `value` is a board ADC resource.
+    fn adc_resource_parts(&self, value: Value) -> Option<(u32, u32)> {
+        value
+            .as_ref()
+            .filter(|r| self.heap.type_id_of(*r) == self.adc_resource_type_id)
+            .map(|r| (self.heap.read_u32(r.0), self.heap.read_u32(r.0 + 4)))
+    }
+
+    /// Allocates an OPEN `Channel`.
+    fn new_adc_channel(
+        &mut self,
+        channel: u32,
+        pin: u32,
+        bits: u32,
+        reference_uv: u32,
+    ) -> Result<Value, Trap> {
+        self.alloc_leaf(self.adc_channel_type_id, &[channel, 1, pin, bits, reference_uv])
+    }
+
+    /// One raw word of a `Channel`'s payload.
+    fn adc_channel_word(&self, channel: Value, word: u32) -> u32 {
+        self.leaf_word(channel, word)
+    }
+
+    /// Replays one ADC init step over the MMIO seam.
+    fn apply_adc_op(&mut self, op: crate::adc::AdcOp) {
+        use crate::adc::AdcOp;
+        match op {
+            AdcOp::Write { reg, value } => self.mmio_write(reg, value),
+            AdcOp::PollEq { reg, mask, want } => while self.mmio_read(reg) & mask != want {},
+        }
+    }
+
+    /// `adc.open(resource)`: claims the channel (exclusive) + its pin (a pin-backed channel, through
+    /// the SAME one-owner pool as gpio), brings the SHARED converter block up on the first open, and
+    /// preps an external channel's pad.
+    pub(crate) fn adc_open(&mut self, args: &[Value]) -> Result<Value, Trap> {
+        use crate::adc::NO_PIN;
+        let [resource] = args else {
+            let message = "open() takes exactly one positional argument (the board ADC resource)";
+            return Err(self.with_message(Trap::TypeError, message));
+        };
+        let Some((channel, pin)) = self.adc_resource_parts(*resource) else {
+            let message = "open() expects a board ADC resource (e.g. board.A0 or board.TEMP_SENSOR)";
+            return Err(self.with_message(Trap::TypeError, message));
+        };
+        let Some(facts) = self.board.adc_facts() else {
+            let message = "adc is not supported on this board yet";
+            return Err(self.with_message(Trap::Unsupported, message));
+        };
+        if self.adc_channels_open.contains(&channel) {
+            let message = alloc::format!("ADC channel {channel} in use");
+            return Err(self.raise_named_exception("OSError", &message));
+        }
+        if pin != NO_PIN {
+            self.claim_pin(pin)?;
+        }
+        let first_open = self.adc_channels_open.is_empty();
+        self.adc_channels_open.push(channel);
+        if first_open {
+            for op in self.board.adc_block_init_ops() {
+                self.apply_adc_op(op);
+            }
+        }
+        if pin != NO_PIN {
+            let board = self.board;
+            for op in board.adc_pad_analog_ops(pin) {
+                self.apply_adc_op(op);
+            }
+        }
+        self.new_adc_channel(channel, pin, facts.bits, facts.reference_uv)
+    }
+
+    /// The instance + facts of an OPEN channel (`ValueError` after `close`).
+    fn adc_channel_require_open(&mut self, channel: Value) -> Result<(u32, crate::adc::AdcFacts), Trap> {
+        use crate::adc::{CH_W_CHANNEL, CH_W_OPEN};
+        if self.adc_channel_word(channel, CH_W_OPEN) == 0 {
+            return Err(self.with_message(Trap::ValueError, "I/O operation on closed adc channel"));
+        }
+        let index = self.adc_channel_word(channel, CH_W_CHANNEL);
+        let facts = self.board.adc_facts().ok_or(Trap::Malformed)?;
+        Ok((index, facts))
+    }
+
+    /// One single-shot conversion on `channel`: select AINSEL, START_ONCE, poll READY, discard an
+    /// errored sample (re-run), read the count (the official pico-sdk protocol).
+    fn adc_read_raw(&mut self, facts: &crate::adc::AdcFacts, channel: u32) -> u32 {
+        loop {
+            self.mmio_write(facts.cs, (channel << 12) | facts.cs_enabled);
+            self.mmio_write(facts.cs, (channel << 12) | facts.cs_start);
+            while self.mmio_read(facts.cs) & facts.cs_ready == 0 {}
+            if self.mmio_read(facts.cs) & facts.cs_err != 0 {
+                continue;
+            }
+            return self.mmio_read(facts.result) & facts.result_mask;
+        }
+    }
+
+    /// Dispatches an `adc` module method, positional form.
+    pub(crate) fn call_adc_method(
+        &mut self,
+        _adc: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        match method_id {
+            crate::adc::ADC_OPEN => self.adc_open(args),
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Dispatches a `Channel` method, positional form (no verb takes arguments).
+    pub(crate) fn call_adc_channel_method(
+        &mut self,
+        channel: Value,
+        method_id: u32,
+        args: &[Value],
+    ) -> Result<Value, Trap> {
+        use crate::adc::*;
+        match method_id {
+            CH_READ_U16 => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let (index, facts) = self.adc_channel_require_open(channel)?;
+                let raw = self.adc_read_raw(&facts, index);
+                Value::fixnum(normalize_u16(raw, facts.bits) as i32).ok_or(Trap::Overflow)
+            }
+            CH_READ_RAW => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let (index, facts) = self.adc_channel_require_open(channel)?;
+                let raw = self.adc_read_raw(&facts, index);
+                Value::fixnum(raw as i32).ok_or(Trap::Overflow)
+            }
+            CH_READ_UV => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                let (index, facts) = self.adc_channel_require_open(channel)?;
+                let raw = self.adc_read_raw(&facts, index);
+                let uv = raw_to_microvolts(raw, facts.bits, facts.reference_uv);
+                Value::fixnum(uv as i32).ok_or(Trap::Overflow)
+            }
+            CH_CLOSE => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                self.adc_channel_close(channel);
+                Ok(Value::NONE)
+            }
+            CH_ENTER => Ok(channel),
+            CH_EXIT => {
+                self.adc_channel_close(channel);
+                Ok(Value::NONE)
+            }
+            _ => Err(Trap::AttributeError),
+        }
+    }
+
+    /// Closes a channel: releases the exclusive channel claim + its pin (idempotent). The shared
+    /// converter block re-inits on the next first-open after all channels close.
+    fn adc_channel_close(&mut self, channel: Value) {
+        use crate::adc::{CH_W_CHANNEL, CH_W_OPEN, CH_W_PIN, NO_PIN};
+        if self.adc_channel_word(channel, CH_W_OPEN) == 0 {
+            return;
+        }
+        let index = self.adc_channel_word(channel, CH_W_CHANNEL);
+        let pin = self.adc_channel_word(channel, CH_W_PIN);
+        self.adc_channels_open.retain(|&c| c != index);
+        if pin != NO_PIN {
+            self.release_pin(pin);
+        }
+        self.leaf_set_word(channel, CH_W_OPEN, 0);
+    }
+
+    /// The host ADC sim's write side-effect: a CS write carries AINSEL (the selected channel), so
+    /// the next RESULT read returns THAT channel's scripted conversion.
+    #[cfg(not(target_os = "none"))]
+    fn adc_sim_write(&mut self, address: u32, value: u32) {
+        if let Some(facts) = self.board.adc_facts() {
+            if address == facts.cs {
+                self.adc_sim_ainsel = (value >> 12) & 0xF;
+            }
+        }
+    }
+
+    /// The host ADC sim's read: the clk generator reports ENABLED, CS reports READY (ERR clear),
+    /// and RESULT returns the currently-selected channel's scripted count.
+    #[cfg(not(target_os = "none"))]
+    fn adc_sim_read(&mut self, address: u32) -> Option<u32> {
+        let facts = self.board.adc_facts()?;
+        if address == facts.clk_ctrl {
+            return Some(facts.clk_enabled);
+        }
+        if address == facts.cs {
+            return Some(facts.cs_ready);
+        }
+        if address == facts.result {
+            return Some(self.adc_sim_raw.get(&self.adc_sim_ainsel).copied().unwrap_or(0));
+        }
+        None
+    }
+
+    /// Scripts the conversion result at `channel` (at the table's resolution) for the host ADC sim,
+    /// so a temperature/analogue demo runs off-device.
+    #[cfg(not(target_os = "none"))]
+    pub fn adc_sim_set(&mut self, channel: u32, raw: u32) {
+        self.adc_sim_raw.insert(channel, raw);
+    }
+
+
+    /// The `busio` module singleton (the CircuitPython shim namespace).
     pub fn busio_singleton(&mut self) -> Result<Value, Trap> {
         let reference = self.alloc_object(self.busio_type_id).ok_or(Trap::OutOfMemory)?;
         Ok(Value::from_ref(reference))
@@ -7792,7 +9851,7 @@ impl ObjectModel {
         Err(self.with_message(Trap::ValueError, &message))
     }
 
-    /// Constructs a shim UART: translates the shim's constructor surface onto the clean
+    /// Constructs a shim UART: translates the shimmed API's constructor surface onto the clean
     /// `uart.open`, holding the shim-only state (the implicit timeout) on the shim.
     pub(crate) fn call_uart_shim_factory(
         &mut self,
@@ -7938,7 +9997,7 @@ impl ObjectModel {
     }
 
     /// Dispatches a shim UART method: each translates onto the standard Port dispatch with the
-    /// shim's held timeout, then re-wraps the result in the shim's convention (`None`
+    /// shim's held timeout, then re-wraps the result in the shimmed API's convention (`None`
     /// where the standard returns empty).
     pub(crate) fn call_uart_shim_method(
         &mut self,
@@ -7980,8 +10039,8 @@ impl ObjectModel {
         }
     }
 
-    /// The shims return `None` where the standard returns `b""` -- the wrapping lives here,
-    /// in the shim, never in the standard surface.
+    /// The shimmed APIs return `None` where the standard returns `b""` -- the wrapping lives
+    /// here, in the shim, never in the standard surface.
     fn shim_none_when_empty(&self, result: Value) -> Result<Value, Trap> {
         if self.bytes_value(result).is_some_and(<[u8]>::is_empty) {
             return Ok(Value::NONE);
@@ -8312,7 +10371,7 @@ impl ObjectModel {
                 "direction" => {
                     let output = value.as_int().unwrap_or(0) == i64::from(PIN_MODE_OUTPUT);
                     self.set_pin_direction(pin, output)?;
-         d           return Ok(());
+                    return Ok(());
                 }
                 _ => return Err(Trap::AttributeError),
             }
@@ -8815,10 +10874,214 @@ impl ObjectModel {
         Ok(out)
     }
 
+    /// Whether `method_id` is a builtin-value dunder wrapper (routes to `dispatch_builtin_dunder`).
+    pub(crate) fn is_builtin_dunder_method(&self, method_id: u32) -> bool {
+        dunder_name_of(method_id).is_some()
+    }
+
+    /// Whether builtin VALUE `obj` exposes dunder `name` (so getattr returns a bound method-wrapper
+    /// and `hasattr` reports it). Gated per value-type to match CPython.
+    fn builtin_supports_dunder(&self, obj: Value, name: &str) -> bool {
+        if self.is_int(obj) {
+            int_supports_dunder(name)
+        } else if self.is_float(obj) {
+            float_supports_dunder(name)
+        } else {
+            self.container_supports_dunder(obj, name)
+        }
+    }
+
+    /// The container/sequence-protocol dunders a builtin container/str value exposes (`__len__`,
+    /// `__getitem__`, `__iter__`, `__contains__`, and `__setitem__`/`__delitem__` on the mutable
+    /// ones). Gated by the concrete type so `hasattr` is exact -- e.g. a tuple has no `__setitem__`.
+    fn container_supports_dunder(&self, obj: Value, name: &str) -> bool {
+        let subscriptable = self.is_str(obj)
+            || self.byte_view(obj).is_some()
+            || self.seq_value(obj).is_some()
+            || self.is_dict(obj)
+            || self.is_range(obj);
+        let iterable = subscriptable
+            || self.is_set(obj)
+            || self.is_frozenset(obj)
+            || self.is_deque(obj)
+            || self.is_dict_view(obj);
+        let mutable_item = self.is_list(obj) || self.is_dict(obj) || self.is_bytearray(obj);
+        match name {
+            "__len__" => self.py_len(obj).is_ok(),
+            "__getitem__" => subscriptable,
+            "__setitem__" | "__delitem__" => mutable_item,
+            "__contains__" => iterable,
+            "__iter__" => iterable,
+            _ => false,
+        }
+    }
+
+    /// Whether a numeric dunder on `receiver` handles `other` DIRECTLY, else it is `NotImplemented`
+    /// (deferring to the other operand's reflected dunder). Matches CPython: an int/bool dunder
+    /// handles only int/bool operands (`(5).__add__(2.5)` is NotImplemented); a float dunder also
+    /// handles a float (`(2.5).__add__(5)` is 7.5).
+    fn numeric_dunder_accepts(&self, receiver: Value, other: Value) -> bool {
+        if self.is_int(other) {
+            true
+        } else if self.is_float(other) {
+            self.is_float(receiver)
+        } else {
+            false
+        }
+    }
+
+    /// The full `a OP b` result -- the str/seq operators then the numeric path, exactly as
+    /// [`crate::interp::dispatch_binary`] composes them. Used by the arithmetic dunders.
+    fn full_binary(&mut self, op: BinOp, a: Value, b: Value) -> Result<Value, Trap> {
+        match self.py_binary(op, a, b) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => crate::interp::binary(op, a, b, self),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// `int(number)`: an int is itself (a bool normalizes to 1/0); a float truncates toward zero
+    /// (NaN/inf error, magnitude beyond i128 overflows), matching the `int` builtin.
+    fn number_to_int(&mut self, value: Value) -> Result<Value, Trap> {
+        if value == Value::TRUE {
+            return Value::fixnum(1).ok_or(Trap::Overflow);
+        }
+        if value == Value::FALSE {
+            return Value::fixnum(0).ok_or(Trap::Overflow);
+        }
+        if self.is_int(value) {
+            return Ok(value);
+        }
+        let Some(f) = self.float_value(value) else {
+            return Err(Trap::TypeError);
+        };
+        if f.is_nan() {
+            return Err(self.with_message(Trap::ValueError, "cannot convert float NaN to integer"));
+        }
+        if f.is_infinite() {
+            return Err(self.with_message(Trap::Overflow, "cannot convert float infinity to integer"));
+        }
+        if !(-1.701_411_834_604_692_3e38..1.701_411_834_604_692_3e38).contains(&f) {
+            return Err(Trap::Overflow);
+        }
+        self.new_long(f as i128)
+    }
+
+    /// Runs a builtin value's dunder (a reserved id from [`builtin_dunder_id`]). A binary/comparison
+    /// dunder returns `NotImplemented` for an operand its type does not handle (CPython:
+    /// `(2).__add__("s")` is NotImplemented, not the `2 + "s"` TypeError); the rest act directly.
+    fn dispatch_builtin_dunder(&mut self, receiver: Value, id: u32, args: &[Value]) -> Result<Value, Trap> {
+        let name = dunder_name_of(id).ok_or(Trap::Malformed)?;
+        if let Some((op, reflected)) = binop_of_dunder(name) {
+            let [other] = args else {
+                return Err(Trap::TypeError);
+            };
+            if !self.numeric_dunder_accepts(receiver, *other) {
+                return Ok(Value::NOT_IMPLEMENTED);
+            }
+            let (a, b) = if reflected { (*other, receiver) } else { (receiver, *other) };
+            return match self.full_binary(op, a, b) {
+                Ok(value) => Ok(value),
+                Err(Trap::TypeError) => Ok(Value::NOT_IMPLEMENTED),
+                Err(other) => Err(other),
+            };
+        }
+        if let Some(op) = cmpop_of_dunder(name) {
+            let [other] = args else {
+                return Err(Trap::TypeError);
+            };
+            if !self.numeric_dunder_accepts(receiver, *other) {
+                return Ok(Value::NOT_IMPLEMENTED);
+            }
+            return crate::interp::compare(op, receiver, *other, self);
+        }
+        match name {
+            "__divmod__" | "__rdivmod__" => {
+                let [other] = args else {
+                    return Err(Trap::TypeError);
+                };
+                if !self.numeric_dunder_accepts(receiver, *other) {
+                    return Ok(Value::NOT_IMPLEMENTED);
+                }
+                let (a, b) =
+                    if name == "__rdivmod__" { (*other, receiver) } else { (receiver, *other) };
+                match (self.full_binary(BinOp::FloorDiv, a, b), self.full_binary(BinOp::Mod, a, b)) {
+                    (Ok(quotient), Ok(remainder)) => {
+                        self.new_tuple(alloc::vec![quotient, remainder])
+                    }
+                    (Err(Trap::TypeError), _) | (_, Err(Trap::TypeError)) => {
+                        Ok(Value::NOT_IMPLEMENTED)
+                    }
+                    (Err(other), _) | (_, Err(other)) => Err(other),
+                }
+            }
+            "__neg__" => crate::interp::unary(UnaryOp::Neg, receiver, self),
+            "__pos__" => crate::interp::unary(UnaryOp::Pos, receiver, self),
+            "__invert__" => crate::interp::unary(UnaryOp::Invert, receiver, self),
+            "__abs__" => {
+                if let Some(f) = self.float_value(receiver) {
+                    return self.new_float(f.abs());
+                }
+                let zero = Value::fixnum(0).ok_or(Trap::Overflow)?;
+                if crate::interp::compare(CmpOp::Lt, receiver, zero, self)? == Value::TRUE {
+                    crate::interp::unary(UnaryOp::Neg, receiver, self)
+                } else {
+                    self.number_to_int(receiver)
+                }
+            }
+            "__int__" => self.number_to_int(receiver),
+            "__float__" => {
+                let f = self
+                    .float_value(receiver)
+                    .or_else(|| self.as_i128(receiver).map(|n| n as f64));
+                self.new_float(f.ok_or(Trap::TypeError)?)
+            }
+            "__bool__" => Ok(Value::from_bool(self.py_truthy(receiver)?.unwrap_or(true))),
+            "__hash__" => self.py_hash(receiver),
+            "__repr__" => {
+                let rendered = self.repr(receiver);
+                self.new_str(&rendered)
+            }
+            "__str__" => {
+                let rendered = self.display(receiver);
+                self.new_str(&rendered)
+            }
+            "__len__" => self.py_len(receiver),
+            "__getitem__" => {
+                let [index] = args else {
+                    return Err(Trap::TypeError);
+                };
+                self.py_getitem(receiver, *index)
+            }
+            "__setitem__" => {
+                let [index, value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                self.py_setitem(receiver, *index, *value)?;
+                Ok(Value::NONE)
+            }
+            "__delitem__" => {
+                let [index] = args else {
+                    return Err(Trap::TypeError);
+                };
+                self.py_delitem(receiver, *index)?;
+                Ok(Value::NONE)
+            }
+            "__contains__" => {
+                let [element] = args else {
+                    return Err(Trap::TypeError);
+                };
+                Ok(Value::from_bool(self.py_contains(receiver, *element)?))
+            }
+            "__iter__" => self.new_iter(receiver),
+            _ => Err(Trap::Malformed),
+        }
+    }
+
     /// Calls a bound method -- the `Call` dispatch when [`ObjectModel::is_bound_method`]. Reads the
-    /// stored `[receiver, method_id]` and runs the receiver's method: list/dict/set/tuple/gpio/pin
-    /// methods, else a `str` method (Python 3.14.6 "String Methods"). A wrong argument count, or a
-    /// wrong-typed argument, is a `TypeError`.
+    /// stored `[receiver, method_id]` and runs the receiver's method: a builtin value's exposed
+    /// dunder, list/dict/set/tuple/gpio/pin methods, else a `str` method (Python 3.14.6 "String
+    /// Methods"). A wrong argument count, or a wrong-typed argument, is a `TypeError`.
     pub fn call_bound_method(&mut self, callee: Value, args: &[Value]) -> Result<Value, Trap> {
         let reference = callee.as_ref().ok_or(Trap::TypeError)?;
         let receiver = Value::from_bits(self.heap.read_u32(reference.0));
@@ -8826,6 +11089,12 @@ impl ObjectModel {
         if method_id == EXC_INIT && self.is_instance(receiver) {
             self.init_default_args(receiver, args)?;
             return Ok(Value::NONE);
+        }
+        if method_id == OBJECT_NOOP {
+            return Ok(Value::NONE);
+        }
+        if dunder_name_of(method_id).is_some() {
+            return self.dispatch_builtin_dunder(receiver, method_id, args);
         }
         if self.is_list(receiver) {
             return self.call_list_method(receiver, method_id, args);
@@ -8873,8 +11142,35 @@ impl ObjectModel {
         if self.is_uart_port(receiver) {
             return self.call_port_method(receiver, method_id, args);
         }
+        if self.is_spi(receiver) {
+            return self.call_spi_method(receiver, method_id, args);
+        }
+        if self.is_spi_bus(receiver) {
+            return self.call_spi_bus_method(receiver, method_id, args);
+        }
+        if self.is_i2c(receiver) {
+            return self.call_i2c_method(receiver, method_id, args);
+        }
+        if self.is_i2c_bus(receiver) {
+            return self.call_i2c_bus_method(receiver, method_id, args);
+        }
+        if self.is_adc(receiver) {
+            return self.call_adc_method(receiver, method_id, args);
+        }
+        if self.is_adc_channel(receiver) {
+            return self.call_adc_channel_method(receiver, method_id, args);
+        }
         if self.is_uart_shim(receiver) {
             return self.call_uart_shim_method(receiver, method_id, args);
+        }
+        if self.is_spi_shim(receiver) {
+            return self.call_spi_shim_method(receiver, method_id, args, &[]);
+        }
+        if self.is_i2c_shim(receiver) {
+            return self.call_i2c_shim_method(receiver, method_id, args, &[]);
+        }
+        if self.is_adc_shim(receiver) {
+            return self.call_adc_shim_method(receiver, method_id, args);
         }
         match method_id {
             STR_UPPER | STR_LOWER => {
@@ -9407,6 +11703,91 @@ impl ObjectModel {
         match self.seqs[slot][lo..hi].iter().position(|e| self.key_eq(*e, value)) {
             Some(p) => Value::fixnum((p + lo) as i32).ok_or(Trap::Overflow),
             None => Err(Trap::ValueError),
+        }
+    }
+
+    /// The `__eq__`-dependent list methods (`count`/`index`/`remove`), dispatched interp-aware so a
+    /// custom element `__eq__` decides membership -- mirroring the set/dict/deque `_dyn` seams. The
+    /// arena-free methods (append/pop/sort/...) fall through to the model-only `call_bound_method`.
+    pub(crate) fn call_list_method_dyn(
+        &mut self,
+        callee: Value,
+        list: Value,
+        method_id: u32,
+        args: &[Value],
+        functions: &[CodeObject],
+        depth: usize,
+    ) -> Result<Value, Trap> {
+        let slot = match self.container_slot(list, self.list_type_id) {
+            Some(slot) => slot,
+            None => return self.call_bound_method(callee, args),
+        };
+        match method_id {
+            LIST_COUNT => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let elements = self.seqs[slot].clone();
+                let mut count = 0i32;
+                for element in elements {
+                    if crate::interp::elem_eq(*value, element, functions, self, depth)? {
+                        count = count.checked_add(1).ok_or(Trap::Overflow)?;
+                    }
+                }
+                Value::fixnum(count).ok_or(Trap::Overflow)
+            }
+            LIST_INDEX => {
+                let elements = self.seqs[slot].clone();
+                let len = elements.len() as i64;
+                let clamp = |i: i64| (if i < 0 { i + len } else { i }).clamp(0, len) as usize;
+                let (value, lo, hi) = match args {
+                    [v] => (*v, 0usize, len as usize),
+                    [v, s] => (*v, clamp(s.as_int().ok_or(Trap::TypeError)?), len as usize),
+                    [v, s, e] => (
+                        *v,
+                        clamp(s.as_int().ok_or(Trap::TypeError)?),
+                        clamp(e.as_int().ok_or(Trap::TypeError)?),
+                    ),
+                    _ => return Err(Trap::TypeError),
+                };
+                let hi = hi.max(lo);
+                for (offset, element) in elements[lo..hi].iter().enumerate() {
+                    if crate::interp::elem_eq(value, *element, functions, self, depth)? {
+                        return Value::fixnum((lo + offset) as i32).ok_or(Trap::Overflow);
+                    }
+                }
+                Err(self.with_message(Trap::ValueError, "list.index(x): x not in list"))
+            }
+            LIST_REMOVE => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let elements = self.seqs[slot].clone();
+                let mut found = None;
+                for (position, element) in elements.iter().enumerate() {
+                    if crate::interp::elem_eq(*value, *element, functions, self, depth)? {
+                        found = Some(position);
+                        break;
+                    }
+                }
+                match found {
+                    Some(position) => {
+                        self.seqs[slot].remove(position);
+                        Ok(Value::NONE)
+                    }
+                    None => Err(self.with_message(Trap::ValueError, "list.remove(x): x not in list")),
+                }
+            }
+            LIST_EXTEND => {
+                let [iterable] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let items = crate::builtins::collect_iterable(self, &[*iterable], functions, depth)?;
+                let slot = self.container_slot(list, self.list_type_id).ok_or(Trap::TypeError)?;
+                self.seqs[slot].extend(items);
+                Ok(Value::NONE)
+            }
+            _ => self.call_bound_method(callee, args),
         }
     }
 
@@ -9950,7 +12331,7 @@ impl ObjectModel {
                 if !args.is_empty() {
                     return Err(Trap::TypeError);
                 }
-                Ok(receiver)
+                self.number_to_int(receiver)
             }
             INT_AS_INTEGER_RATIO => {
                 if !args.is_empty() {

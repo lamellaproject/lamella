@@ -515,6 +515,10 @@ pub struct CompilationUnit {
     pub usings: Vec<UsingDirective>,
     /// The top-level namespace and type declarations.
     pub members: Vec<NamespaceMember>,
+    /// The assembly-/module-level global attributes (24.2) -- `[assembly: ...]` / `[module: ...]`
+    /// sections (typically in an AssemblyInfo.cs). They attach to the assembly/module manifest, not
+    /// to any declaration.
+    pub global_attributes: Vec<AttributeSection>,
     /// The byte range the unit covers.
     pub span: Span,
     /// The `#define`d preprocessor symbols (9.5.3) -- the set a `[Conditional]` call is checked

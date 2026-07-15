@@ -8,7 +8,7 @@ use lamella_gc::Ref;
 use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, ExcEntry, Op, UnaryOp};
 
 use crate::bigint::BigInt;
-use crate::object::{DictViewKind, InlineCache, ObjectModel};
+use crate::object::{DescriptorRead, DictViewKind, InlineCache, ObjectModel};
 use crate::trap::Trap;
 use crate::value::{Value, FIXNUM_MAX, FIXNUM_MIN};
 
@@ -565,10 +565,16 @@ fn try_binop_dunder(
 ) -> Result<Option<Value>, Trap> {
     let (name, reflected) = binop_dunder_names(op);
     if let Some(method) = model.find_dunder(lhs, name) {
-        return Ok(Some(call_value(method, &[rhs], functions, model, depth + 1)?));
+        let outcome = call_value(method, &[rhs], functions, model, depth + 1)?;
+        if !outcome.is_not_implemented() {
+            return Ok(Some(outcome));
+        }
     }
     if let Some(method) = model.find_dunder(rhs, reflected) {
-        return Ok(Some(call_value(method, &[lhs], functions, model, depth + 1)?));
+        let outcome = call_value(method, &[lhs], functions, model, depth + 1)?;
+        if !outcome.is_not_implemented() {
+            return Ok(Some(outcome));
+        }
     }
     Ok(None)
 }
@@ -625,8 +631,8 @@ fn inplace_binop_dunder_name(op: BinOp) -> &'static str {
 }
 
 /// The in-place dispatch for augmented assignment ([`Op::InplaceBinOp`]): a user class's in-place
-/// dunder (`__iadd__`/`__ior__`/...) wins (NotImplemented is not modeled -- a defined method is
-/// used, exactly as [`try_binop_dunder`]); then a built-in MUTABLE left operand applies the
+/// dunder (`__iadd__`/`__ior__`/...) wins (a NotImplemented return falls back to the plain binary
+/// protocol, like [`try_binop_dunder`]); then a built-in MUTABLE left operand applies the
 /// operation in place and the result IS that same object, so aliases observe the mutation:
 /// `list += any-iterable` extends (a generator source too), `list *= int` repeats,
 /// `dict |= dict-or-pairs` updates, `set OP= set|frozenset` rewrites the contents for `| & - ^`,
@@ -642,7 +648,10 @@ fn dispatch_inplace_binary(
     depth: usize,
 ) -> Result<Value, Trap> {
     if let Some(method) = model.find_dunder(lhs, inplace_binop_dunder_name(binop)) {
-        return call_value(method, &[rhs], functions, model, depth + 1);
+        let outcome = call_value(method, &[rhs], functions, model, depth + 1)?;
+        if !outcome.is_not_implemented() {
+            return Ok(outcome);
+        }
     }
     if model.is_list(lhs) {
         match binop {
@@ -807,12 +816,16 @@ fn compare_dunder_call(
 ) -> Result<Option<Value>, Trap> {
     if let Some(method) = model.find_dunder(receiver, compare_dunder_name(op)) {
         let outcome = call_value(method, &[other], functions, model, depth + 1)?;
-        return Ok(Some(Value::from_bool(model.py_truthy(outcome)?.unwrap_or(false))));
+        if !outcome.is_not_implemented() {
+            return Ok(Some(Value::from_bool(model.py_truthy(outcome)?.unwrap_or(false))));
+        }
     }
     if matches!(op, CmpOp::Ne) {
         if let Some(method) = model.find_dunder(receiver, "__eq__") {
             let outcome = call_value(method, &[other], functions, model, depth + 1)?;
-            return Ok(Some(Value::from_bool(!model.py_truthy(outcome)?.unwrap_or(false))));
+            if !outcome.is_not_implemented() {
+                return Ok(Some(Value::from_bool(!model.py_truthy(outcome)?.unwrap_or(false))));
+            }
         }
     }
     Ok(None)
@@ -843,6 +856,10 @@ pub(crate) fn py_truthy_dyn(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
+    if value.is_not_implemented() {
+        let message = "NotImplemented should not be used in a boolean context";
+        return Err(model.with_message(Trap::TypeError, message));
+    }
     if model.is_instance(value) {
         if let Some(method) = model.find_dunder(value, "__bool__") {
             let result = call_value(method, &[], functions, model, depth + 1)?;
@@ -1427,7 +1444,7 @@ fn try_view_compare_dyn(
 /// Evaluates a unary `-`/`+`/`~` over an `int`/`bool` operand (Python int semantics:
 /// `+x == x`, `-x`, `~x == -x - 1`); other types are a `TypeError`. The customizable
 /// `__neg__`/`__pos__`/`__invert__` protocol composes with the broader object model.
-fn unary(op: UnaryOp, v: Value, model: &mut ObjectModel) -> Result<Value, Trap> {
+pub(crate) fn unary(op: UnaryOp, v: Value, model: &mut ObjectModel) -> Result<Value, Trap> {
     #[cfg(feature = "complex")]
     if let Some((re, im)) = model.complex_value(v) {
         return match op {
@@ -1469,7 +1486,7 @@ fn unary(op: UnaryOp, v: Value, model: &mut ObjectModel) -> Result<Value, Trap> 
 /// operators `<`/`<=`/`>`/`>=` have no default and raise `TypeError`. The customizable
 /// `__eq__`/`__lt__`/... protocol (the `py_compare` intrinsic) composes with the broader
 /// object model.
-fn compare(op: CmpOp, a: Value, b: Value, model: &ObjectModel) -> Result<Value, Trap> {
+pub(crate) fn compare(op: CmpOp, a: Value, b: Value, model: &ObjectModel) -> Result<Value, Trap> {
     #[cfg(feature = "complex")]
     if model.is_complex(a) || model.is_complex(b) {
         let equal = match (model.as_complex(a), model.as_complex(b)) {
@@ -1703,6 +1720,8 @@ fn resolve_global(name: &str, functions: &[CodeObject], model: &mut ObjectModel)
         Some(Value::builtin_ref(id))
     } else if name == "Ellipsis" {
         Some(Value::ELLIPSIS)
+    } else if name == "NotImplemented" {
+        Some(Value::NOT_IMPLEMENTED)
     } else {
         model.exception_class(name)
     }
@@ -1778,6 +1797,44 @@ fn invoke_function(
     }
 }
 
+/// `object.attr = value` -- the one attribute-store dispatch shared by the `SetAttr` op and the
+/// `setattr` builtin, so `obj.x = v` and `setattr(obj, 'x', v)` cannot diverge. An instance routes
+/// through a user `__setattr__` (which owns every write) or a property setter before the plain
+/// instance-dict store; a class writes its own namespace (decorator mutation / class-level rebinding);
+/// a user function stores in the attribute side-table; anything else is a native property set.
+pub(crate) fn set_attr(
+    object: Value,
+    attr: &str,
+    value: Value,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<(), Trap> {
+    if model.is_instance(object) {
+        if let Some(hook) = model.find_dunder(object, "__setattr__") {
+            let name_value = model.new_str(attr)?;
+            call_value(hook, &[name_value, value], functions, model, depth + 1)?;
+        } else if let Some(set) = model.instance_set_descriptor(object, attr) {
+            call_value(set, &[object, value], functions, model, depth + 1)?;
+        } else if let Some(property) = model.class_property(object, attr) {
+            let (_, fset, _) = model.property_accessors(property);
+            if fset.is_none() {
+                return Err(Trap::AttributeError);
+            }
+            call_value(fset, &[object, value], functions, model, depth + 1)?;
+        } else {
+            model.py_setattr_instance(object, attr, value)?;
+        }
+    } else if model.is_class(object) {
+        model.py_setattr_class(object, attr, value)?;
+    } else if model.is_user_function(object) {
+        model.py_setattr_function(object, attr, value)?;
+    } else {
+        model.py_setattr_native(object, attr, value)?;
+    }
+    Ok(())
+}
+
 /// Dispatches a call of `callee` with `args` -- the unified callable protocol shared by the
 /// `Call` op, builtins that invoke dunders, and dunder dispatch. `depth` is the callee's call
 /// depth. Handles module functions, builtins, bound str/Python methods, and instantiating a class.
@@ -1821,7 +1878,9 @@ pub(crate) fn call_value(
     } else if model.is_bound_method(callee) {
         let receiver = model.bound_receiver(callee);
         let method_id = model.bound_method_id(callee);
-        if model.is_generator(receiver) {
+        if model.is_builtin_dunder_method(method_id) {
+            model.call_bound_method(callee, args)
+        } else if model.is_generator(receiver) {
             call_generator_method(receiver, method_id, args, functions, model, depth)
         } else if model.is_set(receiver) || model.is_frozenset(receiver) {
             model.call_set_method_dyn(receiver, method_id, args, functions, depth)
@@ -1829,6 +1888,8 @@ pub(crate) fn call_value(
             model.call_dict_method_dyn(receiver, method_id, args, functions, depth)
         } else if model.is_deque(receiver) {
             model.call_deque_method_dyn(receiver, method_id, args, functions, depth)
+        } else if model.is_list(receiver) {
+            model.call_list_method_dyn(callee, receiver, method_id, args, functions, depth)
         } else {
             model.call_bound_method(callee, args)
         }
@@ -1864,6 +1925,12 @@ pub(crate) fn call_value(
         model.call_pin_factory(args)
     } else if model.is_uart_shim_factory(callee) {
         model.call_uart_shim_factory(callee, args, &[])
+    } else if model.is_spi_shim_factory(callee) {
+        model.call_spi_shim_factory(callee, args, &[])
+    } else if model.is_i2c_shim_factory(callee) {
+        model.call_i2c_shim_factory(callee, args, &[])
+    } else if model.is_adc_shim_factory(callee) {
+        model.call_adc_shim_factory(callee, args)
     } else if model.is_dio_factory(callee) {
         model.call_dio_factory(args)
     } else if let Some(call_method) = model.find_dunder(callee, "__call__") {
@@ -1982,6 +2049,24 @@ fn call_value_kw(
         Ok(Value::NONE)
     } else if model.is_uart_shim_factory(callee) {
         model.call_uart_shim_factory(callee, posargs, kwargs)
+    } else if model.is_spi_shim_factory(callee) {
+        model.call_spi_shim_factory(callee, posargs, kwargs)
+    } else if model.is_i2c_shim_factory(callee) {
+        model.call_i2c_shim_factory(callee, posargs, kwargs)
+    } else if model.is_bound_method(callee) && model.is_spi_shim(model.bound_receiver(callee)) {
+        let receiver = model.bound_receiver(callee);
+        let method_id = model.bound_method_id(callee);
+        model.call_spi_shim_method(receiver, method_id, posargs, kwargs)
+    } else if model.is_bound_method(callee) && model.is_i2c_shim(model.bound_receiver(callee)) {
+        let receiver = model.bound_receiver(callee);
+        let method_id = model.bound_method_id(callee);
+        model.call_i2c_shim_method(receiver, method_id, posargs, kwargs)
+    } else if model.is_adc_shim_factory(callee) {
+        model.call_adc_shim_factory(callee, posargs)
+    } else if model.is_bound_method(callee) && model.is_adc_shim(model.bound_receiver(callee)) {
+        let receiver = model.bound_receiver(callee);
+        let method_id = model.bound_method_id(callee);
+        model.call_adc_shim_method(receiver, method_id, posargs)
     } else if model.is_bound_method(callee)
         && (model.is_uart(model.bound_receiver(callee))
             || model.is_uart_port(model.bound_receiver(callee)))
@@ -1989,6 +2074,20 @@ fn call_value_kw(
         let receiver = model.bound_receiver(callee);
         let method_id = model.bound_method_id(callee);
         model.call_uart_bound_kw(receiver, method_id, posargs, kwargs)
+    } else if model.is_bound_method(callee)
+        && (model.is_spi(model.bound_receiver(callee))
+            || model.is_spi_bus(model.bound_receiver(callee)))
+    {
+        let receiver = model.bound_receiver(callee);
+        let method_id = model.bound_method_id(callee);
+        model.call_spi_bound_kw(receiver, method_id, posargs, kwargs)
+    } else if model.is_bound_method(callee)
+        && (model.is_i2c(model.bound_receiver(callee))
+            || model.is_i2c_bus(model.bound_receiver(callee)))
+    {
+        let receiver = model.bound_receiver(callee);
+        let method_id = model.bound_method_id(callee);
+        model.call_i2c_bound_kw(receiver, method_id, posargs, kwargs)
     } else if model.is_bound_method(callee) {
         let receiver = model.bound_receiver(callee);
         if model.is_ntinstance(receiver) && model.bound_method_id(callee) == crate::object::NT_REPLACE
@@ -2013,7 +2112,11 @@ fn call_value_kw(
             }
             return model.new_ntinstance(class, elements);
         }
-        Err(Trap::TypeError)
+        if kwargs.is_empty() {
+            model.call_bound_method(callee, posargs)
+        } else {
+            Err(Trap::TypeError)
+        }
     } else if let Some(id) = callee.as_builtin_id() {
         crate::builtins::call_builtin_kw(id, posargs, kwargs, functions, model, depth)
     } else if let Some(call_method) = model.find_dunder(callee, "__call__") {
@@ -2491,6 +2594,9 @@ pub(crate) fn getattr_hooked(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
+    if let Some(value) = descriptor_read(receiver, name, functions, model, depth)? {
+        return Ok(value);
+    }
     match model.getattr(receiver, name, slot) {
         Err(Trap::AttributeError) => match model.find_dunder(receiver, "__getattr__") {
             Some(hook) => {
@@ -2500,6 +2606,31 @@ pub(crate) fn getattr_hooked(
             None => Err(Trap::AttributeError),
         },
         other => other,
+    }
+}
+
+/// The descriptor read hook shared by `Op::LoadAttr` and `getattr_hooked`: a class attribute whose
+/// own class defines `__get__` intercepts `instance.name` per CPython precedence (a DATA descriptor
+/// wins over the instance dict; a NON-data one yields to it). `None` = no user descriptor applies, so
+/// the caller runs its normal read path (the fast path for methods/property/plain values). `__get__`
+/// is invoked with `(instance, type(instance))`.
+fn descriptor_read(
+    receiver: Value,
+    name: &str,
+    functions: &[CodeObject],
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    if name == "__dict__" {
+        return Ok(None);
+    }
+    match model.instance_descriptor_read(receiver, name) {
+        Some(DescriptorRead::Value(value)) => Ok(Some(value)),
+        Some(DescriptorRead::Get(get)) => {
+            let objtype = model.instance_class(receiver);
+            Ok(Some(call_value(get, &[receiver, objtype], functions, model, depth + 1)?))
+        }
+        None => Ok(None),
     }
 }
 
@@ -2619,6 +2750,18 @@ pub(crate) fn py_next_value(
     }
 }
 
+/// CPython's `zip(strict=True)` length-mismatch message: `index` is the 0-based position of the
+/// offending source (the one shorter, or -- for `longer` -- the later one that outlives source 0),
+/// and the sources it is compared against are `1` (singular) or `1-index` (plural).
+fn zip_strict_message(index: usize, longer: bool) -> String {
+    let relation = if longer { "longer" } else { "shorter" };
+    if index == 1 {
+        alloc::format!("zip() argument 2 is {relation} than argument 1")
+    } else {
+        alloc::format!("zip() argument {} is {relation} than arguments 1-{index}", index + 1)
+    }
+}
+
 /// Advances a lazy `map`/`filter`/`zip`/`enumerate` one step, pulling from its source iterator(s)
 /// and applying its function. `None` when a source is exhausted.
 fn lazy_iter_next(
@@ -2662,11 +2805,26 @@ fn lazy_iter_next(
             if sources.is_empty() {
                 return Ok(None);
             }
+            let strict = model.lazy_iter_state(iterator).is_truthy();
             let mut row = Vec::with_capacity(sources.len());
-            for source in &sources {
+            for (i, source) in sources.iter().enumerate() {
                 match py_next_value(*source, functions, model, depth)? {
                     Some(value) => row.push(value),
-                    None => return Ok(None),
+                    None => {
+                        if strict {
+                            if i > 0 {
+                                let message = zip_strict_message(i, false);
+                                return Err(model.with_message(Trap::ValueError, &message));
+                            }
+                            for (j, later) in sources.iter().enumerate().skip(1) {
+                                if py_next_value(*later, functions, model, depth)?.is_some() {
+                                    let message = zip_strict_message(j, true);
+                                    return Err(model.with_message(Trap::ValueError, &message));
+                                }
+                            }
+                        }
+                        return Ok(None);
+                    }
                 }
             }
             Ok(Some(model.new_tuple(row)?))
@@ -2892,29 +3050,34 @@ fn drive(
             Op::LoadAttr { name, cache } => {
                 let receiver = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
-                let slot = frame.caches.get_mut(cache as usize).ok_or(Trap::Malformed)?;
-                match model.getattr(receiver, attr, slot) {
-                    Ok(value) => {
-                        if model.is_property(value) && model.is_instance(receiver) {
-                            let (fget, _, _) = model.property_accessors(value);
-                            if fget.is_none() {
-                                return Err(Trap::AttributeError);
+                if let Some(value) = descriptor_read(receiver, attr, functions, model, depth)? {
+                    frame.push(value);
+                } else {
+                    let slot = frame.caches.get_mut(cache as usize).ok_or(Trap::Malformed)?;
+                    match model.getattr(receiver, attr, slot) {
+                        Ok(value) => {
+                            if model.is_property(value) && model.is_instance(receiver) {
+                                let (fget, _, _) = model.property_accessors(value);
+                                if fget.is_none() {
+                                    return Err(Trap::AttributeError);
+                                }
+                                let result = call_value(fget, &[receiver], functions, model, depth + 1)?;
+                                frame.push(result);
+                            } else {
+                                frame.push(value);
                             }
-                            let result = call_value(fget, &[receiver], functions, model, depth + 1)?;
-                            frame.push(result);
-                        } else {
-                            frame.push(value);
                         }
+                        Err(Trap::AttributeError) => match model.find_dunder(receiver, "__getattr__") {
+                            Some(hook) => {
+                                let name_value = model.new_str(attr)?;
+                                let result =
+                                    call_value(hook, &[name_value], functions, model, depth + 1)?;
+                                frame.push(result);
+                            }
+                            None => return Err(model.attribute_error(receiver, attr)),
+                        },
+                        Err(other) => return Err(other),
                     }
-                    Err(Trap::AttributeError) => match model.find_dunder(receiver, "__getattr__") {
-                        Some(hook) => {
-                            let name_value = model.new_str(attr)?;
-                            let result = call_value(hook, &[name_value], functions, model, depth + 1)?;
-                            frame.push(result);
-                        }
-                        None => return Err(model.attribute_error(receiver, attr)),
-                    },
-                    Err(other) => return Err(other),
                 }
             }
             Op::Binary(binop) => {
@@ -2974,7 +3137,14 @@ fn drive(
             Op::Subscript { cache: _ } => {
                 let index = frame.pop()?;
                 let container = frame.pop()?;
-                let result = if let Some(method) = model.find_dunder(container, "__getitem__") {
+                let class_getitem = if model.is_class(container) {
+                    model.class_method_dunder(container, "__class_getitem__")
+                } else {
+                    None
+                };
+                let result = if let Some(func) = class_getitem {
+                    call_value(func, &[container, index], functions, model, depth + 1)?
+                } else if let Some(method) = model.find_dunder(container, "__getitem__") {
                     call_value(method, &[index], functions, model, depth + 1)?
                 } else {
                     let index = if model.is_dict(container) {
@@ -3402,29 +3572,19 @@ fn drive(
                 let name = frame.pop()?;
                 let class = model.new_class(name, bases, namespace)?;
                 model.set_class_module(class, model.current_module())?;
+                for (name_value, hook) in model.set_name_hooks(class) {
+                    call_value(hook, &[class, name_value], functions, model, depth + 1)?;
+                }
+                if let Some(hook) = model.inherited_init_subclass(class) {
+                    call_value(hook, &[class], functions, model, depth + 1)?;
+                }
                 frame.push(class);
             }
             Op::SetAttr { name, cache: _ } => {
                 let object = frame.pop()?;
                 let value = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
-                if model.is_instance(object) {
-                    if let Some(property) = model.class_property(object, attr) {
-                        let (_, fset, _) = model.property_accessors(property);
-                        if fset.is_none() {
-                            return Err(Trap::AttributeError);
-                        }
-                        call_value(fset, &[object, value], functions, model, depth + 1)?;
-                    } else {
-                        model.py_setattr_instance(object, attr, value)?;
-                    }
-                } else if model.is_class(object) {
-                    model.py_setattr_class(object, attr, value)?;
-                } else if model.is_user_function(object) {
-                    model.py_setattr_function(object, attr, value)?;
-                } else {
-                    model.py_setattr_native(object, attr, value)?;
-                }
+                set_attr(object, attr, value, functions, model, depth)?;
             }
             Op::DeleteItem => {
                 let index = frame.pop()?;
@@ -3444,7 +3604,14 @@ fn drive(
                 let object = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
                 if model.is_instance(object) {
-                    model.py_delattr_instance(object, attr)?;
+                    if let Some(hook) = model.find_dunder(object, "__delattr__") {
+                        let name_value = model.new_str(attr)?;
+                        call_value(hook, &[name_value], functions, model, depth + 1)?;
+                    } else if let Some(delete) = model.instance_delete_descriptor(object, attr) {
+                        call_value(delete, &[object], functions, model, depth + 1)?;
+                    } else {
+                        model.py_delattr_instance(object, attr)?;
+                    }
                 } else {
                     return Err(Trap::AttributeError);
                 }
@@ -3571,6 +3738,9 @@ fn unwind_exception(
             None => return Err(trap),
         },
     };
+    if let Some(active) = frames.last().and_then(|f| f.active_exception) {
+        model.chain_context_if_unset(exception, active)?;
+    }
     let mut search_ip = faulting_ip;
     loop {
         let top = frames.len() - 1;

@@ -1,4 +1,4 @@
-//! The wireline debug + REPL **runner core**: the piece that runs a host-compiled program on the
+//! The Lamella Link debug + REPL **runner core**: the piece that runs a host-compiled program on the
 //! interpreter and answers over the wire. ONE implementation serves three hosts:
 //! - the **host reference runner** (in-process, for the `lamella-repl` CLI loopback + tests),
 //! - the **browser runner** (compiled into `lamella-wasm` for the Studio REPL),
@@ -20,7 +20,7 @@ use lamella_load::load_with_corlib;
 use lamella_metadata::Assembly;
 use lamella_wire::{Transport, TransportError};
 
-/// Wireline message types for the REPL (debug types live elsewhere).
+/// Lamella Link message types for the REPL (debug types live elsewhere).
 pub mod repl {
     /// Host -> target: run a program. Payload = the program assembly (PE) bytes.
     pub const RUN_PROGRAM: u8 = 0x20;
@@ -32,7 +32,7 @@ pub mod repl {
     pub const RUN_IMAGE: u8 = 0x22;
 }
 
-/// Wireline message types for the DEBUG channel (the reserved 0x10+ range). A code
+/// Lamella Link message types for the DEBUG channel (the reserved 0x10+ range). A code
 /// location crosses the wire as `(method_id: u32, offset: u32)` in the TARGET's code-unit
 /// domain -- on the `in_place` (baked) tier that is the CIL BYTE offset, the same domain
 /// Portable-PDB sequence points use, so the host's source mapping needs no conversion.
@@ -78,6 +78,66 @@ pub mod debug {
     /// (reason `Trap`) carrying the boot error. Served by deploy-capable targets
     /// ([`crate::serve_one_deploy`]), advertised as `Capabilities::DEBUG_ATTACH`.
     pub const DBG_ATTACH: u8 = 0x1A;
+    /// Host -> target: request one frame's variables (advertised as `Capabilities::LOCALS`).
+    /// Payload = `frame_index(u16 LE)` in the [`DBG_FRAMES`] order (0 = innermost). Replies
+    /// [`DBG_VARS`]. Accepted while HALTED (between stops the values are in motion).
+    pub const DBG_LOCALS: u8 = 0x1B;
+    /// Target -> host: one frame's variables, POSITIONAL (slot names live host-side in the
+    /// srcmap's `local_variables`; the device carries none). Payload = `locals(u16 LE)` then
+    /// that many [`val`]-tagged values, then `args(u16 LE)` and that many more. An unknown
+    /// frame index answers `0, 0` (no locals, no args).
+    pub const DBG_VARS: u8 = 0x1C;
+    /// Host -> target: expand one value's children (an object's fields, an array's elements,
+    /// a box's content, an inline struct's fields). Payload = `frame_index(u16 LE)` (the
+    /// [`DBG_FRAMES`] order) + `root_kind(u8)` (0 = local, 1 = argument) + `root_slot(u16
+    /// LE)` + `path_len(u8)` + `path_len` x `child_index(u16 LE)`. The selector is STATELESS:
+    /// the target re-walks it from the frame root on every request (each index picks the
+    /// N-th child of the previous step's expansion), so no device-side handle table exists
+    /// to invalidate on resume. Replies [`DBG_CHILDREN`]; an unresolvable selector answers
+    /// an empty one.
+    pub const DBG_EXPAND: u8 = 0x1D;
+    /// Target -> host: the expanded children. Payload = `count(u16 LE)` then `count` x
+    /// `(name_len(u8), name(UTF-8), <val>)` -- the names here are runtime TYPE metadata
+    /// (`fieldN` by slot, `[i]`, a box's `value`), not source local names.
+    pub const DBG_CHILDREN: u8 = 0x1E;
+
+    /// The `<val>` encoding [`DBG_VARS`]/[`DBG_CHILDREN`] carry: one tag byte, then the
+    /// payload the tag implies (all little-endian). [`NULL`] is bare; [`INT32`] carries an
+    /// `i32`; [`INT64`]/[`NATIVE_INT`] an `i64`; [`FLOAT`] an `f64`; [`SINGLE`] an `f32`;
+    /// [`OBJECT`] a `handle(u32)` (the heap slot, a display/correlation id -- stale after a
+    /// resume) + `type_token(u64)` (the asm-folded `TypeDef` handle, 0 when the value has no
+    /// recoverable type identity -- an array, a box, a string); [`STRUCT`] a
+    /// `field_count(u16)` + `type_token(u64)` (0 today: an inline value-type instance
+    /// carries no type id at runtime); [`BYREF`] a location descriptor `kind(u8) + a(u32) +
+    /// b(u32) + c(u32)` (kind 0 local`{frame,slot,-}`, 1 argument`{frame,slot,-}`, 2
+    /// stackalloc`{frame,buffer,offset}`, 3 field`{object,slot,-}`, 4
+    /// element`{array,index,byte_offset}`, 5 string-data`{string,byte_offset,-}`, 6
+    /// local-bytes`{frame,slot,byte_offset}`, 7 arg-bytes`{frame,slot,byte_offset}`, 8
+    /// static`{slot,-,-}`, 9 boxed`{object,-,-}`, 10 nested-field`{slot,base_kind,-}`);
+    /// [`TYPED_REF`] a `type_token(u64)` + the same location descriptor. A tier compiled
+    /// without a value's feature (float, typed references) never produces its tag.
+    pub mod val {
+        /// The null reference (no payload).
+        pub const NULL: u8 = 0x00;
+        /// A 32-bit integer (`i32 LE`) -- also `bool`/`char`/small ints, widened per III.1.1.1.
+        pub const INT32: u8 = 0x01;
+        /// A 64-bit integer (`i64 LE`).
+        pub const INT64: u8 = 0x02;
+        /// A native-sized integer (`i64 LE` on the wire regardless of target width).
+        pub const NATIVE_INT: u8 = 0x03;
+        /// A `System.Double` (`f64 LE`).
+        pub const FLOAT: u8 = 0x04;
+        /// A `System.Single` (`f32 LE`).
+        pub const SINGLE: u8 = 0x05;
+        /// An object reference: `handle(u32 LE) + type_token(u64 LE)`.
+        pub const OBJECT: u8 = 0x06;
+        /// An inline value-type instance: `field_count(u16 LE) + type_token(u64 LE)`.
+        pub const STRUCT: u8 = 0x07;
+        /// A managed pointer: `kind(u8) + a(u32 LE) + b(u32 LE) + c(u32 LE)`.
+        pub const BYREF: u8 = 0x08;
+        /// A typed reference: `type_token(u64 LE)` + the [`BYREF`] location descriptor.
+        pub const TYPED_REF: u8 = 0x09;
+    }
 
     /// [`EVT_STOPPED`] reasons.
     pub mod reason {
@@ -97,7 +157,7 @@ pub mod debug {
     }
 }
 
-/// Wireline message types for PROFILE INTROSPECTION (the 0x30 range): the board tells the IDE
+/// Lamella Link message types for PROFILE INTROSPECTION (the 0x30 range): the board tells the IDE
 /// what it is. The `HELLO_ACK` already carries the compact [`lamella_wire::ProfileIdentity`]
 /// (abi level + surface hash + name) at zero extra round-trips; this pair pulls the FULL
 /// resident manifest only when the host's cache misses that hash
@@ -111,7 +171,7 @@ pub mod profile {
     pub const PROFILE_MANIFEST: u8 = 0x31;
 }
 
-/// Wireline message types for PERSISTENT deploy (write a baked image to the target's flash
+/// Lamella Link message types for PERSISTENT deploy (write a baked image to the target's flash
 /// so it boots on reset), in the 0x20 REPL range beside [`repl::RUN_IMAGE`].
 pub mod deploy {
     /// Host -> target: write a baked image to the persistent flash region and keep it, so
@@ -298,6 +358,13 @@ pub fn run_program(corlib_bytes: &[u8], program_bytes: &[u8]) -> RunResult {
     let mut vm = Vm::default();
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
+    #[cfg(target_os = "none")]
+    vm.set_mmio_subword(
+        lamella_mmio::write8,
+        lamella_mmio::read8,
+        lamella_mmio::write16,
+        lamella_mmio::read16,
+    );
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     let outcome = run(&loaded.module, &mut vm, loaded.entry, Vec::new());
     let exit = match outcome {
@@ -325,6 +392,7 @@ fn serve_caps() -> lamella_wire::Capabilities {
             | Capabilities::DEBUG_BASIC
             | Capabilities::BREAKPOINTS
             | Capabilities::STEPPING
+            | Capabilities::LOCALS
             | Capabilities::PROFILE_CHIPID,
     )
 }
@@ -432,7 +500,7 @@ fn debug_location(session: &lamella_cil_runtime::Session) -> (u32, u32) {
     }
     session
         .frame(depth - 1)
-        .map_or((0, 0), |frame| (frame.method, frame.ip as u32))
+        .map_or((0, 0), |frame| (frame.method, frame.ip))
 }
 
 #[cfg(feature = "baked-image")]
@@ -469,8 +537,8 @@ fn run_result_of(vm: &Vm, value: &Option<lamella_cil_runtime::Value>) -> RunResu
 /// conversion: a `baked-image` device runs the interpreter `code-in-place`, under which the
 /// executing `frame.ip` is a CIL BYTE offset (interp.rs advances it via `decode_at` -> `next_ip`,
 /// a variable-width byte step), and `is_at_breakpoint` matches `breakpoints.get(&(method,
-/// frame.ip))` -- so the key domain IS byte offsets. The wireline host sends the srcmap's raw
-/// il_offset (a byte offset) precisely because of this (see lamella-wireline debug_backend: "the
+/// frame.ip))` -- so the key domain IS byte offsets. The Lamella Link host sends the srcmap's raw
+/// il_offset (a byte offset) precisely because of this (see lamella-wire-host debug_backend: "the
 /// wire reports the CIL offset directly, so no index conversion is needed"). Converting the
 /// offset to an instruction INDEX here would store a key the byte-domain ip never equals -- the
 /// breakpoint would silently miss. Index conversion is the HOST interpreter's job (that Session
@@ -497,11 +565,211 @@ fn apply_breakpoints(session: &mut lamella_cil_runtime::Session, payload: &[u8])
     }
 }
 
+/// Appends the [`debug::val`] location descriptor of a managed pointer: `kind(u8)` + three
+/// `u32 LE` words (unused trailing words are 0). Purely descriptive -- the host renders it;
+/// on-device drill-down goes through the [`debug::DBG_EXPAND`] selector instead.
+#[cfg(feature = "baked-image")]
+fn encode_location(location: &lamella_cil_runtime::Location, out: &mut Vec<u8>) {
+    use lamella_cil_runtime::Location;
+    let (kind, a, b, c) = match location {
+        Location::Local { frame, slot } => (0u8, *frame as u32, *slot as u32, 0),
+        Location::Arg { frame, slot } => (1, *frame as u32, *slot as u32, 0),
+        Location::Stack { frame, buffer, offset } => (2, *frame as u32, *buffer as u32, *offset),
+        Location::Field { object, slot } => (3, object.index(), *slot, 0),
+        Location::Element { array, index, byte_offset } => (4, array.index(), *index as u32, *byte_offset),
+        Location::StringChar { string, byte_offset } => (5, string.index(), *byte_offset, 0),
+        Location::LocalBytes { frame, slot, byte_offset } => (6, *frame as u32, *slot as u32, *byte_offset),
+        Location::ArgBytes { frame, slot, byte_offset } => (7, *frame as u32, *slot as u32, *byte_offset),
+        Location::Static { slot } => (8, *slot as u32, 0, 0),
+        Location::Boxed { object } => (9, object.index(), 0, 0),
+        Location::Nested { base, slot } => (10, *slot, location_kind(base), 0),
+    };
+    out.push(kind);
+    out.extend_from_slice(&a.to_le_bytes());
+    out.extend_from_slice(&b.to_le_bytes());
+    out.extend_from_slice(&c.to_le_bytes());
+}
+
+/// The [`encode_location`] kind byte of a location, for flattening a nested pointer's base.
+#[cfg(feature = "baked-image")]
+fn location_kind(location: &lamella_cil_runtime::Location) -> u32 {
+    use lamella_cil_runtime::Location;
+    match location {
+        Location::Local { .. } => 0,
+        Location::Arg { .. } => 1,
+        Location::Stack { .. } => 2,
+        Location::Field { .. } => 3,
+        Location::Element { .. } => 4,
+        Location::StringChar { .. } => 5,
+        Location::LocalBytes { .. } => 6,
+        Location::ArgBytes { .. } => 7,
+        Location::Static { .. } => 8,
+        Location::Boxed { .. } => 9,
+        Location::Nested { .. } => 10,
+    }
+}
+
+/// Appends one [`debug::val`]-encoded value to a [`debug::DBG_VARS`]/[`debug::DBG_CHILDREN`]
+/// payload. Positional and shallow by design: aggregates go
+/// out as a handle/count + type token and the host drills down lazily via
+/// [`debug::DBG_EXPAND`]; source-local NAMES never cross the wire (the host maps slots
+/// through the srcmap). A value whose feature this tier lacks cannot occur; the defensive
+/// tail arm keeps the match total under feature unification and reports such a value null.
+#[cfg(feature = "baked-image")]
+fn encode_value(
+    vm: &Vm,
+    module: &lamella_cil_runtime::Module,
+    value: &lamella_cil_runtime::Value,
+    out: &mut Vec<u8>,
+) {
+    use lamella_cil_runtime::{Object, Value};
+    match value {
+        Value::Null => out.push(debug::val::NULL),
+        Value::Int32(v) => {
+            out.push(debug::val::INT32);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Int64(v) => {
+            out.push(debug::val::INT64);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::NativeInt(v) => {
+            out.push(debug::val::NATIVE_INT);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        #[cfg(feature = "float")]
+        Value::Float(v) => {
+            out.push(debug::val::FLOAT);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        #[cfg(feature = "float")]
+        Value::Single(v) => {
+            out.push(debug::val::SINGLE);
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        Value::Object(reference) => {
+            out.push(debug::val::OBJECT);
+            out.extend_from_slice(&reference.index().to_le_bytes());
+            let token = match vm.heap().get(*reference) {
+                Some(Object::Instance { type_id, .. }) => module.type_handle_of(*type_id).unwrap_or(0),
+                _ => 0,
+            };
+            out.extend_from_slice(&token.to_le_bytes());
+        }
+        Value::Struct(fields) => {
+            out.push(debug::val::STRUCT);
+            out.extend_from_slice(&(fields.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u64.to_le_bytes());
+        }
+        Value::ByRef(location) => {
+            out.push(debug::val::BYREF);
+            encode_location(location, out);
+        }
+        #[cfg(feature = "typed-references")]
+        Value::TypedRef { location, type_token } => {
+            out.push(debug::val::TYPED_REF);
+            out.extend_from_slice(&type_token.to_le_bytes());
+            encode_location(location, out);
+        }
+        #[allow(unreachable_patterns)]
+        _ => out.push(debug::val::NULL),
+    }
+}
+
+/// Builds the [`debug::DBG_VARS`] payload for the [`debug::DBG_FRAMES`]-ordered
+/// `wire_index` (0 = innermost): the frame's locals then arguments, each a
+/// [`debug::val`]-encoded value. An out-of-range frame answers `0, 0`.
+#[cfg(feature = "baked-image")]
+fn locals_reply(
+    session: &lamella_cil_runtime::Session,
+    vm: &Vm,
+    module: &lamella_cil_runtime::Module,
+    request: &[u8],
+) -> Vec<u8> {
+    let wire_index = request
+        .get(0..2)
+        .map_or(0, |bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize);
+    let mut payload = Vec::new();
+    let session_index = session.depth().checked_sub(1 + wire_index);
+    match session_index.and_then(|index| session.frame(index)) {
+        Some(view) => {
+            payload.extend_from_slice(&(view.locals.len() as u16).to_le_bytes());
+            for value in view.locals {
+                encode_value(vm, module, value, &mut payload);
+            }
+            payload.extend_from_slice(&(view.args.len() as u16).to_le_bytes());
+            for value in view.args {
+                encode_value(vm, module, value, &mut payload);
+            }
+        }
+        None => payload.extend_from_slice(&[0, 0, 0, 0]),
+    }
+    payload
+}
+
+/// Builds the [`debug::DBG_CHILDREN`] payload for a [`debug::DBG_EXPAND`] selector:
+/// re-walks the stateless slot/field path from the frame root, then expands the value it
+/// lands on. Any unresolvable step (a bad frame, slot, or child index -- e.g. the host
+/// raced a resume) answers the EMPTY expansion rather than an error: the pane shows a
+/// leaf, and the next stop re-requests fresh.
+#[cfg(feature = "baked-image")]
+fn expand_reply(
+    session: &lamella_cil_runtime::Session,
+    vm: &Vm,
+    module: &lamella_cil_runtime::Module,
+    request: &[u8],
+) -> Vec<u8> {
+    let empty = alloc::vec![0u8, 0u8];
+    let (Some(frame_bytes), Some(&root_kind), Some(slot_bytes), Some(&path_len)) = (
+        request.get(0..2),
+        request.get(2),
+        request.get(3..5),
+        request.get(5),
+    ) else {
+        return empty;
+    };
+    let wire_index = u16::from_le_bytes([frame_bytes[0], frame_bytes[1]]) as usize;
+    let root_slot = u16::from_le_bytes([slot_bytes[0], slot_bytes[1]]) as usize;
+    let Some(view) = session
+        .depth()
+        .checked_sub(1 + wire_index)
+        .and_then(|index| session.frame(index))
+    else {
+        return empty;
+    };
+    let roots = if root_kind == 1 { view.args } else { view.locals };
+    let Some(mut value) = roots.get(root_slot).cloned() else {
+        return empty;
+    };
+    for step in 0..path_len as usize {
+        let base = 6 + step * 2;
+        let Some(bytes) = request.get(base..base + 2) else {
+            return empty;
+        };
+        let child = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        let Some(next) = session.expand(vm, &value).into_iter().nth(child) else {
+            return empty;
+        };
+        value = next.value;
+    }
+    let children = session.expand(vm, &value);
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&(children.len() as u16).to_le_bytes());
+    for child in children {
+        let name = child.name.as_bytes();
+        let len = name.len().min(255);
+        payload.push(len as u8);
+        payload.extend_from_slice(&name[..len]);
+        encode_value(vm, module, &child.value, &mut payload);
+    }
+    payload
+}
+
 /// Run until a breakpoint, completion, a trap, or a [`debug::DBG_PAUSE`]: bounded bursts
 /// of steps with a wire poll between bursts, so a running target stays pause-able.
 /// A mid-run `HELLO` is answered with `caps` and ends the run ([`RunStop::Reclaimed`]);
 /// a mid-run detach is acked and ends it ([`RunStop::Detached`]) -- without these, a
-/// resume over a non-terminating program left the wireline PERMANENTLY deaf on every
+/// resume over a non-terminating program left the Lamella Link PERMANENTLY deaf on every
 /// carrier (the F427 post-debug wedge: the blink loops forever, no breakpoint fires,
 /// and the old loop dropped every reclaim HELLO here).
 #[cfg(feature = "baked-image")]
@@ -607,6 +875,13 @@ pub fn run_debug_session_static(
     let mut vm = Vm::default();
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
+    #[cfg(target_os = "none")]
+    vm.set_mmio_subword(
+        lamella_mmio::write8,
+        lamella_mmio::read8,
+        lamella_mmio::write16,
+        lamella_mmio::read16,
+    );
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     configure(&mut vm);
     if let Err(trap) = boot_static_ctors(&module, &mut vm) {
@@ -700,11 +975,19 @@ pub fn run_debug_session_static(
                 payload.extend_from_slice(&(depth as u16).to_le_bytes());
                 for index in (0..depth).rev() {
                     let (method, offset) =
-                        session.frame(index).map_or((0, 0), |frame| (frame.method, frame.ip as u32));
+                        session.frame(index).map_or((0, 0), |frame| (frame.method, frame.ip));
                     payload.extend_from_slice(&method.to_le_bytes());
                     payload.extend_from_slice(&offset.to_le_bytes());
                 }
                 transport.send(debug::DBG_FRAMES, frame.seq, &payload)?;
+            }
+            debug::DBG_LOCALS => {
+                let payload = locals_reply(&session, &vm, &module, &frame.payload);
+                transport.send(debug::DBG_VARS, frame.seq, &payload)?;
+            }
+            debug::DBG_EXPAND => {
+                let payload = expand_reply(&session, &vm, &module, &frame.payload);
+                transport.send(debug::DBG_CHILDREN, frame.seq, &payload)?;
             }
             debug::DBG_PAUSE => {
                 send_stopped(transport, frame.seq, reason::PAUSED, debug_location(&session), None)?;
@@ -752,6 +1035,13 @@ pub fn run_image_with(image: Vec<u8>, configure: &mut dyn FnMut(&mut Vm)) -> Run
     let mut vm = Vm::default();
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
+    #[cfg(target_os = "none")]
+    vm.set_mmio_subword(
+        lamella_mmio::write8,
+        lamella_mmio::read8,
+        lamella_mmio::write16,
+        lamella_mmio::read16,
+    );
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     configure(&mut vm);
     if boot_static_ctors(&module, &mut vm).is_err() {
@@ -983,6 +1273,13 @@ pub fn run_deployed_with(
     let mut vm = Vm::default();
     #[cfg(target_os = "none")]
     vm.set_mmio(lamella_mmio::write32, lamella_mmio::read32);
+    #[cfg(target_os = "none")]
+    vm.set_mmio_subword(
+        lamella_mmio::write8,
+        lamella_mmio::read8,
+        lamella_mmio::write16,
+        lamella_mmio::read16,
+    );
     vm.set_memory_backend(Box::new(SafeMemory::new()));
     configure(&mut vm);
     if let Err(trap) = boot_static_ctors(module, &mut vm) {
@@ -1106,7 +1403,7 @@ mod tests {
 
         let Ok(program) = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wireline/tests/fixtures/hello.exe"
+            "/../lamella-wire-host/tests/fixtures/hello.exe"
         )) else {
             return;
         };
@@ -1135,7 +1432,7 @@ mod tests {
 
         let Ok(program) = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wireline/tests/fixtures/hello.exe"
+            "/../lamella-wire-host/tests/fixtures/hello.exe"
         )) else {
             return;
         };
@@ -1224,7 +1521,7 @@ mod tests {
 
         let Ok(program) = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wireline/tests/fixtures/spin.exe"
+            "/../lamella-wire-host/tests/fixtures/spin.exe"
         )) else {
             return;
         };
@@ -1265,7 +1562,7 @@ mod tests {
 
         let Ok(program) = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wireline/tests/fixtures/spin.exe"
+            "/../lamella-wire-host/tests/fixtures/spin.exe"
         )) else {
             return;
         };
@@ -1335,6 +1632,189 @@ mod tests {
 
     #[cfg(feature = "baked-image")]
     #[test]
+    fn dbg_locals_and_expand_report_frame_variables() {
+        use lamella_wire::MemTransport;
+
+        let Ok(program) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-wire-host/tests/fixtures/locals.exe"
+        )) else {
+            return;
+        };
+        let program: &'static [u8] = Box::leak(program.into_boxed_slice());
+        let assembly = Assembly::read(program).expect("fixture parses");
+        let loaded = lamella_load::load(&assembly).expect("fixture loads");
+        let mut module = loaded.module;
+        let image = module.write_baked(Some(loaded.entry)).expect("fixture bakes");
+
+        fn split_values(bytes: &[u8], count: usize, at: &mut usize) -> Vec<(u8, Vec<u8>)> {
+            let mut out = Vec::new();
+            for _ in 0..count {
+                let tag = bytes[*at];
+                *at += 1;
+                let size = match tag {
+                    debug::val::NULL => 0,
+                    debug::val::INT32 | debug::val::SINGLE => 4,
+                    debug::val::INT64 | debug::val::NATIVE_INT | debug::val::FLOAT => 8,
+                    debug::val::OBJECT => 12,
+                    debug::val::STRUCT => 10,
+                    debug::val::BYREF => 13,
+                    debug::val::TYPED_REF => 21,
+                    other => panic!("unknown val tag {other}"),
+                };
+                out.push((tag, bytes[*at..*at + size].to_vec()));
+                *at += size;
+            }
+            out
+        }
+        fn vars(payload: &[u8]) -> (Vec<(u8, Vec<u8>)>, Vec<(u8, Vec<u8>)>) {
+            let locals_n = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            let mut at = 2;
+            let locals = split_values(payload, locals_n, &mut at);
+            let args_n = u16::from_le_bytes([payload[at], payload[at + 1]]) as usize;
+            at += 2;
+            let args = split_values(payload, args_n, &mut at);
+            (locals, args)
+        }
+        fn object_token(raw: &[u8]) -> u64 {
+            u64::from_le_bytes(raw[4..12].try_into().unwrap())
+        }
+
+        const STEPS: u16 = 300;
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        driver.send(debug::DBG_IMAGE, 1, &image).unwrap();
+        for seq in 0..STEPS {
+            driver.send(debug::DBG_STEP, 2 + seq, &[]).unwrap();
+        }
+        driver.send(debug::DBG_LOCALS, 900, &0u16.to_le_bytes()).unwrap();
+        driver.send(debug::DBG_LOCALS, 901, &1u16.to_le_bytes()).unwrap();
+        driver.send(debug::DBG_LOCALS, 902, &9u16.to_le_bytes()).unwrap();
+        driver.send(debug::DBG_DETACH, 903, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(serve_one_baked(&mut runner).unwrap(), "the locals session served");
+        driver.feed(&runner.take_sent());
+        let mut replies = Vec::new();
+        while let Some(frame) = driver.poll().unwrap() {
+            if frame.msg_type == debug::DBG_VARS {
+                replies.push(frame.payload);
+            }
+        }
+        assert_eq!(replies.len(), 3, "three DBG_LOCALS requests, three DBG_VARS replies");
+
+        let (spin_locals, spin_args) = vars(&replies[0]);
+        assert!(
+            spin_locals.iter().any(|(tag, _)| *tag == debug::val::INT32),
+            "Spin has at least the int guard local"
+        );
+        assert_eq!(spin_args.len(), 4);
+        assert_eq!(spin_args[0].0, debug::val::INT32);
+        assert_eq!(i32::from_le_bytes(spin_args[0].1[..].try_into().unwrap()), 18);
+        assert_eq!(spin_args[1].0, debug::val::OBJECT);
+        assert_ne!(object_token(&spin_args[1].1), 0, "a declared class instance carries its type handle");
+        assert_eq!(spin_args[2].0, debug::val::OBJECT);
+        assert_eq!(object_token(&spin_args[2].1), 0, "an array has no recoverable type token");
+        assert_eq!(spin_args[3].0, debug::val::BYREF);
+        assert_eq!(spin_args[3].1[0], 0, "the ref parameter points at a local slot");
+
+        let (main_locals, main_args) = vars(&replies[1]);
+        assert!(main_args.is_empty(), "Main takes no arguments");
+        let has = |tag: u8, raw: Option<&[u8]>| {
+            main_locals
+                .iter()
+                .any(|(t, payload)| *t == tag && raw.is_none_or(|bytes| payload.as_slice() == bytes))
+        };
+        assert!(has(debug::val::INT32, Some(&7i32.to_le_bytes()[..])));
+        assert!(has(debug::val::INT64, Some(&1_234_567_890_123i64.to_le_bytes()[..])));
+        assert!(has(debug::val::FLOAT, Some(&1.5f64.to_le_bytes()[..])));
+        assert!(has(debug::val::NULL, None));
+        let box_slot = main_locals
+            .iter()
+            .position(|(tag, raw)| *tag == debug::val::OBJECT && object_token(raw) != 0)
+            .expect("the Box2 local");
+        let arr_slot = main_locals
+            .iter()
+            .position(|(tag, raw)| *tag == debug::val::OBJECT && object_token(raw) == 0)
+            .expect("the array local");
+        let pair_slot = main_locals
+            .iter()
+            .position(|(tag, raw)| {
+                *tag == debug::val::STRUCT && raw[0..2] == 2u16.to_le_bytes()
+            })
+            .expect("the Pair local");
+
+        assert_eq!(replies[2], alloc::vec![0u8, 0, 0, 0]);
+
+        fn expand_request(frame: u16, kind: u8, slot: u16, path: &[u16]) -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&frame.to_le_bytes());
+            payload.push(kind);
+            payload.extend_from_slice(&slot.to_le_bytes());
+            payload.push(path.len() as u8);
+            for step in path {
+                payload.extend_from_slice(&step.to_le_bytes());
+            }
+            payload
+        }
+        fn children(payload: &[u8]) -> Vec<(String, u8, Vec<u8>)> {
+            let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            let mut at = 2;
+            let mut out = Vec::new();
+            for _ in 0..count {
+                let len = payload[at] as usize;
+                at += 1;
+                let name = String::from_utf8(payload[at..at + len].to_vec()).unwrap();
+                at += len;
+                let mut one = split_values(payload, 1, &mut at);
+                let (tag, raw) = one.remove(0);
+                out.push((name, tag, raw));
+            }
+            out
+        }
+
+        driver.send(debug::DBG_IMAGE, 20, &image).unwrap();
+        for seq in 0..STEPS {
+            driver.send(debug::DBG_STEP, 21 + seq, &[]).unwrap();
+        }
+        driver.send(debug::DBG_EXPAND, 950, &expand_request(1, 0, box_slot as u16, &[])).unwrap();
+        driver.send(debug::DBG_EXPAND, 951, &expand_request(1, 0, arr_slot as u16, &[])).unwrap();
+        driver.send(debug::DBG_EXPAND, 952, &expand_request(1, 0, pair_slot as u16, &[])).unwrap();
+        driver.send(debug::DBG_EXPAND, 953, &expand_request(1, 0, box_slot as u16, &[0])).unwrap();
+        driver.send(debug::DBG_EXPAND, 954, &expand_request(1, 0, 999, &[])).unwrap();
+        driver.send(debug::DBG_DETACH, 955, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        assert!(serve_one_baked(&mut runner).unwrap(), "the expand session served");
+        driver.feed(&runner.take_sent());
+        let mut expansions = Vec::new();
+        while let Some(frame) = driver.poll().unwrap() {
+            if frame.msg_type == debug::DBG_CHILDREN {
+                expansions.push(frame.payload);
+            }
+        }
+        assert_eq!(expansions.len(), 5);
+        let box_children = children(&expansions[0]);
+        assert_eq!(box_children.len(), 2);
+        assert_eq!(box_children[0].0, "field0");
+        assert_eq!(box_children[0].1, debug::val::INT32);
+        assert_eq!(box_children[0].2, 40i32.to_le_bytes().to_vec());
+        assert_eq!(box_children[1].2, 2i32.to_le_bytes().to_vec());
+        let arr_children = children(&expansions[1]);
+        assert_eq!(arr_children.len(), 3);
+        assert_eq!(arr_children[0].0, "[0]");
+        assert_eq!(arr_children[0].2, 10i32.to_le_bytes().to_vec());
+        assert_eq!(arr_children[1].2, 0i32.to_le_bytes().to_vec());
+        assert_eq!(arr_children[2].2, 30i32.to_le_bytes().to_vec());
+        let pair_children = children(&expansions[2]);
+        assert_eq!(pair_children.len(), 2);
+        assert_eq!(pair_children[0].0, "field0");
+        assert_eq!(pair_children[0].2, 5i32.to_le_bytes().to_vec());
+        assert_eq!(pair_children[1].2, 6i32.to_le_bytes().to_vec());
+        assert!(children(&expansions[3]).is_empty(), "a scalar leaf expands to nothing");
+        assert!(children(&expansions[4]).is_empty(), "a bad selector answers the empty expansion");
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
     fn dbg_attach_debugs_the_deployed_image_without_resending_it() {
         use lamella_wire::{
             Capabilities, Hello, HelloAck, MemTransport, PROTOCOL_VERSION, ProtocolRange, msg,
@@ -1342,7 +1822,7 @@ mod tests {
 
         let Ok(program) = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wireline/tests/fixtures/hello.exe"
+            "/../lamella-wire-host/tests/fixtures/hello.exe"
         )) else {
             return;
         };
@@ -1418,7 +1898,7 @@ mod tests {
 
         let Ok(program) = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wireline/tests/fixtures/hello.exe"
+            "/../lamella-wire-host/tests/fixtures/hello.exe"
         )) else {
             return;
         };
@@ -1501,7 +1981,7 @@ mod tests {
 
         let Ok(program) = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wireline/tests/fixtures/hello.exe"
+            "/../lamella-wire-host/tests/fixtures/hello.exe"
         )) else {
             return;
         };

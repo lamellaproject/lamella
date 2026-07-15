@@ -20,6 +20,8 @@ pub enum LanguageVersion {
     CSharp2,
     /// C# 3.0. A gating label only; not yet implemented.
     CSharp3,
+    /// C# 4.0. A gating label only; not yet implemented.
+    CSharp4,
     /// C# 6.0 (ECMA-334 6th ed, 2022). A gating label only; not yet implemented.
     CSharp6,
     /// C# 7.0 (ECMA-334 7th ed, 2023 -- ISO/IEC 20619:2023 -- the latest ratified standard). A
@@ -79,6 +81,7 @@ impl LanguageVersion {
             LanguageVersion::CSharp1 => "ISO-1",
             LanguageVersion::CSharp2 => "ISO-2",
             LanguageVersion::CSharp3 => "3",
+            LanguageVersion::CSharp4 => "4",
             LanguageVersion::CSharp6 => "6",
             LanguageVersion::CSharp7 => "7",
         }
@@ -91,6 +94,7 @@ impl LanguageVersion {
             LanguageVersion::CSharp1 => "C# 1.0",
             LanguageVersion::CSharp2 => "C# 2.0",
             LanguageVersion::CSharp3 => "C# 3.0",
+            LanguageVersion::CSharp4 => "C# 4.0",
             LanguageVersion::CSharp6 => "C# 6.0",
             LanguageVersion::CSharp7 => "C# 7.0",
         }
@@ -137,11 +141,28 @@ pub enum Feature {
     NullCoalescing,
     /// The namespace alias qualifier `::` (`global::System`). Introduced in C# 2.0.
     NamespaceAlias,
+    /// An access modifier on a property, indexer, or event accessor, for example `private set`.
+    /// Introduced in C# 2.0.
+    AccessorAccessibility,
     /// The `=>` operator -- lambda expressions, and later expression-bodied members.
     /// Introduced in C# 3.0.
     LambdaArrow,
+    /// Object and collection initializers, for example `new C { F = 1 }` or
+    /// `new List { 1, 2 }`, initializing members or adding elements after `new`.
+    /// Introduced in C# 3.0.
+    ObjectAndCollectionInitializers,
+    /// An anonymous object creation `new { A = 1, ... }`, producing an instance of a
+    /// compiler-synthesized anonymous type. Introduced in C# 3.0.
+    AnonymousObjectCreation,
+    /// A default (optional) parameter value, for example `void M(int x = 5)`. Introduced in C# 4.0.
+    DefaultParameterValues,
+    /// A named argument, for example `M(name: value)`. Introduced in C# 4.0.
+    NamedArguments,
     /// The null-conditional operators `?.` and `?[`. Introduced in C# 6.0.
     NullConditional,
+    /// A `using static` directive (`using static System.Math;`), importing a type's static
+    /// members into scope. Introduced in C# 6.0.
+    UsingStatic,
 }
 
 impl Feature {
@@ -153,9 +174,13 @@ impl Feature {
             | Feature::AnonymousMethods
             | Feature::NullableValueTypes
             | Feature::NullCoalescing
+            | Feature::AccessorAccessibility
             | Feature::NamespaceAlias => LanguageVersion::CSharp2,
-            Feature::LambdaArrow => LanguageVersion::CSharp3,
-            Feature::NullConditional => LanguageVersion::CSharp6,
+            Feature::LambdaArrow
+            | Feature::ObjectAndCollectionInitializers
+            | Feature::AnonymousObjectCreation => LanguageVersion::CSharp3,
+            Feature::DefaultParameterValues | Feature::NamedArguments => LanguageVersion::CSharp4,
+            Feature::NullConditional | Feature::UsingStatic => LanguageVersion::CSharp6,
         }
     }
 
@@ -169,8 +194,14 @@ impl Feature {
             Feature::NullableValueTypes => "nullable value types",
             Feature::NullCoalescing => "the null-coalescing operator '??'",
             Feature::NamespaceAlias => "the namespace alias qualifier '::'",
+            Feature::AccessorAccessibility => "accessor access modifiers",
             Feature::LambdaArrow => "lambda and expression-bodied members ('=>')",
+            Feature::ObjectAndCollectionInitializers => "object and collection initializers",
+            Feature::AnonymousObjectCreation => "anonymous types",
+            Feature::DefaultParameterValues => "optional parameters",
+            Feature::NamedArguments => "named arguments",
             Feature::NullConditional => "null-conditional operators ('?.' and '?[')",
+            Feature::UsingStatic => "using static",
         }
     }
 }

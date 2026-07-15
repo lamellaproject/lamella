@@ -21,6 +21,18 @@ pub const CMD_DMI: u8 = 0x08;
 pub const CMD_RESET: u8 = 0x0B;
 /// Leave debug mode (release the target).
 pub const CMD_DISABLE: u8 = 0x0E;
+/// Switch the PROBE's own operating mode (ARM/DAP <-> RISC-V), a firmware command that resets the probe
+/// into the requested mode -- the software equivalent of the ModeS button, so no case/button access is
+/// needed. Issued to a probe found in the OTHER mode; the probe then re-enumerates under the target
+/// mode's product id. The payload is a single [`MODE_RISCV`]/[`MODE_ARM`] selector byte.
+pub const CMD_MODE_SWITCH: u8 = 0xFF;
+
+/// [`CMD_MODE_SWITCH`] selector: switch the probe into RISC-V mode (ASCII `'R'`); it re-enumerates as
+/// [`crate::WCH_PID_RV`] (`1a86:8010`). Required before debugging/flashing a RISC-V target (a CH32V003).
+pub const MODE_RISCV: u8 = b'R';
+/// [`CMD_MODE_SWITCH`] selector: switch the probe into ARM/DAP mode (ASCII `'A'`); it re-enumerates as
+/// the CMSIS-DAP product id (`1a86:8012`).
+pub const MODE_ARM: u8 = b'A';
 
 /// DMI request `op`: no-op / read / write (the RISC-V debug DMI operation encoding).
 pub const DMI_NOP: u8 = 0;
@@ -32,6 +44,81 @@ pub const DMI_WRITE: u8 = 2;
 pub const DMI_STATUS_OK: u8 = 0;
 /// DMI reply status: the operation failed (retry or surface an error).
 pub const DMI_STATUS_FAIL: u8 = 2;
+
+
+/// [`CMD_CONTROL`] subcommand: detach/release the target, ending a program session.
+pub const CTRL_DETACH: u8 = 0xFF;
+/// [`CMD_CONTROL`] subcommand: erase code flash by cycling the target's power (WCH-LinkE, which supplies
+/// that power). Recovers a chip too locked to attach normally. Payload `[CTRL_ERASE_POWER_OFF, riscvchip]`.
+pub const CTRL_ERASE_POWER_OFF: u8 = 0x0F;
+/// [`CMD_CONTROL`] subcommand: erase code flash by driving the target's RST pin (needs a RST wire).
+/// Payload `[CTRL_ERASE_RST_PIN, riscvchip]`.
+pub const CTRL_ERASE_RST_PIN: u8 = 0x08;
+
+/// Set the address+length window a following flash program/read applies to (`[start(BE), len(BE)]`).
+pub const CMD_SET_ADDRESS: u8 = 0x01;
+/// Flash/memory program operation, selected by a `PROG_*` subcommand byte.
+pub const CMD_PROGRAM: u8 = 0x02;
+/// Query/set flash protection, selected by a `CONFIG_*` subcommand byte.
+pub const CMD_CONFIG: u8 = 0x06;
+/// Set the probe<->target clock speed for a chip family (`[riscvchip, speed]`).
+pub const CMD_SET_SPEED: u8 = 0x0C;
+
+/// [`CMD_PROGRAM`] subcommand: erase the target code flash.
+pub const PROG_ERASE_FLASH: u8 = 0x01;
+/// [`CMD_PROGRAM`] subcommand: begin the fast-program image stream.
+pub const PROG_WRITE_FLASH: u8 = 0x02;
+/// [`CMD_PROGRAM`] subcommand: prepare to receive the RAM flash-loader (streamed on the data endpoint).
+pub const PROG_WRITE_FLASH_OP: u8 = 0x05;
+/// [`CMD_PROGRAM`] subcommand: commit the just-written flash-loader; the reply echoes this byte on success.
+pub const PROG_COMMIT_FLASH_OP: u8 = 0x07;
+/// [`CMD_PROGRAM`] subcommand: end the program session.
+pub const PROG_END: u8 = 0x08;
+
+/// [`CMD_RESET`] subcommand: reset the target and run, so it boots the freshly flashed image.
+pub const RESET_RUN: u8 = 0x01;
+
+/// [`CMD_SET_SPEED`] selector: the high (default) clock speed.
+pub const SPEED_HIGH: u8 = 0x01;
+/// [`CMD_SET_SPEED`] selector: the medium clock speed.
+pub const SPEED_MEDIUM: u8 = 0x02;
+/// [`CMD_SET_SPEED`] selector: the low clock speed.
+pub const SPEED_LOW: u8 = 0x03;
+
+/// [`CMD_CONFIG`] subcommand: query read-protection ([`FLAG_READ_PROTECTED`]/[`FLAG_READ_UNPROTECTED`]).
+pub const CONFIG_CHECK_READ_PROTECT: u8 = 0x01;
+/// [`CMD_CONFIG`] subcommand: query write-protection ([`FLAG_WRITE_PROTECTED`] when locked).
+pub const CONFIG_CHECK_WRITE_PROTECT: u8 = 0x04;
+/// [`CMD_CONFIG`] subcommand: remove flash protection. Sent alone (`[CONFIG_UNPROTECT]`) it lifts
+/// read-protection; with the write-protect key appended (see [`unprotect_ex_payload`]) it lifts
+/// write-protection. Lifting read-protection makes the probe firmware mass-erase the option-byte page
+/// and code flash -- the security contract: protection cannot be removed while keeping the firmware.
+pub const CONFIG_UNPROTECT: u8 = 0x02;
+
+/// Read-protect query reply: flash is read-protected (debug/flash access is locked).
+pub const FLAG_READ_PROTECTED: u8 = 0x01;
+/// Read-protect query reply: flash is not read-protected.
+pub const FLAG_READ_UNPROTECTED: u8 = 0x02;
+/// Write-protect query reply: flash is write-protected.
+pub const FLAG_WRITE_PROTECTED: u8 = 0x11;
+/// Write-protect query reply: flash is not write-protected.
+pub const FLAG_WRITE_UNPROTECTED: u8 = 0x00;
+
+/// The status byte (last of four) of a fast-program pack acknowledgement that reports the pack programmed.
+pub const FASTPROGRAM_ACK: u8 = 0x04;
+
+/// Encodes the [`CMD_SET_ADDRESS`] payload `[start(big-endian u32), len(big-endian u32)]` -- the address
+/// window a following flash program/read applies to.
+pub fn set_address_payload(start: u32, len: u32) -> [u8; 8] {
+    let (s, l) = (start.to_be_bytes(), len.to_be_bytes());
+    [s[0], s[1], s[2], s[3], l[0], l[1], l[2], l[3]]
+}
+
+/// Encodes the [`CMD_CONFIG`] write-protection-removal payload `[CONFIG_UNPROTECT, key, 0xff x6]`: the
+/// unprotect subcommand, the write-protect key (`0xff`), and six all-set write-protect bytes (clear WRP).
+pub fn unprotect_ex_payload() -> [u8; 8] {
+    [CONFIG_UNPROTECT, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]
+}
 
 /// Frames a request packet: `[0x81, cmd, len, payload...]` with `len = payload.len()`.
 ///
@@ -45,6 +132,14 @@ pub fn frame(cmd: u8, payload: &[u8]) -> Vec<u8> {
     packet.push(payload.len() as u8);
     packet.extend_from_slice(payload);
     packet
+}
+
+/// Encodes a probe mode-switch request: `frame(CMD_MODE_SWITCH, [mode])` = `[0x81, 0xFF, 0x01, mode]`
+/// with `mode` = [`MODE_RISCV`] or [`MODE_ARM`]. Sent to a probe found in the OTHER mode; the probe
+/// resets into `mode` and re-enumerates under that mode's product id. Fire-and-forget: the probe drops
+/// the USB link as it resets, so the caller does not read a reply (it opens the re-enumerated device).
+pub fn mode_switch(mode: u8) -> Vec<u8> {
+    frame(CMD_MODE_SWITCH, &[mode])
 }
 
 /// Encodes a DMI operation payload: `[addr, data (big-endian u32), op]` -- the request body carried by
@@ -111,6 +206,17 @@ pub enum WchError {
     },
     /// A DMI operation reported a non-success status.
     DmiStatus(u8),
+    /// Flash is protected, so programming was refused (unprotect the chip first).
+    FlashProtected,
+    /// A fast-program pack was not acknowledged (its status byte was not [`FASTPROGRAM_ACK`]).
+    FastProgram(u8),
+    /// A program subcommand returned an unexpected status/echo byte.
+    ProgramReply {
+        /// The byte the subcommand should have echoed/returned.
+        expected: u8,
+        /// The byte the reply actually carried.
+        got: u8,
+    },
 }
 
 impl fmt::Display for WchError {
@@ -125,6 +231,16 @@ impl fmt::Display for WchError {
                 write!(f, "WCH-Link reply command 0x{got:02x} != request 0x{sent:02x}")
             }
             WchError::DmiStatus(status) => write!(f, "WCH-Link DMI status 0x{status:02x} (not ok)"),
+            WchError::FlashProtected => {
+                write!(f, "target flash is protected; unprotect the chip before flashing")
+            }
+            WchError::FastProgram(status) => {
+                write!(f, "WCH-Link fast-program pack not acknowledged (status 0x{status:02x})")
+            }
+            WchError::ProgramReply { expected, got } => write!(
+                f,
+                "WCH-Link program reply 0x{got:02x} != expected 0x{expected:02x}"
+            ),
         }
     }
 }
@@ -144,6 +260,12 @@ mod tests {
     #[test]
     fn encodes_a_dmi_payload_big_endian() {
         assert_eq!(dmi_payload(0x10, 0x8000_0001, DMI_WRITE), [0x10, 0x80, 0x00, 0x00, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn encodes_the_probe_mode_switch_request() {
+        assert_eq!(mode_switch(MODE_RISCV), [0x81, 0xFF, 0x01, b'R']);
+        assert_eq!(mode_switch(MODE_ARM), [0x81, 0xFF, 0x01, b'A']);
     }
 
     #[test]
@@ -168,6 +290,19 @@ mod tests {
     fn round_trips_a_dmi_reply() {
         let payload = [0x11, 0x00, 0x0C, 0x03, 0x82, DMI_STATUS_OK];
         assert_eq!(parse_dmi(&payload).unwrap(), (0x11, 0x000C_0382, DMI_STATUS_OK));
+    }
+
+    #[test]
+    fn encodes_the_set_address_window_big_endian() {
+        assert_eq!(
+            set_address_payload(0x0800_0000, 1372),
+            [0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x5c]
+        );
+    }
+
+    #[test]
+    fn encodes_the_write_unprotect_payload() {
+        assert_eq!(unprotect_ex_payload(), [0x02, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
     }
 
     #[test]

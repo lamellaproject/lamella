@@ -1,10 +1,10 @@
-//! The wireline DEVICE DAP server: VS Code speaks DAP-JSON over stdio to this binary,
-//! which speaks wireline frames over a serial port to the on-device interpreter. The
-//! adapter is unchanged -- [`lamella_wireline::debug_backend::WirelineBackend`] implements
+//! The Lamella Link DEVICE DAP server: VS Code speaks DAP-JSON over stdio to this binary,
+//! which speaks Lamella Link frames over a serial port to the on-device interpreter. The
+//! adapter is unchanged -- [`lamella_wire_host::debug_backend::WireHostBackend`] implements
 //! the same `DebugBackend` seam the host interpreter backend does, and the polled serve
 //! loop surfaces asynchronous stops (a breakpoint the device hits) on their own.
 
-use lamella_wireline::debug_backend::WirelineBackend;
+use lamella_wire_host::debug_backend::WireHostBackend;
 use std::time::Duration;
 
 fn main() -> std::io::Result<()> {
@@ -21,8 +21,8 @@ fn main() -> std::io::Result<()> {
 
     let image = std::fs::read(&image_path).expect("read image");
     let srcmap = std::fs::read(std::path::Path::new(&image_path).with_extension("srcmap.json")).ok();
-    let backend = WirelineBackend::open_target(&target, baud, image, Duration::from_secs(5))
-        .expect("wireline target (is the serve firmware running?)")
+    let backend = WireHostBackend::open_target(&target, baud, image, Duration::from_secs(5))
+        .expect("Lamella Link target (is the serve firmware running?)")
         .with_srcmap(srcmap);
     let mut debugger = lamella_dap::Debugger::with_backend(Box::new(backend));
     let stdout = std::io::stdout();
@@ -32,13 +32,13 @@ fn main() -> std::io::Result<()> {
 
 /// Print the attached boards as a JSON array the extension's board picker consumes -- each entry a
 /// `{ carrier, target, vid, pid, serial, product }`, where `target` is exactly what goes in the launch
-/// config's `port`. Two carriers: native-USB (driverless) wireline boards, and OS serial ports (a debug
+/// config's `port`. Two carriers: native-USB (driverless) Lamella Link boards, and OS serial ports (a debug
 /// probe / FTDI / EDBG UART). Cross-platform; a platform that cannot enumerate one carrier just omits it.
 /// Hand-formatted JSON (no serde dep in this bin), with the handful of strings properly escaped.
 fn print_boards() {
     let mut items: Vec<String> = Vec::new();
 
-    if let Ok(boards) = lamella_wireline::UsbTransport::list() {
+    if let Ok(boards) = lamella_wire_host::UsbTransport::list() {
         for board in boards {
             let target = match &board.serial_number {
                 Some(serial) => format!("usb:{:04x}:{:04x}:{serial}", board.vendor_id, board.product_id),
@@ -55,7 +55,7 @@ fn print_boards() {
         }
     }
 
-    for port in lamella_wireline::list_serial() {
+    for port in lamella_wire_host::list_serial() {
         items.push(format!(
             "{{\"carrier\":\"serial\",\"target\":{},\"vid\":{},\"pid\":{},\"serial\":{},\"product\":{}}}",
             json_str(&port.port),

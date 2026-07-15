@@ -1,0 +1,3 @@
+# The upstream CA bundle is fetched in-session (https://curl.se/ca/cacert.pem), not committed --
+# only the generated src/roots.der + src/bundle.rs are. Re-fetch before regenerating.
+cacert.pem

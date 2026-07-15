@@ -50,16 +50,16 @@ pub struct DeviceInfo {
     pub product: Option<String>,
 }
 
-/// Lists every connected vendor-bulk device -- a CMSIS-DAP v2 probe OR e.g. a Lamella wireline board (both
+/// Lists every connected vendor-bulk device -- a CMSIS-DAP v2 probe OR e.g. a Lamella Link board (both
 /// expose a vendor-specific class-0xFF interface with bulk IN/OUT) -- with its ids and, where the OS reports
 /// them, serial/product strings. No VID filter: a caller keeps the vendor id(s) it wants (a probe consumer
-/// filters to probe vendors; the wireline picker keeps its own VID). Cross-platform (Windows/macOS/Linux).
+/// filters to probe vendors; the Lamella Link picker keeps its own VID). Cross-platform (Windows/macOS/Linux).
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     imp::enumerate()
 }
 
 /// Lists the devices registered under a caller-supplied WinUSB device-interface GUID (a
-/// `"{...}"` string) -- e.g. every attached Lamella wireline board -- with product and serial
+/// `"{...}"` string) -- e.g. every attached Lamella Link board -- with product and serial
 /// strings where the OS can report them. Windows-only for now ([`Error::Unsupported`]
 /// elsewhere): macOS and Linux have no interface-GUID registry, and their backends match by
 /// VID/PID at open time instead.
@@ -78,7 +78,7 @@ impl Device {
     }
 
     /// Opens a WinUSB device that registered under a caller-supplied device-interface GUID (a
-    /// `"{...}"` string) -- e.g. the Lamella wireline carrier rather than a CMSIS-DAP v2 probe. On
+    /// `"{...}"` string) -- e.g. the Lamella Link carrier rather than a CMSIS-DAP v2 probe. On
     /// Windows the device is found by that interface GUID; macOS and Linux match by VID/PID + the
     /// vendor-specific (class 0xFF) interface, so there the GUID is ignored.
     pub fn open_interface(
@@ -90,14 +90,30 @@ impl Device {
         imp::Device::open_guid(interface_guid, vendor_id, product_id, serial).map(Device)
     }
 
-    /// Sends one bulk OUT packet (raw -- no report id or padding).
+    /// Sends one bulk OUT packet (raw -- no report id or padding) on the primary (lowest-address) OUT
+    /// endpoint.
     pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
         self.0.write_packet(data)
     }
 
-    /// Reads one bulk IN packet into `buf`, returning its length (or [`Error::Timeout`]).
+    /// Reads one bulk IN packet into `buf` from the primary IN endpoint, returning its length (or
+    /// [`Error::Timeout`]).
     pub fn read_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         self.0.read_packet(buf, timeout)
+    }
+
+    /// Sends one bulk OUT packet on a specific endpoint address. A single-pair probe uses only its
+    /// primary endpoint ([`write_packet`](Self::write_packet)); a device with more than one bulk pair --
+    /// e.g. a WCH-Link, whose command pair is `0x01`/`0x81` and whose flash-stream data pair is
+    /// `0x02`/`0x82` -- reaches the others here.
+    pub fn write_endpoint(&mut self, endpoint: u8, data: &[u8]) -> Result<()> {
+        self.0.write_endpoint(endpoint, data)
+    }
+
+    /// Reads one bulk IN packet from a specific endpoint address into `buf`, returning its length (or
+    /// [`Error::Timeout`]) -- the companion to [`write_endpoint`](Self::write_endpoint).
+    pub fn read_endpoint(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.0.read_endpoint(endpoint, buf, timeout)
     }
 }
 

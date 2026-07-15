@@ -1,7 +1,7 @@
 //! Lowering the AST to our bytecode.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec;
@@ -314,8 +314,12 @@ fn compile_code_object(
         hoisted: Vec::new(),
         lambda_counter: 0,
         has_yield: false,
+        direct_body_stmt: false,
+        block_def_counter: 0,
+        nested_def_counts: BTreeMap::new(),
     };
     for stmt in body {
+        compiler.direct_body_stmt = true;
         compiler.compile_stmt(stmt)?;
     }
     let none = compiler.const_index(bc::Const::None);
@@ -1325,11 +1329,14 @@ fn walk_expr_uses(expr: &Expr, u: &mut Uses) {
     }
 }
 
-/// Infer `int` for unannotated locals whose every value-assignment is statically an
-/// integer (so `x = 5` needs no `: int`). An optimistic fixpoint: start each
-/// unannotated slot at `Int`, then demote any whose right-hand side is not provably
-/// `Int` -- to a fixed point, so a chain like `a = 0; b = a; c = obj.x; a = c` all
-/// settle. Parameters and annotated locals are pinned to their declared type.
+/// Infer `int`/`float` for unannotated locals whose every value-assignment is statically numeric (so
+/// `x = 5` needs no `: int`, `s = 0.0` no `: float`). TWO monotone passes over the {Int, Float, Dynamic}
+/// lattice, both from an `Int` seed: pass 1 WIDENS (an int/float mix promotes to `Float`), pass 2 then
+/// DEMOTES a genuinely multi-typed local (a real int source AND a real float source) back to `Dynamic`.
+/// So a chain like `a = 0; b = a; c = obj.x; a = c` settles, AND a float accumulator `s = 0.0; for v in
+/// xs: s = s + v` settles `Float` -- the widen pass promotes its self-referential `s + v` while it is
+/// transiently `Int` (the for-target `v` still settling), where a single non-promoting pass would
+/// lock `s` at that transient mix (a sticky `Dynamic`). Parameters and annotated locals are pinned.
 fn infer_local_types(
     params: &[ast::ParamDef],
     body: &[&Stmt],
@@ -1349,6 +1356,21 @@ fn infer_local_types(
             *ty = bc::StaticType::Int;
         }
     }
+    settle_local_types(names, &pinned, &rhss, types, promoted_kind);
+    settle_local_types(names, &pinned, &rhss, types, numeric_kind);
+}
+
+/// Run one monotone fixpoint of `kind` over the unpinned locals, updating `types` in place until no
+/// local's type changes. `kind` maps a local's RHSs (read against the current `types`) to its settled
+/// type; a RHS may name another local, so iterate. Shared by the widen and demote passes of
+/// [`infer_local_types`].
+fn settle_local_types(
+    names: &[String],
+    pinned: &[bool],
+    rhss: &[Vec<Expr>],
+    types: &mut [bc::StaticType],
+    kind: fn(&[Expr], &[String], &[bc::StaticType]) -> bc::StaticType,
+) {
     let mut changed = true;
     while changed {
         changed = false;
@@ -1356,7 +1378,7 @@ fn infer_local_types(
             if pinned[i] {
                 continue;
             }
-            let new_ty = numeric_kind(&rhss[i], names, types);
+            let new_ty = kind(&rhss[i], names, types);
             if new_ty != types[i] {
                 types[i] = new_ty;
                 changed = true;
@@ -1365,9 +1387,12 @@ fn infer_local_types(
     }
 }
 
-/// The common numeric static type of a local's assignment RHSs (for [`infer_local_types`]): `Int` if
-/// every RHS is provably Int, `Float` if every RHS is provably Float, else `Dynamic` -- no RHS, any
-/// dynamic RHS, or a MIXED int/float local (one MIR slot cannot be both machine widths).
+/// The common numeric static type of a local's assignment RHSs -- pass 2 (DEMOTE) of
+/// [`infer_local_types`]: `Int` if every RHS is provably Int, `Float` if every RHS is provably Float,
+/// else `Dynamic` -- no RHS, any dynamic RHS, or a MIXED int/float local (one MIR slot cannot be both
+/// machine widths). Run against the widened environment from pass 1, so a float accumulator's `s + v`
+/// reads Float (agreeing with its `0.0` seed) while a genuine `x = 1; x = 2.0` reads a real int and a
+/// real float and is correctly demoted.
 fn numeric_kind(rhss: &[Expr], names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
     let mut kind: Option<bc::StaticType> = None;
     for e in rhss {
@@ -1380,6 +1405,29 @@ fn numeric_kind(rhss: &[Expr], names: &[String], types: &[bc::StaticType]) -> bc
         }
     }
     kind.unwrap_or(bc::StaticType::Dynamic)
+}
+
+/// The WIDEST numeric type over a local's RHSs -- pass 1 (WIDEN) of [`infer_local_types`]: like
+/// [`numeric_kind`] but an int/float MIX promotes to `Float` instead of collapsing to `Dynamic`. This
+/// settles a float accumulator (`s = 0.0; s = s + v`) to `Float` even while its self-referential
+/// `s + v` is transiently `Int` (the for-target `v` not yet settled) -- the sticky-`Dynamic`
+/// self-poisoning a single non-promoting pass would hit. Only the two scalar numerics promote; a
+/// container vs a scalar, or two different container element kinds, is still `Dynamic`. Pass 2 then
+/// demotes any GENUINE int/float mix.
+fn promoted_kind(rhss: &[Expr], names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
+    use bc::StaticType::{Dynamic, Float, Int};
+    let mut kind: Option<bc::StaticType> = None;
+    for e in rhss {
+        let t = expr_static_type(e, names, types);
+        kind = Some(match (kind, t) {
+            (_, Dynamic) => return Dynamic,
+            (None, t) => t,
+            (Some(a), b) if a == b => a,
+            (Some(Int | Float), Int | Float) => Float,
+            (Some(_), _) => return Dynamic,
+        });
+    }
+    kind.unwrap_or(Dynamic)
 }
 
 /// Walk a statement, pinning the targets of annotated assignments and collecting each
@@ -1489,12 +1537,16 @@ fn gather_assignments_stmt(
         }
         Stmt::ForIter {
             target,
+            iterable,
             body,
             orelse,
             ..
         } => {
             if let Some(slot) = names.iter().position(|n| n == target) {
-                pinned[slot] = true;
+                rhss[slot].push(Expr::Subscript {
+                    value: Box::new(iterable.clone()),
+                    index: Box::new(Expr::Int(0)),
+                });
             }
             for s in body.iter().chain(orelse) {
                 gather_assignments_stmt(s, names, pinned, rhss);
@@ -1567,7 +1619,7 @@ fn gather_assignments_stmt(
 /// `Dynamic`. Kept in lockstep with `lower.rs` so an inferred slot type always matches the value the
 /// lowering stores into it.
 fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
-    use bc::StaticType::{Dynamic, Float, Int};
+    use bc::StaticType::{Dynamic, Float, Int, ListFloat, ListInt, TupleFloat, TupleInt};
     fn numeric(t: bc::StaticType) -> bool {
         matches!(t, Int | Float)
     }
@@ -1640,12 +1692,12 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
         Expr::Call { func, args, keywords }
             if keywords.is_empty()
                 && args.len() == 1
-                && matches!(&**func, Expr::Name(n) if n == "int" || n == "float")
+                && matches!(&**func, Expr::Name(n) if n == "int" || n == "float" || n == "bool")
                 && numeric(expr_static_type(&args[0], names, types)) =>
         {
             match &**func {
-                Expr::Name(n) if n == "int" => Int,
-                _ => Float,
+                Expr::Name(n) if n == "float" => Float,
+                _ => Int,
             }
         }
         Expr::Call { func, args, keywords }
@@ -1666,11 +1718,63 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
         }
         Expr::Call { func, args, keywords }
             if keywords.is_empty()
+                && args.len() == 2
+                && matches!(&**func, Expr::Name(n) if n == "min" || n == "max") =>
+        {
+            let a = expr_static_type(&args[0], names, types);
+            let b = expr_static_type(&args[1], names, types);
+            if a == b && numeric(a) { a } else { Dynamic }
+        }
+        Expr::Call { func, args, keywords }
+            if keywords.is_empty()
                 && matches!(&**func, Expr::Name(n) if matches!(n.as_str(),
-                    "min" | "max" | "mmio_read8" | "mmio_read16" | "mmio_read32"))
+                    "mmio_read8" | "mmio_read16" | "mmio_read32"))
                 && args.iter().all(|a| expr_static_type(a, names, types) == Int) =>
         {
             Int
+        }
+        Expr::Call { func, args, keywords }
+            if keywords.is_empty()
+                && args.len() == 1
+                && matches!(&**func, Expr::Name(n) if n == "len") =>
+        {
+            Int
+        }
+        Expr::List(elems) if !elems.is_empty() => {
+            let first = expr_static_type(&elems[0], names, types);
+            let container = match first {
+                Int => ListInt,
+                Float => ListFloat,
+                _ => return Dynamic,
+            };
+            if elems[1..].iter().all(|e| expr_static_type(e, names, types) == first) {
+                container
+            } else {
+                Dynamic
+            }
+        }
+        Expr::Tuple(elems) if !elems.is_empty() => {
+            let first = expr_static_type(&elems[0], names, types);
+            let container = match first {
+                Int => TupleInt,
+                Float => TupleFloat,
+                _ => return Dynamic,
+            };
+            if elems[1..].iter().all(|e| expr_static_type(e, names, types) == first) {
+                container
+            } else {
+                Dynamic
+            }
+        }
+        Expr::Subscript { value, index } => {
+            if expr_static_type(index, names, types) != Int {
+                return Dynamic;
+            }
+            match expr_static_type(value, names, types) {
+                ListInt | TupleInt => Int,
+                ListFloat | TupleFloat => Float,
+                _ => Dynamic,
+            }
         }
         _ => Dynamic,
     }
@@ -1740,6 +1844,19 @@ struct Compiler {
     lambda_counter: usize,
     /// Set when the body emits a `Yield`, marking this code object a generator function.
     has_yield: bool,
+    /// True while compiling a DIRECT statement of this code object's body (set per statement by the
+    /// body loop, cleared on entry to `compile_stmt` so a nested statement sees false). At module
+    /// scope this distinguishes a direct top-level `def` -- a pure function-table entry already
+    /// hoisted by `compile_module` -- from one buried in an `if`/`for`/`while`/`try`/`with` body,
+    /// which must be hoisted + emitted at its def site (a version-guarded / fallback def).
+    direct_body_stmt: bool,
+    /// Counts block-nested module defs hoisted from this body, for a unique table name per def site
+    /// (so sibling same-named defs -- `if c: def f else: def f` -- do not collide on one name).
+    block_def_counter: usize,
+    /// Per-name occurrence count of a nested `def` hoisted from this (function) body, so sibling
+    /// same-named defs get DISTINCT code-object names (`scope.name`, then `scope.name$1`, ...). The
+    /// first keeps the bare qualified name (stable), so only a redefinition is suffixed.
+    nested_def_counts: BTreeMap<String, usize>,
 }
 
 impl Compiler {
@@ -1844,12 +1961,16 @@ impl Compiler {
     }
 
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
+        let direct = self.direct_body_stmt;
+        self.direct_body_stmt = false;
         match stmt {
             Stmt::FuncDef(func) => {
                 if self.scope == Scope::Function {
                     self.compile_nested_def(func)
-                } else {
+                } else if direct {
                     self.compile_defaulted_def(func)
+                } else {
+                    self.compile_block_nested_module_def(func)
                 }
             }
             Stmt::Delete(targets) => {
@@ -1896,7 +2017,7 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Assign(assign) => self.compile_assign(assign),
-            Stmt::Decorated { decorators, inner } => self.compile_decorated(decorators, inner),
+            Stmt::Decorated { decorators, inner } => self.compile_decorated(decorators, inner, direct),
             Stmt::MultiAssign { targets, value } => self.compile_multi_assign(targets, value),
             Stmt::TupleAssign { targets, star, value } => {
                 self.compile_expr(value)?;
@@ -1924,7 +2045,7 @@ impl Compiler {
                 value,
                 op,
             } => self.compile_setattr(obj, attr, value, *op),
-            Stmt::ClassDef { name, bases, body } => self.compile_classdef(name, bases, body),
+            Stmt::ClassDef { name, bases, body } => self.compile_classdef(name, bases, body, direct),
             Stmt::Expr(expr) => {
                 self.compile_expr(expr)?;
                 self.asm.emit(bc::Op::PopTop);
@@ -2040,7 +2161,9 @@ impl Compiler {
         &mut self,
         decorators: &[Expr],
         inner: &Stmt,
+        direct: bool,
     ) -> Result<(), CompileError> {
+        self.direct_body_stmt = direct;
         self.compile_stmt(inner)?;
         let name = match inner {
             Stmt::FuncDef(f) => f.name.clone(),
@@ -2427,9 +2550,18 @@ impl Compiler {
         name: &str,
         bases: &[Expr],
         body: &[Stmt],
+        direct: bool,
     ) -> Result<(), CompileError> {
         let class_qual = if self.scope == Scope::Module {
-            String::from(name)
+            if direct {
+                String::from(name)
+            } else {
+                let seq = self.block_def_counter;
+                self.block_def_counter += 1;
+                let qualified = format!("{}.${seq}.{}", self.name, name);
+                compile_class_method_bodies(&qualified, body, &mut self.hoisted, &[])?;
+                qualified
+            }
         } else {
             let qualified = format!("{}.{}", self.name, name);
             let enclosing = self.child_scopes.clone();
@@ -2530,6 +2662,16 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), CompileError> {
+        let it_type = expr_static_type(iterable, &self.local_names, &self.local_types);
+        if matches!(
+            it_type,
+            bc::StaticType::ListInt
+                | bc::StaticType::ListFloat
+                | bc::StaticType::TupleInt
+                | bc::StaticType::TupleFloat
+        ) {
+            return self.compile_for_iter_list(target, iterable, it_type, body, orelse);
+        }
         self.compile_expr(iterable)?;
         self.asm.emit(bc::Op::GetIter);
         let iter_slot = self.alloc_temp();
@@ -2546,6 +2688,65 @@ impl Compiler {
             self.compile_stmt(stmt)?;
         }
         self.loops.pop();
+        self.asm.emit_jump(top);
+        self.asm.place(else_label);
+        for stmt in orelse {
+            self.compile_stmt(stmt)?;
+        }
+        self.asm.place(after);
+        Ok(())
+    }
+
+    /// `for target in <typed list/tuple>: body` -- desugared to a counted loop `while i < len(it):
+    /// target = it[i]; body; i += 1`, so the AOT lane runs it as array element loads (the same shape a
+    /// `range(...)` loop uses). The iterable is evaluated ONCE into a hidden temp typed as the sequence
+    /// (so the lowering recognizes its `len`/subscript as typed array ops); the counter temp is an int.
+    /// The target holds the last element after the loop (Python's for-loop semantics), and `break`/
+    /// `continue`/`else` behave exactly as in the range loop.
+    fn compile_for_iter_list(
+        &mut self,
+        target: &str,
+        iterable: &Expr,
+        it_type: bc::StaticType,
+        body: &[Stmt],
+        orelse: &[Stmt],
+    ) -> Result<(), CompileError> {
+        let it_tmp = self.alloc_temp();
+        self.local_types[it_tmp as usize] = it_type;
+        self.compile_expr(iterable)?;
+        self.asm.emit(bc::Op::StoreFast(it_tmp));
+        let counter = self.alloc_temp();
+        let zero = self.const_index(bc::Const::Int(0));
+        self.asm.emit(bc::Op::LoadConst(zero));
+        self.asm.emit(bc::Op::StoreFast(counter));
+        let top = self.asm.new_label();
+        let cont = self.asm.new_label();
+        let else_label = self.asm.new_label();
+        let after = self.asm.new_label();
+        self.asm.place(top);
+        self.asm.emit(bc::Op::LoadFast(counter));
+        let len_idx = self.name_index("len");
+        self.asm.emit(bc::Op::LoadGlobal(len_idx));
+        self.asm.emit(bc::Op::LoadFast(it_tmp));
+        self.asm.emit(bc::Op::Call(1));
+        self.asm.emit(bc::Op::Compare(bc::CmpOp::Lt));
+        self.asm.emit_branch(else_label);
+        self.asm.emit(bc::Op::LoadFast(it_tmp));
+        self.asm.emit(bc::Op::LoadFast(counter));
+        let cache = self.asm.next_cache_slot();
+        self.asm.emit(bc::Op::Subscript { cache });
+        self.emit_store_name(target);
+        self.loops.push((cont, after, self.finallys.len(), self.handler_depth));
+        for stmt in body {
+            self.compile_stmt(stmt)?;
+        }
+        self.loops.pop();
+        self.asm.place(cont);
+        self.asm.emit(bc::Op::LoadFast(counter));
+        let one = self.const_index(bc::Const::Int(1));
+        self.asm.emit(bc::Op::LoadConst(one));
+        self.asm.emit(bc::Op::Binary(bc::BinOp::Add));
+        self.asm.emit(bc::Op::StoreFast(counter));
         self.asm.emit_jump(top);
         self.asm.place(else_label);
         for stmt in orelse {
@@ -2800,6 +3001,38 @@ impl Compiler {
         Ok(())
     }
 
+    /// Compile a module-level `def` buried in a block (`if`/`for`/`while`/`try`/`with`) AT ITS DEF
+    /// SITE: hoist its `CodeObject` into the module function table under a UNIQUE synthetic name
+    /// (`<block N>.name`, so sibling same-named defs -- a version guard `if c: def f else: def f` --
+    /// stay DISTINCT code objects and each def site resolves to its own body), then emit the def-site
+    /// `MakeFunction` (referencing that unique name) + `StoreName` of the def's real name. Unlike a
+    /// direct top-level def (a pure table entry, callable by name with no body emission), a
+    /// block-nested def is bound only when its block runs, so it needs this emission. Module scope has
+    /// no cells, so it captures nothing (every enclosing name is a global) -- compiled against an empty
+    /// scope chain, exactly like a direct top-level def.
+    fn compile_block_nested_module_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
+        let seq = self.block_def_counter;
+        self.block_def_counter += 1;
+        let qualified = format!("{}.${seq}.{}", self.name, func.name);
+        let body: Vec<&Stmt> = func.body.iter().collect();
+        let (co, hoisted) = compile_code_object(
+            Scope::Function,
+            &qualified,
+            &func.params,
+            &func.ret,
+            &body,
+            None,
+            &[],
+        )?;
+        self.hoisted.push(co);
+        self.hoisted.extend(hoisted);
+        let flags = self.emit_param_defaults(&func.params)?;
+        let idx = self.name_index(&qualified);
+        self.asm.emit(bc::Op::MakeFunction { func: idx, flags });
+        self.emit_store_name(&func.name);
+        Ok(())
+    }
+
     /// Emit a def / lambda / method's default operands at its def site, bottom-to-top to match
     /// MakeFunction's pop order: the positional-defaults TUPLE (flag bit0 = 0x01), then the
     /// keyword-only-defaults DICT `{name: value}` (flag bit1 = 0x02). Returns the combined flag bits
@@ -2846,11 +3079,22 @@ impl Compiler {
     /// nesting path (so the module function table stays flat), carrying its own cellvars/freevars
     /// analyzed against this function's scope chain. At the def site emit any positional-defaults
     /// tuple, then one `LoadClosure` per captured free variable, then `MakeFunction` with the
-    /// CLOSURE (and defaults) flags, then bind the def's name in this scope. (Two sibling nested
-    /// defs sharing a name -- a redefinition -- would collide on the qualified name; that rare
-    /// re-`def` is out of this increment.)
+    /// CLOSURE (and defaults) flags, then bind the def's name in this scope. Two sibling defs sharing
+    /// a name -- `if c: def f ... else: def f ...`, capturing DIFFERENT enclosing vars -- get DISTINCT
+    /// code-object names (`scope.f`, then `scope.f$1`), so each site's `MakeFunction` resolves to its
+    /// OWN body + freevar layout (else the second bound the first's closure).
     fn compile_nested_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
-        let qualified = format!("{}.{}", self.name, func.name);
+        let seq = {
+            let count = self.nested_def_counts.entry(func.name.clone()).or_insert(0);
+            let s = *count;
+            *count += 1;
+            s
+        };
+        let qualified = if seq == 0 {
+            format!("{}.{}", self.name, func.name)
+        } else {
+            format!("{}.{}${seq}", self.name, func.name)
+        };
         let body: Vec<&Stmt> = func.body.iter().collect();
         let (co, hoisted) = compile_code_object(
             Scope::Function,
@@ -3447,6 +3691,81 @@ mod tests {
     }
 
     #[test]
+    fn a_module_def_nested_in_a_block_is_hoisted_into_the_function_table() {
+        let module = compile_src("if True:\n    def f():\n        return 1\nprint(f())\n").unwrap();
+        assert!(
+            module.functions.iter().any(|c| c.name.contains('$') && c.name.ends_with(".f")),
+            "the block-nested def is hoisted under a synthetic name"
+        );
+        assert!(module.body.ops.iter().any(|op| matches!(op, Op::MakeFunction { .. })));
+    }
+
+    #[test]
+    fn sibling_same_named_module_defs_get_distinct_code_objects() {
+        let module = compile_src(
+            "if c:\n    def f():\n        return 1\nelse:\n    def f():\n        return 2\n",
+        )
+        .unwrap();
+        let fs: Vec<&str> = module
+            .functions
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| n.ends_with(".f"))
+            .collect();
+        assert_eq!(fs.len(), 2, "two distinct code objects for the sibling defs");
+        assert_ne!(fs[0], fs[1], "distinct synthetic names");
+    }
+
+    #[test]
+    fn a_module_class_nested_in_a_block_hoists_its_methods() {
+        let module = compile_src(
+            "try:\n    class C:\n        def m(self):\n            return 1\nexcept Exception:\n    pass\n",
+        )
+        .unwrap();
+        assert!(
+            module.functions.iter().any(|c| c.name.contains('$') && c.name.ends_with(".m")),
+            "the block-nested class's method is hoisted"
+        );
+    }
+
+    #[test]
+    fn a_direct_top_level_decorated_def_is_not_re_hoisted_as_block_nested() {
+        let module = compile_src("def d(fn):\n    return fn\n@d\ndef f():\n    return 1\n").unwrap();
+        assert!(module.functions.iter().any(|c| c.name == "f"));
+        assert!(
+            !module.functions.iter().any(|c| c.name.contains('$') && c.name.ends_with(".f")),
+            "no redundant block-nested hoist of a direct top-level decorated def"
+        );
+    }
+
+    #[test]
+    fn sibling_same_named_nested_defs_get_distinct_code_objects() {
+        let module = compile_src(
+            "def make(a, b):\n    if a:\n        def f():\n            return a\n    else:\n        def f():\n            return b\n    return f\n",
+        )
+        .unwrap();
+        let fs: Vec<&str> = module
+            .functions
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|n| n.starts_with("make.f"))
+            .collect();
+        assert_eq!(fs.len(), 2, "two distinct code objects for the sibling defs");
+        assert!(fs.contains(&"make.f"), "the first keeps the bare qualified name");
+        assert!(fs.iter().any(|n| n.contains('$')), "the sibling is suffixed");
+    }
+
+    #[test]
+    fn a_single_nested_def_keeps_its_bare_qualified_name() {
+        let module = compile_src(
+            "def make_adder(n):\n    def add(x):\n        return x + n\n    return add\n",
+        )
+        .unwrap();
+        assert!(module.functions.iter().any(|c| c.name == "make_adder.add"));
+        assert!(!module.functions.iter().any(|c| c.name.contains('$')));
+    }
+
+    #[test]
     fn keyword_only_params_set_kwonly_count() {
         let module = compile_src("def f(a, b, *, c, d):\n    return a\n").unwrap();
         let f = func(&module, "f");
@@ -4011,6 +4330,25 @@ mod tests {
     }
 
     #[test]
+    fn a_float_accumulator_over_a_float_loop_infers_float() {
+        let module = compile_src(
+            "def f() -> int:\n    xs = [1.5, 2.5]\n    s = 0.0\n    for v in xs:\n        s = s + v\n    return int(s)\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "s").unwrap()], StaticType::Float);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "v").unwrap()], StaticType::Float);
+    }
+
+    #[test]
+    fn an_int_seeded_then_float_incremented_local_is_dynamic() {
+        let module =
+            compile_src("def f() -> int:\n    s = 0\n    s = s + 0.5\n    return int(s)\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "s").unwrap()], StaticType::Dynamic);
+    }
+
+    #[test]
     fn a_float_comparison_result_infers_int() {
         let module = compile_src(
             "def f() -> int:\n    a = 2.5\n    b = 1.5\n    flag = a > b\n    return 0\n",
@@ -4019,6 +4357,114 @@ mod tests {
         let f = func(&module, "f");
         assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "a").unwrap()], StaticType::Float);
         assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "flag").unwrap()], StaticType::Int);
+    }
+
+    #[test]
+    fn a_homogeneous_numeric_list_literal_infers_a_list_type() {
+        let module = compile_src(
+            "def f() -> int:\n    xs = [1, 2, 3]\n    ys = [1.0, 2.0]\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "xs").unwrap()], StaticType::ListInt);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "ys").unwrap()], StaticType::ListFloat);
+    }
+
+    #[test]
+    fn a_list_element_read_and_len_stay_typed() {
+        let module = compile_src(
+            "def f() -> int:\n    xs = [10, 20, 30]\n    i = 1\n    v = xs[i]\n    n = len(xs)\n    return v + n\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "v").unwrap()], StaticType::Int);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "n").unwrap()], StaticType::Int);
+    }
+
+    #[test]
+    fn a_for_loop_over_a_typed_list_infers_the_element_type() {
+        let module = compile_src(
+            "def f() -> int:\n    xs = [1, 2, 3]\n    for x in xs:\n        pass\n    ys = [1.0, 2.0]\n    for y in ys:\n        pass\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "x").unwrap()], StaticType::Int);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "y").unwrap()], StaticType::Float);
+    }
+
+    #[test]
+    fn a_for_loop_over_a_dynamic_iterable_keeps_the_item_dynamic() {
+        let module = compile_src("def f(s) -> int:\n    for ch in s:\n        pass\n    return 0\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "ch").unwrap()], StaticType::Dynamic);
+    }
+
+    #[test]
+    fn a_float_list_element_read_infers_float() {
+        let module = compile_src(
+            "def f() -> int:\n    xs = [1.5, 2.5]\n    s = xs[0]\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "s").unwrap()], StaticType::Float);
+    }
+
+    #[test]
+    fn a_mixed_or_empty_list_literal_is_dynamic() {
+        let module = compile_src(
+            "def f() -> int:\n    a = [1, 2.0]\n    b = []\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "a").unwrap()], StaticType::Dynamic);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "b").unwrap()], StaticType::Dynamic);
+    }
+
+    #[test]
+    fn a_homogeneous_numeric_tuple_literal_infers_a_tuple_type() {
+        let module = compile_src(
+            "def f() -> int:\n    t = (1, 2, 3)\n    u = (1.0, 2.0)\n    a = 5\n    b = 7\n    v = (a, b)\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "t").unwrap()], StaticType::TupleInt);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "u").unwrap()], StaticType::TupleFloat);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "v").unwrap()], StaticType::TupleInt);
+    }
+
+    #[test]
+    fn a_tuple_element_read_stays_typed() {
+        let module = compile_src(
+            "def f() -> int:\n    t = (10, 20, 30)\n    v = t[1]\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "v").unwrap()], StaticType::Int);
+    }
+
+    #[test]
+    fn a_for_loop_over_a_typed_tuple_infers_the_element_type() {
+        let module = compile_src(
+            "def f() -> int:\n    for x in (1, 2, 3):\n        pass\n    return 0\n",
+        )
+        .unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "x").unwrap()], StaticType::Int);
+    }
+
+    #[test]
+    fn a_mixed_tuple_literal_is_dynamic() {
+        let module = compile_src("def f() -> int:\n    t = (1, 2.0)\n    return 0\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "t").unwrap()], StaticType::Dynamic);
+    }
+
+    #[test]
+    fn a_parallel_assignment_is_not_a_tuple_type() {
+        let module = compile_src("def f() -> int:\n    a, b = 1, 2\n    return a + b\n").unwrap();
+        let f = func(&module, "f");
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "a").unwrap()], StaticType::Int);
+        assert_eq!(f.local_types[f.local_names.iter().position(|n| n == "b").unwrap()], StaticType::Int);
     }
 
     #[test]

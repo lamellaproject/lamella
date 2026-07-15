@@ -15,6 +15,7 @@ namespace System.Net.Security
         [Lamella.Runtime.RuntimeProvided] internal static int ReadPlain(int tls, byte[] buf, int offset, int count) { return 0; }
         [Lamella.Runtime.RuntimeProvided] internal static int WritePlain(int tls, byte[] buf, int offset, int count) { return 0; }
         [Lamella.Runtime.RuntimeProvided] internal static int PeerCert(int tls, byte[] buf) { return 0; }
+        [Lamella.Runtime.RuntimeProvided] internal static int SessionFlags(int tls) { return 0; }
         [Lamella.Runtime.RuntimeProvided] internal static void CloseTls(int tls) { }
         [Lamella.Runtime.RuntimeProvided] internal static int DefaultStack() { return 0; }
     }

@@ -55,6 +55,60 @@ impl FeatureFlags {
     }
 }
 
+/// The built-in exception hierarchy, `(name, base-name)` pairs -- the ONE definition every
+/// engine derives from: the interpreter builds its exception classes from this table, and a
+/// static lowering derives per-type tags and subtype closures from it, so `except LookupError:`
+/// catches an `IndexError` identically everywhere.
+///
+/// Invariants: each entry's base appears EARLIER in the table (`""` marks the root,
+/// `BaseException`); the table is APPEND-ONLY (new types are added at the end, existing entries
+/// are never reordered or renamed, so derived artifacts stay stable).
+///
+/// `GeneratorExit` derives from `BaseException` (NOT `Exception`), so `except Exception:` around
+/// a `yield` does not swallow a generator's `close()`.
+pub const EXCEPTION_HIERARCHY: &[(&str, &str)] = &[
+    ("BaseException", ""),
+    ("Exception", "BaseException"),
+    ("ArithmeticError", "Exception"),
+    ("ZeroDivisionError", "ArithmeticError"),
+    ("OverflowError", "ArithmeticError"),
+    ("LookupError", "Exception"),
+    ("IndexError", "LookupError"),
+    ("KeyError", "LookupError"),
+    ("AttributeError", "Exception"),
+    ("NameError", "Exception"),
+    ("UnboundLocalError", "NameError"),
+    ("TypeError", "Exception"),
+    ("ValueError", "Exception"),
+    ("AssertionError", "Exception"),
+    ("RuntimeError", "Exception"),
+    ("RecursionError", "RuntimeError"),
+    ("NotImplementedError", "RuntimeError"),
+    ("StopIteration", "Exception"),
+    ("ImportError", "Exception"),
+    ("ModuleNotFoundError", "ImportError"),
+    ("OSError", "Exception"),
+    ("TimeoutError", "OSError"),
+    ("GeneratorExit", "BaseException"),
+];
+
+/// The AOT exception TAG of a Python exception `name`: FNV-1a-32 over `"python." + name`, the high
+/// bit forced set. A tag is therefore never zero -- zero is the "no exception in flight" sentinel the
+/// tag-dispatch exception model reserves. This is the decentralized name-tag convention: the AOT
+/// throw site, the catch dispatch, and a synthesized bounds-or-divide-by-zero check all derive the
+/// SAME value from the type's name with no shared registry, so a tag never diverges across engines or
+/// deployment tiers. The formula is the shared metadata name-tag hash specialized to the `python`
+/// namespace (so a Python tag can never collide with a `System.*` one); a unit test pins the results.
+#[must_use]
+pub fn exception_tag(name: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in b"python.".iter().chain(name.as_bytes()) {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash | 0x8000_0000
+}
+
 /// A binary arithmetic/bitwise operator carried by [`Op::Binary`] -- add/sub/mul, floor-division
 /// and modulo, true division (`/`, float-producing), exponentiation (`**`), and the bitwise operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -508,6 +562,24 @@ pub enum StaticType {
     /// MIR's F64, the same the C#/.NET `double` codegen targets. A dynamic (un-annotated) float is
     /// a heap object in the interpreter instead.
     Float = 2,
+    /// A homogeneous `list` of `int`: a fixed packed array of machine integers on the typed path (a
+    /// GC `ObjectRef` to `[u32 len][i32 elems...]`, the same array MIR the C# `int[]` lowering emits).
+    /// The interpreter treats it as an ordinary dynamic list; this static type only drives the AOT
+    /// lane's zero-runtime-call container path.
+    ListInt = 3,
+    /// A homogeneous `list` of `float`: a fixed packed array of `f64` elements on the typed path
+    /// (`[u32 len][f64 elems...]`). The AOT-lane twin of [`StaticType::ListInt`]; the interpreter
+    /// treats it as an ordinary dynamic list.
+    ListFloat = 4,
+    /// A homogeneous `tuple` of `int`: the SAME fixed packed array as [`StaticType::ListInt`] on the
+    /// typed path, but IMMUTABLE -- `t[i] = v` is a `TypeError` (rejected by the lowering), so it is a
+    /// distinct type the element-store path can refuse. The interpreter treats it as an ordinary
+    /// dynamic tuple.
+    TupleInt = 5,
+    /// A homogeneous `tuple` of `float`: the immutable twin of [`StaticType::ListFloat`] (a fixed
+    /// packed array of `f64` elements that rejects item assignment). The interpreter treats it as an
+    /// ordinary dynamic tuple.
+    TupleFloat = 6,
 }
 
 impl StaticType {
@@ -518,6 +590,10 @@ impl StaticType {
             0 => Some(StaticType::Dynamic),
             1 => Some(StaticType::Int),
             2 => Some(StaticType::Float),
+            3 => Some(StaticType::ListInt),
+            4 => Some(StaticType::ListFloat),
+            5 => Some(StaticType::TupleInt),
+            6 => Some(StaticType::TupleFloat),
             _ => None,
         }
     }
@@ -1326,6 +1402,18 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn exception_tags_match_the_ratified_values() {
+        assert_eq!(exception_tag("IndexError"), 0xA7B8_5DD5);
+        assert_eq!(exception_tag("Exception"), 0x8391_09C4);
+        let mut tags: Vec<u32> = EXCEPTION_HIERARCHY.iter().map(|(n, _)| exception_tag(n)).collect();
+        assert!(tags.iter().all(|&t| t != 0));
+        tags.sort_unstable();
+        let count = tags.len();
+        tags.dedup();
+        assert_eq!(tags.len(), count, "exception tags must be collision-free");
+    }
 
     fn sample_module() -> Module {
         let func = CodeObject {

@@ -4,7 +4,9 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use lamella_asm_arm32::{AssembleError, Cond, Encoder, Label, Reg};
-use lamella_ir::{BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, Terminator, ValueId};
+use lamella_ir::{
+    BinOp, BlockId, CmpOp, ConvKind, Function, Inst, MirType, StaticOwner, Terminator, ValueId,
+};
 
 use crate::target::TargetLowering;
 
@@ -196,6 +198,8 @@ fn lower_inst(
         | Inst::InitStruct
         | Inst::FieldLoad { .. }
         | Inst::FieldStore { .. }
+        | Inst::FieldLoadNarrow { .. }
+        | Inst::FieldStoreNarrow { .. }
         | Inst::FieldAddr { .. }
         | Inst::CopyStruct { .. } => return Err(LowerError::CallUnsupported),
         Inst::Call { .. }
@@ -302,6 +306,176 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
 
 /// Loads a 32-bit constant into `reg` -- inline if it fits a `MOVS #imm8`, else from the
 /// literal pool.
+/// Leaves the ADDRESS of static-region byte `offset` (in `owner`'s region) in r0. On the
+/// RELOCATING (object) path the address is a linker-resolved pool word: an OWN offset 0 -- the
+/// reserved MIR-level EH-tag marker (`cil::G_EXCEPTION_TAG_OFFSET`) -- resolves to the ONE
+/// VES-global `__lamella_eh_tag` word every assembly shares (a per-assembly row 0 would break a
+/// cross-assembly throw/catch), any other OWN offset resolves to THIS assembly's own region
+/// symbol plus the slot's addend, so two linked assemblies' statics can never stomp each other
+/// (#15), and a REFERENCE-owned offset (a cross-assembly `ldsfld`/`stsfld`) resolves to the
+/// OWNING assembly's region symbol -- its slot 0 is reserved like every region's, so a reference
+/// offset is never 0 and needs no EH split. The linker-free flat path keeps the fixed
+/// `STATIC_FIELD_BASE` layout -- a self-contained single-assembly image, where another assembly's
+/// region does not exist to address.
+fn static_slot_addr(
+    enc: &mut Encoder,
+    pool: &mut Vec<(Label, u32)>,
+    sym_pool: &mut Vec<(Label, u32, i32)>,
+    relocate: bool,
+    owner: StaticOwner,
+    offset: u32,
+) -> Result<(), LowerError> {
+    if !relocate {
+        return match owner {
+            StaticOwner::Own => load_const_word(enc, pool, Reg::R0, STATIC_FIELD_BASE + offset),
+            StaticOwner::Reference(_) => Err(LowerError::CallUnsupported),
+        };
+    }
+    let label = enc.new_label();
+    match owner {
+        StaticOwner::Own if offset == crate::cil::G_EXCEPTION_TAG_OFFSET => {
+            sym_pool.push((label, EH_TAG_SYMBOL_FLAG, 0));
+        }
+        StaticOwner::Own => sym_pool.push((label, STATICS_BASE_SYMBOL_FLAG, offset as i32)),
+        StaticOwner::Reference(ordinal) => {
+            assert!(
+                ordinal < 16,
+                "statics symbol out of encoding range (reference ordinal {ordinal})"
+            );
+            sym_pool.push((
+                label,
+                STATICS_BASE_SYMBOL_FLAG | (u32::from(ordinal) + 1),
+                offset as i32,
+            ));
+        }
+    }
+    enc.ldr_literal(Reg::R0, label)
+        .map_err(|_| LowerError::TooManyValues)
+}
+
+/// Loads spill-slot word `off` into `rt`. Within the Thumb-1 `LDR [SP,#imm8*4]` reach (<= 1020)
+/// this is that one instruction; past it the address SELF-ASSEMBLES through the destination --
+/// build the offset in `rt` (movs/lsls/adds), rebase onto SP (`add rt, sp, rt`), load through it
+/// -- so a LOAD never needs a scratch register. The sequence clobbers flags; slot traffic sits at
+/// instruction boundaries (operand loads before any compare, result stores after its
+/// materialization), so no live flags exist there.
+fn slot_load(enc: &mut Encoder, rt: Reg, off: u16) -> Result<(), LowerError> {
+    if off <= 1020 {
+        return enc.ldr_sp(rt, off).map_err(|_| LowerError::TooManyValues);
+    }
+    let e = |_| LowerError::TooManyValues;
+    enc.movs_imm(rt, (off >> 8) as u8).map_err(e)?;
+    enc.lsls_imm(rt, rt, 8).map_err(e)?;
+    enc.adds_imm8(rt, (off & 0xff) as u8).map_err(e)?;
+    enc.add_sp_reg(rt).map_err(e)?;
+    enc.ldr_imm(rt, rt, 0).map_err(e)
+}
+
+/// Leaves the ADDRESS of spill-slot byte `off` in `rd` -- the `ADD Rd, SP, #imm8*4` shape
+/// (a slot-resident struct's field address, an sret pointer, the py argv base), extended past the
+/// encoding's 1020 reach by self-assembling the offset in `rd` like [`slot_load`]. No scratch,
+/// no memory access.
+fn slot_addr(enc: &mut Encoder, rd: Reg, off: u16) -> Result<(), LowerError> {
+    if off <= 1020 {
+        return enc.add_sp_imm(rd, off).map_err(|_| LowerError::TooManyValues);
+    }
+    let e = |_| LowerError::TooManyValues;
+    enc.movs_imm(rd, (off >> 8) as u8).map_err(e)?;
+    enc.lsls_imm(rd, rd, 8).map_err(e)?;
+    enc.adds_imm8(rd, (off & 0xff) as u8).map_err(e)?;
+    enc.add_sp_reg(rd).map_err(e)
+}
+
+/// Stores `rt` into spill-slot word `off` -- [`slot_load`]'s twin, except a far STORE must build
+/// the address in a SCRATCH register (the value occupies `rt`). SCRATCH POLICY: the caller names
+/// a low register that is dead at the store site. The spilled path shuttles operands through
+/// r0-r3 and every result store happens after its instruction's emission has consumed them, so
+/// r3 (or r2 beside an r0:r1 pair, r1 in the post-spill prologue) is free by construction at
+/// every converted site -- r4-r7 are NOT candidates (only pushed for delegate bodies). Within
+/// SP-immediate reach the scratch is untouched.
+fn slot_store(enc: &mut Encoder, rt: Reg, off: u16, scratch: Reg) -> Result<(), LowerError> {
+    if off <= 1020 {
+        return enc.str_sp(rt, off).map_err(|_| LowerError::TooManyValues);
+    }
+    debug_assert_ne!(rt, scratch, "the far store builds its address in the scratch");
+    let e = |_| LowerError::TooManyValues;
+    enc.movs_imm(scratch, (off >> 8) as u8).map_err(e)?;
+    enc.lsls_imm(scratch, scratch, 8).map_err(e)?;
+    enc.adds_imm8(scratch, (off & 0xff) as u8).map_err(e)?;
+    enc.add_sp_reg(scratch).map_err(e)?;
+    enc.str_imm(rt, scratch, 0).map_err(e)
+}
+
+/// Walks `addr` forward until `offset` fits the narrow load/store's imm5 reach (31 bytes for a
+/// byte access, 62 for a halfword), returning the residual offset. `addr` is a scratch COPY of
+/// the base (the narrow arms load/derive it fresh), so advancing it in place is free.
+fn narrow_reach(enc: &mut Encoder, addr: Reg, offset: u32, reach: u32) -> Result<u8, LowerError> {
+    let mut off = offset;
+    while off > reach {
+        let step = off.saturating_sub(reach).min(255) as u8;
+        enc.adds_imm8(addr, step)
+            .map_err(|_| LowerError::TooManyValues)?;
+        off -= u32::from(step);
+    }
+    Ok(off as u8)
+}
+
+/// Loads the `size`-byte (1 or 2) field at `addr + offset` into `rt`, zero- or sign-extended to
+/// the I32 result -- `LDRB`/`LDRH` plus `SXTB`/`SXTH` for the signed widths (Thumb-1 has no
+/// immediate-offset LDRSB/LDRSH). A halfword field's offset is even by layout; an odd one is an
+/// UnencodableOperand, surfacing as a LOUD lowering error rather than a rotated read.
+fn narrow_load_at(
+    enc: &mut Encoder,
+    rt: Reg,
+    addr: Reg,
+    offset: u32,
+    size: u8,
+    signed: bool,
+) -> Result<(), LowerError> {
+    let e = |_| LowerError::TooManyValues;
+    match size {
+        1 => {
+            let off = narrow_reach(enc, addr, offset, 31)?;
+            enc.ldrb_imm(rt, addr, off).map_err(e)?;
+            if signed {
+                enc.sxtb(rt, rt).map_err(e)?;
+            }
+        }
+        2 => {
+            let off = narrow_reach(enc, addr, offset, 62)?;
+            enc.ldrh_imm(rt, addr, off).map_err(e)?;
+            if signed {
+                enc.sxth(rt, rt).map_err(e)?;
+            }
+        }
+        _ => return Err(LowerError::CallUnsupported),
+    }
+    Ok(())
+}
+
+/// Stores the low `size` bytes (1 or 2) of `rt` at `addr + offset` -- [`narrow_load_at`]'s twin
+/// (`STRB`/`STRH`), the store that CANNOT be word-wide: it would stomp the neighboring fields.
+fn narrow_store_at(
+    enc: &mut Encoder,
+    rt: Reg,
+    addr: Reg,
+    offset: u32,
+    size: u8,
+) -> Result<(), LowerError> {
+    let e = |_| LowerError::TooManyValues;
+    match size {
+        1 => {
+            let off = narrow_reach(enc, addr, offset, 31)?;
+            enc.strb_imm(rt, addr, off).map_err(e)
+        }
+        2 => {
+            let off = narrow_reach(enc, addr, offset, 62)?;
+            enc.strh_imm(rt, addr, off).map_err(e)
+        }
+        _ => Err(LowerError::CallUnsupported),
+    }
+}
+
 fn load_const_word(
     enc: &mut Encoder,
     pool: &mut Vec<(Label, u32)>,
@@ -360,15 +534,13 @@ fn load_call_args(
             .map_err(|_| LowerError::TooManyValues)?;
     }
     for &(stack_off, a, woff) in &stack_plan {
-        enc.ldr_sp(Reg::R3, slot(a) + stack_bytes + woff)
-            .map_err(|_| LowerError::TooManyValues)?;
+        slot_load(enc, Reg::R3, slot(a) + stack_bytes + woff)?;
         enc.str_sp(Reg::R3, stack_off)
             .map_err(|_| LowerError::TooManyValues)?;
     }
     for &(r, a, woff) in &reg_plan {
         let dst = Reg::new(r).ok_or(LowerError::CallUnsupported)?;
-        enc.ldr_sp(dst, slot(a) + stack_bytes + woff)
-            .map_err(|_| LowerError::TooManyValues)?;
+        slot_load(enc, dst, slot(a) + stack_bytes + woff)?;
     }
     Ok(stack_bytes)
 }
@@ -389,7 +561,7 @@ fn is_pointer_base(value_types: &[MirType], base: ValueId) -> bool {
 fn lower_spilled_inst(
     enc: &mut Encoder,
     pool: &mut Vec<(Label, u32)>,
-    sym_pool: &mut Vec<(Label, u32)>,
+    sym_pool: &mut Vec<(Label, u32, i32)>,
     strings: &mut Vec<(Label, Box<[u8]>)>,
     string_blobs: &mut Vec<(Label, Box<[u16]>)>,
     value_types: &[MirType],
@@ -414,14 +586,10 @@ fn lower_spilled_inst(
         }
         Inst::Binary { op, lhs, rhs } if value_types.get(lhs.0 as usize) == Some(&MirType::I64) => {
             let (a, b) = (slot(*lhs), slot(*rhs));
-            enc.ldr_sp(Reg::R0, a)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, a + 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R2, b)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R3, b + 4)
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, a)?;
+            slot_load(enc, Reg::R1, a + 4)?;
+            slot_load(enc, Reg::R2, b)?;
+            slot_load(enc, Reg::R3, b + 4)?;
             match op {
                 BinOp::Add => {
                     enc.adds(Reg::R0, Reg::R0, Reg::R2)
@@ -470,10 +638,8 @@ fn lower_spilled_inst(
             ) {
                 return Err(LowerError::CallUnsupported);
             }
-            enc.ldr_sp(Reg::R0, slot(*lhs))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*rhs))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*lhs))?;
+            slot_load(enc, Reg::R1, slot(*rhs))?;
             match op {
                 BinOp::DivSigned => emit_divmod32(enc, true, false)?,
                 BinOp::DivUnsigned => emit_divmod32(enc, false, false)?,
@@ -501,14 +667,10 @@ fn lower_spilled_inst(
         {
             if matches!(op, CmpOp::Eq | CmpOp::Ne) {
                 let (a, b) = (slot(*lhs), slot(*rhs));
-                enc.ldr_sp(Reg::R0, a)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R1, a + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R2, b)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R3, b + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, a)?;
+                slot_load(enc, Reg::R1, a + 4)?;
+                slot_load(enc, Reg::R2, b)?;
+                slot_load(enc, Reg::R3, b + 4)?;
                 enc.eors(Reg::R0, Reg::R2)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.eors(Reg::R1, Reg::R3)
@@ -531,14 +693,10 @@ fn lower_spilled_inst(
                 };
                 let (min, sub) = if swap { (*rhs, *lhs) } else { (*lhs, *rhs) };
                 let (m, s) = (slot(min), slot(sub));
-                enc.ldr_sp(Reg::R0, m)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R1, m + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R2, s)
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R3, s + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, m)?;
+                slot_load(enc, Reg::R1, m + 4)?;
+                slot_load(enc, Reg::R2, s)?;
+                slot_load(enc, Reg::R3, s + 4)?;
                 enc.subs(Reg::R0, Reg::R0, Reg::R2)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.sbcs(Reg::R1, Reg::R3)
@@ -554,10 +712,8 @@ fn lower_spilled_inst(
             ) {
                 return Err(LowerError::CallUnsupported);
             }
-            enc.ldr_sp(Reg::R0, slot(*lhs))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*rhs))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*lhs))?;
+            slot_load(enc, Reg::R1, slot(*rhs))?;
             materialize_compare(enc, Reg::R0, Reg::R0, Reg::R1, *op)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
@@ -583,7 +739,7 @@ fn lower_spilled_inst(
                 return Err(LowerError::CallUnsupported);
             }
             let label = enc.new_label();
-            sym_pool.push((label, *func));
+            sym_pool.push((label, *func, 0));
             enc.ldr_literal(Reg::R0, label)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
@@ -593,8 +749,7 @@ fn lower_spilled_inst(
                 .and_then(|x| x.checked_add(4))
                 .filter(|&offset| offset <= 255)
                 .ok_or(LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R0, slot(*object))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*object))?;
             enc.subs_imm8(Reg::R0, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
@@ -611,13 +766,12 @@ fn lower_spilled_inst(
         }
         Inst::TypeDescLiteral { handle, .. } => {
             let label = enc.new_label();
-            sym_pool.push((label, DESC_SYMBOL_FLAG | *handle));
+            sym_pool.push((label, DESC_SYMBOL_FLAG | *handle, 0));
             enc.ldr_literal(Reg::R0, label)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
         Inst::CallIndirect { target, args, .. } => {
-            enc.ldr_sp(Reg::R0, slot(*target))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*target))?;
             enc.mov_reg(Reg::R12, Reg::R0);
             let stack_bytes = load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
@@ -641,7 +795,7 @@ fn lower_spilled_inst(
             let e = |_| LowerError::TooManyValues;
             enc.movs_imm(Reg::R4, 0).map_err(e)?;
             enc.bind_label(mloop);
-            enc.ldr_sp(Reg::R3, slot(*delegate)).map_err(e)?;
+            slot_load(enc, Reg::R3, slot(*delegate))?;
             enc.ldr_imm(Reg::R1, Reg::R3, 8).map_err(e)?;
             enc.cmp_imm(Reg::R1, 0).map_err(e)?;
             enc.b_cond(Cond::Ne, multi);
@@ -702,8 +856,7 @@ fn lower_spilled_inst(
                 .and_then(|x| x.checked_add(4))
                 .filter(|&offset| offset <= 255)
                 .ok_or(LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R0, slot(receiver))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(receiver))?;
             enc.subs_imm8(Reg::R0, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
@@ -729,8 +882,7 @@ fn lower_spilled_inst(
         }
         Inst::CallInterface { tag, args, .. } => {
             let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
-            enc.ldr_sp(Reg::R0, slot(receiver))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(receiver))?;
             enc.subs_imm8(Reg::R0, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
@@ -765,8 +917,7 @@ fn lower_spilled_inst(
             enc.bind_label(found);
             enc.ldr_imm(Reg::R0, Reg::R1, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R3, slot(receiver))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R3, slot(receiver))?;
             enc.subs_imm8(Reg::R3, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.ldr_imm(Reg::R3, Reg::R3, 0)
@@ -788,10 +939,8 @@ fn lower_spilled_inst(
         Inst::CastClassScan { args } => {
             let start = *args.first().ok_or(LowerError::CallUnsupported)?;
             let target = *args.get(1).ok_or(LowerError::CallUnsupported)?;
-            enc.ldr_sp(Reg::R0, slot(start))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R2, slot(target))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(start))?;
+            slot_load(enc, Reg::R2, slot(target))?;
             let search = enc.new_label();
             let found = enc.new_label();
             let miss = enc.new_label();
@@ -822,15 +971,12 @@ fn lower_spilled_inst(
             value,
             width,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*address))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*address))?;
+            slot_load(enc, Reg::R1, slot(*value))?;
             if *width == 8 {
                 enc.str_imm(Reg::R1, Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R1, slot(*value) + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R1, slot(*value) + 4)?;
                 enc.str_imm(Reg::R1, Reg::R0, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
             } else {
@@ -842,8 +988,7 @@ fn lower_spilled_inst(
             width,
             signed,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*address))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*address))?;
             if *width == 8 {
                 enc.ldr_imm(Reg::R1, Reg::R0, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -854,12 +999,9 @@ fn lower_spilled_inst(
             }
         }
         Inst::CopyBlock { dst, src, size } => {
-            enc.ldr_sp(Reg::R0, slot(*dst))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*src))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R2, slot(*size))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*dst))?;
+            slot_load(enc, Reg::R1, slot(*src))?;
+            slot_load(enc, Reg::R2, slot(*size))?;
             let body = enc.new_label();
             let test = enc.new_label();
             enc.b(test);
@@ -880,12 +1022,9 @@ fn lower_spilled_inst(
             enc.b_cond(Cond::Ne, body);
         }
         Inst::FillBlock { dst, value, size } => {
-            enc.ldr_sp(Reg::R0, slot(*dst))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R2, slot(*size))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*dst))?;
+            slot_load(enc, Reg::R1, slot(*value))?;
+            slot_load(enc, Reg::R2, slot(*size))?;
             let body = enc.new_label();
             let test = enc.new_label();
             enc.b(test);
@@ -904,8 +1043,7 @@ fn lower_spilled_inst(
         Inst::FieldLoad { base, offset } => {
             let two_words = matches!(result_ty, Some(MirType::I64 | MirType::F64));
             if is_pointer_base(value_types, *base) {
-                enc.ldr_sp(Reg::R2, slot(*base))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R2, slot(*base))?;
                 enc.ldr_imm(Reg::R0, Reg::R2, *offset as u16)
                     .map_err(|_| LowerError::TooManyValues)?;
                 if two_words {
@@ -913,11 +1051,9 @@ fn lower_spilled_inst(
                         .map_err(|_| LowerError::TooManyValues)?;
                 }
             } else {
-                enc.ldr_sp(Reg::R0, slot(*base) + *offset as u16)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, slot(*base) + *offset as u16)?;
                 if two_words {
-                    enc.ldr_sp(Reg::R1, slot(*base) + *offset as u16 + 4)
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_load(enc, Reg::R1, slot(*base) + *offset as u16 + 4)?;
                 }
             }
         }
@@ -932,47 +1068,66 @@ fn lower_spilled_inst(
             );
             let base_ptr = is_pointer_base(value_types, *base);
             if base_ptr {
-                enc.ldr_sp(Reg::R1, slot(*base))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R1, slot(*base))?;
             }
-            enc.ldr_sp(Reg::R0, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*value))?;
             if base_ptr {
                 enc.str_imm(Reg::R0, Reg::R1, *offset as u16)
                     .map_err(|_| LowerError::TooManyValues)?;
             } else {
-                enc.str_sp(Reg::R0, slot(*base) + *offset as u16)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R0, slot(*base) + *offset as u16, Reg::R2)?;
             }
             if two_words {
-                enc.ldr_sp(Reg::R0, slot(*value) + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, slot(*value) + 4)?;
                 if base_ptr {
                     enc.str_imm(Reg::R0, Reg::R1, *offset as u16 + 4)
                         .map_err(|_| LowerError::TooManyValues)?;
                 } else {
-                    enc.str_sp(Reg::R0, slot(*base) + *offset as u16 + 4)
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_store(enc, Reg::R0, slot(*base) + *offset as u16 + 4, Reg::R2)?;
                 }
             }
         }
+        Inst::FieldLoadNarrow {
+            base,
+            offset,
+            size,
+            signed,
+        } => {
+            if is_pointer_base(value_types, *base) {
+                slot_load(enc, Reg::R1, slot(*base))?;
+            } else {
+                slot_addr(enc, Reg::R1, slot(*base))?;
+            }
+            narrow_load_at(enc, Reg::R0, Reg::R1, *offset, *size, *signed)?;
+        }
+        Inst::FieldStoreNarrow {
+            base,
+            offset,
+            value,
+            size,
+        } => {
+            if is_pointer_base(value_types, *base) {
+                slot_load(enc, Reg::R1, slot(*base))?;
+            } else {
+                slot_addr(enc, Reg::R1, slot(*base))?;
+            }
+            slot_load(enc, Reg::R0, slot(*value))?;
+            narrow_store_at(enc, Reg::R0, Reg::R1, *offset, *size)?;
+        }
         Inst::FieldAddr { base, offset } => {
             if is_pointer_base(value_types, *base) {
-                enc.ldr_sp(Reg::R0, slot(*base))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, slot(*base))?;
                 if *offset != 0 {
                     enc.adds_imm8(Reg::R0, *offset as u8)
                         .map_err(|_| LowerError::TooManyValues)?;
                 }
             } else {
-                enc.add_sp_imm(Reg::R0, slot(*base) + *offset as u16)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_addr(enc, Reg::R0, slot(*base) + *offset as u16)?;
             }
         }
         Inst::InitStruct | Inst::CopyStruct { .. } => {}
         Inst::Convert { value, kind } => {
-            enc.ldr_sp(Reg::R0, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*value))?;
             if matches!(kind, ConvKind::Float32ToInt) {
                 emit_f2i(enc)?;
             } else if matches!(kind, ConvKind::IntToFloat32) {
@@ -984,8 +1139,7 @@ fn lower_spilled_inst(
             }
         }
         Inst::Widen { value, signed } => {
-            enc.ldr_sp(Reg::R0, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*value))?;
             if *signed {
                 enc.asrs_imm(Reg::R1, Reg::R0, 31)
                     .map_err(|_| LowerError::TooManyValues)?;
@@ -995,8 +1149,7 @@ fn lower_spilled_inst(
             }
         }
         Inst::Truncate { value } => {
-            enc.ldr_sp(Reg::R0, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*value))?;
         }
         Inst::SemihostWrite { text } => {
             let entry = enc.new_label();
@@ -1008,8 +1161,7 @@ fn lower_spilled_inst(
             enc.bkpt(0xAB);
         }
         Inst::WriteInt { value } => {
-            enc.ldr_sp(Reg::R0, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*value))?;
             emit_write_int(enc)?;
         }
         Inst::StringLiteral { utf16 } => match blob_table {
@@ -1020,7 +1172,7 @@ fn lower_spilled_inst(
                     .expect("the emit_object_pass pre-scan registers every string literal")
                     as u32;
                 let label = enc.new_label();
-                sym_pool.push((label, STRING_SYMBOL_FLAG | id));
+                sym_pool.push((label, STRING_SYMBOL_FLAG | id, 0));
                 enc.ldr_literal(Reg::R0, label)
                     .map_err(|_| LowerError::TooManyValues)?;
             }
@@ -1032,10 +1184,8 @@ fn lower_spilled_inst(
             }
         },
         Inst::StringEquals { lhs, rhs } => {
-            enc.ldr_sp(Reg::R0, slot(*lhs))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*rhs))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*lhs))?;
+            slot_load(enc, Reg::R1, slot(*rhs))?;
             emit_string_equals(enc)?;
         }
         Inst::StringConcat { .. } | Inst::IntToString { .. } => {
@@ -1047,10 +1197,8 @@ fn lower_spilled_inst(
             element_size,
             signed,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*array))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*index))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*array))?;
+            slot_load(enc, Reg::R1, slot(*index))?;
             emit_array_bounds_check(enc)?;
             scale_index(enc, pool, *element_size)?;
             enc.adds_imm3(Reg::R0, Reg::R0, 4)
@@ -1079,10 +1227,8 @@ fn lower_spilled_inst(
             value,
             element_size,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*array))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*index))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*array))?;
+            slot_load(enc, Reg::R1, slot(*index))?;
             emit_array_bounds_check(enc)?;
             scale_index(enc, pool, *element_size)?;
             enc.adds_imm3(Reg::R0, Reg::R0, 4)
@@ -1090,17 +1236,14 @@ fn lower_spilled_inst(
             if *element_size == 8 {
                 enc.adds(Reg::R0, Reg::R0, Reg::R1)
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R2, slot(*value))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R3, slot(*value) + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R2, slot(*value))?;
+                slot_load(enc, Reg::R3, slot(*value) + 4)?;
                 enc.str_imm(Reg::R2, Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.str_imm(Reg::R3, Reg::R0, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
             } else {
-                enc.ldr_sp(Reg::R2, slot(*value))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R2, slot(*value))?;
                 match *element_size {
                     1 => enc.strb_reg(Reg::R2, Reg::R0, Reg::R1),
                     2 => enc.strh_reg(Reg::R2, Reg::R0, Reg::R1),
@@ -1114,10 +1257,8 @@ fn lower_spilled_inst(
             index,
             element_size,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*array))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*index))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*array))?;
+            slot_load(enc, Reg::R1, slot(*index))?;
             emit_array_bounds_check(enc)?;
             scale_index(enc, pool, *element_size)?;
             enc.adds_imm3(Reg::R0, Reg::R0, 4)
@@ -1125,15 +1266,18 @@ fn lower_spilled_inst(
             enc.adds(Reg::R0, Reg::R0, Reg::R1)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::StaticLoad { offset } => {
-            load_const_word(enc, pool, Reg::R0, STATIC_FIELD_BASE + *offset)?;
+        Inst::StaticLoad { owner, offset } => {
+            static_slot_addr(enc, pool, sym_pool, relocate, *owner, *offset)?;
             enc.ldr_imm(Reg::R0, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
-        Inst::StaticStore { offset, value } => {
-            load_const_word(enc, pool, Reg::R0, STATIC_FIELD_BASE + *offset)?;
-            enc.ldr_sp(Reg::R1, slot(*value))
-                .map_err(|_| LowerError::TooManyValues)?;
+        Inst::StaticStore {
+            owner,
+            offset,
+            value,
+        } => {
+            static_slot_addr(enc, pool, sym_pool, relocate, *owner, *offset)?;
+            slot_load(enc, Reg::R1, slot(*value))?;
             enc.str_imm(Reg::R1, Reg::R0, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
@@ -1153,22 +1297,17 @@ fn lower_spilled_inst(
             element_size,
             signed,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*array))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*index0))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*array))?;
+            slot_load(enc, Reg::R1, slot(*index0))?;
             emit_dim_bounds_check(enc, 0)?;
-            enc.ldr_sp(Reg::R1, slot(*index1))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R1, slot(*index1))?;
             emit_dim_bounds_check(enc, 4)?;
-            enc.ldr_sp(Reg::R1, slot(*index0))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R1, slot(*index0))?;
             enc.ldr_imm(Reg::R2, Reg::R0, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.muls(Reg::R1, Reg::R2)
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R2, slot(*index1))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R2, slot(*index1))?;
             enc.adds(Reg::R1, Reg::R1, Reg::R2)
                 .map_err(|_| LowerError::TooManyValues)?;
             scale_index(enc, pool, *element_size)?;
@@ -1199,22 +1338,17 @@ fn lower_spilled_inst(
             value,
             element_size,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*array))
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R1, slot(*index0))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*array))?;
+            slot_load(enc, Reg::R1, slot(*index0))?;
             emit_dim_bounds_check(enc, 0)?;
-            enc.ldr_sp(Reg::R1, slot(*index1))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R1, slot(*index1))?;
             emit_dim_bounds_check(enc, 4)?;
-            enc.ldr_sp(Reg::R1, slot(*index0))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R1, slot(*index0))?;
             enc.ldr_imm(Reg::R2, Reg::R0, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.muls(Reg::R1, Reg::R2)
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_sp(Reg::R2, slot(*index1))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R2, slot(*index1))?;
             enc.adds(Reg::R1, Reg::R1, Reg::R2)
                 .map_err(|_| LowerError::TooManyValues)?;
             scale_index(enc, pool, *element_size)?;
@@ -1223,17 +1357,14 @@ fn lower_spilled_inst(
             if *element_size == 8 {
                 enc.adds(Reg::R0, Reg::R0, Reg::R1)
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R2, slot(*value))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R3, slot(*value) + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R2, slot(*value))?;
+                slot_load(enc, Reg::R3, slot(*value) + 4)?;
                 enc.str_imm(Reg::R2, Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.str_imm(Reg::R3, Reg::R0, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
             } else {
-                enc.ldr_sp(Reg::R2, slot(*value))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R2, slot(*value))?;
                 match *element_size {
                     1 => enc.strb_reg(Reg::R2, Reg::R0, Reg::R1),
                     2 => enc.strh_reg(Reg::R2, Reg::R0, Reg::R1),
@@ -1248,8 +1379,7 @@ fn lower_spilled_inst(
             element_size,
             signed,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*array))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*array))?;
             emit_md_element_address(enc, pool, slot, indices, *element_size)?;
             if *element_size == 8 {
                 enc.ldr_imm(Reg::R1, Reg::R0, 4)
@@ -1266,21 +1396,17 @@ fn lower_spilled_inst(
             value,
             element_size,
         } => {
-            enc.ldr_sp(Reg::R0, slot(*array))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_load(enc, Reg::R0, slot(*array))?;
             emit_md_element_address(enc, pool, slot, indices, *element_size)?;
             if *element_size == 8 {
-                enc.ldr_sp(Reg::R1, slot(*value))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R2, slot(*value) + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R1, slot(*value))?;
+                slot_load(enc, Reg::R2, slot(*value) + 4)?;
                 enc.str_imm(Reg::R1, Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.str_imm(Reg::R2, Reg::R0, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
             } else {
-                enc.ldr_sp(Reg::R1, slot(*value))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R1, slot(*value))?;
                 emit_sized_store(enc, Reg::R1, Reg::R0, *element_size)?;
             }
         }
@@ -1288,10 +1414,12 @@ fn lower_spilled_inst(
     Ok(None)
 }
 
-/// The absolute base of the module's static-field storage in RAM. A convention for now (a real
-/// target would place this region and pass its base like the GC allocator address); scalar statics
-/// live here at their byte offsets, between the semihosting output word and the GC heap.
-const STATIC_FIELD_BASE: u32 = 0x2000_1000;
+/// The absolute base of the FLAT path's static-field storage in RAM (`lower_module*` -- the
+/// linker-free self-contained image, where one shared region is exactly right). The OBJECT path
+/// retired this constant (#15): each assembly's accesses relocate against its own
+/// `__lamella_statics_<hash>` symbol and `lamella-link` places the regions -- its per-machine
+/// default window starts at this same value, so flat and linked images share one RAM plan.
+pub const STATIC_FIELD_BASE: u32 = 0x2000_1000;
 
 /// Emits the array bounds check: with `r0` = the array and `r1` = the index, traps (`udf`) unless
 /// `index < length` (the length at `[array+0]`), compared UNSIGNED so a negative index -- a huge
@@ -1374,12 +1502,12 @@ fn emit_md_element_address(
 ) -> Result<(), LowerError> {
     let oops = |_| LowerError::TooManyValues;
     let n = indices.len();
-    enc.ldr_sp(Reg::R1, slot(indices[0])).map_err(oops)?;
+    slot_load(enc, Reg::R1, slot(indices[0]))?;
     emit_dim_bounds_check(enc, 0)?;
     for (k, &idx) in indices.iter().enumerate().skip(1) {
         enc.ldr_imm(Reg::R2, Reg::R0, (4 * k) as u16).map_err(oops)?;
         enc.muls(Reg::R1, Reg::R2).map_err(oops)?;
-        enc.ldr_sp(Reg::R3, slot(idx)).map_err(oops)?;
+        slot_load(enc, Reg::R3, slot(idx))?;
         enc.cmp_reg(Reg::R3, Reg::R2).map_err(oops)?;
         let ok = enc.new_label();
         enc.b_cond(Cond::CarryClear, ok);
@@ -1944,6 +2072,20 @@ fn encode_string_bytes(units: &[u16]) -> Vec<u8> {
 /// block's parameter values are distinct from any argument value, the parameter
 /// copies on a jump need no ordering. `func_labels` resolves calls.
 #[allow(clippy::too_many_arguments)]
+/// Each value's frame-slot byte offset on the fully-spilled path, plus the total slot bytes.
+/// ONE home computation shared by the lowering ([`lower_spilled_into`]) and the per-method
+/// stack-map record builder ([`method_record_roots`]), so a record's root offsets can never
+/// drift from the offsets the emitted stores actually use.
+fn spilled_slot_offsets(func: &Function) -> (Vec<u16>, u16) {
+    let mut offsets: Vec<u16> = Vec::with_capacity(func.value_types.len());
+    let mut used = 0u16;
+    for ty in &func.value_types {
+        offsets.push(used);
+        used = used.saturating_add(ty.stack_slot_bytes() as u16);
+    }
+    (offsets, used)
+}
+
 fn lower_spilled_into(
     func: &Function,
     enc: &mut Encoder,
@@ -1985,17 +2127,15 @@ fn lower_spilled_into(
     let saved_mask: u8 = if invokes_delegate { 0x30 } else { 0 };
     let saved_bytes: u16 = (saved_mask.count_ones() as u16 + 1) * 4;
     let lr_bytes = if has_calls { 4 } else { 0 };
-    let mut offsets: Vec<u16> = Vec::with_capacity(func.value_types.len());
-    let mut used = 0u16;
-    for ty in &func.value_types {
-        offsets.push(used);
-        used += ty.stack_slot_bytes() as u16;
-    }
     let returns_big_struct = matches!(func.ret, Some(MirType::ValueType { size, .. }) if size > 4);
-    let result_ptr_off = used;
-    if returns_big_struct {
-        used += 4;
-    }
+    let (offsets, mut used) = spilled_slot_offsets(func);
+    let result_ptr_off = 0u16;
+    let offsets: Vec<u16> = if returns_big_struct {
+        used = used.saturating_add(4);
+        offsets.iter().map(|o| o.saturating_add(4)).collect()
+    } else {
+        offsets
+    };
     let max_call_argc = func
         .blocks
         .iter()
@@ -2011,9 +2151,9 @@ fn lower_spilled_into(
         .max()
         .unwrap_or(0);
     let argv_scratch_off = used;
-    used += (max_call_argc as u16) * 4;
+    used = used.saturating_add((max_call_argc as u16) * 4);
     let frame = ((used as usize + lr_bytes + 7) & !7usize) - lr_bytes;
-    if frame > 1020 {
+    if frame > 65024 {
         return Err(LowerError::TooManyValues);
     }
     let frame = frame as u16;
@@ -2047,7 +2187,7 @@ fn lower_spilled_into(
         };
 
     let mut pool: Vec<(Label, u32)> = Vec::new();
-    let mut sym_pool: Vec<(Label, u32)> = Vec::new();
+    let mut sym_pool: Vec<(Label, u32, i32)> = Vec::new();
     let mut strings: Vec<(Label, Box<[u8]>)> = Vec::new();
     let mut string_blobs: Vec<(Label, Box<[u16]>)> = Vec::new();
     let mut type_descs: Vec<(Label, Box<[u32]>)> = Vec::new();
@@ -2082,11 +2222,31 @@ fn lower_spilled_into(
                     .map_err(|_| LowerError::TooManyValues)?;
                 reg += 1;
             } else {
-                enc.ldr_sp(Reg::R0, frame + lr_bytes as u16 + stack_param_off)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, frame + lr_bytes as u16 + stack_param_off)?;
                 enc.str_sp(Reg::R0, slot(param) + woff)
                     .map_err(|_| LowerError::TooManyValues)?;
                 stack_param_off += 4;
+            }
+        }
+    }
+
+    if has_calls {
+        let entry_params = &entry_block.params;
+        let ref_slots: Vec<u16> = func
+            .value_types
+            .iter()
+            .enumerate()
+            .filter(|(v, ty)| {
+                (ty.is_gc_reference() || ty.is_tagged_value())
+                    && !entry_params.contains(&ValueId(*v as u32))
+            })
+            .map(|(v, _)| offsets[v])
+            .collect();
+        if !ref_slots.is_empty() {
+            enc.movs_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            for off in ref_slots {
+                slot_store(enc, Reg::R0, off, Reg::R2)?;
             }
         }
     }
@@ -2111,8 +2271,7 @@ fn lower_spilled_into(
                 enc.movs_imm(Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
                 for w in 0..(bytes / 4) {
-                    enc.str_sp(Reg::R0, slot(*result) + (w as u16) * 4)
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_store(enc, Reg::R0, slot(*result) + (w as u16) * 4, Reg::R2)?;
                 }
                 continue;
             }
@@ -2122,10 +2281,8 @@ fn lower_spilled_into(
                     .map_or(0, MirType::stack_slot_bytes);
                 for w in 0..(bytes / 4) {
                     let off = (w as u16) * 4;
-                    enc.ldr_sp(Reg::R0, slot(*src) + off)
-                        .map_err(|_| LowerError::TooManyValues)?;
-                    enc.str_sp(Reg::R0, slot(*result) + off)
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_load(enc, Reg::R0, slot(*src) + off)?;
+                    slot_store(enc, Reg::R0, slot(*result) + off, Reg::R2)?;
                 }
                 continue;
             }
@@ -2136,44 +2293,62 @@ fn lower_spilled_into(
             } = inst
             {
                 if let Some(MirType::ValueType { size, .. }) = func.value_type(*value) {
-                    let words = (size / 4) as u16;
+                    let full_words = (size / 4) as u16;
+                    let rem = (size % 4) as u16;
                     let ptr = is_pointer_base(&func.value_types, *base);
                     if ptr {
-                        enc.ldr_sp(Reg::R1, slot(*base))
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R1, slot(*base))?;
                     }
-                    for w in 0..words {
-                        enc.ldr_sp(Reg::R0, slot(*value) + w * 4)
-                            .map_err(|_| LowerError::TooManyValues)?;
+                    for w in 0..full_words {
+                        slot_load(enc, Reg::R0, slot(*value) + w * 4)?;
                         if ptr {
                             enc.str_imm(Reg::R0, Reg::R1, *offset as u16 + w * 4)
                                 .map_err(|_| LowerError::TooManyValues)?;
                         } else {
-                            enc.str_sp(Reg::R0, slot(*base) + *offset as u16 + w * 4)
-                                .map_err(|_| LowerError::TooManyValues)?;
+                            slot_store(enc, Reg::R0, slot(*base) + *offset as u16 + w * 4, Reg::R2)?;
                         }
+                    }
+                    for k in 0..rem {
+                        let at = full_words * 4 + k;
+                        slot_addr(enc, Reg::R1, slot(*value))?;
+                        narrow_load_at(enc, Reg::R0, Reg::R1, at as u32, 1, false)?;
+                        if ptr {
+                            slot_load(enc, Reg::R1, slot(*base))?;
+                        } else {
+                            slot_addr(enc, Reg::R1, slot(*base))?;
+                        }
+                        narrow_store_at(enc, Reg::R0, Reg::R1, *offset + at as u32, 1)?;
                     }
                     continue;
                 }
             }
             if let Inst::FieldLoad { base, offset } = inst {
                 if let Some(MirType::ValueType { size, .. }) = func.value_type(*result) {
-                    let words = (size / 4) as u16;
+                    let full_words = (size / 4) as u16;
+                    let rem = (size % 4) as u16;
                     let ptr = is_pointer_base(&func.value_types, *base);
                     if ptr {
-                        enc.ldr_sp(Reg::R1, slot(*base))
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R1, slot(*base))?;
                     }
-                    for w in 0..words {
+                    for w in 0..full_words {
                         if ptr {
                             enc.ldr_imm(Reg::R0, Reg::R1, *offset as u16 + w * 4)
                                 .map_err(|_| LowerError::TooManyValues)?;
                         } else {
-                            enc.ldr_sp(Reg::R0, slot(*base) + *offset as u16 + w * 4)
-                                .map_err(|_| LowerError::TooManyValues)?;
+                            slot_load(enc, Reg::R0, slot(*base) + *offset as u16 + w * 4)?;
                         }
-                        enc.str_sp(Reg::R0, slot(*result) + w * 4)
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_store(enc, Reg::R0, slot(*result) + w * 4, Reg::R2)?;
+                    }
+                    for k in 0..rem {
+                        let at = full_words * 4 + k;
+                        if ptr {
+                            slot_load(enc, Reg::R1, slot(*base))?;
+                        } else {
+                            slot_addr(enc, Reg::R1, slot(*base))?;
+                        }
+                        narrow_load_at(enc, Reg::R0, Reg::R1, *offset + at as u32, 1, false)?;
+                        slot_addr(enc, Reg::R1, slot(*result))?;
+                        narrow_store_at(enc, Reg::R0, Reg::R1, at as u32, 1)?;
                     }
                     continue;
                 }
@@ -2181,8 +2356,7 @@ fn lower_spilled_into(
             if let Inst::Call { callee, args } = inst {
                 if matches!(func.value_type(*result), Some(MirType::ValueType { size, .. }) if size > 4)
                 {
-                    enc.add_sp_imm(Reg::R0, slot(*result))
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_addr(enc, Reg::R0, slot(*result))?;
                     load_call_args(enc, &func.value_types, &slot, args, 1)?;
                     if relocate {
                         enc.bl_symbol(*callee);
@@ -2201,8 +2375,7 @@ fn lower_spilled_into(
                     lamella_ir::PyOp::Getattr { name } => {
                         let support = py_support.getattr.ok_or(LowerError::CallUnsupported)?;
                         let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
-                        enc.ldr_sp(Reg::R0, slot(receiver))
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R0, slot(receiver))?;
                         load_const_word(enc, &mut pool, Reg::R1, *name)?;
                         load_const_word(enc, &mut pool, Reg::R2, *cache)?;
                         load_const_word(enc, &mut pool, Reg::R3, support)?;
@@ -2211,8 +2384,7 @@ fn lower_spilled_into(
                     lamella_ir::PyOp::Len => {
                         let support = py_support.len.ok_or(LowerError::CallUnsupported)?;
                         let x = *args.first().ok_or(LowerError::CallUnsupported)?;
-                        enc.ldr_sp(Reg::R0, slot(x))
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R0, slot(x))?;
                         load_const_word(enc, &mut pool, Reg::R1, support)?;
                         enc.blx(Reg::R1);
                     }
@@ -2220,15 +2392,11 @@ fn lower_spilled_into(
                         let support = py_support.call.ok_or(LowerError::CallUnsupported)?;
                         let callee = *args.first().ok_or(LowerError::CallUnsupported)?;
                         for (i, &arg) in args[1..].iter().enumerate() {
-                            enc.ldr_sp(Reg::R0, slot(arg))
-                                .map_err(|_| LowerError::TooManyValues)?;
-                            enc.str_sp(Reg::R0, argv_scratch_off + (i as u16) * 4)
-                                .map_err(|_| LowerError::TooManyValues)?;
+                            slot_load(enc, Reg::R0, slot(arg))?;
+                            slot_store(enc, Reg::R0, argv_scratch_off + (i as u16) * 4, Reg::R2)?;
                         }
-                        enc.ldr_sp(Reg::R0, slot(callee))
-                            .map_err(|_| LowerError::TooManyValues)?;
-                        enc.add_sp_imm(Reg::R1, argv_scratch_off)
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R0, slot(callee))?;
+                        slot_addr(enc, Reg::R1, argv_scratch_off)?;
                         load_const_word(enc, &mut pool, Reg::R2, (args.len() - 1) as u32)?;
                         load_const_word(enc, &mut pool, Reg::R3, support)?;
                         enc.blx(Reg::R3);
@@ -2237,8 +2405,7 @@ fn lower_spilled_into(
                 }
                 record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
                 if op.result_type().is_some() {
-                    enc.str_sp(Reg::R0, slot(*result))
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 }
                 continue;
             }
@@ -2279,8 +2446,7 @@ fn lower_spilled_into(
                 enc.b_cond(Cond::Ne, ok);
                 enc.udf(0);
                 enc.bind_label(ok);
-                enc.str_sp(Reg::R0, slot(*result))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
             if let Inst::AllocLike {
@@ -2290,8 +2456,7 @@ fn lower_spilled_into(
             {
                 let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
                 load_const_word(enc, &mut pool, Reg::R0, *payload_size)?;
-                enc.ldr_sp(Reg::R1, slot(*proto))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R1, slot(*proto))?;
                 enc.subs_imm8(Reg::R1, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.ldr_imm(Reg::R1, Reg::R1, 0)
@@ -2305,8 +2470,7 @@ fn lower_spilled_into(
                 enc.b_cond(Cond::Ne, ok);
                 enc.udf(0);
                 enc.bind_label(ok);
-                enc.str_sp(Reg::R0, slot(*result))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
             if let Inst::TypeDescAddr { handle } = inst {
@@ -2321,19 +2485,16 @@ fn lower_spilled_into(
                 };
                 enc.adr(Reg::R0, desc_label)
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.str_sp(Reg::R0, slot(*result))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
             if let Inst::LoadTypeDesc { object } = inst {
-                enc.ldr_sp(Reg::R0, slot(*object))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, slot(*object))?;
                 enc.subs_imm8(Reg::R0, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.ldr_imm(Reg::R0, Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.str_sp(Reg::R0, slot(*result))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
             if let Inst::AllocArray {
@@ -2352,8 +2513,7 @@ fn lower_spilled_into(
                         label
                     }
                 };
-                enc.ldr_sp(Reg::R0, slot(*length))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, slot(*length))?;
                 if *element_size != 1 {
                     if element_size.is_power_of_two() {
                         enc.lsls_imm(Reg::R0, Reg::R0, element_size.trailing_zeros() as u8)
@@ -2377,12 +2537,10 @@ fn lower_spilled_into(
                 enc.b_cond(Cond::Ne, ok);
                 enc.udf(0);
                 enc.bind_label(ok);
-                enc.ldr_sp(Reg::R1, slot(*length))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R1, slot(*length))?;
                 enc.str_imm(Reg::R1, Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.str_sp(Reg::R0, slot(*result))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
             if let Inst::AllocArray2D {
@@ -2402,10 +2560,8 @@ fn lower_spilled_into(
                         label
                     }
                 };
-                enc.ldr_sp(Reg::R0, slot(*dim0))
-                    .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R1, slot(*dim1))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, slot(*dim0))?;
+                slot_load(enc, Reg::R1, slot(*dim1))?;
                 enc.muls(Reg::R0, Reg::R1)
                     .map_err(|_| LowerError::TooManyValues)?;
                 if *element_size != 1 {
@@ -2431,16 +2587,13 @@ fn lower_spilled_into(
                 enc.b_cond(Cond::Ne, ok);
                 enc.udf(0);
                 enc.bind_label(ok);
-                enc.ldr_sp(Reg::R1, slot(*dim0))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R1, slot(*dim0))?;
                 enc.str_imm(Reg::R1, Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.ldr_sp(Reg::R1, slot(*dim1))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R1, slot(*dim1))?;
                 enc.str_imm(Reg::R1, Reg::R0, 4)
                     .map_err(|_| LowerError::TooManyValues)?;
-                enc.str_sp(Reg::R0, slot(*result))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
             if let Inst::AllocArrayMD {
@@ -2460,11 +2613,9 @@ fn lower_spilled_into(
                     }
                 };
                 let n = dims.len();
-                enc.ldr_sp(Reg::R0, slot(dims[0]))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, slot(dims[0]))?;
                 for d in &dims[1..] {
-                    enc.ldr_sp(Reg::R1, slot(*d))
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_load(enc, Reg::R1, slot(*d))?;
                     enc.muls(Reg::R0, Reg::R1)
                         .map_err(|_| LowerError::TooManyValues)?;
                 }
@@ -2492,13 +2643,11 @@ fn lower_spilled_into(
                 enc.udf(0);
                 enc.bind_label(ok);
                 for (k, d) in dims.iter().enumerate() {
-                    enc.ldr_sp(Reg::R1, slot(*d))
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_load(enc, Reg::R1, slot(*d))?;
                     enc.str_imm(Reg::R1, Reg::R0, (4 * k) as u16)
                         .map_err(|_| LowerError::TooManyValues)?;
                 }
-                enc.str_sp(Reg::R0, slot(*result))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
                 continue;
             }
             let call_pc = lower_spilled_inst(
@@ -2518,11 +2667,9 @@ fn lower_spilled_into(
             if let Some(return_pc) = call_pc {
                 record_safepoint(stack_maps, index, inst_pos, return_pc);
             }
-            enc.str_sp(Reg::R0, slot(*result))
-                .map_err(|_| LowerError::TooManyValues)?;
+            slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
             if matches!(func.value_type(*result), Some(MirType::I64 | MirType::F64)) {
-                enc.str_sp(Reg::R1, slot(*result) + 4)
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_store(enc, Reg::R1, slot(*result) + 4, Reg::R2)?;
             }
         }
         if let Some(&cil) = source_map.get(index).and_then(|b| b.last()) {
@@ -2533,24 +2680,19 @@ fn lower_spilled_into(
                 if returns_big_struct {
                     if let Some(v) = value {
                         let size = func.value_type(*v).map_or(0, MirType::stack_slot_bytes);
-                        enc.ldr_sp(Reg::R1, result_ptr_off)
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R1, result_ptr_off)?;
                         for w in 0..(size / 4) {
                             let off = (w as u16) * 4;
-                            enc.ldr_sp(Reg::R0, slot(*v) + off)
-                                .map_err(|_| LowerError::TooManyValues)?;
+                            slot_load(enc, Reg::R0, slot(*v) + off)?;
                             enc.str_imm(Reg::R0, Reg::R1, off)
                                 .map_err(|_| LowerError::TooManyValues)?;
                         }
-                        enc.ldr_sp(Reg::R0, result_ptr_off)
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R0, result_ptr_off)?;
                     }
                 } else if let Some(v) = value {
-                    enc.ldr_sp(Reg::R0, slot(*v))
-                        .map_err(|_| LowerError::TooManyValues)?;
+                    slot_load(enc, Reg::R0, slot(*v))?;
                     if matches!(func.value_type(*v), Some(MirType::I64 | MirType::F64)) {
-                        enc.ldr_sp(Reg::R1, slot(*v) + 4)
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R1, slot(*v) + 4)?;
                     }
                 }
                 enc.add_sp_far(frame).map_err(|_| LowerError::TooManyValues)?;
@@ -2572,10 +2714,8 @@ fn lower_spilled_into(
                     let bytes = func.value_type(*a).map_or(4, |t| t.stack_slot_bytes() as u16);
                     let mut off = 0u16;
                     while off < bytes {
-                        enc.ldr_sp(Reg::R0, slot(*a) + off)
-                            .map_err(|_| LowerError::TooManyValues)?;
-                        enc.str_sp(Reg::R0, slot(*p) + off)
-                            .map_err(|_| LowerError::TooManyValues)?;
+                        slot_load(enc, Reg::R0, slot(*a) + off)?;
+                        slot_store(enc, Reg::R0, slot(*p) + off, Reg::R2)?;
                         off += 4;
                     }
                 }
@@ -2600,8 +2740,7 @@ fn lower_spilled_into(
                 let false_label = *block_labels
                     .get(if_false.index())
                     .ok_or(LowerError::ControlFlowUnsupported)?;
-                enc.ldr_sp(Reg::R0, slot(*cond))
-                    .map_err(|_| LowerError::TooManyValues)?;
+                slot_load(enc, Reg::R0, slot(*cond))?;
                 enc.cmp_imm(Reg::R0, 0)
                     .map_err(|_| LowerError::TooManyValues)?;
                 enc.b_cond(Cond::Ne, true_label);
@@ -2622,8 +2761,8 @@ fn lower_spilled_into(
     }
     if !sym_pool.is_empty() {
         enc.align_to_word();
-        for (entry, func) in sym_pool {
-            enc.pool_word_symbol(entry, func);
+        for (entry, symbol, addend) in sym_pool {
+            enc.pool_word_symbol_addend(entry, symbol, addend);
         }
     }
     for (entry, text) in strings {
@@ -2824,7 +2963,11 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
         b.insts.iter().any(|(_, i)| {
             matches!(
                 i,
-                Inst::FieldLoad { .. } | Inst::FieldStore { .. } | Inst::FieldAddr { .. }
+                Inst::FieldLoad { .. }
+                | Inst::FieldStore { .. }
+                | Inst::FieldLoadNarrow { .. }
+                | Inst::FieldStoreNarrow { .. }
+                | Inst::FieldAddr { .. }
             )
         })
     }) {
@@ -2884,7 +3027,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
     let pushed = saved.count_ones() as usize * 4 + lr_bytes;
     let frame = ((pushed + mixed.spill_count as usize * 4 + 7) & !7usize) - pushed;
     if frame > 1020 {
-        return Err(LowerError::TooManyValues);
+        return Ok(Assignment::Spilled);
     }
     Ok(Assignment::Mixed {
         homes,
@@ -3553,6 +3696,182 @@ impl StackMaps {
     }
 }
 
+/// `.lamella_stackmaps` record mode: one METHOD_SLOTS record per safepoint-bearing method --
+/// `frame_words`/`ret_lr_word` give the fixed frame hop, `roots` enumerate EVERY ref-typed slot
+/// (liveness-free; sound because refs are memory-homed across safepoints and ref slots are
+/// zero-initialized at the prologue). The record layout, little-endian, word-aligned:
+///
+/// ```text
+///   u32 func_addr    (R_ARM_ABS32 -> the function symbol; bit 0 = Thumb, mask before matching)
+///   u32 code_size    (a PC matches iff func_addr <= (pc & !1) < func_addr + code_size)
+///   u16 mode         (1 = METHOD_SLOTS, 2 = STATICS)
+///   u16 frame_words  (SP delta from the stopped SP to the caller's SP, in words)
+///   u16 ret_lr_word  (word offset from the stopped SP of the saved return address)
+///   u16 root_count
+///   u16 roots[root_count]   bits[13:0] = slot WORD offset from SP, bits[15:14] = kind
+///   (pad to u32)
+/// ```
+pub const STACKMAP_MODE_METHOD_SLOTS: u16 = 1;
+/// `.lamella_stackmaps` record mode 2: GLOBAL roots in a fixed RAM region -- `func_addr` holds the
+/// region base ADDRESS (no relocation), `code_size` the region size in bytes, and each root's
+/// word offset indexes the region. Emitted once per assembly for its ref-bearing static rows.
+pub const STACKMAP_MODE_STATICS: u16 = 2;
+/// Root kind: an object reference -- points at an object header; relocate = rewrite to the moved
+/// header.
+pub const STACKMAP_KIND_OBJECT_REF: u16 = 0;
+/// Root kind: a managed (maybe-interior, maybe-non-heap) pointer -- the collector range-checks it
+/// and, when it lands in the heap, resolves the owning allocation and rebases by the move delta.
+pub const STACKMAP_KIND_MANAGED_PTR: u16 = 1;
+/// Root kind: a PINNED object reference -- the referenced object must not move while this frame is
+/// live, because the frame (a runtime seam body) derived a raw native pointer from it that a parked
+/// native callee still holds (e.g. `recv_poll`'s buffer across an Io park).
+pub const STACKMAP_KIND_PINNED: u16 = 2;
+/// Root kind: a Python tagged value -- traced only when its tag marks a heap pointer (reserved on
+/// the C# lane; the Python lowering's `PyValue` slots take it).
+pub const STACKMAP_KIND_TAGGED: u16 = 3;
+
+/// The runtime-support seams a green thread can be switched away inside (or a collection can run
+/// inside): the ANCHOR-writing externs. A frame that passes a `RefToInt`-derived raw pointer into
+/// one of these can be parked there arbitrarily long, so the source ObjectRef's slot is emitted
+/// [`STACKMAP_KIND_PINNED`]. This list mirrors the anchor shims in `tools/runtime-support` (the
+/// two are welded by the walk contract, not by code -- keep them in step).
+const ANCHOR_SEAM_EXTERNS: &[&str] = &[
+    "lamella_thread_yield",
+    "lamella_thread_join",
+    "lamella_thread_sleep",
+    "lamella_thread_connect_poll",
+    "lamella_thread_accept_poll",
+    "lamella_thread_send_poll",
+    "lamella_thread_recv_poll",
+    "lamella_gc_alloc",
+    "lamella_monitor_enter",
+    "lamella_monitor_wait",
+    "lamella_string_substring",
+    "lamella_char_to_string",
+    "lamella_double_to_string",
+    "lamella_gc_walk_roots",
+    "lamella_gc_count_roots",
+];
+
+/// One assembly's static region as the OBJECT path emits it (#15): the linker-placed region
+/// symbol's identity, its byte size, and its GLOBAL-roots (mode 2) stack-map record rows. The
+/// region has NO fixed address -- every `ldsfld`/`stsfld` and the record's base word carry
+/// relocations against `__lamella_statics_<suffix>`, and `lamella-link` places the region in a RAM
+/// window and defines the symbol. The record's `func_addr` word is therefore emitted 0 + reloc
+/// (exactly like a method record's), so the walker reads the LINKED base with no format change.
+#[derive(Debug, Clone, Default)]
+pub struct AssemblyStatics {
+    /// The assembly-identity suffix both symbol names derive from: EIGHT lowercase hex digits
+    /// (fnv1a32 of the assembly's CIL bytes -- the same hash that prefixes a library object's
+    /// internal `L<hash>.f<rid>` symbols). The linker's region matcher REQUIRES the 8-hex shape.
+    pub suffix: alloc::string::String,
+    /// The region's size in bytes: `(1 + static field count) * 4` -- word 0 is the reserved
+    /// EH-marker slot (dense slots start at 1), present in EVERY region so the entry assembly's
+    /// word 0 can serve as the shared `__lamella_eh_tag` home.
+    pub region_bytes: u32,
+    /// Root entries, encoded exactly like a method record's: word offset | kind << 14.
+    pub roots: Vec<u16>,
+}
+
+impl AssemblyStatics {
+    /// The RAM region symbol the linker defines (`__lamella_statics_<suffix>`).
+    #[must_use]
+    pub fn region_symbol(&self) -> alloc::string::String {
+        alloc::format!("{}{}", lamella_elf::STATICS_BASE_PREFIX, self.suffix)
+    }
+
+    /// The mode-2 statics record's data symbol (`__lamella_smstat_<suffix>`).
+    #[must_use]
+    pub fn record_symbol(&self) -> alloc::string::String {
+        alloc::format!("{}{}", lamella_elf::STACKMAP_STATICS_PREFIX, self.suffix)
+    }
+}
+
+/// Encodes one `.lamella_stackmaps` record (see [`STACKMAP_MODE_METHOD_SLOTS`] for the layout).
+/// The `func_addr` word is emitted 0 for a method record -- the R_ARM_ABS32 relocation the caller
+/// registers patches it -- and holds the region base for a statics record.
+fn encode_stackmap_record(
+    out: &mut Vec<u8>,
+    func_addr: u32,
+    code_size: u32,
+    mode: u16,
+    frame_words: u16,
+    ret_lr_word: u16,
+    roots: &[u16],
+) {
+    out.extend_from_slice(&func_addr.to_le_bytes());
+    out.extend_from_slice(&code_size.to_le_bytes());
+    out.extend_from_slice(&mode.to_le_bytes());
+    out.extend_from_slice(&frame_words.to_le_bytes());
+    out.extend_from_slice(&ret_lr_word.to_le_bytes());
+    out.extend_from_slice(&(roots.len() as u16).to_le_bytes());
+    for &root in roots {
+        out.extend_from_slice(&root.to_le_bytes());
+    }
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+}
+
+/// The values whose slots must be emitted [`STACKMAP_KIND_PINNED`]: ObjectRefs a `RefToInt` derives
+/// a raw pointer from, in a function that `CallNative`s an anchor seam (see
+/// [`ANCHOR_SEAM_EXTERNS`]). Anywhere else a raw derived pointer cannot outlive a collection --
+/// on the cooperative tier a collection only runs inside those seams.
+fn pinned_values(func: &Function, externs: &[alloc::string::String]) -> Vec<bool> {
+    let mut pinned = alloc::vec![false; func.value_types.len()];
+    let parks_or_allocates = func.blocks.iter().any(|b| {
+        b.insts.iter().any(|(_, i)| {
+            matches!(i, Inst::CallNative { symbol, .. }
+                if externs
+                    .get(*symbol as usize)
+                    .is_some_and(|n| ANCHOR_SEAM_EXTERNS.contains(&n.as_str())))
+        })
+    });
+    if !parks_or_allocates {
+        return pinned;
+    }
+    for block in &func.blocks {
+        for (_, inst) in &block.insts {
+            if let Inst::Convert {
+                value,
+                kind: lamella_ir::ConvKind::RefToInt,
+            } = inst
+            {
+                if func.value_type(*value) == Some(MirType::ObjectRef) {
+                    pinned[value.index()] = true;
+                }
+            }
+        }
+    }
+    pinned
+}
+
+/// The METHOD_SLOTS root list for one lowered function: on the fully-spilled path, EVERY ref-typed
+/// value's slot (each value has its own slot there, so enumeration is complete by construction);
+/// on the Registers/Mixed paths, EMPTY -- `prepare` forces the Spilled path whenever any value is
+/// live across a safepoint (`any_value_live_across_call`), so a Registers/Mixed frame provably
+/// holds no live reference at any PC a stack walk can observe it at. The record still matters for
+/// those frames: its `frame_words`/`ret_lr_word` carry the walk PAST them.
+fn method_record_roots(func: &Function, externs: &[alloc::string::String]) -> Vec<u16> {
+    if !matches!(prepare(func), Ok(Assignment::Spilled)) {
+        return Vec::new();
+    }
+    let (offsets, _) = spilled_slot_offsets(func);
+    let pinned = pinned_values(func, externs);
+    let mut roots = Vec::new();
+    for (v, ty) in func.value_types.iter().enumerate() {
+        let kind = match ty {
+            MirType::ObjectRef if pinned[v] => STACKMAP_KIND_PINNED,
+            MirType::ObjectRef => STACKMAP_KIND_OBJECT_REF,
+            MirType::ManagedPtr => STACKMAP_KIND_MANAGED_PTR,
+            MirType::PyValue => STACKMAP_KIND_TAGGED,
+            _ => continue,
+        };
+        roots.push((offsets[v] / 4) | (kind << 14));
+    }
+    roots
+}
+
 /// Lowers a single function to ARM32 machine code. A function that calls another
 /// must go through [`lower_module`], which resolves the call targets.
 pub fn lower(func: &Function) -> Result<Vec<u8>, LowerError> {
@@ -3744,9 +4063,77 @@ const DESC_SYMBOL_FLAG: u32 = 0x4000_0000;
 /// `finish`'s literal islanding instead of hard-erroring. Program objects only -- a library's blob symbols
 /// would collide across a link (the assembly-unique-prefix fix descriptors also await is deferred).
 const STRING_SYMBOL_FLAG: u32 = 0x2000_0000;
+/// A backend symbol standing for a STATIC-REGION base (`__lamella_statics_<asmhash>`, see
+/// `lamella_elf::STATICS_BASE_PREFIX`) -- an object-path `ldsfld`/`stsfld` pool word references
+/// one with addend = the field's dense slot offset, and `lamella-link` places every referenced
+/// region in RAM and defines the symbols. The low bits say WHOSE region: 0 = this assembly's own;
+/// k+1 = the region of reference ordinal k (a cross-assembly static, resolved to the OWNER's
+/// hash-qualified symbol via [`DescQualifiers::references`] -- the owner's own numbering, so both
+/// sides address the same slots). Bit 28, distinct from the flags above; the payload stays under
+/// bit 24, so the top-byte test in the relocation loop cannot alias a DESC value's TypeSpec bits.
+const STATICS_BASE_SYMBOL_FLAG: u32 = 0x1000_0000;
+/// A backend symbol standing for the ONE VES-global in-flight exception word
+/// (`lamella_elf::EH_TAG_SYMBOL`). Every assembly's throw/catch lowering references the SAME symbol
+/// -- the split that keeps a corlib `throw` visible to a program `catch` (a per-region row 0 would
+/// silently break EH across assemblies). No payload bits. Bit 27, distinct from the flags above.
+const EH_TAG_SYMBOL_FLAG: u32 = 0x0800_0000;
 /// The name prefix of a deduplicated string-literal blob symbol. Backend-only (unlike `TYPE_DESC_PREFIX`
 /// the linker never special-cases it: `trim_object` keeps a reached non-descriptor data symbol already).
 const STR_BLOB_PREFIX: &str = "__lamella_str_";
+
+/// How descriptor SYMBOLS qualify by their OWNING assembly -- the N-reference identity scheme.
+/// A build's OWN descriptors take `own` (a library passes its fnv1a32 hash, the same identity its
+/// `L<hash>.` function prefix and `__lamella_statics_<hash>` region use; a program stays
+/// unqualified); a REFERENCE-owned handle (see [`crate::resolver::REFERENCE_HANDLE_TABLE`]) takes
+/// `references[ordinal]`. Both sides of one type thus emit the SAME symbol (the program's strong
+/// synthesized copy dedupes against the library's weak own copy, identity-by-address preserved),
+/// while two DIFFERENT types can never share one -- the raw-token collision (a program's row N vs
+/// corlib's row N, e.g. corlib's internal `new object()` vs any program's first allocated class)
+/// is retired.
+#[derive(Default)]
+pub struct DescQualifiers {
+    /// The fnv1a32 hash (8 lowercase hex) qualifying THIS build's own descriptors; `None` = the
+    /// program convention (plain `__lamella_typedesc_<token>`).
+    pub own: Option<alloc::string::String>,
+    /// Ordinal-indexed reference hashes, exactly the resolver's reference order.
+    pub references: alloc::vec::Vec<alloc::string::String>,
+}
+
+/// The mode an object build runs in -- program vs library, strict vs deferring, plus the
+/// descriptor-identity qualifiers -- bundled so the emit pipeline's signatures stay flat.
+pub struct ObjectBuildMode<'a> {
+    /// Emit the `lamella_main` entry symbol (a program); `false` = a library object.
+    pub emit_entry: bool,
+    /// A program that DEFERS un-lowerable/un-encodable bodies to traps instead of failing.
+    pub defer_encode: bool,
+    /// The descriptor-identity qualifiers (see [`DescQualifiers`]).
+    pub qualifiers: &'a DescQualifiers,
+    /// Relax a far reference to its wide Thumb-2 form (`B.W`/`ADR.W`) rather than hard-erroring at
+    /// the ARMv6-M reach -- set for a Mainline (M33) target object build (see
+    /// [`Encoder::set_wide_thumb2`]). `false` (an ARMv6-M target) keeps every path byte-identical,
+    /// since the widen fires only for an out-of-reach ref.
+    pub wide: bool,
+}
+
+/// The canonical symbol for `handle`'s descriptor under `qualifiers` (see [`DescQualifiers`]).
+/// A reference-owned handle names the OWNER's token, so the symbol matches what the owning
+/// library's own build emits. Panics on a reference handle with no attached hash -- that is a
+/// build wiring bug, never a program's fault.
+fn descriptor_symbol(handle: u32, qualifiers: &DescQualifiers) -> alloc::string::String {
+    if let Some((ordinal, owner_token)) =
+        crate::resolver::reference_handle_parts(lamella_ir::TypeHandle(handle))
+    {
+        let hash = qualifiers
+            .references
+            .get(ordinal)
+            .unwrap_or_else(|| panic!("reference ordinal {ordinal} has no descriptor qualifier"));
+        alloc::format!("{}{}_{}", lamella_elf::TYPE_DESC_PREFIX, hash, owner_token)
+    } else if let Some(own) = &qualifiers.own {
+        alloc::format!("{}{}_{}", lamella_elf::TYPE_DESC_PREFIX, own, handle)
+    } else {
+        alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle)
+    }
+}
 
 /// The `__aeabi_*` soft-float helper for a float arithmetic `Binary` op, keyed by the operand type;
 /// `None` for an integer op (a different type) or a non-arithmetic op. ARM AAPCS soft-float passes
@@ -4265,7 +4652,9 @@ pub fn lower_object(
     names: &[&str],
     extern_syms: &[&str],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_object_inner(funcs, names, extern_syms, &[], true)
+    let mode =
+        ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
+    lower_object_inner(funcs, names, extern_syms, &[], None, &mode).map(|(bytes, _)| bytes)
 }
 
 /// As [`lower_object`], but also emitting per-type VTABLES/TypeDescs from `descriptors` (the resolver's
@@ -4279,7 +4668,46 @@ pub fn lower_object_vtables(
     extern_syms: &[&str],
     descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_object_inner(funcs, names, extern_syms, descriptors, true)
+    let mode =
+        ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
+    lower_object_inner(funcs, names, extern_syms, descriptors, None, &mode).map(|(bytes, _)| bytes)
+}
+
+/// As [`lower_object_vtables`], but also emitting the assembly's GLOBAL-roots statics record
+/// (mode 2) into the object's `.lamella_stackmaps` records AND resolving the object's statics
+/// accesses against its region symbol -- the build path passes the dense ref-bearing rows it read
+/// from metadata, so the collector's root walk covers statics wherever the linker places them.
+pub fn lower_object_vtables_statics(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+    statics: &AssemblyStatics,
+    qualifiers: &DescQualifiers,
+) -> Result<Vec<u8>, LowerError> {
+    let mode = ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers, wide: false };
+    lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode)
+        .map(|(bytes, _)| bytes)
+}
+
+/// As [`lower_object_vtables_statics`], but DEFERRING instead of failing: a program method whose
+/// body does not lower or whose inclusion overflows an object-scale encoding reach is emitted as
+/// a `udf #0` trap (NEVER the library path's truthy `bx lr` -- a reached deferred method must
+/// fail LOUD at its exact call site, and an unreached one is `--gc-sections` fodder), and the
+/// stub report says which and why. The single-assembly device-demo bake (app + BSP +
+/// System.Device sources in one program assembly) is the customer: library-grade surface rides
+/// along that the program never calls.
+pub fn lower_object_vtables_statics_report(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+    statics: &AssemblyStatics,
+    qualifiers: &DescQualifiers,
+    wide: bool,
+) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
+    let mode = ObjectBuildMode { emit_entry: true, defer_encode: true, qualifiers, wide };
+    lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode)
 }
 
 /// As [`lower_object`], but for a LIBRARY object with no entry point: it omits the `lamella_main` entry
@@ -4290,7 +4718,30 @@ pub fn lower_object_library(
     names: &[&str],
     extern_syms: &[&str],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_object_inner(funcs, names, extern_syms, &[], false)
+    let mode =
+        ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
+    lower_object_inner(funcs, names, extern_syms, &[], None, &mode).map(|(bytes, _)| bytes)
+}
+
+/// As [`lower_object_library_vtables`], but also returning the STUB REPORT: every function the
+/// library build emitted as a bare `bx lr` instead of a body, as `(function index, why)` -- a
+/// per-method dry-run lowering failure carries its [`LowerError`]; a fixpoint stub (the method
+/// lowered but the whole object could not encode with it in) carries [`LowerError::CodeTooLarge`].
+/// The object bytes are IDENTICAL to [`lower_object_library_vtables`]'s -- the report is
+/// observation, not behavior. This is the (4b) tooling seam: a `bx lr` stub silently returns its
+/// first argument, so knowing the stub set is what separates a stubbed method from a vtable slot
+/// bug when a call misbehaves.
+pub fn lower_object_library_vtables_report(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+    statics: Option<&AssemblyStatics>,
+    qualifiers: &DescQualifiers,
+    wide: bool,
+) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
+    let mode = ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers, wide };
+    lower_object_inner(funcs, names, extern_syms, descriptors, statics, &mode)
 }
 
 /// As [`lower_object_library`], but emitting per-type vtables/TypeDescs from `descriptors` -- so a corlib
@@ -4302,7 +4753,9 @@ pub fn lower_object_library_vtables(
     extern_syms: &[&str],
     descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
-    lower_object_inner(funcs, names, extern_syms, descriptors, false)
+    let mode =
+        ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
+    lower_object_inner(funcs, names, extern_syms, descriptors, None, &mode).map(|(bytes, _)| bytes)
 }
 
 /// Verifies, prepares, and emits ONE function into `enc`. Extracted so a library object can DRY-RUN a
@@ -4366,8 +4819,9 @@ fn lower_object_inner(
     names: &[&str],
     extern_syms: &[&str],
     descriptors: &[TypeMeta],
-    emit_entry: bool,
-) -> Result<Vec<u8>, LowerError> {
+    statics_record: Option<&AssemblyStatics>,
+    mode: &ObjectBuildMode,
+) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
     let mut externs: Vec<alloc::string::String> = extern_syms.iter().map(|s| (*s).into()).collect();
     let mut program = funcs.to_vec();
     crate::stringgen::lower_string_concat(&mut program);
@@ -4386,8 +4840,20 @@ fn lower_object_inner(
     let funcs = funcs.as_slice();
     let mut stubbed: alloc::collections::BTreeSet<usize> = alloc::collections::BTreeSet::new();
     loop {
-        match emit_object_pass(funcs, names, &externs, descriptors, emit_entry, &stubbed)? {
-            PassOutcome::Object(bytes) => return Ok(bytes),
+        match emit_object_pass(
+            funcs,
+            names,
+            &externs,
+            descriptors,
+            statics_record,
+            &stubbed,
+            mode,
+        )? {
+            PassOutcome::Object(bytes, mut stub_report) => {
+                stub_report.extend(stubbed.iter().map(|&i| (i, LowerError::CodeTooLarge)));
+                stub_report.sort_by_key(|&(i, _)| i);
+                return Ok((bytes, stub_report));
+            }
             PassOutcome::StubAndRetry(index) => {
                 stubbed.insert(index);
             }
@@ -4395,13 +4861,18 @@ fn lower_object_inner(
     }
 }
 
-/// One outcome of [`emit_object_pass`]: either the finished object bytes, or -- for a library -- the
-/// index of a method that lowered but made the whole object exceed a Thumb-1 encoding reach, so the
-/// driver stubs it and rebuilds.
+/// One outcome of [`emit_object_pass`]: either the finished object bytes plus the pass's stub
+/// report -- each `(function index, why)` the pass emitted as a bare `bx lr` because its body
+/// failed the per-method dry run -- or, for a library, the index of a method that lowered but made
+/// the whole object exceed a Thumb-1 encoding reach, so the driver stubs it and rebuilds.
 enum PassOutcome {
-    Object(Vec<u8>),
+    Object(Vec<u8>, LibraryStubReport),
     StubAndRetry(usize),
 }
+
+/// A library build's stub report: each function the build emitted as a bare `bx lr` instead of a
+/// body, as `(function index, the lowering error that forced it)`.
+pub type LibraryStubReport = Vec<(usize, LowerError)>;
 
 /// Emits ONE object from the already-lowered `funcs`: every function, then the canonical per-type
 /// descriptors, then `finish`. `stubbed` names functions to emit as a bare `bx lr` (a prior pass found
@@ -4413,10 +4884,13 @@ fn emit_object_pass(
     names: &[&str],
     externs: &[alloc::string::String],
     descriptors: &[TypeMeta],
-    emit_entry: bool,
+    statics_record: Option<&AssemblyStatics>,
     stubbed: &alloc::collections::BTreeSet<usize>,
+    mode: &ObjectBuildMode,
 ) -> Result<PassOutcome, LowerError> {
+    let (emit_entry, defer_encode, qualifiers) = (mode.emit_entry, mode.defer_encode, mode.qualifiers);
     let mut enc = Encoder::new();
+    enc.set_wide_thumb2(mode.wide);
     let func_labels: Vec<Label> = funcs.iter().map(|_| enc.new_label()).collect();
     let mut stack_maps: Vec<StackMapEntry> = Vec::new();
     let string_table: Vec<Box<[u16]>> = if emit_entry {
@@ -4437,27 +4911,42 @@ fn emit_object_pass(
         Vec::new()
     };
     let blob_table: Option<&[Box<[u16]>]> = emit_entry.then_some(string_table.as_slice());
+    let mut map_ranges: Vec<(usize, usize)> = Vec::with_capacity(funcs.len());
+    let mut stub_report: LibraryStubReport = Vec::new();
     for (index, func) in funcs.iter().enumerate() {
         enc.align_to_word();
         enc.bind_label(func_labels[index]);
-        if emit_entry {
+        let map_start = stack_maps.len();
+        if emit_entry && !defer_encode {
             lower_one_func(func, &mut enc, &func_labels, &mut stack_maps, blob_table)?;
         } else if stubbed.contains(&index) {
-            enc.bx(Reg::LR);
+            if emit_entry {
+                enc.udf(0);
+            } else {
+                enc.bx(Reg::LR);
+            }
         } else {
             let mut scratch = Encoder::new();
             let scratch_labels: Vec<Label> =
                 (0..funcs.len()).map(|_| scratch.new_label()).collect();
             let mut scratch_maps = Vec::new();
-            if lower_one_func(func, &mut scratch, &scratch_labels, &mut scratch_maps, blob_table)
-                .is_ok()
+            match lower_one_func(func, &mut scratch, &scratch_labels, &mut scratch_maps, blob_table)
             {
-                lower_one_func(func, &mut enc, &func_labels, &mut stack_maps, blob_table)
-                    .expect("a method that lowered in the dry run lowers for real");
-            } else {
-                enc.bx(Reg::LR);
+                Ok(()) => {
+                    lower_one_func(func, &mut enc, &func_labels, &mut stack_maps, blob_table)
+                        .expect("a method that lowered in the dry run lowers for real");
+                }
+                Err(error) => {
+                    stub_report.push((index, error));
+                    if emit_entry {
+                        enc.udf(0);
+                    } else {
+                        enc.bx(Reg::LR);
+                    }
+                }
             }
         }
+        map_ranges.push((map_start, stack_maps.len()));
     }
     let code_end_label = enc.new_label();
     enc.bind_label(code_end_label);
@@ -4583,7 +5072,7 @@ fn emit_object_pass(
         }
         str_syms.push((label, enc.position() - start));
     }
-    let assembled = if emit_entry {
+    let assembled = if emit_entry && !defer_encode {
         enc.finish().map_err(|_| LowerError::CodeTooLarge)?
     } else {
         let probe = enc.clone();
@@ -4617,9 +5106,52 @@ fn emit_object_pass(
     let code_end = assembled
         .label_position(code_end_label)
         .unwrap_or(assembled.bytes.len() as u32);
-    for entry in &mut stack_maps {
-        entry.return_pc = assembled.label_position_by_id(entry.return_pc).unwrap_or(0);
+    let mut method_records: Vec<(usize, u32, u16, u16, Vec<u16>)> = Vec::new();
+    for (i, &(start, end)) in map_ranges.iter().enumerate() {
+        if start == end {
+            continue;
+        }
+        let frame_size = stack_maps[start].frame_size;
+        let saved_bytes = stack_maps[start].saved_bytes;
+        debug_assert!(
+            stack_maps[start..end]
+                .iter()
+                .all(|e| e.frame_size == frame_size && e.saved_bytes == saved_bytes),
+            "a function's frame constants are fixed by its one prologue"
+        );
+        let frame_words = (frame_size + saved_bytes) / 4;
+        let ret_lr_word = frame_words - 1;
+        let end_off = offsets.get(i + 1).copied().unwrap_or(code_end);
+        let code_size = end_off - offsets[i];
+        let roots = method_record_roots(&funcs[i], externs);
+        method_records.push((i, code_size, frame_words, ret_lr_word, roots));
     }
+    let smrec_names: Vec<alloc::string::String> = method_records
+        .iter()
+        .map(|&(i, ..)| alloc::format!("{}{}", lamella_elf::STACKMAP_RECORD_PREFIX, names[i]))
+        .collect();
+    let smstat_name = statics_record.map(AssemblyStatics::record_symbol);
+    let region_name = statics_record.map(AssemblyStatics::region_symbol);
+    let mut ref_region_ordinals: Vec<u32> = assembled
+        .relocs
+        .iter()
+        .filter(|r| r.symbol >> 24 == STATICS_BASE_SYMBOL_FLAG >> 24)
+        .map(|r| r.symbol & 0x00ff_ffff)
+        .filter(|&payload| payload != 0)
+        .map(|payload| payload - 1)
+        .collect();
+    ref_region_ordinals.sort_unstable();
+    ref_region_ordinals.dedup();
+    let ref_region_names: Vec<alloc::string::String> = ref_region_ordinals
+        .iter()
+        .map(|&ordinal| {
+            let hash = qualifiers
+                .references
+                .get(ordinal as usize)
+                .unwrap_or_else(|| panic!("reference ordinal {ordinal} has no statics qualifier"));
+            alloc::format!("{}{}", lamella_elf::STATICS_BASE_PREFIX, hash)
+        })
+        .collect();
     let desc_positions: Vec<u32> = desc_syms
         .iter()
         .map(|(_, label, ..)| assembled.label_position(*label).unwrap_or(0))
@@ -4652,6 +5184,50 @@ fn emit_object_pass(
             section: lamella_elf::SymbolSection::Undefined,
         });
     }
+    let statics_base_index = region_name.as_ref().map(|name| {
+        let index = symbols.len() as u32;
+        symbols.push(lamella_elf::Symbol {
+            name: name.as_str(),
+            value: 0,
+            size: statics_record.map_or(0, |s| s.region_bytes),
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Undefined,
+        });
+        index
+    });
+    let ref_region_index: alloc::collections::BTreeMap<u32, u32> = ref_region_ordinals
+        .iter()
+        .zip(&ref_region_names)
+        .map(|(&ordinal, name)| {
+            let index = symbols.len() as u32;
+            symbols.push(lamella_elf::Symbol {
+                name: name.as_str(),
+                value: 0,
+                size: 0,
+                binding: lamella_elf::Binding::Global,
+                kind: lamella_elf::SymbolType::NoType,
+                section: lamella_elf::SymbolSection::Undefined,
+            });
+            (ordinal, index)
+        })
+        .collect();
+    let eh_tag_index = assembled
+        .relocs
+        .iter()
+        .any(|r| r.symbol == EH_TAG_SYMBOL_FLAG)
+        .then(|| {
+            let index = symbols.len() as u32;
+            symbols.push(lamella_elf::Symbol {
+                name: lamella_elf::EH_TAG_SYMBOL,
+                value: 0,
+                size: 0,
+                binding: lamella_elf::Binding::Global,
+                kind: lamella_elf::SymbolType::NoType,
+                section: lamella_elf::SymbolSection::Undefined,
+            });
+            index
+        });
     if emit_entry {
         if let Some(&entry_off) = offsets.first() {
             symbols.push(lamella_elf::Symbol {
@@ -4666,7 +5242,7 @@ fn emit_object_pass(
     }
     let desc_names: Vec<alloc::string::String> = desc_syms
         .iter()
-        .map(|(h, ..)| alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, h))
+        .map(|(h, ..)| descriptor_symbol(*h, qualifiers))
         .collect();
     let mut desc_index: alloc::collections::BTreeMap<u32, (u32, i32)> =
         alloc::collections::BTreeMap::new();
@@ -4708,13 +5284,24 @@ fn emit_object_pass(
     for r in &assembled.relocs {
         let (kind, addend) = match r.kind {
             lamella_asm_arm32::RelocKind::ThumbCall => (lamella_elf::arm::R_ARM_THM_CALL, -4),
-            lamella_asm_arm32::RelocKind::Abs32 => (lamella_elf::arm::R_ARM_ABS32, 0),
+            lamella_asm_arm32::RelocKind::Abs32 => (lamella_elf::arm::R_ARM_ABS32, r.addend),
             lamella_asm_arm32::RelocKind::RelDesc32 => {
                 (lamella_elf::arm::R_LAMELLA_REL_DESC, r.addend)
             }
             _ => return Err(LowerError::CallUnsupported),
         };
-        let (symbol, final_addend) = if r.symbol & EXTERN_SYMBOL_FLAG != 0 {
+        let (symbol, final_addend) = if r.symbol >> 24 == STATICS_BASE_SYMBOL_FLAG >> 24 {
+            let index = match r.symbol & 0x00ff_ffff {
+                0 => statics_base_index.ok_or(LowerError::CallUnsupported)?,
+                payload => *ref_region_index
+                    .get(&(payload - 1))
+                    .expect("the reference-region scan saw this relocation"),
+            };
+            (index, addend)
+        } else if r.symbol == EH_TAG_SYMBOL_FLAG {
+            let index = eh_tag_index.expect("the eh-tag scan saw this relocation");
+            (index, addend)
+        } else if r.symbol & EXTERN_SYMBOL_FLAG != 0 {
             (funcs.len() as u32 + (r.symbol & !EXTERN_SYMBOL_FLAG), addend)
         } else if r.symbol & DESC_SYMBOL_FLAG != 0 {
             let (index, vtable_bytes) = desc_index[&(r.symbol & !DESC_SYMBOL_FLAG)];
@@ -4753,12 +5340,78 @@ fn emit_object_pass(
             section: lamella_elf::SymbolSection::Text,
         });
     }
-    Ok(PassOutcome::Object(lamella_elf::write_relocatable_object(
-        lamella_elf::Machine::Arm,
-        &text,
-        &symbols,
-        &relocations,
-    )))
+    for (rec_index, &(i, code_size, frame_words, ret_lr_word, ref roots)) in
+        method_records.iter().enumerate()
+    {
+        while text.len() % 4 != 0 {
+            text.push(0);
+        }
+        let rec_offset = text.len() as u32;
+        encode_stackmap_record(
+            &mut text,
+            0,
+            code_size,
+            STACKMAP_MODE_METHOD_SLOTS,
+            frame_words,
+            ret_lr_word,
+            roots,
+        );
+        symbols.push(lamella_elf::Symbol {
+            name: smrec_names[rec_index].as_str(),
+            value: rec_offset,
+            size: text.len() as u32 - rec_offset,
+            binding: lamella_elf::Binding::Weak,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        });
+        relocations.push(lamella_elf::Relocation {
+            offset: rec_offset,
+            symbol: i as u32,
+            kind: lamella_elf::arm::R_ARM_ABS32,
+            addend: 0,
+        });
+    }
+    if let Some(statics) = statics_record {
+        while text.len() % 4 != 0 {
+            text.push(0);
+        }
+        let rec_offset = text.len() as u32;
+        encode_stackmap_record(
+            &mut text,
+            0,
+            statics.region_bytes,
+            STACKMAP_MODE_STATICS,
+            0,
+            0,
+            &statics.roots,
+        );
+        symbols.push(lamella_elf::Symbol {
+            name: smstat_name
+                .as_deref()
+                .expect("a statics record derives its symbol name"),
+            value: rec_offset,
+            size: text.len() as u32 - rec_offset,
+            binding: lamella_elf::Binding::Weak,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        });
+        relocations.push(lamella_elf::Relocation {
+            offset: rec_offset,
+            symbol: statics_base_index
+                .expect("a statics record appends its region symbol"),
+            kind: lamella_elf::arm::R_ARM_ABS32,
+            addend: 0,
+        });
+    }
+    Ok(PassOutcome::Object(
+        lamella_elf::write_relocatable_object(
+            lamella_elf::Machine::Arm,
+            &text,
+            &symbols,
+            &relocations,
+        ),
+        stub_report,
+    ))
 }
 
 /// Lowers a whole multi-method program WITH debug line tables -- the module variant of [`lower_debug`].
@@ -4915,6 +5568,40 @@ mod tests {
             }],
         };
         assert_eq!(lower(&func).unwrap(), vec![0x2A, 0x20, 0x70, 0x47]);
+    }
+
+    #[test]
+    fn descriptor_symbols_qualify_by_owner() {
+        let plain = DescQualifiers::default();
+        assert_eq!(
+            descriptor_symbol(0x0200_0005, &plain),
+            "__lamella_typedesc_33554437"
+        );
+        let lib = DescQualifiers {
+            own: Some("0bd4d82a".into()),
+            references: alloc::vec::Vec::new(),
+        };
+        assert_eq!(
+            descriptor_symbol(0x0200_0005, &lib),
+            "__lamella_typedesc_0bd4d82a_33554437"
+        );
+        let handle = (crate::resolver::REFERENCE_HANDLE_TABLE << 24) | (1 << 20) | 5;
+        let refs = DescQualifiers {
+            own: None,
+            references: alloc::vec!["aaaaaaaa".into(), "0bd4d82a".into()],
+        };
+        assert_eq!(
+            descriptor_symbol(handle, &refs),
+            "__lamella_typedesc_0bd4d82a_33554437"
+        );
+        assert_eq!(
+            crate::resolver::reference_handle_parts(lamella_ir::TypeHandle(handle)),
+            Some((1, 0x0200_0005))
+        );
+        assert_eq!(
+            crate::resolver::reference_handle_parts(lamella_ir::TypeHandle(0x0200_0005)),
+            None
+        );
     }
 
     #[test]
@@ -5278,6 +5965,52 @@ mod tests {
         };
         assert!(lamella_ir::verify(&func).is_ok());
         assert!(lower(&func).is_ok());
+    }
+
+    #[test]
+    fn a_sub_word_struct_field_copies_width_exact() {
+        let flag = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 1,
+        };
+        let func = Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, flag, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (ValueId(1), Inst::FieldLoad { base: ValueId(0), offset: 0 }),
+                    (
+                        ValueId(2),
+                        Inst::FieldStore {
+                            base: ValueId(0),
+                            offset: 0,
+                            value: ValueId(1),
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(3)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let bytes = lower(&func).unwrap();
+        assert!(
+            bytes.windows(2).any(|w| w[1] & 0xF8 == 0x70),
+            "the sub-word field store goes through STRB"
+        );
+        assert!(
+            bytes.windows(2).any(|w| w[1] & 0xF8 == 0x78),
+            "the sub-word field load goes through LDRB"
+        );
     }
 
     #[test]
@@ -7095,9 +7828,10 @@ mod tests {
         let answer_sym = obj.symbols.iter().find(|s| s.name == "answer").unwrap();
         assert_eq!(main_sym.value & 1, 1, "main is a Thumb function");
         assert_eq!(answer_sym.value & 1, 1, "answer is a Thumb function");
-        assert_eq!(obj.relocations.len(), 1);
-        assert_eq!(obj.relocations[0].kind, lamella_elf::arm::R_ARM_THM_CALL);
-        assert_eq!(obj.relocations[0].addend, -4);
+        let code = code_relocations(&obj);
+        assert_eq!(code.len(), 1);
+        assert_eq!(code[0].kind, lamella_elf::arm::R_ARM_THM_CALL);
+        assert_eq!(code[0].addend, -4);
     }
 
     #[test]
@@ -7157,10 +7891,10 @@ mod tests {
         let obj_bytes =
             lower_object(&[main, answer], &["main", "answer"], &[]).expect("lower_object");
         let obj = lamella_elf::read_object(&obj_bytes).unwrap();
-        assert_eq!(obj.relocations.len(), 2);
+        let code = code_relocations(&obj);
+        assert_eq!(code.len(), 2);
         assert!(
-            obj.relocations
-                .iter()
+            code.iter()
                 .all(|r| r.kind == lamella_elf::arm::R_ARM_THM_CALL && r.addend == -4)
         );
     }
@@ -7210,8 +7944,9 @@ mod tests {
             &lower_object(&[main, answer], &["main", "answer"], &[]).expect("lower_object"),
         )
         .unwrap();
-        assert_eq!(obj.relocations.len(), 1);
-        assert_eq!(obj.relocations[0].kind, lamella_elf::arm::R_ARM_ABS32);
+        let code = code_relocations(&obj);
+        assert_eq!(code.len(), 1);
+        assert_eq!(code[0].kind, lamella_elf::arm::R_ARM_ABS32);
     }
 
     #[test]
@@ -7253,9 +7988,10 @@ mod tests {
             .unwrap();
         let cadd = obj.symbols.iter().find(|s| s.name == "cadd").unwrap();
         assert!(!cadd.defined, "the extern symbol is undefined");
-        assert_eq!(obj.relocations.len(), 1);
-        assert_eq!(obj.relocations[0].kind, lamella_elf::arm::R_ARM_THM_CALL);
-        assert_eq!(obj.symbols[obj.relocations[0].symbol as usize].name, "cadd");
+        let code = code_relocations(&obj);
+        assert_eq!(code.len(), 1);
+        assert_eq!(code[0].kind, lamella_elf::arm::R_ARM_THM_CALL);
+        assert_eq!(obj.symbols[code[0].symbol as usize].name, "cadd");
     }
 
     #[test]
@@ -7353,11 +8089,9 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "__aeabi_fadd" && !s.defined)
         );
-        assert_eq!(obj.relocations.len(), 1);
-        assert_eq!(
-            obj.symbols[obj.relocations[0].symbol as usize].name,
-            "__aeabi_fadd"
-        );
+        let code = code_relocations(&obj);
+        assert_eq!(code.len(), 1);
+        assert_eq!(obj.symbols[code[0].symbol as usize].name, "__aeabi_fadd");
     }
 
     #[test]
@@ -8232,7 +8966,7 @@ mod tests {
         assert!(has("__aeabi_fcmplt"), "f32 < -> fcmplt");
         assert!(has("__aeabi_fcmpeq"), "f32 != -> fcmpeq (inverted)");
         assert!(has("__aeabi_dcmplt"), "f64 < -> dcmplt");
-        assert_eq!(obj.relocations.len(), 3);
+        assert_eq!(code_relocations(&obj).len(), 3);
     }
 
     #[test]
@@ -8393,6 +9127,680 @@ mod tests {
             obj.text.len() > 1020,
             "the body must overrun the ~1 KB literal reach for islanding to matter (text {})",
             obj.text.len()
+        );
+    }
+
+    /// The object's relocations excluding the stack-map records' `func_addr` patches -- most
+    /// object tests assert the CODE's relocations, and every safepoint-bearing function now adds
+    /// one record ABS32 alongside them.
+    fn code_relocations(obj: &lamella_elf::Object) -> Vec<lamella_elf::ParsedRelocation> {
+        let record_spans: Vec<(u32, u32)> = obj
+            .symbols
+            .iter()
+            .filter(|s| {
+                s.defined
+                    && (s.name.starts_with(lamella_elf::STACKMAP_RECORD_PREFIX)
+                        || s.name.starts_with(lamella_elf::STACKMAP_STATICS_PREFIX))
+            })
+            .map(|s| (s.value, s.value + s.size))
+            .collect();
+        obj.relocations
+            .iter()
+            .filter(|r| !record_spans.iter().any(|&(a, b)| r.offset >= a && r.offset < b))
+            .cloned()
+            .collect()
+    }
+
+    /// Decodes one encoded stack-map record -- the test-side mirror of the walker's parse.
+    fn decode_stackmap_record(bytes: &[u8]) -> (u32, u32, u16, u16, u16, Vec<u16>) {
+        let word =
+            |o: usize| u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
+        let half = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        let count = half(14) as usize;
+        let roots = (0..count).map(|i| half(16 + 2 * i)).collect();
+        (word(0), word(4), half(8), half(10), half(12), roots)
+    }
+
+    #[test]
+    fn stackmap_record_encoding_round_trips() {
+        let roots = [
+            5 | (STACKMAP_KIND_OBJECT_REF << 14),
+            9 | (STACKMAP_KIND_MANAGED_PTR << 14),
+            2 | (STACKMAP_KIND_PINNED << 14),
+        ];
+        let mut bytes = Vec::new();
+        encode_stackmap_record(&mut bytes, 0, 0x84, STACKMAP_MODE_METHOD_SLOTS, 7, 6, &roots);
+        assert_eq!(bytes.len() % 4, 0, "records stay word-aligned");
+        let (func_addr, code_size, mode, frame_words, ret_lr_word, decoded) =
+            decode_stackmap_record(&bytes);
+        assert_eq!(func_addr, 0);
+        assert_eq!(code_size, 0x84);
+        assert_eq!(mode, STACKMAP_MODE_METHOD_SLOTS);
+        assert_eq!(frame_words, 7);
+        assert_eq!(ret_lr_word, 6);
+        assert_eq!(decoded, roots);
+    }
+
+    /// The sec-2.3 memory-homing invariant, pinned: a function keeping an ObjectRef LIVE ACROSS a
+    /// call must take the fully-spilled path (the METHOD_SLOTS record enumerates SLOTS, so a ref
+    /// surviving a safepoint in a callee-saved register would be invisible to the collector). The
+    /// `any_value_live_across_call` gate in `prepare` is what enforces it; this test is the
+    /// tripwire should a register-path optimization ever loosen that gate.
+    #[test]
+    fn a_ref_live_across_a_call_forces_the_spilled_path() {
+        let live_across = Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::Call {
+                        callee: 1,
+                        args: Vec::new(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        assert!(matches!(prepare(&live_across), Ok(Assignment::Spilled)));
+        let with_ptr = Function {
+            params: vec![MirType::ManagedPtr],
+            ret: None,
+            value_types: vec![MirType::ManagedPtr],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: Vec::new(),
+                terminator: Some(Terminator::Return(None)),
+            }],
+        };
+        assert!(matches!(prepare(&with_ptr), Ok(Assignment::Spilled)));
+    }
+
+    /// WELD: every live root the per-safepoint analysis reports must appear among the METHOD_SLOTS
+    /// record's slots at the same offset -- the record enumerates a superset (all ref slots), and
+    /// this keeps the two computations (the lowering's `record_safepoint` and the record builder's
+    /// `method_record_roots`) from drifting apart.
+    #[test]
+    fn method_record_roots_cover_every_per_site_live_root() {
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(0),
+                            payload_size: 4,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(0),
+                            payload_size: 4,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let record_slots: Vec<u16> = method_record_roots(&func, &[])
+            .iter()
+            .map(|r| (r & 0x3FFF) * 4)
+            .collect();
+        let (offsets, _) = spilled_slot_offsets(&func);
+        let per_site = crate::regalloc::safepoint_roots(&func, &func.value_types);
+        let mut live_sites = 0;
+        for block_roots in &per_site {
+            for roots in block_roots.iter().flatten() {
+                for v in roots {
+                    live_sites += 1;
+                    assert!(
+                        record_slots.contains(&offsets[v.index()]),
+                        "live root v{} (slot {}) missing from the method record {record_slots:?}",
+                        v.index(),
+                        offsets[v.index()]
+                    );
+                }
+            }
+        }
+        assert!(live_sites > 0, "the fixture must exercise live roots");
+    }
+
+    #[test]
+    fn lower_object_emits_method_records_with_function_relocations() {
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::Alloc {
+                            handle: lamella_ir::TypeHandle(0),
+                            payload_size: 4,
+                            ref_offsets: Vec::new().into_boxed_slice(),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::Call {
+                            callee: 1,
+                            args: Vec::new(),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let g = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main, g], &["main", "g"], &[]).unwrap())
+                .unwrap();
+        let rec = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_smrec_main")
+            .expect("main gets a method record");
+        assert!(rec.defined && rec.binding == lamella_elf::Binding::Weak);
+        assert!(
+            !obj.symbols.iter().any(|s| s.name == "__lamella_smrec_g"),
+            "a leaf (no safepoint) gets no record -- it can never appear mid-walk"
+        );
+        let bytes = &obj.text[rec.value as usize..(rec.value + rec.size) as usize];
+        let (_, code_size, mode, frame_words, ret_lr_word, roots) = decode_stackmap_record(bytes);
+        assert_eq!(mode, STACKMAP_MODE_METHOD_SLOTS);
+        assert!(code_size > 0);
+        assert_eq!(ret_lr_word, frame_words - 1, "LR is pushed first (highest)");
+        assert_eq!(roots, vec![STACKMAP_KIND_OBJECT_REF << 14]);
+        let main_index = obj
+            .symbols
+            .iter()
+            .position(|s| s.name == "main")
+            .expect("main symbol") as u32;
+        assert!(
+            obj.relocations.iter().any(|r| r.offset == rec.value
+                && r.symbol == main_index
+                && r.kind == lamella_elf::arm::R_ARM_ABS32),
+            "the func_addr word carries an ABS32 to the function symbol"
+        );
+    }
+
+    #[test]
+    fn a_seam_shaped_function_pins_its_reftoint_source() {
+        let seam = Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::ObjectRef, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(1),
+                        Inst::Convert {
+                            value: ValueId(0),
+                            kind: lamella_ir::ConvKind::RefToInt,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::CallNative {
+                            symbol: 0,
+                            args: vec![ValueId(1)],
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let externs = [alloc::string::String::from("lamella_thread_recv_poll")];
+        let roots = method_record_roots(&seam, &externs);
+        assert_eq!(roots, vec![STACKMAP_KIND_PINNED << 14]);
+        let externs = [alloc::string::String::from("lamella_console_write")];
+        let roots = method_record_roots(&seam, &externs);
+        assert_eq!(roots, vec![STACKMAP_KIND_OBJECT_REF << 14]);
+    }
+
+    #[test]
+    fn lower_object_vtables_statics_emits_the_mode2_record() {
+        let f = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 42,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("0badf00d"),
+            region_bytes: 12,
+            roots: vec![
+                STACKMAP_KIND_MANAGED_PTR << 14,
+                2 | (STACKMAP_KIND_OBJECT_REF << 14),
+            ],
+        };
+        let obj = lamella_elf::read_object(
+            &lower_object_vtables_statics(&[f], &["main"], &[], &[], &statics, &DescQualifiers::default())
+                .unwrap(),
+        )
+        .unwrap();
+        let rec = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_smstat_0badf00d")
+            .expect("the statics record is emitted under the assembly's suffix");
+        let bytes = &obj.text[rec.value as usize..(rec.value + rec.size) as usize];
+        let (base, region, mode, _, _, roots) = decode_stackmap_record(bytes);
+        assert_eq!(mode, STACKMAP_MODE_STATICS);
+        assert_eq!(base, 0, "the base word is emitted 0 and patched by relocation");
+        assert_eq!(region, 12);
+        assert_eq!(roots, statics.roots);
+        let reloc = obj
+            .relocations
+            .iter()
+            .find(|r| r.offset == rec.value)
+            .expect("the record's base word carries a relocation");
+        let target = &obj.symbols[reloc.symbol as usize];
+        assert_eq!(target.name, "__lamella_statics_0badf00d");
+        assert!(!target.defined, "the linker places the region");
+        assert_eq!(target.size, 12, "st_size carries the region size");
+    }
+
+    #[test]
+    fn object_statics_split_eh_word_from_the_assembly_region() {
+        let f = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 7,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::StaticStore {
+                            owner: StaticOwner::Own,
+                            offset: 0,
+                            value: ValueId(0),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::StaticLoad {
+                            owner: StaticOwner::Own,
+                            offset: 8,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("11223344"),
+            region_bytes: 12,
+            roots: Vec::new(),
+        };
+        let obj = lamella_elf::read_object(
+            &lower_object_vtables_statics(&[f], &["main"], &[], &[], &statics, &DescQualifiers::default())
+                .unwrap(),
+        )
+        .unwrap();
+        let target = |r: &lamella_elf::ParsedRelocation| obj.symbols[r.symbol as usize].name.clone();
+        assert!(
+            obj.relocations.iter().any(|r| {
+                r.kind == lamella_elf::arm::R_ARM_ABS32
+                    && target(r) == lamella_elf::EH_TAG_SYMBOL
+                    && r.addend == 0
+            }),
+            "the offset-0 store references the shared EH word"
+        );
+        assert!(
+            obj.relocations.iter().any(|r| {
+                r.kind == lamella_elf::arm::R_ARM_ABS32
+                    && target(r) == "__lamella_statics_11223344"
+                    && r.addend == 8
+            }),
+            "the field access references the assembly's own region + slot addend"
+        );
+        let words: Vec<u32> = obj
+            .text
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert!(
+            !words.contains(&(STATIC_FIELD_BASE + 8)),
+            "the linked path retired the fixed-address statics idiom"
+        );
+    }
+
+    #[test]
+    fn cross_assembly_statics_reference_the_owners_region() {
+        let f = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::StaticLoad {
+                            owner: StaticOwner::Reference(0),
+                            offset: 4,
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::StaticStore {
+                            owner: StaticOwner::Reference(1),
+                            offset: 8,
+                            value: ValueId(0),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::StaticLoad {
+                            owner: StaticOwner::Own,
+                            offset: 4,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("11223344"),
+            region_bytes: 8,
+            roots: Vec::new(),
+        };
+        let qualifiers = DescQualifiers {
+            own: None,
+            references: alloc::vec![
+                alloc::string::String::from("aaaa0001"),
+                alloc::string::String::from("bbbb0002"),
+            ],
+        };
+        let obj = lamella_elf::read_object(
+            &lower_object_vtables_statics(&[f], &["main"], &[], &[], &statics, &qualifiers)
+                .unwrap(),
+        )
+        .unwrap();
+        let lands = |name: &str, addend: i32| {
+            obj.relocations.iter().any(|r| {
+                r.kind == lamella_elf::arm::R_ARM_ABS32
+                    && obj.symbols[r.symbol as usize].name == name
+                    && r.addend == addend
+            })
+        };
+        assert!(
+            lands("__lamella_statics_aaaa0001", 4),
+            "the reference-0 load lands on ITS owner's region + slot addend"
+        );
+        assert!(
+            lands("__lamella_statics_bbbb0002", 8),
+            "the reference-1 store lands on ITS owner's region + slot addend"
+        );
+        assert!(
+            lands("__lamella_statics_11223344", 4),
+            "an own access still lands on this assembly's region"
+        );
+        for name in ["__lamella_statics_aaaa0001", "__lamella_statics_bbbb0002"] {
+            let sym = obj.symbols.iter().find(|s| s.name == name).unwrap();
+            assert!(!sym.defined, "the linker places the owner's region");
+            assert_eq!(sym.size, 0, "the owner's own object carries the st_size channel");
+        }
+    }
+
+    #[test]
+    fn flat_path_rejects_a_cross_assembly_static() {
+        let f = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::StaticLoad {
+                        owner: StaticOwner::Reference(0),
+                        offset: 4,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        assert!(matches!(
+            lower_module(&[f]),
+            Err(LowerError::CallUnsupported)
+        ));
+    }
+
+    /// A non-leaf function with `n` spilled I32 values (a call keeps it walkable and needs LR).
+    fn many_values(n: u32) -> Function {
+        let mut insts = Vec::new();
+        for i in 0..n {
+            insts.push((
+                ValueId(i),
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: i64::from(i),
+                },
+            ));
+        }
+        insts.push((
+            ValueId(n),
+            Inst::Call {
+                callee: 0,
+                args: Vec::new(),
+            },
+        ));
+        Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32; n as usize + 1],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts,
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        }
+    }
+
+    #[test]
+    fn library_report_names_the_dry_run_stubs_and_leaves_bytes_identical() {
+        let good = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 7,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let bad = many_values(17_000);
+        let funcs = [good, bad];
+        let names = ["good", "bad"];
+        let (bytes, report) =
+            lower_object_library_vtables_report(&funcs, &names, &[], &[], None, &DescQualifiers::default(), false)
+                .unwrap();
+        assert_eq!(
+            report,
+            vec![(1, LowerError::TooManyValues)],
+            "the oversized frame is reported by index with its lowering error"
+        );
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let bad_sym = obj.symbols.iter().find(|s| s.name == "bad").unwrap();
+        let start = (bad_sym.value & !1) as usize;
+        assert_eq!(
+            &obj.text[start..start + 2],
+            &[0x70, 0x47],
+            "the reported method is a bare `bx lr` stub"
+        );
+        let plain = lower_object_library_vtables(&funcs, &names, &[], &[]).unwrap();
+        assert_eq!(plain, bytes);
+    }
+
+    #[test]
+    fn narrow_field_access_is_width_exact() {
+        let f = Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types: vec![
+                MirType::ObjectRef,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![
+                    (
+                        ValueId(1),
+                        Inst::FieldLoadNarrow {
+                            base: ValueId(0),
+                            offset: 1,
+                            size: 1,
+                            signed: false,
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0,
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::FieldStoreNarrow {
+                            base: ValueId(0),
+                            offset: 0,
+                            value: ValueId(2),
+                            size: 1,
+                        },
+                    ),
+                    (
+                        ValueId(4),
+                        Inst::FieldLoadNarrow {
+                            base: ValueId(0),
+                            offset: 2,
+                            size: 1,
+                            signed: true,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(4)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[f], &["main"], &[]).unwrap()).unwrap();
+        let halfwords: Vec<u16> = obj
+            .text
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert!(
+            halfwords.iter().any(|&h| h & 0xF800 == 0x7800),
+            "the loads are LDRB"
+        );
+        assert!(
+            halfwords.iter().any(|&h| h & 0xF800 == 0x7000),
+            "the store is STRB -- never a word-wide stomp"
+        );
+        assert!(
+            halfwords.iter().any(|&h| h & 0xFFC0 == 0xB240),
+            "the signed byte load sign-extends (SXTB)"
+        );
+    }
+
+    #[test]
+    fn big_frame_past_the_thumb1_reach_lowers() {
+        let f = many_values(600);
+        let obj =
+            lamella_elf::read_object(&lower_object(&[f], &["big"], &[]).unwrap()).unwrap();
+        let big = obj.symbols.iter().find(|s| s.name == "big").unwrap();
+        assert!(
+            big.size > 600 * 2,
+            "a real body, not a stub (got {} bytes)",
+            big.size
+        );
+        let rec = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == "__lamella_smrec_big")
+            .expect("a safepoint-bearing function gets a record");
+        let bytes = &obj.text[rec.value as usize..(rec.value + rec.size) as usize];
+        let (_, _, mode, frame_words, _, _) = decode_stackmap_record(bytes);
+        assert_eq!(mode, STACKMAP_MODE_METHOD_SLOTS);
+        assert!(
+            u32::from(frame_words) * 4 > 1020,
+            "the record spans the big frame ({frame_words} words)"
         );
     }
 }

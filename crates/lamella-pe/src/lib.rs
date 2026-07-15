@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+mod deflate;
 pub mod heap;
 pub mod module;
 pub mod pdb;

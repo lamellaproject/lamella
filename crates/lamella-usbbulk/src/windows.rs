@@ -53,12 +53,12 @@ unsafe fn iface_paths(guid: &GUID) -> Vec<Vec<u16>> {
             break;
         }
         let mut needed = 0u32;
-        SetupDiGetDeviceInterfaceDetailW(hdev, &mut ifd, null_mut(), 0, &mut needed, null_mut());
+        SetupDiGetDeviceInterfaceDetailW(hdev, &ifd, null_mut(), 0, &mut needed, null_mut());
         if needed > 0 {
             let mut buf = vec![0u8; needed as usize];
             let detail = buf.as_mut_ptr() as *mut SP_DEVICE_INTERFACE_DETAIL_DATA_W;
             (*detail).cbSize = std::mem::size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
-            if SetupDiGetDeviceInterfaceDetailW(hdev, &mut ifd, detail, needed, null_mut(), null_mut()) != 0 {
+            if SetupDiGetDeviceInterfaceDetailW(hdev, &ifd, detail, needed, null_mut(), null_mut()) != 0 {
                 let p = (*detail).DevicePath.as_ptr();
                 let mut len = 0usize;
                 while *p.add(len) != 0 {
@@ -305,13 +305,16 @@ impl Device {
         Err(Error::NotFound)
     }
 
-    pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
+    /// Sends one bulk OUT packet on a specific endpoint address (WinUSB's `PipeID` is the endpoint
+    /// address) -- see [`crate::Device::write_endpoint`]. [`write_packet`](Self::write_packet) is this
+    /// on the primary OUT endpoint.
+    pub fn write_endpoint(&mut self, endpoint: u8, data: &[u8]) -> Result<()> {
         unsafe {
             ResetEvent(self.ev);
             let mut ov: OVERLAPPED = std::mem::zeroed();
             ov.hEvent = self.ev;
             let mut n = 0u32;
-            if WinUsb_WritePipe(self.wu, self.ep_out, data.as_ptr(), data.len() as u32, &mut n, &mut ov) == 0 {
+            if WinUsb_WritePipe(self.wu, endpoint, data.as_ptr(), data.len() as u32, &mut n, &ov) == 0 {
                 if GetLastError() == ERROR_IO_PENDING {
                     WinUsb_GetOverlappedResult(self.wu, &ov, &mut n, 1);
                 } else {
@@ -322,14 +325,17 @@ impl Device {
         }
     }
 
-    pub fn read_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+    /// Reads one bulk IN packet from a specific endpoint address into `buf` -- see
+    /// [`crate::Device::read_endpoint`]. [`read_packet`](Self::read_packet) is this on the primary IN
+    /// endpoint.
+    pub fn read_endpoint(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         const PIPE_TRANSFER_TIMEOUT: u32 = 0x03;
         const ERROR_SEM_TIMEOUT: u32 = 121;
         let ms: u32 = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
         unsafe {
             WinUsb_SetPipePolicy(
                 self.wu,
-                self.ep_in,
+                endpoint,
                 PIPE_TRANSFER_TIMEOUT,
                 4,
                 (&ms as *const u32).cast::<core::ffi::c_void>(),
@@ -338,7 +344,7 @@ impl Device {
             let mut ov: OVERLAPPED = std::mem::zeroed();
             ov.hEvent = self.ev;
             let mut got = 0u32;
-            if WinUsb_ReadPipe(self.wu, self.ep_in, buf.as_mut_ptr(), buf.len() as u32, &mut got, &mut ov) == 0 {
+            if WinUsb_ReadPipe(self.wu, endpoint, buf.as_mut_ptr(), buf.len() as u32, &mut got, &ov) == 0 {
                 let err = GetLastError();
                 if err == ERROR_IO_PENDING {
                     if WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 1) == 0 {
@@ -356,6 +362,14 @@ impl Device {
             }
             Ok(got as usize)
         }
+    }
+
+    pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
+        self.write_endpoint(self.ep_out, data)
+    }
+
+    pub fn read_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.read_endpoint(self.ep_in, buf, timeout)
     }
 }
 

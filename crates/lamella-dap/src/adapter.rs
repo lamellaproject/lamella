@@ -922,7 +922,7 @@ mod tests {
         })
     }
 
-    /// A backend that surfaces a one-shot connect banner from `take_output` -- as the WirelineBackend
+    /// A backend that surfaces a one-shot connect banner from `take_output` -- as the WireHostBackend
     /// does with the board/chip identity it sets on HELLO -- and produces nothing thereafter. Inert
     /// otherwise. Used to check the adapter drains that banner at `launch`, before the program runs.
     struct BannerBackend {

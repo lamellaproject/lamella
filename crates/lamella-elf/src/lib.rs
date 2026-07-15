@@ -116,6 +116,57 @@ pub enum SymbolType {
 /// method); shared here so the two crates agree on one string.
 pub const TYPE_DESC_PREFIX: &str = "__lamella_typedesc_";
 
+/// The prefix on a per-method GC stack-map record's data symbol (`__lamella_smrec_<function symbol>`).
+/// The AOT backend emits one METHOD_SLOTS record per safepoint-bearing function; the record is
+/// code-UNreferenced (only the collector reads it at runtime), so the linker applies the INVERSE
+/// gc-sections rule: a record survives if and only if the function its name carries survives (a plain
+/// data-keep would leave a dropped function's record with a dangling `func_addr` relocation, and a
+/// reachability-keep would drop every record). Shared here so backend and linker agree on one string.
+pub const STACKMAP_RECORD_PREFIX: &str = "__lamella_smrec_";
+
+/// The prefix on a GLOBAL-roots stack-map record's data symbol (`__lamella_smstat_<asmhash>`) -- the
+/// mode-2 STATICS record naming one assembly's static region's ref-bearing words. Its `func_addr`
+/// word carries an `R_ARM_ABS32` relocation against the assembly's region symbol
+/// ([`STATICS_BASE_PREFIX`]), so the walker reads the linker-placed base. Always kept; the linker
+/// recognizes it so the gather pass tables it alongside the per-method records.
+pub const STACKMAP_STATICS_PREFIX: &str = "__lamella_smstat_";
+
+/// The prefix on a managed assembly's STATIC-REGION symbol (`__lamella_statics_<asmhash>`, the
+/// suffix EXACTLY eight lowercase hex digits -- fnv1a32 of the assembly's CIL bytes, the same hash
+/// that prefixes a library object's internal symbols). The AOT backend references it UNDEFINED from
+/// every `ldsfld`/`stsfld` pool word (addend = the field's dense slot offset) and from the mode-2
+/// statics record's base word, carrying the region's byte size in the reference's `st_size`;
+/// `lamella-link` lays each referenced region out in a RAM window, defines the symbol, and brackets
+/// the span with [`STATICS_START_SYMBOL`]/[`STATICS_END_SYMBOL`]. Word 0 of every region is
+/// RESERVED (dense slots start at 1): offset 0 is the MIR-level EH-tag marker, split out to
+/// [`EH_TAG_SYMBOL`].
+pub const STATICS_BASE_PREFIX: &str = "__lamella_statics_";
+
+/// The ONE VES-global in-flight exception word, shared by EVERY assembly's throw/catch lowering
+/// (`__lamella_eh_tag`). Splitting it out of the per-assembly static regions is what keeps EH
+/// working across assemblies: a corlib `throw` and a program `catch` must read the SAME word, so
+/// it cannot be "row 0 of the thrower's region". `lamella-link` defines it as the ENTRY object's
+/// region word 0 (reserved by the dense layout, and covered by that record's row-0 ManagedPtr
+/// root), falling back to the first laid region / a standalone word.
+pub const EH_TAG_SYMBOL: &str = "__lamella_eh_tag";
+
+/// The symbol at the start of the linker-laid statics RAM span (every region plus the EH word).
+/// A boot stub zeroes `[start, end)` before calling the entry -- C# statics are zero-initialized
+/// by the CLI spec, and `.cctor`s (chained by the entry's startup) do the rest. Not 8 hex digits,
+/// so the region matcher never mistakes it for a region reference.
+pub const STATICS_START_SYMBOL: &str = "__lamella_statics_start";
+
+/// The symbol just past the linker-laid statics RAM span (see [`STATICS_START_SYMBOL`]).
+pub const STATICS_END_SYMBOL: &str = "__lamella_statics_end";
+
+/// The symbol bracketing the gathered stack-map pointer table's first word (its `u32` record count).
+/// `lamella-link` defines it (Global) on any image whose objects carry stack-map records; the
+/// runtime-support walker declares it extern with a WEAK empty-table fallback for images without one.
+pub const STACKMAP_START_SYMBOL: &str = "__lamella_stackmaps_start";
+
+/// The symbol just past the gathered stack-map pointer table (see [`STACKMAP_START_SYMBOL`]).
+pub const STACKMAP_END_SYMBOL: &str = "__lamella_stackmaps_end";
+
 /// Where a symbol is defined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolSection {

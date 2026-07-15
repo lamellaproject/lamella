@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use lamella_asm_riscv32::{BranchCond, Encoder, Label, Reg};
 use lamella_ir::{
-    BinOp, CmpOp, ConvKind, Function, Inst, MirType, Terminator, TypeHandle, ValueId,
+    BinOp, CmpOp, ConvKind, Function, Inst, MirType, StaticOwner, Terminator, TypeHandle, ValueId,
 };
 
 use crate::resolver::{TypeMeta, VtableEntry};
@@ -122,7 +122,7 @@ fn register_arg_count(inst: &Inst) -> usize {
 /// reference), an int64/f64/small-struct a register PAIR, a scalar one; and a wide RESULT reserves a0 for
 /// the sret pointer so the explicit arguments start at a1. Returns 0 for a call that fits in registers, or
 /// a non-`Call`/`CallNative` inst -- the dispatch kinds (indirect/virtual/interface/delegate) still cap at
-/// the argument registers (their stack-arg support is a follow-on).
+/// the argument registers (they do not model stack-passed arguments).
 fn call_stack_words(
     inst: &Inst,
     result: ValueId,
@@ -744,7 +744,11 @@ fn lower_object_relocatable(
             name: desc_names[i].as_str(),
             value: vtable_start,
             size: total_size,
-            binding: lamella_elf::Binding::Global,
+            binding: if tolerant {
+                lamella_elf::Binding::Weak
+            } else {
+                lamella_elf::Binding::Global
+            },
             kind: lamella_elf::SymbolType::NoType,
             section: lamella_elf::SymbolSection::Text,
         });
@@ -1084,6 +1088,40 @@ fn lower_inst(
             }
             enc.sw(reg(*value), reg(*base), field_offset(*offset)?);
         }
+        Inst::FieldLoadNarrow {
+            base,
+            offset,
+            size,
+            signed,
+        } => {
+            if !is_pointer(value_types, *base) {
+                return Err(LowerError::Unsupported);
+            }
+            let off = field_offset(*offset)?;
+            match (*size, *signed) {
+                (1, false) => enc.lbu(reg(result), reg(*base), off),
+                (1, true) => enc.lb(reg(result), reg(*base), off),
+                (2, false) => enc.lhu(reg(result), reg(*base), off),
+                (2, true) => enc.lh(reg(result), reg(*base), off),
+                _ => return Err(LowerError::Unsupported),
+            }
+        }
+        Inst::FieldStoreNarrow {
+            base,
+            offset,
+            value,
+            size,
+        } => {
+            if !is_pointer(value_types, *base) {
+                return Err(LowerError::Unsupported);
+            }
+            let off = field_offset(*offset)?;
+            match *size {
+                1 => enc.sb(reg(*value), reg(*base), off),
+                2 => enc.sh(reg(*value), reg(*base), off),
+                _ => return Err(LowerError::Unsupported),
+            }
+        }
         Inst::FieldAddr { base, offset } => {
             if !is_pointer(value_types, *base) {
                 return Err(LowerError::Unsupported);
@@ -1184,11 +1222,21 @@ fn lower_inst(
             enc.mv(Reg::T2, reg(*size));
             emit_fill_block(enc, Reg::T0, Reg::T1, Reg::T2);
         }
-        Inst::StaticLoad { offset } => {
+        Inst::StaticLoad { owner, offset } => {
+            if !matches!(owner, StaticOwner::Own) {
+                return Err(LowerError::Unsupported);
+            }
             enc.li(reg(result), (STATIC_FIELD_BASE + *offset) as i32);
             enc.lw(reg(result), reg(result), 0);
         }
-        Inst::StaticStore { offset, value } => {
+        Inst::StaticStore {
+            owner,
+            offset,
+            value,
+        } => {
+            if !matches!(owner, StaticOwner::Own) {
+                return Err(LowerError::Unsupported);
+            }
             enc.li(scratch(), (STATIC_FIELD_BASE + *offset) as i32);
             enc.sw(reg(*value), scratch(), 0);
         }
@@ -1740,12 +1788,22 @@ fn lower_inst_spilled(
             enc.lw(t2, Reg::SP, slot(*size));
             emit_fill_block(enc, t0, t1, t2);
         }
-        Inst::StaticLoad { offset } => {
+        Inst::StaticLoad { owner, offset } => {
+            if !matches!(owner, StaticOwner::Own) {
+                return Err(LowerError::Unsupported);
+            }
             enc.li(t0, (STATIC_FIELD_BASE + *offset) as i32);
             enc.lw(t0, t0, 0);
             enc.sw(t0, Reg::SP, slot(result));
         }
-        Inst::StaticStore { offset, value } => {
+        Inst::StaticStore {
+            owner,
+            offset,
+            value,
+        } => {
+            if !matches!(owner, StaticOwner::Own) {
+                return Err(LowerError::Unsupported);
+            }
             enc.li(t0, (STATIC_FIELD_BASE + *offset) as i32);
             enc.lw(t1, Reg::SP, slot(*value));
             enc.sw(t1, t0, 0);
@@ -2002,6 +2060,46 @@ fn lower_inst_spilled(
             } else {
                 enc.lw(t1, Reg::SP, slot(*value));
                 enc.sw(t1, Reg::SP, slot(*base) + *offset as i32);
+            }
+        }
+        Inst::FieldLoadNarrow {
+            base,
+            offset,
+            size,
+            signed,
+        } => {
+            if is_pointer(value_types, *base) {
+                enc.lw(t0, Reg::SP, slot(*base));
+            } else {
+                enc.addi(t0, Reg::SP, slot(*base));
+            }
+            let off = field_offset(*offset)?;
+            match (*size, *signed) {
+                (1, false) => enc.lbu(t1, t0, off),
+                (1, true) => enc.lb(t1, t0, off),
+                (2, false) => enc.lhu(t1, t0, off),
+                (2, true) => enc.lh(t1, t0, off),
+                _ => return Err(LowerError::Unsupported),
+            }
+            enc.sw(t1, Reg::SP, slot(result));
+        }
+        Inst::FieldStoreNarrow {
+            base,
+            offset,
+            value,
+            size,
+        } => {
+            if is_pointer(value_types, *base) {
+                enc.lw(t0, Reg::SP, slot(*base));
+            } else {
+                enc.addi(t0, Reg::SP, slot(*base));
+            }
+            enc.lw(t1, Reg::SP, slot(*value));
+            let off = field_offset(*offset)?;
+            match *size {
+                1 => enc.sb(t1, t0, off),
+                2 => enc.sh(t1, t0, off),
+                _ => return Err(LowerError::Unsupported),
             }
         }
         Inst::FieldAddr { base, offset } => {
@@ -3947,11 +4045,18 @@ mod tests {
                     (
                         n(1),
                         Inst::StaticStore {
+                            owner: lamella_ir::StaticOwner::Own,
                             offset: 8,
                             value: n(0),
                         },
                     ),
-                    (n(2), Inst::StaticLoad { offset: 8 }),
+                    (
+                        n(2),
+                        Inst::StaticLoad {
+                            owner: lamella_ir::StaticOwner::Own,
+                            offset: 8,
+                        },
+                    ),
                 ],
                 terminator: Some(Terminator::Return(Some(n(2)))),
             }],
@@ -4199,6 +4304,51 @@ mod tests {
             lower_module_gc_with_descriptors(&funcs, 0x8000_0004, &descriptors).is_ok(),
             "virtual dispatch with a vtable lowers to RV32IM"
         );
+    }
+
+    #[test]
+    fn library_descriptors_are_weak_program_descriptors_global() {
+        let allocates = || Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: TypeHandle(7),
+                        payload_size: 12,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let descriptors = vec![TypeMeta {
+            handle: TypeHandle(7),
+            type_tag: 0,
+            vtable: Vec::new(),
+            itable: Vec::new(),
+            base: None,
+        }];
+        let name = alloc::format!("{}7", lamella_elf::TYPE_DESC_PREFIX);
+        let binding_of = |object: &[u8]| {
+            lamella_elf::read_object(object)
+                .expect("parse the emitted object")
+                .symbols
+                .iter()
+                .find(|s| s.name == name)
+                .expect("the descriptor symbol is emitted")
+                .binding
+        };
+        let library = lower_object_library(&[allocates()], &["m"], &[], &descriptors)
+            .expect("library lowers");
+        let program =
+            lower_object(&[allocates()], &["m"], &[], &descriptors).expect("program lowers");
+        assert_eq!(binding_of(&library), lamella_elf::Binding::Weak);
+        assert_eq!(binding_of(&program), lamella_elf::Binding::Global);
     }
 
     #[test]

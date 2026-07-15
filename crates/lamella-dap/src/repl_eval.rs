@@ -1,12 +1,12 @@
-//! The Debug Console REPL: a DAP `evaluate` handler backed by the wireline REPL engine.
+//! The Debug Console REPL: a DAP `evaluate` handler backed by the Lamella Link REPL engine.
 //! Each submission is compiled and run so declarations persist and an expression prints its value.
 
 use lamella_cil_runtime::{Value, Vm, run};
 use lamella_load::load;
 use lamella_metadata::Assembly;
 use lamella_wire::TransportError;
-use lamella_wireline::RunResult;
-use lamella_wireline::engine::{LcscCompiler, Outcome, Repl, ReplLink};
+use lamella_wire_host::RunResult;
+use lamella_wire_host::engine::{LcscCompiler, Outcome, Repl, ReplLink};
 use serde_json::{Value as Json, json};
 
 /// The REPL for a debug session: built lazily on the first `evaluate`, then reused so the

@@ -15,7 +15,9 @@ use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use lamella_cil_runtime::net::{Interest, NetBackend, NetResult, SocketHandle};
+use lamella_cil_runtime::net::{
+    IfaceKind, Interest, InterfaceInfo, NetBackend, NetResult, OperStatus, SocketHandle,
+};
 use smoltcp::iface::{Config, Interface, SocketHandle as SmolHandle, SocketSet};
 use smoltcp::phy::Device;
 use smoltcp::socket::{dhcpv4, dns, tcp, udp};
@@ -139,6 +141,10 @@ pub struct SmoltcpNet<D: Device> {
     dhcp: Option<SmolHandle>,
     dns: SmolHandle,
     dns_servers: Vec<IpAddress>,
+    /// The current IPv4 default gateway (the static config's, or the last DHCP lease's router), kept
+    /// so the `NetworkInterface` poll surface can report it -- `smoltcp`'s routes are not readable
+    /// back out. `None` = none configured.
+    gateway: Option<[u8; 4]>,
     next_handle: SocketHandle,
     next_port: u16,
 }
@@ -157,6 +163,15 @@ fn addr_bytes(ip: &IpAddress) -> Vec<u8> {
     }
 }
 
+/// The dotted IPv4 subnet mask for a CIDR prefix length (24 -> 255.255.255.0; 0 -> 0.0.0.0). Backs
+/// the `NetworkInterface.IPv4SubnetMask` poll surface, since `smoltcp` stores the prefix, not a mask.
+fn prefix_to_mask(prefix: u8) -> [u8; 4] {
+    if prefix == 0 {
+        return [0, 0, 0, 0];
+    }
+    (u32::MAX << (32 - u32::from(prefix.min(32)))).to_be_bytes()
+}
+
 impl<D: Device> SmoltcpNet<D> {
     /// Creates the backend over the MAC driver: builds the interface, applies the
     /// addressing mode, and readies the DNS/DHCP sockets. `now_ms` is the monotonic
@@ -170,6 +185,7 @@ impl<D: Device> SmoltcpNet<D> {
         let mut sockets = SocketSet::new(Vec::new());
         let mut dhcp = None;
         let mut dns_servers: Vec<IpAddress> = Vec::new();
+        let mut gateway_addr: Option<[u8; 4]> = None;
         match &config.ip {
             IpSetup::Dhcp => {
                 dhcp = Some(sockets.add(dhcpv4::Socket::new()));
@@ -181,6 +197,7 @@ impl<D: Device> SmoltcpNet<D> {
                 });
                 if let Some(gw) = gateway {
                     let _ = iface.routes_mut().add_default_ipv4_route(Ipv4Address::from(*gw));
+                    gateway_addr = Some(*gw);
                 }
                 dns_servers =
                     dns.iter().map(|s| IpAddress::Ipv4(Ipv4Address::from(*s))).collect();
@@ -200,6 +217,7 @@ impl<D: Device> SmoltcpNet<D> {
             dhcp,
             dns,
             dns_servers,
+            gateway: gateway_addr,
             next_handle: 1,
             next_port: EPHEMERAL_FIRST,
         }
@@ -258,6 +276,7 @@ impl<D: Device> SmoltcpNet<D> {
                         self.iface.routes_mut().remove_default_ipv4_route();
                     }
                 }
+                self.gateway = lease.router.map(|router| router.octets());
                 self.dns_servers =
                     lease.dns_servers.iter().map(|s| IpAddress::Ipv4(*s)).collect();
                 self.dns_servers.truncate(3);
@@ -266,6 +285,7 @@ impl<D: Device> SmoltcpNet<D> {
             Some(dhcpv4::Event::Deconfigured) => {
                 self.iface.update_ip_addrs(|addrs| addrs.clear());
                 self.iface.routes_mut().remove_default_ipv4_route();
+                self.gateway = None;
             }
         }
     }
@@ -694,6 +714,41 @@ impl<D: Device> NetBackend for SmoltcpNet<D> {
             }
         }
     }
+
+    fn network_available(&mut self) -> bool {
+        self.drive();
+        self.iface.ipv4_addr().is_some()
+    }
+
+    fn interface_count(&mut self) -> u32 {
+        1
+    }
+
+    fn interface_info(&mut self, index: u32) -> Option<InterfaceInfo> {
+        if index != 0 {
+            return None;
+        }
+        let ipv4 = self.iface.ipv4_addr().map(|addr| addr.octets());
+        let subnet = self
+            .iface
+            .ip_addrs()
+            .first()
+            .map_or([0, 0, 0, 0], |cidr| prefix_to_mask(cidr.prefix_len()));
+        Some(InterfaceInfo {
+            oper_status: if ipv4.is_some() {
+                OperStatus::Up
+            } else if self.dhcp.is_some() {
+                OperStatus::Dormant
+            } else {
+                OperStatus::Down
+            },
+            kind: IfaceKind::Ethernet,
+            ipv4: ipv4.unwrap_or([0, 0, 0, 0]),
+            subnet,
+            gateway: self.gateway.unwrap_or([0, 0, 0, 0]),
+            dhcp_enabled: self.dhcp.is_some(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -725,6 +780,21 @@ mod tests {
         );
         config.would_block_grace_ms = 50;
         SmoltcpNet::new(device, config, counting_now_ms, 0x6c61_6d65_6c6c_6100)
+    }
+
+    #[test]
+    fn interface_info_reports_the_static_loopback_config() {
+        let mut net = loopback_net();
+        assert!(net.network_available());
+        assert_eq!(net.interface_count(), 1);
+        let info = net.interface_info(0).expect("interface 0");
+        assert_eq!(info.ipv4, [127, 0, 0, 1]);
+        assert_eq!(info.subnet, [255, 0, 0, 0]);
+        assert_eq!(info.oper_status, OperStatus::Up);
+        assert_eq!(info.kind, IfaceKind::Ethernet);
+        assert_eq!(info.gateway, [0, 0, 0, 0]);
+        assert!(!info.dhcp_enabled);
+        assert!(net.interface_info(1).is_none());
     }
 
     /// Busy-retries `operation` like the managed poll loops (`Socket.cs` spins on the

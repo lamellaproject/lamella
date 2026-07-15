@@ -16,8 +16,8 @@ name = "lamella-mcp-csharp"
 path = "src/main.rs"
 
 [dependencies]
-# The canonical local server links the toolchain directly (no wasm, no JS): the wireline REPL engine gives
+# The canonical local server links the toolchain directly (no wasm, no JS): the Lamella Link REPL engine gives
 # compile (LcscCompiler) + in-process run (LoopbackLink) -- the same path wire-repl / the Debug Console use.
-lamella-wireline = { path = "../lamella-wireline", features = ["repl-host"] }
+lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host"] }
 # Hand-rolled JSON-RPC on serde_json -- no tokio, no MCP SDK (dependency-minimal, matching the workspace).
 serde_json = "1"

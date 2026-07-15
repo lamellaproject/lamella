@@ -1,0 +1,274 @@
+// Lamella managed corlib (from scratch). -- System.IO.Ports.SerialPort
+#if LAMELLA_SURFACE_SERIAL
+namespace System.IO.Ports
+{
+    public class SerialPort : Stream
+    {
+        public const int InfiniteTimeout = -1;
+
+        private string _portName;
+        private int _baudRate;
+        private Parity _parity;
+        private int _dataBits;
+        private StopBits _stopBits;
+        private Handshake _handshake;
+        private int _readTimeout;
+        private int _writeTimeout;
+        private int _handle;
+
+        public SerialPort(string portName)
+            : this(portName, 9600, Parity.None, 8, StopBits.One)
+        {
+        }
+
+        public SerialPort(string portName, int baudRate)
+            : this(portName, baudRate, Parity.None, 8, StopBits.One)
+        {
+        }
+
+        public SerialPort(string portName, int baudRate, Parity parity)
+            : this(portName, baudRate, parity, 8, StopBits.One)
+        {
+        }
+
+        public SerialPort(string portName, int baudRate, Parity parity, int dataBits)
+            : this(portName, baudRate, parity, dataBits, StopBits.One)
+        {
+        }
+
+        public SerialPort(string portName, int baudRate, Parity parity, int dataBits, StopBits stopBits)
+        {
+            if ((object)portName == null) throw new ArgumentNullException("portName");
+            if (portName.Length == 0) throw new ArgumentException("The PortName cannot be empty.", "portName");
+            _portName = portName;
+            _baudRate = baudRate;
+            _parity = parity;
+            _dataBits = dataBits;
+            _stopBits = stopBits;
+            _handshake = Handshake.None;
+            _readTimeout = InfiniteTimeout;
+            _writeTimeout = InfiniteTimeout;
+            _handle = -1;
+        }
+
+        public string PortName { get { return _portName; } }
+
+        public bool IsOpen { get { return _handle >= 0; } }
+
+        public int BaudRate
+        {
+            get { return _baudRate; }
+            set
+            {
+                if (value <= 0) throw new ArgumentOutOfRangeException("value");
+                EnsureNotOpen();
+                _baudRate = value;
+            }
+        }
+
+        public Parity Parity
+        {
+            get { return _parity; }
+            set
+            {
+                if ((int)value < (int)Parity.None || (int)value > (int)Parity.Space)
+                    throw new ArgumentOutOfRangeException("value");
+                EnsureNotOpen();
+                _parity = value;
+            }
+        }
+
+        public int DataBits
+        {
+            get { return _dataBits; }
+            set
+            {
+                if (value < 5 || value > 8) throw new ArgumentOutOfRangeException("value");
+                EnsureNotOpen();
+                _dataBits = value;
+            }
+        }
+
+        public StopBits StopBits
+        {
+            get { return _stopBits; }
+            set
+            {
+                if ((int)value < (int)StopBits.One || (int)value > (int)StopBits.OnePointFive)
+                    throw new ArgumentOutOfRangeException("value");
+                EnsureNotOpen();
+                _stopBits = value;
+            }
+        }
+
+        public Handshake Handshake
+        {
+            get { return _handshake; }
+            set
+            {
+                if ((int)value < (int)Handshake.None || (int)value > (int)Handshake.RequestToSendXOnXOff)
+                    throw new ArgumentOutOfRangeException("value");
+                EnsureNotOpen();
+                _handshake = value;
+            }
+        }
+
+        public int ReadTimeout
+        {
+            get { return _readTimeout; }
+            set
+            {
+                if (value < 0 && value != InfiniteTimeout)
+                    throw new ArgumentOutOfRangeException("value");
+                _readTimeout = value;
+            }
+        }
+
+        public int WriteTimeout
+        {
+            get { return _writeTimeout; }
+            set
+            {
+                if (value < 0 && value != InfiniteTimeout)
+                    throw new ArgumentOutOfRangeException("value");
+                _writeTimeout = value;
+            }
+        }
+
+        public int BytesToRead
+        {
+            get
+            {
+                EnsureOpen();
+                int n = NativeSerial.BytesToRead(_handle);
+                if (n < 0) NativeSerial.Throw(n, _portName);
+                return n;
+            }
+        }
+
+        public int BytesToWrite
+        {
+            get
+            {
+                EnsureOpen();
+                int n = NativeSerial.BytesToWrite(_handle);
+                if (n < 0) NativeSerial.Throw(n, _portName);
+                return n;
+            }
+        }
+
+        public Stream BaseStream
+        {
+            get
+            {
+                EnsureOpen();
+                return this;
+            }
+        }
+
+        public override bool CanRead { get { return true; } }
+        public override bool CanWrite { get { return true; } }
+        public override bool CanSeek { get { return false; } }
+        public bool CanTimeout { get { return true; } }
+
+        public void Open()
+        {
+            if (_handle >= 0) throw new InvalidOperationException("The port is already open.");
+            int handle = NativeSerial.Open(_portName, _baudRate, (int)_parity, _dataBits, (int)_stopBits, (int)_handshake);
+            if (handle < 0) NativeSerial.Throw(handle, _portName);
+            _handle = handle;
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            ValidateRange(buffer, offset, count);
+            EnsureOpen();
+            int read = NativeSerial.Read(_handle, buffer, offset, count, _readTimeout);
+            if (read < 0) NativeSerial.Throw(read, _portName);
+            return read;
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            ValidateRange(buffer, offset, count);
+            EnsureOpen();
+            int written = 0;
+            while (written < count)
+            {
+                int n = NativeSerial.Write(_handle, buffer, offset + written, count - written, _writeTimeout);
+                if (n < 0) NativeSerial.Throw(n, _portName);
+                if (n == 0) throw new IOException("An I/O error occurred while accessing the port '" + _portName + "'.");
+                written += n;
+            }
+        }
+
+        public override void Flush()
+        {
+            EnsureOpen();
+            int code = NativeSerial.Flush(_handle);
+            if (code < 0) NativeSerial.Throw(code, _portName);
+        }
+
+        public void DiscardInBuffer()
+        {
+            EnsureOpen();
+            int code = NativeSerial.DiscardIn(_handle);
+            if (code < 0) NativeSerial.Throw(code, _portName);
+        }
+
+        public void DiscardOutBuffer()
+        {
+            EnsureOpen();
+            int code = NativeSerial.DiscardOut(_handle);
+            if (code < 0) NativeSerial.Throw(code, _portName);
+        }
+
+        public override long Length { get { throw new NotSupportedException("Seek is not supported on a serial port."); } }
+
+        public override long Position
+        {
+            get { throw new NotSupportedException("Seek is not supported on a serial port."); }
+            set { throw new NotSupportedException("Seek is not supported on a serial port."); }
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            throw new NotSupportedException("Seek is not supported on a serial port.");
+        }
+
+        public override void SetLength(long value)
+        {
+            throw new NotSupportedException("Seek is not supported on a serial port.");
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (_handle >= 0)
+            {
+                NativeSerial.Close(_handle);
+                _handle = -1;
+            }
+            base.Dispose(disposing);
+        }
+
+        private void EnsureOpen()
+        {
+            if (_handle < 0) throw new InvalidOperationException("The port is closed.");
+        }
+
+        private void EnsureNotOpen()
+        {
+            if (_handle >= 0) throw new InvalidOperationException("The port setting cannot be changed while the port is open.");
+        }
+
+        private static void ValidateRange(byte[] buffer, int offset, int count)
+        {
+            if ((object)buffer == null) throw new ArgumentNullException("buffer");
+            if (offset < 0) throw new ArgumentOutOfRangeException("offset");
+            if (count < 0) throw new ArgumentOutOfRangeException("count");
+            if (buffer.Length - offset < count)
+                throw new ArgumentException("Offset and length were out of bounds for the array or count is greater than the number of elements from index to the end of the source collection.");
+        }
+    }
+}
+#endif

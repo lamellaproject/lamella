@@ -26,7 +26,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match compile(&options) {
+    match run_on_compile_stack(move || compile(&options)) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(message) => {
@@ -34,6 +34,23 @@ fn main() -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// Runs `work` on a freshly spawned thread whose stack is large enough for the front end's
+/// recursion to follow deeply nested source (see the call site). Fully synchronous -- the
+/// calling thread waits for the compile and gets its result back -- and a panic inside the
+/// compile re-raises on return, so behaviour is unchanged but for the roomier stack.
+fn run_on_compile_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
+    const COMPILE_STACK_BYTES: usize = 512 * 1024 * 1024;
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(String::from("lcsc-compile"))
+            .stack_size(COMPILE_STACK_BYTES)
+            .spawn_scoped(scope, work)
+            .expect("spawn the lcsc compile thread")
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
 }
 
 /// Parses csc-style options. Bare arguments are the source files (one or more);

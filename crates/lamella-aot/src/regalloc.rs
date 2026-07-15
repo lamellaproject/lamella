@@ -216,6 +216,13 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                     mark(&mut lo, &mut hi, &mut defined, *base, ip);
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
+                Inst::FieldLoadNarrow { base, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *base, ip);
+                }
+                Inst::FieldStoreNarrow { base, value, .. } => {
+                    mark(&mut lo, &mut hi, &mut defined, *base, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *value, ip);
+                }
                 Inst::FieldAddr { base, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *base, ip);
                 }
@@ -606,6 +613,11 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::InitStruct => {}
         Inst::FieldLoad { base, .. } => f(*base),
         Inst::FieldStore { base, value, .. } => {
+            f(*base);
+            f(*value);
+        }
+        Inst::FieldLoadNarrow { base, .. } => f(*base),
+        Inst::FieldStoreNarrow { base, value, .. } => {
             f(*base);
             f(*value);
         }

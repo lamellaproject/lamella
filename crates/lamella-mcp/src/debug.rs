@@ -1,5 +1,5 @@
-//! The wireline SOURCE-LEVEL debug session tools. Each MCP `debug_*` tool drives a `lamella_dap::Debugger`
-//! (wrapping a `WirelineBackend`) as a DAP CLIENT -- it synthesizes DAP requests and parses the responses/
+//! The Lamella Link SOURCE-LEVEL debug session tools. Each MCP `debug_*` tool drives a `lamella_dap::Debugger`
+//! (wrapping a `WireHostBackend`) as a DAP CLIENT -- it synthesizes DAP requests and parses the responses/
 //! events -- so all the adapter's source-stepping, breakpoint binding, and stop-reason logic is REUSED, not
 //! reimplemented (the same code the VS Code wire debugger runs). A launched program is compiled with a PDB,
 //! baked SINGLE-assembly (the shape `run_on_device` deploys and the device runs), and paired with a matching
@@ -10,7 +10,7 @@ use lamella_dap::protocol::{Message, Request};
 use lamella_dap::Debugger;
 use lamella_metadata::{Assembly, PortablePdb};
 use lamella_token::Token;
-use lamella_wireline::debug_backend::WirelineBackend;
+use lamella_wire_host::debug_backend::WireHostBackend;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -171,7 +171,7 @@ fn stop_summary(session: &mut Session, msgs: &[Message]) -> String {
     format!("stopped ({reason}) at {}{extra}", top_frame(session))
 }
 
-/// Resume the target (`continue`/`stepIn`/`next`/`stepOut`) and WAIT for the resulting stop. A wireline stop is
+/// Resume the target (`continue`/`stepIn`/`next`/`stepOut`) and WAIT for the resulting stop. A Lamella Link stop is
 /// ASYNCHRONOUS -- the resume request only tells the device to run; the breakpoint/step/exit arrives later as an
 /// event surfaced by `Debugger::poll`. So if the immediate response carried no terminal event, poll until one
 /// does (or a timeout). Without this, a `continue` returns "still running" and the stop leaks into the next call.
@@ -220,7 +220,7 @@ impl Sessions {
             Ok(v) => v,
             Err(e) => return text_result(e, true),
         };
-        let backend = match WirelineBackend::open_target(target, crate::BAUD, image, Duration::from_secs(20)) {
+        let backend = match WireHostBackend::open_target(target, crate::BAUD, image, Duration::from_secs(20)) {
             Ok(b) => b.with_srcmap(Some(srcmap)),
             Err(e) => return text_result(format!("cannot open {target} for debug: {e:?}"), true),
         };

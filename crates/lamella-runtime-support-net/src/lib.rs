@@ -46,6 +46,12 @@ struct NetRtState {
     net: Option<Box<dyn NetBackend>>,
     #[cfg(feature = "tls")]
     tls: Option<Box<dyn TlsBackend>>,
+    /// The SAME monotonic millisecond clock the net stack was constructed with -- copied here so
+    /// `lamella_net_now_ms` exposes it to the AOT scheduler's reactor without a board-specific
+    /// symbol (single source of truth: the reactor's `now_millis` and `NetSmoltcp`'s `now_ms`
+    /// read one timer). A `static` cannot hold it (the archive has no writable-data segment), so
+    /// it lives in this caller-provided region like the backend cells.
+    now_ms: Option<fn() -> u64>,
 }
 
 /// The caller region base, or 0 before [`lamella_net_rt_init_ram`].
@@ -104,6 +110,7 @@ pub unsafe extern "C" fn lamella_net_rt_init_ram(base: *mut u8, len: usize) {
                 net: None,
                 #[cfg(feature = "tls")]
                 tls: None,
+                now_ms: None,
             },
         );
         let heap_start = (base + STATE_OFF + core::mem::size_of::<NetRtState>() + 7) & !7;
@@ -116,17 +123,39 @@ pub unsafe extern "C" fn lamella_net_rt_init_ram(base: *mut u8, len: usize) {
 
 /// Installs the networking backend the C-ABI entries drive. The board firmware calls this once
 /// at boot (after [`lamella_net_rt_init_ram`]) with its `SmoltcpNet<BoardDevice>`; a second call
-/// replaces the first (dropping any open sockets with the old backend).
+/// replaces the first (dropping any open sockets with the old backend). A board should ALSO call
+/// [`set_now_ms`] with the SAME clock it handed the backend, so [`lamella_net_now_ms`] can expose it.
 pub fn install_net(backend: Box<dyn NetBackend>) {
     if let Some(state) = rt_state() {
         state.net = Some(backend);
     }
 }
 
+/// Records the monotonic millisecond clock the net stack runs on, so the AOT scheduler's reactor
+/// reads the SAME timer through [`lamella_net_now_ms`] rather than hard-coding a board's timer. The
+/// board firmware calls this with the same `now_ms` it passed `SmoltcpNet::new`; [`install_loopback`]
+/// registers its counting clock here for the QEMU vehicle.
+pub fn set_now_ms(now_ms: fn() -> u64) {
+    if let Some(state) = rt_state() {
+        state.now_ms = Some(now_ms);
+    }
+}
+
 /// Installs a smoltcp LOOPBACK stack at 127.0.0.1/8 -- no MAC, no board: the QEMU / e2e
 /// vehicle. `now_ms` is the image's monotonic millisecond clock (QEMU images derive one
-/// from a counter loop; boards use their timer).
+/// from a counter loop; boards use their timer). This Rust entry serves the SCHEDULER-LESS
+/// tier (serve/interp hosts), whose managed poll loop busy-retries -- so it installs with
+/// the 50 ms in-op grace, the only window that tier gives the stack to progress inside
+/// each retry.
 pub fn install_loopback(now_ms: fn() -> u64) {
+    install_loopback_with_grace(now_ms, 50);
+}
+
+/// The tier-split core of [`install_loopback`]: the caller states the would-block grace its
+/// execution tier needs. The grace exists for scheduler-less callers only; a tier whose
+/// socket seams PARK a would-block into the reactor's real wait does the same drive work
+/// there, so any in-op grace is pure added latency per op -- it passes 0.
+fn install_loopback_with_grace(now_ms: fn() -> u64, would_block_grace_ms: u64) {
     let device = smoltcp::phy::Loopback::new(smoltcp::phy::Medium::Ethernet);
     let mut config = lamella_net_smoltcp::NetConfig::new(
         [0x02, 0, 0, 0, 0, 0x01],
@@ -137,10 +166,11 @@ pub fn install_loopback(now_ms: fn() -> u64) {
             dns: alloc::vec::Vec::new(),
         },
     );
-    config.would_block_grace_ms = 50;
+    config.would_block_grace_ms = would_block_grace_ms;
     install_net(Box::new(lamella_net_smoltcp::SmoltcpNet::new(
         device, config, now_ms, 0x6c61_6d65_6c6c_6100,
     )));
+    set_now_ms(now_ms);
 }
 
 /// A monotonic stand-in clock for images with no timer wired yet (the QEMU loopback
@@ -160,10 +190,14 @@ fn counting_now_ms() -> u64 {
 
 /// The C-ABI twin of [`install_loopback`] for a reset stub that cannot call Rust
 /// generics: wires the loopback stack over the internal counting clock. An AOT image's
-/// boot sequence calls this once before the program entry.
+/// boot sequence calls this once before the program entry. Every image booting through
+/// here links the Tier-2 PARKING socket seams -- a would-block parks the green thread into
+/// the reactor's one real wait, where the same drive work happens anyway -- so it installs
+/// with grace 0; the scheduler-less tier's 50 ms in-op grace would be pure per-op latency
+/// on this path.
 #[unsafe(no_mangle)]
 pub extern "C" fn lamella_net_support_init_loopback() {
-    install_loopback(counting_now_ms);
+    install_loopback_with_grace(counting_now_ms, 0);
 }
 
 /// Runs `operation` on the installed backend, or reports the error sentinel.
@@ -318,6 +352,51 @@ pub extern "C" fn lamella_net_local_port(handle: i32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn lamella_net_close(handle: i32) {
     with_net((), |net| net.close(handle as u32));
+}
+
+/// The scheduler block point's socket wait: block until at least one REGISTERED socket is ready
+/// for its interest, or `timeout_ms` elapses, and write the ready handles into `out[..cap]`,
+/// returning how many were written (`-1` = no backend installed). `timeout_ms < 0` = block
+/// indefinitely (the reactor's `None`); `>= 0` = the millisecond timeout. Interest is registered
+/// by the socket ops themselves -- a `connect_poll`/`accept_poll`/`send_poll`/`recv_poll` that
+/// returns would-block has already registered the matching Read/Write interest, so a subsequent
+/// call here reports that handle once it readies. More than `cap` ready handles are truncated to
+/// `cap`; they stay registered and re-report on the next call, so none is lost (matching the
+/// reactor's `READY_BATCH` drain). The AOT native scheduler's `ReactorEnv::net_poll` calls this
+/// with a stack buffer -- allocation-free at the caller, though the net stack itself allocates.
+///
+/// # Safety
+/// `out` must reference `cap` writable `u32`s when non-null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_net_poll(timeout_ms: i64, out: *mut u32, cap: u32) -> i32 {
+    let timeout = if timeout_ms < 0 { None } else { Some(timeout_ms as u64) };
+    with_net(-1, |net| {
+        let ready = net.poll(timeout);
+        if out.is_null() || cap == 0 {
+            return 0;
+        }
+        let slots = unsafe { core::slice::from_raw_parts_mut(out, cap as usize) };
+        let n = ready.len().min(slots.len());
+        slots[..n].copy_from_slice(&ready[..n]);
+        n as i32
+    })
+}
+
+/// Drop `handle` from the poll-set once its parked waiter is woken (a stale registration must not
+/// produce a spurious later wake; a subsequent socket op re-arms it). The AOT scheduler's
+/// `ReactorEnv::net_deregister` calls this for each woken io-waiter.
+#[unsafe(no_mangle)]
+pub extern "C" fn lamella_net_deregister(handle: i32) {
+    with_net((), |net| net.deregister(handle as u32));
+}
+
+/// The monotonic millisecond clock the net stack runs on (`0` before a clock is registered) -- the
+/// AOT scheduler's `ReactorEnv::now_millis`. A board-independent symbol: it forwards to the SAME
+/// `now_ms` the firmware handed the net backend (via [`set_now_ms`] / [`install_loopback`]), so the
+/// reactor's timers and smoltcp read ONE timer. The scheduler need not know the board's timer.
+#[unsafe(no_mangle)]
+pub extern "C" fn lamella_net_now_ms() -> u64 {
+    rt_state().and_then(|state| state.now_ms).map_or(0, |clock| clock())
 }
 
 #[cfg(feature = "tls")]

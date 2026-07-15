@@ -2,9 +2,9 @@
 //! tools over stdio (JSON-RPC 2.0, newline-delimited), linking the crates directly (no wasm round-trip, no JS
 //! marshaling; always the latest toolchain; a single self-contained binary). Hand-rolled on `serde_json` --
 //! no tokio, no MCP SDK -- matching the workspace's dependency-minimal ethos. The compile+run path is the
-//! wireline REPL engine (`LcscCompiler` + `LoopbackLink`), the same one `wire-repl` and the Debug Console use.
+//! Lamella Link REPL engine (`LcscCompiler` + `LoopbackLink`), the same one `wire-repl` and the Debug Console use.
 
-use lamella_wireline::engine::{CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler};
+use lamella_wire_host::engine::{CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 

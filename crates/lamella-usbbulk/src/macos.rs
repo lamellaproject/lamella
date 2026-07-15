@@ -193,6 +193,7 @@ pub struct Device {
     intf: *mut *mut IOUSBInterfaceInterface500,
     ep_in: u8,
     ep_out: u8,
+    pipes: Vec<(u8, u8)>,
 }
 
 impl Device {
@@ -237,6 +238,40 @@ impl Device {
         Self::open(vendor_id, product_id, serial)
     }
 
+    /// The IOUSBLib pipe reference number for a USB endpoint address, or [`Error::NotFound`] if this
+    /// interface exposes no such bulk endpoint.
+    fn pipe_ref(&self, endpoint: u8) -> Result<u8> {
+        self.pipes
+            .iter()
+            .find_map(|&(addr, pipe)| (addr == endpoint).then_some(pipe))
+            .ok_or(Error::NotFound)
+    }
+
+    /// Sends one bulk OUT packet on a specific endpoint address (see [`crate::Device::write_endpoint`]).
+    pub fn write_endpoint(&mut self, endpoint: u8, data: &[u8]) -> Result<()> {
+        let pipe = self.pipe_ref(endpoint)?;
+        unsafe {
+            if ((**self.intf).WritePipeTO)(self.intf as *mut c_void, pipe, data.as_ptr() as *const c_void, data.len() as u32, 1000, 1000) != kIOReturnSuccess {
+                return Err(Error::Os("WritePipeTO failed".into()));
+            }
+            Ok(())
+        }
+    }
+
+    /// Reads one bulk IN packet from a specific endpoint address (see [`crate::Device::read_endpoint`]).
+    pub fn read_endpoint(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        let pipe = self.pipe_ref(endpoint)?;
+        unsafe {
+            let ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+            let mut size = buf.len() as u32;
+            let r = ((**self.intf).ReadPipeTO)(self.intf as *mut c_void, pipe, buf.as_mut_ptr() as *mut c_void, &mut size, ms, ms);
+            if r != kIOReturnSuccess {
+                return Err(Error::Os("ReadPipeTO failed".into()));
+            }
+            Ok(size as usize)
+        }
+    }
+
     pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
         unsafe {
             if ((**self.intf).WritePipeTO)(self.intf as *mut c_void, self.ep_out, data.as_ptr() as *const c_void, data.len() as u32, 1000, 1000) != kIOReturnSuccess {
@@ -276,7 +311,7 @@ unsafe fn open_vendor_interface(
     plugin_id: CFUUIDRef,
     intf_user: CFUUIDRef,
     intf_iid: CFUUIDBytes,
-) -> Option<(*mut *mut IOUSBInterfaceInterface500, u8, u8)> {
+) -> Option<(*mut *mut IOUSBInterfaceInterface500, u8, u8, Vec<(u8, u8)>)> {
     let req = IOUSBFindInterfaceRequest {
         bInterfaceClass: DONT_CARE,
         bInterfaceSubClass: DONT_CARE,
@@ -307,12 +342,15 @@ unsafe fn open_vendor_interface(
                     let mut n: u8 = 0;
                     ((**intf).GetNumEndpoints)(intf as *mut c_void, &mut n);
                     let (mut ep_in, mut ep_out) = (0u8, 0u8);
+                    let mut pipes: Vec<(u8, u8)> = Vec::new();
                     for pipe in 1..=n {
                         let (mut dir, mut num, mut tt, mut iv): (u8, u8, u8, u8) = (0, 0, 0, 0);
                         let mut mps: u16 = 0;
                         if ((**intf).GetPipeProperties)(intf as *mut c_void, pipe, &mut dir, &mut num, &mut tt, &mut mps, &mut iv) == kIOReturnSuccess
                             && tt == kUSBBulk
                         {
+                            let addr = if dir == kUSBIn { 0x80 | num } else { num };
+                            pipes.push((addr, pipe));
                             if dir == kUSBIn {
                                 ep_in = pipe;
                             } else if dir == kUSBOut {
@@ -321,7 +359,7 @@ unsafe fn open_vendor_interface(
                         }
                     }
                     if ep_in != 0 && ep_out != 0 {
-                        found = Some((intf, ep_in, ep_out));
+                        found = Some((intf, ep_in, ep_out, pipes));
                     } else {
                         ((**intf).USBInterfaceClose)(intf as *mut c_void);
                         ((**intf).Release)(intf as *mut c_void);
@@ -381,7 +419,7 @@ unsafe fn try_device(
     ((**dev).SetConfiguration)(dev as *mut c_void, 1);
 
     match open_vendor_interface(dev, plugin_id, intf_user, intf_iid) {
-        Some((intf, ep_in, ep_out)) => Some(Device { dev, intf, ep_in, ep_out }),
+        Some((intf, ep_in, ep_out, pipes)) => Some(Device { dev, intf, ep_in, ep_out, pipes }),
         None => {
             ((**dev).USBDeviceClose)(dev as *mut c_void);
             ((**dev).Release)(dev as *mut c_void);
@@ -390,10 +428,10 @@ unsafe fn try_device(
     }
 }
 
-/// Does this device declare a vendor-specific (class 0xFF) interface -- the CMSIS-DAP v2 / wireline bulk
+/// Does this device declare a vendor-specific (class 0xFF) interface -- the CMSIS-DAP v2 / Lamella Link bulk
 /// shape? Reads the CONFIGURATION DESCRIPTOR the OS cached at enumeration (`GetConfigurationDescriptorPtr`),
 /// NOT the live interface nodes: a vendor-only device the OS never configured (no class driver to claim it --
-/// e.g. the Pico's native-USB wireline carrier) exposes NO live interface objects to iterate, but its config
+/// e.g. the Pico's native-USB Lamella Link carrier) exposes NO live interface objects to iterate, but its config
 /// descriptor is always present. Opens nothing, so it is safe to probe any device.
 unsafe fn has_vendor_iface(dev: *mut *mut IOUSBDeviceInterface500) -> bool {
     let mut desc: *const u8 = null();

@@ -26,6 +26,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(arg_iterator_get),
     #[cfg(feature = "varargs")]
     entry!(arg_iterator_remaining),
+    entry!(array_clear_range),
     entry!(array_clone),
     entry!(array_empty),
     entry!(array_get_value),
@@ -71,6 +72,8 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(char_to_string),
     #[cfg(feature = "NETMFv4_4")]
     entry!(char_to_upper),
+    entry!(clock_is_set),
+    entry!(clock_set_ticks),
     #[cfg(feature = "NETMFv4_4")]
     entry!(collection_contains),
     #[cfg(feature = "NETMFv4_4")]
@@ -294,6 +297,10 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(member_get_type),
     entry!(mmio_read32),
     entry!(mmio_write32),
+    entry!(mmio_read8),
+    entry!(mmio_write8),
+    entry!(mmio_read16),
+    entry!(mmio_write16),
     #[cfg(feature = "NETMFv4_4")]
     entry!(method_invoke),
     #[cfg(feature = "NETMFv4_4")]
@@ -320,6 +327,14 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(monitor_pulse_all),
     entry!(monitor_try_enter),
     entry!(monitor_wait),
+    entry!(net_iface_count),
+    entry!(net_iface_flags),
+    entry!(net_iface_gateway),
+    entry!(net_iface_ipv4),
+    entry!(net_iface_oper_status),
+    entry!(net_iface_subnet),
+    entry!(net_iface_type),
+    entry!(net_is_available),
     entry!(object_ctor),
     entry!(object_get_type),
     entry!(object_reference_equals),
@@ -334,6 +349,15 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(reflect_handle_not_equals),
     #[cfg(feature = "finalizers")]
     entry!(reregister_finalize),
+    entry!(serial_bytes_to_read),
+    entry!(serial_bytes_to_write),
+    entry!(serial_close),
+    entry!(serial_discard_in),
+    entry!(serial_discard_out),
+    entry!(serial_flush),
+    entry!(serial_open),
+    entry!(serial_read),
+    entry!(serial_write),
     #[cfg(feature = "float")]
     entry!(single_parse),
     #[cfg(feature = "float")]
@@ -350,6 +374,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(socket_local_port),
     entry!(socket_recv),
     entry!(socket_send),
+    entry!(socket_set_recv_timeout),
     entry!(socket_udp_bind),
     entry!(socket_udp_recv_from),
     entry!(socket_udp_send_to),
@@ -378,6 +403,8 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(string_index_of_string),
     #[cfg(feature = "NETMFv4_4")]
     entry!(string_insert),
+    entry!(string_intern),
+    entry!(string_is_interned),
     entry!(string_is_null_or_empty),
     #[cfg(feature = "NETMFv4_4")]
     entry!(string_join),
@@ -414,16 +441,24 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(thread_sleep),
     entry!(thread_start),
     entry!(thread_yield),
+    entry!(aead_import_key),
+    entry!(aead_siv_decrypt),
+    entry!(aead_siv_encrypt),
+    entry!(tls_alpn_is),
     entry!(tls_client_config),
+    entry!(tls_client_config_alpn),
     entry!(tls_client_new),
     entry!(tls_close),
     entry!(tls_default_stack),
+    entry!(tls_drop_key),
+    entry!(tls_exporter_key),
     entry!(tls_peer_cert),
     entry!(tls_process),
     entry!(tls_read_plain),
     entry!(tls_read_tls),
     entry!(tls_server_config),
     entry!(tls_server_new),
+    entry!(tls_session_flags),
     entry!(tls_wants_write),
     entry!(tls_write_plain),
     entry!(tls_write_tls),
@@ -473,19 +508,19 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(weak_write_cell),
 ];
 
-/// The intrinsic-ABI LEVEL a target advertises in its wireline profile identity. Bump it ONLY
+/// The intrinsic-ABI LEVEL a target advertises in its Lamella Link profile identity. Bump it ONLY
 /// when an EXISTING intrinsic id's semantics change incompatibly -- adding or removing intrinsics
 /// already changes [`registry_fingerprint`] (the surface CONTENT hash), not the level.
 pub const INTRINSIC_ABI: u16 = 1;
 
 /// Every intrinsic id this build registers, in registry order -- the resident-surface listing a
-/// wireline `PROFILE_MANIFEST` carries (docs/deployment-tiers.md: a resident corlib is compatible
+/// Lamella Link `PROFILE_MANIFEST` carries (docs/deployment-tiers.md: a resident corlib is compatible
 /// iff its `[RuntimeProvided]` demand set is a SUBSET of these).
 pub fn registry_ids() -> impl Iterator<Item = u32> {
     REGISTRY.iter().map(|(id, _)| *id)
 }
 
-/// A short display name for THIS build's intrinsic surface -- the wireline profile identity's
+/// A short display name for THIS build's intrinsic surface -- the Lamella Link profile identity's
 /// name hint. Derived from the same features that shape [`REGISTRY`], so it cannot drift from
 /// [`registry_fingerprint`]: the desktop superset is "full", the NETMF-conformant device tier
 /// "netmf-v4_4", the bcl floor "kernel-floor".
@@ -601,5 +636,9 @@ mod tests {
         assert_eq!(intrinsic_id("array_clone"), 0x70AB_44F0);
         assert_eq!(intrinsic_id("string_concat"), 0xF106_E8DD);
         assert_eq!(intrinsic_id("mmio_write32"), 0xF37A_3AFA);
+        assert_eq!(intrinsic_id("mmio_read8"), 0x8B9D_EF8C);
+        assert_eq!(intrinsic_id("mmio_write8"), 0xA004_2EBD);
+        assert_eq!(intrinsic_id("mmio_read16"), 0x75B6_1213);
+        assert_eq!(intrinsic_id("mmio_write16"), 0x5F7F_622C);
     }
 }

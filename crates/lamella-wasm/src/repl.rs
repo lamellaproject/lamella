@@ -5,7 +5,7 @@
 use core::cell::RefCell;
 
 use lamella_metadata::Assembly;
-use lamella_wireline::engine::{CompileFailure, LoopbackLink, Outcome, Repl, ReplCompiler};
+use lamella_wire_host::engine::{CompileFailure, LoopbackLink, Outcome, Repl, ReplCompiler};
 
 use crate::abi::result_buffer;
 use crate::compile::split_refs;

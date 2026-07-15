@@ -57,45 +57,60 @@ const DEBUG_DIRECTORY_SIZE: u32 = 28;
 /// at its start (so the COM-descriptor directory points at [`TEXT_RVA`]).
 #[must_use]
 pub fn write_image(text: &[u8], is_dll: bool) -> Vec<u8> {
-    write_image_with_debug(text, is_dll, None)
+    write_image_with_debug(text, is_dll, &[])
 }
 
-/// Builds one `IMAGE_DEBUG_DIRECTORY` entry of type `CODEVIEW` (2), addressing the
-/// CodeView record by both RVA and file offset.
+/// Builds one `IMAGE_DEBUG_DIRECTORY` entry of the given `kind` (2 = CodeView, 17 = Embedded
+/// Portable PDB, 19 = PDB checksum), addressing its record by both RVA and file offset.
 fn debug_directory_entry(
+    kind: u32,
     address_of_raw_data: u32,
     pointer_to_raw_data: u32,
     size_of_data: u32,
 ) -> [u8; DEBUG_DIRECTORY_SIZE as usize] {
     let mut entry = [0u8; DEBUG_DIRECTORY_SIZE as usize];
-    put_u32(&mut entry, 12, 2);
+    if kind == 17 {
+        put_u16(&mut entry, 8, 0x0100);
+        put_u16(&mut entry, 10, 0x0100);
+    }
+    put_u32(&mut entry, 12, kind);
     put_u32(&mut entry, 16, size_of_data);
     put_u32(&mut entry, 20, address_of_raw_data);
     put_u32(&mut entry, 24, pointer_to_raw_data);
     entry
 }
 
-/// Writes the PE headers around `text`, optionally appending a debug directory and
-/// `codeview` record (an `RSDS` blob) so a debugger can find and match the PDB.
+/// Writes the PE headers around `text`, optionally appending a debug directory of
+/// `(type, record)` entries -- the CodeView `RSDS` blob so a debugger finds/matches the PDB,
+/// and (for an embedded build) the compressed PDB + its checksum.
 #[must_use]
-pub fn write_image_with_debug(text: &[u8], is_dll: bool, codeview: Option<&[u8]>) -> Vec<u8> {
+pub fn write_image_with_debug(text: &[u8], is_dll: bool, debug_entries: &[(u32, &[u8])]) -> Vec<u8> {
     let optional_start = (PE_OFFSET + 4 + 20) as usize;
     let headers_end = optional_start as u32 + OPTIONAL_HEADER_SIZE + 40;
     let size_of_headers = align(headers_end, FILE_ALIGNMENT);
 
     let mut body = Vec::from(text);
     let mut debug_directory = None;
-    if let Some(codeview) = codeview {
-        let entry_offset = body.len() as u32;
-        let data_offset = entry_offset + DEBUG_DIRECTORY_SIZE;
-        let entry = debug_directory_entry(
-            TEXT_RVA + data_offset,
-            size_of_headers + data_offset,
-            codeview.len() as u32,
-        );
-        body.extend_from_slice(&entry);
-        body.extend_from_slice(codeview);
-        debug_directory = Some((TEXT_RVA + entry_offset, DEBUG_DIRECTORY_SIZE));
+    if !debug_entries.is_empty() {
+        let array_offset = body.len() as u32;
+        let array_size = DEBUG_DIRECTORY_SIZE * debug_entries.len() as u32;
+        let mut array = Vec::with_capacity(array_size as usize);
+        let mut records = Vec::new();
+        let mut record_offset = array_offset + array_size;
+        for (kind, record) in debug_entries {
+            let entry = debug_directory_entry(
+                *kind,
+                TEXT_RVA + record_offset,
+                size_of_headers + record_offset,
+                record.len() as u32,
+            );
+            array.extend_from_slice(&entry);
+            records.extend_from_slice(record);
+            record_offset += record.len() as u32;
+        }
+        body.extend_from_slice(&array);
+        body.extend_from_slice(&records);
+        debug_directory = Some((TEXT_RVA + array_offset, array_size));
     }
 
     let text = body.as_slice();
@@ -156,6 +171,31 @@ pub fn write_image_with_debug(text: &[u8], is_dll: bool, codeview: Option<&[u8]>
     out.extend_from_slice(text);
     out.resize((size_of_headers + text_raw_size) as usize, 0);
     out
+}
+
+/// Reads back the `(type, record)` debug directory entries an image carries -- the inverse of
+/// what [`write_image_with_debug`] wrote (data directory 6 -> the entry array -> each record by
+/// its file offset). Used to verify the embedded-PDB emission.
+#[cfg(test)]
+pub(crate) fn read_debug_directory(image: &[u8]) -> alloc::vec::Vec<(u32, alloc::vec::Vec<u8>)> {
+    let read_u32 = |offset: usize| u32::from_le_bytes(image[offset..offset + 4].try_into().unwrap());
+    let opt = (PE_OFFSET + 4 + 20) as usize;
+    let dir_rva = read_u32(opt + 0x60 + 6 * 8);
+    let dir_size = read_u32(opt + 0x60 + 6 * 8 + 4);
+    if dir_rva == 0 || dir_size == 0 {
+        return alloc::vec::Vec::new();
+    }
+    let mut entries = alloc::vec::Vec::new();
+    let mut cursor =
+        (dir_rva - TEXT_RVA + read_u32(opt + 0x3C)) as usize;
+    for _ in 0..dir_size / DEBUG_DIRECTORY_SIZE {
+        let kind = read_u32(cursor + 12);
+        let size = read_u32(cursor + 16) as usize;
+        let file_offset = read_u32(cursor + 24) as usize;
+        entries.push((kind, image[file_offset..file_offset + size].to_vec()));
+        cursor += DEBUG_DIRECTORY_SIZE as usize;
+    }
+    entries
 }
 
 /// The size of the CLI header in bytes (II.25.3.3).

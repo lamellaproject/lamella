@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "The wireline debug + REPL RUNNER core, shared by the host reference runner, the browser (wasm) runner, and the on-device firmware: run_program (load the managed corlib + run a program + capture its output) + the serve_one request handler + the host driver helpers, over the lamella-wire Transport seam. no_std + alloc so it rides onto a microcontroller."
+description = "The Lamella Link debug + REPL RUNNER core, shared by the host reference runner, the browser (wasm) runner, and the on-device firmware: run_program (load the managed corlib + run a program + capture its output) + the serve_one request handler + the host driver helpers, over the lamella-wire Transport seam. no_std + alloc so it rides onto a microcontroller."
 
 [dependencies]
 lamella-wire = { path = "../lamella-wire" }
@@ -31,10 +31,14 @@ debug-names = ["lamella-load/debug-names"]
 # (intrinsic BCL + exceptions + GC, no float / math / finalizers / varargs) for the tightest parts
 # (micro:bit v1, 256 KB flash) so the interpreter leaves room for a deployed image.
 profile-full = [
-    "lamella-load/NETMFv4_4", "lamella-load/exceptions", "lamella-load/float", "lamella-load/gc",
-    "lamella-load/finalizers", "lamella-load/math-transcendental", "lamella-load/typed-references",
+    "lamella-load/NETMFv4_4", "lamella-load/exceptions", "float", "lamella-load/gc",
+    "lamella-load/finalizers", "lamella-load/math-transcendental", "typed-references",
     "lamella-load/varargs",
 ]
+# cfg-testable passthroughs for the Value variants the debug `<val>` encoder names: the encoder
+# compiles on every profile and emits the float/typedref tags only where the tier carries them.
+float = ["lamella-load/float"]
+typed-references = ["lamella-load/typed-references"]
 profile-minimal = ["lamella-load/bcl", "lamella-load/exceptions", "lamella-load/gc"]
 # RUN_IMAGE support: boot + run a baked flash image (Module::from_baked) as the runner's execution
 # path -- the PE-less constrained-target story. Forwards the loader's code-in-place (XIP) knob, which

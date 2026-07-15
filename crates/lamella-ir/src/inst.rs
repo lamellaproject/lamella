@@ -509,6 +509,35 @@ pub enum Inst {
         /// The scalar value to store (its width comes from its type).
         value: ValueId,
     },
+    /// Loads a SUB-WORD scalar field -- a `bool`/`byte`/`sbyte` (`size` 1) or `short`/`ushort`/
+    /// `char` (`size` 2) `ldfld`. A distinct instruction because the width is invisible in the
+    /// result's type (a narrow field widens to I32 on the evaluation stack) yet the ACCESS must
+    /// be byte-/halfword-wide: such fields sit at unaligned offsets in the natural layout, and a
+    /// word-wide read would misread the neighboring fields.
+    FieldLoadNarrow {
+        /// The instance being read (a heap reference, managed pointer, or slot-resident struct).
+        base: ValueId,
+        /// The field's byte offset within the instance.
+        offset: u32,
+        /// The field's width in bytes: 1 or 2.
+        size: u8,
+        /// Whether the loaded value sign-extends (`sbyte`/`short`) or zero-extends
+        /// (`bool`/`byte`/`char`/`ushort`) into the I32 result.
+        signed: bool,
+    },
+    /// Stores the low `size` bytes of `value` into a SUB-WORD scalar field -- the `stfld` twin
+    /// of [`Inst::FieldLoadNarrow`]. Width-exact by necessity: a word-wide store to a 1-byte
+    /// field would STOMP the adjacent fields (`signaled = false` zeroing its neighbor).
+    FieldStoreNarrow {
+        /// The instance being written.
+        base: ValueId,
+        /// The field's byte offset within the instance.
+        offset: u32,
+        /// The scalar whose low `size` bytes are stored.
+        value: ValueId,
+        /// The field's width in bytes: 1 or 2.
+        size: u8,
+    },
     /// The address of the value-type `base`'s field at byte `offset` -- the CLI's `ldflda`
     /// once the address escapes (e.g. as an instance method's `this`). The result is a
     /// managed pointer; the lowering materializes `&base + offset`.
@@ -774,19 +803,39 @@ pub enum Inst {
         /// The size in bytes of one element.
         element_size: u32,
     },
-    /// Loads a static field -- the CLI's `ldsfld`. `offset` is the field's byte offset within the
-    /// module's static storage region (the target adds its static base). Static fields holding an
-    /// `ObjectRef` are GC roots the collector must scan; only scalar statics are lowered so far.
+    /// Loads a static field -- the CLI's `ldsfld`. `offset` is the field's byte offset within
+    /// `owner`'s static storage region (the target adds that region's base). Static fields holding
+    /// an `ObjectRef` are GC roots the collector must scan; only scalar statics are lowered so far.
     StaticLoad {
-        /// The field's byte offset within the static region.
+        /// Whose static region the field lives in.
+        owner: StaticOwner,
+        /// The field's byte offset within the owner's static region.
         offset: u32,
     },
     /// Stores `value` into a static field -- the CLI's `stsfld`. A side effect; the result is a
     /// placeholder callers ignore.
     StaticStore {
-        /// The field's byte offset within the static region.
+        /// Whose static region the field lives in.
+        owner: StaticOwner,
+        /// The field's byte offset within the owner's static region.
         offset: u32,
         /// The value to store.
         value: ValueId,
     },
+}
+
+/// Whose static storage region a [`Inst::StaticLoad`]/[`Inst::StaticStore`] addresses. Every
+/// assembly's statics live in the assembly's OWN region; a cross-assembly `ldsfld`/`stsfld` (a
+/// field `MemberRef` into a referenced assembly, ECMA-335 II.22.25) must address the OWNER's
+/// region with the OWNER's dense slot numbering -- addressing the accessor's own region there
+/// would read a phantom slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StaticOwner {
+    /// The lowered module's own region (a this-assembly `Field` token, or the synthesized
+    /// exception-tag machinery at offset 0).
+    #[default]
+    Own,
+    /// The region of the referenced assembly at this ordinal, in the build's reference order
+    /// (the same ordering reference-owned type handles and descriptor qualifiers use).
+    Reference(u8),
 }

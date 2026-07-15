@@ -1,4 +1,4 @@
-//! Identity + USB descriptors for the native driverless-WinUSB wireline carrier -- the fast
+//! Identity + USB descriptors for the native driverless-WinUSB Lamella Link carrier -- the fast
 //! interpreter-flash path for a board with a native USB device peripheral.
 
 /// Vendor id: the pid.codes open-source VID for development (swap for an allocated Lamella PID before
@@ -6,7 +6,7 @@
 pub const VID: u16 = 0x1209;
 /// Product id: the pid.codes prototype PID.
 pub const PID: u16 = 0x0001;
-/// The WinUSB device-interface GUID a host opens to reach the wireline vendor interface. The device
+/// The WinUSB device-interface GUID a host opens to reach the Lamella Link vendor interface. The device
 /// advertises it in its Microsoft OS 2.0 `DeviceInterfaceGUIDs` registry property; the host matches on
 /// it. Stable by contract -- changing it makes the device invisible to an existing host.
 pub const WINUSB_INTERFACE_GUID: &str = "{1D4B2365-4749-5541-8D5E-9A0A0000C0DE}";
