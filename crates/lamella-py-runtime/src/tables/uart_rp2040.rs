@@ -1,5 +1,5 @@
 //! The Raspberry Pi RP2040 UART0 (an ARM PrimeCell PL011) register facts -- transcribed from
-//! the repo's docs/peripheral-tables/uart-rp2040.toml (sources: the official RP2040 SVD + the
+//! the neutral peripheral-table SSOT (sources: the official RP2040 SVD + the
 //! datasheet sections the silicon-proven rp2040-serve UART path cites; the sequence is
 //! silicon-verified on a Pico H via loopback + a logic-analyzer decode).
 

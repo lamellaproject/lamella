@@ -602,6 +602,60 @@ impl<'a> Assembly<'a> {
         self.strings().get(row.raw(7)).ok()
     }
 
+    /// This assembly's own version `(major, minor, build, revision)` (the `Assembly` row, II.22.2).
+    #[must_use]
+    pub fn assembly_version(&self) -> (u16, u16, u16, u16) {
+        self.tables
+            .row(table::ASSEMBLY, 1)
+            .map_or((0, 0, 0, 0), |row| {
+                (
+                    row.raw(1) as u16,
+                    row.raw(2) as u16,
+                    row.raw(3) as u16,
+                    row.raw(4) as u16,
+                )
+            })
+    }
+
+    /// This assembly's full public key (the `Assembly.PublicKey` blob, II.22.2); empty if the
+    /// assembly is unsigned. A reference assembly carries the FULL key here, and an `AssemblyRef`
+    /// to it may hold either that key (with the `afPublicKey` flag) or its derived 8-byte token.
+    #[must_use]
+    pub fn assembly_public_key(&self) -> &'a [u8] {
+        self.tables
+            .row(table::ASSEMBLY, 1)
+            .and_then(|row| self.image.blob().get(row.raw(6)).ok())
+            .unwrap_or(&[])
+    }
+
+    /// This assembly's hash-algorithm id (the `Assembly.HashAlgId` column, II.22.2 -- an
+    /// `AssemblyHashAlgorithm`, e.g. `0x8004` for SHA-1), or `0` (None) if absent.
+    #[must_use]
+    pub fn assembly_hash_algorithm(&self) -> u32 {
+        self.tables
+            .row(table::ASSEMBLY, 1)
+            .map_or(0, |row| row.raw(0))
+    }
+
+    /// This assembly's flags (the `Assembly.Flags` column, II.22.2 / II.23.1.2), or `0` if absent.
+    #[must_use]
+    pub fn assembly_flags(&self) -> u32 {
+        self.tables
+            .row(table::ASSEMBLY, 1)
+            .map_or(0, |row| row.raw(5))
+    }
+
+    /// This assembly's culture name (the `Assembly.Culture` column, II.22.2), or `None` for the
+    /// neutral culture (a nil column).
+    #[must_use]
+    pub fn assembly_culture(&self) -> Option<&'a str> {
+        let row = self.tables.row(table::ASSEMBLY, 1)?;
+        match row.raw(8) {
+            0 => None,
+            offset => self.strings().get(offset).ok(),
+        }
+    }
+
     /// The 1-based `index`-th `TypeRef` (a referenced type, II.22.38).
     #[must_use]
     pub fn type_ref(&self, index: u32) -> Option<TypeRef<'a>> {
@@ -1814,6 +1868,27 @@ impl<'a> AssemblyRef<'a> {
                     row.raw(3) as u16,
                 )
             })
+    }
+
+    /// The reference's flags (II.23.1.2). The `afPublicKey` bit (0x0001) says
+    /// [`AssemblyRef::public_key_or_token`] holds the full public key rather than its 8-byte token.
+    #[must_use]
+    pub fn flags(&self) -> u32 {
+        self.assembly
+            .tables
+            .row(table::ASSEMBLY_REF, self.index)
+            .map_or(0, |row| row.raw(4))
+    }
+
+    /// The reference's public key or token blob (II.22.5); empty for a tokenless name-only
+    /// reference. [`AssemblyRef::flags`] `afPublicKey` distinguishes a full key from a token.
+    #[must_use]
+    pub fn public_key_or_token(&self) -> &'a [u8] {
+        self.assembly
+            .tables
+            .row(table::ASSEMBLY_REF, self.index)
+            .and_then(|row| self.assembly.image.blob().get(row.raw(5)).ok())
+            .unwrap_or(&[])
     }
 }
 

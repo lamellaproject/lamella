@@ -106,6 +106,10 @@ pub struct MethodSymbol {
     /// Whether the last parameter is a `params` array (a variable-length trailing
     /// argument list at the call site).
     pub is_params: bool,
+    /// Whether the parameter list ends with csc's `__arglist` marker (the typedref knob):
+    /// the member takes CLI varargs beyond `parameters`, and a call must supply a trailing
+    /// `__arglist(...)` argument at the sentinel position.
+    pub is_vararg: bool,
     /// Whether the method is declared `virtual` -- an overridable vtable slot. An
     /// interface's members are implicitly virtual+abstract.
     pub is_virtual: bool,
@@ -594,6 +598,7 @@ mod tests {
             parameters: Vec::new(),
             is_static: false,
             is_params: false,
+            is_vararg: false,
             is_virtual: false,
             is_abstract: false,
             is_override: false,
@@ -606,6 +611,7 @@ mod tests {
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Int32)],
             is_static: false,
             is_params: false,
+            is_vararg: false,
             is_virtual: false,
             is_abstract: false,
             is_override: false,
@@ -618,6 +624,7 @@ mod tests {
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::Double)],
             is_static: false,
             is_params: false,
+            is_vararg: false,
             is_virtual: false,
             is_abstract: false,
             is_override: false,

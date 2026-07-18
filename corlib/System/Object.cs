@@ -8,5 +8,13 @@ namespace System
         public virtual int GetHashCode() { return 0; }
         [Lamella.Runtime.RuntimeProvided] public virtual string ToString() { return null; }
         [Lamella.Runtime.RuntimeProvided] public Type GetType() { return null; }
+
+        [Lamella.Runtime.RuntimeProvided] public static bool ReferenceEquals(object objA, object objB) { return false; }
+
+        public static bool Equals(object objA, object objB)
+        {
+            if (objA == null) return objB == null;
+            return objA.Equals(objB);
+        }
     }
 }

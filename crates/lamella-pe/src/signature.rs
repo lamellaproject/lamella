@@ -157,6 +157,56 @@ pub fn method_signature(has_this: bool, parameters: &[TypeSig], return_type: &Ty
     out
 }
 
+/// Encodes a vararg method DEF signature (II.23.2.1, `VARARG` convention): only the
+/// FIXED parameters appear (no sentinel); the variable arguments live in each call
+/// site's signature. csc emits `25 00 01` for `public T(__arglist)`.
+#[must_use]
+pub fn vararg_method_signature(
+    has_this: bool,
+    parameters: &[TypeSig],
+    return_type: &TypeSig,
+) -> Vec<u8> {
+    let mut out = vec![if has_this {
+        calling::VARARG | calling::HAS_THIS
+    } else {
+        calling::VARARG
+    }];
+    compress_u32(parameters.len() as u32, &mut out);
+    encode_type(return_type, &mut out);
+    for parameter in parameters {
+        encode_type(parameter, &mut out);
+    }
+    out
+}
+
+/// Encodes a vararg CALL-SITE signature (II.23.2.1): the `VARARG` convention, the
+/// TOTAL parameter count, the return type, the fixed parameter types, a `SENTINEL`,
+/// then each variable argument's type. csc emits `25 04 01 41 08 0E 1C 0D` for
+/// `new T(__arglist(2, "s", null, 2.2))` (null rides as `object`).
+#[must_use]
+pub fn vararg_call_site_signature(
+    has_this: bool,
+    fixed: &[TypeSig],
+    variable: &[TypeSig],
+    return_type: &TypeSig,
+) -> Vec<u8> {
+    let mut out = vec![if has_this {
+        calling::VARARG | calling::HAS_THIS
+    } else {
+        calling::VARARG
+    }];
+    compress_u32((fixed.len() + variable.len()) as u32, &mut out);
+    encode_type(return_type, &mut out);
+    for parameter in fixed {
+        encode_type(parameter, &mut out);
+    }
+    out.push(calling::SENTINEL);
+    for argument in variable {
+        encode_type(argument, &mut out);
+    }
+    out
+}
+
 /// Encodes a field signature (II.23.2.4).
 #[must_use]
 pub fn field_signature(field_type: &TypeSig) -> Vec<u8> {
@@ -237,6 +287,32 @@ mod tests {
         assert_eq!(
             local_signature(&[TypeSig::Int32, TypeSig::Boolean]),
             [0x07, 0x02, 0x08, 0x02]
+        );
+    }
+
+    #[test]
+    fn vararg_signatures_match_the_csc_oracle() {
+        assert_eq!(
+            vararg_method_signature(true, &[], &TypeSig::Void),
+            [0x25, 0x00, 0x01]
+        );
+        assert_eq!(
+            vararg_method_signature(false, &[TypeSig::Int32], &TypeSig::Int32),
+            [0x05, 0x01, 0x08, 0x08]
+        );
+        assert_eq!(
+            vararg_call_site_signature(
+                true,
+                &[],
+                &[
+                    TypeSig::Int32,
+                    TypeSig::String,
+                    TypeSig::Object,
+                    TypeSig::Double
+                ],
+                &TypeSig::Void
+            ),
+            [0x25, 0x04, 0x01, 0x41, 0x08, 0x0E, 0x1C, 0x0D]
         );
     }
 }

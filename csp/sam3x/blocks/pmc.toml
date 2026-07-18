@@ -1,0 +1,104 @@
+# The SAM3X Power Management Controller block: the peripheral-clock registers the bring-up
+# paths touch, plus the clock generator (main oscillator, PLLA, master clock) a board PLAN programs
+# to reach an operating point (partial, append-only, schema total). Offsets are PMC-base-
+# relative; the base lives in ../instances.toml. Nothing here names a rate, a crystal, or a board --
+# a plan's chosen MULA/DIVA/PRES and its resulting MCK are plan facts.
+
+[table]
+kind = "block"
+family = "sam3x"
+block = "pmc"
+sources = [
+    "SAM3X/A datasheet Atmel-11057C: PMC Peripheral Clock Enable/Disable/Status registers (ch 28.15)",
+    "SAM3X/A datasheet Atmel-11057C: PMC clock generator -- CKGR_MOR (28.15.8), CKGR_MCFR (28.15.9), CKGR_PLLAR (28.15.10), PMC_MCKR (28.15.11), PMC_SR (28.15.16)",
+    "silicon-grounded on an Arduino Due: the running Atmel boot code reads back CKGR_PLLAR = 0x200D3F01 (ONE | MULA 13 | PLLACOUNT 63 | DIVA 1) and PMC_MCKR = 0x00000012 (CSS PLLA_CLK | PRES CLK_2) at these offsets",
+]
+notes = [
+    "A peripheral's clock is enabled by writing 1 to its id's bit in PCER0 (id 0-31; PCER1 covers id >= 32) and read back in PCSR0; peripheral clocks are off until enabled (silicon: PCSR0 = 0 -> 0x100 after enabling the UART, pid 8).",
+    "The instance row carries the peripheral id; a driver ORs 1 << (id % 32) into PCER0/PCER1. Named bits are those the current bring-up gates; append.",
+    "MCK chain: MAINCK / DIVA * (MULA + 1) = PLLA; PLLA / (PLLADIV2 + 1) / PRES = MCK. A plan states the source rate and the chain; the resulting MCK and any divisor derive from it.",
+    "CKGR_MOR and PMC_MCKR are WRITE-PROTECTED by PMC_WPMR: write WPMR = 0x504D4300 ('PMC' key, WPEN = 0) before programming them if the running firmware enabled protection.",
+    "PMC_MCKR MUST NOT be programmed in a single write when selecting a PLL source (28.15.11): write PRES, wait PMC_SR.MCKRDY, then write CSS, wait MCKRDY again. Reversing the order for a PLL source is the documented trap.",
+    "CKGR_PLLAR bit 29 (ONE) must always be written 1 (28.15.10). MULA = 0 deactivates PLLA; the PLLA clock is the input multiplied by MULA + 1.",
+    "CKGR_MCFR.MAINF counts MAINCK cycles per 16 SLOW-CLOCK periods, and the on-chip slow RC is spec'd 20-44 kHz (Table 45-15), so MAINF BOUNDS the main clock (+-37%) rather than measuring it. Atmel's own boot ROM allows for exactly this when it gates USB on a 12.000 MHz crystal (ch 20.3).",
+    "DATASHEET ERROR, corrected by silicon -- PMC_SR.MOSCSELS: Atmel-11057 28.15.16 states '0 = Selection is done, 1 = Selection is in progress'. That is INVERTED. Atmel's own SAM4S datasheet (Atmel-11100 29.17.16), documenting the same PMC block, states the opposite: '0: Selection is in progress. 1: Selection is done.' Silicon settles it: an Arduino Due running stably at 84 MHz with the crystal long since selected reads PMC_SR = 0x0003004B -- MOSCSELS (bit 16) SET. A settled part cannot be reporting a selection still in progress, so 1 = DONE. After writing CKGR_MOR.MOSCSEL, WAIT FOR MOSCSELS TO BE SET; a driver written from this datasheet's text alone waits on the wrong level.",
+]
+
+[registers.PCER0]
+offset = 0x10
+width = 32
+fields = { UART = [8, 1], PIOA = [11, 1] }
+notes = "Peripheral Clock Enable Register 0 (write-only): write 1 to bit <id> to enable that peripheral's clock (id 0-31)."
+
+[registers.PCDR0]
+offset = 0x14
+width = 32
+fields = { UART = [8, 1], PIOA = [11, 1] }
+notes = "Peripheral Clock Disable Register 0 (write-only)."
+
+[registers.PCSR0]
+offset = 0x18
+width = 32
+fields = { UART = [8, 1], PIOA = [11, 1] }
+notes = "Peripheral Clock Status Register 0 (read-only): bit <id> = 1 when that clock is enabled."
+
+# -- the clock generator: what a board PLAN programs to reach its operating point --
+
+[registers.CKGR_MOR]
+offset = 0x20
+width = 32
+fields = { MOSCXTEN = [0, 1], MOSCXTBY = [1, 1], MOSCRCEN = [3, 1], MOSCRCF = [4, 3], MOSCXTST = [8, 8], KEY = [16, 8], MOSCSEL = [24, 1], CFDEN = [25, 1] }
+notes = "Main Oscillator Register. KEY must be 0x37 or the write aborts. MOSCXTEN enables the crystal (MOSCXTS rises in PMC_SR when stable); MOSCSEL 1 selects it over the on-chip RC. MOSCRCF selects the RC rate (0 = 4 MHz at start-up, 1 = 8 MHz, 2 = 12 MHz). MOSCXTST = crystal start-up time in slow-clock cycles x8."
+
+[registers.CKGR_MCFR]
+offset = 0x24
+width = 32
+fields = { MAINF = [0, 16], MAINFRDY = [16, 1] }
+notes = "Main Clock Frequency Register (read-only). MAINF = MAINCK cycles within 16 slow-clock periods, valid once MAINFRDY is set. The slow RC's 20-44 kHz spread makes this a bound, not a measurement (see the block notes)."
+
+[registers.CKGR_PLLAR]
+offset = 0x28
+width = 32
+fields = { DIVA = [0, 8], PLLACOUNT = [8, 6], MULA = [16, 11], ONE = [29, 1] }
+notes = "PLLA Register. PLLA = (MAINCK / DIVA) * (MULA + 1); DIVA 0 disables the divider, 1 bypasses it. PLLACOUNT = slow-clock cycles x8 before PMC_SR.LOCKA rises. ONE (bit 29) must always be written 1."
+
+[registers.PMC_MCKR]
+offset = 0x30
+width = 32
+fields = { CSS = [0, 2], PRES = [4, 3], PLLADIV2 = [12, 1], UPLLDIV2 = [13, 1] }
+notes = "Master Clock Register. CSS selects the source (0 SLOW_CLK, 1 MAIN_CLK, 2 PLLA_CLK, 3 UPLL_CLK); PRES divides it; PLLADIV2 1 halves PLLA first. See the block note on the mandatory two-step write order."
+
+[registers.PMC_SR]
+offset = 0x68
+width = 32
+fields = { MOSCXTS = [0, 1], LOCKA = [1, 1], MCKRDY = [3, 1], LOCKU = [6, 1], OSCSELS = [7, 1], MOSCSELS = [16, 1], MOSCRCS = [17, 1] }
+notes = "Status Register (read-only). MOSCXTS = crystal stable; LOCKA = PLLA locked; MCKRDY = master clock ready (clears on any CSS/PRES change); OSCSELS = the slow clock is an external 32 kHz crystal rather than the RC. MOSCSELS = 1 means the main-oscillator SELECTION IS DONE -- see the block note; the datasheet's own text for this bit is inverted and wrong."
+
+[registers.PMC_WPMR]
+offset = 0xE4
+width = 32
+fields = { WPEN = [0, 1], WPKEY = [8, 24] }
+notes = "Write Protect Mode Register. WPKEY must be 0x504D43 ('PMC'); WPEN 0 disables protection on CKGR_MOR / PMC_MCKR and friends."
+
+# Block-scoped magic only: passwords, field encodings. No rate, no board, no plan choice.
+#
+# The PRES encodings are the DE-SHIFTED reading of Atmel-11057 28.15.11. In the datasheet's text
+# form that table's Description column is offset one row from its Value/Name column, so a literal
+# read pairs CLK with "divided by 2" and CLK_3 with nothing. The NAMES carry the truth and are
+# self-checking (CLK_2 divides by 2), which is what this table encodes; PRES 7 = CLK_3 = divide by
+# 3 is the one that a shifted read silently loses.
+[constants]
+MOR_KEY = 0x37
+WPMR_DISABLE = 0x504D4300
+MCKR_CSS_SLOW_CLK = 0
+MCKR_CSS_MAIN_CLK = 1
+MCKR_CSS_PLLA_CLK = 2
+MCKR_CSS_UPLL_CLK = 3
+MCKR_PRES_CLK = 0
+MCKR_PRES_CLK_2 = 1
+MCKR_PRES_CLK_4 = 2
+MCKR_PRES_CLK_8 = 3
+MCKR_PRES_CLK_16 = 4
+MCKR_PRES_CLK_32 = 5
+MCKR_PRES_CLK_64 = 6
+MCKR_PRES_CLK_3 = 7

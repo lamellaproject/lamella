@@ -3,7 +3,8 @@
 use crate::bound::integer_literal;
 use crate::special::SpecialType;
 use crate::symbols::{
-    Accessibility, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo, TypeKind,
+    Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo,
+    TypeKind,
 };
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
@@ -99,6 +100,7 @@ fn type_info(
             is_params: method
                 .params()
                 .any(|parameter| param_array.contains(&parameter.token().row())),
+            is_vararg: signature.is_vararg,
             is_virtual: method_is_virtual(method.flags()),
             is_abstract: method_is_abstract(method.flags()),
             is_override: method_is_virtual(method.flags()) && !method_is_newslot(method.flags()),
@@ -124,6 +126,21 @@ fn type_info(
                     accessibility: Accessibility::Public,
                     has_getter: method_name.starts_with("get_"),
                     has_setter: method_name.starts_with("set_"),
+                });
+            }
+        }
+        let event = method_name
+            .strip_prefix("add_")
+            .or_else(|| method_name.strip_prefix("remove_"))
+            .filter(|_| symbol.parameters.len() == 1)
+            .map(|name| (name, symbol.parameters[0].clone()));
+        if let Some((event_name, ty)) = event {
+            if info.find_event(event_name).is_none() {
+                info.events.push(EventSymbol {
+                    name: event_name.into(),
+                    ty,
+                    is_static: symbol.is_static,
+                    accessibility: symbol.accessibility,
                 });
             }
         }

@@ -194,17 +194,20 @@ spelled_enum! {
 }
 
 spelled_enum! {
-    /// An undocumented csc typed-reference operator keyword. These three are NOT part of
-    /// ECMA-334; they are csc's own `__`-prefixed operators over `System.TypedReference`,
-    /// each lowering to an ECMA-335 typed-reference opcode (`mkrefany`/`refanyval`/
-    /// `refanytype`). The lexer recognizes them only when [`LexOptions::typedref`] is on
-    /// (the csc-parity knob); in strict ISO-1 mode they scan as ordinary identifiers.
+    /// An undocumented csc typed-reference operator keyword. These are NOT part of
+    /// ECMA-334; they are csc's own `__`-prefixed operators over the typed-reference
+    /// family (`System.TypedReference` and the CLI vararg machinery), each lowering to
+    /// an ECMA-335 typed-reference opcode (`mkrefany`/`refanyval`/`refanytype`) or, for
+    /// `__arglist`, the vararg calling convention + the `arglist` opcode. The lexer
+    /// recognizes them only when [`LexOptions::typedref`] is on (the csc-parity knob);
+    /// in strict ISO-1 mode they scan as ordinary identifiers.
     ///
     /// [`LexOptions::typedref`]: crate::lexer::LexOptions::typedref
     pub enum TypedRefKeyword {
         "__makeref" => MakeRef,
         "__refvalue" => RefValue,
         "__reftype" => RefType,
+        "__arglist" => ArgList,
     }
 }
 

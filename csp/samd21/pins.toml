@@ -1,0 +1,81 @@
+# The SAMD21 pin-function map: pin x function -> (instance, signal). PARTIAL and
+# append-only: rows exist for every binding the in-tree boards use,
+# each with its source; grow the table with the boards, never from memory. A binding whose
+# (pin, function) row is missing REFUSES.
+
+[table]
+kind = "pins"
+family = "samd21"
+sources = [
+    "SAMD21 datasheet DS40001882 Table 7-1 (I/O multiplexing and considerations)",
+]
+
+
+pin = "PA12"
+function = "C"
+instance = "sercom2"
+signal = "pad0"
+source = "DS40001882 Table 7-1; silicon-proven by samd21_wifi.rs (WINC MOSI)"
+
+
+pin = "PA13"
+function = "C"
+instance = "sercom2"
+signal = "pad1"
+source = "DS40001882 Table 7-1; silicon-proven by samd21_wifi.rs (WINC SCK)"
+
+
+pin = "PA14"
+function = "C"
+instance = "sercom2"
+signal = "pad2"
+source = "DS40001882 Table 7-1 (unused by the module wiring: PA14 stays a soft CS PORT output)"
+
+
+pin = "PA15"
+function = "C"
+instance = "sercom2"
+signal = "pad3"
+source = "DS40001882 Table 7-1; silicon-proven by samd21_wifi.rs (WINC MISO)"
+
+
+pin = "PA22"
+function = "C"
+instance = "sercom3"
+signal = "pad0"
+source = "DS40001882 Table 7-1 + SAM D21 XPro UG 42220 (EDBG VCP TX); silicon-proven by samd21-edbg-serve"
+
+
+pin = "PA23"
+function = "C"
+instance = "sercom3"
+signal = "pad1"
+source = "DS40001882 Table 7-1 + SAM D21 XPro UG 42220 (EDBG VCP RX); silicon-proven by samd21-edbg-serve"
+
+
+pin = "PB10"
+function = "D"
+instance = "sercom4"
+signal = "pad2"
+source = "DS40001882 Table 7-1; silicon-proven by samd21-serve on the SAM W25 XPro (EDBG VCP TX, measured -- see the board note)"
+
+
+pin = "PB11"
+function = "D"
+instance = "sercom4"
+signal = "pad3"
+source = "DS40001882 Table 7-1; silicon-proven by samd21-serve on the SAM W25 XPro (EDBG VCP RX, measured)"
+
+
+pin = "PB22"
+function = "D"
+instance = "sercom5"
+signal = "pad2"
+source = "DS40001882 Table 7-1 + Arduino Zero schematic (EDBG VCP TX); serve-proven by samd21-edbg-serve --features arduino-zero"
+
+
+pin = "PB23"
+function = "D"
+instance = "sercom5"
+signal = "pad3"
+source = "DS40001882 Table 7-1 + Arduino Zero schematic (EDBG VCP RX); serve-proven by samd21-edbg-serve --features arduino-zero"

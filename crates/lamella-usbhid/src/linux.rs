@@ -43,11 +43,16 @@ fn scan() -> Vec<(String, u16, u16, Option<String>)> {
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     Ok(scan()
         .into_iter()
-        .map(|(_, vendor_id, product_id, product)| DeviceInfo {
+        .map(|(name, vendor_id, product_id, product)| DeviceInfo {
             vendor_id,
             product_id,
             serial_number: None,
             product,
+            id: name,
+            usage_page: None,
+            usage: None,
+            input_report_len: None,
+            output_report_len: None,
         })
         .collect())
 }
@@ -70,6 +75,19 @@ impl Device {
             }
         }
         Err(Error::NotFound)
+    }
+
+    pub fn open_id(id: &str) -> Result<Self> {
+        if id.is_empty() || id.contains('/') {
+            return Err(Error::NotFound);
+        }
+        let path = format!("/dev/{id}");
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| Error::Os(format!("open {path}: {e}")))?;
+        Ok(Device { file })
     }
 
     pub fn write_report(&mut self, data: &[u8]) -> Result<()> {

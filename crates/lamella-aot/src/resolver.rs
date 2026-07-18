@@ -53,6 +53,41 @@ fn reference_handle(ordinal: usize, type_def_token: u32) -> TypeHandle {
     )
 }
 
+/// How descriptor SYMBOLS qualify by their OWNING assembly -- the N-reference identity scheme,
+/// shared by every object-emitting backend (ARM32 and RISC-V name descriptors identically, so a
+/// mixed-provenance link dedupes one canonical symbol per type). A build's OWN descriptors take
+/// `own` (a library passes its fnv1a32 hash, the same identity its `L<hash>.` function prefix and
+/// `__lamella_statics_<hash>` region use; a program stays unqualified); a REFERENCE-owned handle
+/// (see [`REFERENCE_HANDLE_TABLE`]) takes `references[ordinal]`. Both sides of one type thus emit
+/// the SAME symbol (the program's strong synthesized copy dedupes against the library's weak own
+/// copy, identity-by-address preserved), while two DIFFERENT types can never share one.
+#[derive(Default)]
+pub struct DescQualifiers {
+    /// The fnv1a32 hash (8 lowercase hex) qualifying THIS build's own descriptors; `None` = the
+    /// program convention (plain `__lamella_typedesc_<token>`).
+    pub own: Option<String>,
+    /// Ordinal-indexed reference hashes, exactly the resolver's reference order.
+    pub references: Vec<String>,
+}
+
+/// The canonical symbol for `handle`'s descriptor under `qualifiers` (see [`DescQualifiers`]).
+/// A reference-owned handle names the OWNER's token, so the symbol matches what the owning
+/// library's own build emits. Panics on a reference handle with no attached hash -- that is a
+/// build wiring bug, never a program's fault.
+pub(crate) fn descriptor_symbol(handle: u32, qualifiers: &DescQualifiers) -> String {
+    if let Some((ordinal, owner_token)) = reference_handle_parts(TypeHandle(handle)) {
+        let hash = qualifiers
+            .references
+            .get(ordinal)
+            .unwrap_or_else(|| panic!("reference ordinal {ordinal} has no descriptor qualifier"));
+        alloc::format!("{}{}_{}", lamella_elf::TYPE_DESC_PREFIX, hash, owner_token)
+    } else if let Some(own) = &qualifiers.own {
+        alloc::format!("{}{}_{}", lamella_elf::TYPE_DESC_PREFIX, own, handle)
+    } else {
+        alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle)
+    }
+}
+
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
 pub struct MetadataResolver<'a> {
     assembly: &'a Assembly<'a>,
@@ -121,6 +156,30 @@ impl<'a> MetadataResolver<'a> {
                 .find_type(namespace, name)
                 .map(|td| (ordinal, *reference, td))
         })
+    }
+
+    /// The IDENTITY handle for a type token: a this-assembly TypeDef keeps its raw token, and a
+    /// TypeRef that resolves through the attached references becomes the REFERENCE-OWNED handle
+    /// (the 0x03 encoding: ordinal + the owner's TypeDef row) -- so every consumer of the type's
+    /// descriptor (an `Alloc`, a `box`, a cast target's compare, an `unbox.any` check) names the
+    /// OWNER's canonical descriptor, and one type stays ONE identity across the link. Without
+    /// this, a `castclass`/`isinst`/`unbox.any` against a referenced type minted a 0x01
+    /// TypeRef-keyed handle whose minimal descriptor was a SECOND identity: the address compare
+    /// against a cross-assembly-allocated instance's (owner-keyed) header descriptor could never
+    /// match. A TypeRef the references do not resolve keeps its raw token -- the reference-less
+    /// single-assembly behavior, where the 0x01-keyed descriptor is the only identity anyone
+    /// mints and every compare is self-consistent.
+    fn qualified_type_handle(&self, token: Token) -> TypeHandle {
+        if token.table() == table::TYPE_REF {
+            if let Some(name) = self.assembly.type_token_name(token) {
+                if let Some((ordinal, _, ref_td)) =
+                    self.find_reference_type(name.namespace, name.name)
+                {
+                    return reference_handle(ordinal, ref_td.token().0);
+                }
+            }
+        }
+        TypeHandle(token.0)
     }
 
     /// Wraps an assembly to resolve calls among the methods of a module: `method_rids` are
@@ -323,6 +382,20 @@ impl<'a> MetadataResolver<'a> {
         let vtables = self.vtables();
         let itables = self.itables();
         let bases = self.base_handles();
+        let words: Vec<(TypeHandle, Box<[u32]>)> = self
+            .assembly
+            .type_defs()
+            .filter(|type_def| type_def.is_public() || type_def.is_nested())
+            .filter_map(|type_def| {
+                let name = self.assembly.type_token_name(type_def.token())?;
+                let type_tag = exception_tag_for_name(name.namespace, name.name);
+                let layout = self.reference_layout_of(self.assembly, type_def)?;
+                let mut w =
+                    alloc::vec![layout.size, layout.reference_offsets.len() as u32, type_tag, 0];
+                w.extend(layout.reference_offsets.iter().copied());
+                Some((TypeHandle(type_def.token().0), w.into_boxed_slice()))
+            })
+            .collect();
         self.type_tags()
             .into_iter()
             .map(|(handle, type_tag)| {
@@ -340,12 +413,14 @@ impl<'a> MetadataResolver<'a> {
                     .iter()
                     .find(|(h, _)| *h == handle)
                     .and_then(|(_, b)| *b);
+                let words = words.iter().find(|(h, _)| *h == handle).map(|(_, w)| w.clone());
                 TypeMeta {
                     handle,
                     type_tag,
                     vtable,
                     itable,
                     base,
+                    words,
                 }
             })
             .collect()
@@ -355,9 +430,11 @@ impl<'a> MetadataResolver<'a> {
     /// declare -- e.g. `new StringBuilder()`. Its vtable is numbered ENTIRELY within the reference,
     /// each slot the corlib's exported extern symbol, so a `callvirt` on a program-allocated corlib
     /// object dispatches to the corlib's most-derived override (and the descriptor's vtable relocs
-    /// keep those library methods alive through gc). The base chain terminates at the assembly
-    /// boundary (`base` None) and interface dispatch on such a type is not yet threaded (empty
-    /// itable). `None` without a reference, or if the handle is not a reference TypeDef.
+    /// keep those library methods alive through gc). `base` carries the owner's OWN base as a
+    /// reference-owned handle (resolved across the attached references when the owner extends a
+    /// type from one of ITS references), so a `castclass`/`isinst` chain scan crosses the
+    /// assembly boundary; interface dispatch on such a type is not yet threaded (empty itable).
+    /// `None` without a reference, or if the handle is not a reference TypeDef.
     pub fn reference_type_meta(&self, handle: TypeHandle) -> Option<TypeMeta> {
         let (ordinal, token) = reference_handle_parts(handle)?;
         let reference = *self.references.get(ordinal)?;
@@ -370,27 +447,121 @@ impl<'a> MetadataResolver<'a> {
             })
             .collect();
         let name = reference.type_token_name(type_def.token())?;
+        let extends = type_def.extends();
+        let base = if extends.row() == 0 {
+            None
+        } else if extends.table() == table::TYPE_DEF {
+            Some(reference_handle(ordinal, extends.0))
+        } else {
+            reference.type_token_name(extends).and_then(|base_name| {
+                self.find_reference_type(base_name.namespace, base_name.name)
+                    .map(|(base_ordinal, _, base_td)| {
+                        reference_handle(base_ordinal, base_td.token().0)
+                    })
+            })
+        };
         Some(TypeMeta {
             handle,
             type_tag: exception_tag_for_name(name.namespace, name.name),
             vtable,
-            itable: Vec::new(),
-            base: None,
+            itable: self.reference_itable(reference, type_def),
+            base,
+            words: None,
         })
     }
 
-    /// Each this-module type's immediate IN-PROGRAM base, as `(handle, base_handle)` -- the `extends`
-    /// target when it is a this-module TypeDef, else `None` (a BCL TypeRef base or System.Object, where
-    /// the AOT base-pointer chain terminates). The backend walks this to lay the TypeDesc base_ptr chain
-    /// a `castclass` scans. Keyed by `TypeHandle(token.0)`, like [`type_tags`](Self::type_tags).
+    /// The itable of a REFERENCE-owned type -- [`itables`](Self::itables)' derivation run from the
+    /// OWNER's metadata instead of this assembly's, so a program that allocates a library type
+    /// (`new IfaceLib.Sensor()`, `new Rp2350I2cDriver()`) emits a descriptor that can dispatch an
+    /// interface method on it. The program declares neither the interface nor the `InterfaceImpl`
+    /// rows, so nothing about the map is visible here: every row is read from the assembly that
+    /// DECLARES the link, and each interface `TypeRef` resolves across the attached references by
+    /// name ([`Self::find_reference_type`] -- the one rule everywhere), which is what carries the
+    /// 3-assembly BSP shape (interface in one library, implementor in another).
+    ///
+    /// The chain is walked with [`Self::cross_class_chain`], so an interface implemented on a BASE
+    /// -- across a further assembly boundary -- is found too (`Rp2350I2cDriver` inheriting
+    /// `I2cDriver`'s `IDisposable`, the `using (var d = new Rp2350I2cDriver())` shape). The
+    /// implementations come from [`reference_vtable_slots`], which already resolves each interface
+    /// method to its MOST-DERIVED override and names it by its stable extern symbol -- so every
+    /// entry is an [`VtableEntry::Extern`] the linker resolves against the owning library object,
+    /// the same reloc family an inherited vtable slot rides. Implicit implementations only, exactly
+    /// as [`itables`](Self::itables) scopes them: explicit (MethodImpl) implementations are
+    /// unsupported on both sides.
+    fn reference_itable(
+        &self,
+        reference: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+    ) -> Vec<(u32, VtableEntry)> {
+        let impls = reference_vtable_slots(&self.references, reference, type_def);
+        let mut entries: Vec<(u32, VtableEntry)> = Vec::new();
+        for (link_assembly, link) in self.cross_class_chain(reference, type_def) {
+            for iface_token in link.interfaces() {
+                let Some((iface_assembly, iface)) = (match iface_token.table() {
+                    table::TYPE_DEF => link_assembly
+                        .type_def(iface_token.row())
+                        .map(|td| (link_assembly, td)),
+                    table::TYPE_REF => link_assembly
+                        .type_token_name(iface_token)
+                        .and_then(|n| self.find_reference_type(n.namespace, n.name))
+                        .map(|(_, owner, td)| (owner, td)),
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                let Some(iface_name) = iface_assembly.type_token_name(iface.token()) else {
+                    continue;
+                };
+                for method in iface.methods() {
+                    let Some(name) = method.name() else { continue };
+                    let params = method
+                        .signature()
+                        .map(|sig| sig.parameters)
+                        .unwrap_or_default();
+                    let tag = interface_method_tag(&iface_name, name, &params);
+                    let key = param_key(iface_assembly, &params);
+                    let Some(slot) = impls
+                        .iter()
+                        .find(|slot| slot.name == Some(name) && slot.key == key)
+                    else {
+                        continue;
+                    };
+                    if entries.iter().any(|(t, _)| *t == tag) {
+                        continue;
+                    }
+                    let entry = match &slot.impl_ {
+                        SlotImpl::Extern(symbol) => VtableEntry::Extern(symbol.clone()),
+                        SlotImpl::Rid(rid) => VtableEntry::Func(*rid),
+                    };
+                    entries.push((tag, entry));
+                }
+            }
+        }
+        entries
+    }
+
+    /// Each this-module type's immediate base, as `(handle, base_handle)`: a this-module TypeDef
+    /// keeps its raw handle, and a TypeRef base that RESOLVES through the attached references
+    /// becomes the reference-owned handle -- the cross-assembly base_ptr EDGE a
+    /// `castclass`/`isinst` chain scan follows into the owner's descriptors. An UNRESOLVED
+    /// TypeRef base (no references attached -- the single-assembly build) stays `None`, so the
+    /// chain terminates at the assembly boundary exactly as before. The backend walks this to lay
+    /// the TypeDesc base_ptr chain. Keyed by `TypeHandle(token.0)`, like
+    /// [`type_tags`](Self::type_tags).
     #[must_use]
     pub fn base_handles(&self) -> Vec<(TypeHandle, Option<TypeHandle>)> {
         self.assembly
             .type_defs()
             .map(|type_def| {
                 let base = type_def.extends();
-                let base_handle = (base.table() == table::TYPE_DEF && base.row() != 0)
-                    .then_some(TypeHandle(base.0));
+                let base_handle = if base.row() == 0 {
+                    None
+                } else if base.table() == table::TYPE_DEF {
+                    Some(TypeHandle(base.0))
+                } else {
+                    let qualified = self.qualified_type_handle(base);
+                    reference_handle_parts(qualified).is_some().then_some(qualified)
+                };
                 (TypeHandle(type_def.token().0), base_handle)
             })
             .collect()
@@ -404,11 +575,11 @@ impl<'a> MetadataResolver<'a> {
     /// already collects the virtual methods overrides included). Explicit (MethodImpl) and
     /// external-interface dispatch are unsupported.
     #[must_use]
-    pub fn itables(&self) -> Vec<(TypeHandle, Vec<(u32, u32)>)> {
+    pub fn itables(&self) -> Vec<(TypeHandle, Vec<(u32, VtableEntry)>)> {
         let mut result = Vec::new();
         for type_def in self.assembly.type_defs() {
             let impls = self.vtable_methods(type_def);
-            let mut entries: Vec<(u32, u32)> = Vec::new();
+            let mut entries: Vec<(u32, VtableEntry)> = Vec::new();
             for iface_token in type_def.interfaces() {
                 if iface_token.table() != table::TYPE_DEF {
                     continue;
@@ -435,7 +606,7 @@ impl<'a> MetadataResolver<'a> {
                     };
                     if let SlotImpl::Rid(rid) = &slot.impl_ {
                         if let Some(func_index) = self.function_index(*rid) {
-                            entries.push((tag, func_index));
+                            entries.push((tag, VtableEntry::Func(func_index)));
                         }
                     }
                 }
@@ -615,10 +786,12 @@ fn reference_vtable_slots_seeded<'x>(
     slots
 }
 
-/// A vtable slot's emitted form: a module FUNCTION INDEX (this-assembly implementation), or the
-/// stable extern symbol of a referenced-assembly implementation the linker resolves cross-object
-/// (an inherited, not-overridden base virtual -- e.g. `System.Object.ToString.` for a program type
-/// that never overrides `ToString`).
+/// Where a dispatched method's implementation lives -- a vtable slot's or an itable entry's emitted
+/// form: a module FUNCTION INDEX (this-assembly implementation), or the stable extern symbol of a
+/// referenced-assembly implementation the linker resolves cross-object (an inherited,
+/// not-overridden base virtual -- e.g. `System.Object.ToString.` for a program type that never
+/// overrides `ToString` -- or a library type's interface implementation, reached when the PROGRAM
+/// allocates that type and dispatches through the interface).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VtableEntry {
     /// A module function index (the this-assembly implementation).
@@ -640,11 +813,25 @@ pub struct TypeMeta {
     /// Virtual-method slots in order (empty if the type has no virtuals): a module function index,
     /// or the extern symbol of an inherited referenced-assembly implementation.
     pub vtable: Vec<VtableEntry>,
-    /// Interface dispatch entries -- `(interface_method_tag, implementation function index)`.
-    pub itable: Vec<(u32, u32)>,
+    /// Interface dispatch entries -- `(interface_method_tag, implementation)`. The implementation is
+    /// a module function for a this-assembly type, and a referenced-assembly EXTERN for a
+    /// reference-owned one (a library type the program allocates: its interface implementations are
+    /// the library's, reached across the link exactly as an inherited vtable slot is).
+    pub itable: Vec<(u32, VtableEntry)>,
     /// The immediate in-program base type's handle, or `None` at the chain's end (a BCL base or
     /// System.Object). The backend lays this as the TypeDesc base_ptr@12 a `castclass` scan walks.
     pub base: Option<TypeHandle>,
+    /// The descriptor's own header WORDS -- `[payload, nrefs, tag, base_ptr=0]` then the ref_offsets,
+    /// the SAME shape an `Alloc`'s `TypeDescLiteral` carries -- or `None` for a value type. Populated
+    /// by [`type_descriptors`](Self::type_descriptors) (from [`reference_layout_of`](Self::reference_layout_of),
+    /// the one layout source the `newobj` path also sizes by). It lets a LIBRARY object lay a rich
+    /// descriptor for an exported type it never allocates or type-tests -- so a consumer that derives
+    /// from that type across the assembly boundary (its base_ptr edge naming the type's canonical
+    /// symbol) links against ONE authoritative copy, in its owner, rather than a byte-fragile copy the
+    /// consumer would have to reconstruct. `--gc-sections` drops an unreferenced one for zero flash, so
+    /// this only grows the reached set. Left `None` on the reference-owned metas that a consumer's
+    /// [`reference_type_meta`](Self::reference_type_meta) stages (that path never lays the base itself).
+    pub words: Option<Box<[u32]>>,
 }
 
 impl<'a> MetadataResolver<'a> {
@@ -1321,7 +1508,7 @@ impl CallResolver for MetadataResolver<'_> {
             return Vec::new();
         };
         let mut handles = Vec::new();
-        handles.push(TypeHandle(target.0));
+        handles.push(self.qualified_type_handle(target));
         for type_def in self.assembly.type_defs() {
             let mut current = type_def.extends();
             for _ in 0..64 {
@@ -1355,14 +1542,18 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         let target = self.type_token_of(*token)?;
-        (target.table() == table::TYPE_DEF).then_some(TypeHandle(target.0))
+        if target.table() == table::TYPE_DEF {
+            return Some(TypeHandle(target.0));
+        }
+        let qualified = self.qualified_type_handle(target);
+        reference_handle_parts(qualified).is_some().then_some(qualified)
     }
 
     fn boxed_layout(&self, operand: &Operand) -> Option<ReferenceLayout> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let handle = TypeHandle(token.0);
+        let handle = self.qualified_type_handle(*token);
         if let Some(name) = self.assembly.type_token_name(*token) {
             if name.namespace == "System" {
                 let size = match name.name {
@@ -1493,25 +1684,42 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        if token.table() != table::METHOD_DEF {
-            return None;
+        match token.table() {
+            table::METHOD_DEF => {
+                let type_token = self.type_token_of(*token)?;
+                if type_token.table() != table::TYPE_DEF {
+                    return None;
+                }
+                let type_def = self.assembly.type_def(type_token.row())?;
+                if !type_def.is_interface() {
+                    return None;
+                }
+                let method = type_def.methods().find(|m| m.rid() == token.row())?;
+                let name = method.name()?;
+                let params = method
+                    .signature()
+                    .map(|sig| sig.parameters)
+                    .unwrap_or_default();
+                let iface_name = self.assembly.type_token_name(type_token)?;
+                Some(interface_method_tag(&iface_name, name, &params))
+            }
+            table::MEMBER_REF => {
+                let method = self.assembly.resolve_method(*token)?;
+                let declaring = method.declaring_type?;
+                let (_, _, ref_td) =
+                    self.find_reference_type(declaring.namespace, declaring.name)?;
+                if !ref_td.is_interface() {
+                    return None;
+                }
+                let signature = method.signature.as_ref()?;
+                Some(interface_method_tag(
+                    &declaring,
+                    method.name?,
+                    &signature.parameters,
+                ))
+            }
+            _ => None,
         }
-        let type_token = self.type_token_of(*token)?;
-        if type_token.table() != table::TYPE_DEF {
-            return None;
-        }
-        let type_def = self.assembly.type_def(type_token.row())?;
-        if !type_def.is_interface() {
-            return None;
-        }
-        let method = type_def.methods().find(|m| m.rid() == token.row())?;
-        let name = method.name()?;
-        let params = method
-            .signature()
-            .map(|sig| sig.parameters)
-            .unwrap_or_default();
-        let iface_name = self.assembly.type_token_name(type_token)?;
-        Some(interface_method_tag(&iface_name, name, &params))
     }
 }
 

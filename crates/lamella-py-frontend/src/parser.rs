@@ -1789,10 +1789,14 @@ impl Parser {
         for stmt in &body {
             if !matches!(
                 stmt,
-                Stmt::FuncDef(_) | Stmt::Assign(_) | Stmt::Pass | Stmt::Decorated { .. }
+                Stmt::FuncDef(_)
+                    | Stmt::Assign(_)
+                    | Stmt::Pass
+                    | Stmt::Decorated { .. }
+                    | Stmt::Expr(Expr::Str(_))
             ) {
                 return Err(self.error(
-                    "a class body supports only methods and attribute assignments in this subset",
+                    "a class body supports only methods, attribute assignments, and a docstring in this subset",
                 ));
             }
         }
@@ -4124,6 +4128,19 @@ mod tests {
         ));
         assert!(parse_src("class F(metaclass=M):\n    pass\n").is_err());
         assert!(matches!(parse_ok("obj.x = 5\n").body[0], Stmt::SetAttr { .. }));
+    }
+
+    #[test]
+    fn a_class_body_takes_a_docstring() {
+        let m = parse_ok("class C:\n    \"\"\"doc\"\"\"\n    def m(self):\n        return 1\n");
+        let Stmt::ClassDef { body, .. } = &m.body[0] else {
+            panic!("expected a class def");
+        };
+        assert_eq!(body.len(), 2);
+        assert!(matches!(&body[0], Stmt::Expr(Expr::Str(s)) if s == "doc"));
+        assert!(matches!(&parse_ok("class D:\n    \"doc\"\n").body[0], Stmt::ClassDef { body, .. } if body.len() == 1));
+        assert!(parse_src("class E:\n    print(1)\n    def m(self):\n        return 1\n").is_err());
+        assert!(parse_src("class F:\n    x + 1\n").is_err());
     }
 
     #[test]

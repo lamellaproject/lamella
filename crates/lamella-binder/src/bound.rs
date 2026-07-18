@@ -60,12 +60,17 @@ pub struct MethodReference {
     pub declaring_type: TypeSymbol,
     /// The method name.
     pub name: Box<str>,
-    /// The parameter types, in order.
+    /// The parameter types, in order. For a vararg member these are the FIXED
+    /// parameters only; the variable arguments ride the call's trailing
+    /// [`BoundExprKind::ArgListLiteral`] argument.
     pub parameters: Vec<TypeSymbol>,
     /// The return type.
     pub return_type: TypeSymbol,
     /// Whether the method is `static`.
     pub is_static: bool,
+    /// Whether the member uses the CLI vararg calling convention (`__arglist`), so
+    /// emission mints the vararg def/call-site signatures instead of DEFAULT.
+    pub is_vararg: bool,
 }
 
 /// A user-defined `++`/`--` whose operand or result type differs from the variable's (14.14.2): the
@@ -293,6 +298,15 @@ pub enum BoundExprKind {
         /// The asserted referent type (`refanyval` names it; it is the expression's type).
         target: TypeSymbol,
     },
+    /// A bare `__arglist` inside a vararg member's body: the handle to the current
+    /// method's variable arguments, of type `System.RuntimeArgumentHandle`. Emits the
+    /// `arglist` opcode.
+    ArgListValue,
+    /// An `__arglist(argument, ...)` at a call site: the variable arguments passed past a
+    /// vararg member's fixed parameters. Rides as the FINAL element of a `Call`/
+    /// `ObjectCreation` argument list; emission pushes each element and encodes its type
+    /// after the sentinel in the call-site signature. Never a value by itself (CS0226).
+    ArgListLiteral(Vec<BoundExpr>),
     /// A `stackalloc T[count]` (unsafe): a `T*` to `count * sizeof(T)` stack bytes.
     StackAlloc {
         /// The element type.
@@ -321,13 +335,15 @@ pub enum BoundExprKind {
 }
 
 /// The method currently being bound: its name (for `CS0127`), declared return
-/// type (for checking `return`), and whether it is `static` (for `CS0120`/`CS0026`,
-/// which forbid an implicit `this` where there is no object).
+/// type (for checking `return`), whether it is `static` (for `CS0120`/`CS0026`,
+/// which forbid an implicit `this` where there is no object), and whether it takes
+/// CLI varargs (for `CS0190`: bare `__arglist` is legal only inside a vararg member).
 #[derive(Debug, Clone)]
 struct MethodContext {
     name: Box<str>,
     return_type: TypeSymbol,
     is_static: bool,
+    is_vararg: bool,
 }
 
 /// The result of binding one REPL submission ([`Binder::bind_submission`]): the bound
@@ -368,6 +384,11 @@ pub struct Binder {
     model: Model,
     current_type: Option<TypeSymbol>,
     current_method: Option<MethodContext>,
+    /// Whether the NEXT [`Binder::bind_method`] call binds a vararg member's body, so a
+    /// bare `__arglist` is legal there (CS0190 elsewhere). Set by the caller just before
+    /// `bind_method`, which consumes (clears) it -- like `set_canon`, pre-set state the
+    /// caller owns; self-clearing so a forgotten reset cannot leak into the next member.
+    next_method_vararg: bool,
     imported_namespaces: Vec<Box<str>>,
     /// `using X = N.T;` aliases in scope, each the alias name and its target type, so an
     /// unqualified `X` resolves to the target (16.4.1). Scoped per namespace block alongside
@@ -580,6 +601,9 @@ impl Binder {
 
     /// Resolves a type against the reference world, reporting `CS0246` if unknown.
     pub(crate) fn resolve_named_type(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
+        if let TypeSymbol::Special(special) = ty {
+            return self.resolve_special_type(*special, span);
+        }
         if let TypeSymbol::Named(parts) = ty {
             if parts.len() == 1 {
                 let name: &str = &parts[0];
@@ -613,7 +637,51 @@ impl Binder {
                 }
             }
         }
-        resolve_type(&self.world, ty, &mut self.diagnostics, span).fold_builtin()
+        match resolve_type(&self.world, ty, &mut self.diagnostics, span).fold_builtin() {
+            TypeSymbol::Special(special) => self.resolve_special_type(special, span),
+            resolved => resolved,
+        }
+    }
+
+    /// Resolves a predefined type's mention: [`TypeSymbol::Special`] when its `System`
+    /// backing type is defined or imported (or when no corlib is present at all), else
+    /// csc's CS0518 at `span` and the error type. The null type has no `System` identity
+    /// and always resolves.
+    pub(crate) fn resolve_special_type(&mut self, special: SpecialType, span: Span) -> TypeSymbol {
+        if matches!(special, SpecialType::Null)
+            || !self.corlib_present()
+            || self.special_backing_defined(special)
+        {
+            return TypeSymbol::Special(special);
+        }
+        let (namespace, name) = special.full_name();
+        self.diagnostics.push(Diagnostic::new(
+            DiagnosticKind::PredefinedTypeMissing {
+                full_name: alloc::format!("{namespace}.{name}").into(),
+            },
+            span,
+        ));
+        TypeSymbol::Error
+    }
+
+    /// Whether a predefined type's `System` backing type is declared in source or a
+    /// reference (4.1.4).
+    fn special_backing_defined(&self, special: SpecialType) -> bool {
+        let (namespace, name) = special.full_name();
+        self.model.get(namespace, name).is_some() || self.world.contains(namespace, name)
+    }
+
+    /// Whether the compilation carries a corlib: `System.Object` AND `System.Int32` are
+    /// declared in source or a reference. Every real corlib -- including a no-float one --
+    /// carries the integral core, so the anchor is invisible in practice; requiring BOTH
+    /// keeps the check off for minimal hand-built models (a test fixture declaring only
+    /// `System.Object` to give classes a root) and for model-less binding, where csc has
+    /// no equivalent mode (it always demands a corlib), so no parity is lost.
+    fn corlib_present(&self) -> bool {
+        (self.model.get("System", "Object").is_some()
+            || self.world.contains("System", "Object"))
+            && (self.model.get("System", "Int32").is_some()
+                || self.world.contains("System", "Int32"))
     }
 
     /// Rewrites a single-part named type to its canonical fully-qualified symbol when that
@@ -761,25 +829,31 @@ impl Binder {
         to: &TypeSymbol,
         name: &str,
     ) -> Option<MethodReference> {
+        let mut fallback: Option<MethodReference> = None;
         for owner in [from, to] {
             for method in self.methods_in_chain(owner, name) {
-                if method.parameters.len() == 1
-                    && converts(&self.model, from, &method.parameters[0])
-                    && &method.return_type == to
+                if method.parameters.len() != 1
+                    || &method.return_type != to
+                    || !converts(&self.model, from, &method.parameters[0])
                 {
-                    let declaring_type =
-                        self.declaring_type_in_chain(owner, name, &method.parameters);
-                    return Some(MethodReference {
-                        declaring_type,
-                        name: name.into(),
-                        parameters: method.parameters,
-                        return_type: method.return_type,
-                        is_static: true,
-                    });
+                    continue;
                 }
+                let exact = &method.parameters[0] == from;
+                let reference = MethodReference {
+                    declaring_type: self.declaring_type_in_chain(owner, name, &method.parameters),
+                    name: name.into(),
+                    parameters: method.parameters,
+                    return_type: method.return_type,
+                    is_static: true,
+                    is_vararg: false,
+                };
+                if exact {
+                    return Some(reference);
+                }
+                fallback.get_or_insert(reference);
             }
         }
-        None
+        fallback
     }
 
     /// Reports a failed implicit conversion at `span`: `CS0266` when an explicit
@@ -792,6 +866,10 @@ impl Binder {
         to: &TypeSymbol,
         span: Span,
     ) {
+        if is_arglist_marker(from) {
+            self.report(Diagnostic::new(DiagnosticKind::ArglistOutsideCall, span));
+            return;
+        }
         let kind = if can_cast(&self.model, from, to) {
             DiagnosticKind::ExplicitConversionExists {
                 from: from.to_string().into(),
@@ -1175,6 +1253,14 @@ impl Binder {
         hits
     }
 
+    /// Marks the next [`Binder::bind_method`] call as binding a vararg member's body
+    /// (`M(..., __arglist)` / `T(..., __arglist)`), so a bare `__arglist` binds to the
+    /// runtime argument handle instead of reporting CS0190. `bind_method` consumes the
+    /// mark, so it never leaks past the one member it was set for.
+    pub fn set_next_method_vararg(&mut self) {
+        self.next_method_vararg = true;
+    }
+
     /// Binds a method body end to end: the enclosing type is in scope for `this`
     /// and unqualified names, the parameters are declared as locals, and `return`
     /// statements are checked against `return_type` (15.9.4). Returns the bound
@@ -1197,6 +1283,7 @@ impl Binder {
             name: name.into(),
             return_type,
             is_static,
+            is_vararg: core::mem::take(&mut self.next_method_vararg),
         });
         self.enter_scope();
         self.case_label_uses.clear();
@@ -1280,6 +1367,7 @@ impl Binder {
             name: "Submit".into(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             is_static: true,
+            is_vararg: false,
         });
         self.enter_scope();
         self.case_label_uses.clear();
@@ -1447,6 +1535,7 @@ impl Binder {
             MethodReference {
                 declaring_type: target,
                 name: ".ctor".into(),
+                is_vararg: chosen.is_vararg,
                 parameters: chosen.parameters,
                 return_type: TypeSymbol::Special(SpecialType::Void),
                 is_static: false,
@@ -1580,10 +1669,16 @@ impl Binder {
     /// Binds an expression (14).
     pub fn bind_expression(&mut self, expr: &Expr) -> BoundExpr {
         match &expr.kind {
-            ExprKind::Literal(literal) => BoundExpr {
-                kind: BoundExprKind::Literal(literal.clone()),
-                ty: literal_type(literal),
-            },
+            ExprKind::Literal(literal) => {
+                let ty = match literal_type(literal) {
+                    TypeSymbol::Special(special) => self.resolve_special_type(special, expr.span),
+                    other => other,
+                };
+                BoundExpr {
+                    kind: BoundExprKind::Literal(literal.clone()),
+                    ty,
+                }
+            }
             ExprKind::Name(name) => self.bind_name(name, expr.span),
             ExprKind::This => {
                 if self.in_static_method() {
@@ -1709,6 +1804,7 @@ impl Binder {
                                         parameters: method.parameters,
                                         return_type: method.return_type,
                                         is_static: true,
+                                        is_vararg: false,
                                     }),
                                 },
                             };
@@ -1776,6 +1872,7 @@ impl Binder {
                                         parameters: method.parameters,
                                         return_type: method.return_type,
                                         is_static: true,
+                                        is_vararg: false,
                                     }),
                                 },
                             };
@@ -1903,6 +2000,33 @@ impl Binder {
                         target: target_ty.clone(),
                     },
                     ty: target_ty,
+                }
+            }
+            ExprKind::ArgListHandle => {
+                if !self
+                    .current_method
+                    .as_ref()
+                    .is_some_and(|method| method.is_vararg)
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::ArglistOutsideVarargMethod,
+                        expr.span,
+                    ));
+                    return error_expr();
+                }
+                BoundExpr {
+                    kind: BoundExprKind::ArgListValue,
+                    ty: runtime_argument_handle(),
+                }
+            }
+            ExprKind::ArgListCall(arguments) => {
+                let arguments: Vec<BoundExpr> = arguments
+                    .iter()
+                    .map(|argument| self.bind_expression(argument))
+                    .collect();
+                BoundExpr {
+                    kind: BoundExprKind::ArgListLiteral(arguments),
+                    ty: arglist_marker(),
                 }
             }
             ExprKind::StackAlloc { element, count } => {
@@ -2214,6 +2338,7 @@ impl Binder {
                             parameters: method.parameters,
                             return_type: method.return_type,
                             is_static: true,
+                            is_vararg: false,
                         }),
                     },
                 });
@@ -2247,6 +2372,7 @@ impl Binder {
             parameters: alloc::vec![delegate_base.clone(), delegate_base],
             return_type: bool_type.clone(),
             is_static: true,
+            is_vararg: false,
         };
         BoundExpr {
             kind: BoundExprKind::Call {
@@ -2281,6 +2407,7 @@ impl Binder {
             parameters: alloc::vec![delegate_base.clone(), delegate_base.clone()],
             return_type: delegate_base.clone(),
             is_static: true,
+            is_vararg: false,
         };
         let combined = BoundExpr {
             kind: BoundExprKind::Call {
@@ -2542,6 +2669,7 @@ impl Binder {
                         parameters: method.parameters,
                         return_type: method.return_type,
                         is_static: true,
+                        is_vararg: false,
                     }),
                 },
             });
@@ -2571,6 +2699,7 @@ impl Binder {
                         parameters: method.parameters,
                         return_type: method.return_type,
                         is_static: true,
+                        is_vararg: false,
                     }),
                 },
             });
@@ -2670,6 +2799,7 @@ impl Binder {
                 parameters: method.parameters.clone(),
                 return_type: method.return_type.clone(),
                 is_static: true,
+                is_vararg: false,
             };
             return Some((operator, result_conversion));
         }
@@ -2764,6 +2894,7 @@ impl Binder {
             parameters: alloc::vec![event.ty.clone()],
             return_type: void.clone(),
             is_static: event.is_static,
+            is_vararg: false,
         };
         let callee = BoundExpr {
             ty: TypeSymbol::Error,
@@ -2899,6 +3030,7 @@ impl Binder {
                 parameters: alloc::vec![delegate_base.clone(), delegate_base.clone()],
                 return_type: delegate_base.clone(),
                 is_static: true,
+                is_vararg: false,
             };
             let callee = BoundExpr {
                 ty: TypeSymbol::Error,
@@ -3370,6 +3502,7 @@ impl Binder {
                         self.declaring_type_in_chain(&receiver_ty, &method.name, &method.parameters);
                     MethodReference {
                         declaring_type,
+                        is_vararg: method.is_vararg,
                         name: method.name,
                         parameters: method.parameters,
                         return_type: method.return_type,
@@ -3391,6 +3524,7 @@ impl Binder {
                     parameters: invoke.parameters,
                     return_type: invoke.return_type,
                     is_static: false,
+                    is_vararg: false,
                 });
             }
         }
@@ -3411,6 +3545,19 @@ impl Binder {
         }
         let arguments = match resolved.as_ref() {
             Some(method) if params_method => self.bind_params_arguments(method, arguments),
+            Some(method)
+                if method.is_vararg && method.parameters.len() + 1 == arguments.len() =>
+            {
+                let mut remaining = arguments.into_iter();
+                let mut bound = Vec::with_capacity(method.parameters.len() + 1);
+                for parameter in method.parameters.iter() {
+                    if let Some(argument) = remaining.next() {
+                        bound.push(self.convert(argument, parameter));
+                    }
+                }
+                bound.extend(remaining);
+                bound
+            }
             Some(method) if method.parameters.len() == arguments.len() => arguments
                 .into_iter()
                 .zip(method.parameters.iter())
@@ -3500,6 +3647,18 @@ impl Binder {
                 None
             }
             OverloadResult::WrongArgumentCount => {
+                if let Some(vararg) = candidates
+                    .iter()
+                    .find(|c| c.is_vararg && c.parameters.len() == argument_types.len())
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::NoArgumentForArglist {
+                            method: vararg_member_display(declaring, name, &vararg.parameters),
+                        },
+                        span,
+                    ));
+                    return None;
+                }
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::NoOverloadForArgumentCount {
                         method: name.into(),
@@ -3675,6 +3834,7 @@ impl Binder {
             self.declaring_type_in_chain(&receiver.ty, &method.name, &method.parameters);
         let method_ref = MethodReference {
             declaring_type,
+            is_vararg: method.is_vararg,
             name: method.name,
             parameters: method.parameters,
             return_type: method.return_type,
@@ -3722,7 +3882,7 @@ impl Binder {
             .type_info_of(&target_ty)
             .is_some_and(|info| info.kind == TypeKind::Delegate)
         {
-            return self.bind_delegate_creation(&target_ty, &arguments, span);
+            return self.bind_delegate_creation_new(&target_ty, arguments, span);
         }
         let has_method_group = arguments
             .iter()
@@ -3743,6 +3903,7 @@ impl Binder {
                         parameters: Vec::new(),
                         return_type: TypeSymbol::Special(SpecialType::Void),
                         is_static: false,
+                        is_vararg: false,
                     });
                 } else if let Some(constructors) = self
                     .type_info_of(&target_ty)
@@ -3777,10 +3938,23 @@ impl Binder {
                             parameters: chosen.parameters.clone(),
                             return_type: TypeSymbol::Special(SpecialType::Void),
                             is_static: false,
+                            is_vararg: chosen.is_vararg,
                         };
                         if chosen.is_params {
                             arguments =
                                 self.bind_params_arguments(&ctor_ref, core::mem::take(&mut arguments));
+                        } else if chosen.is_vararg
+                            && chosen.parameters.len() + 1 == arguments.len()
+                        {
+                            let mut remaining = core::mem::take(&mut arguments).into_iter();
+                            let mut bound = Vec::with_capacity(chosen.parameters.len() + 1);
+                            for parameter in chosen.parameters.iter() {
+                                if let Some(argument) = remaining.next() {
+                                    bound.push(self.convert(argument, parameter));
+                                }
+                            }
+                            bound.extend(remaining);
+                            arguments = bound;
                         } else if chosen.parameters.len() == arguments.len() {
                             arguments = core::mem::take(&mut arguments)
                                 .into_iter()
@@ -3801,6 +3975,92 @@ impl Binder {
             },
             ty,
         }
+    }
+
+    /// Binds a `new D(...)` whose target is a delegate type (14.5.10.3): a method-group argument
+    /// converts as in [`Self::bind_delegate_creation`]; a VALUE of a delegate type whose `Invoke`
+    /// matches `D`'s creates a delegate to that value's invocation list -- the operand becomes the
+    /// receiver and its own `Invoke` the target, which the emitter already lowers as
+    /// `dup; ldvirtftn Invoke; newobj`. The delegate-value form lives HERE and not in the pure
+    /// binder because it exists only in a delegate-creation-expression -- there is no implicit
+    /// conversion between distinct delegate types, so the conversion probes must not see it.
+    ///
+    /// When neither form applies, this reports the csc-matching diagnostic (all probed):
+    /// `CS1729` for no arguments, `CS0149` for an argument that is neither form (or extras after
+    /// it), `CS0123` for a method group or delegate value with no signature match.
+    fn bind_delegate_creation_new(
+        &mut self,
+        delegate_ty: &TypeSymbol,
+        arguments: Vec<BoundExpr>,
+        span: Span,
+    ) -> BoundExpr {
+        let bound = self.bind_delegate_creation(delegate_ty, &arguments, span);
+        if matches!(bound.kind, BoundExprKind::DelegateCreation { .. }) {
+            return bound;
+        }
+        if let [argument] = &arguments[..] {
+            if matches!(argument.kind, BoundExprKind::Ref { .. }) {
+                self.report(Diagnostic::new(DiagnosticKind::MethodNameExpected, span));
+                return bound;
+            }
+        }
+        let invoke_of = |binder: &Self, ty: &TypeSymbol| {
+            binder
+                .type_info_of(ty)
+                .filter(|info| info.kind == TypeKind::Delegate)
+                .and_then(|info| info.methods.iter().find(|m| &*m.name == "Invoke").cloned())
+        };
+        if let ([argument], Some(target_invoke)) = (&arguments[..], invoke_of(self, delegate_ty)) {
+            if let Some(operand_invoke) = invoke_of(self, &argument.ty) {
+                if operand_invoke.parameters == target_invoke.parameters
+                    && operand_invoke.return_type == target_invoke.return_type
+                {
+                    let operand_ty = self.resolve_type(&argument.ty);
+                    return BoundExpr {
+                        kind: BoundExprKind::DelegateCreation {
+                            delegate_type: delegate_ty.clone(),
+                            target: MethodReference {
+                                declaring_type: operand_ty,
+                                name: operand_invoke.name.clone(),
+                                parameters: operand_invoke.parameters.clone(),
+                                return_type: operand_invoke.return_type,
+                                is_static: false,
+                                is_vararg: false,
+                            },
+                            receiver: Some(Box::new(argument.clone())),
+                        },
+                        ty: delegate_ty.clone(),
+                    };
+                }
+                self.report(Diagnostic::new(
+                    DiagnosticKind::NoOverloadMatchesDelegate {
+                        method: alloc::format!("{}.Invoke", argument.ty).into(),
+                        delegate: delegate_ty.to_string().into(),
+                    },
+                    span,
+                ));
+                return bound;
+            }
+        }
+        let kind = match &arguments[..] {
+            [] => DiagnosticKind::NoConstructor {
+                type_name: delegate_ty.to_string().into(),
+                count: 0,
+            },
+            [argument] => match &argument.kind {
+                BoundExprKind::MethodGroup { name, .. } => {
+                    DiagnosticKind::NoOverloadMatchesDelegate {
+                        method: name.clone(),
+                        delegate: delegate_ty.to_string().into(),
+                    }
+                }
+                _ if argument.ty.is_error() => return bound,
+                _ => DiagnosticKind::MethodNameExpected,
+            },
+            _ => DiagnosticKind::MethodNameExpected,
+        };
+        self.report(Diagnostic::new(kind, span));
+        bound
     }
 
     /// Binds `new D(methodGroup)`: the method group converts to delegate `D` when a
@@ -3850,6 +4110,7 @@ impl Binder {
                 delegate_type: delegate_ty.clone(),
                 target: MethodReference {
                     declaring_type: declaring,
+                    is_vararg: target.is_vararg,
                     name: target.name.clone(),
                     parameters: target.parameters.clone(),
                     return_type: target.return_type,
@@ -3894,13 +4155,27 @@ impl Binder {
     ) -> Option<MethodSymbol> {
         match resolve_overload(&self.model, constructors, argument_types, arg_constants) {
             OverloadResult::Resolved(constructor) => return Some(constructor),
-            OverloadResult::WrongArgumentCount => self.diagnostics.push(Diagnostic::new(
-                DiagnosticKind::NoConstructor {
-                    type_name: target.to_string().into(),
-                    count: argument_types.len() as u32,
-                },
-                span,
-            )),
+            OverloadResult::WrongArgumentCount => {
+                if let Some(vararg) = constructors
+                    .iter()
+                    .find(|c| c.is_vararg && c.parameters.len() == argument_types.len())
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::NoArgumentForArglist {
+                            method: vararg_member_display(target, ".ctor", &vararg.parameters),
+                        },
+                        span,
+                    ));
+                    return None;
+                }
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::NoConstructor {
+                        type_name: target.to_string().into(),
+                        count: argument_types.len() as u32,
+                    },
+                    span,
+                ))
+            }
             OverloadResult::BadArgument { index, from, to } => {
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::ArgumentConversion {
@@ -3928,15 +4203,37 @@ impl Binder {
     /// and lcsc does not distinguish a reference assembly's internal members (rarely named)
     /// -- cross-assembly internal enforcement is a known gap.
     fn is_accessible(&self, declaring: &TypeSymbol, accessibility: Accessibility) -> bool {
+        let Some(current) = self.current_type.clone() else {
+            return match accessibility {
+                Accessibility::Public => true,
+                Accessibility::Internal | Accessibility::ProtectedInternal => {
+                    !self.type_is_external(declaring)
+                }
+                Accessibility::Private | Accessibility::Protected => false,
+            };
+        };
+        self.accessible_from(&current, declaring, accessibility)
+    }
+
+    /// Whether a member of `declaring` with the given accessibility is accessible from the
+    /// program text of `from` -- `is_accessible` generalized past the current bind context, for
+    /// checks that name their vantage type explicitly (an override target is judged from the
+    /// DERIVING class, whatever is being bound at the time).
+    fn accessible_from(
+        &self,
+        from: &TypeSymbol,
+        declaring: &TypeSymbol,
+        accessibility: Accessibility,
+    ) -> bool {
         match accessibility {
             Accessibility::Public => true,
             Accessibility::Internal => !self.type_is_external(declaring),
             Accessibility::ProtectedInternal => {
-                !self.type_is_external(declaring) || self.current_derives_from(declaring)
+                !self.type_is_external(declaring) || self.derives_from(from, declaring)
             }
-            Accessibility::Private => self.in_private_scope_of(declaring),
+            Accessibility::Private => self.within_private_scope(from, declaring),
             Accessibility::Protected => {
-                self.in_private_scope_of(declaring) || self.current_derives_from(declaring)
+                self.within_private_scope(from, declaring) || self.derives_from(from, declaring)
             }
         }
     }
@@ -3950,16 +4247,18 @@ impl Binder {
     /// Whether the current type is `declaring` or a type nested (at any depth) within it --
     /// the scope a `private` member is accessible from (10.5.1).
     fn in_private_scope_of(&self, declaring: &TypeSymbol) -> bool {
-        let Some(current) = &self.current_type else {
-            return false;
-        };
-        if current == declaring
-            || fold_primitive_name(current) == fold_primitive_name(declaring)
-        {
+        self.current_type
+            .as_ref()
+            .is_some_and(|current| self.within_private_scope(current, declaring))
+    }
+
+    /// Whether `from` is `declaring` or a type nested (at any depth) within it.
+    fn within_private_scope(&self, from: &TypeSymbol, declaring: &TypeSymbol) -> bool {
+        if from == declaring || fold_primitive_name(from) == fold_primitive_name(declaring) {
             return true;
         }
         let declaring_name = declaring.to_string();
-        let mut info = self.type_info_of(current);
+        let mut info = self.type_info_of(from);
         while let Some(type_info) = info {
             match type_info.enclosing.as_deref() {
                 None => return false,
@@ -3974,10 +4273,14 @@ impl Binder {
     /// member adds (a simplification of 10.5.3; the access-through-an-instance-of-the-derived-
     /// type rule is not enforced).
     fn current_derives_from(&self, declaring: &TypeSymbol) -> bool {
-        let Some(current) = &self.current_type else {
-            return false;
-        };
-        let mut info = self.type_info_of(current);
+        self.current_type
+            .as_ref()
+            .is_some_and(|current| self.derives_from(current, declaring))
+    }
+
+    /// Whether `from` derives (directly or transitively) from `declaring`.
+    fn derives_from(&self, from: &TypeSymbol, declaring: &TypeSymbol) -> bool {
+        let mut info = self.type_info_of(from);
         while let Some(base) = info.and_then(|type_info| type_info.base.clone()) {
             if &base == declaring {
                 return true;
@@ -4479,7 +4782,9 @@ impl Binder {
                 return (None, false);
             };
             if let Some(method) = self.matching_method(info, name, query) {
-                return (Some((method.clone(), info.name.clone())), true);
+                if self.accessible_from(class_ty, &ty, method.accessibility) {
+                    return (Some((method.clone(), info.name.clone())), true);
+                }
             }
             current = info.base.clone();
         }
@@ -4867,6 +5172,7 @@ impl Binder {
             self.declaring_type_in_chain(receiver_ty, &chosen.name, &chosen.parameters);
         Some(MethodReference {
             declaring_type,
+            is_vararg: chosen.is_vararg,
             name: chosen.name,
             parameters: chosen.parameters,
             return_type: chosen.return_type,
@@ -4902,6 +5208,7 @@ impl Binder {
                 parameters: Vec::new(),
                 return_type: property_ty,
                 is_static: false,
+                is_vararg: false,
             }),
             _ => None,
         }
@@ -5016,6 +5323,13 @@ impl Binder {
     /// getter -- so each accessor is named on the most-derived type whose declaration of the
     /// property provides it (14.5.4). For a whole property both are the property's own declaring
     /// type. Walks the property up the base chain because accessors are not model `methods`.
+    ///
+    /// An INACCESSIBLE declaration provides no accessors, exactly as it does not resolve in
+    /// `resolve_member` (7.3 looks up accessible members only): a `protected new` property in a
+    /// nested class must not capture the getter of an access that RESOLVED to the accessible base
+    /// property -- the two walks disagreeing is how `z.P = z.P` bound base's float property but
+    /// called the derived double getter. Overrides are unaffected: an override carries its base
+    /// declaration's accessibility, so the accessors of any property that resolved stay eligible.
     fn property_accessor_declarers(
         &self,
         receiver_ty: &TypeSymbol,
@@ -5036,11 +5350,13 @@ impl Binder {
             };
             if let Some(property) = info.find_property(name) {
                 let declaring = type_symbol_in(&info.namespace, &info.name);
-                if getter.is_none() && property.has_getter {
-                    getter = Some(declaring.clone());
-                }
-                if setter.is_none() && property.has_setter {
-                    setter = Some(declaring);
+                if self.is_accessible(&declaring, property.accessibility) {
+                    if getter.is_none() && property.has_getter {
+                        getter = Some(declaring.clone());
+                    }
+                    if setter.is_none() && property.has_setter {
+                        setter = Some(declaring);
+                    }
                 }
             }
             if getter.is_some() && setter.is_some() {
@@ -5852,6 +6168,9 @@ fn arg_applicable(
     arg_const: Option<i64>,
     param: &TypeSymbol,
 ) -> bool {
+    if is_arglist_marker(arg_ty) {
+        return false;
+    }
     if matches!(arg_ty, TypeSymbol::ByRef(_)) || matches!(param, TypeSymbol::ByRef(_)) {
         return arg_ty == param;
     }
@@ -5907,7 +6226,20 @@ fn resolve_overload(
     }
     let mut expanded = None;
     for candidate in candidates {
-        if candidate.parameters.len() == arguments.len() {
+        if candidate.is_vararg
+            && candidate.parameters.len() + 1 == arguments.len()
+            && arguments.last().is_some_and(is_arglist_marker)
+        {
+            if let Some(bad) = first_bad_normal(
+                model,
+                candidate,
+                &arguments[..arguments.len() - 1],
+                arg_constants,
+            ) {
+                return bad;
+            }
+        }
+        if !candidate.is_vararg && candidate.parameters.len() == arguments.len() {
             if let Some(bad) = first_bad_normal(model, candidate, arguments, arg_constants) {
                 return bad;
             }
@@ -6000,12 +6332,34 @@ fn is_applicable(
 
 /// Whether a method applies in NORMAL form: the counts match and every argument converts
 /// to its parameter (14.4.2.1). (Expanded `params` form is [`is_applicable_expanded`].)
+/// A vararg member's sentinel behaves as one required trailing parameter that only an
+/// `__arglist(...)` argument matches (csc: CS7036 when missing), so its effective arity
+/// is `parameters + 1` and the marker argument must close the list.
 fn is_normal_applicable(
     model: &Model,
     method: &MethodSymbol,
     arguments: &[TypeSymbol],
     arg_constants: &[Option<i64>],
 ) -> bool {
+    if method.is_vararg {
+        let Some((last, fixed)) = arguments.split_last() else {
+            return false;
+        };
+        return is_arglist_marker(last)
+            && method.parameters.len() == fixed.len()
+            && fixed
+                .iter()
+                .zip(&method.parameters)
+                .enumerate()
+                .all(|(i, (argument, parameter))| {
+                    arg_applicable(
+                        model,
+                        argument,
+                        arg_constants.get(i).copied().flatten(),
+                        parameter,
+                    )
+                });
+    }
     method.parameters.len() == arguments.len()
         && arguments
             .iter()
@@ -6194,6 +6548,48 @@ fn system_type() -> TypeSymbol {
 /// so emission encodes it specially rather than as a value type named by a token.
 fn typed_reference() -> TypeSymbol {
     TypeSymbol::Named([Box::from("System"), Box::from("TypedReference")].into())
+}
+
+/// `System.RuntimeArgumentHandle` -- the type of a bare `__arglist` (what
+/// `ArgIterator(RuntimeArgumentHandle)` consumes). An ordinary corlib value type.
+fn runtime_argument_handle() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("System"), Box::from("RuntimeArgumentHandle")].into())
+}
+
+/// The pseudo-type of an `__arglist(...)` argument pack. It is not a real type: it exists
+/// so overload resolution can match the pack against a vararg member's sentinel (and
+/// nothing else), and so CS1503 renders `__arglist` exactly as csc does. The single-part
+/// name never resolves (user code cannot spell it -- `__arglist` lexes as the keyword).
+fn arglist_marker() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("__arglist")].into())
+}
+
+/// Whether `ty` is the [`arglist_marker`] pseudo-type (an `__arglist(...)` argument pack).
+fn is_arglist_marker(ty: &TypeSymbol) -> bool {
+    matches!(ty, TypeSymbol::Named(parts) if parts.len() == 1 && &*parts[0] == "__arglist")
+}
+
+/// csc's member display in CS7036 for a vararg member: `P.M(int, __arglist)`, with a
+/// constructor shown by its type name (`T.T(__arglist)`).
+fn vararg_member_display(
+    declaring: &TypeSymbol,
+    name: &str,
+    parameters: &[TypeSymbol],
+) -> Box<str> {
+    use core::fmt::Write;
+    let declaring = declaring.to_string();
+    let shown = if name == ".ctor" {
+        declaring.rsplit('.').next().unwrap_or(&declaring).to_string()
+    } else {
+        String::from(name)
+    };
+    let mut display = String::new();
+    let _ = write!(display, "{declaring}.{shown}(");
+    for parameter in parameters {
+        let _ = write!(display, "{parameter}, ");
+    }
+    display.push_str("__arglist)");
+    display.into()
 }
 
 /// `System.Array`, whose members (Length, GetLength, ...) an array's member access
@@ -6688,6 +7084,7 @@ mod tests {
             parameters: Vec::new(),
             is_static: false,
             is_params: false,
+            is_vararg: false,
             is_virtual: false,
             is_abstract: false,
             is_override: false,
@@ -6811,6 +7208,7 @@ mod tests {
             parameters: Vec::new(),
             is_static: false,
             is_params: false,
+            is_vararg: false,
             is_virtual: false,
             is_abstract: false,
             is_override: false,
@@ -7241,6 +7639,7 @@ mod tests {
                 parameters,
                 is_static: false,
                 is_params: false,
+                is_vararg: false,
                 is_virtual: false,
                 is_abstract: false,
                 is_override: false,
@@ -7455,6 +7854,7 @@ mod tests {
             parameters,
             is_static: false,
             is_params: false,
+            is_vararg: false,
             is_virtual: true,
             is_abstract: true,
             is_override: false,
@@ -7859,6 +8259,7 @@ mod tests {
             parameters: alloc::vec![int.clone()],
             is_static: false,
             is_params: false,
+            is_vararg: false,
             is_virtual: false,
             is_abstract: false,
             is_override: false,

@@ -1,0 +1,21 @@
+# PARTS table for the esp32c6 family. PARTIAL.
+#
+# part id: the family-generic chip name, deliberately -- the DevKitC-1 carries the chip
+# inside an ESP32-C6-WROOM-1 module whose exact order code (and the bare chip's) must be
+# transcribed datasheet-open when the module CSP is authored (deferred, not recalled
+#). flash = 0: code XIPs from module/external QSPI flash through the cache
+# window -- a board/module fact, not chip truth (same class as the rp2040; see the posted
+# amendment). ram: the 512 KB HP SRAM (TRM ch 4; the serve's proven linker script maps
+# 0x40800000..0x40880000 with the bootloader carve-out documented in its header).
+
+[table]
+kind = "parts"
+family = "esp32c6"
+
+
+part = "esp32c6"
+package = "module-carried (order code lands with the module CSP, datasheet-open)"
+flash = 0
+ram = 0x80000
+pins = ["GPIO16", "GPIO17"]
+source = "ESP32-C6 TRM ch 4 (internal memory: 512 KB HP SRAM) -- PARTIAL pin list: complete from the datasheet pinout as bindings demand"

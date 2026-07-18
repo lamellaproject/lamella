@@ -302,6 +302,103 @@ namespace System
             return -1;
         }
 
+        public int IndexOf(char value, int startIndex, int count)
+        {
+            int n = this.Length;
+            if (startIndex < 0 || startIndex > n) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex > n - count) throw new ArgumentOutOfRangeException("count");
+            int end = startIndex + count;
+            for (int i = startIndex; i < end; i++)
+            {
+                if (this[i] == value) return i;
+            }
+            return -1;
+        }
+
+        public bool Contains(string value)
+        {
+            return IndexOf(value) >= 0;
+        }
+
+        public string[] Split(char[] separator)
+        {
+            return Split(separator, Int32.MaxValue);
+        }
+
+        public string[] Split(char[] separator, int count)
+        {
+            if (count < 0) throw new ArgumentOutOfRangeException("count");
+            if (count == 0) return new string[0];
+            bool whitespace = (object)separator == null || separator.Length == 0;
+            int n = this.Length;
+            int pieces = 1;
+            for (int i = 0; i < n && pieces < count; i++)
+            {
+                if (IsSeparatorChar(this[i], separator, whitespace)) pieces++;
+            }
+            string[] result = new string[pieces];
+            int start = 0;
+            int idx = 0;
+            for (int i = 0; i < n && idx < pieces - 1; i++)
+            {
+                if (IsSeparatorChar(this[i], separator, whitespace))
+                {
+                    result[idx] = this.Substring(start, i - start);
+                    idx++;
+                    start = i + 1;
+                }
+            }
+            result[pieces - 1] = this.Substring(start, n - start);
+            return result;
+        }
+
+        private static bool IsSeparatorChar(char c, char[] separator, bool whitespace)
+        {
+            if (whitespace) return Char.IsWhiteSpace(c);
+            for (int j = 0; j < separator.Length; j++)
+            {
+                if (separator[j] == c) return true;
+            }
+            return false;
+        }
+
+        public static string Join(string separator, string[] value)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            return Join(separator, value, 0, value.Length);
+        }
+
+        public static string Join(string separator, string[] value, int startIndex, int count)
+        {
+            if ((object)value == null) throw new ArgumentNullException("value");
+            if (startIndex < 0) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0) throw new ArgumentOutOfRangeException("count");
+            if (startIndex > value.Length - count) throw new ArgumentOutOfRangeException("startIndex");
+            if ((object)separator == null) separator = "";
+            if (count == 0) return "";
+            string first = value[startIndex];
+            string result = (object)first == null ? "" : first;
+            for (int i = 1; i < count; i++)
+            {
+                string piece = value[startIndex + i];
+                result = String.Concat(result, separator);
+                result = String.Concat(result, (object)piece == null ? "" : piece);
+            }
+            return result;
+        }
+
+        public void CopyTo(int sourceIndex, char[] destination, int destinationIndex, int count)
+        {
+            if ((object)destination == null) throw new ArgumentNullException("destination");
+            if (count < 0) throw new ArgumentOutOfRangeException("count");
+            if (sourceIndex < 0 || sourceIndex > this.Length - count) throw new ArgumentOutOfRangeException("sourceIndex");
+            if (destinationIndex < 0 || destinationIndex > destination.Length - count) throw new ArgumentOutOfRangeException("destinationIndex");
+            for (int i = 0; i < count; i++)
+            {
+                destination[destinationIndex + i] = this[sourceIndex + i];
+            }
+        }
+
         public bool StartsWith(string value)
         {
             int n = value.Length;

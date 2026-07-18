@@ -2,8 +2,10 @@
 #if LAMELLA_SURFACE_GC
 namespace System
 {
-    public static class GC
+    public sealed class GC
     {
+        private GC() { }
+
         [Lamella.Runtime.RuntimeProvided] public static void Collect() { }
 
         public static void Collect(int generation)

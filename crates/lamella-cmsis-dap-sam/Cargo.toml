@@ -17,3 +17,6 @@ lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", features = ["test-util"] }
 # Real-probe HID access for the examples.
 lamella-usbhid = { path = "../lamella-usbhid" }
+# Probe discovery/selection, so examples targeting a board on a COMPOSITE probe (e.g. the Arduino
+# Due behind an MCU-Link, whose DAP interface must be selected out of several) can open it.
+lamella-probe = { path = "../lamella-probe" }

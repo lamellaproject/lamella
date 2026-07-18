@@ -20,6 +20,7 @@ use lamella_metadata::{Assembly, encode_exception_base_chain, exception_tag_for_
 use lamella_pe::{
     DebugDocument, ImageBuilder, LocalVariable, MethodDebug, SequencePoint, TypeSig,
     field_signature, local_signature, method_signature, property_signature, type_signature,
+    vararg_call_site_signature, vararg_method_signature,
 };
 use lamella_syntax::ast::{
     AssignmentOperator, AttributeArgument, AttributeSection, CompilationUnit, ConstructorInitializer,
@@ -437,6 +438,7 @@ fn build_image(
         image.set_content_id(&content);
     }
     register_external_assemblies(binder.model(), &mut image);
+    register_assembly_identities(references, &mut image);
     let object =
         declared_system_type(&tokens, "Object").unwrap_or_else(|| image.object_type());
     let mut entry_point = None;
@@ -586,14 +588,118 @@ fn emit_global_attributes(
 ) {
     let enclosing = TypeSymbol::Special(SpecialType::Object);
     for section in sections {
+        let is_assembly = section.target.as_deref() != Some("module");
         let parent = match section.target.as_deref() {
             Some("module") => image.module_token(),
             _ => image.assembly_token(),
         };
         for attribute in &section.attributes {
+            if is_assembly {
+                if let Some(version) = assembly_version_from_attribute(attribute) {
+                    image.set_assembly_version(version);
+                    continue;
+                }
+                if let Some(flags) = assembly_flags_from_attribute(attribute) {
+                    image.set_assembly_flags(flags);
+                    continue;
+                }
+                if let Some(algorithm) = assembly_algorithm_id_from_attribute(attribute) {
+                    image.set_assembly_hash_algorithm(algorithm);
+                    continue;
+                }
+                if let Some(culture) = assembly_culture_from_attribute(attribute) {
+                    image.set_assembly_culture(&culture);
+                    continue;
+                }
+            }
             emit_one_attribute(image, binder, tokens, &enclosing, parent, attribute);
         }
     }
+}
+
+/// The version from an `[assembly: AssemblyVersion("a.b.c.d")]` attribute, matched by its
+/// well-known name (like `[DllImport]`), or `None` if this is a different attribute. csc treats
+/// `AssemblyVersion` specially by name -- the type need not be resolvable -- so this reads it
+/// syntactically.
+fn assembly_version_from_attribute(
+    attribute: &lamella_syntax::ast::Attribute,
+) -> Option<(u16, u16, u16, u16)> {
+    let last = attribute.name.parts.last()?;
+    if &**last != "AssemblyVersion" && &**last != "AssemblyVersionAttribute" {
+        return None;
+    }
+    let text = attribute.arguments.iter().find_map(|argument| match argument {
+        AttributeArgument::Positional(expr) => string_literal_value(expr),
+        AttributeArgument::Named { .. } => None,
+    })?;
+    parse_assembly_version(&text)
+}
+
+/// The flags from an `[assembly: AssemblyFlags(n)]` attribute, consumed into the Assembly row's
+/// `Flags` column (II.22.2) rather than emitted as a `CustomAttribute` -- csc's behaviour, matched
+/// by well-known name like `AssemblyVersion`. `None` for a different attribute.
+fn assembly_flags_from_attribute(attribute: &lamella_syntax::ast::Attribute) -> Option<u32> {
+    assembly_u32_from_attribute(attribute, "AssemblyFlags")
+}
+
+/// The algorithm id from an `[assembly: AssemblyAlgorithmId(n)]` attribute, consumed into the
+/// Assembly row's `HashAlgId` column (II.22.2), like `AssemblyFlags`.
+fn assembly_algorithm_id_from_attribute(attribute: &lamella_syntax::ast::Attribute) -> Option<u32> {
+    assembly_u32_from_attribute(attribute, "AssemblyAlgorithmId")
+}
+
+/// The `u32` argument of a well-known assembly attribute whose last name part is `simple_name` (with
+/// or without the `Attribute` suffix), read syntactically from a single integer-literal positional
+/// argument. `None` if this is a different attribute, the argument is not an integer constant, or it
+/// does not fit `u32` (a well-formed `AssemblyFlags`/`AssemblyAlgorithmId` argument always does).
+fn assembly_u32_from_attribute(
+    attribute: &lamella_syntax::ast::Attribute,
+    simple_name: &str,
+) -> Option<u32> {
+    let last = &**attribute.name.parts.last()?;
+    if last != simple_name && last.strip_suffix("Attribute") != Some(simple_name) {
+        return None;
+    }
+    let value = attribute.arguments.iter().find_map(|argument| match argument {
+        AttributeArgument::Positional(expr) => match &expr.kind {
+            ExprKind::Literal(literal) => lamella_binder::literal_int_value(literal),
+            _ => None,
+        },
+        AttributeArgument::Named { .. } => None,
+    })?;
+    u32::try_from(value).ok()
+}
+
+/// The culture from an `[assembly: AssemblyCulture("name")]` attribute, consumed into the Assembly
+/// row's `Culture` column (II.22.2). csc treats the empty string as the neutral culture (a nil
+/// column), which the string interner already maps to heap offset 0. `None` for a different
+/// attribute.
+fn assembly_culture_from_attribute(attribute: &lamella_syntax::ast::Attribute) -> Option<String> {
+    let last = &**attribute.name.parts.last()?;
+    if last != "AssemblyCulture" && last != "AssemblyCultureAttribute" {
+        return None;
+    }
+    attribute.arguments.iter().find_map(|argument| match argument {
+        AttributeArgument::Positional(expr) => string_literal_value(expr),
+        AttributeArgument::Named { .. } => None,
+    })
+}
+
+/// Parses an assembly version string: 1..=4 dot-separated `u16` parts, missing trailing parts
+/// padding with 0 (`"1.0"` -> `(1, 0, 0, 0)`). Returns `None` on more than four parts, an empty
+/// string, a non-`u16` part, or the csc wildcard form (`"1.0.*"`) -- we emit byte-deterministic
+/// assemblies, and the wildcard's auto-generated build/revision are not.
+fn parse_assembly_version(text: &str) -> Option<(u16, u16, u16, u16)> {
+    let mut parts = [0u16; 4];
+    let mut seen = 0usize;
+    for (index, piece) in text.split('.').enumerate() {
+        if index >= 4 {
+            return None;
+        }
+        parts[index] = piece.trim().parse::<u16>().ok()?;
+        seen = index + 1;
+    }
+    (seen > 0).then_some((parts[0], parts[1], parts[2], parts[3]))
 }
 
 fn emit_one_attribute(
@@ -671,6 +777,7 @@ fn emit_one_attribute(
             parameters: parameters.clone(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             is_static: false,
+            is_vararg: false,
         };
         mint_member_ref(&constructor_ref, image, tokens);
     }
@@ -1857,6 +1964,7 @@ fn emit_type(
             tokens,
             declaration,
             &[],
+            false,
             None,
             &body,
             base_ctor,
@@ -1881,6 +1989,7 @@ fn emit_type(
             &[],
             &body,
             true,
+            false,
             CCTOR_FLAGS,
             None,
             debug,
@@ -1893,6 +2002,7 @@ fn emit_type(
                 return_type,
                 name,
                 parameters,
+                is_vararg,
                 body: Some(body),
                 explicit_interface,
                 attributes,
@@ -1907,6 +2017,7 @@ fn emit_type(
                     name,
                     return_type,
                     parameters,
+                    *is_vararg,
                     body,
                     explicit_interface.as_ref(),
                     debug,
@@ -1952,9 +2063,10 @@ fn emit_type(
                 operator,
                 parameters,
                 body,
+                attributes,
                 ..
             } => {
-                emit_one_method(
+                let token = emit_one_method(
                     image,
                     binder,
                     &enclosing,
@@ -1963,10 +2075,12 @@ fn emit_type(
                     operator.method_name(parameters.len()),
                     return_type,
                     parameters,
+                    false,
                     body,
                     None,
                     debug,
                 )?;
+                emit_attributes(image, binder, tokens, &enclosing, token, attributes);
             }
             Member::ConversionOperator {
                 modifiers,
@@ -1974,9 +2088,10 @@ fn emit_type(
                 target,
                 parameters,
                 body,
+                attributes,
                 ..
             } => {
-                emit_one_method(
+                let token = emit_one_method(
                     image,
                     binder,
                     &enclosing,
@@ -1985,14 +2100,17 @@ fn emit_type(
                     direction.method_name(),
                     target,
                     parameters,
+                    false,
                     body,
                     None,
                     debug,
                 )?;
+                emit_attributes(image, binder, tokens, &enclosing, token, attributes);
             }
             Member::Constructor {
                 modifiers,
                 parameters,
+                is_vararg,
                 initializer,
                 body,
                 header_span,
@@ -2013,6 +2131,7 @@ fn emit_type(
                     tokens,
                     declaration,
                     parameters,
+                    *is_vararg,
                     initializer.as_ref(),
                     body,
                     base_ctor,
@@ -2021,8 +2140,10 @@ fn emit_type(
                 )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
             }
-            Member::Destructor { body, .. } => {
-                emit_destructor(
+            Member::Destructor {
+                body, attributes, ..
+            } => {
+                let token = emit_destructor(
                     image,
                     binder,
                     &enclosing,
@@ -2031,6 +2152,7 @@ fn emit_type(
                     body,
                     debug,
                 )?;
+                emit_attributes(image, binder, tokens, &enclosing, token, attributes);
             }
             _ => {}
         }
@@ -2122,6 +2244,7 @@ fn emit_type(
             }
         }
         if let Member::Event {
+            modifiers,
             ty,
             name,
             adder,
@@ -2142,6 +2265,7 @@ fn emit_type(
                 adder.as_ref().and_then(|accessor| accessor.body.as_ref()),
                 remover.as_ref().and_then(|accessor| accessor.body.as_ref()),
                 explicit_interface.as_ref(),
+                modifiers.contains(&Modifier::Static),
                 debug,
             )?;
             emit_attributes(image, binder, tokens, &enclosing, event, attributes);
@@ -2203,6 +2327,7 @@ fn emit_event(
         &[],
         &event_accessor_body(name, AssignmentOperator::Add),
         is_static,
+        false,
         flags,
         None,
         debug,
@@ -2218,6 +2343,7 @@ fn emit_event(
         &[],
         &event_accessor_body(name, AssignmentOperator::Subtract),
         is_static,
+        false,
         flags,
         None,
         debug,
@@ -2237,6 +2363,11 @@ fn emit_event(
 /// user-written add/remove bodies plus an Event row. An explicit-interface event names its
 /// accessors `I.add_E`/`I.remove_E`, private hidebysig newslot virtual final with a
 /// MethodImpl (like an explicit method); an ordinary one's accessors are public.
+///
+/// A `static` event's accessors are static too (17.7.1) -- `is_static` carries the declared
+/// modifier to both the accessor flags (II.23.1.10 Static) and the body's frame, where it
+/// decides whether argument slot 0 is `this` or the implicit `value`. An explicit-interface
+/// event cannot be static (13.4.1), so that branch keeps its instance slot flags.
 #[allow(clippy::too_many_arguments)]
 fn emit_custom_event(
     image: &mut ImageBuilder,
@@ -2248,9 +2379,11 @@ fn emit_custom_event(
     add_body: Option<&lamella_syntax::ast::Stmt>,
     remove_body: Option<&lamella_syntax::ast::Stmt>,
     explicit_interface: Option<&lamella_syntax::ast::TypeRef>,
+    is_static: bool,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
     let void = TypeSymbol::Special(SpecialType::Void);
+    let is_static = is_static && explicit_interface.is_none();
     let flags = if explicit_interface.is_some() {
         METHOD_PRIVATE
             | METHOD_VIRTUAL
@@ -2259,7 +2392,10 @@ fn emit_custom_event(
             | METHOD_HIDEBYSIG
             | SPECIAL_NAME
     } else {
-        METHOD_PUBLIC | SPECIAL_NAME | METHOD_HIDEBYSIG
+        METHOD_PUBLIC
+            | SPECIAL_NAME
+            | METHOD_HIDEBYSIG
+            | if is_static { METHOD_STATIC } else { 0 }
     };
     let params = [(Box::<str>::from("value"), event_ty.clone())];
     let accessor_token = |prefix: &str,
@@ -2272,8 +2408,8 @@ fn emit_custom_event(
         let accessor = accessor_name(prefix, name);
         let method_name = explicit_accessor_name(explicit_interface, &accessor);
         let token = emit_method_body(
-            image, binder, tokens, enclosing, &method_name, &void, &params, &[], body, false,
-            flags, None, debug,
+            image, binder, tokens, enclosing, &method_name, &void, &params, &[], body, is_static,
+            false, flags, None, debug,
         )?;
         if let Some(interface) = explicit_interface {
             emit_explicit_interface_impl(
@@ -2367,6 +2503,7 @@ fn emit_one_method(
     name: &str,
     return_type: &TypeRef,
     parameters: &[Parameter],
+    is_vararg: bool,
     body: &Stmt,
     explicit_interface: Option<&TypeRef>,
     debug: Option<&DebugContext>,
@@ -2392,6 +2529,7 @@ fn emit_one_method(
             &byref_flags,
             body,
             false,
+            is_vararg,
             flags,
             None,
             debug,
@@ -2441,6 +2579,7 @@ fn emit_one_method(
         &byref_flags,
         body,
         is_static,
+        is_vararg,
         flags,
         None,
         debug,
@@ -2616,6 +2755,7 @@ fn emit_constructor(
     tokens: &mut Tokens,
     declaration: &TypeDecl,
     parameters: &[Parameter],
+    is_vararg: bool,
     initializer: Option<&ConstructorInitializer>,
     body: &lamella_syntax::ast::Stmt,
     base_ctor: Option<Token>,
@@ -2637,12 +2777,17 @@ fn emit_constructor(
             binder
                 .bind_constructor_chain(enclosing, &params, init)
                 .map(|(method, arguments)| {
+                    let chain_key = if method.is_vararg {
+                        crate::expr::vararg_lookup_params(&method.parameters, &[])
+                    } else {
+                        method.parameters.clone()
+                    };
                     let ctor = tokens
-                        .method(&method.declaring_type, ".ctor", &method.parameters)
+                        .method(&method.declaring_type, ".ctor", &chain_key)
                         .unwrap_or_else(|| {
                             mint_member_ref(&method, image, tokens);
                             tokens
-                                .method(&method.declaring_type, ".ctor", &method.parameters)
+                                .method(&method.declaring_type, ".ctor", &chain_key)
                                 .unwrap_or_else(|| image.object_ctor())
                         });
                     ConstructorPrologue {
@@ -2683,6 +2828,7 @@ fn emit_constructor(
         &byref_flags(parameters),
         &body,
         false,
+        is_vararg,
         CTOR_FLAGS,
         prologue.as_ref(),
         debug,
@@ -2693,6 +2839,7 @@ fn emit_constructor(
 /// method reusing System.Object::Finalize's slot, so a dropped object's body runs at
 /// finalization (17.12). The body is wrapped in `try { <body> } finally { base.Finalize(); }`
 /// so the base finalizer runs afterwards, the chain ending at System.Object::Finalize.
+/// Returns the `Finalize` MethodDef token, which the destructor's own attributes attach to.
 fn emit_destructor(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -2701,7 +2848,7 @@ fn emit_destructor(
     base_class: Option<&TypeSymbol>,
     body: &lamella_syntax::ast::Stmt,
     debug: Option<&DebugContext>,
-) -> Result<(), crate::EmitError> {
+) -> Result<Token, crate::EmitError> {
     let void = TypeSymbol::Special(SpecialType::Void);
     let bound =
         binder.bind_method(Some(enclosing.clone()), "Finalize", void.clone(), &[], &[], false, body);
@@ -2714,6 +2861,7 @@ fn emit_destructor(
         &[],
         &[],
         &bound,
+        false,
         false,
         FINALIZE_FLAGS,
         None,
@@ -2736,7 +2884,7 @@ fn emit_destructor(
         }
     };
     image.add_method_impl(class, finalize, declaration);
-    Ok(())
+    Ok(finalize)
 }
 
 /// The base type's `Finalize` a destructor chains to (17.12): the direct base's own
@@ -2756,6 +2904,7 @@ fn base_finalizer_reference(
         parameters: Vec::new(),
         return_type: TypeSymbol::Special(SpecialType::Void),
         is_static: false,
+        is_vararg: false,
     }
 }
 
@@ -2812,10 +2961,14 @@ fn emit_method_body(
     byref_flags: &[bool],
     body: &lamella_syntax::ast::Stmt,
     is_static: bool,
+    is_vararg: bool,
     flags: u16,
     prologue: Option<&ConstructorPrologue>,
     debug: Option<&DebugContext>,
 ) -> Result<Token, crate::EmitError> {
+    if is_vararg {
+        binder.set_next_method_vararg();
+    }
     let bound = binder.bind_method(
         Some(enclosing.clone()),
         name,
@@ -2834,6 +2987,7 @@ fn emit_method_body(
         byref_flags,
         &bound,
         is_static,
+        is_vararg,
         flags,
         prologue,
         debug,
@@ -2853,6 +3007,7 @@ fn emit_bound_body(
     byref_flags: &[bool],
     bound: &BoundStmt,
     is_static: bool,
+    is_vararg: bool,
     flags: u16,
     prologue: Option<&ConstructorPrologue>,
     debug: Option<&DebugContext>,
@@ -2949,11 +3104,15 @@ fn emit_bound_body(
             })
         })
         .collect::<Result<_, _>>()?;
-    let signature = method_signature(
-        !is_static,
-        &parameter_sigs,
-        &type_sig(tokens, return_symbol)?,
-    );
+    let signature = if is_vararg {
+        vararg_method_signature(!is_static, &parameter_sigs, &type_sig(tokens, return_symbol)?)
+    } else {
+        method_signature(
+            !is_static,
+            &parameter_sigs,
+            &type_sig(tokens, return_symbol)?,
+        )
+    };
     let method = image.add_method(
         name,
         &signature,
@@ -3073,7 +3232,7 @@ fn emit_property(
         let token = if let Some(body) = &getter.body {
             let token = emit_method_body(
                 image, binder, tokens, enclosing, &method_name, &property_ty, &[], &[], body,
-                is_static, flags, None, debug,
+                is_static, false, flags, None, debug,
             )?;
             if let Some(interface) = explicit_interface {
                 emit_explicit_interface_impl(
@@ -3108,7 +3267,7 @@ fn emit_property(
         let token = if let Some(body) = &setter.body {
             let token = emit_method_body(
                 image, binder, tokens, enclosing, &method_name, &void, &params, &[], body,
-                is_static, flags, None, debug,
+                is_static, false, flags, None, debug,
             )?;
             if let Some(interface) = explicit_interface {
                 emit_explicit_interface_impl(
@@ -3224,7 +3383,7 @@ fn emit_indexer(
         let token = if let Some(body) = &getter.body {
             Some(emit_method_body(
                 image, binder, tokens, enclosing, &getter_name, &element_ty, &index_params, &[],
-                body, false, flags, None, debug,
+                body, false, false, flags, None, debug,
             )?)
         } else if is_abstract {
             let signature = method_signature(true, &index_sigs, &element_sig);
@@ -3249,7 +3408,7 @@ fn emit_indexer(
         let token = if let Some(body) = &setter.body {
             Some(emit_method_body(
                 image, binder, tokens, enclosing, &setter_name, &void, &params, &[],
-                body, false, flags, None, debug,
+                body, false, false, flags, None, debug,
             )?)
         } else if is_abstract {
             let mut signature_params = index_sigs.clone();
@@ -3323,6 +3482,7 @@ fn emit_default_member_attribute(
             parameters: parameters.clone(),
             return_type: TypeSymbol::Special(SpecialType::Void),
             is_static: false,
+            is_vararg: false,
         };
         mint_member_ref(&constructor_ref, image, tokens);
     }
@@ -3693,8 +3853,18 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 }
             }
             if let Some(method) = method {
+                if let (_, Some(extras)) = crate::expr::split_vararg_arguments(arguments) {
+                    if !extras.is_empty() {
+                        mint_vararg_site_ref(method, extras, image, tokens);
+                    }
+                }
+                let def_key = if method.is_vararg {
+                    crate::expr::vararg_lookup_params(&method.parameters, &[])
+                } else {
+                    method.parameters.clone()
+                };
                 if tokens
-                    .method(&method.declaring_type, &method.name, &method.parameters)
+                    .method(&method.declaring_type, &method.name, &def_key)
                     .is_none()
                 {
                     mint_member_ref(method, image, tokens);
@@ -3709,12 +3879,18 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 mint_in_expr(argument, image, tokens);
             }
             if let Some(constructor) = constructor {
+                if let (_, Some(extras)) = crate::expr::split_vararg_arguments(arguments) {
+                    if !extras.is_empty() {
+                        mint_vararg_site_ref(constructor, extras, image, tokens);
+                    }
+                }
+                let def_key = if constructor.is_vararg {
+                    crate::expr::vararg_lookup_params(&constructor.parameters, &[])
+                } else {
+                    constructor.parameters.clone()
+                };
                 if tokens
-                    .method(
-                        &constructor.declaring_type,
-                        &constructor.name,
-                        &constructor.parameters,
-                    )
+                    .method(&constructor.declaring_type, &constructor.name, &def_key)
                     .is_none()
                 {
                     mint_member_ref(constructor, image, tokens);
@@ -3782,6 +3958,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                 parameters: Vec::new(),
                 return_type: expr.ty.clone(),
                 is_static: matches!(receiver.kind, BoundExprKind::TypeReference(_)),
+                is_vararg: false,
             };
             if tokens
                 .method(&getter.declaring_type, &getter.name, &getter.parameters)
@@ -3816,6 +3993,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     parameters: alloc::vec![TypeSymbol::Special(SpecialType::Int32)],
                     return_type: TypeSymbol::Special(SpecialType::Char),
                     is_static: false,
+                    is_vararg: false,
                 };
                 if tokens
                     .method(&getter.declaring_type, &getter.name, &getter.parameters)
@@ -3846,6 +4024,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     parameters: alloc::vec![target.ty.clone()],
                     return_type: TypeSymbol::Special(SpecialType::Void),
                     is_static: matches!(receiver.kind, BoundExprKind::TypeReference(_)),
+                    is_vararg: false,
                 };
                 if tokens
                     .method(&setter.declaring_type, &setter.name, &setter.parameters)
@@ -3904,6 +4083,14 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             mint_in_expr(reference, image, tokens);
             mint_type_token(image, tokens, target);
         }
+        BoundExprKind::ArgListLiteral(elements) => {
+            for element in elements {
+                mint_in_expr(element, image, tokens);
+            }
+        }
+        BoundExprKind::SizeOf(target) => {
+            mint_named_type_token(target, image, tokens);
+        }
         _ => {}
     }
 }
@@ -3925,6 +4112,7 @@ fn get_type_from_handle_reference() -> lamella_binder::MethodReference {
         parameters: alloc::vec![crate::expr::runtime_type_handle_symbol()],
         return_type: crate::expr::system_type_symbol(),
         is_static: true,
+        is_vararg: false,
     }
 }
 
@@ -3937,6 +4125,7 @@ pub(crate) fn offset_to_string_data_reference() -> lamella_binder::MethodReferen
         parameters: alloc::vec![],
         return_type: TypeSymbol::Special(SpecialType::Int32),
         is_static: true,
+        is_vararg: false,
     }
 }
 
@@ -3956,6 +4145,7 @@ fn string_concat_reference(both_strings: bool) -> lamella_binder::MethodReferenc
         parameters: alloc::vec![arg.clone(), arg],
         return_type: string,
         is_static: true,
+        is_vararg: false,
     }
 }
 
@@ -3969,6 +4159,7 @@ fn string_equality_reference() -> lamella_binder::MethodReference {
         parameters: alloc::vec![string.clone(), string.clone()],
         return_type: TypeSymbol::Special(SpecialType::Boolean),
         is_static: true,
+        is_vararg: false,
     }
 }
 
@@ -3995,15 +4186,81 @@ fn mint_member_ref(
     else {
         return;
     };
-    let signature = method_signature(!method.is_static, &parameter_sigs, &return_sig);
+    let signature = if method.is_vararg {
+        vararg_method_signature(!method.is_static, &parameter_sigs, &return_sig)
+    } else {
+        method_signature(!method.is_static, &parameter_sigs, &return_sig)
+    };
+    let key_params = if method.is_vararg {
+        crate::expr::vararg_lookup_params(&method.parameters, &[])
+    } else {
+        method.parameters.clone()
+    };
     let type_ref = image.type_ref(&namespace, &name);
     let member = image.member_ref(type_ref, &method.name, &signature);
     tokens.insert_method(
         &method.declaring_type,
         &crate::tokens::conversion_key_name(&method.name, &method.return_type),
-        &method.parameters,
+        &key_params,
         member,
     );
+}
+
+/// Mints the `MemberRef` a NON-empty vararg call site names (II.23.2.1): the parent is
+/// the target's own `TypeDef` (a this-module member) or its `TypeRef` (external), and
+/// the signature is the CALL-SITE form -- the fixed parameters, a sentinel, then each
+/// variable argument's type. Keyed by fixed + `__arglist` marker + the extra types, so
+/// same-shaped call sites share one row and emission finds it by identity. (An EMPTY
+/// `__arglist()` call names the def token instead, exactly as csc lowers it.)
+fn mint_vararg_site_ref(
+    method: &lamella_binder::MethodReference,
+    extras: &[lamella_binder::BoundExpr],
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+) {
+    let key_params = crate::expr::vararg_lookup_params(&method.parameters, extras);
+    if tokens
+        .method(&method.declaring_type, &method.name, &key_params)
+        .is_some()
+    {
+        return;
+    }
+    let parent = match tokens.type_token(&method.declaring_type) {
+        Some(token) => token,
+        None => {
+            let Some((namespace, name)) = split_type_name(&method.declaring_type) else {
+                return;
+            };
+            mint_named_type_token(&method.declaring_type, image, tokens);
+            image.type_ref(&namespace, &name)
+        }
+    };
+    for parameter in &method.parameters {
+        mint_named_type_token(parameter, image, tokens);
+    }
+    let extra_symbols: Vec<TypeSymbol> =
+        extras.iter().map(crate::expr::vararg_extra_symbol).collect();
+    for extra in &extra_symbols {
+        mint_named_type_token(extra, image, tokens);
+    }
+    let fixed_sigs: Result<Vec<TypeSig>, _> = method
+        .parameters
+        .iter()
+        .map(|ty| type_sig(tokens, ty))
+        .collect();
+    let extra_sigs: Result<Vec<TypeSig>, _> =
+        extra_symbols.iter().map(|ty| type_sig(tokens, ty)).collect();
+    let (Ok(fixed_sigs), Ok(extra_sigs), Ok(return_sig)) = (
+        fixed_sigs,
+        extra_sigs,
+        type_sig(tokens, &method.return_type),
+    ) else {
+        return;
+    };
+    let signature =
+        vararg_call_site_signature(!method.is_static, &fixed_sigs, &extra_sigs, &return_sig);
+    let member = image.member_ref(parent, &method.name, &signature);
+    tokens.insert_method(&method.declaring_type, &method.name, &key_params, member);
 }
 
 /// Mints a `MemberRef` (a FieldRef) for a field on a type outside this module -- the
@@ -4158,6 +4415,24 @@ fn register_external_assemblies(model: &Model, image: &mut ImageBuilder) {
         .collect();
     for (qualified, assembly) in entries {
         image.set_type_assembly(&qualified, &assembly);
+    }
+}
+
+/// Records each reference assembly's real identity (name -> version + full public key) in the
+/// image, so an `AssemblyRef` we emit for it carries that identity rather than a
+/// `Version=4.0.0.0, PublicKeyToken=null` default. Without this, csc consuming an lcsc-built
+/// library alongside the same reference pack rejects it -- our `System.Runtime` reference names a
+/// phantom assembly whose identity matches nothing it has (CS0012). The reference pack is the
+/// single source of truth: we forward exactly what it declares.
+fn register_assembly_identities(references: &[Assembly], image: &mut ImageBuilder) {
+    for reference in references {
+        if let Some(name) = reference.assembly_name() {
+            image.set_assembly_identity(
+                name,
+                reference.assembly_version(),
+                reference.assembly_public_key(),
+            );
+        }
     }
 }
 
@@ -4378,6 +4653,7 @@ fn emit_decimal_constant_attribute(
         parameters: params.to_vec(),
         return_type: TypeSymbol::Special(SpecialType::Void),
         is_static: false,
+        is_vararg: false,
     };
     mint_member_ref(&reference, image, tokens);
     let Some(ctor) = tokens.method(&attr_ty, ".ctor", &params) else {
@@ -4806,6 +5082,7 @@ fn collect_tokens(
                             modifiers,
                             name,
                             parameters,
+                            is_vararg,
                             body,
                             explicit_interface,
                             attributes,
@@ -4816,8 +5093,11 @@ fn collect_tokens(
                             || find_dll_import(name, attributes).is_some() =>
                         {
                             *next_method += 1;
-                            let params: Vec<TypeSymbol> =
+                            let mut params: Vec<TypeSymbol> =
                                 parameters.iter().map(parameter_symbol).collect();
+                            if *is_vararg {
+                                params.push(crate::expr::arglist_marker_symbol());
+                            }
                             let token = Token::new(METHOD_DEF, *next_method);
                             match explicit_interface {
                                 Some(interface) => tokens.insert_method(
@@ -4876,11 +5156,15 @@ fn collect_tokens(
                         Member::Constructor {
                             modifiers,
                             parameters,
+                            is_vararg,
                             ..
                         } if !is_static_constructor(modifiers) => {
                             *next_method += 1;
-                            let params: Vec<TypeSymbol> =
+                            let mut params: Vec<TypeSymbol> =
                                 parameters.iter().map(parameter_symbol).collect();
+                            if *is_vararg {
+                                params.push(crate::expr::arglist_marker_symbol());
+                            }
                             tokens.insert_method(
                                 &declaring,
                                 ".ctor",
@@ -5171,6 +5455,25 @@ mod tests {
         let pe = lamella_metadata::pe::PeImage::parse(&image).expect("valid PE");
         assert_eq!(pe.cli_header_rva(), lamella_pe::pe::TEXT_RVA);
         assert!(lamella_metadata::image::MetadataImage::read(&image).is_ok());
+    }
+
+    #[test]
+    fn assembly_flags_algid_culture_are_consumed_into_the_assembly_row() {
+        let unit = parse_compilation_unit(
+            "[assembly: System.Reflection.AssemblyFlags(0x100u)] \
+             [assembly: System.Reflection.AssemblyAlgorithmId(0x8004u)] \
+             [assembly: System.Reflection.AssemblyCulture(\"en-US\")] \
+             class C { static int Main() { return 0; } }",
+        )
+        .unit;
+        let result = compile_unit(&unit, "attrs.dll", "attrs");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let image = result.image.expect("an image");
+        let assembly = Assembly::read(&image).expect("the reader parses the image");
+
+        assert_eq!(assembly.assembly_flags(), 0x100);
+        assert_eq!(assembly.assembly_hash_algorithm(), 0x8004);
+        assert_eq!(assembly.assembly_culture(), Some("en-US"));
     }
 
     #[test]

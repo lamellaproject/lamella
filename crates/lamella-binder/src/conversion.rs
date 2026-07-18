@@ -12,6 +12,10 @@ pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
     if matches!(from, TypeSymbol::Special(SpecialType::Void)) {
         return false;
     }
+    if matches!(from, TypeSymbol::Named(parts) if parts.len() == 1 && &**parts.first().expect("len checked") == "__arglist")
+    {
+        return false;
+    }
     if let TypeSymbol::ByRef(element) = to {
         return from == element.as_ref();
     }

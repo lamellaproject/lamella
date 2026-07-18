@@ -1,0 +1,25 @@
+# BLOCK layout: the ESP32-C6 peripheral clock/reset block -- the UART0 slot's registers
+# (; other peripherals' slots are appended as their consumers land,
+#). Transcribed from the retired v0 uart-esp32c6.toml. Registers here are SLOT-named
+# (each peripheral owns fixed offsets within PCR); the field layout is shared across slots.
+
+[table]
+kind = "block"
+family = "esp32c6"
+block = "pcr"
+sources = ["espressif/svd esp32c6.svd", "esp-idf v5.3 hal/esp32c6 uart_ll.h via the silicon-proven demo path"]
+
+[registers.UART0_CONF]
+offset = 0x0
+width = 32
+fields = { CLK_EN = [0, 1], RST_EN = [1, 1] }
+notes = "Module bus clock + reset (reset pulses 1 then 0). Resets to CLK_EN = 1 (console)."
+
+[registers.UART0_SCLK_CONF]
+offset = 0x4
+width = 32
+fields = { SCLK_DIV_A = [0, 6], SCLK_DIV_B = [6, 6], SCLK_DIV_NUM = [12, 8], SCLK_SEL = [20, 2], SCLK_EN = [22, 1] }
+notes = "Function-clock source + coarse divider: SCLK_SEL 1 = PLL_F80M, 2 = RTC, 3 = XTAL (40 MHz). sclk = src / (1 + DIV_NUM + DIV_A/DIV_B)."
+
+[constants]
+SCLK_SEL_XTAL = 3

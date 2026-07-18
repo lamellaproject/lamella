@@ -580,6 +580,13 @@ pub enum StaticType {
     /// packed array of `f64` elements that rejects item assignment). The interpreter treats it as an
     /// ordinary dynamic tuple.
     TupleFloat = 6,
+    /// A GROWABLE homogeneous `list` of `int`: a list the function `append`s to. On the typed path it
+    /// is a small heap HEADER (`[i32 len][i32 cap][ObjectRef backing]`) whose backing is a resized
+    /// packed array, so the list's identity is stable across a grow and aliases observe each other's
+    /// appends. The interpreter treats it as an ordinary dynamic list.
+    GrowListInt = 7,
+    /// A GROWABLE homogeneous `list` of `float`: the `f64` twin of [`StaticType::GrowListInt`].
+    GrowListFloat = 8,
 }
 
 impl StaticType {
@@ -594,6 +601,8 @@ impl StaticType {
             4 => Some(StaticType::ListFloat),
             5 => Some(StaticType::TupleInt),
             6 => Some(StaticType::TupleFloat),
+            7 => Some(StaticType::GrowListInt),
+            8 => Some(StaticType::GrowListFloat),
             _ => None,
         }
     }

@@ -1,0 +1,20 @@
+# The SAM3X parts table: the orderable parts the in-tree boards carry. Pin lists are PARTIAL
+# present-lists: they carry the silicon-evidenced pins the boards bind
+# today, so validates every current binding; completing each list is a datasheet-open
+# transcription task (Atmel-11057 ch 4 pinouts), completed datasheet-open
+#.
+
+[table]
+kind = "parts"
+family = "sam3x"
+sources = [
+    "SAM3X/A datasheet Atmel-11057C: Table 1-1 (configuration summary) + ch 4 (packages and pinout)",
+]
+
+
+part = "atsam3x8e"
+package = "144-pin"
+flash = 0x80000
+ram = 0x18000
+pins = ["PA8-PA9"]
+source = "Atmel-11057 Table 1-1: SAM3X8E = LQFP144, 512 KB flash (2 x 256 KB planes), 96 KB SRAM, 103 PIOs; CHIPID_CIDR 0x285E0A60 read on silicon -- PARTIAL pin list: PA8/PA9 are the UART (Serial / prog-port) pins the Arduino Due binds; complete from ch 4 before further bindings"

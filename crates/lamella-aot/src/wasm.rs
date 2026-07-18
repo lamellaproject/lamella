@@ -529,8 +529,15 @@ fn layout_descriptors(
         blob.extend_from_slice(&handle.to_le_bytes());
         blob.extend_from_slice(&base_ptr.to_le_bytes());
         blob.extend_from_slice(&(itable.len() as u32).to_le_bytes());
-        for &(tag, func_index) in itable {
+        for (tag, impl_) in itable {
             blob.extend_from_slice(&tag.to_le_bytes());
+            let func_index = match impl_ {
+                crate::resolver::VtableEntry::Func(index) => *index,
+                crate::resolver::VtableEntry::Extern(_) => {
+                    debug_assert!(false, "extern itable entry on the wasm path");
+                    0
+                }
+            };
             blob.extend_from_slice(&(func_index + import_count).to_le_bytes());
         }
         segments.push((desc_addr - (vtable.len() as u32) * 4, blob));
@@ -2698,6 +2705,7 @@ mod tests {
             vtable: alloc::vec![crate::resolver::VtableEntry::Func(1)],
             itable: Vec::new(),
             base: None,
+            words: None,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the callvirt lowers to WASM");
@@ -2764,8 +2772,9 @@ mod tests {
             handle: lamella_ir::TypeHandle(1),
             type_tag: 0,
             vtable: Vec::new(),
-            itable: alloc::vec![(TAG, 1)],
+            itable: alloc::vec![(TAG, crate::resolver::VtableEntry::Func(1))],
             base: None,
+            words: None,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the interface call lowers to WASM");
@@ -2821,6 +2830,7 @@ mod tests {
                 vtable: Vec::new(),
                 itable: Vec::new(),
                 base: Some(lamella_ir::TypeHandle(1)),
+                words: None,
             },
             TypeMeta {
                 handle: lamella_ir::TypeHandle(1),
@@ -2828,6 +2838,7 @@ mod tests {
                 vtable: Vec::new(),
                 itable: Vec::new(),
                 base: None,
+                words: None,
             },
         ];
         let bytes = lower_module_with_exports(&[main], &[("main", 0)], &descriptors)
@@ -2898,6 +2909,7 @@ mod tests {
             vtable: alloc::vec![crate::resolver::VtableEntry::Func(1)],
             itable: Vec::new(),
             base: None,
+            words: None,
         }];
         let bytes = lower_module_with_exports(&[caller, target], &[("main", 0)], &descriptors)
             .expect("the void callvirt lowers to WASM");

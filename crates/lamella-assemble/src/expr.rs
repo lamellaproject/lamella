@@ -26,6 +26,17 @@ pub enum EmitError {
     },
 }
 
+impl core::fmt::Display for EmitError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            EmitError::Unsupported(reason) => f.write_str(reason),
+            EmitError::UnsupportedIn { reason, method } => {
+                write!(f, "{reason} (in method '{method}')")
+            }
+        }
+    }
+}
+
 impl EmitError {
     /// This error carrying the containing method's name; an error already attributed
     /// to a method keeps its original site.
@@ -39,6 +50,54 @@ impl EmitError {
             other => other,
         }
     }
+}
+
+/// The `__arglist` marker pseudo-parameter that KEYS a vararg member in the token
+/// table: appended after the fixed parameters on the DEF key, and followed by the
+/// extra argument types on a non-empty call-site key. It mirrors the binder's marker
+/// type; user code cannot spell it (`__arglist` lexes as a keyword under the knob).
+pub(crate) fn arglist_marker_symbol() -> TypeSymbol {
+    TypeSymbol::Named([Box::from("__arglist")].into())
+}
+
+/// Splits a bound argument list at its trailing `__arglist(...)` pack: `(fixed,
+/// Some(extras))` for a vararg call site, `(all, None)` otherwise.
+pub(crate) fn split_vararg_arguments(
+    arguments: &[BoundExpr],
+) -> (&[BoundExpr], Option<&[BoundExpr]>) {
+    if let Some((last, fixed)) = arguments.split_last() {
+        if let BoundExprKind::ArgListLiteral(extras) = &last.kind {
+            return (fixed, Some(extras));
+        }
+    }
+    (arguments, None)
+}
+
+/// A variable argument's type as the call-site signature records it: its static type,
+/// with the null literal folded to `object` (csc's `1C` in the oracle blob) and a
+/// `ref`/`out` element as a byref of its referent.
+pub(crate) fn vararg_extra_symbol(extra: &BoundExpr) -> TypeSymbol {
+    if matches!(extra.kind, BoundExprKind::Ref { .. }) {
+        return TypeSymbol::ByRef(Box::new(extra.ty.clone()));
+    }
+    if matches!(extra.ty, TypeSymbol::Special(SpecialType::Null)) {
+        return TypeSymbol::Special(SpecialType::Object);
+    }
+    extra.ty.clone()
+}
+
+/// The token-table key for a vararg CALL SITE: the fixed parameters, the `__arglist`
+/// marker, then each extra argument's signature type. An EMPTY `__arglist()` yields
+/// exactly the DEF key (fixed + marker), so it resolves to the MethodDef token -- the
+/// same lowering csc uses.
+pub(crate) fn vararg_lookup_params(
+    fixed: &[TypeSymbol],
+    extras: &[BoundExpr],
+) -> Vec<TypeSymbol> {
+    let mut params = fixed.to_vec();
+    params.push(arglist_marker_symbol());
+    params.extend(extras.iter().map(vararg_extra_symbol));
+    params
 }
 
 /// Lowers `expr` to CIL, appending the instructions that leave its value on the
@@ -222,6 +281,13 @@ pub fn emit_expression(
         BoundExprKind::TypeOf(target) => emit_typeof(target, tokens, out),
         BoundExprKind::SizeOf(target) => emit_sizeof(target, tokens, out),
         BoundExprKind::MakeRef(operand) => emit_makeref(operand, frame, tokens, out),
+        BoundExprKind::ArgListValue => {
+            out.push(Instruction::simple(Opcode::Arglist));
+            Ok(())
+        }
+        BoundExprKind::ArgListLiteral(_) => Err(EmitError::Unsupported(
+            "an __arglist expression outside a call or new expression",
+        )),
         BoundExprKind::RefType(reference) => emit_reftype(reference, frame, tokens, out),
         BoundExprKind::RefValue { reference, target } => {
             emit_refvalue(reference, target, frame, tokens, out)
@@ -558,6 +624,7 @@ fn emit_element_load(
     if matches!(receiver.ty, TypeSymbol::Pointer(_)) {
         emit_expression(receiver, frame, tokens, out)?;
         emit_expression(&indices[0], frame, tokens, out)?;
+        widen_pointer_offset(&indices[0].ty, out);
         emit_sizeof(element_ty, tokens, out)?;
         out.push(Instruction::simple(Opcode::Mul));
         out.push(Instruction::simple(Opcode::Add));
@@ -736,15 +803,21 @@ fn emit_new(
         out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
         return Ok(());
     }
-    for argument in arguments {
+    let (fixed_args, extras) = split_vararg_arguments(arguments);
+    for argument in fixed_args {
         emit_argument(argument, frame, tokens, out)?;
     }
+    if let Some(extras) = extras {
+        for element in extras {
+            emit_argument(element, frame, tokens, out)?;
+        }
+    }
+    let lookup_params = match extras {
+        Some(extras) => vararg_lookup_params(&constructor.parameters, extras),
+        None => constructor.parameters.clone(),
+    };
     let token = tokens
-        .method(
-            &constructor.declaring_type,
-            &constructor.name,
-            &constructor.parameters,
-        )
+        .method(&constructor.declaring_type, &constructor.name, &lookup_params)
         .ok_or(EmitError::Unsupported("constructor outside this module"))?;
     out.push(Instruction::new(Opcode::Newobj, Operand::Token(token)));
     Ok(())
@@ -868,17 +941,27 @@ fn emit_call(
             _ => emit_expression(callee, frame, tokens, out)?,
         }
     }
-    for argument in arguments {
+    let (fixed_args, extras) = split_vararg_arguments(arguments);
+    for argument in fixed_args {
         emit_argument(argument, frame, tokens, out)?;
     }
+    if let Some(extras) = extras {
+        for element in extras {
+            emit_argument(element, frame, tokens, out)?;
+        }
+    }
+    let lookup_params = match extras {
+        Some(extras) => vararg_lookup_params(&method.parameters, extras),
+        None => method.parameters.clone(),
+    };
     let token = tokens
         .method(
             &method.declaring_type,
             &crate::tokens::conversion_key_name(&method.name, &method.return_type),
-            &method.parameters,
+            &lookup_params,
         )
         .or_else(|| {
-            tokens.method(&method.declaring_type, &method.name, &method.parameters)
+            tokens.method(&method.declaring_type, &method.name, &lookup_params)
         })
         .ok_or(EmitError::Unsupported(
             "call to a method outside this module",
@@ -1937,7 +2020,11 @@ fn emit_pointer_arithmetic(
             widen_pointer_offset(&offset.ty, out);
             emit_sizeof(&element, tokens, out)?;
             out.push(Instruction::simple(Opcode::Mul));
-            out.push(Instruction::simple(Opcode::Add));
+            out.push(Instruction::simple(if checked {
+                Opcode::AddOvfUn
+            } else {
+                Opcode::Add
+            }));
             Ok(true)
         }
         BinaryOperator::Subtract => {

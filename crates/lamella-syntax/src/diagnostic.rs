@@ -135,6 +135,12 @@ pub enum DiagnosticKind {
         /// The version that introduced it, e.g. "C# 3.0".
         required: &'static str,
     },
+    /// An `__arglist` parameter marker appeared before other parameters; it must
+    /// close the list (csc CS0257). Tokenized only under the typedref knob.
+    ArglistMustBeLast,
+    /// An `__arglist` parameter marker appeared in a declaration that cannot be
+    /// vararg -- a delegate, an operator, or an indexer (csc CS1669).
+    ArglistNotValidInThisContext,
 }
 
 impl DiagnosticKind {
@@ -179,6 +185,8 @@ impl DiagnosticKind {
             DiagnosticKind::OverloadableOperatorExpected => 1037,
             DiagnosticKind::InExpected => 1515,
             DiagnosticKind::FeatureRequiresLaterVersion { .. } => 8022,
+            DiagnosticKind::ArglistMustBeLast => 257,
+            DiagnosticKind::ArglistNotValidInThisContext => 1669,
         }
     }
 
@@ -266,6 +274,15 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::InExpected => f.write_str("'in' expected"),
             DiagnosticKind::FeatureRequiresLaterVersion { feature, required } => {
                 write!(f, "Feature {feature} is not available in C# 1.0; it requires {required} or greater")
+            }
+            DiagnosticKind::ArglistMustBeLast => {
+                write!(
+                    f,
+                    "An __arglist parameter must be the last parameter in a parameter list"
+                )
+            }
+            DiagnosticKind::ArglistNotValidInThisContext => {
+                write!(f, "__arglist is not valid in this context")
             }
         }
     }

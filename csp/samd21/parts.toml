@@ -1,0 +1,27 @@
+# The SAMD21 parts table: the orderable parts the in-tree boards carry. Pin lists are
+# PARTIAL present-lists: they carry the silicon-evidenced pins the
+# boards bind today, so validates every current binding; completing each list is a
+# datasheet-open transcription task (DS40001882 ch 5 pinouts).
+
+[table]
+kind = "parts"
+family = "samd21"
+sources = [
+    "SAMD21 datasheet DS40001882: ch 5 (pinouts per package), ch 10 (memories)",
+]
+
+
+part = "atsamd21g18a"
+package = "48-pin"
+flash = 0x40000
+ram = 0x8000
+pins = ["PA12-PA15", "PA22-PA23", "PA27-PA28", "PB09-PB11", "PB22-PB23"]
+source = "DS40001882 ch 5 (48-pin) -- PARTIAL: the listed pins are silicon-evidenced by the W25/Zero/MKR1000 wirings; complete the list from the datasheet before authoring bindings on other pins"
+
+
+part = "atsamd21j18a"
+package = "64-pin"
+flash = 0x40000
+ram = 0x8000
+pins = ["PA22-PA23"]
+source = "DS40001882 ch 5 (64-pin) -- PARTIAL: silicon-evidenced by the SAM D21 XPro VCP; complete from the datasheet before authoring further XPro bindings"

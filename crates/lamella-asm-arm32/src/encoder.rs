@@ -144,6 +144,13 @@ pub struct Encoder {
     /// `ThumbLdrLit8` targets -- an `adr` to a string or a multi-word descriptor -- are NOT listed
     /// here and are never split this way.
     pool_literals: Vec<u32>,
+    /// Marked data BLOBs: `(label id, byte length)` for each self-contained datum registered via
+    /// [`Encoder::mark_blob`] -- a string laid at its function's end, referenced by an `adr`. On a
+    /// Mainline target, a marked blob beyond even the widened `ADR.W`'s +/-4 KB reach relocates a
+    /// copy into a nearer branch-over island (see [`Encoder::island_far_blob`]); an UNMARKED far
+    /// `adr` target (a descriptor, whose interior labels a byte copy would not carry) still
+    /// hard-errors in [`Encoder::finish`].
+    blobs: Vec<(u32, u32)>,
     /// Whether the target is a Mainline (wide-Thumb-2) profile -- ARMv7-M / ARMv8-M Mainline, e.g. the
     /// RP2350's Cortex-M33. When set, a far unconditional branch relaxes to `B.W` and a far `adr` to
     /// `ADR.W` (see [`Encoder::relax`]) rather than the ARMv6-M literal-pool veneer. The object build
@@ -1031,6 +1038,17 @@ impl Encoder {
         self.bytes.extend_from_slice(&[0; 4]);
     }
 
+    /// Marks `label` as the start of a self-contained data BLOB of `len` bytes -- a string laid at
+    /// its function's end -- making it islandable BY COPY: on a Mainline target, if a (widened)
+    /// `adr` to it still lands beyond `ADR.W`'s +/-4 KB reach, [`Encoder::finish`] moves a copy of
+    /// the whole blob into a branch-over island beside the `adr` and re-points the label (see
+    /// [`Encoder::island_far_blob`]). Call after the blob's bytes are emitted, once `len` is known.
+    /// An unmarked `adr` target -- a type descriptor, whose interior labels and diffs a byte copy
+    /// would not carry -- is never copied and still hard-errors out of reach.
+    pub fn mark_blob(&mut self, label: Label, len: u32) {
+        self.blobs.push((label.0, len));
+    }
+
     /// Inserts `insert` bytes at byte offset `at`, shifting every later reference -- any bound
     /// label, fixup, relocation, or diff at offset >= `at` -- forward by `insert.len()`. The shared
     /// building block for growing the image mid-stream: branch relaxation splices a halfword-pair,
@@ -1064,9 +1082,10 @@ impl Encoder {
     /// Runs branch relaxation and literal-pool islanding to a JOINT fixpoint before the fixups are
     /// resolved. Each grows the image -- a widened conditional branch splices a halfword-pair, an
     /// islanded literal splices a branch-over datum -- which shifts later references and can push
-    /// another branch or load out of reach, so the two co-iterate until neither must move. Each
-    /// conditional branch widens at most once (it then has the wider reach) and each pool word
-    /// islands at most once (its copy then sits a few bytes from the load), so this terminates.
+    /// another branch or load out of reach, so the steps co-iterate until nothing must move. Each
+    /// conditional branch widens at most once (it then has the wider reach), each pool word islands
+    /// at most once (its copy then sits a few bytes from the load), and each far blob islands at
+    /// most once per referencing `adr` (its copy then sits beside the `ADR.W`), so this terminates.
     fn relax(&mut self) -> Result<(), AssembleError> {
         loop {
             if self.widen_far_conditional_branch()? {
@@ -1076,6 +1095,9 @@ impl Encoder {
                 continue;
             }
             if self.wide && self.widen_far_adr()? {
+                continue;
+            }
+            if self.wide && self.island_far_blob()? {
                 continue;
             }
             if self.island_far_literal()? {
@@ -1214,6 +1236,77 @@ impl Encoder {
             self.fixups.push((ins, RelocKind::ThumbBranch11, over_label.0));
             if let Some(mut r) = carried {
                 r.at = word_site;
+                self.relocs.push(r);
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Relocates the first marked blob (see [`Encoder::mark_blob`]) that lies beyond its widened
+    /// `adr`'s +/-4 KB `ADR.W` reach into a branch-over island placed right after that `ADR.W` --
+    /// the multi-byte twin of [`Encoder::island_far_literal`], and Mainline-only: it fires on a
+    /// [`RelocKind::ThumbAdrWide`] fixup, which only [`Encoder::widen_far_adr`] mints (widening is
+    /// tried first, so the 4-byte `ADR.W` rescues the 1 KB..4 KB band and a copy is spliced only
+    /// past that). Returns whether one moved.
+    ///
+    /// The island is `B over` (which skips the datum), word-align padding, the blob copy, then
+    /// trailing padding to a MULTIPLE OF 4 -- the splice preserves every later `ldr [pc, #imm*4]`
+    /// pool word's 4-byte alignment, exactly as [`Encoder::island_far_literal`] does. The original
+    /// blob stays where it was as harmless dead data (its label now names the copy); a relocation
+    /// inside its range is replicated onto the live copy at the same interior offset, while the
+    /// orphaned one merely patches unread bytes. A blob longer than the skip branch's +/-2 KB reach
+    /// pushes `B over` out of range; the joint fixpoint then widens that skip to `B.W` on a later
+    /// pass (`wide` is always set when this fires).
+    fn island_far_blob(&mut self) -> Result<bool, AssembleError> {
+        for idx in 0..self.fixups.len() {
+            let (at, kind, label_id) = self.fixups[idx];
+            if kind != RelocKind::ThumbAdrWide {
+                continue;
+            }
+            let blob_len = match self.blobs.iter().find(|(id, _)| *id == label_id) {
+                Some(&(_, len)) => len,
+                None => continue,
+            };
+            let target = match self.labels.get(label_id as usize) {
+                Some(Some(offset)) => *offset,
+                _ => return Err(AssembleError::UnboundLabel(Label(label_id))),
+            };
+            let pc = i64::from((at + 4) & !3u32);
+            let delta = i64::from(target) - pc;
+            if (-4095..=4095).contains(&delta) {
+                continue;
+            }
+            let blob = match self
+                .bytes
+                .get(target as usize..(target + blob_len) as usize)
+            {
+                Some(b) => b.to_vec(),
+                None => return Err(AssembleError::BranchOutOfRange { at }),
+            };
+            let carried: Vec<Reloc> = self
+                .relocs
+                .iter()
+                .filter(|r| r.at >= target && r.at < target + blob_len)
+                .copied()
+                .collect();
+            let ins = at + 4;
+            let pad = (4 - ((ins + 2) & 3)) & 3;
+            let mut island = Vec::with_capacity(8 + blob.len());
+            island.extend_from_slice(&0xE000u16.to_le_bytes());
+            island.resize(island.len() + pad as usize, 0);
+            let copy_site = ins + 2 + pad;
+            island.extend_from_slice(&blob);
+            let trailing = (4 - (island.len() as u32 & 3)) & 3;
+            island.resize(island.len() + trailing as usize, 0);
+            let over = ins + island.len() as u32;
+            self.splice_in(ins, &island);
+            self.labels[label_id as usize] = Some(copy_site);
+            let over_label = self.new_label();
+            self.labels[over_label.0 as usize] = Some(over);
+            self.fixups.push((ins, RelocKind::ThumbBranch11, over_label.0));
+            for mut r in carried {
+                r.at = copy_site + (r.at - target);
                 self.relocs.push(r);
             }
             return Ok(true);
@@ -1843,6 +1936,164 @@ mod tests {
             "the load's pool word is intact past the widened branch"
         );
         assert_eq!(pos % 4, 0, "the pool word stayed 4-aligned across the widening");
+    }
+
+    #[test]
+    fn a_far_blob_islands_beside_its_wide_adr() {
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(true);
+        let blob = enc.new_label();
+        enc.adr(Reg::R0, blob).unwrap();
+        for _ in 0..2200 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.bind_label(blob);
+        let start = enc.position();
+        enc.emit_word(2);
+        enc.emit_u16(0x0041);
+        enc.emit_u16(0x0042);
+        enc.mark_blob(blob, enc.position() - start);
+        let out = enc.finish().expect("a far blob islands beside its wide adr");
+        let hw1 = u16::from_le_bytes([out.bytes[0], out.bytes[1]]);
+        let hw2 = u16::from_le_bytes([out.bytes[2], out.bytes[3]]);
+        assert_eq!(hw1 & 0xFBFF, 0xF20F, "the adr widened to ADR.W ADD form first");
+        let imm = (u32::from((hw1 >> 10) & 1) << 11)
+            | (u32::from((hw2 >> 12) & 7) << 8)
+            | u32::from(hw2 & 0xFF);
+        let copy = out.label_position(blob).expect("the blob label was re-bound");
+        assert_eq!(4 + imm, copy, "the ADR.W points at the ISLANDED copy");
+        assert_eq!(copy, 8, "the copy sits right beside the adr, not at the original site");
+        assert_eq!(
+            &out.bytes[copy as usize..copy as usize + 8],
+            &[2, 0, 0, 0, 0x41, 0, 0x42, 0],
+            "the copy carries the whole blob -- count word and units"
+        );
+        let skip = u16::from_le_bytes([out.bytes[4], out.bytes[5]]);
+        assert_eq!(skip, 0xE004, "a 16-bit B skips the 12-byte island to the shifted code");
+    }
+
+    #[test]
+    fn an_adr_w_reach_blob_widens_without_islanding() {
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(true);
+        let blob = enc.new_label();
+        enc.adr(Reg::R0, blob).unwrap();
+        for _ in 0..800 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.bind_label(blob);
+        let start = enc.position();
+        enc.emit_word(1);
+        enc.emit_u16(0x0041);
+        enc.mark_blob(blob, enc.position() - start);
+        let out = enc.finish().expect("an ADR.W-reach blob needs no island");
+        let pos = out.label_position(blob).expect("blob bound");
+        assert!(pos > 1600, "the blob stayed at its original function-end site");
+    }
+
+    #[test]
+    fn a_far_marked_blob_hard_errors_without_the_wide_capability() {
+        let mut enc = Encoder::new();
+        let blob = enc.new_label();
+        enc.adr(Reg::R0, blob).unwrap();
+        for _ in 0..800 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.bind_label(blob);
+        let start = enc.position();
+        enc.emit_word(1);
+        enc.emit_u16(0x0041);
+        enc.mark_blob(blob, enc.position() - start);
+        assert!(matches!(
+            enc.finish(),
+            Err(AssembleError::BranchOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn a_blob_island_between_a_load_and_its_pool_word_keeps_the_word_aligned() {
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(true);
+        let blob = enc.new_label();
+        let pool = enc.new_label();
+        enc.adr(Reg::R0, blob).unwrap();
+        enc.ldr_literal(Reg::R1, pool).unwrap();
+        enc.align_to_word();
+        enc.pool_word(pool, 0xCAFE_F00D);
+        for _ in 0..2200 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.bind_label(blob);
+        let start = enc.position();
+        enc.emit_bytes(b"hello, world\0");
+        enc.mark_blob(blob, enc.position() - start);
+        let out = enc
+            .finish()
+            .expect("a blob island between a load and its word keeps the word 4-aligned");
+        let pos = out.label_position(pool).unwrap() as usize;
+        assert_eq!(
+            &out.bytes[pos..pos + 4],
+            &0xCAFE_F00Du32.to_le_bytes(),
+            "the pool word is intact past the island"
+        );
+        assert_eq!(pos % 4, 0, "the pool word stayed 4-aligned across the island splice");
+        let copy = out.label_position(blob).unwrap() as usize;
+        assert_eq!(&out.bytes[copy..copy + 13], b"hello, world\0", "the copy carries the text");
+    }
+
+    #[test]
+    fn a_relocation_inside_an_islanded_blob_replicates_onto_the_copy() {
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(true);
+        let blob = enc.new_label();
+        enc.adr(Reg::R0, blob).unwrap();
+        for _ in 0..2200 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.bind_label(blob);
+        let start = enc.position();
+        enc.emit_word(1);
+        enc.data_word_symbol(7);
+        enc.mark_blob(blob, enc.position() - start);
+        let out = enc.finish().expect("a reloc-carrying far blob islands");
+        let copy = out.label_position(blob).unwrap();
+        assert!(
+            out.relocs
+                .iter()
+                .any(|r| r.at == copy + 4 && r.symbol == 7 && r.kind == RelocKind::Abs32),
+            "the interior relocation is replicated at the copy's matching offset"
+        );
+    }
+
+    #[test]
+    fn a_blob_longer_than_the_skip_branch_reach_widens_the_skip_to_bw() {
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(true);
+        let blob = enc.new_label();
+        enc.adr(Reg::R0, blob).unwrap();
+        for _ in 0..2200 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.bind_label(blob);
+        let start = enc.position();
+        enc.emit_word(1200);
+        for i in 0..1200u16 {
+            enc.emit_u16(i);
+        }
+        enc.mark_blob(blob, enc.position() - start);
+        let out = enc
+            .finish()
+            .expect("the island's skip branch widens to B.W around a huge blob");
+        let copy = out.label_position(blob).unwrap() as usize;
+        assert_eq!(copy % 4, 0, "the copy stays word-aligned across the skip's widening");
+        assert_eq!(&out.bytes[copy..copy + 4], &1200u32.to_le_bytes(), "count word intact");
+        assert_eq!(&out.bytes[copy + 4..copy + 8], &[0, 0, 1, 0], "units 0 and 1 intact");
     }
 
     #[test]

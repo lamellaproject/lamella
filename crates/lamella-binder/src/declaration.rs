@@ -99,6 +99,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                     .collect(),
                 is_static: false,
                 is_params: has_params_array(&declaration.parameters),
+                is_vararg: false,
                 is_virtual: false,
                 is_abstract: false,
                 is_override: false,
@@ -238,6 +239,10 @@ pub(crate) fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Op
             } => Some(Literal::Integer {
                 value: 9_223_372_036_854_775_808,
                 suffix: IntegerSuffix::Long,
+            }),
+            Literal::Real { bits, suffix } => Some(Literal::Real {
+                bits: (-f64::from_bits(*bits)).to_bits(),
+                suffix: *suffix,
             }),
             _ => Some(integer_literal(literal_int_value(operand)?.checked_neg()?)),
         },
@@ -445,6 +450,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 return_type,
                 name,
                 parameters,
+                is_vararg,
                 explicit_interface,
                 attributes,
                 ..
@@ -457,6 +463,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: explicit_interface.is_none() && is_static(modifiers),
                 is_params: has_params_array(parameters),
+                is_vararg: *is_vararg,
                 is_virtual: is_virtual(modifiers),
                 is_abstract: is_abstract_member(modifiers, info.kind),
                 is_override: is_override(modifiers),
@@ -477,6 +484,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: true,
                 is_params: false,
+                is_vararg: false,
                 is_virtual: false,
                 is_abstract: false,
                 is_override: false,
@@ -494,6 +502,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters: parameters.iter().map(parameter_symbol).collect(),
                 is_static: true,
                 is_params: false,
+                is_vararg: false,
                 is_virtual: false,
                 is_abstract: false,
                 is_override: false,
@@ -536,6 +545,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         parameters: indices.clone(),
                         is_static: false,
                         is_params: has_params_array(parameters),
+                        is_vararg: false,
                         is_virtual: indexer_is_virtual,
                         is_abstract: indexer_is_abstract,
                         is_override: indexer_is_override,
@@ -552,6 +562,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         parameters,
                         is_static: false,
                         is_params: false,
+                        is_vararg: false,
                         is_virtual: indexer_is_virtual,
                         is_abstract: indexer_is_abstract,
                         is_override: indexer_is_override,
@@ -563,10 +574,12 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
             Member::Constructor {
                 modifiers,
                 parameters,
+                is_vararg,
                 ..
             } if !is_static(modifiers) => {
-                info.constructors
-                    .push(constructor(parameters, access(modifiers)))
+                let mut ctor = constructor(parameters, access(modifiers));
+                ctor.is_vararg = *is_vararg;
+                info.constructors.push(ctor)
             }
             _ => {}
         }
@@ -599,6 +612,7 @@ fn constructor(
         parameters: parameters.iter().map(parameter_symbol).collect(),
         is_static: false,
         is_params: has_params_array(parameters),
+        is_vararg: false,
         is_virtual: false,
         is_abstract: false,
         is_override: false,

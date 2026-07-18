@@ -2,8 +2,10 @@
 #if LAMELLA_SURFACE_SERIAL
 namespace System.IO.Ports
 {
-    internal static class NativeSerial
+    internal sealed class NativeSerial
     {
+        private NativeSerial() { }
+
         internal const int ErrNotFound = -2;
         internal const int ErrAccessDenied = -3;
         internal const int ErrTimeout = -4;

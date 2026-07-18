@@ -23,23 +23,16 @@ fn unpack(address: u64) -> (u32, u32) {
     ((address >> 32) as u32, address as u32)
 }
 
-/// A display name for a Lamella Link `board_model` code, or `None` for UNKNOWN / a model this build doesn't name.
-/// Uses the `lamella_wire::board_model` constants so it tracks the protocol registry.
+/// A display name for a Lamella Link `board_model` code, or `None` for UNKNOWN / a model the registry does not
+/// name. DERIVES from [`lamella_wire::board_model::name`] -- the ONE canonical value -> name map -- so it cannot
+/// drift from the registry. (Hand-mirroring it drifted twice: "SAM E54" for canonical "SAME54", and four boards
+/// missing entirely.) UNKNOWN maps to `None` rather than the canonical "custom board" because [`identity_line`]
+/// uses `None` to stay silent on a target with nothing to identify.
 fn board_model_name(model: u16) -> Option<&'static str> {
-    use lamella_wire::board_model as bm;
-    Some(match model {
-        bm::MICROBIT_V1 => "BBC micro:bit v1",
-        bm::PICO2 => "Raspberry Pi Pico 2",
-        bm::SAM4S_XPLAINED_PRO => "SAM4S Xplained Pro",
-        bm::SAME54_XPLAINED_PRO => "SAM E54 Xplained Pro",
-        bm::SAMD21_XPLAINED_PRO => "SAM D21 Xplained Pro",
-        bm::SAMW25_XPLAINED_PRO => "ATSAMW25 Xplained Pro",
-        7 => "STM32F091 Nucleo-64",
-        bm::STM32L476 => "STM32L476 Nucleo",
-        bm::MKR1000 => "Arduino MKR1000",
-        bm::PICO2_W => "Raspberry Pi Pico 2 W",
-        _ => return None,
-    })
+    if model == lamella_wire::board_model::UNKNOWN {
+        return None;
+    }
+    lamella_wire::board_model::name(model)
 }
 
 /// The connect line the debug console shows for a target's self-reported [`ProfileIdentity`]: the board name

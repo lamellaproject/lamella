@@ -2,8 +2,10 @@
 #if LAMELLA_SURFACE_THREADS
 namespace System.Threading
 {
-    public static class Monitor
+    public sealed class Monitor
     {
+        private Monitor() { }
+
         public static void Enter(object obj) { EnterLock(obj); }
 
         public static void Enter(object obj, ref bool lockTaken) { EnterLock(obj); lockTaken = true; }

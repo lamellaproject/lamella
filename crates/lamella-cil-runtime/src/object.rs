@@ -31,8 +31,8 @@ impl ObjectRef {
 /// The in-heap representation of a `System.String`'s code units, chosen by the string
 /// storage encoding. UTF-16 by default (O(1) indexing, lone surrogates free); the
 /// `string-utf8` feature switches to UTF-8 (~half the size for ASCII text, at O(n) UTF-16
-/// indexing). Either way the [`Heap::as_string`] seam presents .NET UTF-16 semantics. See
-/// `docs/bcl-profiles-and-strings.md` (the surrogate-preserving WTF-8 tier is future).
+/// indexing). Either way the [`Heap::as_string`] seam presents .NET UTF-16 semantics.
+/// (The surrogate-preserving WTF-8 tier is future.)
 #[cfg(not(feature = "string-utf8"))]
 type StrStore = Box<[u16]>;
 #[cfg(feature = "string-utf8")]

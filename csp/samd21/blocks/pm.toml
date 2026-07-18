@@ -1,0 +1,20 @@
+# The SAMD21 Power Manager block: only the register the peripheral bring-up paths touch
+# is transcribed so far (partial, append-only, schema total). Offsets are PM-base-relative;
+# the base lives in ../instances.toml.
+
+[table]
+kind = "block"
+family = "samd21"
+block = "pm"
+sources = [
+    "SAMD21 datasheet DS40001882: Power Manager APBCMASK (ch 16)",
+]
+notes = [
+    "APBCMASK gates each peripheral's APB (bus) clock; SERCOM0..5 = bits 2..7. Read-modify-write in drivers (other peripherals share the register).",
+]
+
+[registers.APBCMASK]
+offset = 0x20
+width = 32
+fields = { SERCOM0 = [2, 1], SERCOM1 = [3, 1], SERCOM2 = [4, 1], SERCOM3 = [5, 1], SERCOM4 = [6, 1], SERCOM5 = [7, 1] }
+notes = "One gate bit per APBC peripheral; a driver ORs in its instance's bit (the instance row carries the bit index)."

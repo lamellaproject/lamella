@@ -1,14 +1,82 @@
 // Lamella managed corlib (from scratch). -- System.Char
+using System.Globalization;
 namespace System
 {
     public struct Char : IComparable
     {
-        public static bool IsDigit(char c) { return c >= '0' && c <= '9'; }
-        public static bool IsLetter(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
-        public static bool IsLetterOrDigit(char c) { return IsLetter(c) || IsDigit(c); }
-        public static bool IsWhiteSpace(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
-        public static bool IsUpper(char c) { return c >= 'A' && c <= 'Z'; }
-        public static bool IsLower(char c) { return c >= 'a' && c <= 'z'; }
+
+        public static UnicodeCategory GetUnicodeCategory(char c) { return (UnicodeCategory)CharCategoryData.Category(c); }
+
+        public static bool IsLetter(char c)
+        {
+            if (c < 0x80) return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+            return (int)GetUnicodeCategory(c) <= (int)UnicodeCategory.OtherLetter;
+        }
+
+        public static bool IsDigit(char c)
+        {
+            if (c < 0x80) return c >= '0' && c <= '9';
+            return GetUnicodeCategory(c) == UnicodeCategory.DecimalDigitNumber;
+        }
+
+        public static bool IsLetterOrDigit(char c)
+        {
+            if (c < 0x80) return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+            int cat = (int)GetUnicodeCategory(c);
+            return cat <= (int)UnicodeCategory.OtherLetter || cat == (int)UnicodeCategory.DecimalDigitNumber;
+        }
+
+        public static bool IsUpper(char c)
+        {
+            if (c < 0x80) return c >= 'A' && c <= 'Z';
+            return GetUnicodeCategory(c) == UnicodeCategory.UppercaseLetter;
+        }
+
+        public static bool IsLower(char c)
+        {
+            if (c < 0x80) return c >= 'a' && c <= 'z';
+            return GetUnicodeCategory(c) == UnicodeCategory.LowercaseLetter;
+        }
+
+        public static bool IsNumber(char c)
+        {
+            if (c < 0x80) return c >= '0' && c <= '9';
+            int cat = (int)GetUnicodeCategory(c);
+            return cat >= (int)UnicodeCategory.DecimalDigitNumber && cat <= (int)UnicodeCategory.OtherNumber;
+        }
+
+        public static bool IsWhiteSpace(char c)
+        {
+            if (c < 0x80) return c == ' ' || (c >= '\t' && c <= '\r');
+            if (c == '\u0085') return true;
+            int cat = (int)GetUnicodeCategory(c);
+            return cat >= (int)UnicodeCategory.SpaceSeparator && cat <= (int)UnicodeCategory.ParagraphSeparator;
+        }
+
+        public static bool IsPunctuation(char c)
+        {
+            int cat = (int)GetUnicodeCategory(c);
+            return cat >= (int)UnicodeCategory.ConnectorPunctuation && cat <= (int)UnicodeCategory.OtherPunctuation;
+        }
+
+        public static bool IsSymbol(char c)
+        {
+            int cat = (int)GetUnicodeCategory(c);
+            return cat >= (int)UnicodeCategory.MathSymbol && cat <= (int)UnicodeCategory.OtherSymbol;
+        }
+
+        public static bool IsSeparator(char c)
+        {
+            if (c < 0x80) return c == ' ';
+            int cat = (int)GetUnicodeCategory(c);
+            return cat >= (int)UnicodeCategory.SpaceSeparator && cat <= (int)UnicodeCategory.ParagraphSeparator;
+        }
+
+        public static bool IsControl(char c) { return c <= '\u001F' || (c >= '\u007F' && c <= '\u009F'); }
+
+        public static bool IsSurrogate(char c) { return c >= '\uD800' && c <= '\uDFFF'; }
+
+        public static double GetNumericValue(char c) { return CharNumericData.Value(c); }
 
         public static char ToUpper(char c) { return CaseMapping.ToUpper(c); }
         public static char ToLower(char c) { return CaseMapping.ToLower(c); }

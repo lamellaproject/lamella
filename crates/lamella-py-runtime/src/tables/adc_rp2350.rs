@@ -1,5 +1,5 @@
 //! The Raspberry Pi RP2350 (Pico 2) SAR ADC register facts + calibration -- transcribed from
-//! docs/peripheral-tables/adc-rp2350.toml (sources: the official RP2350 datasheet ch 12.4 + the
+//! the neutral peripheral-table SSOT (sources: the official RP2350 datasheet ch 12.4 + the
 //! pico-sdk hardware_adc). SILICON-VERIFIED via TempDemoRp2350.cs on a Pico 2 (a finger-proven
 //! temperature stream; raw 891 = 20.1 C reproduced). 12-bit, one converter muxed over 5 channels;
 //! the last channel is the internal temperature sensor. clk_adc runs on its own 48 MHz generator

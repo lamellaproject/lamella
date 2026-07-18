@@ -2,8 +2,10 @@
 #if LAMELLA_SURFACE_FILE_IO
 namespace System.IO
 {
-    internal static class NativeFs
+    internal sealed class NativeFs
     {
+        private NativeFs() { }
+
         internal const int ErrNotFound = -2;
         internal const int ErrDirectoryNotFound = -3;
         internal const int ErrAccessDenied = -4;

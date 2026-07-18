@@ -66,6 +66,11 @@ pub struct ImageBuilder {
     /// The defining assembly of an external type, by `namespace.name`, recorded before emission
     /// so [`ImageBuilder::type_ref`] scopes the `TypeRef` to the right `AssemblyRef`.
     type_assemblies: BTreeMap<String, String>,
+    /// The identity (version + full public key) of a referenced assembly, by simple name, taken
+    /// from the reference the unit was compiled against. An `AssemblyRef` we emit for that name
+    /// carries this identity so an external consumer (csc + the ref pack) reconciles it with the
+    /// same assembly instead of rejecting a `Version=0.0.0.0, PublicKeyToken=null` phantom (CS0012).
+    assembly_identities: BTreeMap<String, (u16, u16, u16, u16, Vec<u8>)>,
     object: Option<Token>,
     object_ctor: Option<Token>,
     /// Per-method debug info, parallel to `MethodDef`: a placeholder is appended for
@@ -92,6 +97,7 @@ impl ImageBuilder {
             mscorlib: None,
             assembly_refs: BTreeMap::new(),
             type_assemblies: BTreeMap::new(),
+            assembly_identities: BTreeMap::new(),
             object: None,
             object_ctor: None,
             method_debug: Vec::new(),
@@ -118,7 +124,7 @@ impl ImageBuilder {
             table::ASSEMBLY,
             alloc::vec![
                 Column::U32(0),
-                Column::U16(4),
+                Column::U16(0),
                 Column::U16(0),
                 Column::U16(0),
                 Column::U16(0),
@@ -177,15 +183,26 @@ impl ImageBuilder {
             return *row;
         }
         let interned = self.strings.intern(name);
+        let (major, minor, build, revision, flags, public_key) =
+            match self.assembly_identities.get(name) {
+                Some((major, minor, build, revision, key)) if !key.is_empty() => {
+                    let blob = self.blobs.intern(key);
+                    (*major, *minor, *build, *revision, 0x0000_0001, blob)
+                }
+                Some((major, minor, build, revision, _)) => {
+                    (*major, *minor, *build, *revision, 0, 0)
+                }
+                None => (4, 0, 0, 0, 0, 0),
+            };
         let row = self.tables.add_row(
             table::ASSEMBLY_REF,
             alloc::vec![
-                Column::U16(4),
-                Column::U16(0),
-                Column::U16(0),
-                Column::U16(0),
-                Column::U32(0),
-                Column::BlobRef(0),
+                Column::U16(major),
+                Column::U16(minor),
+                Column::U16(build),
+                Column::U16(revision),
+                Column::U32(flags),
+                Column::BlobRef(public_key),
                 Column::StringRef(interned),
                 Column::StringRef(0),
                 Column::BlobRef(0),
@@ -200,6 +217,66 @@ impl ImageBuilder {
     pub fn set_type_assembly(&mut self, qualified_name: &str, assembly: &str) {
         self.type_assemblies
             .insert(qualified_name.to_string(), assembly.to_string());
+    }
+
+    /// Sets this assembly's own version (the `Assembly` row, II.22.2), from an
+    /// `[assembly: AssemblyVersion("a.b.c.d")]` attribute. csc consumes that attribute into this
+    /// field rather than emitting a `CustomAttribute` (oracle-verified), and this mirrors it. Left
+    /// unset when the source declares no version -- the row keeps its constructor default.
+    pub fn set_assembly_version(&mut self, version: (u16, u16, u16, u16)) {
+        let (major, minor, build, revision) = version;
+        self.tables
+            .set_cell(table::ASSEMBLY, 1, 1, Column::U16(major));
+        self.tables
+            .set_cell(table::ASSEMBLY, 1, 2, Column::U16(minor));
+        self.tables
+            .set_cell(table::ASSEMBLY, 1, 3, Column::U16(build));
+        self.tables
+            .set_cell(table::ASSEMBLY, 1, 4, Column::U16(revision));
+    }
+
+    /// Sets this assembly's hash-algorithm id (the `Assembly.HashAlgId` column, II.22.2), from an
+    /// `[assembly: AssemblyAlgorithmId(n)]` attribute. csc consumes that attribute into this column
+    /// rather than emitting a `CustomAttribute` (oracle-verified), and this mirrors it.
+    pub fn set_assembly_hash_algorithm(&mut self, algorithm: u32) {
+        self.tables
+            .set_cell(table::ASSEMBLY, 1, 0, Column::U32(algorithm));
+    }
+
+    /// Sets this assembly's flags (the `Assembly.Flags` column, II.22.2 / II.23.1.2), from an
+    /// `[assembly: AssemblyFlags(n)]` attribute. csc consumes that attribute into this column rather
+    /// than emitting a `CustomAttribute` (oracle-verified), and this mirrors it.
+    pub fn set_assembly_flags(&mut self, flags: u32) {
+        self.tables
+            .set_cell(table::ASSEMBLY, 1, 5, Column::U32(flags));
+    }
+
+    /// Sets this assembly's culture (the `Assembly.Culture` column, II.22.2), from an
+    /// `[assembly: AssemblyCulture("name")]` attribute. csc consumes that attribute into this column
+    /// rather than emitting a `CustomAttribute` (oracle-verified); the empty (neutral) culture
+    /// interns to heap offset 0, so it stays a nil column exactly as csc leaves it.
+    pub fn set_assembly_culture(&mut self, culture: &str) {
+        let interned = self.strings.intern(culture);
+        self.tables
+            .set_cell(table::ASSEMBLY, 1, 8, Column::StringRef(interned));
+    }
+
+    /// Records a referenced assembly's identity (version + full public key, empty if unsigned) by
+    /// simple name, from the reference the unit compiled against. An `AssemblyRef` emitted for that
+    /// name then carries this identity instead of a `Version=#.0.0.0, PublicKeyToken=null` default,
+    /// so an external consumer (csc alongside the same reference pack) reconciles it rather than
+    /// demanding a phantom assembly (CS0012).
+    pub fn set_assembly_identity(
+        &mut self,
+        name: &str,
+        version: (u16, u16, u16, u16),
+        public_key: &[u8],
+    ) {
+        let (major, minor, build, revision) = version;
+        self.assembly_identities.insert(
+            name.to_string(),
+            (major, minor, build, revision, public_key.to_vec()),
+        );
     }
 
     /// The `TypeRef` token for `System.Object`, added on first use.
@@ -753,6 +830,7 @@ impl ImageBuilder {
     ) -> Vec<u8> {
         align4(&mut self.bodies);
         self.tables.sort_by_coded_parent(table::CUSTOM_ATTRIBUTE);
+        self.tables.sort_by_coded_column(table::METHOD_SEMANTICS, 2);
         let tables = self.tables.serialize(HeapSizes::default());
         let strings = self.strings.into_bytes();
         let guids = self.guids.into_bytes();
@@ -945,5 +1023,44 @@ mod tests {
             Some(chain.to_vec())
         );
         assert_eq!(assembly.exception_base_chain(marker), None);
+    }
+
+    #[test]
+    fn assembly_ref_carries_the_reference_identity() {
+        let mut builder = ImageBuilder::new("test.dll", "test");
+        let key: [u8; 8] = [0x00, 0x24, 0x00, 0x00, 0x04, 0x80, 0x00, 0x00];
+        builder.set_assembly_identity("System.Runtime", (8, 0, 0, 0), &key);
+        builder.set_type_assembly("System.EventArgs", "System.Runtime");
+        let _identified = builder.type_ref("System", "EventArgs");
+        let _defaulted = builder.type_ref("System.Diagnostics", "Trace");
+        let pe = builder.finish(Token::new(0, 0), true);
+
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+        let runtime = assembly
+            .assembly_refs()
+            .find(|r| r.name() == Some("System.Runtime"))
+            .expect("System.Runtime AssemblyRef present");
+        assert_eq!(runtime.version(), (8, 0, 0, 0));
+        assert_eq!(runtime.flags() & 0x0000_0001, 0x0000_0001, "afPublicKey set");
+        assert_eq!(runtime.public_key_or_token(), &key);
+    }
+
+    #[test]
+    fn set_assembly_version_reaches_the_assembly_row() {
+        let mut builder = ImageBuilder::new("test.dll", "test");
+        builder.set_assembly_version((1, 0, 0, 0));
+        let pe = builder.finish(Token::new(0, 0), true);
+
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+        assert_eq!(assembly.assembly_version(), (1, 0, 0, 0));
+    }
+
+    #[test]
+    fn assembly_row_defaults_to_zero_version() {
+        let builder = ImageBuilder::new("test.dll", "test");
+        let pe = builder.finish(Token::new(0, 0), true);
+
+        let assembly = lamella_metadata::Assembly::read(&pe).expect("valid assembly");
+        assert_eq!(assembly.assembly_version(), (0, 0, 0, 0));
     }
 }

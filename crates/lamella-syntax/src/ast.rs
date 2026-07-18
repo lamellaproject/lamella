@@ -152,6 +152,16 @@ pub enum ExprKind {
         /// The asserted referent type.
         target: TypeRef,
     },
+    /// A bare `__arglist` inside a vararg member's body (parsed only under
+    /// [`crate::lexer::LexOptions::typedref`]): the handle to the current method's variable
+    /// arguments, of type `System.RuntimeArgumentHandle`. Lowers to the `arglist` opcode.
+    /// Outside a vararg member it is CS0190.
+    ArgListHandle,
+    /// An `__arglist ( argument, ... )` at a call site: the variable arguments passed past a
+    /// vararg member's fixed parameters. Legal only as the final argument of a call or object
+    /// creation whose target is a vararg member (CS0226 elsewhere); the argument types ride in
+    /// the call-site signature after the sentinel.
+    ArgListCall(Vec<Expr>),
     /// An `is` or `as` type test (14.9.9, 14.9.10): the operand against a type.
     TypeTest {
         /// Whether this is `is` or `as`.
@@ -723,6 +733,10 @@ pub enum Member {
         name: Box<str>,
         /// The formal parameters.
         parameters: Vec<Parameter>,
+        /// Whether the parameter list ends with csc's `__arglist` marker (parsed only under
+        /// the typedref knob): the method takes variable arguments via the CLI vararg calling
+        /// convention, beyond `parameters`.
+        is_vararg: bool,
         /// The method body, or `None` if it was a bare `;`.
         body: Option<Stmt>,
         /// For an explicit interface member implementation (20.4.1), the interface
@@ -745,6 +759,9 @@ pub enum Member {
         name: Box<str>,
         /// The formal parameters.
         parameters: Vec<Parameter>,
+        /// Whether the parameter list ends with csc's `__arglist` marker (typedref knob):
+        /// the constructor takes variable arguments via the CLI vararg calling convention.
+        is_vararg: bool,
         /// The `: base(...)` or `: this(...)` initializer, if present.
         initializer: Option<ConstructorInitializer>,
         /// The constructor body.
@@ -843,6 +860,8 @@ pub enum Member {
         parameters: Vec<Parameter>,
         /// The operator body.
         body: Stmt,
+        /// The member's attributes (24.2), carried to the `op_*` method row.
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -859,6 +878,8 @@ pub enum Member {
         parameters: Vec<Parameter>,
         /// The operator body.
         body: Stmt,
+        /// The member's attributes (24.2), carried to the `op_Implicit`/`op_Explicit` row.
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -870,6 +891,8 @@ pub enum Member {
         name: Box<str>,
         /// The destructor body.
         body: Stmt,
+        /// The member's attributes (24.2), carried to the synthesized `Finalize` row.
+        attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
         span: Span,
     },
@@ -891,7 +914,10 @@ impl Member {
             | Member::Property { attributes: slot, .. }
             | Member::Indexer { attributes: slot, .. }
             | Member::EventField { attributes: slot, .. }
-            | Member::Event { attributes: slot, .. } => *slot = attributes,
+            | Member::Event { attributes: slot, .. }
+            | Member::Operator { attributes: slot, .. }
+            | Member::ConversionOperator { attributes: slot, .. }
+            | Member::Destructor { attributes: slot, .. } => *slot = attributes,
             _ => {}
         }
     }

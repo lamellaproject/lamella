@@ -1,0 +1,67 @@
+# The SAMD21 PORT block: the pin-mux and pin-config machinery, one PORT group per port
+# letter (the porta/portb instance rows carry the group bases). PMUX and PINCFG are PER-PIN
+# ARRAYS: the offsets below are the n = 0 element; element addresses derive as
+# PMUX[n] = group_base + 0x30 + n (n = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
+# PINCFG[p] = group_base + 0x40 + p (p = the pin index within the group)
+# The generator owns those derivations; drivers receive resolved
+# addresses through their bindings.
+
+[table]
+kind = "block"
+family = "samd21"
+block = "port"
+sources = [
+    "SAMD21 datasheet DS40001882: PORT PMUX/PINCFG (ch 23)",
+]
+notes = [
+    "PMUX[n] covers pins 2n (PMUXE, low nibble) and 2n+1 (PMUXO, high nibble); function values A..H = 0..7.",
+    "PINCFG: PMUXEN hands the pin to the muxed function; INEN enables the input buffer (required for any pin the peripheral READS -- an RX line, MISO).",
+    "DIRSET/OUTSET/OUTCLR/IN are the raw GPIO word registers (group-base-relative), used by soft chip-selects and module control pins.",
+]
+
+[registers.DIRSET]
+offset = 0x08
+width = 32
+fields = { DIRSET = [0, 32] }
+notes = "Write 1s to make pins outputs."
+
+[registers.OUTCLR]
+offset = 0x14
+width = 32
+fields = { OUTCLR = [0, 32] }
+notes = "Write 1s to drive pins low."
+
+[registers.OUTSET]
+offset = 0x18
+width = 32
+fields = { OUTSET = [0, 32] }
+notes = "Write 1s to drive pins high."
+
+[registers.IN]
+offset = 0x20
+width = 32
+fields = { IN = [0, 32] }
+notes = "The input samples (INEN pins only)."
+
+[registers.PMUX0]
+offset = 0x30
+width = 8
+fields = { PMUXE = [0, 4], PMUXO = [4, 4] }
+notes = "Element 0 of the per-pin-pair mux array; see the block header for the element derivation."
+
+[registers.PINCFG0]
+offset = 0x40
+width = 8
+fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1] }
+notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
+
+# Function-letter values for PMUX nibbles (family-wide; the pin rows name letters).
+[constants]
+FUNC_A = 0
+FUNC_B = 1
+FUNC_C = 2
+FUNC_D = 3
+FUNC_E = 4
+FUNC_F = 5
+FUNC_G = 6
+FUNC_H = 7

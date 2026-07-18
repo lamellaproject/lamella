@@ -171,12 +171,84 @@ namespace System.IO.Ports
         public override bool CanSeek { get { return false; } }
         public bool CanTimeout { get { return true; } }
 
+#if LAMELLA_SURFACE_THREADS
+
+        /// <summary>Indicates that data has been received through a port represented by the
+        /// <see cref="SerialPort"/> object.</summary>
+        public event SerialDataReceivedEventHandler DataReceived;
+
+        private const int PollIntervalMs = 10;
+
+        private int _receivedBytesThreshold = 1;
+
+        private int _pumpGeneration;
+
+        /// <summary>The number of bytes in the internal input buffer before a
+        /// <see cref="DataReceived"/> event occurs. The default is 1.</summary>
+        public int ReceivedBytesThreshold
+        {
+            get { return _receivedBytesThreshold; }
+            set
+            {
+                if (value <= 0) throw new ArgumentOutOfRangeException("value");
+                _receivedBytesThreshold = value;
+            }
+        }
+
+        private void RaiseDataReceived(SerialData eventType)
+        {
+            SerialDataReceivedEventHandler handlers = DataReceived;
+            if (handlers != null)
+            {
+                handlers(this, new SerialDataReceivedEventArgs(eventType));
+            }
+        }
+
+        private void StartPump()
+        {
+            _pumpGeneration++;
+            System.Threading.Thread pump = new System.Threading.Thread(new System.Threading.ThreadStart(PumpLoop));
+            pump.IsBackground = true;
+            pump.Start();
+        }
+
+        private void PumpLoop()
+        {
+            int generation = _pumpGeneration;
+            bool raised = false;
+            while (true)
+            {
+                System.Threading.Thread.Sleep(PollIntervalMs);
+                if (_pumpGeneration != generation) return;
+                int handle = _handle;
+                if (handle < 0) return;
+                int available = NativeSerial.BytesToRead(handle);
+                if (available < 0) return;
+                if (available >= _receivedBytesThreshold)
+                {
+                    if (!raised)
+                    {
+                        raised = true;
+                        RaiseDataReceived(SerialData.Chars);
+                    }
+                }
+                else
+                {
+                    raised = false;
+                }
+            }
+        }
+#endif
+
         public void Open()
         {
             if (_handle >= 0) throw new InvalidOperationException("The port is already open.");
             int handle = NativeSerial.Open(_portName, _baudRate, (int)_parity, _dataBits, (int)_stopBits, (int)_handshake);
             if (handle < 0) NativeSerial.Throw(handle, _portName);
             _handle = handle;
+#if LAMELLA_SURFACE_THREADS
+            StartPump();
+#endif
         }
 
         public override int Read(byte[] buffer, int offset, int count)

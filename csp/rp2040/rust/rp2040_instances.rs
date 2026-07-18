@@ -1,0 +1,14 @@
+
+pub const XOSC_BASE: u32 = 0x40024000;
+pub const CLOCKS_BASE: u32 = 0x40008000;
+pub const RESETS_BASE: u32 = 0x4000C000;
+pub const RESETS_CLR_BASE: u32 = 0x4000F000;
+pub const IO_BANK0_BASE: u32 = 0x40014000;
+pub const IO_BANK0_RESET_BIT: u32 = 5;
+pub const IO_BANK0_RESET_MASK: u32 = 0x20;
+pub const PADS_BANK0_BASE: u32 = 0x4001C000;
+pub const PADS_BANK0_RESET_BIT: u32 = 8;
+pub const PADS_BANK0_RESET_MASK: u32 = 0x100;
+pub const UART0_BASE: u32 = 0x40034000;
+pub const UART0_RESET_BIT: u32 = 22;
+pub const UART0_RESET_MASK: u32 = 0x400000;

@@ -36,18 +36,23 @@ impl SerialTransport {
     /// # Errors
     /// [`TransportError::Carrier`] if the port cannot be opened.
     pub fn open(path: &str, baud: u32) -> Result<Self, TransportError> {
-        let espressif = serialport::available_ports()
+        let resets_on_dtr = serialport::available_ports()
             .into_iter()
             .flatten()
             .find(|p| p.port_name.eq_ignore_ascii_case(path))
-            .map(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(ref i) if i.vid == 0x303a))
+            .map(|p| match p.port_type {
+                serialport::SerialPortType::UsbPort(ref i) => {
+                    i.vid == 0x303a || (i.vid == 0x2341 && i.pid == 0x003D)
+                }
+                _ => false,
+            })
             .unwrap_or(false);
         let mut port = serialport::new(path, baud)
             .timeout(Duration::from_millis(50))
-            .dtr_on_open(!espressif)
+            .dtr_on_open(!resets_on_dtr)
             .open()
             .map_err(|_| TransportError::Carrier)?;
-        if espressif {
+        if resets_on_dtr {
             port.write_data_terminal_ready(false).ok();
             port.write_request_to_send(false).ok();
         } else {

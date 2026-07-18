@@ -1,0 +1,28 @@
+# The SAMD21 Generic Clock Controller block: the channel-routing registers the peripheral
+# bring-up paths touch (partial, append-only). Offsets are GCLK-base-relative; the base
+# lives in ../instances.toml. WHICH generator runs at WHAT rate is a PLAN fact (board.toml),
+# never stated here.
+
+[table]
+kind = "block"
+family = "samd21"
+block = "gclk"
+sources = [
+    "SAMD21 datasheet DS40001882: GCLK CLKCTRL/STATUS (ch 15)",
+]
+notes = [
+    "CLKCTRL is 16-bit at an UNALIGNED offset (base + 0x2) and STATUS is 8-bit at base + 0x1 -- sub-word access only on this M0+ family.",
+    "Route a generator to a peripheral channel: write CLKCTRL = ID | (GEN << 8) | CLKEN, then wait STATUS.SYNCBUSY clear. Each instance row carries its CLKCTRL ID.",
+]
+
+[registers.CLKCTRL]
+offset = 0x2
+width = 16
+fields = { ID = [0, 6], GEN = [8, 4], CLKEN = [14, 1] }
+notes = "Peripheral channel control: ID selects the peripheral channel, GEN the source generator, CLKEN enables the route."
+
+[registers.STATUS]
+offset = 0x1
+width = 8
+fields = { SYNCBUSY = [7, 1] }
+notes = "Wait SYNCBUSY clear after a CLKCTRL write."

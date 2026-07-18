@@ -332,10 +332,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lamella-bsp-gen"
-version = "0.0.0"
-
-[[package]]
 name = "lamella-cil"
 version = "0.0.0"
 dependencies = [
@@ -387,6 +383,7 @@ name = "lamella-cmsis-dap-sam"
 version = "0.0.0"
 dependencies = [
  "lamella-cmsis-dap",
+ "lamella-probe",
  "lamella-usbhid",
 ]
 
@@ -530,6 +527,15 @@ version = "0.0.0"
 dependencies = [
  "lamella-metadata",
  "lamella-token",
+]
+
+[[package]]
+name = "lamella-probe"
+version = "0.0.0"
+dependencies = [
+ "lamella-cmsis-dap",
+ "lamella-usbbulk",
+ "lamella-usbhid",
 ]
 
 [[package]]

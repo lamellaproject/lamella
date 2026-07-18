@@ -160,8 +160,8 @@ pub mod debug {
 /// Lamella Link message types for PROFILE INTROSPECTION (the 0x30 range): the board tells the IDE
 /// what it is. The `HELLO_ACK` already carries the compact [`lamella_wire::ProfileIdentity`]
 /// (abi level + surface hash + name) at zero extra round-trips; this pair pulls the FULL
-/// resident manifest only when the host's cache misses that hash
-/// (docs/deployment-tiers.md's identity/manifest split).
+/// resident manifest only when the host's cache misses that hash -- the resident
+/// profile's identity/manifest split.
 pub mod profile {
     /// Host -> target: request the resident-profile manifest. Empty payload. Answered by
     /// [`PROFILE_MANIFEST`].
@@ -169,6 +169,21 @@ pub mod profile {
     /// Target -> host: the manifest ([`lamella_wire::ProfileManifest`] bytes -- the identity +
     /// the complete intrinsic-id listing of the resident surface).
     pub const PROFILE_MANIFEST: u8 = 0x31;
+}
+
+/// Lamella Link message types for on-device TELEMETRY / live-signal SCOPE (the 0x40 range).
+/// RESERVED for a POST-v1 feature (the telemetry-scope "observe" half that
+/// pairs with the incremental REPL's "adjust"): the host subscribes to device signals -- command
+/// outputs, sensor traces, energy -- and the target streams samples asynchronously over the live
+/// session.
+pub mod telemetry {
+    /// Host -> target: subscribe to a signal. RESERVED (payload shape set at build).
+    pub const SCOPE_SUBSCRIBE: u8 = 0x40;
+    /// Host -> target: unsubscribe from a signal. RESERVED (payload shape set at build).
+    pub const SCOPE_UNSUBSCRIBE: u8 = 0x41;
+    /// Target -> host: an asynchronous sample batch for a subscribed signal. RESERVED (payload
+    /// shape set at build).
+    pub const SCOPE_SAMPLE: u8 = 0x42;
 }
 
 /// Lamella Link message types for PERSISTENT deploy (write a baked image to the target's flash
@@ -429,7 +444,7 @@ fn deploy_caps() -> lamella_wire::Capabilities {
     lamella_wire::Capabilities(serve_caps().0 | lamella_wire::Capabilities::DEBUG_ATTACH)
 }
 
-/// This build's resident-profile identity (docs/deployment-tiers.md): the intrinsic-ABI level +
+/// This build's resident-profile identity: the intrinsic-ABI level +
 /// the registry fingerprint as the surface hash + the surface's name, all derived in
 /// `intrinsic_registry` from the one feature set that shapes the registry. A Tier-2 target
 /// folds its resident corlib's content hash in once one is resident.

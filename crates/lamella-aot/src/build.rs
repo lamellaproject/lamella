@@ -430,23 +430,7 @@ fn build_object_core(
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
     let resolver = MetadataResolver::new(&assembly).with_references(&references);
     let mut descriptors = resolver.type_descriptors();
-    let mut added: Vec<u32> = Vec::new();
-    for func in &funcs {
-        for block in &func.blocks {
-            for (_, inst) in &block.insts {
-                if let Inst::Alloc { handle, .. } = inst {
-                    let known = descriptors.iter().any(|d| d.handle == *handle)
-                        || added.contains(&handle.0);
-                    if !known {
-                        if let Some(meta) = resolver.reference_type_meta(*handle) {
-                            added.push(handle.0);
-                            descriptors.push(meta);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, true);
     if !defer {
         let bytes = arm32::lower_object_vtables_statics(
@@ -497,27 +481,76 @@ fn build_object_core(
     Ok((bytes, report))
 }
 
-/// One assembly's [`arm32::AssemblyStatics`] (#15): its region-symbol identity (the fnv1a32 of the
-/// CIL bytes -- the SAME hash that prefixes a library object's internal symbols, so the two views
-/// of one assembly agree), its dense region size, and its GLOBAL-roots record rows -- every
-/// ref-typed static field's dense slot (the resolver's [`static_field_slots`] layout; the record
-/// and the `ldsfld`/`stsfld` lowering share that one source, or the collector would walk the wrong
-/// words). `include_eh_row` adds word 0 for the PROGRAM assembly only: the linker aliases the
-/// shared `__lamella_eh_tag` word to the ENTRY object's reserved word 0, and that word holds a
-/// type TAG today (an integer; the no-GC exception model), so it is emitted `ManagedPtr` -- the
-/// collector range-checks a maybe-heap word and skips a non-heap value, and when an
+/// Appends the REFERENCE-OWNED descriptors a lowered module mentions but this assembly does not
+/// declare, each with the OWNER's rich meta (payload + cross-assembly vtable + base chain, via
+/// [`MetadataResolver::reference_type_meta`]). An `Alloc` of a referenced class needs it so the
+/// object's `obj-4` dispatches the owner's overrides -- and a cast/box/unbox identity
+/// (`TypeDescAddr`, feeding the address compares and `CastClassScan`) needs it just as much: with
+/// cast and box handles now OWNER-QUALIFIED, an object that only casts against a referenced type
+/// would otherwise lay a MINIMAL descriptor under the type's canonical qualified name and -- in a
+/// program, where descriptors are STRONG -- clobber the owner's rich WEAK copy at the link's
+/// dedupe, breaking every virtual dispatch through it. Array and unresolved handles pass through
+/// untouched (`reference_type_meta` only answers for reference-owned handles).
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+fn append_reference_descriptors(
+    funcs: &[Function],
+    resolver: &MetadataResolver,
+    descriptors: &mut Vec<crate::resolver::TypeMeta>,
+) {
+    let mut added: Vec<u32> = Vec::new();
+    for func in funcs {
+        for block in &func.blocks {
+            for (_, inst) in &block.insts {
+                let handle = match inst {
+                    Inst::Alloc { handle, .. } | Inst::TypeDescAddr { handle } => *handle,
+                    _ => continue,
+                };
+                let known =
+                    descriptors.iter().any(|d| d.handle == handle) || added.contains(&handle.0);
+                if !known {
+                    if let Some(meta) = resolver.reference_type_meta(handle) {
+                        added.push(handle.0);
+                        descriptors.push(meta);
+                    }
+                }
+            }
+        }
+    }
+    let mut i = 0;
+    while i < descriptors.len() {
+        if let Some(base) = descriptors[i].base {
+            let known = descriptors.iter().any(|d| d.handle == base);
+            if !known {
+                if let Some(meta) = resolver.reference_type_meta(base) {
+                    descriptors.push(meta);
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// One assembly's [`crate::stackmaps::AssemblyStatics`] (#15): its region-symbol identity (the
+/// fnv1a32 of the CIL bytes -- the SAME hash that prefixes a library object's internal symbols, so
+/// the two views of one assembly agree), its dense region size, and its GLOBAL-roots record rows
+/// -- every ref-typed static field's dense slot (the resolver's [`static_field_slots`] layout; the
+/// record and the `ldsfld`/`stsfld` lowering share that one source, or the collector would walk
+/// the wrong words). `include_eh_row` adds word 0 for the PROGRAM assembly only: the linker
+/// aliases the shared `__lamella_eh_tag` word to the ENTRY object's reserved word 0, and that word
+/// holds a type TAG today (an integer; the no-GC exception model), so it is emitted `ManagedPtr`
+/// -- the collector range-checks a maybe-heap word and skips a non-heap value, and when an
 /// object-carrying exception model lands the same entry covers the in-flight exception reference.
 /// A library's word 0 is dead (never aliased, never written), so its record claims no root there.
-#[cfg(feature = "arm32")]
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
 fn assembly_statics(
     cil: &[u8],
     assembly: &Assembly,
     include_eh_row: bool,
-) -> arm32::AssemblyStatics {
+) -> crate::stackmaps::AssemblyStatics {
     let slots = crate::resolver::static_field_slots(assembly);
     let mut roots = Vec::new();
     if include_eh_row {
-        roots.push(arm32::STACKMAP_KIND_MANAGED_PTR << 14);
+        roots.push(crate::stackmaps::STACKMAP_KIND_MANAGED_PTR << 14);
     }
     let mut ref_rows: alloc::collections::BTreeSet<u32> = alloc::collections::BTreeSet::new();
     for type_def in assembly.type_defs() {
@@ -539,10 +572,10 @@ fn assembly_statics(
     }
     for (row, slot) in &slots {
         if *slot < 0x4000 && ref_rows.contains(row) {
-            roots.push((*slot as u16) | (arm32::STACKMAP_KIND_OBJECT_REF << 14));
+            roots.push((*slot as u16) | (crate::stackmaps::STACKMAP_KIND_OBJECT_REF << 14));
         }
     }
-    arm32::AssemblyStatics {
+    crate::stackmaps::AssemblyStatics {
         suffix: alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, cil)),
         region_bytes: (slots.len() as u32 + 1) * 4,
         roots,
@@ -566,7 +599,7 @@ fn assembly_statics(
 /// stubbed. Emitting the object stays linker-free (the driver/examples own the link + boot).
 #[cfg(feature = "riscv32")]
 pub fn build_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
-    build_object_riscv_inner(cil, None, riscv32::RiscvProfile::Rv32im)
+    build_object_riscv_inner(cil, &[], riscv32::RiscvProfile::Rv32im)
 }
 
 /// As [`build_object_riscv`], but for a chosen RISC-V [`RiscvProfile`](riscv32::RiscvProfile). `Rv32ec`
@@ -579,7 +612,7 @@ pub fn build_object_riscv_profile(
     cil: &[u8],
     profile: riscv32::RiscvProfile,
 ) -> Result<Vec<u8>, BuildError> {
-    build_object_riscv_inner(cil, None, profile)
+    build_object_riscv_inner(cil, &[], profile)
 }
 
 /// As [`build_object_riscv`], but with a REFERENCED assembly (a corlib or helper library) attached, so
@@ -592,47 +625,73 @@ pub fn build_object_riscv_with_reference(
     cil: &[u8],
     reference: &[u8],
 ) -> Result<Vec<u8>, BuildError> {
-    build_object_riscv_inner(cil, Some(reference), riscv32::RiscvProfile::Rv32im)
+    build_object_riscv_inner(cil, &[reference], riscv32::RiscvProfile::Rv32im)
+}
+
+/// As [`build_object_riscv_with_reference`], but against an ORDERED reference list (the
+/// multi-assembly deploy shape: corlib + a library + ...). A `ldsfld` into a reference's static
+/// resolves to `StaticOwner::Reference(ordinal)` -- that owner's dense slot in that owner's
+/// `__lamella_statics_<ownerhash>` region -- so the ordinals here must match the list the
+/// program was COMPILED against. The RISC-V twin of [`build_object_with_libraries`].
+#[cfg(feature = "riscv32")]
+pub fn build_object_riscv_with_references(
+    cil: &[u8],
+    references: &[&[u8]],
+) -> Result<Vec<u8>, BuildError> {
+    build_object_riscv_inner(cil, references, riscv32::RiscvProfile::Rv32im)
 }
 
 #[cfg(feature = "riscv32")]
 fn build_object_riscv_inner(
     cil: &[u8],
-    reference_cil: Option<&[u8]>,
+    reference_cils: &[&[u8]],
     profile: riscv32::RiscvProfile,
 ) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
-    let reference = match reference_cil {
-        Some(bytes) => Some(Assembly::read(bytes).map_err(|_| BuildError::Parse)?),
-        None => None,
-    };
+    let reference_assemblies: Vec<Assembly> = reference_cils
+        .iter()
+        .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
+        .collect::<Result<_, _>>()?;
+    let references: Vec<&Assembly> = reference_assemblies.iter().collect();
     let entry = find_main(&assembly).ok_or(BuildError::NoEntryPoint)?;
-    let mut resolver = MetadataResolver::new(&assembly);
-    if let Some(reference) = reference.as_ref() {
-        resolver = resolver.with_reference(reference);
-    }
+    let resolver = MetadataResolver::new(&assembly).with_references(&references);
     let mut descriptors = resolver.type_descriptors();
-    let funcs = lower_reachable(&assembly, entry, &descriptors, reference.as_ref())?;
-    let mut added: Vec<u32> = Vec::new();
-    for func in &funcs {
-        for (_, inst) in func.blocks.iter().flat_map(|b| &b.insts) {
-            if let Inst::Alloc { handle, .. } = inst {
-                let known =
-                    descriptors.iter().any(|d| d.handle == *handle) || added.contains(&handle.0);
-                if !known {
-                    if let Some(meta) = resolver.reference_type_meta(*handle) {
-                        added.push(handle.0);
-                        descriptors.push(meta);
-                    }
-                }
-            }
-        }
+    let mut reference_cctors: Vec<alloc::string::String> = Vec::new();
+    for (bytes, reference) in reference_cils.iter().zip(&reference_assemblies) {
+        let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, bytes));
+        reference_cctors
+            .extend(find_cctors(reference).into_iter().map(|rid| alloc::format!("{prefix}f{rid}")));
     }
+    let funcs = lower_reachable(&assembly, entry, &descriptors, &references, &reference_cctors)?;
+    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     let names: Vec<alloc::string::String> =
         (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    riscv32::lower_object_profile(&funcs, &name_refs, &[], &descriptors, profile)
-        .map_err(BuildError::LowerRiscv)
+    let statics = assembly_statics(cil, &assembly, true);
+    let reference_regions: Vec<alloc::string::String> = reference_cils
+        .iter()
+        .zip(&reference_assemblies)
+        .map(|(bytes, reference)| assembly_statics(bytes, reference, false).region_symbol())
+        .collect();
+    let reference_region_refs: Vec<&str> = reference_regions.iter().map(|s| s.as_str()).collect();
+    let qualifiers = crate::resolver::DescQualifiers {
+        own: None,
+        references: reference_cils
+            .iter()
+            .map(|bytes| alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, bytes)))
+            .collect(),
+    };
+    riscv32::lower_object_profile_statics_references(
+        &funcs,
+        &name_refs,
+        &[],
+        &descriptors,
+        Some(&statics),
+        &reference_region_refs,
+        &qualifiers,
+        profile,
+    )
+    .map_err(BuildError::LowerRiscv)
 }
 
 /// Lowers the methods of a self-contained assembly REACHABLE from `entry`, rid-indexed, into a dense
@@ -647,7 +706,8 @@ fn lower_reachable<'a>(
     assembly: &'a Assembly<'a>,
     entry: u32,
     descriptors: &[crate::resolver::TypeMeta],
-    reference: Option<&'a Assembly<'a>>,
+    references: &[&'a Assembly<'a>],
+    reference_cctors: &[alloc::string::String],
 ) -> Result<Vec<Function>, BuildError> {
     let mut max_rid = entry;
     for type_def in assembly.type_defs() {
@@ -659,10 +719,7 @@ fn lower_reachable<'a>(
     let mut lowered = vec![false; funcs.len()];
     let cctors = find_cctors(assembly);
     let init = find_native_export(assembly, "lamella_time_init");
-    let resolver = match reference {
-        Some(reference) => MetadataResolver::new(assembly).with_reference(reference),
-        None => MetadataResolver::new(assembly),
-    };
+    let resolver = MetadataResolver::new(assembly).with_references(references);
     let mut worklist: Vec<u32> = core::iter::once(entry)
         .chain(cctors.iter().copied())
         .chain(init)
@@ -673,8 +730,10 @@ fn lower_reachable<'a>(
                 worklist.push(*index);
             }
         }
-        for (_, index) in &meta.itable {
-            worklist.push(*index);
+        for (_, impl_) in &meta.itable {
+            if let crate::resolver::VtableEntry::Func(index) = impl_ {
+                worklist.push(*index);
+            }
         }
     }
     while let Some(rid) = worklist.pop() {
@@ -695,11 +754,16 @@ fn lower_reachable<'a>(
                         worklist.push(*callee);
                     }
                 }
+                if let Inst::FuncAddr { func } = inst {
+                    if lowered.get(*func as usize) == Some(&false) {
+                        worklist.push(*func);
+                    }
+                }
             }
         }
         funcs[rid as usize] = func;
     }
-    funcs[0] = startup(init, &cctors, entry);
+    funcs[0] = startup_with_references(init, reference_cctors, &cctors, entry);
     Ok(funcs)
 }
 
@@ -755,13 +819,67 @@ fn lower_one_reachable(
 /// library where every method lowers.
 #[cfg(feature = "riscv32")]
 pub fn build_library_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+    build_library_object_riscv_inner(cil, &[])
+}
+
+/// As [`build_library_object_riscv`], but with the library's OWN references (its corlib, a
+/// helper library) attached, so its bodies resolve cross-assembly types the way its compile did:
+/// a `new object()` inside a library ctor needs corlib's layout, or the method stubs and the
+/// object it builds is inert. A cross-assembly `ldsfld` in a library body resolves to its
+/// owner's region, exactly as a program's does.
+#[cfg(feature = "riscv32")]
+pub fn build_library_object_riscv_with_references(
+    cil: &[u8],
+    references: &[&[u8]],
+) -> Result<Vec<u8>, BuildError> {
+    build_library_object_riscv_inner(cil, references)
+}
+
+#[cfg(feature = "riscv32")]
+fn build_library_object_riscv_inner(
+    cil: &[u8],
+    reference_cils: &[&[u8]],
+) -> Result<Vec<u8>, BuildError> {
     let assembly = Assembly::read(cil).map_err(|_| BuildError::Parse)?;
-    let (funcs, _maps, _fails) = lower_assembly_debug(&assembly, None, &[]);
+    let reference_assemblies: Vec<Assembly> = reference_cils
+        .iter()
+        .map(|bytes| Assembly::read(bytes).map_err(|_| BuildError::Parse))
+        .collect::<Result<_, _>>()?;
+    let references: Vec<&Assembly> = reference_assemblies.iter().collect();
+    let (funcs, _maps, _fails) = lower_assembly_debug(&assembly, None, &references);
     let prefix = alloc::format!("L{:08x}.", lamella_metadata::fnv1a32(0x811c_9dc5, cil));
     let names = library_symbol_names(&assembly, funcs.len(), &prefix);
     let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
-    let descriptors = MetadataResolver::new(&assembly).type_descriptors();
-    riscv32::lower_object_library(&funcs, &name_refs, &[], &descriptors).map_err(BuildError::LowerRiscv)
+    let resolver = MetadataResolver::new(&assembly).with_references(&references);
+    let mut descriptors = resolver.type_descriptors();
+    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
+    let statics = assembly_statics(cil, &assembly, false);
+    let reference_regions: Vec<alloc::string::String> = reference_cils
+        .iter()
+        .zip(&reference_assemblies)
+        .map(|(bytes, reference)| assembly_statics(bytes, reference, false).region_symbol())
+        .collect();
+    let reference_region_refs: Vec<&str> = reference_regions.iter().map(|s| s.as_str()).collect();
+    let qualifiers = crate::resolver::DescQualifiers {
+        own: Some(alloc::format!(
+            "{:08x}",
+            lamella_metadata::fnv1a32(0x811c_9dc5, cil)
+        )),
+        references: reference_cils
+            .iter()
+            .map(|bytes| alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, bytes)))
+            .collect(),
+    };
+    riscv32::lower_object_library_statics(
+        &funcs,
+        &name_refs,
+        &[],
+        &descriptors,
+        Some(&statics),
+        &reference_region_refs,
+        &qualifiers,
+    )
+    .map_err(BuildError::LowerRiscv)
 }
 
 /// AOT-lowers a whole assembly as a LINKABLE LIBRARY object (a corlib, a helper library): every public
@@ -879,7 +997,8 @@ fn build_library_object_inner(
             .collect(),
     };
     let resolver = MetadataResolver::new(&assembly).with_references(&reference_list);
-    let descriptors = resolver.type_descriptors();
+    let mut descriptors = resolver.type_descriptors();
+    append_reference_descriptors(&funcs, &resolver, &mut descriptors);
     let statics = assembly_statics(cil, &assembly, false);
     let (bytes, stubs) = arm32::lower_object_library_vtables_report(
         &funcs,

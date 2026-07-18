@@ -1,0 +1,44 @@
+# The SAM3X Parallel I/O Controller block: one PIO group per port letter (the pioa instance
+# row carries the group base). Only the mux registers the peripheral bring-up paths touch are
+# transcribed so far (partial, append-only). Each register is one bit per I/O line (0-31).
+
+[table]
+kind = "block"
+family = "sam3x"
+block = "pio"
+sources = [
+    "SAM3X/A datasheet Atmel-11057C: PIO Controller register mapping + peripheral A/B selection (ch 31)",
+]
+notes = [
+    "To hand a pin to its peripheral: write the line's bit in PDR (disable PIO control), then select peripheral A (ABSR bit 0, the reset default) or B (bit 1). PER takes a line back to GPIO.",
+    "The pin rows name the line and its function letter (A/B); the driver sets that line's bit. ABSR resets to 0 = all peripheral A, so a peripheral-A pin (like the UART) needs only PDR.",
+]
+
+[registers.PER]
+offset = 0x00
+width = 32
+fields = { PER = [0, 32] }
+notes = "PIO Enable Register (write-only): write 1 to a line's bit to make it GPIO (PIO-controlled)."
+
+[registers.PDR]
+offset = 0x04
+width = 32
+fields = { PDR = [0, 32] }
+notes = "PIO Disable Register (write-only): write 1 to a line's bit to hand it to the peripheral selected in ABSR."
+
+[registers.PSR]
+offset = 0x08
+width = 32
+fields = { PSR = [0, 32] }
+notes = "PIO Status Register (read-only): 1 = the line is PIO-controlled, 0 = peripheral-controlled."
+
+[registers.ABSR]
+offset = 0x70
+width = 32
+fields = { ABSR = [0, 32] }
+notes = "Peripheral AB Select Register: per line, 0 = peripheral A, 1 = peripheral B. Reset 0 (all peripheral A)."
+
+# Function-letter values for a line's peripheral selection (the pin rows name letters).
+[constants]
+FUNC_A = 0
+FUNC_B = 1

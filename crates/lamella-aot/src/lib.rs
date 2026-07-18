@@ -15,6 +15,9 @@ mod regalloc;
 #[cfg(any(feature = "arm32", feature = "wasm"))]
 mod stringgen;
 
+#[cfg(any(feature = "arm32", feature = "riscv32"))]
+mod stackmaps;
+
 #[cfg(feature = "arm32")]
 pub mod arm32;
 

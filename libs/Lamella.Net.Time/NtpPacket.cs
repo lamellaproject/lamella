@@ -3,8 +3,10 @@ using System;
 
 namespace Lamella.Net.Time
 {
-    public static class NtpPacket
+    public sealed class NtpPacket
     {
+        private NtpPacket() { }
+
         public static byte[] BuildClientHeader(long utcTicksT1)
         {
             byte[] header = new byte[48];

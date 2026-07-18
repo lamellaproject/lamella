@@ -1,0 +1,108 @@
+# The UART peripheral on the Microchip/Atmel SAM3X / SAM3A family -- the BLOCK layout:
+# register offsets are UART-instance-relative; nothing here names an instance, a pin, a board, or a
+# clock plan. Instance bases/ids live in ../instances.toml; board wiring
+# lives in bsp/<board>/board.toml.
+#
+# The SAM3X UART is a single-mode peripheral (no USART-style mode register), always 8 data bits +
+# 1 stop bit; parity is chosen by MR.PAR. Transcribed from the SAM3X/A datasheet (Atmel-11057) ch 34.
+
+[table]
+kind = "block"
+family = "sam3x"
+block = "uart"
+sources = [
+    "SAM3X/A datasheet Atmel-11057C: UART register mapping (Table 34-3) + register descriptions (ch 34.6)",
+]
+notes = [
+    "Single 8-bit character, one stop bit; parity per MR.PAR (4 = none). No character-size or stop-bit field.",
+    "Baud: the baud-rate clock is MCK / (16 * CD), where CD is UART_BRGR[15:0]; CD = 0 disables the UART (34.5.1). MCK is the routed master-clock rate -- a PLAN fact, not a block constant.",
+    "Enable order: set the PMC peripheral clock (instance pid) and the PIO mux (peripheral A on the UART pins) BEFORE configuring here -- cross-block bring-up is driver code.",
+    "TX: poll SR.TXRDY, write THR. RX: poll SR.RXRDY, read RHR. RSTSTA in CR clears the sticky OVRE/FRAME/PARE.",
+]
+
+[registers.CR]
+offset = 0x0
+width = 32
+fields = { RSTRX = [2, 1], RSTTX = [3, 1], RXEN = [4, 1], RXDIS = [5, 1], TXEN = [6, 1], TXDIS = [7, 1], RSTSTA = [8, 1] }
+notes = "Control Register (write-only). RXEN|TXEN enable the receiver/transmitter; RSTRX|RSTTX reset them; RSTSTA resets the status error bits."
+
+[registers.MR]
+offset = 0x4
+width = 32
+fields = { PAR = [9, 3], CHMODE = [14, 2] }
+notes = "Mode Register. PAR 4 = no parity (0 even, 1 odd, 2 space, 3 mark, 4 none). CHMODE 0 = normal."
+
+[registers.IER]
+offset = 0x8
+width = 32
+fields = { RXRDY = [0, 1], TXRDY = [1, 1], ENDRX = [3, 1], ENDTX = [4, 1], OVRE = [5, 1], FRAME = [6, 1], PARE = [7, 1], TXEMPTY = [9, 1], TXBUFE = [11, 1], RXBUFF = [12, 1] }
+notes = "Interrupt Enable Register (write-only, write-1-to-enable). Same bit layout as IDR/IMR/SR."
+
+[registers.IDR]
+offset = 0xC
+width = 32
+fields = { RXRDY = [0, 1], TXRDY = [1, 1], ENDRX = [3, 1], ENDTX = [4, 1], OVRE = [5, 1], FRAME = [6, 1], PARE = [7, 1], TXEMPTY = [9, 1], TXBUFE = [11, 1], RXBUFF = [12, 1] }
+notes = "Interrupt Disable Register (write-only, write-1-to-disable)."
+
+[registers.IMR]
+offset = 0x10
+width = 32
+fields = { RXRDY = [0, 1], TXRDY = [1, 1], ENDRX = [3, 1], ENDTX = [4, 1], OVRE = [5, 1], FRAME = [6, 1], PARE = [7, 1], TXEMPTY = [9, 1], TXBUFE = [11, 1], RXBUFF = [12, 1] }
+notes = "Interrupt Mask Register (read-only). Reset value 0."
+
+[registers.SR]
+offset = 0x14
+width = 32
+fields = { RXRDY = [0, 1], TXRDY = [1, 1], ENDRX = [3, 1], ENDTX = [4, 1], OVRE = [5, 1], FRAME = [6, 1], PARE = [7, 1], TXEMPTY = [9, 1], TXBUFE = [11, 1], RXBUFF = [12, 1] }
+notes = "Status Register (read-only). RXRDY = a byte is in RHR; TXRDY = THR is ready for a byte; TXEMPTY = transmitter idle; OVRE/FRAME/PARE = sticky errors (clear with CR.RSTSTA)."
+
+[registers.RHR]
+offset = 0x18
+width = 32
+fields = { RXCHR = [0, 8] }
+notes = "Receive Holding Register (read-only): the received byte in [7:0]."
+
+[registers.THR]
+offset = 0x1C
+width = 32
+fields = { TXCHR = [0, 8] }
+notes = "Transmit Holding Register (write-only): write the byte to send in [7:0]."
+
+[registers.BRGR]
+offset = 0x20
+width = 32
+fields = { CD = [0, 16] }
+notes = "Baud Rate Generator: CD is the clock divisor; baud = MCK / (16 * CD). See the block baud parameter."
+
+# Block-scoped magic only: the MR value for 8-bit, no parity, normal mode.
+[constants]
+MR_8N1 = 0x800
+
+[parameters]
+baud = "baud = MCK / (16 * CD); CD = round(MCK / (16 * baud_hz)) written to BRGR[15:0]. MCK is the routed master-clock rate (a plan fact)."
+tx_byte = "the byte to transmit (write to THR once SR.TXRDY is set)."
+
+# Block-LOCAL sequences only: every step touches a UART register. The PMC clock-enable and PIO mux
+# are cross-block bring-up (driver code), not steps here.
+
+[[sequences.tx_byte]]
+op = "poll"
+reg = "SR"
+mask = 0x2
+note = "TXRDY: the transmit holding register is ready"
+
+[[sequences.tx_byte]]
+op = "write"
+reg = "THR"
+value = "$tx_byte"
+
+[[sequences.rx_poll]]
+op = "poll"
+reg = "SR"
+mask = 0x1
+note = "RXRDY: a byte arrived"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "RHR"
+mask = 0xFF

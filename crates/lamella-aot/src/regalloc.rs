@@ -93,6 +93,41 @@ impl Liveness {
         false
     }
 
+    /// Whether any REF-LIKE value (an `ObjectRef`/`ManagedPtr` root, or a tagged `PyValue`) is
+    /// live across a safepoint -- defined before it and used after. The RISC-V register path's
+    /// MEMORY-HOMING gate: its value pool is CALLEE-SAVED registers, so an ordinary value survives
+    /// a call correctly there, but a reference doing so would sit where no METHOD_SLOTS stack-map
+    /// record can describe it (records enumerate frame SLOTS only) -- invisible to a moving
+    /// collector walking the frame mid-call. Such a function must take the all-spilled path.
+    /// (ARM needs no ref-scoped variant: its register pool is caller-saved, so
+    /// [`Self::any_value_live_across_call`] already forces the spilled path for ANY live-across
+    /// value -- hence the riscv32 gate.)
+    #[cfg(feature = "riscv32")]
+    pub fn any_ref_live_across_safepoint(&self, func: &Function) -> bool {
+        let is_ref = |v: usize| {
+            func.value_types
+                .get(v)
+                .is_some_and(|ty| ty.is_gc_reference() || ty.is_tagged_value())
+        };
+        for (b, block) in func.blocks.iter().enumerate() {
+            let mut live = self.live_out[b].clone();
+            each_terminator_use(&block.terminator, |u| set(&mut live, u));
+            for (result, inst) in block.insts.iter().rev() {
+                if is_safepoint(inst)
+                    && live
+                        .iter()
+                        .enumerate()
+                        .any(|(v, &alive)| alive && v != result.index() && is_ref(v))
+                {
+                    return true;
+                }
+                live[result.index()] = false;
+                each_inst_use(inst, |u| set(&mut live, u));
+            }
+        }
+        false
+    }
+
     /// Whether `value` is live on entry to block `block`.
     pub fn live_in(&self, block: usize, value: ValueId) -> bool {
         self.live_in

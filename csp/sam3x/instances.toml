@@ -1,0 +1,36 @@
+# The SAM3X instance map: every placed block copy, its base, and its peripheral id. Layout
+# truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. On the SAM3X the
+# peripheral id (Table 9-1) is BOTH the PMC clock-control index (PMC_PCER0/PCDR0 bit for id < 32,
+# PMC_PCER1 for id >= 32) AND the NVIC interrupt line -- one number, so one field. -1 marks a row
+# with no peripheral id (the PMC itself is the clock controller; it is not gated).
+
+[table]
+kind = "instances"
+family = "sam3x"
+record = ["base", "pid"]
+sources = [
+    "SAM3X/A datasheet Atmel-11057C: peripheral base addresses (memory map, ch 7) + Peripheral Identifiers (Table 9-1)",
+    "silicon-grounded on an Arduino Due (SAM3X8E, CHIPID_CIDR 0x285E0A60): UART/CHIPID/EEFC bases read directly; PMC base located by its SCSR (0x400E0600 reads 0x21, while 0x400E0400 = the MATRIX reads 0)",
+]
+notes = [
+    "pid drives PMC_PCER0 bit (id) for clock enable and the NVIC line; UART = 8, PIOA = 11, PMC = 5 (Table 9-1).",
+    "Bases confirmed on silicon: UART 0x400E0800, PMC 0x400E0600 (the System Controller order is SMC/SDRAMC/MATRIX/PMC/UART at 0x400E0000/0200/0400/0600/0800). PIOA 0x400E0E00 per the memory map.",
+]
+
+
+name = "uart"
+block = "uart"
+base = 0x400E0800
+pid = 8
+
+
+name = "pmc"
+block = "pmc"
+base = 0x400E0600
+pid = -1
+
+
+name = "pioa"
+block = "pio"
+base = 0x400E0E00
+pid = 11

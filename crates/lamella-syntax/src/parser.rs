@@ -1255,7 +1255,10 @@ impl Parser {
         self.bump();
         let return_type = self.parse_type();
         let (name, _) = self.expect_identifier();
-        let parameters = self.parse_parameter_list();
+        let (parameters, arglist) = self.parse_parameter_list();
+        if let Some(span) = arglist {
+            self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
+        }
         let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         DelegateDecl {
             attributes,
@@ -1423,7 +1426,7 @@ impl Parser {
                 Punctuator::OpenParen,
                 DiagnosticKind::TokenExpected { expected: "(" },
             );
-            let parameters = self.parse_parameter_sequence(Punctuator::CloseParen);
+            let (parameters, arglist) = self.parse_parameter_sequence(Punctuator::CloseParen);
             let header_end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
             let initializer = if self.eat(Punctuator::Colon) {
                 Some(self.parse_constructor_initializer())
@@ -1436,6 +1439,7 @@ impl Parser {
                 modifiers,
                 name,
                 parameters,
+                is_vararg: arglist.is_some(),
                 initializer,
                 body,
                 header_span: Span::new(start, header_end),
@@ -1454,7 +1458,7 @@ impl Parser {
             && self.next_is(Punctuator::OpenParen)
         {
             let (name, _) = self.expect_identifier();
-            let parameters = self.parse_parameter_list();
+            let (parameters, arglist) = self.parse_parameter_list();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 let block = self.parse_block();
                 let end = block.span.end;
@@ -1468,6 +1472,7 @@ impl Parser {
                 return_type: ty,
                 name,
                 parameters,
+                is_vararg: arglist.is_some(),
                 body,
                 explicit_interface: None,
                 attributes: Vec::new(),
@@ -1495,7 +1500,7 @@ impl Parser {
             if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 return self.parse_property(modifiers, ty, member, Some(explicit_interface), start);
             }
-            let parameters = self.parse_parameter_list();
+            let (parameters, arglist) = self.parse_parameter_list();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
                 let block = self.parse_block();
                 let end = block.span.end;
@@ -1509,6 +1514,7 @@ impl Parser {
                 return_type: ty,
                 name: member,
                 parameters,
+                is_vararg: arglist.is_some(),
                 body,
                 explicit_interface: Some(explicit_interface),
                 attributes: Vec::new(),
@@ -1782,7 +1788,10 @@ impl Parser {
                 OverloadableOperator::Plus
             }
         };
-        let parameters = self.parse_parameter_list();
+        let (parameters, arglist) = self.parse_parameter_list();
+        if let Some(span) = arglist {
+            self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
+        }
         let body = self.parse_required_block();
         let end = body.span.end;
         Member::Operator {
@@ -1791,6 +1800,7 @@ impl Parser {
             operator,
             parameters,
             body,
+            attributes: Vec::new(),
             span: Span::new(start, end),
         }
     }
@@ -1807,7 +1817,10 @@ impl Parser {
         };
         self.expect_keyword(Keyword::Operator, "operator");
         let target = self.parse_type();
-        let parameters = self.parse_parameter_list();
+        let (parameters, arglist) = self.parse_parameter_list();
+        if let Some(span) = arglist {
+            self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
+        }
         let body = self.parse_required_block();
         let end = body.span.end;
         Member::ConversionOperator {
@@ -1816,6 +1829,7 @@ impl Parser {
             target,
             parameters,
             body,
+            attributes: Vec::new(),
             span: Span::new(start, end),
         }
     }
@@ -1871,6 +1885,7 @@ impl Parser {
             modifiers,
             name,
             body,
+            attributes: Vec::new(),
             span: Span::new(start, end),
         }
     }
@@ -1912,7 +1927,10 @@ impl Parser {
             Punctuator::OpenBracket,
             DiagnosticKind::TokenExpected { expected: "[" },
         );
-        let parameters = self.parse_parameter_sequence(Punctuator::CloseBracket);
+        let (parameters, arglist) = self.parse_parameter_sequence(Punctuator::CloseBracket);
+        if let Some(span) = arglist {
+            self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
+        }
         self.expect(
             Punctuator::CloseBracket,
             DiagnosticKind::TokenExpected { expected: "]" },
@@ -1930,7 +1948,7 @@ impl Parser {
     }
 
     /// Parses a parenthesized formal-parameter list (17.5.1).
-    fn parse_parameter_list(&mut self) -> Vec<Parameter> {
+    fn parse_parameter_list(&mut self) -> (Vec<Parameter>, Option<Span>) {
         self.expect(
             Punctuator::OpenParen,
             DiagnosticKind::TokenExpected { expected: "(" },
@@ -1942,15 +1960,33 @@ impl Parser {
 
     /// Parses a comma-separated formal-parameter sequence up to `close`, without
     /// consuming the surrounding brackets. Shared by parameter lists `( )` and
-    /// indexer index lists `[ ]`.
-    fn parse_parameter_sequence(&mut self, close: Punctuator) -> Vec<Parameter> {
+    /// indexer index lists `[ ]`. The second element is the span of a trailing
+    /// `__arglist` vararg marker when one was present (tokenized only under the
+    /// typedref knob): a method/constructor list accepts it, any other context
+    /// reports CS1669 at that span. A non-final `__arglist` is CS0257 here, where
+    /// the position is known, and the marker still registers so the member keeps
+    /// its vararg shape for downstream binding.
+    fn parse_parameter_sequence(&mut self, close: Punctuator) -> (Vec<Parameter>, Option<Span>) {
         let mut parameters = Vec::new();
+        let mut arglist: Option<Span> = None;
         if self.current_punctuator() == Some(close) {
-            return parameters;
+            return (parameters, arglist);
         }
         loop {
             let start = self.current().span.start;
             let _ = self.parse_attribute_sections();
+            if self.current().kind == TokenKind::TypedRefKeyword(TypedRefKeyword::ArgList) {
+                let span = self.current().span;
+                self.bump();
+                if arglist.is_none() {
+                    arglist = Some(span);
+                }
+                if self.eat(Punctuator::Comma) {
+                    self.report(DiagnosticKind::ArglistMustBeLast, span);
+                    continue;
+                }
+                break;
+            }
             let modifier = match self.current_keyword() {
                 Some(Keyword::Ref) => {
                     self.bump();
@@ -1992,7 +2028,7 @@ impl Parser {
                 break;
             }
         }
-        parameters
+        (parameters, arglist)
     }
 
     /// Parses a full expression (14): an assignment, which sits at the bottom of
@@ -2425,6 +2461,19 @@ impl Parser {
                     },
                     Span::new(span.start, end),
                 )
+            }
+            TokenKind::TypedRefKeyword(TypedRefKeyword::ArgList) => {
+                self.bump();
+                if self.current_punctuator() == Some(Punctuator::OpenParen) {
+                    self.bump();
+                    let (arguments, end) = self.parse_arguments(
+                        Punctuator::CloseParen,
+                        DiagnosticKind::CloseParenExpected,
+                    );
+                    Expr::new(ExprKind::ArgListCall(arguments), Span::new(span.start, end))
+                } else {
+                    Expr::new(ExprKind::ArgListHandle, span)
+                }
             }
             TokenKind::Identifier(name) => {
                 self.bump();
@@ -3164,6 +3213,16 @@ mod tests {
             ExprKind::RefValue { reference, target } => {
                 format!("(refvalue {} {})", dump(reference), dump_type(target))
             }
+            ExprKind::ArgListHandle => String::from("(arglist-handle)"),
+            ExprKind::ArgListCall(arguments) => {
+                let mut text = String::from("(arglist");
+                for argument in arguments {
+                    text.push(' ');
+                    text.push_str(&dump(argument));
+                }
+                text.push(')');
+                text
+            }
             ExprKind::TypeTest {
                 operation,
                 operand,
@@ -3606,6 +3665,103 @@ mod tests {
     }
 
     #[test]
+    fn arglist_expressions_parse_only_under_the_knob() {
+        let typedref = LexOptions {
+            typedref: true,
+            ..LexOptions::default()
+        };
+        let parse = |source: &str| -> String {
+            let mut parser = Parser::new(tokenize_with(source, typedref.clone()));
+            let expr = parser.parse_expression();
+            assert!(
+                parser.diagnostics.is_empty(),
+                "unexpected diagnostics for {source:?}: {:?}",
+                parser.diagnostics
+            );
+            dump(&expr)
+        };
+        assert_eq!(parse("__arglist(2, x)"), "(arglist 2 x)");
+        assert_eq!(parse("__arglist()"), "(arglist)");
+        assert_eq!(parse("__arglist"), "(arglist-handle)");
+        assert_eq!(
+            parse("new ArgIterator(__arglist)"),
+            "(new ArgIterator (arglist-handle))"
+        );
+        assert_eq!(tree("__arglist(x)"), "(call __arglist x)");
+    }
+
+    #[test]
+    fn arglist_parameter_marks_a_vararg_method_or_constructor() {
+        let typedref = LexOptions {
+            typedref: true,
+            ..LexOptions::default()
+        };
+        let parse_unit = |source: &str| -> String {
+            let parsed = parse_compilation_unit_with(source, typedref.clone());
+            assert!(
+                parsed.diagnostics.is_empty(),
+                "unexpected diagnostics for {source:?}: {:?}",
+                parsed.diagnostics
+            );
+            dump_unit(&parsed.unit)
+        };
+        assert_eq!(
+            parse_unit("class C { static int Sum(int seed, __arglist) { return seed; } }"),
+            "(class C (method static int Sum (int seed, __arglist) (block (return seed))))"
+        );
+        assert_eq!(
+            parse_unit("class T { public T(__arglist) { } }"),
+            "(class T (ctor public T (__arglist) (block)))"
+        );
+        assert_eq!(
+            parse_unit("interface I { void M(__arglist); }"),
+            "(interface I (method void M (__arglist) ;))"
+        );
+    }
+
+    #[test]
+    fn arglist_not_last_is_cs0257_and_still_marks_the_member() {
+        let typedref = LexOptions {
+            typedref: true,
+            ..LexOptions::default()
+        };
+        let parsed = parse_compilation_unit_with(
+            "class C { static void M(__arglist, int a) { } }",
+            typedref.clone(),
+        );
+        let codes: Vec<u16> = parsed.diagnostics.iter().map(Diagnostic::code).collect();
+        assert_eq!(codes, vec![257]);
+        assert_eq!(
+            dump_unit(&parsed.unit),
+            "(class C (method static void M (int a, __arglist) (block)))"
+        );
+    }
+
+    #[test]
+    fn arglist_in_a_non_vararg_context_is_cs1669() {
+        let typedref = LexOptions {
+            typedref: true,
+            ..LexOptions::default()
+        };
+        let codes = |source: &str| -> Vec<u16> {
+            parse_compilation_unit_with(source, typedref.clone())
+                .diagnostics
+                .iter()
+                .map(Diagnostic::code)
+                .collect()
+        };
+        assert_eq!(codes("delegate void D(__arglist);"), vec![1669]);
+        assert_eq!(
+            codes("class C { public static int operator +(C a, __arglist) { return 1; } }"),
+            vec![1669]
+        );
+        assert_eq!(
+            codes("class C { int this[__arglist] { get { return 1; } } }"),
+            vec![1669]
+        );
+    }
+
+    #[test]
     fn the_precedence_ladder_matches_the_grammar() {
         assert_eq!(tree("a || b && c"), "(|| a (&& b c))");
         assert_eq!(tree("a == b && c"), "(&& (== a b) c)");
@@ -3991,6 +4147,14 @@ mod tests {
         text
     }
 
+    fn vararg_marker(parameters: &[Parameter], is_vararg: bool) -> &'static str {
+        match (is_vararg, parameters.is_empty()) {
+            (false, _) => "",
+            (true, true) => "__arglist",
+            (true, false) => ", __arglist",
+        }
+    }
+
     fn dump_member(member: &Member) -> String {
         match member {
             Member::Field {
@@ -4020,6 +4184,7 @@ mod tests {
                 return_type,
                 name,
                 parameters,
+                is_vararg,
                 body,
                 explicit_interface,
                 ..
@@ -4033,9 +4198,10 @@ mod tests {
                     None => name.to_string(),
                 };
                 text.push_str(&format!(
-                    " {} {qualified} ({})",
+                    " {} {qualified} ({}{})",
                     dump_type(return_type),
-                    dump_params(parameters)
+                    dump_params(parameters),
+                    vararg_marker(parameters, *is_vararg)
                 ));
                 match body {
                     Some(body) => text.push_str(&format!(" {}", dump_stmt(body))),
@@ -4048,6 +4214,7 @@ mod tests {
                 modifiers,
                 name,
                 parameters,
+                is_vararg,
                 initializer,
                 body,
                 ..
@@ -4056,7 +4223,11 @@ mod tests {
                 for modifier in modifiers {
                     text.push_str(&format!(" {}", modifier_name(*modifier)));
                 }
-                text.push_str(&format!(" {name} ({})", dump_params(parameters)));
+                text.push_str(&format!(
+                    " {name} ({}{})",
+                    dump_params(parameters),
+                    vararg_marker(parameters, *is_vararg)
+                ));
                 if let Some(initializer) = initializer {
                     let keyword = match initializer.kind {
                         ConstructorInitializerKind::Base => "base",
@@ -4897,8 +5068,10 @@ mod tests {
     /// drivers (lcsc and the compile-file harness) compile on a large-stack worker thread so this
     /// cannot overflow the small default main-thread stack. Parsing the same shape here on a
     /// thread with a generous stack -- the default test-thread stack (about 2 MiB) would itself
-    /// overflow -- confirms the parser carries no pathological per-frame cost. Both the parse and
-    /// the deep tree's recursive drop run on the worker, so only the diagnostic count crosses back.
+    /// overflow -- confirms the parser carries no pathological per-frame cost. The worker matches
+    /// the drivers' 64 MiB (which follows a full debug compile past depth 3750; a parse alone costs
+    /// less per level, so depth 3000 clears with wide margin). Both the parse and the deep tree's
+    /// recursive drop run on the worker, so only the diagnostic count crosses back.
     #[test]
     fn a_deeply_nested_expression_parses_on_a_generous_stack() {
         let depth = 3000;
@@ -4909,7 +5082,7 @@ mod tests {
         source.push_str("; } }");
 
         let diagnostic_count = std::thread::Builder::new()
-            .stack_size(256 * 1024 * 1024)
+            .stack_size(64 * 1024 * 1024)
             .spawn(move || parse_compilation_unit(&source).diagnostics.len())
             .expect("spawn a generous-stack parse thread")
             .join()

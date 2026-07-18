@@ -1,5 +1,5 @@
 // Lamella System.Net.NetworkInformation -- the network-CHANGE event surface (threaded tiers only).
-#if LAMELLA_SURFACE_THREADS && LAMELLA_SURFACE_NET_CHANGE
+#if LAMELLA_SURFACE_THREADS
 using System;
 using System.Text;
 using System.Threading;

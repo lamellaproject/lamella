@@ -3,8 +3,10 @@
 namespace Lamella.Hardware
 {
     /// <summary>Volatile access to memory-mapped hardware registers, for peripheral drivers.</summary>
-    public static class Mmio
+    public sealed class Mmio
     {
+        private Mmio() { }
+
         /// <summary>Volatile 32-bit read of the register at <paramref name="address"/>.</summary>
         [Lamella.Runtime.RuntimeProvided]
         public static uint Read32(uint address) { return 0; }

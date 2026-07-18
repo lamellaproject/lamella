@@ -1371,44 +1371,37 @@ impl<'a> Lexer<'a> {
 /// A line terminator (9.3.1). A CR/LF pair is combined into one by the scanner.
 /// Parses a `decimal`-literal's numeric text (digits with an optional `.` and `e`/`E` exponent, no
 /// suffix or sign) to `(lo, mid, hi, scale)` -- the 96-bit integer mantissa split into three `u32`
-/// and the power-of-ten scale, so the value is `mantissa x 10^-scale`. `None` if the mantissa
-/// overflows 96 bits, the scale falls outside `0..=28`, or a character is not a digit. (The sign of
-/// `-2.5m` is a separate unary minus, folded later, not part of the literal.)
+/// and the power-of-ten scale, so the value is `mantissa x 10^-scale`. A literal too precise for
+/// that form (more than 28 fractional places, or more significant digits than 96 bits hold) is
+/// rounded to the NEAREST representable decimal, ties to even -- csc's behavior, probed against
+/// Roslyn 2026-07-16: `2.5e-28m` is `2e-28`, `4.5e-28m` is `4e-28`, `5e-29m` is a zero of scale
+/// 28, and `7922816251426433759354395033.59m` re-scales to `...034`. `None` only when even the
+/// rounded value is out of range (the integer part exceeds 96 bits). (The sign of `-2.5m` is a
+/// separate unary minus, folded later, not part of the literal.)
 fn parse_decimal_literal(text: &str) -> Option<(u32, u32, u32, u8)> {
     let (mantissa_text, exponent) = match text.split_once(['e', 'E']) {
         Some((mantissa, exp)) => (mantissa, exp.parse::<i32>().ok()?),
         None => (text, 0),
     };
-    const CEILING: u128 = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
     let mut mantissa: u128 = 0;
     let mut fractional_digits: i32 = 0;
     let mut after_point = false;
-    let mut first_dropped: Option<u32> = None;
-    let mut rest_nonzero = false;
+    let mut sticky = false;
     for ch in mantissa_text.chars() {
         if ch == '.' {
             after_point = true;
             continue;
         }
         let digit = ch.to_digit(10)?;
-        if mantissa <= (CEILING - u128::from(digit)) / 10 {
+        if mantissa <= (u128::MAX - u128::from(digit)) / 10 {
             mantissa = mantissa * 10 + u128::from(digit);
             if after_point {
                 fractional_digits += 1;
             }
         } else if after_point {
-            match first_dropped {
-                None => first_dropped = Some(digit),
-                Some(_) if digit != 0 => rest_nonzero = true,
-                Some(_) => {}
-            }
+            sticky |= digit != 0;
         } else {
             return None;
-        }
-    }
-    if let Some(dropped) = first_dropped {
-        if dropped > 5 || (dropped == 5 && (rest_nonzero || mantissa % 2 == 1)) {
-            mantissa += 1;
         }
     }
     let mut scale = fractional_digits - exponent;
@@ -1416,16 +1409,33 @@ fn parse_decimal_literal(text: &str) -> Option<(u32, u32, u32, u8)> {
         mantissa = mantissa.checked_mul(10)?;
         scale += 1;
     }
-    while scale > 28 {
-        let dropped = mantissa % 10;
-        mantissa /= 10;
-        if dropped > 5 || (dropped == 5 && mantissa % 2 == 1) {
-            mantissa += 1;
+    if scale > 67 {
+        return Some((0, 0, 0, 28));
+    }
+    const MAX96: u128 = 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF;
+    let mut round_digit: u128 = 0;
+    while scale > 28 || mantissa > MAX96 {
+        if scale == 0 {
+            return None;
         }
+        sticky |= round_digit != 0;
+        round_digit = mantissa % 10;
+        mantissa /= 10;
         scale -= 1;
     }
-    if mantissa > 0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF {
-        return None;
+    if round_digit > 5 || (round_digit == 5 && (sticky || mantissa % 2 == 1)) {
+        mantissa += 1;
+        if mantissa > MAX96 {
+            if scale == 0 {
+                return None;
+            }
+            let carry_digit = mantissa % 10;
+            mantissa /= 10;
+            scale -= 1;
+            if carry_digit > 5 {
+                mantissa += 1;
+            }
+        }
     }
     Some((
         mantissa as u32,
@@ -1762,6 +1772,42 @@ mod tests {
         assert_eq!(parse_decimal_literal("79228162514264337593543950336"), None);
     }
 
+    /// The 96-bit split of a wide expected mantissa, so a test can state it as one number.
+    fn parts(mantissa: u128, scale: u8) -> Option<(u32, u32, u32, u8)> {
+        Some((
+            mantissa as u32,
+            (mantissa >> 32) as u32,
+            (mantissa >> 64) as u32,
+            scale,
+        ))
+    }
+
+    #[test]
+    fn too_precise_decimal_literals_round_half_to_even_at_the_final_position() {
+        assert_eq!(parse_decimal_literal("3.0500000000000000000001e-27"), parts(31, 28));
+        assert_eq!(parse_decimal_literal("3.05000000000000000000001e-27"), parts(31, 28));
+        assert_eq!(parse_decimal_literal("5.00000000000000000001e-29"), parts(1, 28));
+        assert_eq!(
+            parse_decimal_literal(".10000000000000000000000000005000000000000000000001"),
+            parts(1_000_000_000_000_000_000_000_000_001, 28)
+        );
+        assert_eq!(parse_decimal_literal("0.00000000000000000000000000025"), parts(2, 28));
+        assert_eq!(parse_decimal_literal("0.00000000000000000000000000045"), parts(4, 28));
+        assert_eq!(parse_decimal_literal("2.5e-28"), parts(2, 28));
+        assert_eq!(parse_decimal_literal("0.00000000000000000000000000005"), parts(0, 28));
+        assert_eq!(parse_decimal_literal("1e-999"), parts(0, 28));
+        assert_eq!(
+            parse_decimal_literal("79228162514264337593543950335.4"),
+            parts(0xFFFF_FFFF_FFFF_FFFF_FFFF_FFFF, 0)
+        );
+        assert_eq!(
+            parse_decimal_literal("7922816251426433759354395033.59"),
+            parts(7_922_816_251_426_433_759_354_395_034, 0)
+        );
+        assert_eq!(parse_decimal_literal("79228162514264337593543950335.6"), None);
+        assert_eq!(parse_decimal_literal("1e29"), None);
+    }
+
     #[test]
     fn nfc_knob_folds_decomposed_identifiers_only_when_enabled() {
         let significant = |tokenized: Tokenized| -> Vec<TokenKind> {
@@ -1828,6 +1874,11 @@ mod tests {
         assert_eq!(
             significant(tokenize_with("__reftype", typedref.clone())),
             vec![TokenKind::TypedRefKeyword(TypedRefKeyword::RefType)]
+        );
+        assert_eq!(significant(tokenize("__arglist")), vec![ident("__arglist")]);
+        assert_eq!(
+            significant(tokenize_with("__arglist", typedref.clone())),
+            vec![TokenKind::TypedRefKeyword(TypedRefKeyword::ArgList)]
         );
         assert_eq!(
             significant(tokenize_with("__make", typedref.clone())),

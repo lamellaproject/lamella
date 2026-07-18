@@ -1,0 +1,11 @@
+
+pub const BOARD_MODEL: u16 = 13;
+
+pub const UART0_BASE: u32 = 0x40034000;
+pub const UART0_RESET_MASK: u32 = 0x400120;
+pub const UART0_IO_TX_CTRL: u32 = 0x40014004;
+pub const UART0_IO_RX_CTRL: u32 = 0x4001400C;
+pub const UART0_FUNCSEL: u32 = 2;
+pub const UART0_CLK_PERI_HZ: u32 = 12000000;
+pub const UART0_IBRD_115200_XOSC_12MHZ: u32 = 6;
+pub const UART0_FBRD_115200_XOSC_12MHZ: u32 = 33;

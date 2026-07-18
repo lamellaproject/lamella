@@ -78,6 +78,20 @@ impl TableStream {
         rows.len() as u32
     }
 
+    /// Replaces one cell of an already-added row (1-based `row`), for a value known only after the
+    /// row was added -- the assembly version, backfilled from `[assembly: AssemblyVersion]`. A
+    /// no-op if the table, row, or column is absent.
+    pub fn set_cell(&mut self, table: u8, row: u32, column: usize, value: Column) {
+        if let Some(cell) = self
+            .rows
+            .get_mut(&table)
+            .and_then(|rows| rows.get_mut((row as usize).wrapping_sub(1)))
+            .and_then(|cells| cells.get_mut(column))
+        {
+            *cell = value;
+        }
+    }
+
     /// Records that `table` is emitted in sorted key order, so its bit is set in the
     /// `#~` sorted mask. Some readers reject a sorted-by-spec table (e.g. the PDB's
     /// `LocalScope`) that does not claim it. The caller must actually add the rows
@@ -91,8 +105,17 @@ impl TableStream {
     /// parent (e.g. `CustomAttribute` by `HasCustomAttribute`) need this when rows are added
     /// out of parent order. Safe only for a table no other table indexes into by row.
     pub fn sort_by_coded_parent(&mut self, table: u8) {
+        self.sort_by_coded_column(table, 0);
+    }
+
+    /// Sorts `table`'s rows by the encoded value of the coded index in `column` and marks
+    /// the table sorted -- for a required-sorted table whose key is not its first column
+    /// (`MethodSemantics` sorts by `Association`, its third). The sort is stable, so
+    /// same-key rows (a property's getter and setter) keep their emission order. Safe only
+    /// for a table no other table indexes into by row.
+    pub fn sort_by_coded_column(&mut self, table: u8, column: usize) {
         if let Some(rows) = self.rows.get_mut(&table) {
-            rows.sort_by_key(|row| match row.first() {
+            rows.sort_by_key(|row| match row.get(column) {
                 Some(Column::Coded(kind, token)) => kind.encode(*token),
                 _ => 0,
             });
@@ -224,6 +247,36 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes([stream[row_start], stream[row_start + 1]]),
             5
+        );
+    }
+
+    #[test]
+    fn method_semantics_sorts_by_its_association_column() {
+        let semantics_row = |method: u32, association: Token| {
+            alloc::vec![
+                Column::U16(0x2),
+                Column::Index(table::METHOD_DEF, method),
+                Column::Coded(CodedIndex::HasSemantics, association),
+            ]
+        };
+        let property = Token::new(table::PROPERTY, 1);
+        let event = Token::new(table::EVENT, 1);
+
+        let mut descending = TableStream::new();
+        descending.add_row(table::METHOD_SEMANTICS, semantics_row(1, property));
+        descending.add_row(table::METHOD_SEMANTICS, semantics_row(2, event));
+        descending.sort_by_coded_column(table::METHOD_SEMANTICS, 2);
+
+        let mut ascending = TableStream::new();
+        ascending.add_row(table::METHOD_SEMANTICS, semantics_row(2, event));
+        ascending.add_row(table::METHOD_SEMANTICS, semantics_row(1, property));
+        ascending.sort_by_coded_column(table::METHOD_SEMANTICS, 2);
+
+        let sorted = descending.serialize(HeapSizes::default());
+        assert_eq!(sorted, ascending.serialize(HeapSizes::default()));
+        assert_eq!(
+            u64_at(&sorted, 16) & (1u64 << table::METHOD_SEMANTICS),
+            1u64 << table::METHOD_SEMANTICS
         );
     }
 }

@@ -19,6 +19,10 @@ struct Options {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if wants_help(&args) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let options = match parse_args(&args) {
         Ok(options) => options,
         Err(usage) => {
@@ -41,7 +45,7 @@ fn main() -> ExitCode {
 /// calling thread waits for the compile and gets its result back -- and a panic inside the
 /// compile re-raises on return, so behaviour is unchanged but for the roomier stack.
 fn run_on_compile_stack<T: Send>(work: impl FnOnce() -> T + Send) -> T {
-    const COMPILE_STACK_BYTES: usize = 512 * 1024 * 1024;
+    const COMPILE_STACK_BYTES: usize = 64 * 1024 * 1024;
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name(String::from("lcsc-compile"))
@@ -87,6 +91,13 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             lex.typedref = true;
         } else if matches!(arg.as_str(), "/native-interop" | "--native-interop") {
             lex.native_interop = true;
+        } else if let Some(version) = strip_option(arg, &["/langversion:", "--langversion="]) {
+            if !version.eq_ignore_ascii_case("ISO-1") && version != "1" {
+                return Err(format!(
+                    "lcsc implements only C# 1.0 (ECMA-334 first edition); \
+                     /langversion:{version} is not supported (use ISO-1)"
+                ));
+            }
         } else if arg.starts_with("/target:") || arg == "/nologo" {
         } else if arg.starts_with('-') || (arg.starts_with('/') && !arg[1..].contains('/')) {
             return Err(format!("unknown option '{arg}'\n{USAGE}"));
@@ -106,16 +117,30 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
     })
 }
 
-const USAGE: &str = "usage: lcsc <source.cs>... [/out:<path>] [/reference:<dll>]... [/define:A;B]... \
-     [/debug-] [/normalize-identifiers] [/typedref] [/native-interop]\n\
-     /define:A;B seeds preprocessor symbols for #if (9.5.3), like csc's /define (repeatable).\n\
-     Several source files compile into one assembly (each is its own PDB document).\n\
-     /normalize-identifiers folds identifiers to NFC per ECMA-334 9.4.2 (off by default, to \
-     match csc).\n\
-     /typedref enables csc's undocumented __makeref/__refvalue/__reftype operators (off by \
-     default; they are not in ECMA-334).\n\
-     /native-interop enables [DllImport] P/Invoke (off by default; pure-managed targets \
-     do not need it).";
+const USAGE: &str = "\
+lcsc -- the Lamella C# compiler (C# 1.0 / ECMA-334 first edition).
+
+usage: lcsc <source.cs>... [options]
+
+  <source.cs>...          one or more C# sources; all compile into ONE assembly
+                          (each is its own PDB document).
+  /out:<path>             output assembly path (default: the first source's name, .dll).
+  /reference:<dll>        reference a metadata assembly (repeatable; also -r:, --reference=).
+  /define:A;B             seed #if preprocessor symbols (9.5.3); ';' or ',' separated, repeatable.
+  /debug-                 suppress the Portable PDB (it is emitted by default).
+  /normalize-identifiers  fold identifiers to NFC (ECMA-334 9.4.2; off by default, to match csc).
+  /typedref               enable csc's undocumented __makeref/__refvalue/__reftype (not in ECMA-334).
+  /native-interop         enable [DllImport] P/Invoke (off by default; pure-managed targets omit it).
+  /help, -h, /?           print this help.
+
+Diagnostics use csc's form: path(line,col): error CSxxxx: message.";
+
+/// Whether the arguments request help (`--help`, `-h`, `/help`, `/?`, `-?`) -- printed to stdout
+/// with a success exit, unlike a usage error.
+fn wants_help(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "/help" | "/?" | "-?"))
+}
 
 /// The first matching prefix's tail, if `arg` starts with one of `prefixes`.
 fn strip_option<'a>(arg: &'a str, prefixes: &[&str]) -> Option<&'a str> {
@@ -189,7 +214,9 @@ fn compile(options: &Options) -> Result<bool, String> {
             None => {
                 if !result.diagnostics.iter().any(Diagnostic::is_error) {
                     if let Some(error) = result.emit_error {
-                        println!("{source_path}: error: not lowered yet: {error:?}");
+                        println!(
+                            "{source_path}: error: this construct is not yet supported by lcsc: {error}"
+                        );
                     }
                 }
                 Ok(false)
@@ -238,7 +265,10 @@ fn compile(options: &Options) -> Result<bool, String> {
         None => {
             if !any_error {
                 if let Some(error) = result.emit_error {
-                    println!("{}: error: not lowered yet: {error:?}", options.sources[0]);
+                    println!(
+                        "{}: error: this construct is not yet supported by lcsc: {error}",
+                        options.sources[0]
+                    );
                 }
             }
             Ok(false)
@@ -313,6 +343,28 @@ mod tests {
     #[test]
     fn missing_source_is_a_usage_error() {
         assert!(parse_args(&[]).is_err());
+    }
+
+    #[test]
+    fn langversion_accepts_csharp_1_0_and_refuses_later() {
+        for v in ["/langversion:ISO-1", "/langversion:iso-1", "/langversion:1"] {
+            let args = [String::from("App.cs"), String::from(v)];
+            assert!(parse_args(&args).is_ok(), "{v} should be accepted");
+        }
+        for v in ["/langversion:2", "/langversion:ISO-2", "/langversion:latest"] {
+            let args = [String::from("App.cs"), String::from(v)];
+            assert!(parse_args(&args).is_err(), "{v} should be refused");
+        }
+    }
+
+    #[test]
+    fn help_flags_are_recognized() {
+        for flag in ["--help", "-h", "/help", "/?", "-?"] {
+            assert!(wants_help(&[String::from(flag)]), "{flag} should request help");
+        }
+        assert!(wants_help(&[String::from("App.cs"), String::from("--help")]));
+        assert!(!wants_help(&[String::from("App.cs")]));
+        assert!(!wants_help(&[String::from("/helper")]));
     }
 
     #[test]

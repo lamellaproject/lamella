@@ -11,7 +11,7 @@ namespace Lamella.Boards
     public sealed class Pico2
     {
         /// <summary>Constructs the board and ensures its clock tree is up (idempotent) -- so
-        /// `new Pico2()` "just works" on both tiers: the interpreter serve already raised clocks
+        /// `new Pico2` "just works" on both tiers: the interpreter serve already raised clocks
         /// at boot (guard no-op), an AOT image raises them here.</summary>
         public Pico2()
         {

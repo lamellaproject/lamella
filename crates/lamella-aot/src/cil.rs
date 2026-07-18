@@ -700,7 +700,12 @@ fn lower_with_source(
     let mut propagate_fixups: Vec<usize> = Vec::new();
 
     for (b, &(start, end)) in blocks.iter().enumerate() {
-        if b != 0 && preds[b].is_empty() && handler_clause[b].is_none() && trap_access[b].is_none() {
+        if b != 0
+            && preds[b].is_empty()
+            && handler_clause[b].is_none()
+            && trap_access[b].is_none()
+            && finally_handler[b].is_none()
+        {
             exit_locals[b] = alloc::vec![None; local_count];
             mir_blocks.push(BasicBlock {
                 params: block_params[b].clone(),
@@ -2152,16 +2157,25 @@ fn apply_value_op(
                 }
                 CallTarget::External(symbol) => {
                     let result = new_value(value_types, info.result_type.unwrap_or(MirType::I32));
-                    let slot = (inst.opcode == Opcode::Callvirt)
+                    let is_callvirt = inst.opcode == Opcode::Callvirt;
+                    let interface_tag = is_callvirt
+                        .then(|| resolver.interface_call_tag(&inst.operand))
+                        .flatten();
+                    let slot = is_callvirt
                         .then(|| resolver.virtual_slot(&inst.operand))
                         .flatten();
-                    let call_inst = match slot {
-                        Some(slot) => Inst::CallVirtual {
+                    let call_inst = match (interface_tag, slot) {
+                        (Some(tag), _) => Inst::CallInterface {
+                            tag,
+                            args: call_args,
+                            returns_value: info.has_result,
+                        },
+                        (_, Some(slot)) => Inst::CallVirtual {
                             slot: slot as u32,
                             args: call_args,
                             returns_value: info.has_result,
                         },
-                        None => Inst::PInvoke {
+                        (None, None) => Inst::PInvoke {
                             import: symbol,
                             args: call_args,
                         },
@@ -2965,43 +2979,60 @@ fn apply_value_op(
         }
         Opcode::Isinst => {
             let object = stack.pop().ok_or(CilError::StackUnderflow)?;
-            let handles = resolver.cast_subtype_handles(&inst.operand);
-            if handles.is_empty() {
-                return Err(CilError::Unsupported(inst.opcode));
-            }
             let object_desc = new_value(value_types, MirType::I32);
             insts.push((object_desc, Inst::LoadTypeDesc { object }));
-            let mut matched = new_value(value_types, MirType::I32);
-            insts.push((
-                matched,
-                Inst::ConstInt {
-                    ty: MirType::I32,
-                    value: 0,
-                },
-            ));
-            for handle in handles {
-                let subtype_desc = new_value(value_types, MirType::I32);
-                insts.push((subtype_desc, Inst::TypeDescAddr { handle }));
-                let eq = new_value(value_types, MirType::I32);
+            let chain_target = resolver
+                .cast_target_chain(&inst.operand)
+                .filter(|target| crate::resolver::reference_handle_parts(*target).is_some());
+            let matched = if let Some(target) = chain_target {
+                let target_desc = new_value(value_types, MirType::I32);
+                insts.push((target_desc, Inst::TypeDescAddr { handle: target }));
+                let scanned = new_value(value_types, MirType::I32);
                 insts.push((
-                    eq,
-                    Inst::Compare {
-                        op: CmpOp::Eq,
-                        lhs: object_desc,
-                        rhs: subtype_desc,
+                    scanned,
+                    Inst::CastClassScan {
+                        args: alloc::vec![object_desc, target_desc],
                     },
                 ));
-                let acc = new_value(value_types, MirType::I32);
+                scanned
+            } else {
+                let handles = resolver.cast_subtype_handles(&inst.operand);
+                if handles.is_empty() {
+                    return Err(CilError::Unsupported(inst.opcode));
+                }
+                let mut matched = new_value(value_types, MirType::I32);
                 insts.push((
-                    acc,
-                    Inst::Binary {
-                        op: BinOp::Or,
-                        lhs: matched,
-                        rhs: eq,
+                    matched,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 0,
                     },
                 ));
-                matched = acc;
-            }
+                for handle in handles {
+                    let subtype_desc = new_value(value_types, MirType::I32);
+                    insts.push((subtype_desc, Inst::TypeDescAddr { handle }));
+                    let eq = new_value(value_types, MirType::I32);
+                    insts.push((
+                        eq,
+                        Inst::Compare {
+                            op: CmpOp::Eq,
+                            lhs: object_desc,
+                            rhs: subtype_desc,
+                        },
+                    ));
+                    let acc = new_value(value_types, MirType::I32);
+                    insts.push((
+                        acc,
+                        Inst::Binary {
+                            op: BinOp::Or,
+                            lhs: matched,
+                            rhs: eq,
+                        },
+                    ));
+                    matched = acc;
+                }
+                matched
+            };
             let zero = new_value(value_types, MirType::I32);
             insts.push((
                 zero,
@@ -3527,8 +3558,10 @@ fn trap_kind_at(inst: &Instruction, resolver: &dyn CallResolver) -> Option<TrapK
     }
     if opcode == Opcode::Castclass {
         let handles = resolver.cast_subtype_handles(&inst.operand);
-        if handles.len() > CAST_CHAIN_THRESHOLD {
-            if let Some(target) = resolver.cast_target_chain(&inst.operand) {
+        if let Some(target) = resolver.cast_target_chain(&inst.operand) {
+            if crate::resolver::reference_handle_parts(target).is_some()
+                || handles.len() > CAST_CHAIN_THRESHOLD
+            {
                 return Some(TrapKind::CastClassChain(target));
             }
         }
@@ -5847,6 +5880,53 @@ mod tests {
         assert!(
             trapped,
             "the predecessorless block must lower to an empty Unreachable trap"
+        );
+    }
+
+    #[test]
+    fn a_finally_handler_entry_is_not_mistaken_for_unreachable() {
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(2)),
+                Instruction::new(Opcode::Stloc, Operand::Variable(0)),
+                Instruction::new(Opcode::Leave, Operand::Target(6)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(40)),
+                Instruction::new(Opcode::Stloc, Operand::Variable(1)),
+                Instruction::simple(Opcode::Endfinally),
+                Instruction::new(Opcode::Ldloc, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldloc, Operand::Variable(1)),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 2, end: 3 },
+                handler_range: lamella_cil::InstructionRange { start: 3, end: 6 },
+                kind: EhKind::Finally,
+            }]
+            .into_boxed_slice(),
+        };
+        let func = lower_method_typed(&body, &NoCalls, &[], &[MirType::I32, MirType::I32])
+            .expect("a try/finally lowers")
+            .0;
+        assert!(lamella_ir::verify(&func).is_ok());
+        let finally_present = func.blocks.iter().any(|blk| {
+            blk.insts.iter().any(
+                |(_, inst)| matches!(inst, Inst::ConstInt { value: 40, .. }),
+            )
+        });
+        assert!(
+            finally_present,
+            "the finally handler's body must survive lowering"
+        );
+        assert!(
+            !func.blocks.iter().any(|blk| {
+                matches!(blk.terminator, Some(Terminator::Unreachable)) && blk.insts.is_empty()
+            }),
+            "nothing in a straight-line try/finally is unreachable"
         );
     }
 

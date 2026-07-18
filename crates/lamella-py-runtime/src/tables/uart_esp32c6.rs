@@ -1,5 +1,5 @@
-//! The Espressif ESP32-C6 HP UART0 register facts -- transcribed from the repo's
-//! docs/peripheral-tables/uart-esp32c6.toml (sources: the official ESP32-C6 SVD + esp-idf v5.3
+//! The Espressif ESP32-C6 HP UART0 register facts -- transcribed from the
+//! neutral peripheral-table SSOT (sources: the official ESP32-C6 SVD + esp-idf v5.3
 //! low-level headers; the numbers below are that table's literals, silicon-verified by the C#
 //! driver bring-up on the DevKitC-1).
 

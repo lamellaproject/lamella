@@ -1,0 +1,16 @@
+
+pub const BOARD_MODEL: u16 = 5;
+pub const CARRIER_USB_VID: u16 = 0x03EB;
+pub const CARRIER_USB_PID: u16 = 0x2169;
+
+pub const VCP_SERCOM_BASE: u32 = 0x42001400;
+pub const VCP_IRQ: u32 = 12;
+pub const VCP_GCLK_CLKCTRL_VALUE: u32 = 0x4017;
+pub const VCP_APBC_MASK: u32 = 0x20;
+pub const VCP_PMUX_REG: u32 = 0x4100443B;
+pub const VCP_PMUX_PAIR: u32 = 0x22;
+pub const VCP_PINCFG_TX_REG: u32 = 0x41004456;
+pub const VCP_PINCFG_RX_REG: u32 = 0x41004457;
+pub const VCP_TXPO: u32 = 0;
+pub const VCP_RXPO: u32 = 1;
+pub const VCP_BAUD_115200_OSC8M_8MHZ: u32 = 0xC505;

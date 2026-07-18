@@ -928,10 +928,14 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                 return_type,
                 name,
                 parameters,
+                is_vararg,
                 body: Some(body),
                 ..
             } => {
                 let params = bound_parameters(parameters);
+                if *is_vararg {
+                    binder.set_next_method_vararg();
+                }
                 binder.bind_method(
                     Some(enclosing.clone()),
                     name,
@@ -981,10 +985,14 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
             Member::Constructor {
                 modifiers,
                 parameters,
+                is_vararg,
                 body,
                 ..
             } => {
                 let params = bound_parameters(parameters);
+                if *is_vararg {
+                    binder.set_next_method_vararg();
+                }
                 binder.bind_method(
                     Some(enclosing.clone()),
                     ".ctor",
@@ -1026,6 +1034,33 @@ fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl
                         is_static,
                         body,
                     );
+                }
+            }
+            Member::Event {
+                modifiers,
+                ty,
+                name,
+                adder,
+                remover,
+                ..
+            } => {
+                let event_ty = bind_type(ty);
+                let is_static = is_static_member(modifiers);
+                let value = [(Box::from("value"), event_ty)];
+                let accessors = [("add_", adder), ("remove_", remover)];
+                for (prefix, accessor) in accessors {
+                    if let Some(body) = accessor.as_ref().and_then(|accessor| accessor.body.as_ref())
+                    {
+                        binder.bind_method(
+                            Some(enclosing.clone()),
+                            &accessor_name(prefix, name),
+                            TypeSymbol::Special(SpecialType::Void),
+                            &value,
+                            &[],
+                            is_static,
+                            body,
+                        );
+                    }
                 }
             }
             Member::Indexer {
@@ -1583,6 +1618,101 @@ mod tests {
         codes
     }
 
+    /// Like [`sorted_codes`], but scanned under the typedref knob so `__arglist` (and the
+    /// other csc typed-reference operators) tokenize.
+    fn sorted_codes_typedref(unit: &str) -> Vec<u16> {
+        let options = lamella_syntax::lexer::LexOptions {
+            typedref: true,
+            ..lamella_syntax::lexer::LexOptions::default()
+        };
+        let unit = lamella_syntax::parser::parse_compilation_unit_with(unit, options).unit;
+        let mut codes: Vec<u16> = bind_compilation_unit(&unit)
+            .iter()
+            .map(Diagnostic::code)
+            .collect();
+        codes.sort_unstable();
+        codes
+    }
+
+    #[test]
+    fn predefined_type_with_no_backing_type_is_cs0518() {
+        let prelude = "namespace System { public class Object { } public struct Void { } \
+             public struct Boolean { } public struct Int32 { } public class String { } \
+             public abstract class ValueType { } public abstract class Enum { } } ";
+        let float_use = alloc::format!(
+            "{prelude}class P {{ static void M() {{ double x = 1.0; if (x == x) {{ }} }} }}"
+        );
+        assert_eq!(sorted_codes(&float_use), [518, 518]);
+        let single_use = alloc::format!(
+            "{prelude}class P {{ static void M() {{ float f = 1.5f; if (f == f) {{ }} }} }}"
+        );
+        assert_eq!(sorted_codes(&single_use), [518, 518]);
+        let bare_literal = alloc::format!(
+            "{prelude}class P {{ static void M() {{ object o = 1.0; if (o == o) {{ }} }} }}"
+        );
+        assert_eq!(sorted_codes(&bare_literal), [518]);
+        let int_only = alloc::format!(
+            "{prelude}class P {{ static void M() {{ int fine = 2; if (fine == fine) {{ }} }} }}"
+        );
+        assert_eq!(sorted_codes(&int_only), []);
+    }
+
+    #[test]
+    fn vararg_members_accept_arglist_packs() {
+        let codes = sorted_codes_typedref(
+            "class T { public T(__arglist) { } } \
+             class P { \
+                static int Sum(int seed, __arglist) { return seed; } \
+                static void Main() { \
+                    T t = new T(__arglist()); \
+                    T u = new T(__arglist(1, \"s\", null, 2.2)); \
+                    int s = Sum(2, __arglist(10, 20)); \
+                    if (t == u) { } \
+                    if (s > 0) { } \
+                } \
+             }",
+        );
+        assert_eq!(codes, []);
+    }
+
+    #[test]
+    fn vararg_call_missing_its_arglist_is_cs7036() {
+        let codes = sorted_codes_typedref(
+            "class T { public T(__arglist) { } } \
+             class P { \
+                static void M(int a, __arglist) { } \
+                static void Main() { M(1); T t = new T(); if (t == null) { } } \
+             }",
+        );
+        assert_eq!(codes, [7036, 7036]);
+    }
+
+    #[test]
+    fn arglist_pack_to_a_non_vararg_method_is_cs1503() {
+        let codes = sorted_codes_typedref(
+            "class P { static void N(int a) { } static void Main() { N(__arglist(1)); } }",
+        );
+        assert_eq!(codes, [1503]);
+    }
+
+    #[test]
+    fn bare_arglist_outside_a_vararg_member_is_cs0190() {
+        let codes = sorted_codes_typedref(
+            "class P { static void M() { object o = __arglist; if (o == null) { } } \
+             static void Main() { } }",
+        );
+        assert_eq!(codes, [190]);
+    }
+
+    #[test]
+    fn arglist_pack_as_a_value_is_cs0226() {
+        let codes = sorted_codes_typedref(
+            "class P { static void M(__arglist) { object x = __arglist(1); if (x == null) { } } \
+             static void Main() { } }",
+        );
+        assert_eq!(codes, [226]);
+    }
+
     #[test]
     fn binds_every_method_body_and_collects_diagnostics() {
         let codes = sorted_codes(
@@ -1727,6 +1857,22 @@ mod tests {
             []
         );
         assert_eq!(sorted_codes("class C { int x; }"), [169]);
+    }
+
+    #[test]
+    fn a_field_an_event_accessor_assigns_is_assigned() {
+        assert_eq!(
+            sorted_codes(
+                "delegate void D(); class C { D _h; public event D E { add { _h = value; } remove { _h = null; } } public void Raise() { if (_h != null) _h(); } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "delegate void D(); class C { D _h; public event D E { add { _h = value; } remove { _h = null; } } }"
+            ),
+            [414]
+        );
     }
 
     #[test]
@@ -2262,6 +2408,7 @@ mod tests {
                 parameters: Vec::new(),
                 is_static: false,
                 is_params: false,
+                is_vararg: false,
                 is_virtual: true,
                 is_abstract: false,
                 is_override: false,
@@ -2348,6 +2495,7 @@ mod tests {
             parameters: alloc::vec![TypeSymbol::Special(SpecialType::String)],
             is_static: true,
             is_params: false,
+            is_vararg: false,
             is_virtual: false,
             is_abstract: false,
             is_override: false,

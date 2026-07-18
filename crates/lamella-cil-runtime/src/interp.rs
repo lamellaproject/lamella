@@ -1433,7 +1433,7 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
 /// The cooperative scheduler's deterministic time slice: a thread is preempted after this many CIL
 /// instructions in a multi-threaded run (checked at every interp instruction boundary, which is a GC
 /// safe point). Op-count, not wall-clock, so interleavings reproduce host-and-device. K in the
-/// 256-1024 range per docs/threading-interpreter.md; 256 keeps switch latency well under a quantum.
+/// 256-1024 range; 256 keeps switch latency well under a quantum.
 const TIME_SLICE_QUANTUM: u32 = 256;
 
 /// A scheduler request an intrinsic raises; the scheduler takes it once the running thread pauses.
@@ -4163,10 +4163,13 @@ fn step(
         Opcode::Ldftn => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldftn))?;
             let token = token_operand(instruction)?;
-            let method = module
-                .resolve(asm, token)
-                .ok_or(Trap::UnresolvedCall(token))?;
-            frame.stack.push(Value::NativeInt(i64::from(method)));
+            match module.resolve(asm, token) {
+                Some(method) => frame.stack.push(Value::NativeInt(i64::from(method))),
+                None if module.delegate_invoke(asm, token).is_some() => {
+                    frame.stack.push(Value::NativeInt(i64::from(DELEGATE_INVOKE_FPTR)));
+                }
+                None => return Err(Trap::UnresolvedCall(token)),
+            }
         }
         Opcode::Ldvirtftn => {
             let module = module.ok_or(Trap::Unsupported(Opcode::Ldvirtftn))?;
@@ -4176,15 +4179,20 @@ fn step(
             let sig_key = module.call_target(asm, token).map(|(key, _)| key);
             let explicit_override =
                 runtime_type.and_then(|type_id| module.explicit_override(asm, type_id, token));
-            let method = resolve_callvirt(
+            let resolved = resolve_callvirt(
                 module,
                 module.resolve(asm, token),
                 sig_key,
                 runtime_type,
                 explicit_override,
-            )
-            .ok_or(Trap::UnresolvedCall(token))?;
-            frame.stack.push(Value::NativeInt(i64::from(method)));
+            );
+            match resolved {
+                Some(method) => frame.stack.push(Value::NativeInt(i64::from(method))),
+                None if module.delegate_invoke(asm, token).is_some() => {
+                    frame.stack.push(Value::NativeInt(i64::from(DELEGATE_INVOKE_FPTR)));
+                }
+                None => return Err(Trap::UnresolvedCall(token)),
+            }
         }
 
         Opcode::Newobj => {
@@ -4194,7 +4202,17 @@ fn step(
             if module.is_delegate_ctor(asm, token) {
                 let method = function_pointer(frame.pop()?)?;
                 let target = frame.pop()?;
-                let delegate = vm.heap_mut().alloc_delegate(target, method);
+                let delegate = if method == DELEGATE_INVOKE_FPTR {
+                    let operand = object_ref(target, Opcode::Newobj)?;
+                    let invocations = vm
+                        .heap()
+                        .delegate_invocations(operand)
+                        .ok_or(Trap::TypeMismatch(Opcode::Newobj))?
+                        .to_vec();
+                    vm.heap_mut().alloc_multicast(invocations)
+                } else {
+                    vm.heap_mut().alloc_delegate(target, method)
+                };
                 frame.stack.push(Value::Object(delegate));
                 return Ok(Flow::Next);
             }
@@ -6005,6 +6023,12 @@ fn object_ref(value: Value, opcode: Opcode) -> Result<ObjectRef, Trap> {
         _ => Err(Trap::TypeMismatch(opcode)),
     }
 }
+
+/// The sentinel `ldvirtftn` pushes for `d.Invoke` on a delegate value (the `new D(d)`
+/// delegate-from-a-delegate-value form): the delegate `newobj` recognizes it and copies `d`'s
+/// invocation list instead of binding the bodyless Invoke. `u32::MAX` is never a real method id --
+/// ids are assigned sequentially from 0, so it cannot collide.
+const DELEGATE_INVOKE_FPTR: MethodId = u32::MAX;
 
 /// Extracts a method id from a function pointer: `ldftn` / `ldvirtftn` push the method
 /// id as a native int, and a delegate constructor consumes it.

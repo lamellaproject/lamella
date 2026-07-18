@@ -2,8 +2,10 @@
 #if LAMELLA_SURFACE_FILE_IO
 namespace System.IO
 {
-    public static class Path
+    public sealed class Path
     {
+        private Path() { }
+
         public static readonly char DirectorySeparatorChar = '\\';
         public static readonly char AltDirectorySeparatorChar = '/';
 

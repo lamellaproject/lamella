@@ -396,6 +396,178 @@ fn sam4s_post_bit_write_dummy_read<T: Transport>(dap: &mut Dap<T>) -> Result<(),
     Ok(())
 }
 
+/// EEFC0 user-interface base: the controller for the plane mapped at [`SAM3X_FLASH0_BASE`].
+pub const SAM3X_EEFC0: u32 = 0x400e_0a00;
+/// EEFC1 user-interface base: the controller for the plane mapped at [`SAM3X_FLASH1_BASE`].
+pub const SAM3X_EEFC1: u32 = 0x400e_0c00;
+/// Plane-0 flash window (EEFC0), 256 KB; also mirrored at 0x0 when GPNVM boot-from-flash is set.
+pub const SAM3X_FLASH0_BASE: u32 = 0x0008_0000;
+/// Plane-1 flash window (EEFC1), 256 KB, immediately after plane 0.
+pub const SAM3X_FLASH1_BASE: u32 = 0x000c_0000;
+/// SAM3X flash page size in bytes (the EEFC write granularity); verified by GETD on silicon.
+pub const SAM3X_PAGE: usize = 256;
+/// Each plane's size in bytes.
+pub const SAM3X_PLANE_SIZE: u32 = 256 * 1024;
+/// GPNVM bit index of the security bit (set = the debug port is locked out).
+pub const SAM3X_GPNVM_SECURITY: u32 = 0;
+/// GPNVM bit index of the boot-mode bit (set = boot flash, clear = boot the SAM-BA ROM).
+pub const SAM3X_GPNVM_BOOT_FLASH: u32 = 1;
+/// GPNVM bit index of the flash plane-swap bit (set = plane 1 is mapped at 0x00080000, swapping the
+/// two 256 KB planes). [`SAM3X_FLASH0_BASE`] / [`SAM3X_FLASH1_BASE`] assume it is CLEAR -- the reset
+/// state a bare Due is in; set it and the two plane windows exchange addresses.
+pub const SAM3X_GPNVM_PLANE_SWAP: u32 = 2;
+
+const SAM3X_FCR: u32 = 0x04;
+const SAM3X_FSR: u32 = 0x08;
+const SAM3X_FRR: u32 = 0x0c;
+const SAM3X_FKEY: u32 = 0x5a << 24;
+const SAM3X_CMD_GETD: u32 = 0x00;
+const SAM3X_CMD_EWP: u32 = 0x03;
+const SAM3X_CMD_EA: u32 = 0x05;
+const SAM3X_CMD_CLB: u32 = 0x09;
+const SAM3X_CMD_GLB: u32 = 0x0a;
+const SAM3X_CMD_SGPB: u32 = 0x0b;
+const SAM3X_CMD_CGPB: u32 = 0x0c;
+const SAM3X_CMD_GGPB: u32 = 0x0d;
+const SAM3X_FSR_FRDY: u32 = 1 << 0;
+const SAM3X_FSR_FCMDE: u32 = 1 << 1;
+const SAM3X_FSR_FLOCKE: u32 = 1 << 2;
+
+/// The first words of the flash descriptor a GETD command returns -- the live geometry cross-check.
+/// On a SAM3X8E each controller reports `size` = 256 KB, `page_size` = 256, `planes` = 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sam3xFlashDescriptor {
+    /// FL_ID: flash interface description.
+    pub interface: u32,
+    /// FL_SIZE: this controller's plane size in bytes.
+    pub size: u32,
+    /// FL_PAGE_SIZE: page size in bytes (256 on the SAM3X).
+    pub page_size: u32,
+    /// FL_NB_PLANE: number of planes this controller fronts.
+    pub planes: u32,
+}
+
+/// SAM3X / SAM3A (ATSAM3X8E, ...) flash programming, added to a CMSIS-DAP [`Dap`] probe. `eefc`
+/// selects the controller ([`SAM3X_EEFC0`] / [`SAM3X_EEFC1`]); page numbers are relative to that
+/// controller's plane, whose flash window is `plane_base` ([`SAM3X_FLASH0_BASE`] /
+/// [`SAM3X_FLASH1_BASE`]). Halt the core before erasing or writing so it is not fetching from flash.
+pub trait Sam3xFlash {
+    /// The controller's flash descriptor (GETD): the live geometry cross-check.
+    fn sam3x_flash_descriptor(&mut self, eefc: u32) -> Result<Sam3xFlashDescriptor, DapError>;
+    /// Programs `words` into consecutive pages starting at `first_page`, via ERASE-AND-WRITE-PAGE:
+    /// each page's latch buffer is filled through the plane's flash window and then EWP erases and
+    /// writes that page, so no separate erase pass is needed. A partial final page is padded with
+    /// the erased value (`0xFFFF_FFFF`) to fill the latch buffer, per the ascending-full-buffer
+    /// procedure.
+    fn sam3x_write_flash(
+        &mut self,
+        eefc: u32,
+        plane_base: u32,
+        first_page: u32,
+        words: &[u32],
+    ) -> Result<(), DapError>;
+    /// Erases the ENTIRE plane fronted by `eefc` (EA) -- the only bulk erase the SAM3X offers below
+    /// whole-plane granularity is the per-page erase folded into [`sam3x_write_flash`](Self::sam3x_write_flash).
+    fn sam3x_erase_all(&mut self, eefc: u32) -> Result<(), DapError>;
+    /// The plane's lock bits (bit n = lock region n of 16 KB / 64 pages), via GLB. 16 regions per
+    /// plane, so the low 16 bits are meaningful.
+    fn sam3x_lock_bits(&mut self, eefc: u32) -> Result<u32, DapError>;
+    /// Clears the lock bit of the region containing `page`, via CLB.
+    fn sam3x_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), DapError>;
+    /// The GPNVM bits (bit 0 = security, bit 1 = boot mode), via EEFC0 GGPB.
+    fn sam3x_gpnvm_bits(&mut self) -> Result<u32, DapError>;
+    /// Sets GPNVM bit `bit`, via EEFC0 SGPB.
+    fn sam3x_set_gpnvm(&mut self, bit: u32) -> Result<(), DapError>;
+    /// Clears GPNVM bit `bit`, via EEFC0 CGPB.
+    fn sam3x_clear_gpnvm(&mut self, bit: u32) -> Result<(), DapError>;
+}
+
+impl<T: Transport> Sam3xFlash for Dap<T> {
+    fn sam3x_flash_descriptor(&mut self, eefc: u32) -> Result<Sam3xFlashDescriptor, DapError> {
+        sam3x_command(self, eefc, SAM3X_CMD_GETD, 0)?;
+        Ok(Sam3xFlashDescriptor {
+            interface: self.read_word(eefc + SAM3X_FRR)?,
+            size: self.read_word(eefc + SAM3X_FRR)?,
+            page_size: self.read_word(eefc + SAM3X_FRR)?,
+            planes: self.read_word(eefc + SAM3X_FRR)?,
+        })
+    }
+
+    fn sam3x_write_flash(
+        &mut self,
+        eefc: u32,
+        plane_base: u32,
+        first_page: u32,
+        words: &[u32],
+    ) -> Result<(), DapError> {
+        const PAGE_WORDS: usize = SAM3X_PAGE / 4;
+        for (index, chunk) in words.chunks(PAGE_WORDS).enumerate() {
+            let page = first_page + index as u32;
+            let page_addr = plane_base + page * SAM3X_PAGE as u32;
+            if chunk.len() == PAGE_WORDS {
+                self.write_words(page_addr, chunk)?;
+            } else {
+                let mut full = [0xffff_ffffu32; PAGE_WORDS];
+                full[..chunk.len()].copy_from_slice(chunk);
+                self.write_words(page_addr, &full)?;
+            }
+            sam3x_command(self, eefc, SAM3X_CMD_EWP, page)?;
+        }
+        Ok(())
+    }
+
+    fn sam3x_erase_all(&mut self, eefc: u32) -> Result<(), DapError> {
+        sam3x_command(self, eefc, SAM3X_CMD_EA, 0)
+    }
+
+    fn sam3x_lock_bits(&mut self, eefc: u32) -> Result<u32, DapError> {
+        sam3x_command(self, eefc, SAM3X_CMD_GLB, 0)?;
+        self.read_word(eefc + SAM3X_FRR)
+    }
+
+    fn sam3x_clear_lock(&mut self, eefc: u32, page: u32) -> Result<(), DapError> {
+        sam3x_command(self, eefc, SAM3X_CMD_CLB, page)
+    }
+
+    fn sam3x_gpnvm_bits(&mut self) -> Result<u32, DapError> {
+        sam3x_command(self, SAM3X_EEFC0, SAM3X_CMD_GGPB, 0)?;
+        self.read_word(SAM3X_EEFC0 + SAM3X_FRR)
+    }
+
+    fn sam3x_set_gpnvm(&mut self, bit: u32) -> Result<(), DapError> {
+        sam3x_command(self, SAM3X_EEFC0, SAM3X_CMD_SGPB, bit)
+    }
+
+    fn sam3x_clear_gpnvm(&mut self, bit: u32) -> Result<(), DapError> {
+        sam3x_command(self, SAM3X_EEFC0, SAM3X_CMD_CGPB, bit)
+    }
+}
+
+/// Issues one EEFC command (key | arg | cmd into FCR) and waits for FRDY, mapping the FSR error
+/// flags: FCMDE = bad key/command, FLOCKE = the command hit a locked region and was refused. (The
+/// SAM3X FSR defines no FLERR verify-error bit.)
+fn sam3x_command<T: Transport>(
+    dap: &mut Dap<T>,
+    eefc: u32,
+    cmd: u32,
+    arg: u32,
+) -> Result<(), DapError> {
+    dap.write_word(eefc + SAM3X_FCR, SAM3X_FKEY | (arg << 8) | cmd)?;
+    for _ in 0..4000 {
+        let fsr = dap.read_word(eefc + SAM3X_FSR)?;
+        if fsr & SAM3X_FSR_FRDY != 0 {
+            if fsr & SAM3X_FSR_FCMDE != 0 {
+                return Err(DapError::Device("SAM3X EEFC command error (FCMDE)"));
+            }
+            if fsr & SAM3X_FSR_FLOCKE != 0 {
+                return Err(DapError::Device("SAM3X EEFC lock violation (FLOCKE)"));
+            }
+            return Ok(());
+        }
+    }
+    Err(DapError::Timeout("SAM3X flash controller (FRDY)"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,5 +807,81 @@ mod tests {
         assert_eq!(&sent[1][4..8], &0x5a00_000eu32.to_le_bytes());
         assert_eq!(&sent[4][4..8], &0x0040_0000u32.to_le_bytes());
         assert_eq!(&sent[13][4..8], &0x5a00_000fu32.to_le_bytes());
+    }
+
+    /// An EEFC FRR result-word read reply carrying `v`.
+    fn frr_word(v: u32) -> Vec<u8> {
+        let b = v.to_le_bytes();
+        vec![proto::cmd::TRANSFER, 0x01, 0x01, b[0], b[1], b[2], b[3]]
+    }
+
+    #[test]
+    fn sam3x_write_flash_fills_latch_ascending_then_ewp() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let mut replies = Vec::new();
+        for &count in &[14u16, 14, 14, 14, 8] {
+            replies.push(ack.clone());
+            replies.push(block_ack(count));
+        }
+        replies.push(ack.clone());
+        replies.push(ack.clone());
+        replies.push(ack.clone());
+        replies.push(sam4s_ready_reply());
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.sam3x_write_flash(SAM3X_EEFC0, SAM3X_FLASH0_BASE, 3, &[0xcafe_babe]).unwrap();
+        let sent = &dap.transport().sent;
+        assert_eq!(&sent[0][4..8], &(SAM3X_FLASH0_BASE + 3 * 256).to_le_bytes());
+        assert_eq!(sent[1][0], proto::cmd::TRANSFER_BLOCK);
+        assert_eq!(&sent[1][5..9], &0xcafe_babeu32.to_le_bytes());
+        assert_eq!(&sent[1][9..13], &0xffff_ffffu32.to_le_bytes());
+        assert_eq!(&sent[11][4..8], &0x5a00_0303u32.to_le_bytes());
+    }
+
+    #[test]
+    fn sam3x_erase_all_targets_the_named_controller() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let replies = vec![ack.clone(), ack.clone(), ack.clone(), sam4s_ready_reply()];
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.sam3x_erase_all(SAM3X_EEFC1).unwrap();
+        let sent = &dap.transport().sent;
+        assert_eq!(&sent[0][4..8], &(SAM3X_EEFC1 + 0x04).to_le_bytes());
+        assert_eq!(&sent[1][4..8], &0x5a00_0005u32.to_le_bytes());
+    }
+
+    #[test]
+    fn sam3x_set_gpnvm_drives_eefc0() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let replies = vec![ack.clone(), ack.clone(), ack.clone(), sam4s_ready_reply()];
+        let mut dap = Dap::new(Mock::new(replies));
+        dap.sam3x_set_gpnvm(SAM3X_GPNVM_BOOT_FLASH).unwrap();
+        let sent = &dap.transport().sent;
+        assert_eq!(&sent[0][4..8], &0x400e_0a04u32.to_le_bytes());
+        assert_eq!(&sent[1][4..8], &0x5a00_010bu32.to_le_bytes());
+    }
+
+    #[test]
+    fn sam3x_flash_descriptor_reads_four_frr_words() {
+        let ack = echo(proto::cmd::TRANSFER, &[0x01, 0x01]);
+        let replies = vec![
+            ack.clone(),
+            ack.clone(),
+            ack.clone(),
+            sam4s_ready_reply(),
+            ack.clone(),
+            frr_word(0x000f_0640),
+            ack.clone(),
+            frr_word(262_144),
+            ack.clone(),
+            frr_word(256),
+            ack.clone(),
+            frr_word(1),
+        ];
+        let mut dap = Dap::new(Mock::new(replies));
+        let descriptor = dap.sam3x_flash_descriptor(SAM3X_EEFC0).unwrap();
+        assert_eq!(
+            descriptor,
+            Sam3xFlashDescriptor { interface: 0x000f_0640, size: 262_144, page_size: 256, planes: 1 }
+        );
+        assert_eq!(&dap.transport().sent[1][4..8], &0x5a00_0000u32.to_le_bytes());
     }
 }

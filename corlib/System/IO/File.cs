@@ -2,8 +2,10 @@
 #if LAMELLA_SURFACE_FILE_IO
 namespace System.IO
 {
-    public static class File
+    public sealed class File
     {
+        private File() { }
+
         public static bool Exists(string path)
         {
             if ((object)path == null || path.Length == 0) return false;

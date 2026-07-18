@@ -1,0 +1,34 @@
+# BOARD binding: the Espressif ESP32-C6-DevKitC-1. Board truth
+# ONLY: role bindings, the carrier, and the clock plan. Chip truth lives in csp/esp32c6/.
+#
+# The uart0 binding's pins route to the board's on-board USB-UART bridge (the "UART" USB-C
+# port) AND to header J3 -- it is the ROM console. The Lamella Link wire is NOT that uart:
+# the serve speaks over the chip's built-in USB-Serial-JTAG CDC (the "USB" port), which is
+# the native-usb carrier below.
+
+[table]
+kind = "board"
+board = "esp32c6-devkitc"
+family = "esp32c6"
+part = "esp32c6"
+board_model = 14 # lamella_wire::board_model::ESP32_C6
+sources = ["ESP32-C6-DevKitC-1 schematic/user guide (GPIO16/17 to the on-board bridge; 40 MHz crystal)", "the silicon-proven esp32c6-serve wire (USB-Serial-JTAG CDC)"]
+
+[carrier]
+kind = "native-usb" # the chip's USB-Serial-JTAG; the host sees a CDC COM port
+
+
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F0" # native IO_MUX functions (U0TXD/U0RXD) -- no GPIO matrix
+tx = { pin = "GPIO16" }
+rx = { pin = "GPIO17" }
+
+
+name = "xtal-40mhz"
+default = true
+source = "xtal"
+xtal_hz = 40000000 # the board's crystal
+uart_sclk_hz = 40000000 # PCR sclk = XTAL / 1 (SCLK_SEL 3, dividers 0) -- the generator
+                            # verifies this equality under source xtal (state-and-verify)

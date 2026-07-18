@@ -1,0 +1,88 @@
+# BLOCK layout: the RP2040 UART -- an ARM PrimeCell PL011.
+# Transcribed from the retired v0 table (uart-rp2040.toml), whose values were SILICON-VERIFIED
+# via the old samples/pico/Rp2040Uart.cs on a Pico H: a 10/10 byte round-trip through the
+# PL011's LBE loopback and a logic analyzer's Async Serial decode of the greeting off GP0.
+# Offsets are instance-base-relative; instance bases live in ../instances.toml.
+#
+# Cross-block bring-up (XOSC start, clk_peri switch, RESETS release, IO_BANK0 funcsel) is
+# DRIVER code per language, not sequence data; only block-local sequences ride
+# here. The retired table's cross-block `init` sequence lives on as the driver's Init.
+
+[table]
+kind = "block"
+family = "rp2040"
+block = "uart"
+sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 4.2 (UART) via the silicon-proven rp2040-serve UART path"]
+notes = [
+    "The PL011 latches UARTIBRD/UARTFBRD only on a UARTLCR_H write: always write IBRD, FBRD, then LCR_H, in that order.",
+    "Control-register reprogramming (e.g. loopback) is done disabled: wait for FR.BUSY clear, write UARTCR = 0, then the new value.",
+    "Config envelope: baud = uartclk / (16 * (IBRD + FBRD/64)) with 16-bit IBRD >= 1; parity none/even/odd via PEN/EPS (LCR_H).",
+]
+
+[registers.UARTDR]
+offset = 0x0
+width = 32
+fields = { DATA = [0, 8] }
+notes = "Write queues one TX byte; read pops one RX byte (bits 11..8 carry error flags)."
+
+[registers.UARTFR]
+offset = 0x18
+width = 32
+fields = { BUSY = [3, 1], RXFE = [4, 1], TXFF = [5, 1], TXFE = [7, 1] }
+notes = "BUSY covers the shift register: it clears only when the line is fully idle."
+
+[registers.UARTIBRD]
+offset = 0x24
+width = 32
+fields = { BAUD_DIVINT = [0, 16] }
+
+[registers.UARTFBRD]
+offset = 0x28
+width = 32
+fields = { BAUD_DIVFRAC = [0, 6] }
+notes = "divisor = IBRD + FBRD/64 sixteenths of the UART clock: divisor = uartclk / (16 * baud)."
+
+[registers.UARTLCR_H]
+offset = 0x2C
+width = 32
+fields = { FEN = [4, 1], WLEN = [5, 2], STP2 = [3, 1], EPS = [2, 1], PEN = [1, 1], SPS = [7, 1] }
+notes = "WLEN 3 = 8 data bits; writing this register latches IBRD/FBRD. Parity select: PEN enables, EPS 1 = even / 0 = odd, SPS = stick parity."
+
+[registers.UARTCR]
+offset = 0x30
+width = 32
+fields = { UARTEN = [0, 1], LBE = [7, 1], TXE = [8, 1], RXE = [9, 1] }
+notes = "LBE feeds UARTTXD back to UARTRXD (the no-hands self-test)."
+
+[constants]
+FIFO_DEPTH = 32
+WLEN_8BIT = 3
+
+[parameters]
+ibrd = "uartclk / (16 * baud), integer part -- 115200 over the 12 MHz crystal: 6."
+fbrd = "round(64 * fractional part) -- 115200 over the 12 MHz crystal: 33 (actual 115108, -0.08%)."
+tx_byte = "The byte to transmit."
+
+[[sequences.tx_byte]]
+op = "poll"
+reg = "UARTFR"
+mask = 0x20
+want = 0
+note = "TXFF clear = FIFO has room"
+
+[[sequences.tx_byte]]
+op = "write"
+reg = "UARTDR"
+value = "$tx_byte"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "UARTFR"
+mask = 0x10
+note = "RXFE set = nothing waiting"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "UARTDR"
+mask = 0xFF
+note = "pops one byte when RXFE was clear"

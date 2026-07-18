@@ -127,32 +127,71 @@ fn mir_type(ty: bc::StaticType) -> MirType {
         bc::StaticType::ListInt
         | bc::StaticType::ListFloat
         | bc::StaticType::TupleInt
-        | bc::StaticType::TupleFloat => MirType::ObjectRef,
+        | bc::StaticType::TupleFloat
+        | bc::StaticType::GrowListInt
+        | bc::StaticType::GrowListFloat => MirType::ObjectRef,
         bc::StaticType::Dynamic => MirType::PyValue,
     }
 }
 
-/// What the typed lane knows about a sequence-array `ObjectRef`: its element kind (`I32`/`F64`, which
-/// drives an element op's `element_size` and the loaded value's type) and whether it is MUTABLE. A
-/// `list` and a `tuple` share ALL the array read machinery (index / `len` / iterate over `[u32 len]
-/// [elems...]`); the ONLY difference is that a tuple is immutable, so `t[i] = v` is a CPython
-/// `TypeError` -- the `Setitem` arm refuses a non-mutable array. Keyed by value id in `arrays`.
+/// How a typed sequence's `ObjectRef` reaches its elements -- see [`ArrayInfo`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeqKind {
+    /// The reference IS the packed array (`[u32 len][elems...]`): a fixed `list`, whose length is the
+    /// array's own prefix and whose elements are addressed directly.
+    FixedList,
+    /// A [`SeqKind::FixedList`] that rejects element stores: a `tuple`.
+    FixedTuple,
+    /// The reference is a growable list's HEADER (`[i32 len][i32 cap][ObjectRef backing]`); the
+    /// elements live in the `backing` array, and the header's `len` -- NOT the backing's prefix, which
+    /// is the allocated `cap` -- is the list's length.
+    GrowList,
+}
+
+impl SeqKind {
+    /// Whether `xs[i] = v` is allowed: everything except a `tuple`, which is immutable.
+    fn mutable(self) -> bool {
+        self != SeqKind::FixedTuple
+    }
+}
+
+/// What the typed lane knows about a typed sequence's `ObjectRef`: its element kind (`I32`/`F64`, which
+/// drives an element op's `element_size` and the loaded value's type) and how the reference reaches
+/// those elements. A `list` and a `tuple` share ALL the array read machinery (index / `len` / iterate);
+/// a growable list shares it too, one `backing` field-load further in. Keyed by value id in `arrays`.
 #[derive(Clone, Copy)]
 struct ArrayInfo {
     elem: MirType,
-    mutable: bool,
+    kind: SeqKind,
+}
+
+/// Whether a value the typed lane holds may be passed for a parameter declared `ty` -- the check the
+/// argument's MIR type cannot make.
+///
+/// Every typed sequence is an `ObjectRef`, so MIR type alone cannot tell a packed array from a
+/// growable list's header, nor an `int` element from a `float` one. Reading either as the other is a
+/// silent miscompile (a header's `len` read as element 0), so the argument's recorded sequence must be
+/// exactly what the parameter declares -- and a non-sequence parameter must get a non-sequence value.
+fn sequence_matches(held: Option<&ArrayInfo>, ty: bc::StaticType) -> bool {
+    match (held, seq_info_of(ty)) {
+        (Some(held), Some(declared)) => held.elem == declared.elem && held.kind == declared.kind,
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// The [`ArrayInfo`] a typed sequence static type carries, or `None` if `ty` is not a typed sequence.
-/// A list is mutable; a tuple is not (its element store is rejected).
 fn seq_info_of(ty: bc::StaticType) -> Option<ArrayInfo> {
-    match ty {
-        bc::StaticType::ListInt => Some(ArrayInfo { elem: MirType::I32, mutable: true }),
-        bc::StaticType::ListFloat => Some(ArrayInfo { elem: MirType::F64, mutable: true }),
-        bc::StaticType::TupleInt => Some(ArrayInfo { elem: MirType::I32, mutable: false }),
-        bc::StaticType::TupleFloat => Some(ArrayInfo { elem: MirType::F64, mutable: false }),
-        _ => None,
-    }
+    let (elem, kind) = match ty {
+        bc::StaticType::ListInt => (MirType::I32, SeqKind::FixedList),
+        bc::StaticType::ListFloat => (MirType::F64, SeqKind::FixedList),
+        bc::StaticType::TupleInt => (MirType::I32, SeqKind::FixedTuple),
+        bc::StaticType::TupleFloat => (MirType::F64, SeqKind::FixedTuple),
+        bc::StaticType::GrowListInt => (MirType::I32, SeqKind::GrowList),
+        bc::StaticType::GrowListFloat => (MirType::F64, SeqKind::GrowList),
+        _ => return None,
+    };
+    Some(ArrayInfo { elem, kind })
 }
 
 /// Emit the fixed-array materialization for a homogeneous numeric sequence literal (a `list` or a
@@ -166,7 +205,7 @@ fn materialize_array(
     arrays: &mut BTreeMap<ValueId, ArrayInfo>,
     elems: &[(ValueId, MirType)],
     elem: MirType,
-    mutable: bool,
+    kind: SeqKind,
 ) -> Result<ValueId, LowerError> {
     if !matches!(elem, MirType::I32 | MirType::F64) || elems.iter().any(|&(_, t)| t != elem) {
         return Err(LowerError::DynamicOperation);
@@ -198,8 +237,133 @@ fn materialize_array(
             MirType::I32,
         );
     }
-    arrays.insert(obj, ArrayInfo { elem, mutable });
+    arrays.insert(obj, ArrayInfo { elem, kind });
     Ok(obj)
+}
+
+/// Emit a growable list's HEADER over an already-built backing array, initializing its three fields
+/// and recording it in `arrays`. Returns the header -- the reference the local holds and every later
+/// element op starts from.
+///
+/// The store order is load-bearing: `lamella_gc_alloc` does not zero the payload, so from the `Alloc`
+/// until the `backing` store the header's traced word holds garbage a collector would follow. The
+/// caller must therefore have allocated `backing` ALREADY (it stays live across the header's
+/// allocation safepoint, being stored here), and none of the three stores allocates, so no safepoint
+/// falls inside that window.
+fn alloc_growlist_header(
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    arrays: &mut BTreeMap<ValueId, ArrayInfo>,
+    backing: ValueId,
+    len: ValueId,
+    cap: ValueId,
+    elem: MirType,
+) -> ValueId {
+    let header = emit(
+        values,
+        insts,
+        Inst::Alloc {
+            handle: GROWLIST_HEADER_TYPE_HANDLE,
+            payload_size: GROWLIST_PAYLOAD_SIZE,
+            ref_offsets: alloc::vec![GROWLIST_BACKING_OFFSET].into_boxed_slice(),
+        },
+        MirType::ObjectRef,
+    );
+    for (offset, value) in [
+        (GROWLIST_BACKING_OFFSET, backing),
+        (GROWLIST_LEN_OFFSET, len),
+        (GROWLIST_CAP_OFFSET, cap),
+    ] {
+        emit(values, insts, Inst::FieldStore { base: header, offset, value }, MirType::I32);
+    }
+    arrays.insert(header, ArrayInfo { elem, kind: SeqKind::GrowList });
+    header
+}
+
+/// Emit an EMPTY growable list (`xs = []`): a seed-capacity backing and a `len = 0` header. The
+/// element kind comes from the local's static type, since `[]` carries no element to infer it from.
+fn materialize_empty_growlist(
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    arrays: &mut BTreeMap<ValueId, ArrayInfo>,
+    elem: MirType,
+) -> Result<ValueId, LowerError> {
+    if !matches!(elem, MirType::I32 | MirType::F64) {
+        return Err(LowerError::DynamicOperation);
+    }
+    let cap = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: GROWLIST_SEED_CAP }, MirType::I32);
+    let backing = emit(
+        values,
+        insts,
+        Inst::AllocArray { handle: LIST_TYPE_HANDLE, length: cap, element_size: elem_size(elem) },
+        MirType::ObjectRef,
+    );
+    let len = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 0 }, MirType::I32);
+    Ok(alloc_growlist_header(values, insts, arrays, backing, len, cap, elem))
+}
+
+/// Adopt a just-built fixed array as a growable list's first backing (`xs = [1, 2]` where `xs` is
+/// appended to): wrap it in a header with `len = cap =` the array's length. `cap` is the array's true
+/// extent, so the list starts out full and the first `append` grows it.
+fn wrap_array_as_growlist(
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    arrays: &mut BTreeMap<ValueId, ArrayInfo>,
+    backing: ValueId,
+    elem: MirType,
+) -> ValueId {
+    let len = emit(values, insts, Inst::FieldLoad { base: backing, offset: 0 }, MirType::I32);
+    alloc_growlist_header(values, insts, arrays, backing, len, len, elem)
+}
+
+/// Narrow a growable list's element index from its backing's bounds to the LIST's bounds, so that an
+/// out-of-range access traps exactly as a fixed array's does.
+///
+/// A growable list's backing is allocated to `cap`, so the bounds check the backend already emits on
+/// every `ArrayLoad`/`ArrayStore` -- `index <u <the array's length prefix>`, else trap -- would let an
+/// index in `len..cap` through to read uninitialized slack. This forces such an index to `0xFFFFFFFF`,
+/// which no capacity can satisfy, so that same check traps on it: `mask = 0 - (index >=u len)` is 0 in
+/// range and all-ones out of it, and `index | mask` is either the index or `0xFFFFFFFF`. Branchless,
+/// like the negative-index wrap it follows, so an element op stays a straight line with no block split
+/// -- which also keeps a check off the (already bounds-checked) fixed-array path.
+///
+/// A `try`-guarded access never reaches this: its block-split bounds check has already diverted an
+/// out-of-range index to a catchable `IndexError`, so here the mask is always 0.
+fn narrow_index_to_len(
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    header: ValueId,
+    index: ValueId,
+) -> ValueId {
+    let len = emit(values, insts, Inst::FieldLoad { base: header, offset: GROWLIST_LEN_OFFSET }, MirType::I32);
+    let oob = emit(
+        values,
+        insts,
+        Inst::Compare { op: MCmpOp::UnsignedGe, lhs: index, rhs: len },
+        MirType::I32,
+    );
+    let zero = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 0 }, MirType::I32);
+    let mask = emit(values, insts, Inst::Binary { op: MBinOp::Sub, lhs: zero, rhs: oob }, MirType::I32);
+    emit(values, insts, Inst::Binary { op: MBinOp::Or, lhs: index, rhs: mask }, MirType::I32)
+}
+
+/// The array a typed sequence's elements live in, given the reference the typed lane holds: a fixed
+/// list/tuple IS its array, while a growable list reaches its elements through the header's `backing`.
+fn backing_array(
+    values: &mut Values,
+    insts: &mut Vec<(ValueId, Inst)>,
+    container: ValueId,
+    info: ArrayInfo,
+) -> ValueId {
+    match info.kind {
+        SeqKind::FixedList | SeqKind::FixedTuple => container,
+        SeqKind::GrowList => emit(
+            values,
+            insts,
+            Inst::FieldLoad { base: container, offset: GROWLIST_BACKING_OFFSET },
+            MirType::ObjectRef,
+        ),
+    }
 }
 
 /// The byte size of one array element of the given (numeric) element type: 4 for an `i32`, 8 for an
@@ -216,6 +380,37 @@ fn elem_size(elem: MirType) -> u32 {
 /// it (no vtable, nothing to trace element-wise) regardless of the handle -- one shared handle is
 /// enough. `list[<obj>]` (PyValue elements) will need a distinct, ref-map-carrying handle later.
 const LIST_TYPE_HANDLE: TypeHandle = TypeHandle(0);
+
+/// The `TypeHandle` stamped on a growable list's HEADER `Alloc`. It MUST differ from
+/// [`LIST_TYPE_HANDLE`]: the backend emits one canonical TypeDesc per handle, so sharing a handle with
+/// the packed backing array would give the header the array's ref-less descriptor and the collector
+/// would never trace `backing`. One handle serves every element kind -- the header's layout does not
+/// mention the element type.
+const GROWLIST_HEADER_TYPE_HANDLE: TypeHandle = TypeHandle(1);
+
+/// A growable list's header field offsets. The header is a small heap object, SEPARATE from the packed
+/// `backing` array it points at, so that the list's identity survives a grow: `b = a; a.append(1)`
+/// leaves `b` pointing at the same header and observing the new element, and one header shape serves
+/// every element kind.
+///
+/// `len` is the list's LENGTH; `cap` is how many elements `backing` has room for. The backing's own
+/// `[u32 len]` prefix holds `cap` (its true allocated extent -- what a heap walk must see), NOT `len`,
+/// so an element op's bounds must be checked against THIS `len` before the access.
+const GROWLIST_LEN_OFFSET: u32 = 0;
+const GROWLIST_CAP_OFFSET: u32 = 4;
+const GROWLIST_BACKING_OFFSET: u32 = 8;
+/// The header's payload size: `len` + `cap` + `backing`, three words.
+const GROWLIST_PAYLOAD_SIZE: u32 = 12;
+/// The element capacity a growable list's backing is seeded with when the list starts out empty.
+const GROWLIST_SEED_CAP: i64 = 4;
+
+/// The runtime-support entry `append` calls to ensure a growable list's backing has room:
+/// `py_list_grow(header, needed_cap, element_size)`. It returns immediately when `cap` already
+/// suffices, so `append` can call it unconditionally instead of branching on `len == cap`; when it
+/// does grow, it allocates a larger backing, copies the live elements, and updates the header's
+/// `backing` and `cap`. The growth POLICY lives there rather than here, and the element size is a
+/// compile-time constant this end passes because the backing does not record it.
+const PY_LIST_GROW_SYMBOL: &str = "py_list_grow";
 
 /// Emit one instruction of type `ty`, returning its result value.
 fn emit(values: &mut Values, insts: &mut Vec<(ValueId, Inst)>, inst: Inst, ty: MirType) -> ValueId {
@@ -492,10 +687,10 @@ fn emit_select_extreme(
 fn normalize_index(
     values: &mut Values,
     insts: &mut Vec<(ValueId, Inst)>,
-    array: ValueId,
+    container: ValueId,
     index: ValueId,
 ) -> ValueId {
-    let len = emit(values, insts, Inst::FieldLoad { base: array, offset: 0 }, MirType::I32);
+    let len = emit(values, insts, Inst::FieldLoad { base: container, offset: 0 }, MirType::I32);
     let bits = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 31 }, MirType::I32);
     let sign = emit(values, insts, Inst::Binary { op: MBinOp::ShrSigned, lhs: index, rhs: bits }, MirType::I32);
     let wrap = emit(values, insts, Inst::Binary { op: MBinOp::And, lhs: len, rhs: sign }, MirType::I32);
@@ -637,7 +832,7 @@ fn lower_function(
     let mut tramps: Vec<BasicBlock> = Vec::new();
     let mut blocks: Vec<BasicBlock> = Vec::with_capacity(n_bc + 1);
     let mut exit_locals: Vec<Option<Vec<ValueId>>> = vec![None; n_bc];
-    let mut exit_stack: Vec<Option<Vec<(ValueId, MirType)>>> = vec![None; n_bc];
+    let mut exit_entries: Vec<Option<Vec<StackEntry>>> = vec![None; n_bc];
 
     let mut arrays: BTreeMap<ValueId, ArrayInfo> = BTreeMap::new();
 
@@ -670,10 +865,10 @@ fn lower_function(
         let mut stack: Vec<StackEntry> = if is_handler_target[i] {
             Vec::new()
         } else if is_merge[i] {
-            let incoming = preds[i]
-                .iter()
-                .find_map(|p| exit_stack[*p].clone())
-                .unwrap_or_default();
+            let incoming = match preds[i].iter().find_map(|p| exit_entries[*p].as_ref()) {
+                Some(entries) => stack_exit(entries)?,
+                None => Vec::new(),
+            };
             incoming
                 .into_iter()
                 .map(|(_, ty)| {
@@ -685,12 +880,7 @@ fn lower_function(
         } else if i == 0 {
             Vec::new()
         } else {
-            exit_stack[preds[i][0]]
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(v, ty)| StackEntry::Value(v, ty))
-                .collect()
+            exit_entries[preds[i][0]].clone().unwrap_or_default()
         };
 
         let meta = &metas[i];
@@ -707,11 +897,10 @@ fn lower_function(
         let terminator = if meta.call_exc_handler.is_some() {
             let tag =
                 emit(&mut values, &mut insts, Inst::StaticLoad { owner: StaticOwner::Own, offset: EXCEPTION_TAG_OFFSET }, MirType::I32);
-            let sv = stack_exit(&stack)?;
             let if_false =
-                branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &sv, tramp_base, &mut tramps);
+                branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &stack, tramp_base, &mut tramps)?;
             let if_true =
-                branch_edge(&is_merge, &live_in, meta.succs[1], &locals, &[], tramp_base, &mut tramps);
+                branch_edge(&is_merge, &live_in, meta.succs[1], &locals, &[], tramp_base, &mut tramps)?;
             Terminator::Branch {
                 cond: tag,
                 if_true,
@@ -731,9 +920,8 @@ fn lower_function(
                 Inst::Compare { op: MCmpOp::Eq, lhs: divisor, rhs: zero },
                 MirType::I32,
             );
-            let sv = stack_exit(&stack)?;
             let if_false =
-                branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &sv, tramp_base, &mut tramps);
+                branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &stack, tramp_base, &mut tramps)?;
             let handler = meta.succs[1];
             let raise_id = BlockId((tramp_base + tramps.len()) as u32);
             let mut raise_insts: Vec<(ValueId, Inst)> = Vec::new();
@@ -754,7 +942,7 @@ fn lower_function(
                 insts: raise_insts,
                 terminator: Some(Terminator::Jump {
                     target: handler,
-                    args: merge_args(&is_merge, &live_in, handler, &locals, &[]),
+                    args: merge_args(&is_merge, &live_in, handler, &locals, &[])?,
                 }),
             });
             Terminator::Branch {
@@ -804,9 +992,8 @@ fn lower_function(
                         Inst::Compare { op: MCmpOp::UnsignedGe, lhs: normalized, rhs: len },
                         MirType::I32,
                     );
-                    let sv = stack_exit(&stack)?;
                     let if_false =
-                        branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &sv, tramp_base, &mut tramps);
+                        branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &stack, tramp_base, &mut tramps)?;
                     let handler = meta.succs[1];
                     let raise_id = BlockId((tramp_base + tramps.len()) as u32);
                     let mut raise_insts: Vec<(ValueId, Inst)> = Vec::new();
@@ -827,7 +1014,7 @@ fn lower_function(
                         insts: raise_insts,
                         terminator: Some(Terminator::Jump {
                             target: handler,
-                            args: merge_args(&is_merge, &live_in, handler, &locals, &[]),
+                            args: merge_args(&is_merge, &live_in, handler, &locals, &[])?,
                         }),
                     });
                     Terminator::Branch {
@@ -839,29 +1026,25 @@ fn lower_function(
                     }
                 }
                 _ => {
-                    let sv = stack_exit(&stack)?;
-                    jump_to(&is_merge, &live_in, meta.succs[0], &locals, &sv)
+                            jump_to(&is_merge, &live_in, meta.succs[0], &locals, &stack)?
                 }
             }
         } else if !meta.ends_in_terminator {
-            let sv = stack_exit(&stack)?;
-            jump_to(&is_merge, &live_in, meta.succs[0], &locals, &sv)
+            jump_to(&is_merge, &live_in, meta.succs[0], &locals, &stack)?
         } else {
             match &co.ops[meta.end - 1] {
                 bc::Op::Jump(_) => {
-                    let sv = stack_exit(&stack)?;
-                    jump_to(&is_merge, &live_in, meta.succs[0], &locals, &sv)
+                            jump_to(&is_merge, &live_in, meta.succs[0], &locals, &stack)?
                 }
                 bc::Op::PopJumpIfFalse(_) => {
                     let (cond, ct) = pop_value(&mut stack)?;
                     if ct != MirType::I32 {
                         return Err(LowerError::BadConditionType);
                     }
-                    let sv = stack_exit(&stack)?;
-                    let if_false =
-                        branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &sv, tramp_base, &mut tramps);
+                            let if_false =
+                        branch_edge(&is_merge, &live_in, meta.succs[0], &locals, &stack, tramp_base, &mut tramps)?;
                     let if_true =
-                        branch_edge(&is_merge, &live_in, meta.succs[1], &locals, &sv, tramp_base, &mut tramps);
+                        branch_edge(&is_merge, &live_in, meta.succs[1], &locals, &stack, tramp_base, &mut tramps)?;
                     Terminator::Branch {
                         cond,
                         if_true,
@@ -901,16 +1084,16 @@ fn lower_function(
                         Inst::StaticStore { owner: StaticOwner::Own, offset: EXCEPTION_TAG_OFFSET, value: tagv },
                         MirType::I32,
                     );
-                    raise_route(handler_of(meta.end - 1), &is_merge, &live_in, ret_ty, &locals, &mut values, &mut insts)
+                    raise_route(handler_of(meta.end - 1), &is_merge, &live_in, ret_ty, &locals, &mut values, &mut insts)?
                 }
                 bc::Op::Raise(0) | bc::Op::Reraise => {
-                    raise_route(handler_of(meta.end - 1), &is_merge, &live_in, ret_ty, &locals, &mut values, &mut insts)
+                    raise_route(handler_of(meta.end - 1), &is_merge, &live_in, ret_ty, &locals, &mut values, &mut insts)?
                 }
                 bc::Op::Raise(_) => return Err(LowerError::DynamicOperation),
                 _ => return Err(LowerError::RunsOffEnd),
             }
         };
-        exit_stack[i] = Some(stack_exit(&stack)?);
+        exit_entries[i] = Some(stack);
         exit_locals[i] = Some(locals);
         blocks.push(BasicBlock {
             params,
@@ -919,7 +1102,7 @@ fn lower_function(
         });
     }
 
-    let synth_term = jump_to(&is_merge, &live_in, BlockId(0), &synth_locals, &[]);
+    let synth_term = jump_to(&is_merge, &live_in, BlockId(0), &synth_locals, &[])?;
     blocks.push(BasicBlock {
         params: func_params,
         insts: synth_insts,
@@ -948,24 +1131,29 @@ fn unreachable_block() -> BasicBlock {
 /// locals (in slot order) followed by the threaded operand-stack values (bottom to
 /// top) -- matching the order the merge declares those parameters. A non-merge target
 /// has no parameters, so no arguments: it reuses the predecessor's values directly.
+///
+/// The stack arrives as ENTRIES and is converted to values here, only for a merge -- which is what
+/// decides whether an entry has to be a value at all. A non-merge successor inherits its predecessor's
+/// entries whole, so a callee mid-expression (`print(xs[i])` around a block split) crosses that edge
+/// fine; only a merge, which must declare a parameter per slot, cannot take one.
 fn merge_args(
     is_merge: &[bool],
     live_in: &[Vec<bool>],
     target: BlockId,
     locals: &[ValueId],
-    stack: &[(ValueId, MirType)],
-) -> Vec<ValueId> {
+    stack: &[StackEntry],
+) -> Result<Vec<ValueId>, LowerError> {
     if !is_merge.get(target.index()).copied().unwrap_or(false) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let live = &live_in[target.index()];
     let mut args: Vec<ValueId> = (0..live.len()).filter(|&s| live[s]).map(|s| locals[s]).collect();
-    args.extend(stack.iter().map(|(v, _)| *v));
-    args
+    args.extend(stack_exit(stack)?.iter().map(|(v, _)| *v));
+    Ok(args)
 }
 
-/// The operand stack as `(ValueId, type)` pairs, for threading to successors. A
-/// callable left on the stack at a block boundary (a function used across a
+/// The operand stack as `(ValueId, type)` pairs, for threading to a MERGE successor. A
+/// callable left on the stack at a merge (a function used across a
 /// mid-expression branch) is not supported in the typed subset.
 fn stack_exit(stack: &[StackEntry]) -> Result<Vec<(ValueId, MirType)>, LowerError> {
     stack
@@ -973,7 +1161,9 @@ fn stack_exit(stack: &[StackEntry]) -> Result<Vec<(ValueId, MirType)>, LowerErro
         .map(|e| match e {
             StackEntry::Value(v, t) => Ok((*v, *t)),
             StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
-            StackEntry::Tuple(_) => Err(LowerError::DynamicOperation),
+            StackEntry::Tuple(_) | StackEntry::EmptyList | StackEntry::ListAppend(_) => {
+                Err(LowerError::DynamicOperation)
+            }
             StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => Err(LowerError::DynamicOperation),
         })
         .collect()
@@ -986,12 +1176,12 @@ fn jump_to(
     live_in: &[Vec<bool>],
     target: BlockId,
     locals: &[ValueId],
-    stack: &[(ValueId, MirType)],
-) -> Terminator {
-    Terminator::Jump {
+    stack: &[StackEntry],
+) -> Result<Terminator, LowerError> {
+    Ok(Terminator::Jump {
         target,
-        args: merge_args(is_merge, live_in, target, locals, stack),
-    }
+        args: merge_args(is_merge, live_in, target, locals, stack)?,
+    })
 }
 
 /// Resolve one edge of a `Branch`. A `Branch` may carry no arguments, so an edge into
@@ -1003,23 +1193,21 @@ fn branch_edge(
     live_in: &[Vec<bool>],
     target: BlockId,
     locals: &[ValueId],
-    stack: &[(ValueId, MirType)],
+    stack: &[StackEntry],
     tramp_base: usize,
     tramps: &mut Vec<BasicBlock>,
-) -> BlockId {
+) -> Result<BlockId, LowerError> {
     if is_merge.get(target.index()).copied().unwrap_or(false) {
         let id = BlockId((tramp_base + tramps.len()) as u32);
+        let args = merge_args(is_merge, live_in, target, locals, stack)?;
         tramps.push(BasicBlock {
             params: Vec::new(),
             insts: Vec::new(),
-            terminator: Some(Terminator::Jump {
-                target,
-                args: merge_args(is_merge, live_in, target, locals, stack),
-            }),
+            terminator: Some(Terminator::Jump { target, args }),
         });
-        id
+        Ok(id)
     } else {
-        target
+        Ok(target)
     }
 }
 
@@ -1035,12 +1223,12 @@ fn raise_route(
     locals: &[ValueId],
     values: &mut Values,
     insts: &mut Vec<(ValueId, Inst)>,
-) -> Terminator {
+) -> Result<Terminator, LowerError> {
     match handler {
         Some(h) => jump_to(is_merge, live_in, h, locals, &[]),
         None => {
             let zero = emit(values, insts, Inst::ConstInt { ty: ret_ty, value: 0 }, ret_ty);
-            Terminator::Return(Some(zero))
+            Ok(Terminator::Return(Some(zero)))
         }
     }
 }
@@ -1249,7 +1437,11 @@ struct FuncSig {
     ret: MirType,
     arity: usize,
     param_names: Vec<String>,
-    param_types: Vec<MirType>,
+    /// The parameters' declared PYTHON types, not just their MIR types: an argument's MIR type alone
+    /// cannot say whether it may be passed. Every typed sequence is an `ObjectRef`, so a growable
+    /// list's header would satisfy a `list[int]` parameter on MIR type alone -- and the callee, reading
+    /// it as a packed array, would take the header's `len` for element 0.
+    param_types: Vec<bc::StaticType>,
 }
 
 /// A built-in the typed path handles with no runtime call: `abs`/`min`/`max` over integers
@@ -1342,11 +1534,23 @@ impl Builtin {
 /// of typed values, pushed by `BuildTuple` and consumed by `UnpackSequence`, which lets the
 /// `a, b = <exprs>` idiom elide its heap tuple (any other consumer pops it as a plain value
 /// via `pop_value` and falls to the dynamic path -- a real tuple object).
+///
+/// `Clone` so that a single-successor block boundary can carry the whole stack across: those edges
+/// pass no parameters, so an entry crosses as ITSELF rather than as a threaded value.
+#[derive(Clone)]
 enum StackEntry {
     Value(ValueId, MirType),
     Callable(FuncSig),
     Builtin(Builtin),
     Tuple(Vec<(ValueId, MirType)>),
+    /// An empty list literal `[]`, threaded UNMATERIALIZED because it carries no element to take its
+    /// element kind from: only a `StoreFast` into a growable-list local -- whose static type names that
+    /// kind -- can build it. Every other consumer pops it as dynamic, which is what `[]` already was.
+    EmptyList,
+    /// A growable list's bound `append` method, carrying the HEADER it was read off. Only the `Call`
+    /// that immediately consumes it lowers it; anywhere else (a stored or passed bound method) it is
+    /// dynamic.
+    ListAppend(ValueId),
     /// A built-in exception TYPE pushed by `LoadGlobal` (`raise IndexError`, `except IndexError:`).
     /// It is not a plain value: only `Raise` (which stores its tag) and `MatchExc` (which tests the
     /// in-flight tag against its subtype closure) consume it; anywhere else falls to the dynamic path.
@@ -1368,7 +1572,9 @@ fn pop_value(stack: &mut Vec<StackEntry>) -> Result<(ValueId, MirType), LowerErr
     match pop(stack)? {
         StackEntry::Value(v, t) => Ok((v, t)),
         StackEntry::Callable(_) | StackEntry::Builtin(_) => Err(LowerError::CallableAsValue),
-        StackEntry::Tuple(_) => Err(LowerError::DynamicOperation),
+        StackEntry::Tuple(_) | StackEntry::EmptyList | StackEntry::ListAppend(_) => {
+            Err(LowerError::DynamicOperation)
+        }
         StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => Err(LowerError::DynamicOperation),
     }
 }
@@ -1444,10 +1650,27 @@ fn lower_op(
                 return Err(LowerError::BadLocalIndex(*i));
             }
             if let Some(info) = seq_info_of(co.local_types[slot]) {
-                if !info.mutable && matches!(stack.last(), Some(StackEntry::Tuple(_))) {
+                if info.kind == SeqKind::FixedTuple && matches!(stack.last(), Some(StackEntry::Tuple(_))) {
                     let StackEntry::Tuple(elems) = pop(stack)? else { unreachable!() };
-                    let obj = materialize_array(values, insts, arrays, &elems, info.elem, false)?;
+                    let obj = materialize_array(values, insts, arrays, &elems, info.elem, info.kind)?;
                     locals[slot] = obj;
+                    return Ok(());
+                }
+                if info.kind == SeqKind::GrowList {
+                    let header = if matches!(stack.last(), Some(StackEntry::EmptyList)) {
+                        pop(stack)?;
+                        materialize_empty_growlist(values, insts, arrays, info.elem)?
+                    } else {
+                        let (value, _ty) = pop_value(stack)?;
+                        match arrays.get(&value).map(|held| held.kind) {
+                            Some(SeqKind::GrowList) => value,
+                            Some(SeqKind::FixedList) => {
+                                wrap_array_as_growlist(values, insts, arrays, value, info.elem)
+                            }
+                            _ => return Err(LowerError::DynamicOperation),
+                        }
+                    };
+                    locals[slot] = header;
                     return Ok(());
                 }
             }
@@ -1600,6 +1823,12 @@ fn lower_op(
         }
         bc::Op::LoadAttr { name, cache } => {
             let (obj, _ot) = pop_value(stack)?;
+            if matches!(arrays.get(&obj).map(|info| info.kind), Some(SeqKind::GrowList))
+                && co.names.get(*name as usize).is_some_and(|n| n == "append")
+            {
+                stack.push(StackEntry::ListAppend(obj));
+                return Ok(());
+            }
             let id = values.fresh(MirType::PyValue);
             insts.push((id, Inst::PyIntrinsic {
                 op: PyOp::Getattr { name: *name },
@@ -1616,10 +1845,15 @@ fn lower_op(
                     return Err(LowerError::DynamicOperation);
                 }
                 let index = normalize_index(values, insts, container, index);
+                let index = match info.kind {
+                    SeqKind::GrowList => narrow_index_to_len(values, insts, container, index),
+                    _ => index,
+                };
+                let array = backing_array(values, insts, container, info);
                 let id = emit(
                     values,
                     insts,
-                    Inst::ArrayLoad { array: container, index, element_size: elem_size(info.elem), signed: false },
+                    Inst::ArrayLoad { array, index, element_size: elem_size(info.elem), signed: false },
                     info.elem,
                 );
                 stack.push(StackEntry::Value(id, info.elem));
@@ -1639,14 +1873,15 @@ fn lower_op(
         bc::Op::BuildList(n) => {
             let n = *n as usize;
             if n == 0 {
-                return Err(LowerError::DynamicOperation);
+                stack.push(StackEntry::EmptyList);
+                return Ok(());
             }
             let mut elems: Vec<(ValueId, MirType)> = Vec::with_capacity(n);
             for _ in 0..n {
                 elems.push(pop_value(stack)?);
             }
             elems.reverse();
-            let obj = materialize_array(values, insts, arrays, &elems, elems[0].1, true)?;
+            let obj = materialize_array(values, insts, arrays, &elems, elems[0].1, SeqKind::FixedList)?;
             stack.push(StackEntry::Value(obj, MirType::ObjectRef));
         }
         bc::Op::BuildDict(_) => {
@@ -1692,7 +1927,7 @@ fn lower_op(
             let (index, it) = pop_value(stack)?;
             let (container, _ct) = pop_value(stack)?;
             if let Some(&info) = arrays.get(&container) {
-                if !info.mutable {
+                if !info.kind.mutable() {
                     return Err(LowerError::DynamicOperation);
                 }
                 let (value, vt) = pop_value(stack)?;
@@ -1700,10 +1935,15 @@ fn lower_op(
                     return Err(LowerError::DynamicOperation);
                 }
                 let index = normalize_index(values, insts, container, index);
+                let index = match info.kind {
+                    SeqKind::GrowList => narrow_index_to_len(values, insts, container, index),
+                    _ => index,
+                };
+                let array = backing_array(values, insts, container, info);
                 emit(
                     values,
                     insts,
-                    Inst::ArrayStore { array: container, index, value, element_size: elem_size(info.elem) },
+                    Inst::ArrayStore { array, index, value, element_size: elem_size(info.elem) },
                     MirType::I32,
                 );
             } else {
@@ -1875,7 +2115,7 @@ fn lower_op(
                     }
                     let mut args = Vec::with_capacity(argc);
                     for ((value, ty), &pty) in typed_args.into_iter().zip(&sig.param_types) {
-                        if ty != pty {
+                        if ty != mir_type(pty) || !sequence_matches(arrays.get(&value), pty) {
                             return Err(LowerError::DynamicOperation);
                         }
                         args.push(value);
@@ -2078,7 +2318,40 @@ fn lower_op(
                     let (id, ty) = inline_builtin(builtin, values, insts, &args)?;
                     stack.push(StackEntry::Value(id, ty));
                 }
-                StackEntry::Value(..) | StackEntry::Tuple(_) => {
+                StackEntry::ListAppend(header) => {
+                    if argc != 1 {
+                        return Err(LowerError::ArityMismatch { expected: 1, found: argc });
+                    }
+                    let Some(&info) = arrays.get(&header) else {
+                        return Err(LowerError::DynamicOperation);
+                    };
+                    let (value, vt) = typed_args[0];
+                    if vt != info.elem {
+                        return Err(LowerError::DynamicOperation);
+                    }
+                    let element_size = elem_size(info.elem);
+                    let len = emit(values, insts, Inst::FieldLoad { base: header, offset: GROWLIST_LEN_OFFSET }, MirType::I32);
+                    let one = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 1 }, MirType::I32);
+                    let needed = emit(values, insts, Inst::Binary { op: MBinOp::Add, lhs: len, rhs: one }, MirType::I32);
+                    let width = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: i64::from(element_size) }, MirType::I32);
+                    emit(
+                        values,
+                        insts,
+                        Inst::PInvoke { import: PY_LIST_GROW_SYMBOL.into(), args: vec![header, needed, width] },
+                        MirType::I32,
+                    );
+                    let backing = emit(values, insts, Inst::FieldLoad { base: header, offset: GROWLIST_BACKING_OFFSET }, MirType::ObjectRef);
+                    emit(values, insts, Inst::ArrayStore { array: backing, index: len, value, element_size }, MirType::I32);
+                    emit(
+                        values,
+                        insts,
+                        Inst::FieldStore { base: header, offset: GROWLIST_LEN_OFFSET, value: needed },
+                        MirType::I32,
+                    );
+                    let none = emit(values, insts, Inst::ConstInt { ty: MirType::I32, value: 0 }, MirType::I32);
+                    stack.push(StackEntry::Value(none, MirType::I32));
+                }
+                StackEntry::Value(..) | StackEntry::Tuple(_) | StackEntry::EmptyList => {
                     return Err(LowerError::CallTargetNotCallable);
                 }
                 StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => {
@@ -2113,7 +2386,11 @@ fn lower_op(
             pos_values.reverse();
             let sig = match pop(stack)? {
                 StackEntry::Callable(sig) => sig,
-                StackEntry::Builtin(_) | StackEntry::Value(..) | StackEntry::Tuple(_) => {
+                StackEntry::Builtin(_)
+                | StackEntry::Value(..)
+                | StackEntry::Tuple(_)
+                | StackEntry::EmptyList
+                | StackEntry::ListAppend(_) => {
                     return Err(LowerError::CallTargetNotCallable);
                 }
                 StackEntry::ExcType(_) | StackEntry::ExcTypeTuple(_) => {
@@ -2217,7 +2494,7 @@ pub fn lower_module(module: &bc::Module) -> Result<Vec<(String, Function)>, Lowe
                 ret: mir_type(co.ret_ty),
                 arity: co.params.len(),
                 param_names: co.params.iter().map(|p| p.name.clone()).collect(),
-                param_types: co.params.iter().map(|p| mir_type(p.ty)).collect(),
+                param_types: co.params.iter().map(|p| p.ty).collect(),
             })
         })
         .collect();
@@ -3327,13 +3604,139 @@ def main() -> int:
     }
 
     #[test]
-    fn an_empty_list_is_not_a_typed_array() {
+    fn an_appended_to_empty_list_is_a_growable_list() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = []\n    xs.append(1)\n    xs.append(2)\n    return xs[1]\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(
+            count_insts(&f, |i| matches!(
+                i,
+                Inst::Alloc { handle, payload_size: GROWLIST_PAYLOAD_SIZE, ref_offsets }
+                    if *handle == GROWLIST_HEADER_TYPE_HANDLE
+                        && &ref_offsets[..] == [GROWLIST_BACKING_OFFSET]
+            )),
+            1
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::AllocArray { .. })), 1);
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::PInvoke { import, .. } if &**import == PY_LIST_GROW_SYMBOL)),
+            2
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_growable_list_literal_seed_adopts_its_array_as_the_backing() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [1, 2]\n    xs.append(3)\n    return len(xs)\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::AllocArray { .. })), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Alloc { .. })), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn appending_the_other_numeric_kind_stays_dynamic() {
         let module = compile_str(
             "test",
-            "def main() -> int:\n    xs = []\n    xs.append(1)\n    return xs[0]\n",
+            "def main() -> int:\n    xs = [1]\n    xs.append(2.0)\n    return len(xs)\n",
         )
         .expect("compiles");
         assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn an_unprotected_growable_subscript_narrows_its_index_to_len() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = []\n    xs.append(7)\n    return xs[0]\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert!(!has_const_int(&f, i64::from(bc::exception_tag("IndexError"))));
+        let narrow = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .find(|(_, i)| matches!(i, Inst::Compare { op: MCmpOp::UnsignedGe, .. }))
+            .expect("the index is narrowed against len")
+            .0;
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Binary { op: MBinOp::Or, .. })), 1);
+        assert!(!f.blocks.iter().any(|b| matches!(
+            b.terminator,
+            Some(Terminator::Branch { cond, .. }) if cond == narrow
+        )));
+    }
+
+    #[test]
+    fn a_local_takes_a_called_function_s_declared_return_type() {
+        let f = lower_named(
+            "def helper(n: int) -> int:\n    return n * 2\ndef scale(x: float) -> float:\n    return x * 1.5\ndef main() -> int:\n    a = helper(5)\n    b = a + 1\n    f = scale(2.0)\n    return b + int(f)\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Call { .. })), 2);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_local_of_the_name_shadows_the_called_function() {
+        let f = lower_named(
+            "def helper() -> int:\n    return 7\ndef main(helper: int) -> int:\n    a = helper\n    return a + 1\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Call { .. })), 0);
+    }
+
+    #[test]
+    fn a_list_parameter_takes_a_fixed_list_by_reference() {
+        let f = lower_named(
+            "def total(xs: list[int]) -> int:\n    return xs[0] + xs[1]\ndef main() -> int:\n    ys = [3, 4]\n    return total(ys)\n",
+            "main",
+        );
+        assert_eq!(f.ret, Some(MirType::I32));
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Call { .. })), 1);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+        let callee = lower_named(
+            "def total(xs: list[int]) -> int:\n    return xs[0] + xs[1]\ndef main() -> int:\n    ys = [3, 4]\n    return total(ys)\n",
+            "total",
+        );
+        assert_eq!(callee.params, vec![MirType::ObjectRef]);
+        assert_eq!(count_insts(&callee, |i| matches!(i, Inst::ArrayLoad { .. })), 2);
+    }
+
+    #[test]
+    fn a_growable_list_is_refused_for_a_fixed_list_parameter() {
+        let module = compile_str(
+            "test",
+            "def first(xs: list[int]) -> int:\n    return xs[0]\ndef main() -> int:\n    g = []\n    g.append(42)\n    return first(g)\n",
+        )
+        .expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn a_list_parameter_refuses_the_other_element_kind() {
+        let module = compile_str(
+            "test",
+            "def total(xs: list[float]) -> int:\n    return int(xs[0])\ndef main() -> int:\n    ys = [3, 4]\n    return total(ys)\n",
+        )
+        .expect("compiles");
+        assert!(lower_module(&module).is_err());
+    }
+
+    #[test]
+    fn a_fixed_list_subscript_is_not_narrowed() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20, 30]\n    return xs[1]\n",
+            "main",
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Compare { .. })), 0);
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::Binary { op: MBinOp::Or, .. })), 0);
     }
 
     #[test]
@@ -3375,6 +3778,31 @@ def main() -> int:
         );
         assert_eq!(count_insts(&f, |i| matches!(i, Inst::ArrayLoad { .. })), 1);
         assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+    }
+
+    #[test]
+    fn a_guarded_subscript_lowers_inside_a_call_argument() {
+        let f = lower_named(
+            "def main() -> int:\n    xs = [10, 20]\n    try:\n        print(xs[5])\n    except IndexError:\n        print(9)\n    return 0\n",
+            "main",
+        );
+        assert!(has_const_int(&f, i64::from(bc::exception_tag("IndexError"))));
+        assert_eq!(
+            count_insts(&f, |i| matches!(i, Inst::Compare { op: MCmpOp::UnsignedGe, .. })),
+            1
+        );
+        assert_eq!(count_insts(&f, |i| matches!(i, Inst::PyIntrinsic { .. })), 0);
+        assert!(count_insts(&f, |i| matches!(i, Inst::WriteInt { .. })) >= 2);
+    }
+
+    #[test]
+    fn a_callee_may_not_cross_a_merge() {
+        let module = compile_str(
+            "test",
+            "def main() -> int:\n    c = 1\n    print(10 if c else 20)\n    return 0\n",
+        )
+        .expect("compiles");
+        assert!(lower_module(&module).is_err());
     }
 
     #[test]
@@ -3471,3 +3899,7 @@ def main() -> int:
         assert_eq!(lower_module(&module), Err(LowerError::DynamicOperation));
     }
 }
+
+
+
+

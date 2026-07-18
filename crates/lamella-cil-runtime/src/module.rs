@@ -296,8 +296,8 @@ struct BakedMethods {
 /// This is the seam a BCL method crosses to reach Rust -- `System.Console.Write`
 /// and friends are intrinsics of this shape. The function receives the runtime
 /// context [`Vm`] (heap, console, ...) and the call arguments in declaration
-/// order, and returns the method's result (`None` for `void`) or a [`Trap`]. It is
-/// documented as a shared seam in `docs/COORDINATION.md`.
+/// order, and returns the method's result (`None` for `void`) or a [`Trap`]. This
+/// is a stable, shared seam.
 pub type IntrinsicFn = fn(&mut Vm, &Module, &[Value]) -> Result<Option<Value>, Trap>;
 
 /// The raw-CIL input to the loader for one managed method. Owned (`Box<[u8]>`, a copy of the PE

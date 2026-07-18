@@ -113,22 +113,12 @@ fn host_caps() -> Capabilities {
     )
 }
 
-/// A display name for a Lamella Link `board_model`, mirroring the `lamella_wire::board_model` registry.
+/// A display name for a Lamella Link `board_model`. DERIVES from [`lamella_wire::board_model::name`] -- the ONE
+/// canonical value -> name map -- so it cannot drift from the registry. (Hand-mirroring it drifted twice: "SAM E54"
+/// for canonical "SAME54", and four boards missing entirely.) `None` means the registry does not know the code;
+/// UNKNOWN (0) names ITSELF "custom board", which is a recognized answer rather than an unrecognized one.
 fn board_model_name(model: u16) -> Option<&'static str> {
-    use lamella_wire::board_model as bm;
-    Some(match model {
-        bm::MICROBIT_V1 => "BBC micro:bit v1",
-        bm::PICO2 => "Raspberry Pi Pico 2",
-        bm::SAM4S_XPLAINED_PRO => "SAM4S Xplained Pro",
-        bm::SAME54_XPLAINED_PRO => "SAM E54 Xplained Pro",
-        bm::SAMD21_XPLAINED_PRO => "SAM D21 Xplained Pro",
-        bm::SAMW25_XPLAINED_PRO => "ATSAMW25 Xplained Pro",
-        7 => "STM32F091 Nucleo-64",
-        bm::STM32L476 => "STM32L476 Nucleo",
-        bm::MKR1000 => "Arduino MKR1000",
-        bm::PICO2_W => "Raspberry Pi Pico 2 W",
-        _ => return None,
-    })
+    lamella_wire::board_model::name(model)
 }
 
 /// Enumerate attached boards (native-USB Lamella Link devices + OS serial ports), cross-platform.

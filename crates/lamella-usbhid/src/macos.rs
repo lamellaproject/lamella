@@ -112,6 +112,33 @@ unsafe fn device_u16(device: IOHIDDeviceRef, key: &str) -> Option<u16> {
     }
 }
 
+/// Reads a 32-bit integer device property in full (e.g. `LocationID`, which does not fit `u16`).
+unsafe fn device_u32(device: IOHIDDeviceRef, key: &str) -> Option<u32> {
+    unsafe {
+        let k = cfstr(key);
+        let prop = IOHIDDeviceGetProperty(device, k);
+        CFRelease(k);
+        if prop.is_null() {
+            return None;
+        }
+        let mut value: i32 = 0;
+        let ok = CFNumberGetValue(prop, CF_NUMBER_SINT32, (&mut value as *mut i32).cast());
+        (ok != 0).then_some(value as u32)
+    }
+}
+
+/// A reopen key ([`DeviceInfo::id`]) for one HID interface: its USB `LocationID` plus its top-level
+/// usage, which differs per interface on a composite device -- enough for [`Device::open_id`] to
+/// re-find this exact interface among the matched set.
+unsafe fn device_id(device: IOHIDDeviceRef) -> String {
+    unsafe {
+        let location = device_u32(device, "LocationID").unwrap_or(0);
+        let usage_page = device_u16(device, "PrimaryUsagePage").unwrap_or(0);
+        let usage = device_u16(device, "PrimaryUsage").unwrap_or(0);
+        format!("{location:#010x}:{usage_page:#06x}:{usage:#06x}")
+    }
+}
+
 /// Reads a string device property (e.g. `SerialNumber`).
 unsafe fn device_string(device: IOHIDDeviceRef, key: &str) -> Option<String> {
     unsafe {
@@ -169,6 +196,11 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
                     product_id: device_u16(d, "ProductID")?,
                     serial_number: device_string(d, "SerialNumber"),
                     product: device_string(d, "Product"),
+                    id: device_id(d),
+                    usage_page: device_u16(d, "PrimaryUsagePage"),
+                    usage: device_u16(d, "PrimaryUsage"),
+                    input_report_len: device_u16(d, "MaxInputReportSize"),
+                    output_report_len: device_u16(d, "MaxOutputReportSize"),
                 })
             })
             .collect();
@@ -215,6 +247,28 @@ impl Device {
                         device_string(d, "SerialNumber").as_deref() == Some(want)
                     })
             });
+            Self::open_chosen(manager, chosen)
+        }
+    }
+
+    pub fn open_id(id: &str) -> Result<Self> {
+        unsafe {
+            let manager = matching_manager()?;
+            let chosen = manager_devices(manager)
+                .into_iter()
+                .find(|&d| device_id(d) == id);
+            Self::open_chosen(manager, chosen)
+        }
+    }
+
+    /// Opens `chosen` (from `manager`), registering the input-report callback and run-loop source --
+    /// the shared tail of [`open`](Self::open) and [`open_id`](Self::open_id). Takes ownership of
+    /// `manager`: it is moved into the returned [`Device`], or released here on any failure.
+    unsafe fn open_chosen(
+        manager: IOHIDManagerRef,
+        chosen: Option<IOHIDDeviceRef>,
+    ) -> Result<Self> {
+        unsafe {
             let Some(device) = chosen else {
                 CFRelease(manager);
                 return Err(Error::NotFound);

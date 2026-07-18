@@ -1,0 +1,31 @@
+# BOARD binding: the Raspberry Pi Pico / Pico H. Board truth
+# ONLY: role bindings, the carrier, and the clock plan. Chip truth lives in csp/rp2040/.
+
+[table]
+kind = "board"
+board = "pico"
+family = "rp2040"
+part = "rp2040"
+board_model = 13 # lamella_wire::board_model::PICO
+sources = ["Raspberry Pi Pico datasheet (pinout: GP0/GP1 on header pins 1/2; 12 MHz crystal)", "the silicon-proven rp2040-serve wire (115200 8N1 over the RPi Debug Probe's UART bridge)"]
+
+[carrier]
+kind = "uart" # a bare-UART Link carrier: the wire rides the uart0 binding
+role = "uart0" # through an EXTERNAL bridge (RPi Debug Probe, any USB-UART
+baud = 115200 # dongle) -- no board-fixed USB identity to state.
+
+
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F2"
+tx = { pin = "GP0" }
+rx = { pin = "GP1" }
+
+
+name = "xosc-12mhz"
+default = true
+source = "xosc"
+xosc_hz = 12000000     # the Pico's soldered crystal
+clk_peri_hz = 12000000 # clk_peri rides AUXSRC xosc directly (no divider) -- the
+                       # generator verifies this equality (state-and-verify)

@@ -1,0 +1,95 @@
+# BLOCK layout: the ESP32-C6 HP UART. Transcribed from the
+# retired v0 table (uart-esp32c6.toml), whose values were SILICON-VERIFIED via the old
+# samples/esp32c6/Esp32C6Uart.cs: a 10/10 byte round-trip through the peripheral's internal
+# loopback and the greeting on a host COM port through the DevKitC-1's on-board bridge.
+# Offsets are instance-base-relative; instance bases live in ../instances.toml. Module
+# clock/reset + the function-clock source live in the PCR block (blocks/pcr.toml).
+#
+# Cross-block bring-up (PCR clock/reset, IO_MUX routing) is DRIVER code per language;
+# only block-local sequences ride here.
+
+[table]
+kind = "block"
+family = "esp32c6"
+block = "uart"
+sources = ["espressif/svd esp32c6.svd", "esp-idf v5.3 hal/esp32c6 uart_ll.h", "ESP32-C6 TRM (UART) via the silicon-proven demo + serve paths"]
+notes = [
+    "Every config change must be committed with the REG_UPDATE handshake (write 1, poll until self-clear) -- the register file is clock-domain synchronized.",
+    "The FIFO register must be written as a FULL 32-bit word (the byte in bits 7..0): narrower access read-modify-writes the register and corrupts the FIFO.",
+    "The FIFO resets in CONF0 are pulses (set then clear). LOOPBACK ties TX to RX internally (self-test).",
+]
+
+[registers.FIFO]
+offset = 0x0
+width = 32
+fields = { RXFIFO_RD_BYTE = [0, 8] }
+notes = "Read pops one RX byte (bits 7..0); a full-word WRITE pushes one TX byte."
+
+[registers.CLKDIV]
+offset = 0x14
+width = 32
+fields = { CLKDIV_INT = [0, 12], CLKDIV_FRAG = [20, 4] }
+notes = "Baud divisor of the function clock, in 1/16ths: divisor = INT + FRAG/16."
+
+[registers.STATUS]
+offset = 0x1C
+width = 32
+fields = { RXFIFO_CNT = [0, 8], TXFIFO_CNT = [16, 8] }
+
+[registers.CONF0]
+offset = 0x20
+width = 32
+fields = { PARITY = [0, 1], PARITY_EN = [1, 1], BIT_NUM = [2, 2], STOP_BIT_NUM = [4, 2], LOOPBACK = [12, 1], MEM_CLK_EN = [20, 1], RXFIFO_RST = [22, 1], TXFIFO_RST = [23, 1] }
+notes = "BIT_NUM 3 = 8 data bits; STOP_BIT_NUM 1 = one stop bit."
+
+[registers.CONF1]
+offset = 0x24
+width = 32
+fields = { RXFIFO_FULL_THRHD = [0, 8], TXFIFO_EMPTY_THRHD = [8, 8] }
+
+[registers.CLK_CONF]
+offset = 0x88
+width = 32
+fields = { RST_CORE = [23, 1], TX_SCLK_EN = [24, 1], RX_SCLK_EN = [25, 1], TX_RST_CORE = [26, 1], RX_RST_CORE = [27, 1] }
+notes = "Core clock gates; reset value has TX/RX_SCLK_EN set. (The source select/divider fields that other ESP32 generations keep here moved to PCR on the C6.)"
+
+[registers.REG_UPDATE]
+offset = 0x98
+width = 32
+fields = { REG_UPDATE = [0, 1] }
+notes = "Write 1 to latch config into the UART core clock domain; self-clears when done."
+
+[constants]
+FIFO_DEPTH = 128
+BIT_NUM_8BIT = 3
+STOP_BITS_ONE = 1
+
+[parameters]
+clkdiv_int = "The 12-bit integer part of (sclk_hz * 16 / baud) / 16 -- for 115200 over 40 MHz XTAL with the PCR divider at 1: 347."
+clkdiv_frag = "The low 4 bits of (sclk_hz * 16 / baud) -- for 115200 over 40 MHz XTAL: 3 (actual rate 115211, +0.01%)."
+tx_byte = "The byte to transmit, zero-extended to a 32-bit word."
+
+[[sequences.tx_byte]]
+op = "poll"
+reg = "STATUS"
+mask = 0xFF0000
+want_below = 0x800000
+note = "wait for TXFIFO_CNT < FIFO_DEPTH (room for one byte)"
+
+[[sequences.tx_byte]]
+op = "write"
+reg = "FIFO"
+value = "$tx_byte"
+note = "full 32-bit write, byte in bits 7..0"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "STATUS"
+mask = 0xFF
+note = "RXFIFO_CNT: 0 = nothing waiting"
+
+[[sequences.rx_poll]]
+op = "read"
+reg = "FIFO"
+mask = 0xFF
+note = "pops one byte when RXFIFO_CNT was nonzero"

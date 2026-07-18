@@ -2,8 +2,10 @@
 #if LAMELLA_SURFACE_THREADS
 namespace System.Threading
 {
-    public static class Interlocked
+    public sealed class Interlocked
     {
+        private Interlocked() { }
+
         public static int Increment(ref int location) { location = location + 1; return location; }
         public static int Decrement(ref int location) { location = location - 1; return location; }
         public static int Add(ref int location, int value) { location = location + value; return location; }

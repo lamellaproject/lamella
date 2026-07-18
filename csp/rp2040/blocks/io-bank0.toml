@@ -1,0 +1,24 @@
+# BLOCK layout: the RP2040 user IO bank (function select per pin; the layering contract
+#). Transcribed from the retired v0 uart-rp2040.toml. The per-pin register ARRAY is
+# GPIO<n>_CTRL = base + GPIO0_CTRL offset + GPIO_CTRL_STRIDE * n -- the rp-family pin
+# derivation the generator implements (migration plan 4.1), anchored by the no-drift gate
+# against the retired table's resolved GPIO0/GPIO1 addresses.
+#
+# RP2040 pads are usable at reset (IE = 1, no isolation latch) -- routing the IO_BANK0
+# function select is sufficient; the RP2350 differs (its pads derivation lands at plan 4.4).
+
+[table]
+kind = "block"
+family = "rp2040"
+block = "io-bank0"
+sources = ["raspberrypi/pico-sdk RP2040.svd", "RP2040 datasheet 2.19 (GPIO) via the silicon-proven rp2040-serve UART path"]
+
+[registers.GPIO0_CTRL]
+offset = 0x4
+width = 32
+fields = { FUNCSEL = [0, 5] }
+notes = "The array base pin (GPIO0). Per-pin CTRL stride is 8 (GPIOn_CTRL = 0x04 + 8*n); STATUS sits at each pin's +0x00."
+
+[constants]
+GPIO_CTRL_STRIDE = 8
+FUNCSEL_UART = 2

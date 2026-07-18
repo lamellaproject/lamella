@@ -229,6 +229,9 @@ impl Capabilities {
     /// identify the hardware without parsing a display name. The fields may still read
     /// `0` = unknown (a custom board reports no model; a firmware may not know its ids).
     pub const PROFILE_CHIPID: u32 = 1 << 10;
+    /// On-device TELEMETRY / live-signal SCOPE (the `lamella_runner::telemetry` 0x40 message
+    /// range). RESERVED.
+    pub const TELEMETRY: u32 = 1 << 11;
 
     /// Whether this set includes `flag`.
     #[must_use]
@@ -280,7 +283,7 @@ impl Hello {
 }
 
 /// The RESIDENT-PROFILE identity a target may append to its `HELLO_ACK` -- the board telling the
-/// IDE what it is (docs/deployment-tiers.md), so a host scopes completion/validation to exactly
+/// IDE what it is, so a host scopes completion/validation to exactly
 /// the surface the target carries and keys a cached manifest without a second round-trip.
 ///
 /// `abi` is the intrinsic-ABI LEVEL (bumped only when an existing intrinsic's semantics change
@@ -436,6 +439,8 @@ pub mod board_model {
     pub const SAMD21_XPLAINED_PRO: u16 = 5;
     /// SAM W25 Xplained Pro (ATSAMW25: a SAMD21G18A host MCU + WINC1500 WiFi module).
     pub const SAMW25_XPLAINED_PRO: u16 = 6;
+    /// STM32F091 Nucleo-64 (STM32F091RC).
+    pub const STM32F091: u16 = 7;
     /// The STM32L476 bench board.
     pub const STM32L476: u16 = 8;
     /// Arduino MKR1000 (SAMD21G18A host MCU + WINC1500).
@@ -450,6 +455,8 @@ pub mod board_model {
     pub const PICO: u16 = 13;
     /// Espressif ESP32-C6 (RISC-V RV32IMAC HP core) -- a second-source RISC-V beyond the RP2350.
     pub const ESP32_C6: u16 = 14;
+    /// Arduino Due (ATSAM3X8E, Cortex-M3, 2x256 KiB EEFC planes) -- the first `sam3x`-family board.
+    pub const ARDUINO_DUE: u16 = 15;
 
     /// The display name for a `board_model` wire value, or `None` for an unrecognized code. THE ONE canonical
     /// value -> name map: the JS registry (`engine-sdk/registry.data.mjs`, via a generated `board_models.json`),
@@ -462,9 +469,10 @@ pub mod board_model {
             MICROBIT_V1 => "BBC micro:bit v1",
             PICO2 => "Raspberry Pi Pico 2",
             SAM4S_XPLAINED_PRO => "SAM4S Xplained Pro",
-            SAME54_XPLAINED_PRO => "SAME54 Xplained Pro",
+            SAME54_XPLAINED_PRO => "SAM E54 Xplained Pro",
             SAMD21_XPLAINED_PRO => "SAMD21 Xplained Pro",
             SAMW25_XPLAINED_PRO => "ATSAMW25 Xplained Pro",
+            STM32F091 => "STM32F091 Nucleo-64",
             STM32L476 => "STM32L476 Nucleo",
             MKR1000 => "Arduino MKR1000",
             PICO2_W => "Raspberry Pi Pico 2 W",
@@ -472,6 +480,7 @@ pub mod board_model {
             ARDUINO_ZERO => "Arduino Zero",
             PICO => "Raspberry Pi Pico",
             ESP32_C6 => "Espressif ESP32-C6",
+            ARDUINO_DUE => "Arduino Due",
             _ => return None,
         })
     }

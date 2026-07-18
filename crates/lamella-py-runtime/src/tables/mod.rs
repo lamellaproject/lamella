@@ -1,5 +1,5 @@
 //! Per-chip peripheral register facts, one leaf file per chip/peripheral pair, each transcribed
-//! from its neutral table in `docs/peripheral-tables/` -- the table is the source of truth,
+//! from its neutral peripheral-table SSOT -- the table is the source of truth,
 //! these modules its in-runtime binding. Keeping them in dedicated leaves keeps the core
 //! peripheral machinery (`gpio`, `uart`) chip-neutral: a new chip is a new file here plus its
 //! dispatch arm, never an edit inside the core.

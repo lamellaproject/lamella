@@ -149,9 +149,18 @@ unsafe fn attributes(handle: HANDLE) -> Option<HIDD_ATTRIBUTES> {
     (HidD_GetAttributes(handle, &mut attrs) != 0).then_some(attrs)
 }
 
-/// The device's (input, output) HID report byte-lengths, each including the leading report-id
-/// byte -- the exact sizes `ReadFile`/`WriteFile` require (a CMSIS-DAP probe is 64 or 512 bytes).
-unsafe fn report_lengths(handle: HANDLE) -> Option<(usize, usize)> {
+/// The top-level HID usage and the report byte-lengths (each including the leading report-id byte),
+/// from the device's preparsed report descriptor. The report lengths are the exact sizes
+/// `ReadFile`/`WriteFile` require (a CMSIS-DAP probe is 64 or 512 bytes); the usage is its selection
+/// signature (CMSIS-DAP v1 is the vendor-defined page `0xFF00`, usage `0x01`).
+struct HidCaps {
+    usage_page: u16,
+    usage: u16,
+    input_len: usize,
+    output_len: usize,
+}
+
+unsafe fn hid_caps(handle: HANDLE) -> Option<HidCaps> {
     let mut preparsed: PHIDP_PREPARSED_DATA = mem::zeroed();
     if HidD_GetPreparsedData(handle, &mut preparsed) == 0 {
         return None;
@@ -159,22 +168,38 @@ unsafe fn report_lengths(handle: HANDLE) -> Option<(usize, usize)> {
     let mut caps: HIDP_CAPS = mem::zeroed();
     let status = HidP_GetCaps(preparsed, &mut caps);
     HidD_FreePreparsedData(preparsed);
-    (status == HIDP_STATUS_SUCCESS).then_some((
-        caps.InputReportByteLength as usize,
-        caps.OutputReportByteLength as usize,
-    ))
+    (status == HIDP_STATUS_SUCCESS).then_some(HidCaps {
+        usage_page: caps.UsagePage,
+        usage: caps.Usage,
+        input_len: caps.InputReportByteLength as usize,
+        output_len: caps.OutputReportByteLength as usize,
+    })
+}
+
+/// The reopen id ([`DeviceInfo::id`]) for a device-interface path: the NUL-terminated wide string as
+/// a `String`. Windows device paths are ASCII, so this round-trips losslessly through
+/// [`Device::open_id`], which re-encodes it.
+fn path_string(path: &[u16]) -> String {
+    let end = path.iter().position(|&w| w == 0).unwrap_or(path.len());
+    String::from_utf16_lossy(&path[..end])
 }
 
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     let mut out = Vec::new();
     unsafe {
-        for_each_hid(|_path, handle| {
+        for_each_hid(|path, handle| {
             if let Some(attrs) = attributes(handle) {
+                let caps = hid_caps(handle);
                 out.push(DeviceInfo {
                     vendor_id: attrs.VendorID,
                     product_id: attrs.ProductID,
                     serial_number: hid_string(handle, true),
                     product: hid_string(handle, false),
+                    id: path_string(path),
+                    usage_page: caps.as_ref().map(|c| c.usage_page),
+                    usage: caps.as_ref().map(|c| c.usage),
+                    input_report_len: caps.as_ref().map(|c| c.input_len as u16),
+                    output_report_len: caps.as_ref().map(|c| c.output_len as u16),
                 });
             }
         })?;
@@ -210,32 +235,46 @@ impl Device {
             let Some(path) = chosen else {
                 return Err(Error::NotFound);
             };
-            let handle = CreateFileW(
-                path.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                ptr::null(),
-                OPEN_EXISTING,
-                FILE_FLAG_OVERLAPPED,
-                ptr::null_mut(),
-            );
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(Error::Os("CreateFile (read/write) failed".into()));
-            }
-            let event = CreateEventW(ptr::null(), 1, 0, ptr::null());
-            if event.is_null() {
-                CloseHandle(handle);
-                return Err(Error::Os("CreateEvent failed".into()));
-            }
-            let (in_len, out_len) =
-                report_lengths(handle).unwrap_or((1 + REPORT_MAX, 1 + REPORT_MAX));
-            Ok(Device {
-                handle,
-                event,
-                in_len,
-                out_len,
-            })
+            Self::open_path(&path)
         }
+    }
+
+    pub fn open_id(id: &str) -> Result<Self> {
+        let mut path: Vec<u16> = id.encode_utf16().collect();
+        path.push(0);
+        unsafe { Self::open_path(&path) }
+    }
+
+    /// Opens the HID interface at a device-interface `path` (a NUL-terminated wide string) for
+    /// overlapped read/write, allocating the completion event and caching the report lengths. The
+    /// shared tail of [`open`](Self::open) (path found by vid/pid/serial) and [`open_id`](Self::open_id)
+    /// (path from an enumerated id).
+    unsafe fn open_path(path: &[u16]) -> Result<Self> {
+        let handle = CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(Error::Os("CreateFile (read/write) failed".into()));
+        }
+        let event = CreateEventW(ptr::null(), 1, 0, ptr::null());
+        if event.is_null() {
+            CloseHandle(handle);
+            return Err(Error::Os("CreateEvent failed".into()));
+        }
+        let (in_len, out_len) =
+            hid_caps(handle).map_or((1 + REPORT_MAX, 1 + REPORT_MAX), |c| (c.input_len, c.output_len));
+        Ok(Device {
+            handle,
+            event,
+            in_len,
+            out_len,
+        })
     }
 
     pub fn write_report(&mut self, data: &[u8]) -> Result<()> {

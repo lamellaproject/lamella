@@ -1,0 +1,96 @@
+# The SAMD21 instance map: every placed block copy, its base, and its per-instance ids.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
+# schema is uniform across rows; -1 marks a field that does not
+# apply to a row and emits nothing.
+
+[table]
+kind = "instances"
+family = "samd21"
+record = ["base", "gclk_core_id", "apbc_bit", "irq"]
+sources = [
+    "SAMD21 datasheet DS40001882: peripheral base addresses (product mapping, ch 12), GCLK CLKCTRL IDs (ch 15), PM APBCMASK bits (ch 16), NVIC line assignments (ch 11)",
+    "silicon-grounded: sercom2 via samd21_wifi.rs (WINC SPI), sercom3 via samd21-edbg-serve --features samd21-xpro, sercom4 via samd21-serve (W25), sercom5 via samd21-edbg-serve --features arduino-zero",
+]
+notes = [
+    "SERCOM bases stride 0x400 from 0x42000800; GCLK core-clock IDs stride 1 from 0x14; APBCMASK bits stride 1 from bit 2; NVIC lines stride 1 from 9 -- each row is still stated explicitly (a table is data, not a formula).",
+]
+
+
+name = "sercom0"
+block = "sercom"
+base = 0x42000800
+gclk_core_id = 0x14
+apbc_bit = 2
+irq = 9
+
+
+name = "sercom1"
+block = "sercom"
+base = 0x42000C00
+gclk_core_id = 0x15
+apbc_bit = 3
+irq = 10
+
+
+name = "sercom2"
+block = "sercom"
+base = 0x42001000
+gclk_core_id = 0x16
+apbc_bit = 4
+irq = 11
+
+
+name = "sercom3"
+block = "sercom"
+base = 0x42001400
+gclk_core_id = 0x17
+apbc_bit = 5
+irq = 12
+
+
+name = "sercom4"
+block = "sercom"
+base = 0x42001800
+gclk_core_id = 0x18
+apbc_bit = 6
+irq = 13
+
+
+name = "sercom5"
+block = "sercom"
+base = 0x42001C00
+gclk_core_id = 0x19
+apbc_bit = 7
+irq = 14
+
+
+name = "pm"
+block = "pm"
+base = 0x40000400
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+
+name = "gclk"
+block = "gclk"
+base = 0x40000C00
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+
+name = "porta"
+block = "port"
+base = 0x41004400
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1
+
+
+name = "portb"
+block = "port"
+base = 0x41004480
+gclk_core_id = -1
+apbc_bit = -1
+irq = -1

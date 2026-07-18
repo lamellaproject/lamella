@@ -45,6 +45,49 @@ namespace System
             return -1;
         }
 
+        public static int IndexOf(Array array, object value, int startIndex)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            return IndexOf(array, value, startIndex, array.Length - startIndex);
+        }
+
+        public static int IndexOf(Array array, object value, int startIndex, int count)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            int n = array.Length;
+            if (startIndex < 0 || startIndex > n) throw new ArgumentOutOfRangeException("startIndex");
+            if (count < 0 || startIndex > n - count) throw new ArgumentOutOfRangeException("count");
+            int end = startIndex + count;
+            for (int i = startIndex; i < end; i++)
+            {
+                object element = array.GetValue(i);
+                if (value == null) { if (element == null) return i; }
+                else if (element != null && element.Equals(value)) return i;
+            }
+            return -1;
+        }
+
+        public static int LastIndexOf(Array array, object value)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            return LastIndexOf(array, value, array.Length - 1);
+        }
+
+        public static int LastIndexOf(Array array, object value, int startIndex)
+        {
+            if ((object)array == null) throw new ArgumentNullException("array");
+            int n = array.Length;
+            if (n == 0) return -1;
+            if (startIndex < 0 || startIndex >= n) throw new ArgumentOutOfRangeException("startIndex");
+            for (int i = startIndex; i >= 0; i--)
+            {
+                object element = array.GetValue(i);
+                if (value == null) { if (element == null) return i; }
+                else if (element != null && element.Equals(value)) return i;
+            }
+            return -1;
+        }
+
         public static void Reverse(Array array)
         {
             int i = 0;
@@ -64,6 +107,27 @@ namespace System
             for (int i = 0; i < length; i++)
             {
                 destinationArray.SetValue(sourceArray.GetValue(i), i);
+            }
+        }
+
+        public static void Copy(Array sourceArray, int sourceIndex, Array destinationArray, int destinationIndex, int length)
+        {
+            if ((object)sourceArray == null) throw new ArgumentNullException("sourceArray");
+            if ((object)destinationArray == null) throw new ArgumentNullException("destinationArray");
+            if (sourceIndex < 0) throw new ArgumentOutOfRangeException("sourceIndex");
+            if (destinationIndex < 0) throw new ArgumentOutOfRangeException("destinationIndex");
+            if (length < 0) throw new ArgumentOutOfRangeException("length");
+            if (sourceIndex > sourceArray.Length - length) throw new ArgumentException("sourceArray");
+            if (destinationIndex > destinationArray.Length - length) throw new ArgumentException("destinationArray");
+            if ((object)sourceArray == (object)destinationArray && destinationIndex > sourceIndex)
+            {
+                for (int i = length - 1; i >= 0; i--)
+                    destinationArray.SetValue(sourceArray.GetValue(sourceIndex + i), destinationIndex + i);
+            }
+            else
+            {
+                for (int i = 0; i < length; i++)
+                    destinationArray.SetValue(sourceArray.GetValue(sourceIndex + i), destinationIndex + i);
             }
         }
 

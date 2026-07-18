@@ -392,6 +392,12 @@ fn visit_local_uses(expr: &BoundExpr, f: &mut dyn FnMut(&str)) {
             visit_local_uses(operand, f);
         }
         BoundExprKind::RefValue { reference, .. } => visit_local_uses(reference, f),
+        BoundExprKind::ArgListValue => {}
+        BoundExprKind::ArgListLiteral(arguments) => {
+            for argument in arguments {
+                visit_local_uses(argument, f);
+            }
+        }
         BoundExprKind::StackAlloc { count, .. } => visit_local_uses(count, f),
         BoundExprKind::Call {
             callee, arguments, ..
@@ -678,6 +684,12 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
             collect_field_uses(operand, reads, writes);
         }
         BoundExprKind::RefValue { reference, .. } => collect_field_uses(reference, reads, writes),
+        BoundExprKind::ArgListValue => {}
+        BoundExprKind::ArgListLiteral(arguments) => {
+            for argument in arguments {
+                collect_field_uses(argument, reads, writes);
+            }
+        }
         BoundExprKind::StackAlloc { count, .. } => collect_field_uses(count, reads, writes),
         BoundExprKind::Call {
             callee, arguments, ..
@@ -1553,6 +1565,12 @@ impl Analyzer<'_> {
             }
             BoundExprKind::RefValue { reference, .. } => {
                 self.expression(reference, assigned, span);
+            }
+            BoundExprKind::ArgListValue => {}
+            BoundExprKind::ArgListLiteral(arguments) => {
+                for argument in arguments {
+                    self.expression(argument, assigned, span);
+                }
             }
             BoundExprKind::Conditional {
                 condition,

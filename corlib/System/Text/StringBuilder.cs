@@ -113,6 +113,46 @@ namespace System.Text
             return this;
         }
 
+        public StringBuilder Append(char value, int repeatCount)
+        {
+            if (repeatCount < 0) throw new ArgumentOutOfRangeException("repeatCount");
+            EnsureCapacity(_length + repeatCount);
+            for (int i = 0; i < repeatCount; i++) _chars[_length + i] = value;
+            _length += repeatCount;
+            return this;
+        }
+
+        public StringBuilder Append(char[] value)
+        {
+            if (value == null) return this;
+            return Append(value, 0, value.Length);
+        }
+
+        public StringBuilder Append(char[] value, int startIndex, int charCount)
+        {
+            if (value == null)
+            {
+                if (startIndex == 0 && charCount == 0) return this;
+                throw new ArgumentNullException("value");
+            }
+            if (startIndex < 0) throw new ArgumentOutOfRangeException("startIndex");
+            if (charCount < 0) throw new ArgumentOutOfRangeException("charCount");
+            if (startIndex > value.Length - charCount) throw new ArgumentOutOfRangeException("startIndex");
+            EnsureCapacity(_length + charCount);
+            for (int i = 0; i < charCount; i++) _chars[_length + i] = value[startIndex + i];
+            _length += charCount;
+            return this;
+        }
+
+        public StringBuilder Insert(int index, char value) { return Insert(index, value.ToString()); }
+        public StringBuilder Insert(int index, int value) { return Insert(index, value.ToString()); }
+        public StringBuilder Insert(int index, long value) { return Insert(index, value.ToString()); }
+        public StringBuilder Insert(int index, bool value) { return Insert(index, value ? "True" : "False"); }
+        public StringBuilder Insert(int index, object value)
+        {
+            return Insert(index, value == null ? "" : value.ToString());
+        }
+
         public StringBuilder Remove(int startIndex, int length)
         {
             if (startIndex < 0) throw new ArgumentOutOfRangeException("startIndex");

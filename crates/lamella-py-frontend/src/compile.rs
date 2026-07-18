@@ -35,29 +35,32 @@ fn error(message: &str) -> CompileError {
 pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, CompileError> {
     let mut functions = Vec::new();
     let mut top_level: Vec<&Stmt> = Vec::new();
+    let def_counts = direct_def_counts(&ast.body);
+    let mut defs_seen: BTreeMap<String, usize> = BTreeMap::new();
+    let func_rets = module_func_return_types(&ast.body);
     for stmt in &ast.body {
         match stmt {
             Stmt::FuncDef(func) => {
-                let (co, lambdas) = compile_function(func)?;
-                functions.push(co);
-                functions.extend(lambdas);
-                if func.params.iter().any(|p| p.default.is_some()) {
-                    top_level.push(stmt);
+                let seen = defs_seen.entry(func.name.clone()).or_insert(0);
+                *seen += 1;
+                if *seen == def_counts[&func.name] {
+                    let (co, lambdas) = compile_function(func, &func_rets)?;
+                    functions.push(co);
+                    functions.extend(lambdas);
                 }
+                top_level.push(stmt);
             }
             Stmt::ClassDef { name, body, .. } => {
-                compile_class_method_bodies(name, body, &mut functions, &[])?;
+                compile_class_method_bodies(name, body, &mut functions, &[], &func_rets)?;
                 top_level.push(stmt);
             }
             Stmt::Decorated { inner, .. } => {
                 match &**inner {
                     Stmt::FuncDef(func) => {
-                        let (co, lambdas) = compile_function(func)?;
-                        functions.push(co);
-                        functions.extend(lambdas);
+                        *defs_seen.entry(func.name.clone()).or_insert(0) += 1;
                     }
                     Stmt::ClassDef { name, body, .. } => {
-                        compile_class_method_bodies(name, body, &mut functions, &[])?;
+                        compile_class_method_bodies(name, body, &mut functions, &[], &func_rets)?;
                     }
                     _ => {}
                 }
@@ -67,7 +70,7 @@ pub fn compile_module(name: &str, ast: &ModuleAst) -> Result<bc::Module, Compile
         }
     }
     let (body, body_lambdas) =
-        compile_code_object(Scope::Module, "<module>", &[], &None, &top_level, None, &[])?;
+        compile_code_object(Scope::Module, "<module>", &[], &None, &top_level, None, Outer { enclosing: &[], func_rets: &func_rets })?;
     functions.extend(body_lambdas);
     Ok(bc::Module {
         name: String::from(name),
@@ -86,9 +89,10 @@ enum Scope {
 
 fn compile_function(
     func: &FuncDef,
+    func_rets: &BTreeMap<String, bc::StaticType>,
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let body: Vec<&Stmt> = func.body.iter().collect();
-    compile_code_object(Scope::Function, &func.name, &func.params, &func.ret, &body, None, &[])
+    compile_code_object(Scope::Function, &func.name, &func.params, &func.ret, &body, None, Outer { enclosing: &[], func_rets })
 }
 
 /// The simple method name of a class-body member (a `def` or a decorated `def`), else `None`.
@@ -134,6 +138,7 @@ fn compile_method(
     class_name: &str,
     method: &FuncDef,
     enclosing: &[BTreeSet<String>],
+    func_rets: &BTreeMap<String, bc::StaticType>,
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
     let body: Vec<&Stmt> = method.body.iter().collect();
     compile_code_object(
@@ -143,7 +148,7 @@ fn compile_method(
         &method.ret,
         &body,
         Some(class_name),
-        enclosing,
+        Outer { enclosing, func_rets },
     )
 }
 
@@ -156,6 +161,7 @@ fn compile_class_method_bodies(
     body: &[Stmt],
     functions: &mut Vec<bc::CodeObject>,
     enclosing: &[BTreeSet<String>],
+    func_rets: &BTreeMap<String, bc::StaticType>,
 ) -> Result<(), CompileError> {
     let names = method_qualified_names(class_name, body);
     for (i, member) in body.iter().enumerate() {
@@ -169,12 +175,71 @@ fn compile_class_method_bodies(
         };
         if let Some(method) = method {
             let qualified = names[i].as_ref().expect("a method has a qualified name");
-            let (co, lambdas) = compile_method(qualified, class_name, method, enclosing)?;
+            let (co, lambdas) = compile_method(qualified, class_name, method, enclosing, func_rets)?;
             functions.push(co);
             functions.extend(lambdas);
         }
     }
     Ok(())
+}
+
+/// What a code object compiles against from OUTSIDE itself: the scope chain of the functions it sits
+/// inside, and the module functions whose return type a call in it may resolve. They travel together
+/// because they answer the same question -- what a name that is not local to this body means -- and the
+/// first decides whether the second may be trusted (a scope with an enclosing function can capture a
+/// name as a freevar, shadowing a module function invisibly).
+#[derive(Clone, Copy)]
+struct Outer<'a> {
+    enclosing: &'a [BTreeSet<String>],
+    func_rets: &'a BTreeMap<String, bc::StaticType>,
+}
+
+/// Each module-level function's DECLARED return type, so a call to one types the local it is bound to
+/// (`total = compute(xs)`). The lowering already resolves a call against the callee's signature; this is
+/// what lets the INFERENCE agree with it, instead of leaving the local Dynamic and taking every later
+/// use of it off the typed lane.
+///
+/// A def the module REBINDS contributes the last one's annotation, matching which body the bare name
+/// ends up calling. An unannotated function maps to `Dynamic`, which is what its calls already inferred.
+fn module_func_return_types(body: &[Stmt]) -> BTreeMap<String, bc::StaticType> {
+    let mut rets = BTreeMap::new();
+    for stmt in body {
+        let def = match stmt {
+            Stmt::FuncDef(func) => Some(func),
+            Stmt::Decorated { inner, .. } => match &**inner {
+                Stmt::FuncDef(_) => None,
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(func) = def {
+            rets.insert(func.name.clone(), resolve_type(&func.ret));
+        }
+    }
+    rets
+}
+
+/// How many times each name is `def`ed DIRECTLY in this body (a def nested in a block is not counted:
+/// it never owns a table entry). A later `def` REBINDS the name, so only the LAST def of a name owns
+/// it at module scope -- the function-table entry callable by that name, and what a typed caller
+/// resolves. An earlier same-named def still binds the name for as long as it stands, so it is
+/// hoisted under a unique synthetic name at its def site, like a block-nested def.
+fn direct_def_counts<'a>(body: impl IntoIterator<Item = &'a Stmt>) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for stmt in body {
+        let def = match stmt {
+            Stmt::FuncDef(func) => Some(func),
+            Stmt::Decorated { inner, .. } => match &**inner {
+                Stmt::FuncDef(func) => Some(func),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(func) = def {
+            *counts.entry(func.name.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// The names a class body binds: member assignment targets + method names (bare or decorated). A
@@ -198,6 +263,13 @@ fn resolve_type(annotation: &Option<Expr>) -> bc::StaticType {
     match annotation {
         Some(Expr::Name(name)) if name == "int" => bc::StaticType::Int,
         Some(Expr::Name(name)) if name == "float" => bc::StaticType::Float,
+        Some(Expr::Subscript { value, index }) if matches!(&**value, Expr::Name(n) if n == "list") => {
+            match &**index {
+                Expr::Name(elem) if elem == "int" => bc::StaticType::ListInt,
+                Expr::Name(elem) if elem == "float" => bc::StaticType::ListFloat,
+                _ => bc::StaticType::Dynamic,
+            }
+        }
         _ => bc::StaticType::Dynamic,
     }
 }
@@ -209,8 +281,9 @@ fn compile_code_object(
     ret: &Option<Expr>,
     body: &[&Stmt],
     current_class: Option<&str>,
-    enclosing: &[BTreeSet<String>],
+    outer: Outer<'_>,
 ) -> Result<(bc::CodeObject, Vec<bc::CodeObject>), CompileError> {
+    let Outer { enclosing, func_rets } = outer;
     let mut local_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
     let mut local_types: Vec<bc::StaticType> =
         params.iter().map(|p| resolve_type(&p.annotation)).collect();
@@ -259,7 +332,9 @@ fn compile_code_object(
         local_names = kept_names;
         local_types = kept_types;
     }
-    infer_local_types(params, body, &local_names, &mut local_types);
+    let no_rets = BTreeMap::new();
+    let visible_rets = if enclosing.is_empty() { func_rets } else { &no_rets };
+    infer_local_types(params, body, &local_names, &mut local_types, visible_rets);
 
     let mut bound = bound_names(params, body);
     for n in &globals {
@@ -315,8 +390,12 @@ fn compile_code_object(
         lambda_counter: 0,
         has_yield: false,
         direct_body_stmt: false,
+        decorating_a_def: false,
         block_def_counter: 0,
         nested_def_counts: BTreeMap::new(),
+        module_def_totals: direct_def_counts(body.iter().copied()),
+        module_defs_seen: BTreeMap::new(),
+        func_rets: visible_rets.clone(),
     };
     for stmt in body {
         compiler.direct_body_stmt = true;
@@ -1342,6 +1421,7 @@ fn infer_local_types(
     body: &[&Stmt],
     names: &[String],
     types: &mut [bc::StaticType],
+    func_rets: &BTreeMap<String, bc::StaticType>,
 ) {
     let mut pinned = vec![false; names.len()];
     for p in pinned.iter_mut().take(params.len()) {
@@ -1351,14 +1431,158 @@ fn infer_local_types(
     for stmt in body {
         gather_assignments_stmt(stmt, names, &mut pinned, &mut rhss);
     }
+    settle_numeric_types(names, &pinned, &rhss, types, func_rets);
+    if settle_growable_lists(body, names, &mut pinned, &rhss, types, func_rets) {
+        settle_numeric_types(names, &pinned, &rhss, types, func_rets);
+    }
+}
+
+/// Seed every unpinned local optimistically `Int` and settle the numeric fixpoint over `types`.
+///
+/// Seeding `Int` (not `Dynamic`) is what lets a local whose int-ness DEPENDS on float locals -- e.g. a
+/// compare result `flag = fa > fb` -- settle `Int` once those locals settle `Float`. The two passes
+/// then run in order:
+///
+/// 1. WIDEN: settle each local to its widest numeric type, an int/float mix promoting to `Float` rather
+///    than collapsing to a sticky `Dynamic` (so a float accumulator converges to `Float` even while its
+///    self-referential `s + v` is transiently `Int`).
+/// 2. DEMOTE: with the widened types as the environment, a local whose RHSs do NOT all agree (a genuine
+///    int-and-float mix like `x = 1; x = 2.0`, or any non-numeric RHS) cannot be one machine width ->
+///    `Dynamic`. Iterated inside [`settle_local_types`], so a demotion propagates to dependents. This
+///    does NOT re-fire on the float accumulator: in the widened env its `s + v` is `Float`, agreeing
+///    with the `0.0` seed.
+fn settle_numeric_types(
+    names: &[String],
+    pinned: &[bool],
+    rhss: &[Vec<Expr>],
+    types: &mut [bc::StaticType],
+    func_rets: &BTreeMap<String, bc::StaticType>,
+) {
     for (i, ty) in types.iter_mut().enumerate() {
         if !pinned[i] {
             *ty = bc::StaticType::Int;
         }
     }
-    settle_local_types(names, &pinned, &rhss, types, promoted_kind);
-    settle_local_types(names, &pinned, &rhss, types, numeric_kind);
+    settle_local_types(names, pinned, rhss, types, func_rets, promoted_kind);
+    settle_local_types(names, pinned, rhss, types, func_rets, numeric_kind);
 }
+
+/// Reclassify every list local the function `append`s to as a GROWABLE list -- the header-and-backing
+/// representation, since a fixed array cannot take a new element. Runs after the numeric passes, whose
+/// settled types tell a seeded list's element kind.
+///
+/// The element kind comes from the seed literal (`xs = [1]` is already `ListInt`) or, for an
+/// all-`[]` local that has no element to read, from what the appends push. Anything the two disagree
+/// on is a heterogeneous list -- legal Python the typed lane has no representation for -- so it is
+/// demoted to `Dynamic` and the function falls to the interpreter.
+///
+/// Every local this decides is PINNED, and whether it decided any is the return value (the caller
+/// re-settles the numeric passes when so).
+fn settle_growable_lists(
+    body: &[&Stmt],
+    names: &[String],
+    pinned: &mut [bool],
+    rhss: &[Vec<Expr>],
+    types: &mut [bc::StaticType],
+    func_rets: &BTreeMap<String, bc::StaticType>,
+) -> bool {
+    use bc::StaticType::{Dynamic, Float, GrowListFloat, GrowListInt, Int, ListFloat, ListInt};
+    let mut appends: Vec<Vec<Expr>> = vec![Vec::new(); names.len()];
+    for stmt in body {
+        gather_appends_stmt(stmt, names, &mut appends);
+    }
+    let mut decided = false;
+    for i in 0..names.len() {
+        if pinned[i] || appends[i].is_empty() {
+            continue;
+        }
+        let seeded_empty = !rhss[i].is_empty()
+            && rhss[i]
+                .iter()
+                .all(|e| matches!(e, Expr::List(elems) if elems.is_empty()));
+        let mut elem = match types[i] {
+            ListInt => Some(Int),
+            ListFloat => Some(Float),
+            Dynamic if seeded_empty => None,
+            _ => continue,
+        };
+        for arg in &appends[i] {
+            let pushed = expr_static_type(arg, names, types, func_rets);
+            match elem {
+                None if matches!(pushed, Int | Float) => elem = Some(pushed),
+                Some(kind) if kind == pushed => {}
+                _ => {
+                    elem = None;
+                    break;
+                }
+            }
+        }
+        types[i] = match elem {
+            Some(Int) => GrowListInt,
+            Some(Float) => GrowListFloat,
+            _ => Dynamic,
+        };
+        pinned[i] = true;
+        decided = true;
+    }
+    decided
+}
+
+/// Collect the argument of every statement-level `<local>.append(<arg>)` in `stmt`, per local.
+///
+/// An `append` in any other position (its `None` result used as a value) is not gathered: the local
+/// then stays fixed and the lowering refuses the `append`, so the function falls to the interpreter
+/// rather than growing a list the analysis never saw.
+fn gather_appends_stmt(stmt: &Stmt, names: &[String], appends: &mut [Vec<Expr>]) {
+    match stmt {
+        Stmt::Expr(Expr::Call { func, args, keywords }) if keywords.is_empty() && args.len() == 1 => {
+            if let Expr::Attribute { value, attr } = &**func {
+                if attr == "append" {
+                    if let Expr::Name(name) = &**value {
+                        if let Some(slot) = names.iter().position(|n| n == name) {
+                            appends[slot].push(args[0].clone());
+                        }
+                    }
+                }
+            }
+        }
+        Stmt::If { body, orelse, .. } => {
+            for s in body.iter().chain(orelse) {
+                gather_appends_stmt(s, names, appends);
+            }
+        }
+        Stmt::While { body, orelse, .. } => {
+            for s in body.iter().chain(orelse) {
+                gather_appends_stmt(s, names, appends);
+            }
+        }
+        Stmt::For { body, orelse, .. } | Stmt::ForIter { body, orelse, .. } => {
+            for s in body.iter().chain(orelse) {
+                gather_appends_stmt(s, names, appends);
+            }
+        }
+        Stmt::With { body, .. } => {
+            for s in body {
+                gather_appends_stmt(s, names, appends);
+            }
+        }
+        Stmt::Try { body, handlers, orelse, finalbody } => {
+            for s in body.iter().chain(orelse).chain(finalbody) {
+                gather_appends_stmt(s, names, appends);
+            }
+            for handler in handlers {
+                for s in &handler.body {
+                    gather_appends_stmt(s, names, appends);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// How a settle pass reads a local's type out of its assignment RHSs -- `promoted_kind` (widen) or
+/// `numeric_kind` (demote). See [`settle_numeric_types`].
+type KindFn = fn(&[Expr], &[String], &[bc::StaticType], &BTreeMap<String, bc::StaticType>) -> bc::StaticType;
 
 /// Run one monotone fixpoint of `kind` over the unpinned locals, updating `types` in place until no
 /// local's type changes. `kind` maps a local's RHSs (read against the current `types`) to its settled
@@ -1369,7 +1593,8 @@ fn settle_local_types(
     pinned: &[bool],
     rhss: &[Vec<Expr>],
     types: &mut [bc::StaticType],
-    kind: fn(&[Expr], &[String], &[bc::StaticType]) -> bc::StaticType,
+    func_rets: &BTreeMap<String, bc::StaticType>,
+    kind: KindFn,
 ) {
     let mut changed = true;
     while changed {
@@ -1378,7 +1603,7 @@ fn settle_local_types(
             if pinned[i] {
                 continue;
             }
-            let new_ty = kind(&rhss[i], names, types);
+            let new_ty = kind(&rhss[i], names, types, func_rets);
             if new_ty != types[i] {
                 types[i] = new_ty;
                 changed = true;
@@ -1393,10 +1618,15 @@ fn settle_local_types(
 /// machine widths). Run against the widened environment from pass 1, so a float accumulator's `s + v`
 /// reads Float (agreeing with its `0.0` seed) while a genuine `x = 1; x = 2.0` reads a real int and a
 /// real float and is correctly demoted.
-fn numeric_kind(rhss: &[Expr], names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
+fn numeric_kind(
+    rhss: &[Expr],
+    names: &[String],
+    types: &[bc::StaticType],
+    func_rets: &BTreeMap<String, bc::StaticType>,
+) -> bc::StaticType {
     let mut kind: Option<bc::StaticType> = None;
     for e in rhss {
-        let t = expr_static_type(e, names, types);
+        let t = expr_static_type(e, names, types, func_rets);
         match (kind, t) {
             (_, bc::StaticType::Dynamic) => return bc::StaticType::Dynamic,
             (None, t) => kind = Some(t),
@@ -1414,11 +1644,16 @@ fn numeric_kind(rhss: &[Expr], names: &[String], types: &[bc::StaticType]) -> bc
 /// self-poisoning a single non-promoting pass would hit. Only the two scalar numerics promote; a
 /// container vs a scalar, or two different container element kinds, is still `Dynamic`. Pass 2 then
 /// demotes any GENUINE int/float mix.
-fn promoted_kind(rhss: &[Expr], names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
+fn promoted_kind(
+    rhss: &[Expr],
+    names: &[String],
+    types: &[bc::StaticType],
+    func_rets: &BTreeMap<String, bc::StaticType>,
+) -> bc::StaticType {
     use bc::StaticType::{Dynamic, Float, Int};
     let mut kind: Option<bc::StaticType> = None;
     for e in rhss {
-        let t = expr_static_type(e, names, types);
+        let t = expr_static_type(e, names, types, func_rets);
         kind = Some(match (kind, t) {
             (_, Dynamic) => return Dynamic,
             (None, t) => t,
@@ -1618,8 +1853,15 @@ fn gather_assignments_stmt(
 /// a comparison of two numerics is `Int` (a 0/1 bool); a call result, attribute, `None`, or string is
 /// `Dynamic`. Kept in lockstep with `lower.rs` so an inferred slot type always matches the value the
 /// lowering stores into it.
-fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> bc::StaticType {
-    use bc::StaticType::{Dynamic, Float, Int, ListFloat, ListInt, TupleFloat, TupleInt};
+fn expr_static_type(
+    expr: &Expr,
+    names: &[String],
+    types: &[bc::StaticType],
+    func_rets: &BTreeMap<String, bc::StaticType>,
+) -> bc::StaticType {
+    use bc::StaticType::{
+        Dynamic, Float, GrowListFloat, GrowListInt, Int, ListFloat, ListInt, TupleFloat, TupleInt,
+    };
     fn numeric(t: bc::StaticType) -> bool {
         matches!(t, Int | Float)
     }
@@ -1632,8 +1874,8 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
             .map(|i| types[i])
             .unwrap_or(Dynamic),
         Expr::Binary { op, lhs, rhs } | Expr::InplaceBinary { op, lhs, rhs } => {
-            let a = expr_static_type(lhs, names, types);
-            let b = expr_static_type(rhs, names, types);
+            let a = expr_static_type(lhs, names, types, func_rets);
+            let b = expr_static_type(rhs, names, types, func_rets);
             if !numeric(a) || !numeric(b) {
                 return Dynamic;
             }
@@ -1655,8 +1897,8 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
             }
         }
         Expr::Compare { lhs, rhs, .. } => {
-            if numeric(expr_static_type(lhs, names, types))
-                && numeric(expr_static_type(rhs, names, types))
+            if numeric(expr_static_type(lhs, names, types, func_rets))
+                && numeric(expr_static_type(rhs, names, types, func_rets))
             {
                 Int
             } else {
@@ -1664,8 +1906,8 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
             }
         }
         Expr::BoolBinary { lhs, rhs, .. } => {
-            if expr_static_type(lhs, names, types) == Int
-                && expr_static_type(rhs, names, types) == Int
+            if expr_static_type(lhs, names, types, func_rets) == Int
+                && expr_static_type(rhs, names, types, func_rets) == Int
             {
                 Int
             } else {
@@ -1673,7 +1915,7 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
             }
         }
         Expr::Unary { op, operand } => {
-            let t = expr_static_type(operand, names, types);
+            let t = expr_static_type(operand, names, types, func_rets);
             match op {
                 ast::UnaryOp::Invert => {
                     if t == Int { Int } else { Dynamic }
@@ -1685,15 +1927,15 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
         }
         Expr::Not { .. } => Int,
         Expr::Conditional { body, orelse, .. } => {
-            let a = expr_static_type(body, names, types);
-            let b = expr_static_type(orelse, names, types);
+            let a = expr_static_type(body, names, types, func_rets);
+            let b = expr_static_type(orelse, names, types, func_rets);
             if a == b && numeric(a) { a } else { Dynamic }
         }
         Expr::Call { func, args, keywords }
             if keywords.is_empty()
                 && args.len() == 1
                 && matches!(&**func, Expr::Name(n) if n == "int" || n == "float" || n == "bool")
-                && numeric(expr_static_type(&args[0], names, types)) =>
+                && numeric(expr_static_type(&args[0], names, types, func_rets)) =>
         {
             match &**func {
                 Expr::Name(n) if n == "float" => Float,
@@ -1704,15 +1946,15 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
             if keywords.is_empty()
                 && args.len() == 1
                 && matches!(&**func, Expr::Name(n) if n == "abs")
-                && numeric(expr_static_type(&args[0], names, types)) =>
+                && numeric(expr_static_type(&args[0], names, types, func_rets)) =>
         {
-            expr_static_type(&args[0], names, types)
+            expr_static_type(&args[0], names, types, func_rets)
         }
         Expr::Call { func, args, keywords }
             if keywords.is_empty()
                 && args.len() == 1
                 && matches!(&**func, Expr::Name(n) if n == "round")
-                && numeric(expr_static_type(&args[0], names, types)) =>
+                && numeric(expr_static_type(&args[0], names, types, func_rets)) =>
         {
             Int
         }
@@ -1721,15 +1963,15 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
                 && args.len() == 2
                 && matches!(&**func, Expr::Name(n) if n == "min" || n == "max") =>
         {
-            let a = expr_static_type(&args[0], names, types);
-            let b = expr_static_type(&args[1], names, types);
+            let a = expr_static_type(&args[0], names, types, func_rets);
+            let b = expr_static_type(&args[1], names, types, func_rets);
             if a == b && numeric(a) { a } else { Dynamic }
         }
         Expr::Call { func, args, keywords }
             if keywords.is_empty()
                 && matches!(&**func, Expr::Name(n) if matches!(n.as_str(),
                     "mmio_read8" | "mmio_read16" | "mmio_read32"))
-                && args.iter().all(|a| expr_static_type(a, names, types) == Int) =>
+                && args.iter().all(|a| expr_static_type(a, names, types, func_rets) == Int) =>
         {
             Int
         }
@@ -1740,39 +1982,45 @@ fn expr_static_type(expr: &Expr, names: &[String], types: &[bc::StaticType]) -> 
         {
             Int
         }
+        Expr::Call { func, .. } => match &**func {
+            Expr::Name(name) if !names.contains(name) => {
+                func_rets.get(name).copied().unwrap_or(Dynamic)
+            }
+            _ => Dynamic,
+        },
         Expr::List(elems) if !elems.is_empty() => {
-            let first = expr_static_type(&elems[0], names, types);
+            let first = expr_static_type(&elems[0], names, types, func_rets);
             let container = match first {
                 Int => ListInt,
                 Float => ListFloat,
                 _ => return Dynamic,
             };
-            if elems[1..].iter().all(|e| expr_static_type(e, names, types) == first) {
+            if elems[1..].iter().all(|e| expr_static_type(e, names, types, func_rets) == first) {
                 container
             } else {
                 Dynamic
             }
         }
         Expr::Tuple(elems) if !elems.is_empty() => {
-            let first = expr_static_type(&elems[0], names, types);
+            let first = expr_static_type(&elems[0], names, types, func_rets);
             let container = match first {
                 Int => TupleInt,
                 Float => TupleFloat,
                 _ => return Dynamic,
             };
-            if elems[1..].iter().all(|e| expr_static_type(e, names, types) == first) {
+            if elems[1..].iter().all(|e| expr_static_type(e, names, types, func_rets) == first) {
                 container
             } else {
                 Dynamic
             }
         }
         Expr::Subscript { value, index } => {
-            if expr_static_type(index, names, types) != Int {
+            if expr_static_type(index, names, types, func_rets) != Int {
                 return Dynamic;
             }
-            match expr_static_type(value, names, types) {
-                ListInt | TupleInt => Int,
-                ListFloat | TupleFloat => Float,
+            match expr_static_type(value, names, types, func_rets) {
+                ListInt | TupleInt | GrowListInt => Int,
+                ListFloat | TupleFloat | GrowListFloat => Float,
                 _ => Dynamic,
             }
         }
@@ -1850,6 +2098,12 @@ struct Compiler {
     /// hoisted by `compile_module` -- from one buried in an `if`/`for`/`while`/`try`/`with` body,
     /// which must be hoisted + emitted at its def site (a version-guarded / fallback def).
     direct_body_stmt: bool,
+    /// Set by `compile_decorated` around the def it wraps, and consumed by `compile_stmt` like
+    /// `direct_body_stmt`: a DECORATED def never owns its bare name -- the decorator's RESULT is bound
+    /// to it -- so its body is hoisted under a synthetic name and the bare name is left for the wrapping
+    /// StoreName, exactly as a superseded def is. Otherwise the raw body would sit in the function table
+    /// under the bare name and a `LoadGlobal` of it would call the UNDECORATED body.
+    decorating_a_def: bool,
     /// Counts block-nested module defs hoisted from this body, for a unique table name per def site
     /// (so sibling same-named defs -- `if c: def f else: def f` -- do not collide on one name).
     block_def_counter: usize,
@@ -1857,6 +2111,14 @@ struct Compiler {
     /// same-named defs get DISTINCT code-object names (`scope.name`, then `scope.name$1`, ...). The
     /// first keeps the bare qualified name (stable), so only a redefinition is suffixed.
     nested_def_counts: BTreeMap<String, usize>,
+    /// How many times each name is `def`ed directly in THIS body, against how many of those have been
+    /// compiled so far -- module scope only. Together they say whether the def being compiled is the
+    /// LAST of its name, and so the one that owns the function-table entry under that bare name.
+    module_def_totals: BTreeMap<String, usize>,
+    module_defs_seen: BTreeMap<String, usize>,
+    /// The module functions this scope may resolve a call's type against -- their DECLARED return
+    /// types. Empty for a scope nested in a function, which could capture one of those names.
+    func_rets: BTreeMap<String, bc::StaticType>,
 }
 
 impl Compiler {
@@ -1963,14 +2225,16 @@ impl Compiler {
     fn compile_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
         let direct = self.direct_body_stmt;
         self.direct_body_stmt = false;
+        let decorated = self.decorating_a_def;
+        self.decorating_a_def = false;
         match stmt {
             Stmt::FuncDef(func) => {
                 if self.scope == Scope::Function {
                     self.compile_nested_def(func)
-                } else if direct {
-                    self.compile_defaulted_def(func)
+                } else if direct && self.owns_module_def_name(&func.name) && !decorated {
+                    self.compile_module_def(func)
                 } else {
-                    self.compile_block_nested_module_def(func)
+                    self.compile_hoisted_module_def(func)
                 }
             }
             Stmt::Delete(targets) => {
@@ -2164,6 +2428,7 @@ impl Compiler {
         direct: bool,
     ) -> Result<(), CompileError> {
         self.direct_body_stmt = direct;
+        self.decorating_a_def = matches!(inner, Stmt::FuncDef(_));
         self.compile_stmt(inner)?;
         let name = match inner {
             Stmt::FuncDef(f) => f.name.clone(),
@@ -2559,13 +2824,13 @@ impl Compiler {
                 let seq = self.block_def_counter;
                 self.block_def_counter += 1;
                 let qualified = format!("{}.${seq}.{}", self.name, name);
-                compile_class_method_bodies(&qualified, body, &mut self.hoisted, &[])?;
+                compile_class_method_bodies(&qualified, body, &mut self.hoisted, &[], &self.func_rets.clone())?;
                 qualified
             }
         } else {
             let qualified = format!("{}.{}", self.name, name);
             let enclosing = self.child_scopes.clone();
-            compile_class_method_bodies(&qualified, body, &mut self.hoisted, &enclosing)?;
+            compile_class_method_bodies(&qualified, body, &mut self.hoisted, &enclosing, &self.func_rets.clone())?;
             qualified
         };
         let name_const = self.const_index(bc::Const::Str(String::from(name)));
@@ -2662,13 +2927,15 @@ impl Compiler {
         body: &[Stmt],
         orelse: &[Stmt],
     ) -> Result<(), CompileError> {
-        let it_type = expr_static_type(iterable, &self.local_names, &self.local_types);
+        let it_type = expr_static_type(iterable, &self.local_names, &self.local_types, &self.func_rets);
         if matches!(
             it_type,
             bc::StaticType::ListInt
                 | bc::StaticType::ListFloat
                 | bc::StaticType::TupleInt
                 | bc::StaticType::TupleFloat
+                | bc::StaticType::GrowListInt
+                | bc::StaticType::GrowListFloat
         ) {
             return self.compile_for_iter_list(target, iterable, it_type, body, orelse);
         }
@@ -2984,13 +3251,25 @@ impl Compiler {
         Ok(())
     }
 
-    /// Emit a module-level defaulted def at its source position: push each default value, build
-    /// the defaults tuple, `MakeFunction` (flag bit0 =
-    /// defaults) resolving the function by name, then `StoreFast` -- which set_global's the
-    /// PyFunction so a later `LoadGlobal` prefers it (it carries the defaults) over the plain
-    /// function-table ref. Emitted at the source position because a default may reference an
-    /// earlier module var.
-    fn compile_defaulted_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
+    /// Whether the direct module-level def now being compiled is the LAST of its name, and so the one
+    /// whose body the function table holds under that bare name. Counts each def as it is compiled, so
+    /// it must be called exactly once per direct def, in source order -- the same walk, over the same
+    /// statements, that `compile_module` used to decide which def to put in the table.
+    fn owns_module_def_name(&mut self, name: &str) -> bool {
+        let seen = self.module_defs_seen.entry(String::from(name)).or_insert(0);
+        *seen += 1;
+        self.module_def_totals.get(name) == Some(seen)
+    }
+
+    /// Emit a module-level def that OWNS its name at its source position: any default values, then
+    /// `MakeFunction` resolving the function by that bare name (the table entry `compile_module`
+    /// hoisted), then `StoreName` -- which set_global's the PyFunction, so a later `LoadGlobal` prefers
+    /// it (it carries the defaults) over the plain function-table ref.
+    ///
+    /// A def binds its name where it STANDS, which is why this is emitted at the source position and
+    /// not just left to the table: `g = 1; def g(): ...` must leave `g` the function, and a default may
+    /// reference an earlier module var.
+    fn compile_module_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
         let flags = self.emit_param_defaults(&func.params)?;
         let func_name = self.name_index(&func.name);
         self.asm.emit(bc::Op::MakeFunction {
@@ -3001,16 +3280,20 @@ impl Compiler {
         Ok(())
     }
 
-    /// Compile a module-level `def` buried in a block (`if`/`for`/`while`/`try`/`with`) AT ITS DEF
-    /// SITE: hoist its `CodeObject` into the module function table under a UNIQUE synthetic name
-    /// (`<block N>.name`, so sibling same-named defs -- a version guard `if c: def f else: def f` --
-    /// stay DISTINCT code objects and each def site resolves to its own body), then emit the def-site
-    /// `MakeFunction` (referencing that unique name) + `StoreName` of the def's real name. Unlike a
-    /// direct top-level def (a pure table entry, callable by name with no body emission), a
-    /// block-nested def is bound only when its block runs, so it needs this emission. Module scope has
-    /// no cells, so it captures nothing (every enclosing name is a global) -- compiled against an empty
-    /// scope chain, exactly like a direct top-level def.
-    fn compile_block_nested_module_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
+    /// Compile a module-level `def` that does NOT own its name AT ITS DEF SITE: hoist its `CodeObject`
+    /// into the module function table under a UNIQUE synthetic name, then emit the def-site
+    /// `MakeFunction` (referencing that unique name) + `StoreName` of the def's real name. The unique
+    /// name is what makes each such def resolve to ITS OWN body rather than to whatever the table holds
+    /// under the bare one.
+    ///
+    /// Two kinds of def land here. One buried in a block (`if`/`for`/`while`/`try`/`with`) -- bound only
+    /// when its block runs, and where sibling same-named defs (a version guard `if c: def f else: def f`)
+    /// must stay DISTINCT code objects. And one a LATER def rebinds: it owns the name only until that
+    /// later def stands, while the table's bare name belongs to the last of them.
+    ///
+    /// Module scope has no cells, so either captures nothing (every enclosing name is a global) --
+    /// compiled against an empty scope chain, exactly like a def that does own its name.
+    fn compile_hoisted_module_def(&mut self, func: &FuncDef) -> Result<(), CompileError> {
         let seq = self.block_def_counter;
         self.block_def_counter += 1;
         let qualified = format!("{}.${seq}.{}", self.name, func.name);
@@ -3022,7 +3305,7 @@ impl Compiler {
             &func.ret,
             &body,
             None,
-            &[],
+            Outer { enclosing: &[], func_rets: &self.func_rets },
         )?;
         self.hoisted.push(co);
         self.hoisted.extend(hoisted);
@@ -3103,7 +3386,7 @@ impl Compiler {
             &func.ret,
             &body,
             None,
-            &self.child_scopes,
+            Outer { enclosing: &self.child_scopes, func_rets: &self.func_rets },
         )?;
         let freevars = co.freevars.clone();
         self.hoisted.push(co);
@@ -3137,7 +3420,7 @@ impl Compiler {
             &None,
             &body_refs,
             None,
-            &self.child_scopes,
+            Outer { enclosing: &self.child_scopes, func_rets: &self.func_rets },
         )?;
         let freevars = lambda_co.freevars.clone();
         self.hoisted.push(lambda_co);
@@ -3183,7 +3466,7 @@ impl Compiler {
             &None,
             &body_refs,
             None,
-            &self.child_scopes,
+            Outer { enclosing: &self.child_scopes, func_rets: &self.func_rets },
         )?;
         let freevars = co.freevars.clone();
         self.hoisted.push(co);
@@ -3681,13 +3964,13 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_def_has_no_def_site_emission() {
+    fn a_plain_def_binds_its_name_at_its_def_site() {
         let module = compile_src("def f(a):\n    return a\nprint(f(5))\n").unwrap();
-        assert!(!module
-            .body
-            .ops
-            .iter()
-            .any(|op| matches!(op, Op::MakeFunction { .. })));
+        assert_eq!(
+            module.body.ops.iter().filter(|op| matches!(op, Op::MakeFunction { .. })).count(),
+            1
+        );
+        assert!(module.functions.iter().any(|c| c.name == "f"));
     }
 
     #[test]
@@ -3729,13 +4012,53 @@ mod tests {
     }
 
     #[test]
-    fn a_direct_top_level_decorated_def_is_not_re_hoisted_as_block_nested() {
-        let module = compile_src("def d(fn):\n    return fn\n@d\ndef f():\n    return 1\n").unwrap();
-        assert!(module.functions.iter().any(|c| c.name == "f"));
-        assert!(
-            !module.functions.iter().any(|c| c.name.contains('$') && c.name.ends_with(".f")),
-            "no redundant block-nested hoist of a direct top-level decorated def"
+    fn the_last_module_def_of_a_name_owns_the_function_table_entry() {
+        let module = compile_src(
+            "def f():\n    return 1\na = f\ndef f():\n    return 2\nprint(a(), f())\n",
+        )
+        .unwrap();
+        let bare: Vec<&bc::CodeObject> = module.functions.iter().filter(|c| c.name == "f").collect();
+        assert_eq!(bare.len(), 1, "exactly one table entry owns the bare name");
+        assert!(bare[0].ops.iter().any(|op| matches!(op, Op::LoadConst(i) if bare[0].consts[*i as usize] == bc::Const::Int(2))));
+        assert_eq!(
+            module.functions.iter().filter(|c| c.name.contains('$') && c.name.ends_with(".f")).count(),
+            1
         );
+    }
+
+    #[test]
+    fn a_def_rebinds_a_name_an_earlier_assignment_bound() {
+        let module = compile_src("g = 1\ndef g():\n    return 2\nprint(g())\n").unwrap();
+        let ops = &module.body.ops;
+        let store_of_int = ops.iter().position(|op| matches!(op, Op::StoreName(_) | Op::StoreGlobal(_)));
+        let make = ops.iter().position(|op| matches!(op, Op::MakeFunction { .. }));
+        assert!(make.is_some(), "the def emits at its site");
+        assert!(store_of_int < make, "the def's binding comes AFTER the `g = 1` store");
+    }
+
+    #[test]
+    fn a_decorated_def_does_not_own_its_bare_name() {
+        let module = compile_src("def d(fn):\n    return fn\n@d\ndef f():\n    return 1\nprint(f())\n").unwrap();
+        assert!(
+            !module.functions.iter().any(|c| c.name == "f"),
+            "no bare table entry for a decorated def"
+        );
+        assert_eq!(
+            module.functions.iter().filter(|c| c.name.contains('$') && c.name.ends_with(".f")).count(),
+            1,
+            "its body is hoisted under a synthetic name"
+        );
+    }
+
+    #[test]
+    fn a_decorated_def_counts_toward_its_name_s_is_last_check() {
+        let module = compile_src(
+            "def d(fn):\n    return fn\n@d\ndef f():\n    return 1\ndef f():\n    return 2\nprint(f())\n",
+        )
+        .unwrap();
+        let bare: Vec<&bc::CodeObject> = module.functions.iter().filter(|c| c.name == "f").collect();
+        assert_eq!(bare.len(), 1, "the plain last def owns the bare name");
+        assert!(bare[0].ops.iter().any(|op| matches!(op, Op::LoadConst(i) if bare[0].consts[*i as usize] == bc::Const::Int(2))));
     }
 
     #[test]
@@ -4541,7 +4864,7 @@ mod tests {
         assert!(m.body.ops.iter().any(|op| matches!(op, Op::BuildClass)));
         assert_eq!(
             m.body.ops.iter().filter(|op| matches!(op, Op::MakeFunction { .. })).count(),
-            2
+            3
         );
         assert!(m.functions.iter().any(|f| f.name == "C.__init__"));
         assert!(m.functions.iter().any(|f| f.name == "C.get"));

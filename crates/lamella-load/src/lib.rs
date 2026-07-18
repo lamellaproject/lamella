@@ -567,7 +567,7 @@ impl fmt::Display for DeltaError {
 /// references against the bootstrap's `__Repl` (and any type a prior delta declared, recorded in
 /// `context`) and binding its `Submit$N` method so it can be run by id.
 ///
-/// The delta is a standalone assembly (per `docs/repl-incremental-model.md`). At minimum it
+/// The delta is a standalone assembly. At minimum it
 /// carries a `Submit$N(__Repl s)` static method whose body reads/writes `__Repl` fields through
 /// `MemberRef` FieldRefs and (for an expression submission) boxes its result to `object` and
 /// returns it. A submission that DECLARES a type additionally carries a FULL `TypeDef` for it

@@ -1,8 +1,10 @@
 // Lamella managed corlib (from scratch). -- System.Buffer
 namespace System
 {
-    public static class Buffer
+    public sealed class Buffer
     {
+        private Buffer() { }
+
         [Lamella.Runtime.RuntimeProvided] private static int ByteLengthInternal(Array array) { return -1; }
 
         [Lamella.Runtime.RuntimeProvided] private static void BlockCopyInternal(Array src, int srcOffset, Array dst, int dstOffset, int count) { }

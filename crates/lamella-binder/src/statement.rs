@@ -752,6 +752,7 @@ impl Binder {
                         parameters: alloc::vec![object_ty.clone()],
                         return_type: void_ty.clone(),
                         is_static: true,
+                        is_vararg: false,
                     }),
                 },
                 ty: void_ty.clone(),

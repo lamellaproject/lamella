@@ -3,8 +3,10 @@ using System;
 
 namespace Lamella.Net.Time
 {
-    public static class SystemClock
+    public sealed class SystemClock
     {
+        private SystemClock() { }
+
         public static DateTime UtcNow
         {
             get { return DateTime.UtcNow; }

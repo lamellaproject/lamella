@@ -1,6 +1,6 @@
 //! The scheduler's reactor: the single OS-thread block point, extracted Session-free so the
-//! interpreter's green-thread scheduler and the AOT native scheduler drive ONE implementation
-//! (`design-aot-reactor-gc-scheduler.md` sec 1). A parked thread waits on a timer deadline or a
+//! interpreter's green-thread scheduler and the AOT native scheduler drive ONE implementation.
+//! A parked thread waits on a timer deadline or a
 //! socket; when nothing is runnable, [`block_point`] performs the ONE blocking wait -- a net poll
 //! that honors the nearest timer, or a tickless sleep -- and returns the threads to wake.
 

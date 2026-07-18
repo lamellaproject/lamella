@@ -215,6 +215,24 @@ pub enum DiagnosticKind {
         /// The number of arguments supplied.
         count: u32,
     },
+    /// `CS0518`: a predefined type's backing `System` type is not defined or imported --
+    /// the compilation has a corlib, but that corlib does not declare this type (e.g. a
+    /// no-float corlib and `double`).
+    PredefinedTypeMissing {
+        /// The backing type's full name, e.g. `System.Double`.
+        full_name: Box<str>,
+    },
+    /// `CS0190`: a bare `__arglist` outside a vararg member's body.
+    ArglistOutsideVarargMethod,
+    /// `CS0226`: an `__arglist(...)` expression somewhere other than the final argument
+    /// of a call or object creation.
+    ArglistOutsideCall,
+    /// `CS7036`: a call to a vararg member supplied no `__arglist(...)` at the sentinel
+    /// position (csc reports the sentinel as a missing required parameter).
+    NoArgumentForArglist {
+        /// The member's display signature, e.g. `P.M(int, __arglist)`.
+        method: Box<str>,
+    },
     /// `CS1503`: an argument has no implicit conversion to its parameter type.
     ArgumentConversion {
         /// The 1-based argument position.
@@ -521,6 +539,17 @@ pub enum DiagnosticKind {
         /// The number of arguments supplied.
         count: u32,
     },
+    /// `CS0149`: a delegate-creation argument is not a method group or a compatible delegate
+    /// value (or extra arguments follow it).
+    MethodNameExpected,
+    /// `CS0123`: the named method (or a delegate value's `Invoke`) matches no overload with the
+    /// delegate's signature.
+    NoOverloadMatchesDelegate {
+        /// The method group's name, or `Type.Invoke` for a delegate-value operand.
+        method: Box<str>,
+        /// The delegate type being created.
+        delegate: Box<str>,
+    },
     /// `CS0127`: a `return` in a `void` method has an expression.
     ReturnValueInVoidMethod {
         /// The enclosing method's name.
@@ -598,6 +627,10 @@ impl DiagnosticKind {
             DiagnosticKind::CannotAssignToMethodGroup { .. } => 1656,
             DiagnosticKind::MemberNotFound { .. } => 117,
             DiagnosticKind::NoOverloadForArgumentCount { .. } => 1501,
+            DiagnosticKind::PredefinedTypeMissing { .. } => 518,
+            DiagnosticKind::ArglistOutsideVarargMethod => 190,
+            DiagnosticKind::ArglistOutsideCall => 226,
+            DiagnosticKind::NoArgumentForArglist { .. } => 7036,
             DiagnosticKind::ArgumentConversion { .. } => 1503,
             DiagnosticKind::AmbiguousCall { .. } => 121,
             DiagnosticKind::Inaccessible { .. } => 122,
@@ -655,6 +688,8 @@ impl DiagnosticKind {
             DiagnosticKind::StaticMemberViaInstance { .. } => 176,
             DiagnosticKind::CannotIndex { .. } => 21,
             DiagnosticKind::NoConstructor { .. } => 1729,
+            DiagnosticKind::MethodNameExpected => 149,
+            DiagnosticKind::NoOverloadMatchesDelegate { .. } => 123,
             DiagnosticKind::ReturnValueInVoidMethod { .. } => 127,
             DiagnosticKind::ReturnValueRequired { .. } => 126,
             DiagnosticKind::NotAllPathsReturn { .. } => 161,
@@ -743,6 +778,22 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NoOverloadForArgumentCount { method, count } => write!(
                 f,
                 "No overload for method '{method}' takes {count} arguments"
+            ),
+            DiagnosticKind::PredefinedTypeMissing { full_name } => write!(
+                f,
+                "Predefined type '{full_name}' is not defined or imported"
+            ),
+            DiagnosticKind::ArglistOutsideVarargMethod => write!(
+                f,
+                "The __arglist construct is valid only within a variable argument method"
+            ),
+            DiagnosticKind::ArglistOutsideCall => write!(
+                f,
+                "An __arglist expression may only appear inside of a call or new expression"
+            ),
+            DiagnosticKind::NoArgumentForArglist { method } => write!(
+                f,
+                "There is no argument given that corresponds to the required parameter '__arglist' of '{method}'"
             ),
             DiagnosticKind::ArgumentConversion { index, from, to } => write!(
                 f,
@@ -975,6 +1026,10 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "'{type_name}' does not contain a constructor that takes {count} arguments"
             ),
+            DiagnosticKind::MethodNameExpected => write!(f, "Method name expected"),
+            DiagnosticKind::NoOverloadMatchesDelegate { method, delegate } => {
+                write!(f, "No overload for '{method}' matches delegate '{delegate}'")
+            }
             DiagnosticKind::ReturnValueInVoidMethod { method } => write!(
                 f,
                 "Since '{method}' returns void, a return keyword must not be followed by an \

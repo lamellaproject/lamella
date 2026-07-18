@@ -1,0 +1,55 @@
+# INSTANCE map: where each RP2040 block copy sits + its reset-release bit
+# (; reset bits are per-instance bus-gate facts,). Every value
+# transcribed from the retired v0 uart-rp2040.toml, whose regions + RESETS fields were
+# silicon-verified through the proven UART path (see blocks/uart.toml). `resets_clr` is the
+# chip's atomic write-1-to-CLEAR alias of `resets` (base + 0x3000). -1 = not applicable.
+# Rows are added evidence-first: uart1 (0x40038000 per the SVD) joins when a binding
+# first needs it, verified against RP2040 datasheet 2.14/2.2 with the datasheet open.
+
+[table]
+kind = "instances"
+family = "rp2040"
+record = ["base", "reset_bit"]
+sources = ["raspberrypi/pico-sdk RP2040.svd (bases)", "RP2040 datasheet 2.14 (RESETS bits), 2.2 (address map)"]
+
+
+name = "xosc"
+block = "xosc"
+base = 0x40024000
+reset_bit = -1
+
+
+name = "clocks"
+block = "clocks"
+base = 0x40008000
+reset_bit = -1
+
+
+name = "resets"
+block = "resets"
+base = 0x4000C000
+reset_bit = -1
+
+
+name = "resets_clr"
+block = "resets"
+base = 0x4000F000
+reset_bit = -1
+
+
+name = "io_bank0"
+block = "io-bank0"
+base = 0x40014000
+reset_bit = 5
+
+
+name = "pads_bank0"
+block = "pads-bank0"
+base = 0x4001C000
+reset_bit = 8
+
+
+name = "uart0"
+block = "uart"
+base = 0x40034000
+reset_bit = 22

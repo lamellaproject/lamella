@@ -88,8 +88,8 @@ pub fn link_at_base(
 
 /// Like [`link_at_base`], but also resolving `residents` -- `(name, absolute address)` of functions
 /// already present on the target (the on-board runtime) -- so the injected object's calls and data refs
-/// to those names land on their real addresses. This is the RAM-injection delivery (REPL-against-AOT,
-/// delivery-foundations.md scenario 5): the host links a snippet to the RAM buffer it will write, with
+/// to those names land on their real addresses. This is the RAM-injection delivery (REPL-against-AOT):
+/// the host links a snippet to the RAM buffer it will write, with
 /// the resident runtime's seams (`lamella_gc_alloc`, ...) resolved to the addresses it read from the
 /// board. The result runs correctly only when loaded at `text_base`. A resident in flash, beyond a Thumb
 /// `BL`'s +/-16 MB reach from a RAM buffer, is bridged automatically by an appended long-branch veneer.

@@ -514,7 +514,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
 pub const INTRINSIC_ABI: u16 = 1;
 
 /// Every intrinsic id this build registers, in registry order -- the resident-surface listing a
-/// Lamella Link `PROFILE_MANIFEST` carries (docs/deployment-tiers.md: a resident corlib is compatible
+/// Lamella Link `PROFILE_MANIFEST` carries (a resident corlib is compatible
 /// iff its `[RuntimeProvided]` demand set is a SUBSET of these).
 pub fn registry_ids() -> impl Iterator<Item = u32> {
     REGISTRY.iter().map(|(id, _)| *id)

@@ -205,11 +205,19 @@ impl<T: Transport> Dap<T> {
     /// 0x02 product, 0x03 serial, 0x04 CMSIS-DAP protocol version, 0x09 firmware version on
     /// probes that report one. Empty when the probe does not populate the id.
     pub fn info_string(&mut self, id: u8) -> Result<String, DapError> {
-        let reply = self.command(&proto::info(id))?;
-        let len = reply.get(1).copied().unwrap_or(0) as usize;
-        let bytes = reply.get(2..2 + len).unwrap_or(&[]);
+        let bytes = self.info_bytes(id)?;
         let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
         Ok(String::from_utf8_lossy(&bytes[..end]).into_owned())
+    }
+
+    /// Reads a raw `DAP_Info` value -- the info block after the length byte -- for the numeric ids:
+    /// 0xF0 Capabilities (a bitfield: bit 0 SWD, bit 1 JTAG, ...), 0xFB packet count, 0xFF packet
+    /// size (u16, little-endian). The string ids are better read through
+    /// [`info_string`](Self::info_string). Empty when the probe does not populate the id.
+    pub fn info_bytes(&mut self, id: u8) -> Result<Vec<u8>, DapError> {
+        let reply = self.command(&proto::info(id))?;
+        let len = reply.get(1).copied().unwrap_or(0) as usize;
+        Ok(reply.get(2..2 + len).unwrap_or(&[]).to_vec())
     }
 
     /// Connects to the target over SWD: select the port, set the clock, then send the

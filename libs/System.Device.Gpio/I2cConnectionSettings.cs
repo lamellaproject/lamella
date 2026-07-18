@@ -1,4 +1,4 @@
-// System.Device.I2c -- the dotnet/iot I2C API, shipped in the System.Device.Gpio assembly.
+// System.Device.I2c -- the dotnet/iot I2C API, shipped in the System.Device.Gpio assembly (Microsoft's official packaging of the Spi/I2c namespaces).
 namespace System.Device.I2c
 {
     /// <summary>The connection settings of a device on an I2C bus.</summary>

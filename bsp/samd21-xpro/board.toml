@@ -1,0 +1,42 @@
+# The SAM D21 Xplained Pro: board truth only -- what is wired to what. Chip truth lives in
+# csp/samd21/. This is the PLAIN D21 XPro (kit 2130): its EDBG VCP is SERCOM3 on PA22/PA23
+# (UG 42220, SILICON-CONFIRMED 2026-07-13 on this bench: DP IDCODE 0x0bc11477, EDBG serial
+# ATML2130021800025295, host handshake + C# eval over COM6). The SAM W25 XPro is a DIFFERENT
+# board (bsp/samw25-xpro/) whose VCP is SERCOM4 -- the two were historically conflated under one
+# chip-named table; they are not even the same part (J18A here, G18A there).
+
+[table]
+kind = "board"
+board = "samd21-xpro"
+family = "samd21"
+part = "atsamd21j18a"
+board_model = 5
+sources = [
+    "SAM D21 Xplained Pro user guide UG 42220: EDBG VCP = SERCOM3, PA22 (PAD0) TX / PA23 (PAD1) RX, peripheral function C",
+    "silicon-proven: samd21-edbg-serve --features samd21-xpro (EDBG VCP COM6 handshake + C# eval, 2026-07-13)",
+]
+
+[carrier]
+kind = "edbg-vcp"
+usb_vid = 0x03EB
+usb_pid = 0x2169
+role = "vcp"
+baud = 115200
+
+
+role = "vcp"
+kind = "uart"
+instance = "sercom3"
+function = "C"
+gclk_gen = 0
+tx = { pin = "PA22", pad = 0 }
+rx = { pin = "PA23", pad = 1 }
+
+
+name = "osc8m-8mhz"
+default = true
+source = "osc8m"
+gclk0_hz = 8000000
+
+# rows (LED0, the user button) belong here once transcribed from UG 42220 with the
+# guide open.
